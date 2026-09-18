@@ -1,0 +1,136 @@
+{
+  "overallStatus": "passed",
+  "contractCoverage": [
+    {
+      "contractRef": "Release dry-run builds and packs protocol, sdk, cli in dependency order",
+      "status": "covered",
+      "detail": "Exact clean-room command exited 0; protocol, sdk, and cli builds ran in order and emitted one tarball each.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    },
+    {
+      "contractRef": "dist-packed contains exactly three non-empty package tarballs",
+      "status": "covered",
+      "detail": "ls showed gajaeway-protocol-0.1.0.tgz, gajaeway-sdk-0.1.0.tgz, and gajaeway-cli-0.1.0.tgz; stat reported 55812, 6952, and 31991 bytes.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    },
+    {
+      "contractRef": "SDK package artifact includes dist/* and src/* without node_modules",
+      "status": "covered",
+      "detail": "tar tzf listed package/dist/* and package/src/* plus package.json; no node_modules path appeared.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    },
+    {
+      "contractRef": "Unknown release arguments fail closed",
+      "status": "covered",
+      "detail": "--bogus-flag returned exit 2 with unknown argument: --bogus-flag.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    },
+    {
+      "contractRef": "Publishing is explicitly gated by --publish",
+      "status": "covered",
+      "detail": "Source read/grep shows publish=false by default, exact --publish enables it, and bun publish is only inside if (publish); --publish was not run.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    },
+    {
+      "contractRef": "README build badge references the existing build workflow",
+      "status": "covered",
+      "detail": "README line 8 references actions/workflows/build.yml and its badge.svg; test -f succeeded; workflow line 1 is name: build.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    },
+    {
+      "contractRef": "Root build and focused protocol/sdk/cli tests remain green",
+      "status": "covered",
+      "detail": "bun run build exited 0; focused test run exited 0 with 155 pass, 0 fail, and 546 expect() calls across 6 files.",
+      "artifactRefs": ["artifacts/ultragoal-release-package-qa-transcript.txt"]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "surface": "release dry-run",
+      "command": "cd ~/Documents/Workspace/gajae-way && rm -rf dist-packed packages/protocol/dist packages/sdk/dist packages/cli/dist && bun run release:dry-run",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "All three package builds and bun pm pack operations completed in protocol -> sdk -> cli order.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "package artifact listing",
+      "command": "ls dist-packed/ && stat -f '%N %z' dist-packed/*.tgz",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "Exactly three expected .tgz files; all sizes are non-zero.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "SDK tarball contents",
+      "command": "tar tzf dist-packed/gajaeway-sdk-0.1.0.tgz",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "dist/* and src/* files are listed; no node_modules entry.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "release argument validation",
+      "command": "bun scripts/release-packages.ts --bogus-flag",
+      "exitCode": 2,
+      "verdict": "passed",
+      "detail": "Expected non-zero failure with informative unknown-argument error.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "publish safety source gate",
+      "command": "grep -nE -- '--publish|bun publish|if \\(publish\\)|publishCmd' scripts/release-packages.ts",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "Source evidence proves bun publish is reachable only when the explicit --publish flag sets publish=true; no registry write was attempted.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "README badge and workflow",
+      "command": "grep -n 'badge.svg\\|workflows/build' README.md; test -f .github/workflows/build.yml; grep -n 'name:' .github/workflows/build.yml",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "Badge/workflow references and name: build all match.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "root build",
+      "command": "bun run build",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "All six compiled root binaries emitted.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "surface": "focused package tests",
+      "command": "bun test packages/protocol packages/sdk packages/cli",
+      "exitCode": 0,
+      "verdict": "passed",
+      "detail": "155 pass, 0 fail, 546 expect() calls across 6 files.",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "RELEASE-UNKNOWN-FLAG",
+      "scenario": "Invoke the release script with an unsupported --bogus-flag.",
+      "expectedBehavior": "Fail non-zero with a clear unknown-argument error and do not proceed.",
+      "exitCode": 2,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    },
+    {
+      "id": "RELEASE-PUBLISH-GATE",
+      "scenario": "Inspect the source path that can invoke bun publish without touching a registry.",
+      "expectedBehavior": "bun publish is reachable only after an explicit --publish flag; default execution packs instead.",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-release-package-qa-transcript.txt"
+    }
+  ],
+  "artifactRefs": [
+    "artifacts/ultragoal-release-package-qa-transcript.txt",
+    "artifacts/ultragoal-release-package-qa.json"
+  ],
+  "blockers": []
+}

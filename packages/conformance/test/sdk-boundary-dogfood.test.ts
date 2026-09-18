@@ -48,7 +48,7 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
 		return out;
 	}
 	for (const entry of entries) {
-		if (entry === "node_modules" || entry.startsWith(".")) continue;
+		if (entry === "node_modules" || entry === "dist" || entry.startsWith(".")) continue;
 		const full = join(dir, entry);
 		const stat = statSync(full);
 		if (stat.isDirectory()) collectSourceFiles(full, out);

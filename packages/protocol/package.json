@@ -1,10 +1,44 @@
 {
 	"name": "@gajaeway/protocol",
 	"version": "0.1.0",
-	"private": true,
 	"type": "module",
 	"description": "gajaeway protocol profile v0.x: frames, negotiation, verbs, events, error codes, origin normalization. Zero runtime dependencies.",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/protocol"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/protocol#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"protocol",
+		"ndjson",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
 	"exports": {
-		".": "./src/index.ts"
+		".": {
+			"bun": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
+	},
+	"engines": {
+		"bun": ">=1.4.0"
 	}
 }

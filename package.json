@@ -8,11 +8,13 @@
 	"license": "AGPL-3.0-only",
 	"author": "Yeachan Heo",
 	"type": "module",
-	"packageManager": "bun@1.3.14",
+	"packageManager": "bun@1.4.0",
 	"description": "Gajae Way operator-agent runtime",
 	"scripts": {
 		"test": "bun test packages",
-		"build": "bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/adapter-slack/src/main.ts --outfile dist/gajaeway-slack && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway"
+		"build": "bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/adapter-slack/src/main.ts --outfile dist/gajaeway-slack && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway",
+		"release:dry-run": "bun scripts/release-packages.ts",
+		"release:publish": "bun scripts/release-packages.ts --publish"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.2",
@@ -20,6 +22,6 @@
 		"typescript": "^5.9.3"
 	},
 	"engines": {
-		"bun": ">=1.3.14"
+		"bun": ">=1.4.0"
 	}
 }

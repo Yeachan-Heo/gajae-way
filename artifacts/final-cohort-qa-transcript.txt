@@ -1,0 +1,273 @@
+gajae-way final boundary cohort QA/red-team verification transcript
+Generated: 2026-09-18T04:08:34.210002Z
+Working directory: /Users/bellman/Documents/Workspace/gajae-way
+Host: Darwin MacBook-Pro-3.local 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:41:12 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6050 arm64
+
+
+=== STEP 1: 1 package builds (fresh) ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && rm -rf packages/protocol/dist packages/sdk/dist packages/cli/dist dist dist-packed && bun run --filter '@gajaeway/protocol' build && bun run --filter '@gajaeway/sdk' build && bun run --filter '@gajaeway/cli' build)
+@gajaeway/protocol build: Bundled 10 modules in 3ms
+@gajaeway/protocol build: 
+@gajaeway/protocol build:   index.js  19.38 KB  (entry point)
+@gajaeway/protocol build: 
+@gajaeway/protocol build: Exited with code 0
+@gajaeway/sdk build: Bundled 2 modules in 2ms
+@gajaeway/sdk build: 
+@gajaeway/sdk build:   index.js  6.25 KB  (entry point)
+@gajaeway/sdk build: 
+@gajaeway/sdk build: Exited with code 0
+@gajaeway/cli build: Bundled 3 modules in 4ms
+@gajaeway/cli build: 
+@gajaeway/cli build:   main.js  32.95 KB  (entry point)
+@gajaeway/cli build: 
+@gajaeway/cli build: Exited with code 0
+
+[exit code: 0]
+[duration seconds: 0.972]
+
+=== STEP 2: 2 Node ESM SDK dist import ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && node --input-type=module -e "import('$(pwd)/packages/sdk/dist/index.js').then(m=>console.log(Object.keys(m))).catch(e=>{console.error('FAIL',e.message);process.exit(1)})")
+[ 'GajaewayClient', 'LOOPBACK_ORIGIN' ]
+
+[exit code: 0]
+[duration seconds: 0.034]
+
+=== STEP 3: 3 release dry run ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && bun run release:dry-run)
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/protocol) bun run build
+Bundled 10 modules in 3ms
+
+  index.js  19.38 KB  (entry point)
+
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/protocol) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.11KB package.json
+packed 32.74KB dist/catalog.d.ts
+packed 17.61KB dist/catalog.d.ts.map
+packed 1.83KB dist/engagement.d.ts
+packed 0.87KB dist/engagement.d.ts.map
+packed 1.1KB dist/errors.d.ts
+packed 0.63KB dist/errors.d.ts.map
+packed 2.52KB dist/frames.d.ts
+packed 1.72KB dist/frames.d.ts.map
+packed 3.22KB dist/index.d.ts
+packed 2.43KB dist/index.d.ts.map
+packed 19.38KB dist/index.js
+packed 2.85KB dist/origin.d.ts
+packed 1.22KB dist/origin.d.ts.map
+packed 4.53KB dist/presence.d.ts
+packed 1.78KB dist/presence.d.ts.map
+packed 4.79KB dist/reactions.d.ts
+packed 1.37KB dist/reactions.d.ts.map
+packed 0.55KB dist/runtime-config.d.ts
+packed 389B dist/runtime-config.d.ts.map
+packed 2.21KB dist/version.d.ts
+packed 1.29KB dist/version.d.ts.map
+packed 30.55KB src/catalog.ts
+packed 2.75KB src/engagement.ts
+packed 1.35KB src/errors.ts
+packed 4.89KB src/frames.ts
+packed 3.32KB src/index.ts
+packed 6.1KB src/origin.ts
+packed 6.92KB src/presence.ts
+packed 8.44KB src/reactions.ts
+packed 1.81KB src/runtime-config.ts
+packed 3.56KB src/version.ts
+
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-protocol-0.1.0.tgz
+
+Total files: 32
+Shasum: 9a75abd600c92a7d3d5e75b07f9e6dffeeafbd68
+Integrity: sha512-6H38oJnHusOVE[...]dfC9q1a3lQWiw==
+Unpacked size: 175.77KB
+Packed size: 49.55KB
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/sdk) bun run build
+Bundled 2 modules in 2ms
+
+  index.js  6.25 KB  (entry point)
+
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/sdk) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.12KB package.json
+packed 1.74KB dist/client.d.ts
+packed 1.59KB dist/client.d.ts.map
+packed 166B dist/index.d.ts
+packed 206B dist/index.d.ts.map
+packed 6.25KB dist/index.js
+packed 8.39KB src/client.ts
+packed 131B src/index.ts
+
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-sdk-0.1.0.tgz
+
+Total files: 8
+Shasum: 93de131a4c24348fad379c446fca27321f9edc1f
+Integrity: sha512-vHlt0D1g3LVtv[...]+me2ark+tKBUg==
+Unpacked size: 19.59KB
+Packed size: 5.20KB
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/cli) bun run build
+Bundled 3 modules in 3ms
+
+  main.js  32.95 KB  (entry point)
+
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/cli) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.29KB package.json
+packed 2.39KB dist/list.d.ts
+packed 2.32KB dist/list.d.ts.map
+packed 3.0KB dist/main.d.ts
+packed 1.28KB dist/main.d.ts.map
+packed 32.95KB dist/main.js
+packed 2.14KB dist/services.d.ts
+packed 1.79KB dist/services.d.ts.map
+packed 7.64KB src/list.ts
+packed 23.32KB src/main.ts
+packed 8.12KB src/services.ts
+
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-cli-0.1.0.tgz
+
+Total files: 11
+Shasum: 7b929f7afdb12de39f19fecd53a029c70293bd0c
+Integrity: sha512-sajaFpKvUvJLC[...]L/aTdRkHBlSmg==
+Unpacked size: 86.22KB
+Packed size: 23.64KB
+
+Dry-run packed tarballs written to dist-packed/. Inspect them, then re-run with --publish.
+
+[stderr]
+$ bun scripts/release-packages.ts
+$ rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.build.json
+$ rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external @gajaeway/protocol && tsc -p tsconfig.build.json
+$ rm -rf dist && bun build src/main.ts --outdir dist --target bun --format esm --external @gajaeway/protocol --external @gajaeway/sdk && tsc -p tsconfig.build.json
+
+[exit code: 0]
+[duration seconds: 0.978]
+
+=== STEP 4: 4 clean-room npm install SDK import and CLI help ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && rm -rf /tmp/final-cohort-qa && mkdir -p /tmp/final-cohort-qa/consumer && cd /tmp/final-cohort-qa/consumer && npm init -y && npm install ~/Documents/Workspace/gajae-way/dist-packed/*.tgz && node --input-type=module -e "import('@gajaeway/sdk').then(m=>console.log('SDK OK',Object.keys(m))).catch(e=>{console.error('FAIL',e.message);process.exit(1)})" && node_modules/.bin/gajaeway --help)
+Wrote to /private/tmp/final-cohort-qa/consumer/package.json:
+
+{
+  "name": "consumer",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
+
+
+added 3 packages in 373ms
+SDK OK [ 'GajaewayClient', 'LOOPBACK_ORIGIN' ]
+
+[stderr]
+usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR] (work run waits for a response; caller timeout does not end the attempt)
+
+[exit code: 2]
+[duration seconds: 1.027]
+
+=== STEP 5: 5 frozen lockfile install ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && bun install --frozen-lockfile)
+bun install v1.4.0 (34cbb9a40)
+
+Checked 43 installs across 47 packages (no changes) [8.00ms]
+
+[exit code: 0]
+[duration seconds: 0.016]
+
+=== STEP 6: 6 root build (fresh package dist) ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && rm -rf packages/protocol/dist packages/sdk/dist packages/cli/dist dist && bun run build)
+   [6ms]  bundle  70 modules
+  [60ms] compile  dist/gajaeway-gateway
+  [26ms]  bundle  535 modules
+  [54ms] compile  dist/gajaeway-discord
+   [3ms]  bundle  18 modules
+  [53ms] compile  dist/gajaeway-telegram
+   [4ms]  bundle  26 modules
+  [51ms] compile  dist/gajaeway-slack
+   [3ms]  bundle  24 modules
+  [51ms] compile  dist/gajaeway-admin
+   [3ms] bundle  15 modules
+  [51ms] compile  dist/gajaeway
+
+[stderr]
+$ bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/adapter-slack/src/main.ts --outfile dist/gajaeway-slack && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway
+
+[exit code: 0]
+[duration seconds: 0.436]
+
+=== STEP 7: 7 package tests ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && bun test packages/protocol packages/sdk packages/cli packages/admin packages/subsession)
+bun test v1.4.0 (34cbb9a40)
+Validated SQLite backup: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-pDGtQd/backup.db
+Copied current database to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-pDGtQd/gateway.db.pre-restore-2026-09-18T04-08-37-859Z
+Restored backup to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-pDGtQd/gateway.db
+
+[stderr]
+
+packages/cli/test/main.test.ts:
+
+ 639 pass
+ 0 fail
+ 1660 expect() calls
+Ran 639 tests across 29 files. [207.00ms]
+
+[exit code: 0]
+[duration seconds: 0.216]
+
+=== STEP 8: 8 README refs and paths ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && grep -n 'assets/logo-horizontal.png\|assets/NOTICE.md\|LICENSE\|docs/deployment.md\|docs/memory.md\|docs/monitors.md\|docs/architecture.md\|docs/runbooks\|packages/protocol\|packages/sdk\|packages/cli\|artifacts/ultragoal-npm-clean-install-verification.txt' README.md && for p in assets/logo-horizontal.png assets/NOTICE.md LICENSE docs/deployment.md docs/memory.md docs/monitors.md docs/architecture.md docs/runbooks packages/protocol packages/sdk packages/cli artifacts/ultragoal-npm-clean-install-verification.txt; do test -e "$p" && echo "exists: $p" || { echo "missing: $p"; exit 1; }; done)
+2:  <img src="assets/logo-horizontal.png" alt="gajae-way" width="640">
+5:<p align="center"><sub>Mascot artwork is a derivative of <a href="https://github.com/Yeachan-Heo/gajae-code">gajae-code</a>'s branding — see <a href="assets/NOTICE.md">assets/NOTICE.md</a> for attribution.</sub></p>
+9:  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
+51:| [`@gajaeway/protocol`](packages/protocol) | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
+52:| [`@gajaeway/sdk`](packages/sdk) | Client for the gateway's Unix-domain socket or stdio transport. |
+53:| [`@gajaeway/cli`](packages/cli) | Owner commands over the gateway socket. |
+73:2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
+97:- [Deployment guide](docs/deployment.md) — configuration, credentials, and service-manager setup
+98:- [Memory guide](docs/memory.md) — readable memory and search
+99:- [Monitor guide](docs/monitors.md) — scheduled and event-driven work
+100:- [Architecture](docs/architecture.md) — protocol and reliability details
+101:- [Operator runbook](docs/runbooks/gajaeway-v1.md) — recovery and troubleshooting
+117:`@gajaeway/protocol`, `@gajaeway/sdk`, and `@gajaeway/cli` are npm-publishable under the `@gajaeway` scope. Each has its own `build` step that bundles `src/` into a single Node-ESM-resolvable `dist/*.js` with Bun, then emits `.d.ts` declarations with `tsc` (`emitDeclarationOnly`), and a `prepublishOnly` script so a publish always ships current compiled output. The published tarball includes both `dist/` (resolved by `main`/`types`/the default export condition for non-Bun consumers) and `src/` (resolved by the `bun` export condition, so an installed Bun consumer imports source directly instead of the compiled build). `@gajaeway/protocol` has zero runtime dependencies. Publishing must go through Bun, not plain npm: `npm pack --dry-run` only lists a package's contents and does **not** rewrite dependencies — plain `npm pack`/`npm publish` leave `workspace:*` in the packed manifest, which a real npm consumer cannot resolve. `bun pm pack` and `bun publish` rewrite each published package's `workspace:*` dependency on `@gajaeway/protocol`/`@gajaeway/sdk` to the exact version being packed, producing a registry-valid manifest — verified by packing with `bun pm pack`, `npm install`-ing the tarballs into a scratch project, and running a real `node --input-type=module -e "import('@gajaeway/sdk')"` against the installed package (transcript: [`artifacts/ultragoal-npm-clean-install-verification.txt`](artifacts/ultragoal-npm-clean-install-verification.txt)).
+130:Copyright (C) 2026 Yeachan Heo. Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+exists: assets/logo-horizontal.png
+exists: assets/NOTICE.md
+exists: LICENSE
+exists: docs/deployment.md
+exists: docs/memory.md
+exists: docs/monitors.md
+exists: docs/architecture.md
+exists: docs/runbooks
+exists: packages/protocol
+exists: packages/sdk
+exists: packages/cli
+exists: artifacts/ultragoal-npm-clean-install-verification.txt
+
+[exit code: 0]
+[duration seconds: 0.008]
+
+=== STEP 9: 9 image validity and favicon magic ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && python3 -c "from PIL import Image; [Image.open(f).load() for f in ['assets/icon.png','assets/logo-vertical.png','assets/logo-horizontal.png','assets/favicon-32.png','assets/apple-touch-icon.png']]; print('all PNGs valid')" && python3 -c "from pathlib import Path; b=Path('assets/favicon.ico').read_bytes(); print('favicon magic', b[:4].hex()); assert b[:4] == bytes.fromhex('00000100'); print('favicon ICO magic valid')")
+all PNGs valid
+favicon magic 00000100
+favicon ICO magic valid
+
+[exit code: 0]
+[duration seconds: 0.167]
+
+=== STEP 10: 10 private package flags ===
+$ (cd /Users/bellman/Documents/Workspace/gajae-way && grep -n private packages/admin/package.json packages/subsession/package.json packages/conformance/package.json)
+packages/admin/package.json:4:  "private": true,
+packages/subsession/package.json:4:  "private": true,
+packages/conformance/package.json:4:  "private": true,
+
+[exit code: 0]
+[duration seconds: 0.008]

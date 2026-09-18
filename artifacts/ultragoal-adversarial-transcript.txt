@@ -1,0 +1,162 @@
+
+===== private package scope check =====
+$ python3 - <<'PY2'
+import json
+from pathlib import Path
+paths = ['packages/gateway/package.json','packages/adapter-discord/package.json','packages/adapter-telegram/package.json','packages/adapter-slack/package.json','packages/admin/package.json','packages/subsession/package.json','packages/conformance/package.json']
+for raw in paths:
+    data = json.loads(Path(raw).read_text())
+    print(f"{raw}: private={data.get('private', '<absent>')} publishConfig={'present' if 'publishConfig' in data else 'absent'}")
+    assert data.get('private') is True or 'publishConfig' not in data
+PY2
+packages/gateway/package.json: private=True publishConfig=absent
+packages/adapter-discord/package.json: private=True publishConfig=absent
+packages/adapter-telegram/package.json: private=True publishConfig=absent
+packages/adapter-slack/package.json: private=True publishConfig=absent
+packages/admin/package.json: private=<absent> publishConfig=absent
+packages/subsession/package.json: private=<absent> publishConfig=absent
+packages/conformance/package.json: private=True publishConfig=absent
+[exit code: 0]
+
+===== published dependency workspace protocol check =====
+$ python3 - <<'PY2'
+import json
+from pathlib import Path
+expected = {
+ 'packages/protocol/package.json': {},
+ 'packages/sdk/package.json': {'@gajaeway/protocol': 'workspace:*'},
+ 'packages/cli/package.json': {'@gajaeway/sdk': 'workspace:*', '@gajaeway/protocol': 'workspace:*'},
+}
+for raw, deps in expected.items():
+    data = json.loads(Path(raw).read_text())
+    actual = data.get('dependencies', {})
+    print(f"{raw}: dependencies={actual}")
+    for name, version in deps.items():
+        assert actual.get(name) == version, (raw, name, actual.get(name))
+PY2
+packages/protocol/package.json: dependencies={}
+packages/sdk/package.json: dependencies={'@gajaeway/protocol': 'workspace:*'}
+packages/cli/package.json: dependencies={'@gajaeway/sdk': 'workspace:*', '@gajaeway/protocol': 'workspace:*'}
+[exit code: 0]
+
+===== PNG icon =====
+$ python3 -c "from PIL import Image; im=Image.open('assets/icon.png'); im.load(); print(im.size, im.mode)"
+(1024, 1024) RGBA
+[exit code: 0]
+
+===== PNG logo vertical =====
+$ python3 -c "from PIL import Image; im=Image.open('assets/logo-vertical.png'); im.load(); print(im.size, im.mode)"
+(1200, 1739) RGBA
+[exit code: 0]
+
+===== PNG logo horizontal =====
+$ python3 -c "from PIL import Image; im=Image.open('assets/logo-horizontal.png'); im.load(); print(im.size, im.mode)"
+(1600, 500) RGBA
+[exit code: 0]
+
+===== PNG favicon 32 =====
+$ python3 -c "from PIL import Image; im=Image.open('assets/favicon-32.png'); im.load(); print(im.size, im.mode)"
+(32, 32) RGBA
+[exit code: 0]
+
+===== PNG apple touch icon =====
+$ python3 -c "from PIL import Image; im=Image.open('assets/apple-touch-icon.png'); im.load(); print(im.size, im.mode)"
+(180, 180) RGBA
+[exit code: 0]
+
+===== ICO magic bytes =====
+$ python3 -c "from pathlib import Path; b=Path('assets/favicon.ico').read_bytes(); print(b[:4].hex(' ')); assert b[:4] == bytes.fromhex('00 00 01 00')"
+00 00 01 00
+[exit code: 0]
+
+===== README relative-link grep =====
+$ grep -oE '\(?(assets/|docs/|LICENSE|packages/)[^ )#]+' README.md | sort -u
+(docs/architecture.md
+(docs/deployment.md
+(docs/memory.md
+(docs/monitors.md
+(docs/runbooks/gajaeway-v1.md
+(packages/cli
+(packages/protocol
+(packages/sdk
+assets/logo-horizontal.png"
+LICENSE"><img
+packages/`
+packages/cli
+packages/protocol
+packages/sdk
+[exit code: 0]
+
+===== README relative-link resolution =====
+$ python3 - <<'PY2'
+import re
+from pathlib import Path
+text = Path('README.md').read_text()
+links = re.findall(r'!?\[[^\]]*\]\(([^)]+)\)', text)
+seen = []
+for target in links:
+    target = target.split('#', 1)[0]
+    if not target or target.startswith(('http://', 'https://', 'mailto:')):
+        continue
+    if target not in seen:
+        seen.append(target)
+for target in seen:
+    path = Path(target)
+    print(f"{target} -> {path} exists={path.exists()}")
+    assert path.exists(), target
+PY2
+packages/protocol -> packages/protocol exists=True
+packages/sdk -> packages/sdk exists=True
+packages/cli -> packages/cli exists=True
+docs/ -> docs exists=True
+docs/deployment.md -> docs/deployment.md exists=True
+docs/memory.md -> docs/memory.md exists=True
+docs/monitors.md -> docs/monitors.md exists=True
+docs/architecture.md -> docs/architecture.md exists=True
+docs/runbooks/gajaeway-v1.md -> docs/runbooks/gajaeway-v1.md exists=True
+LICENSE -> LICENSE exists=True
+[exit code: 0]
+
+===== README relative-reference grep =====
+$ grep -nE 'assets/|docs/|LICENSE|packages/' README.md
+2:  <img src="assets/logo-horizontal.png" alt="gajae-way" width="640">
+6:  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
+45:The Bun workspace under `packages/` is divided by responsibility:
+49:| [`@gajaeway/protocol`](packages/protocol) | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
+50:| [`@gajaeway/sdk`](packages/sdk) | Client for the gateway's Unix-domain socket or stdio transport. |
+51:| [`@gajaeway/cli`](packages/cli) | Owner commands over the gateway socket. |
+59:For how memory, monitors, and the gateway work end to end, see [the documentation](docs/).
+71:2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
+95:- [Deployment guide](docs/deployment.md) — configuration, credentials, and service-manager setup
+96:- [Memory guide](docs/memory.md) — readable memory and search
+97:- [Monitor guide](docs/monitors.md) — scheduled and event-driven work
+98:- [Architecture](docs/architecture.md) — protocol and reliability details
+99:- [Operator runbook](docs/runbooks/gajaeway-v1.md) — recovery and troubleshooting
+122:npm pack --dry-run --workspace packages/protocol
+123:npm pack --dry-run --workspace packages/sdk
+124:npm pack --dry-run --workspace packages/cli
+131:Copyright (C) 2026 Yeachan Heo. Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+[exit code: 0]
+
+===== README all relative-reference resolution =====
+$ python3 - <<'PY2'
+import re
+from pathlib import Path
+text = Path('README.md').read_text()
+refs = sorted(set(re.findall(r'(?:assets/[A-Za-z0-9._/-]+|docs/[A-Za-z0-9._/-]+|packages/[A-Za-z0-9._/-]+|LICENSE)', text)))
+for target in refs:
+    path = Path(target)
+    print(f"{target} -> {path} exists={path.exists()}")
+    assert path.exists(), target
+PY2
+LICENSE -> LICENSE exists=True
+assets/logo-horizontal.png -> assets/logo-horizontal.png exists=True
+docs/architecture.md -> docs/architecture.md exists=True
+docs/deployment.md -> docs/deployment.md exists=True
+docs/memory.md -> docs/memory.md exists=True
+docs/monitors.md -> docs/monitors.md exists=True
+docs/runbooks/gajaeway-v1.md -> docs/runbooks/gajaeway-v1.md exists=True
+packages/cli -> packages/cli exists=True
+packages/protocol -> packages/protocol exists=True
+packages/sdk -> packages/sdk exists=True
+[exit code: 0]

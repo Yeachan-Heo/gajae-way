@@ -4,6 +4,7 @@ native/*.node.build.json
 native/.build/
 target/
 dist/
+dist-packed/
 *.bun-build
 .DS_Store
 

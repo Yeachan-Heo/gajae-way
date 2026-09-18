@@ -2,11 +2,49 @@
 	"name": "@gajaeway/cli",
 	"version": "0.1.0",
 	"type": "module",
+	"description": "Owner CLI for the gajaeway gateway: status, sessions, chat, monitors, and worker lanes over the gateway socket. Requires the Bun runtime (uses Bun.file/Bun.spawn).",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/cli"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/cli#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"cli",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/main.js",
+	"types": "./dist/main.d.ts",
+	"exports": {
+		".": {
+			"bun": "./src/main.ts",
+			"types": "./dist/main.d.ts",
+			"default": "./dist/main.js"
+		}
+	},
 	"bin": {
-		"gajaeway": "./src/main.ts"
+		"gajaeway": "./dist/main.js"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/main.ts --outdir dist --target bun --format esm --external @gajaeway/protocol --external @gajaeway/sdk && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
 	},
 	"dependencies": {
 		"@gajaeway/sdk": "workspace:*",
 		"@gajaeway/protocol": "workspace:*"
+	},
+	"engines": {
+		"bun": ">=1.4.0"
 	}
 }

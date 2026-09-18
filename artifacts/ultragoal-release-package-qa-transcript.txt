@@ -1,0 +1,258 @@
+DELTA-ONLY generation-4 QA transcript
+Repo: /Users/bellman/Documents/Workspace/gajae-way
+
+===== 1. release dry-run =====
+$ cd ~/Documents/Workspace/gajae-way && rm -rf dist-packed packages/protocol/dist packages/sdk/dist packages/cli/dist && bun run release:dry-run
+$ bun scripts/release-packages.ts
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/protocol) bun run build
+$ tsc -p tsconfig.build.json
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/protocol) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+... protocol pack output (51 files; dist/* and src/*) ...
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-protocol-0.1.0.tgz
+Total files: 51
+Packed size: 55.81KB
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/sdk) bun run build
+$ tsc -p tsconfig.build.json
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/sdk) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+... sdk pack output (11 files; dist/* and src/*) ...
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-sdk-0.1.0.tgz
+Total files: 11
+Packed size: 6.95KB
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/cli) bun run build
+$ tsc -p tsconfig.build.json
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/cli) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+... cli pack output (16 files; dist/* and src/*) ...
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-cli-0.1.0.tgz
+Total files: 16
+Packed size: 31.99KB
+
+Dry-run packed tarballs written to dist-packed/. Inspect them, then re-run with --publish.
+[exit code: 0]
+
+===== 1b. packed artifact listing and non-empty checks =====
+$ ls dist-packed/ && stat -f '%N %z' dist-packed/*.tgz
+gajaeway-cli-0.1.0.tgz
+gajaeway-protocol-0.1.0.tgz
+gajaeway-sdk-0.1.0.tgz
+
+dist-packed/gajaeway-cli-0.1.0.tgz 31991
+dist-packed/gajaeway-protocol-0.1.0.tgz 55812
+dist-packed/gajaeway-sdk-0.1.0.tgz 6952
+[exit code: 0]
+Verdict: exactly three .tgz artifacts, all non-empty.
+
+===== 2. SDK tarball contents =====
+$ tar tzf dist-packed/gajaeway-sdk-0.1.0.tgz
+package/package.json
+package/dist/client.d.ts
+package/dist/client.d.ts.map
+package/dist/client.js
+package/dist/client.js.map
+package/dist/index.d.ts
+package/dist/index.d.ts.map
+package/dist/index.js
+package/dist/index.js.map
+package/src/client.ts
+package/src/index.ts
+[exit code: 0]
+Verdict: dist/* and src/* are present; no node_modules entry.
+
+===== 3. unknown flag adversarial =====
+$ bun scripts/release-packages.ts --bogus-flag
+unknown argument: --bogus-flag
+Command exited with code 2
+Verdict: non-zero and informative; no release/build proceeded.
+
+===== 4. publish safety source evidence =====
+$ grep -nE -- '--publish|bun publish|if \\(publish\\)|publishCmd' scripts/release-packages.ts
+8: *   bun scripts/release-packages.ts --publish   # build + bun publish (talks to the registry)
+9: *   bun scripts/release-packages.ts --tag next  # forward a dist-tag to bun publish
+24:        if (arg === "--publish") publish = true;
+49:        if (publish) {
+50:            const publishCmd = ["bun", "publish"];
+51:            if (tag) publishCmd.push("--tag", tag);
+52:            await run(publishCmd, dir);
+59:    else console.log(`\nDry-run packed tarballs written to dist-packed/. Inspect them, then re-run with --publish.`);
+[exit code: 0]
+Read evidence (scripts/release-packages.ts lines 19-54): publish initializes false; only exact arg --publish sets it true; bun publish is constructed and run only inside if (publish); default branch invokes bun pm pack. --publish was not executed.
+Verdict: registry write is explicitly gated.
+
+===== 5. README badge/workflow evidence =====
+$ grep -n 'badge.svg\\|workflows/build' README.md && test -f .github/workflows/build.yml && printf 'test -f .github/workflows/build.yml: success\\n' && grep -n 'name:' .github/workflows/build.yml
+8:  <a href="https://github.com/Yeachan-Heo/gajae-way/actions/workflows/build.yml"><img alt="Build" src="https://github.com/Yeachan-Heo/gajae-way/actions/workflows/build.yml/badge.svg"></a>
+test -f .github/workflows/build.yml: success
+1:name: build
+9:    name: ${{ matrix.platform }}-${{ matrix.arch }}
+[exit code: 0]
+Verdict: badge links to actions/workflows/build.yml and badge.svg; referenced workflow exists and root name is build.
+
+===== 6a. root build =====
+$ bun run build
+$ bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/adapter-slack/src/main.ts --outfile dist/gajaeway-slack && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway
+   [8ms]  bundle  70 modules
+  [79ms] compile  dist/gajaeway-gateway
+  [33ms]  bundle  535 modules
+  [82ms] compile  dist/gajaeway-discord
+   [4ms]  bundle  18 modules
+  [82ms] compile  dist/gajaeway-telegram
+   [5ms]  bundle  26 modules
+  [85ms] compile  dist/gajaeway-slack
+   [4ms]  bundle  24 modules
+  [77ms] compile  dist/gajaeway-admin
+   [4ms]  bundle  15 modules
+  [77ms] compile  dist/gajaeway
+[exit code: 0]
+
+===== 6b. focused tests =====
+$ bun test packages/protocol packages/sdk packages/cli
+bun test v1.4.0 (34cbb9a40)
+packages/cli/test/main.test.ts:
+Validated SQLite backup: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-GNxHFw/backup.db
+Copied current database to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-GNxHFw/gateway.db.pre-restore-2026-09-18T03-02-10-484Z
+Restored backup to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-GNxHFw/gateway.db
+
+ 155 pass
+ 0 fail
+ 546 expect() calls
+Ran 155 tests across 6 files. [170.00ms]
+[exit code: 0]
+
+OVERALL STATUS: passed
+
+===== 1 RAW FULL release dry-run output (captured with tee) =====
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/protocol) bun run build
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/protocol) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.0KB package.json
+packed 32.74KB dist/catalog.d.ts
+packed 17.61KB dist/catalog.d.ts.map
+packed 1.86KB dist/catalog.js
+packed 1.21KB dist/catalog.js.map
+packed 1.83KB dist/engagement.d.ts
+packed 0.87KB dist/engagement.d.ts.map
+packed 1.76KB dist/engagement.js
+packed 1.38KB dist/engagement.js.map
+packed 1.1KB dist/errors.d.ts
+packed 0.63KB dist/errors.d.ts.map
+packed 1.1KB dist/errors.js
+packed 0.87KB dist/errors.js.map
+packed 2.52KB dist/frames.d.ts
+packed 1.72KB dist/frames.d.ts.map
+packed 3.64KB dist/frames.js
+packed 2.97KB dist/frames.js.map
+packed 3.22KB dist/index.d.ts
+packed 2.43KB dist/index.d.ts.map
+packed 1.35KB dist/index.js
+packed 1.0KB dist/index.js.map
+packed 2.85KB dist/origin.d.ts
+packed 1.22KB dist/origin.d.ts.map
+packed 5.59KB dist/origin.js
+packed 4.50KB dist/origin.js.map
+packed 4.53KB dist/presence.d.ts
+packed 1.78KB dist/presence.d.ts.map
+packed 4.55KB dist/presence.js
+packed 3.98KB dist/presence.js.map
+packed 4.79KB dist/reactions.d.ts
+packed 1.37KB dist/reactions.d.ts.map
+packed 5.92KB dist/reactions.js
+packed 3.80KB dist/reactions.js.map
+packed 0.55KB dist/runtime-config.d.ts
+packed 389B dist/runtime-config.d.ts.map
+packed 1.56KB dist/runtime-config.js
+packed 1.56KB dist/runtime-config.js.map
+packed 2.21KB dist/version.d.ts
+packed 1.29KB dist/version.d.ts.map
+packed 2.71KB dist/version.js
+packed 1.98KB dist/version.js.map
+packed 30.55KB src/catalog.ts
+packed 2.75KB src/engagement.ts
+packed 1.35KB src/errors.ts
+packed 4.89KB src/frames.ts
+packed 3.32KB src/index.ts
+packed 6.1KB src/origin.ts
+packed 6.92KB src/presence.ts
+packed 8.44KB src/reactions.ts
+packed 1.81KB src/runtime-config.ts
+packed 3.56KB src/version.ts
+
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-protocol-0.1.0.tgz
+
+Total files: 51
+Shasum: 4f482f2c0d7636f622633390211558d7bc095cd1
+Integrity: sha512-r5OksCOGk3FXo[...]pdNFEJtp8u0zw==
+Unpacked size: 209.60KB
+Packed size: 55.81KB
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/sdk) bun run build
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/sdk) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.0KB package.json
+packed 1.74KB dist/client.d.ts
+packed 1.59KB dist/client.d.ts.map
+packed 8.44KB dist/client.js
+packed 7.64KB dist/client.js.map
+packed 166B dist/index.d.ts
+packed 206B dist/index.d.ts.map
+packed 93B dist/index.js
+packed 151B dist/index.js.map
+packed 8.39KB src/client.ts
+packed 131B src/index.ts
+
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-sdk-0.1.0.tgz
+
+Total files: 11
+Shasum: 1e3873a733460f5c08485dcf271e7bf2109cdab3
+Integrity: sha512-J73cKcr+UaETP[...]i8ng3M0PSxR6w==
+Unpacked size: 29.55KB
+Packed size: 6.95KB
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/cli) bun run build
+$ (/Users/bellman/Documents/Workspace/gajae-way/packages/cli) bun pm pack --destination /Users/bellman/Documents/Workspace/gajae-way/dist-packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.16KB package.json
+packed 2.39KB dist/list.d.ts
+packed 2.32KB dist/list.d.ts.map
+packed 6.72KB dist/list.js
+packed 7.39KB dist/list.js.map
+packed 3.0KB dist/main.d.ts
+packed 1.28KB dist/main.d.ts.map
+packed 27.77KB dist/main.js
+packed 22.98KB dist/main.js.map
+packed 2.14KB dist/services.d.ts
+packed 1.79KB dist/services.d.ts.map
+packed 6.99KB dist/services.js
+packed 7.0KB dist/services.js.map
+packed 7.64KB src/list.ts
+packed 23.32KB src/main.ts
+packed 8.12KB src/services.ts
+
+/Users/bellman/Documents/Workspace/gajae-way/dist-packed/gajaeway-cli-0.1.0.tgz
+
+Total files: 16
+Shasum: 2476390f261215b38612c921da0d202f60c38de2
+Integrity: sha512-5Dur2qJBQfIxi[...]NxuJhICF9fQxQ==
+Unpacked size: 132.0KB
+Packed size: 31.99KB
+
+Dry-run packed tarballs written to dist-packed/. Inspect them, then re-run with --publish.
+[raw command exit code: 0]
+===== 2b. SDK tarball explicit node_modules assertion =====
+$ entries=$(tar tzf dist-packed/gajaeway-sdk-0.1.0.tgz); assert no node_modules
+package/package.json
+package/dist/client.d.ts
+package/dist/client.d.ts.map
+package/dist/client.js
+package/dist/client.js.map
+package/dist/index.d.ts
+package/dist/index.d.ts.map
+package/dist/index.js
+package/dist/index.js.map
+package/src/client.ts
+package/src/index.ts
+node_modules: absent
+tar_exit=0 node_modules_check_exit=0
+[exit code: 0]

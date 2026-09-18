@@ -1,0 +1,160 @@
+{
+  "overallStatus": "failed",
+  "blockers": [
+    {
+      "id": "CLI-DUAL-MODE-EXPORTS",
+      "severity": "blocker",
+      "finding": "packages/cli/package.json has no exports field, so the required dual-mode bun/types/default export map is absent.",
+      "expected": {
+        "bun": "./src/main.ts",
+        "types": "./dist/main.d.ts",
+        "default": "./dist/main.js"
+      },
+      "actual": null,
+      "evidenceRef": "artifacts/ultragoal-package-qa-transcript.txt (dual-mode exports acceptance section; exit code 1)"
+    }
+  ],
+  "contractCoverage": [
+    {
+      "goal": "README rewrite and assets",
+      "acceptanceCriteria": [
+        {
+          "criterion": "README banner, badges, packages table, five-step quickstart, docs links, and Publishing packages section",
+          "status": "covered",
+          "reason": "README marker assertions passed; numbered steps were exactly 1 through 5."
+        },
+        {
+          "criterion": "Six generated assets exist and decode; documented PNG dimensions and ICO magic are valid",
+          "status": "covered",
+          "reason": "All five PNGs loaded with PIL; dimensions matched icon 1024x1024, logo-horizontal 1600x500, favicon-32 32x32, apple-touch-icon 180x180; logo-vertical also loaded at 1200x1739; ICO header was 00 00 01 00."
+        }
+      ]
+    },
+    {
+      "goal": "Published protocol/sdk/cli package surfaces",
+      "acceptanceCriteria": [
+        {
+          "criterion": "protocol and sdk publish metadata, tsconfig build, and dual-mode exports",
+          "status": "covered",
+          "reason": "Metadata/export assertions passed; package builds generated declarations and JavaScript."
+        },
+        {
+          "criterion": "cli publish metadata, tsconfig build, shebang, and dual-mode exports",
+          "status": "failed",
+          "reason": "Build/shebang/declaration passed, but package/cli/package.json has no exports field; exact acceptance checker exited 1."
+        }
+      ]
+    },
+    {
+      "goal": "Artifact, workspace-resolution, and regression verification",
+      "acceptanceCriteria": [
+        {
+          "criterion": "Per-package builds and npm pack dry-runs contain dist/* plus package.json only",
+          "status": "covered",
+          "reason": "All three builds and dry-runs exited 0; tarball listings show only dist files and package.json, with no src or node_modules."
+        },
+        {
+          "criterion": "Root build succeeds after deleting all three package dist directories",
+          "status": "covered",
+          "reason": "rm -rf package dist followed by bun run build exited 0; post-check confirmed package dist remained absent and all six root binaries were emitted."
+        },
+        {
+          "criterion": "Focused protocol/sdk/cli tests pass",
+          "status": "covered",
+          "reason": "bun test exited 0 with 155 pass, 0 fail, 546 expect() calls across 6 files."
+        },
+        {
+          "criterion": "Private-package scope, workspace dependency ranges, and README relative paths remain safe",
+          "status": "covered",
+          "reason": "Adversarial checks (a), (b), and (d) all exited 0."
+        }
+      ]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "surface": "CLI/package artifact",
+      "command": "cd packages/protocol && bun run build && ls dist/",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    },
+    {
+      "surface": "CLI/package artifact",
+      "command": "cd packages/sdk && bun run build && ls dist/",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    },
+    {
+      "surface": "CLI/package artifact",
+      "command": "cd packages/cli && bun run build && ls dist/; verify main.js shebang and main.d.ts",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    },
+    {
+      "surface": "CLI/package artifact",
+      "command": "npm pack --dry-run in packages/protocol, packages/sdk, and packages/cli",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    },
+    {
+      "surface": "CLI/package artifact",
+      "command": "rm -rf packages/{protocol,sdk,cli}/dist && bun run build",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    },
+    {
+      "surface": "CLI/package artifact",
+      "command": "bun test packages/protocol packages/sdk packages/cli",
+      "exitCode": 0,
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    },
+    {
+      "surface": "CLI/package artifact",
+      "command": "dual-mode exports acceptance checker for all three published packages",
+      "exitCode": 1,
+      "verdict": "failed",
+      "transcriptRef": "artifacts/ultragoal-package-qa-transcript.txt"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "a",
+      "scenario": "Inspect gateway, adapters, admin, subsession, and conformance package metadata for leakage.",
+      "expectedBehavior": "Each has private:true or lacks publishConfig.",
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-adversarial-transcript.txt"
+    },
+    {
+      "id": "b",
+      "scenario": "Inspect published package dependency ranges.",
+      "expectedBehavior": "@gajaeway dependencies remain workspace:*.",
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-adversarial-transcript.txt"
+    },
+    {
+      "id": "c",
+      "scenario": "Load every PNG with PIL and inspect favicon.ico magic bytes.",
+      "expectedBehavior": "No decode errors; documented dimensions and 00 00 01 00 ICO header.",
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-adversarial-transcript.txt"
+    },
+    {
+      "id": "d",
+      "scenario": "Grep README.md for assets/docs/LICENSE/packages relative references and resolve them on disk.",
+      "expectedBehavior": "Every referenced path exists.",
+      "verdict": "passed",
+      "transcriptRef": "artifacts/ultragoal-adversarial-transcript.txt"
+    }
+  ],
+  "artifactRefs": [
+    "artifacts/ultragoal-package-qa-transcript.txt",
+    "artifacts/ultragoal-adversarial-transcript.txt",
+    "artifacts/ultragoal-executor-qa.json"
+  ]
+}

@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {

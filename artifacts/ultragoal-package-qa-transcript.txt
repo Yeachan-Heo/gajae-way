@@ -1,0 +1,342 @@
+
+===== protocol build and listing =====
+$ cd packages/protocol && bun run build && ls dist/
+$ tsc -p tsconfig.build.json
+catalog.d.ts
+catalog.d.ts.map
+catalog.js
+catalog.js.map
+engagement.d.ts
+engagement.d.ts.map
+engagement.js
+engagement.js.map
+errors.d.ts
+errors.d.ts.map
+errors.js
+errors.js.map
+frames.d.ts
+frames.d.ts.map
+frames.js
+frames.js.map
+index.d.ts
+index.d.ts.map
+index.js
+index.js.map
+origin.d.ts
+origin.d.ts.map
+origin.js
+origin.js.map
+presence.d.ts
+presence.d.ts.map
+presence.js
+presence.js.map
+reactions.d.ts
+reactions.d.ts.map
+reactions.js
+reactions.js.map
+runtime-config.d.ts
+runtime-config.d.ts.map
+runtime-config.js
+runtime-config.js.map
+version.d.ts
+version.d.ts.map
+version.js
+version.js.map
+[exit code: 0]
+
+===== sdk build and listing =====
+$ cd packages/sdk && bun run build && ls dist/
+$ tsc -p tsconfig.build.json
+client.d.ts
+client.d.ts.map
+client.js
+client.js.map
+index.d.ts
+index.d.ts.map
+index.js
+index.js.map
+[exit code: 0]
+
+===== cli build and listing =====
+$ cd packages/cli && bun run build && ls dist/
+$ tsc -p tsconfig.build.json
+list.d.ts
+list.d.ts.map
+list.js
+list.js.map
+main.d.ts
+main.d.ts.map
+main.js
+main.js.map
+services.d.ts
+services.d.ts.map
+services.js
+services.js.map
+[exit code: 0]
+
+===== cli shebang and declaration =====
+$ cd packages/cli && printf 'main.js first line: '; python3 -c "print(open('dist/main.js').readline().rstrip())" && test -f dist/main.d.ts && echo 'dist/main.d.ts present'
+main.js first line: #!/usr/bin/env bun
+dist/main.d.ts present
+[exit code: 0]
+
+===== protocol npm pack dry run =====
+$ cd packages/protocol && npm pack --dry-run
+npm notice
+npm notice 📦  @gajaeway/protocol@0.1.0
+npm notice Tarball Contents
+npm notice 32.7kB dist/catalog.d.ts
+npm notice 17.6kB dist/catalog.d.ts.map
+npm notice 1.9kB dist/catalog.js
+npm notice 1.2kB dist/catalog.js.map
+npm notice 1.8kB dist/engagement.d.ts
+npm notice 869B dist/engagement.d.ts.map
+npm notice 1.8kB dist/engagement.js
+npm notice 1.4kB dist/engagement.js.map
+npm notice 1.1kB dist/errors.d.ts
+npm notice 630B dist/errors.d.ts.map
+npm notice 1.1kB dist/errors.js
+npm notice 866B dist/errors.js.map
+npm notice 2.5kB dist/frames.d.ts
+npm notice 1.7kB dist/frames.d.ts.map
+npm notice 3.6kB dist/frames.js
+npm notice 3.0kB dist/frames.js.map
+npm notice 3.2kB dist/index.d.ts
+npm notice 2.4kB dist/index.d.ts.map
+npm notice 1.4kB dist/index.js
+npm notice 1.0kB dist/index.js.map
+npm notice 2.9kB dist/origin.d.ts
+npm notice 1.2kB dist/origin.d.ts.map
+npm notice 5.6kB dist/origin.js
+npm notice 4.5kB dist/origin.js.map
+npm notice 4.5kB dist/presence.d.ts
+npm notice 1.8kB dist/presence.d.ts.map
+npm notice 4.5kB dist/presence.js
+npm notice 4.0kB dist/presence.js.map
+npm notice 4.8kB dist/reactions.d.ts
+npm notice 1.4kB dist/reactions.d.ts.map
+npm notice 5.9kB dist/reactions.js
+npm notice 3.8kB dist/reactions.js.map
+npm notice 549B dist/runtime-config.d.ts
+npm notice 389B dist/runtime-config.d.ts.map
+npm notice 1.6kB dist/runtime-config.js
+npm notice 1.6kB dist/runtime-config.js.map
+npm notice 2.2kB dist/version.d.ts
+npm notice 1.3kB dist/version.d.ts.map
+npm notice 2.7kB dist/version.js
+npm notice 2.0kB dist/version.js.map
+npm notice 1.0kB package.json
+npm notice Tarball Details
+npm notice name: @gajaeway/protocol
+npm notice version: 0.1.0
+npm notice filename: gajaeway-protocol-0.1.0.tgz
+npm notice package size: 36.9 kB
+npm notice unpacked size: 139.9 kB
+npm notice shasum: f7606a65ddec38b33e8fd990a97441e953e9bf1b
+npm notice integrity: sha512-WPi+EknUW8tHW[...]uMqfJo6gHDujw==
+npm notice total files: 41
+npm notice
+gajaeway-protocol-0.1.0.tgz
+[exit code: 0]
+
+===== sdk npm pack dry run =====
+$ cd packages/sdk && npm pack --dry-run
+npm notice
+npm notice 📦  @gajaeway/sdk@0.1.0
+npm notice Tarball Contents
+npm notice 1.7kB dist/client.d.ts
+npm notice 1.6kB dist/client.d.ts.map
+npm notice 8.4kB dist/client.js
+npm notice 7.6kB dist/client.js.map
+npm notice 166B dist/index.d.ts
+npm notice 206B dist/index.d.ts.map
+npm notice 93B dist/index.js
+npm notice 151B dist/index.js.map
+npm notice 1.0kB package.json
+npm notice Tarball Details
+npm notice name: @gajaeway/sdk
+npm notice version: 0.1.0
+npm notice filename: gajaeway-sdk-0.1.0.tgz
+npm notice package size: 5.7 kB
+npm notice unpacked size: 21.0 kB
+npm notice shasum: 864ae1f93e2f2ecbf345591133ec8feaad096378
+npm notice integrity: sha512-vgKtJp+PLQRiz[...]OfH7s/3/OwZyg==
+npm notice total files: 9
+npm notice
+gajaeway-sdk-0.1.0.tgz
+[exit code: 0]
+
+===== cli npm pack dry run =====
+$ cd packages/cli && npm pack --dry-run
+npm notice
+npm notice 📦  @gajaeway/cli@0.1.0
+npm notice Tarball Contents
+npm notice 2.4kB dist/list.d.ts
+npm notice 2.3kB dist/list.d.ts.map
+npm notice 6.7kB dist/list.js
+npm notice 7.4kB dist/list.js.map
+npm notice 3.0kB dist/main.d.ts
+npm notice 1.3kB dist/main.d.ts.map
+npm notice 27.8kB dist/main.js
+npm notice 23.0kB dist/main.js.map
+npm notice 2.1kB dist/services.d.ts
+npm notice 1.8kB dist/services.d.ts.map
+npm notice 7.0kB dist/services.js
+npm notice 7.0kB dist/services.js.map
+npm notice 1.0kB package.json
+npm notice Tarball Details
+npm notice name: @gajaeway/cli
+npm notice version: 0.1.0
+npm notice filename: gajaeway-cli-0.1.0.tgz
+npm notice package size: 21.5 kB
+npm notice unpacked size: 92.8 kB
+npm notice shasum: d9bdbaf4bc604ff2d4e3bbab41b98444e9f6b1a2
+npm notice integrity: sha512-yQmYpOylMtN8N[...]evhAHvBiPIkxA==
+npm notice total files: 13
+npm notice
+gajaeway-cli-0.1.0.tgz
+[exit code: 0]
+
+===== root build from clean package dist =====
+$ rm -rf packages/protocol/dist packages/sdk/dist packages/cli/dist && bun run build
+$ bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/adapter-slack/src/main.ts --outfile dist/gajaeway-slack && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway
+   [7ms]  bundle  70 modules
+  [93ms] compile  dist/gajaeway-gateway
+  [29ms]  bundle  535 modules
+  [87ms] compile  dist/gajaeway-discord
+   [3ms]  bundle  18 modules
+  [84ms] compile  dist/gajaeway-telegram
+   [4ms]  bundle  26 modules
+  [77ms] compile  dist/gajaeway-slack
+   [4ms]  bundle  24 modules
+  [79ms] compile  dist/gajaeway-admin
+   [3ms]  bundle  15 modules
+  [77ms] compile  dist/gajaeway
+[exit code: 0]
+
+===== focused protocol sdk cli tests =====
+$ bun test packages/protocol packages/sdk packages/cli
+bun test v1.4.0 (34cbb9a40)
+
+packages/cli/test/main.test.ts:
+Validated SQLite backup: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-vWSYkH/backup.db
+Copied current database to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-vWSYkH/gateway.db.pre-restore-2026-09-18T01-52-33-822Z
+Restored backup to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-cli-restore-vWSYkH/gateway.db
+
+ 155 pass
+ 0 fail
+ 546 expect() calls
+Ran 155 tests across 6 files. [152.00ms]
+[exit code: 0]
+
+===== package dist remains absent after root build =====
+$ python3 - <<'PY2'
+from pathlib import Path
+for raw in ['packages/protocol/dist','packages/sdk/dist','packages/cli/dist']:
+    print(f"{raw}: exists={Path(raw).exists()}")
+    assert not Path(raw).exists()
+print('root binaries:')
+for raw in sorted(Path('dist').glob('gajaeway-*')):
+    print(raw)
+PY2
+packages/protocol/dist: exists=False
+packages/sdk/dist: exists=False
+packages/cli/dist: exists=False
+root binaries:
+dist/gajaeway-admin
+dist/gajaeway-discord
+dist/gajaeway-gateway
+dist/gajaeway-slack
+dist/gajaeway-telegram
+[exit code: 0]
+
+===== published package metadata and exports =====
+$ python3 - <<'PY2'
+import json
+from pathlib import Path
+expected = {
+ 'packages/protocol': ('index',),
+ 'packages/sdk': ('index',),
+ 'packages/cli': ('main',),
+}
+for directory, entry in expected.items():
+    data = json.loads(Path(directory + '/package.json').read_text())
+    exports = data['exports']['.']
+    print(f"{directory}: name={data['name']} files={data['files']} publishAccess={data['publishConfig']['access']} build={data['scripts']['build']} prepublishOnly={data['scripts']['prepublishOnly']}")
+    print(f"  exports={exports}")
+    assert data['description'] and data['license'] and data['author'] and data['repository']['url'] and data['keywords']
+    assert data['files'] == ['dist']
+    assert data['publishConfig']['access'] == 'public'
+    assert data['scripts']['build'] == 'tsc -p tsconfig.build.json'
+    assert data['scripts']['prepublishOnly'] == 'bun run build'
+    assert exports == {'bun': f'./src/{entry[0]}.ts', 'types': f'./dist/{entry[0]}.d.ts', 'default': f'./dist/{entry[0]}.js'}
+    assert Path(directory + '/tsconfig.build.json').exists()
+print('all published package metadata assertions passed')
+PY2
+packages/protocol: name=@gajaeway/protocol files=['dist'] publishAccess=public build=tsc -p tsconfig.build.json prepublishOnly=bun run build
+  exports={'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'}
+packages/sdk: name=@gajaeway/sdk files=['dist'] publishAccess=public build=tsc -p tsconfig.build.json prepublishOnly=bun run build
+  exports={'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'}
+Traceback (most recent call last):
+  File "<stdin>", line 10, in <module>
+KeyError: 'exports'
+[exit code: 1]
+
+===== README acceptance markers =====
+$ python3 - <<'PY2'
+from pathlib import Path
+import re
+text = Path('README.md').read_text()
+required = ['assets/logo-horizontal.png', '## Packages', '@gajaeway/protocol', '@gajaeway/sdk', '@gajaeway/cli', '## Start in five steps', '## Publishing packages', 'docs/deployment.md', 'docs/memory.md', 'docs/monitors.md', 'docs/architecture.md', 'docs/runbooks/gajaeway-v1.md']
+for marker in required:
+    print(f"{marker}: {marker in text}")
+    assert marker in text
+steps = re.findall(r'^([1-5])\. ', text, re.MULTILINE)
+print(f"numbered quickstart steps={steps}")
+assert steps == ['1', '2', '3', '4', '5']
+print('README acceptance assertions passed')
+PY2
+assets/logo-horizontal.png: True
+## Packages: True
+@gajaeway/protocol: True
+@gajaeway/sdk: True
+@gajaeway/cli: True
+## Start in five steps: True
+## Publishing packages: True
+docs/deployment.md: True
+docs/memory.md: True
+docs/monitors.md: True
+docs/architecture.md: True
+docs/runbooks/gajaeway-v1.md: True
+numbered quickstart steps=['1', '2', '3', '4', '5']
+README acceptance assertions passed
+[exit code: 0]
+
+===== dual-mode exports acceptance (expected blocker) =====
+$ python3 - <<'PY2'
+import json
+from pathlib import Path
+expected = {
+ 'packages/protocol': {'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'},
+ 'packages/sdk': {'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'},
+ 'packages/cli': {'bun': './src/main.ts', 'types': './dist/main.d.ts', 'default': './dist/main.js'},
+}
+failed = False
+for directory, want in expected.items():
+    data = json.loads(Path(directory + '/package.json').read_text())
+    actual = data.get('exports', {}).get('.') if isinstance(data.get('exports'), dict) else None
+    print(f"{directory}: actual exports={actual}")
+    print(f"{directory}: expected exports={want}")
+    if actual != want:
+        failed = True
+if failed:
+    raise SystemExit('dual-mode exports acceptance failed')
+PY2
+packages/protocol: actual exports={'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'}
+packages/protocol: expected exports={'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'}
+packages/sdk: actual exports={'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'}
+packages/sdk: expected exports={'bun': './src/index.ts', 'types': './dist/index.d.ts', 'default': './dist/index.js'}
+packages/cli: actual exports=None
+packages/cli: expected exports={'bun': './src/main.ts', 'types': './dist/main.d.ts', 'default': './dist/main.js'}
+dual-mode exports acceptance failed
+[exit code: 1]

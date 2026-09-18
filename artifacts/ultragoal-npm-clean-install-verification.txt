@@ -1,0 +1,391 @@
+gajae-way npm clean-install verification transcript
+Generated: 2026-09-18T03:59:49Z
+node v26.4.0 / npm 11.17.0 / bun 1.4.0
+
+$ bun run --filter '@gajaeway/protocol' build
+@gajaeway/protocol build: Bundled 10 modules in 3ms
+@gajaeway/protocol build: 
+@gajaeway/protocol build:   index.js  19.38 KB  (entry point)
+@gajaeway/protocol build: 
+@gajaeway/protocol build: Exited with code 0
+exit code: 0
+
+$ bun run --filter '@gajaeway/sdk' build
+@gajaeway/sdk build: Bundled 2 modules in 3ms
+@gajaeway/sdk build: 
+@gajaeway/sdk build:   index.js  6.25 KB  (entry point)
+@gajaeway/sdk build: 
+@gajaeway/sdk build: Exited with code 0
+exit code: 0
+
+$ bun run --filter '@gajaeway/cli' build
+@gajaeway/cli build: Bundled 3 modules in 3ms
+@gajaeway/cli build: 
+@gajaeway/cli build:   main.js  32.95 KB  (entry point)
+@gajaeway/cli build: 
+@gajaeway/cli build: Exited with code 0
+exit code: 0
+
+$ cd packages/protocol && bun pm pack --destination /tmp/npm-clean-install-verify/packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.11KB package.json
+packed 32.74KB dist/catalog.d.ts
+packed 17.61KB dist/catalog.d.ts.map
+packed 1.83KB dist/engagement.d.ts
+packed 0.87KB dist/engagement.d.ts.map
+packed 1.1KB dist/errors.d.ts
+packed 0.63KB dist/errors.d.ts.map
+packed 2.52KB dist/frames.d.ts
+packed 1.72KB dist/frames.d.ts.map
+packed 3.22KB dist/index.d.ts
+packed 2.43KB dist/index.d.ts.map
+packed 19.38KB dist/index.js
+packed 2.85KB dist/origin.d.ts
+packed 1.22KB dist/origin.d.ts.map
+packed 4.53KB dist/presence.d.ts
+packed 1.78KB dist/presence.d.ts.map
+packed 4.79KB dist/reactions.d.ts
+packed 1.37KB dist/reactions.d.ts.map
+packed 0.55KB dist/runtime-config.d.ts
+packed 389B dist/runtime-config.d.ts.map
+packed 2.21KB dist/version.d.ts
+packed 1.29KB dist/version.d.ts.map
+packed 30.55KB src/catalog.ts
+packed 2.75KB src/engagement.ts
+packed 1.35KB src/errors.ts
+packed 4.89KB src/frames.ts
+packed 3.32KB src/index.ts
+packed 6.1KB src/origin.ts
+packed 6.92KB src/presence.ts
+packed 8.44KB src/reactions.ts
+packed 1.81KB src/runtime-config.ts
+packed 3.56KB src/version.ts
+
+/tmp/npm-clean-install-verify/packed/gajaeway-protocol-0.1.0.tgz
+
+Total files: 32
+Shasum: 9a75abd600c92a7d3d5e75b07f9e6dffeeafbd68
+Integrity: sha512-6H38oJnHusOVE[...]dfC9q1a3lQWiw==
+Unpacked size: 175.77KB
+Packed size: 49.55KB
+exit code: 0
+
+$ cd packages/sdk && bun pm pack --destination /tmp/npm-clean-install-verify/packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.12KB package.json
+packed 1.74KB dist/client.d.ts
+packed 1.59KB dist/client.d.ts.map
+packed 166B dist/index.d.ts
+packed 206B dist/index.d.ts.map
+packed 6.25KB dist/index.js
+packed 8.39KB src/client.ts
+packed 131B src/index.ts
+
+/tmp/npm-clean-install-verify/packed/gajaeway-sdk-0.1.0.tgz
+
+Total files: 8
+Shasum: 93de131a4c24348fad379c446fca27321f9edc1f
+Integrity: sha512-vHlt0D1g3LVtv[...]+me2ark+tKBUg==
+Unpacked size: 19.59KB
+Packed size: 5.20KB
+exit code: 0
+
+$ cd packages/cli && bun pm pack --destination /tmp/npm-clean-install-verify/packed
+bun pack v1.4.0 (34cbb9a40)
+
+packed 1.29KB package.json
+packed 2.39KB dist/list.d.ts
+packed 2.32KB dist/list.d.ts.map
+packed 3.0KB dist/main.d.ts
+packed 1.28KB dist/main.d.ts.map
+packed 32.95KB dist/main.js
+packed 2.14KB dist/services.d.ts
+packed 1.79KB dist/services.d.ts.map
+packed 7.64KB src/list.ts
+packed 23.32KB src/main.ts
+packed 8.12KB src/services.ts
+
+/tmp/npm-clean-install-verify/packed/gajaeway-cli-0.1.0.tgz
+
+Total files: 11
+Shasum: 7b929f7afdb12de39f19fecd53a029c70293bd0c
+Integrity: sha512-sajaFpKvUvJLC[...]L/aTdRkHBlSmg==
+Unpacked size: 86.22KB
+Packed size: 23.64KB
+exit code: 0
+
+$ ls -la /tmp/npm-clean-install-verify/packed
+total 168
+drwxr-xr-x@ 5 bellman  wheel    160  9월 18 12:59 .
+drwxr-xr-x@ 3 bellman  wheel     96  9월 18 12:59 ..
+-rw-r--r--@ 1 bellman  wheel  23635  9월 18 12:59 gajaeway-cli-0.1.0.tgz
+-rw-r--r--@ 1 bellman  wheel  49549  9월 18 12:59 gajaeway-protocol-0.1.0.tgz
+-rw-r--r--@ 1 bellman  wheel   5199  9월 18 12:59 gajaeway-sdk-0.1.0.tgz
+
+$ tar tzf /tmp/npm-clean-install-verify/packed/gajaeway-sdk-0.1.0.tgz
+package/package.json
+package/dist/client.d.ts
+package/dist/client.d.ts.map
+package/dist/index.d.ts
+package/dist/index.d.ts.map
+package/dist/index.js
+package/src/client.ts
+package/src/index.ts
+
+$ tar tzf /tmp/npm-clean-install-verify/packed/gajaeway-cli-0.1.0.tgz
+package/package.json
+package/dist/list.d.ts
+package/dist/list.d.ts.map
+package/dist/main.d.ts
+package/dist/main.d.ts.map
+package/dist/main.js
+package/dist/services.d.ts
+package/dist/services.d.ts.map
+package/src/list.ts
+package/src/main.ts
+package/src/services.ts
+
+$ tar xzf /tmp/npm-clean-install-verify/packed/gajaeway-sdk-0.1.0.tgz -O package/package.json
+{
+	"name": "@gajaeway/sdk",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Client SDK for the gajaeway gateway's Unix-domain socket or stdio transport.",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/sdk"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/sdk#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"sdk",
+		"client",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"bun": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external @gajaeway/protocol && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
+	},
+	"dependencies": {
+		"@gajaeway/protocol": "0.1.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}
+
+$ tar xzf /tmp/npm-clean-install-verify/packed/gajaeway-cli-0.1.0.tgz -O package/package.json
+{
+	"name": "@gajaeway/cli",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Owner CLI for the gajaeway gateway: status, sessions, chat, monitors, and worker lanes over the gateway socket. Requires the Bun runtime (uses Bun.file/Bun.spawn).",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/cli"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/cli#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"cli",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/main.js",
+	"types": "./dist/main.d.ts",
+	"exports": {
+		".": {
+			"bun": "./src/main.ts",
+			"types": "./dist/main.d.ts",
+			"default": "./dist/main.js"
+		}
+	},
+	"bin": {
+		"gajaeway": "./dist/main.js"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/main.ts --outdir dist --target bun --format esm --external @gajaeway/protocol --external @gajaeway/sdk && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
+	},
+	"dependencies": {
+		"@gajaeway/sdk": "0.1.0",
+		"@gajaeway/protocol": "0.1.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}
+
+$ mkdir -p /tmp/npm-clean-install-verify/consumer && cd /tmp/npm-clean-install-verify/consumer && npm init -y
+Wrote to /private/tmp/npm-clean-install-verify/consumer/package.json:
+
+{
+  "name": "consumer",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
+
+
+exit code: 0
+
+$ npm install /tmp/npm-clean-install-verify/packed/gajaeway-protocol-0.1.0.tgz /tmp/npm-clean-install-verify/packed/gajaeway-sdk-0.1.0.tgz /tmp/npm-clean-install-verify/packed/gajaeway-cli-0.1.0.tgz
+
+added 3 packages in 389ms
+exit code: 0
+
+$ cat node_modules/@gajaeway/sdk/package.json
+{
+	"name": "@gajaeway/sdk",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Client SDK for the gajaeway gateway's Unix-domain socket or stdio transport.",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/sdk"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/sdk#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"sdk",
+		"client",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"bun": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external @gajaeway/protocol && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
+	},
+	"dependencies": {
+		"@gajaeway/protocol": "0.1.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}
+
+$ cat node_modules/@gajaeway/cli/package.json
+{
+	"name": "@gajaeway/cli",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Owner CLI for the gajaeway gateway: status, sessions, chat, monitors, and worker lanes over the gateway socket. Requires the Bun runtime (uses Bun.file/Bun.spawn).",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/cli"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/cli#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"cli",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/main.js",
+	"types": "./dist/main.d.ts",
+	"exports": {
+		".": {
+			"bun": "./src/main.ts",
+			"types": "./dist/main.d.ts",
+			"default": "./dist/main.js"
+		}
+	},
+	"bin": {
+		"gajaeway": "./dist/main.js"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/main.ts --outdir dist --target bun --format esm --external @gajaeway/protocol --external @gajaeway/sdk && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
+	},
+	"dependencies": {
+		"@gajaeway/sdk": "0.1.0",
+		"@gajaeway/protocol": "0.1.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}
+
+$ node --input-type=module -e "import('@gajaeway/sdk').then(m => console.log('SDK OK', JSON.stringify(Object.keys(m)))).catch(e => { console.error('SDK FAIL', e.message); process.exit(1); })"
+SDK OK ["GajaewayClient","LOOPBACK_ORIGIN"]
+exit code: 0
+
+$ node --input-type=module -e "import('@gajaeway/protocol').then(m => console.log('PROTOCOL OK', Object.keys(m).length, 'exports')).catch(e => { console.error('PROTOCOL FAIL', e.message); process.exit(1); })"
+PROTOCOL OK 55 exports
+exit code: 0
+
+$ bun -e "import { GajaewayClient } from '@gajaeway/sdk'; console.log('BUN OK', typeof GajaewayClient)"
+BUN OK function
+exit code: 0
+
+$ node_modules/.bin/gajaeway --help
+usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR] (work run waits for a response; caller timeout does not end the attempt)
+exit code: 2 (2 is expected: --help is not a recognized subcommand, matching packages/cli/src/main.ts's documented usage-error convention where an unrecognized command throws CLI_USAGE and exits 2)

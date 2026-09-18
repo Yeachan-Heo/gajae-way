@@ -2,10 +2,46 @@
 	"name": "@gajaeway/sdk",
 	"version": "0.1.0",
 	"type": "module",
+	"description": "Client SDK for the gajaeway gateway's Unix-domain socket or stdio transport.",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/sdk"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/sdk#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"keywords": [
+		"gajaeway",
+		"sdk",
+		"client",
+		"gateway"
+	],
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
 	"exports": {
-		".": "./src/index.ts"
+		".": {
+			"bun": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external @gajaeway/protocol && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build"
 	},
 	"dependencies": {
 		"@gajaeway/protocol": "workspace:*"
+	},
+	"engines": {
+		"bun": ">=1.4.0"
 	}
 }
