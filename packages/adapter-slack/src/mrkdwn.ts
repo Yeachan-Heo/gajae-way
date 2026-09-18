@@ -8,8 +8,32 @@ export function markdownToMrkdwn(text: string): string {
 	return segments.map((segment, index) => (index % 2 === 1 ? segment : convertText(segment))).join("");
 }
 
+/**
+ * Slack's own angle-bracket syntax, which must survive HTML escaping: user
+ * mentions, channel links, and the broadcast keywords. Everything else in
+ * angle brackets is text and is escaped. Until this existed every `<@U\u2026>` the
+ * persona wrote went out as `&lt;@U\u2026&gt;` and pinged nobody (2026-09-17).
+ */
+const SLACK_ENTITY =
+	/<(?:@[UW][A-Z0-9]+(?:\|[^>\n]*)?|#C[A-Z0-9]+(?:\|[^>\n]*)?|!(?:here|channel|everyone)(?:\|[^>\n]*)?|!subteam\^[A-Z0-9]+(?:\|[^>\n]*)?)>/g;
+
+function escapeKeepingEntities(text: string): string {
+	const parts: string[] = [];
+	let last = 0;
+	for (const match of text.matchAll(SLACK_ENTITY)) {
+		parts.push(escapeHtml(text.slice(last, match.index)), match[0]);
+		last = match.index + match[0].length;
+	}
+	parts.push(escapeHtml(text.slice(last)));
+	return parts.join("");
+}
+
+function escapeHtml(text: string): string {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function convertText(text: string): string {
-	const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	const escaped = escapeKeepingEntities(text);
 	// One pass prevents the bold tokens we emit from being converted again as italics.
 	return escaped.replace(
 		/\[([^\]\n]+)\]\(([^)\n]+)\)|^(#{1,6})[ \t]+(.+)$|^([ \t]*)[-*][ \t]+|\*\*([^\n]+?)\*\*|__([^\n]+?)__|~~([^\n]+?)~~|\*([^*\n]+)\*|_([^_\n]+)_/gm,

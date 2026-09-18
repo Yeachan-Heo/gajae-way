@@ -371,7 +371,51 @@ export interface RecoveryOptions {
 	readonly pageLimit?: number;
 	readonly maxPages?: number;
 	readonly botUserId: string;
-	deliver(message: SlackInboundMessage): Promise<RecoveryDelivery>;
+	/**
+	 * `stale` is true when the room has demonstrably moved past this message: it is
+	 * older than STALE_BACKFILL_MS and the bot itself posted in the same
+	 * conversation after it. The adapter records such a message as context only;
+	 * it must not open a turn.
+	 */
+	deliver(message: SlackInboundMessage, stale: boolean): Promise<RecoveryDelivery>;
+}
+
+/**
+ * A backfilled message older than this, with a later bot post in the same
+ * conversation, is history the persona already acted on - not a question
+ * waiting for an answer. Short enough that a genuine catch-up after a brief
+ * outage still answers; long enough that a message a human has watched the
+ * bot answer around is never answered again.
+ */
+export const STALE_BACKFILL_MS = 10 * 60_000;
+
+/**
+ * Which backfilled messages are stale, decided over the whole fetched window
+ * so no extra API call is needed: a message is stale when it is at least
+ * STALE_BACKFILL_MS old at `nowMs` AND the bot posted later in the same
+ * conversation (thread, or top level for a root). The bot's own rows are the
+ * evidence; they are still skipped for delivery afterwards.
+ */
+export function staleBackfillIds(
+	ordered: readonly SlackInboundMessage[],
+	botUserId: string,
+	nowMs: number,
+): ReadonlySet<string> {
+	const latestBotTsByConversation = new Map<string, string>();
+	for (const message of ordered) {
+		if (message.user !== botUserId) continue;
+		const key = message.thread_ts ?? "";
+		const prior = latestBotTsByConversation.get(key);
+		if (!prior || tsIsAfter(message.ts, prior)) latestBotTsByConversation.set(key, message.ts);
+	}
+	const stale = new Set<string>();
+	for (const message of ordered) {
+		if (message.user === botUserId) continue;
+		if (nowMs - Number(message.ts) * 1000 < STALE_BACKFILL_MS) continue;
+		const botAfter = latestBotTsByConversation.get(message.thread_ts ?? "");
+		if (botAfter && tsIsAfter(botAfter, message.ts)) stale.add(message.ts);
+	}
+	return stale;
 }
 export interface RecoveryOutcome {
 	readonly advancedTo?: string;
@@ -480,10 +524,11 @@ export async function recoverConversation(
 	// Slack pages newest-first. Sort the entire bounded window before acknowledging anything;
 	// an incomplete window cannot advance a durable cursor past older, unfetched messages.
 	const ordered = [...messages.values()].sort((a, b) => (tsIsAfter(a.ts, b.ts) ? 1 : tsIsAfter(b.ts, a.ts) ? -1 : 0));
+	const stale = staleBackfillIds(ordered, options.botUserId, options.nowMs);
 	for (const message of ordered) {
 		let result: RecoveryDelivery;
 		try {
-			result = message.user === options.botUserId ? "skip" : await options.deliver(message);
+			result = message.user === options.botUserId ? "skip" : await options.deliver(message, stale.has(message.ts));
 		} catch {
 			return outcome(true);
 		}
@@ -564,10 +609,11 @@ export async function recoverThread(
 		};
 	}
 	const ordered = [...messages.values()].sort((a, b) => (tsIsAfter(a.ts, b.ts) ? 1 : tsIsAfter(b.ts, a.ts) ? -1 : 0));
+	const stale = staleBackfillIds(ordered, options.botUserId, options.nowMs);
 	for (const message of ordered) {
 		let result: RecoveryDelivery;
 		try {
-			result = message.user === options.botUserId ? "skip" : await options.deliver(message);
+			result = message.user === options.botUserId ? "skip" : await options.deliver(message, stale.has(message.ts));
 		} catch {
 			return outcome(true);
 		}

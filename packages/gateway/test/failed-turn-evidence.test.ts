@@ -45,7 +45,7 @@ function failure(parentId = "user", fields: Row = {}): Row {
 async function save(rows: Row[] = [prompt(), failure()], header: Row = {}): Promise<void> {
 	await writeFile(
 		path,
-		[
+		`${[
 			{
 				type: "session",
 				version: 5,
@@ -57,7 +57,7 @@ async function save(rows: Row[] = [prompt(), failure()], header: Row = {}): Prom
 			...rows,
 		]
 			.map((row) => JSON.stringify(row))
-			.join("\n") + "\n",
+			.join("\n")}\n`,
 	);
 }
 const evidence = () => readFailedTurnEvidence(directory, input);
@@ -124,7 +124,7 @@ for (const fields of [
 	{ errorStatus: 401 },
 	{ stopReason: "stop" },
 	{ stopReason: "refusal" },
-	{ errorMessage: "quoted: " + rawError },
+	{ errorMessage: `quoted: ${rawError}` },
 	{ errorMessage: "400 bad request" },
 	{ errorMessage: "400 Unknown parameter: 'input[1].content'." },
 	{ errorMessage: "context at 100%" },

@@ -480,6 +480,27 @@ test("Slack delivery converts markdown, warns of duplicates, ignores voice and c
 	expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
 });
 
+test("Slack delivery repairs leaked mentions through the directory before mrkdwn conversion", async () => {
+	const api = new Api();
+	const gateway = new Gateway();
+	const mentions = {
+		knownUsers: () => [{ id: "U0C2GSKTA6M", name: "bellman", profile: { display_name: "Bellman" } }],
+	};
+	await settleSlackDelivery(
+		gateway,
+		api,
+		delivery({ text: "`<@U0C2GSKTA6M>` / @bellman / @U0BT1S5UGS1 / @unknown / **ok**" }),
+		console,
+		undefined,
+		mentions,
+	);
+	expect(api.posts).toEqual([["C1", "<@U0C2GSKTA6M> / <@U0C2GSKTA6M> / <@U0BT1S5UGS1> / @unknown / *ok*", undefined]]);
+	// Without a directory nothing is repaired: the delivery is still posted as-is.
+	const plain = new Api();
+	await settleSlackDelivery(new Gateway(), plain, delivery({ text: "@bellman hi" }));
+	expect(plain.posts).toEqual([["C1", "@bellman hi", undefined]]);
+});
+
 test("Slack threaded delivery keeps every chunk in the thread; explicit same-channel replies thread", async () => {
 	for (const extra of [
 		{ origin: { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" } as OriginRef },

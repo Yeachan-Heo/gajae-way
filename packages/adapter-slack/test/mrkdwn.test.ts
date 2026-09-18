@@ -12,6 +12,23 @@ test("Slack markdown conversion handles emphasis, links, headings, lists and esc
 		expect(markdownToMrkdwn(input as string)).toBe(output);
 });
 
+test("Slack entities survive escaping; everything else in angle brackets is escaped", () => {
+	for (const [input, output] of [
+		// The whole point: a correct mention must reach Slack as a mention.
+		["<@U0C2GSKTA6M> 확인", "<@U0C2GSKTA6M> 확인"],
+		["<@U0C2GSKTA6M|bellman> 확인", "<@U0C2GSKTA6M|bellman> 확인"],
+		["<#C0C2G8N9KQS|selftest> 확인", "<#C0C2G8N9KQS|selftest> 확인"],
+		["<!here> <!channel> <!subteam^S123ABC>", "<!here> <!channel> <!subteam^S123ABC>"],
+		// Markdown around a mention still converts.
+		["**cc** <@U0C2GSKTA6M> & <@U0BT1S5UGS1>", "*cc* <@U0C2GSKTA6M> &amp; <@U0BT1S5UGS1>"],
+		// Not entities: escaped as before.
+		["<script>x</script>", "&lt;script&gt;x&lt;/script&gt;"],
+		["<@lowercase> <@> <#notachannel>", "&lt;@lowercase&gt; &lt;@&gt; &lt;#notachannel&gt;"],
+		["a < b and c > d", "a &lt; b and c &gt; d"],
+	])
+		expect(markdownToMrkdwn(input as string)).toBe(output);
+});
+
 test("Slack code retains literal markup and fence language tags", () => {
 	const code = "```ts\nconst x = a < b && c > d; // **bold**\n```";
 	expect(markdownToMrkdwn(`**before**\n${code}\n*after*`)).toBe(`*before*\n${code}\n_after_`);

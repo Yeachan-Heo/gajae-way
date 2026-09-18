@@ -44,6 +44,10 @@ export function decideEngagement(
 	 */
 	threadFollowUp = false,
 ): EngagementDecision {
+	// An adapter that already knows the room moved past this message records it
+	// and asks for nothing more. Checked before every other gate, loopback
+	// included, because it is a statement about the message, not the author.
+	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
 	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };

@@ -25,6 +25,25 @@ test("loopback engages while unmentioned groups and unauthorised DMs decline", (
 		decideEngagement({ platform: "discord", kind: "channel", conversationId: "channel" }, engagement, config),
 	).toEqual({ engaged: false, botAudienceAdmission: false });
 });
+test("contextOnly is recorded but never opens a turn, on every surface", () => {
+	const open = { ...config, channels: { channel: { engagement: "open" as const } } };
+	const owner = { mentioned: true, group: true, authorId: "owner-1", contextOnly: true };
+	// Would otherwise engage: open channel, owner, mentioned.
+	expect(decideEngagement({ platform: "discord", kind: "channel", conversationId: "channel" }, owner, open)).toEqual({
+		engaged: false,
+		botAudienceAdmission: false,
+	});
+	// DMs too - the DM gate normally admits the owner unconditionally.
+	expect(
+		decideEngagement({ platform: "discord", kind: "dm", conversationId: "d1" }, { ...owner, group: false }, config)
+			.engaged,
+	).toBe(false);
+	// And loopback, which is otherwise always engaged.
+	expect(
+		decideEngagement({ platform: "loopback", kind: "loopback", conversationId: "loopback" }, owner, config).engaged,
+	).toBe(false);
+});
+
 test("per-channel open override engages group messages", () => {
 	expect(
 		decideEngagement({ platform: "discord", kind: "channel", conversationId: "channel" }, engagement, {
