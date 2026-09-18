@@ -159,6 +159,28 @@ interface ChannelLane {
 	draining: boolean;
 }
 
+/**
+ * Read methods that only accept form/query parameters. Everything the adapter
+ * writes with accepts JSON, so the set is the read surface, not a guess.
+ */
+const SLACK_FORM_ENCODED_METHODS: ReadonlySet<string> = new Set([
+	"conversations.history",
+	"conversations.replies",
+	"conversations.info",
+	"users.info",
+	"reactions.get",
+]);
+
+/** Form-encodes the flat parameter objects this client sends; undefined is omitted, not sent as "undefined". */
+export function formEncode(parameters: Record<string, unknown>): string {
+	const body = new URLSearchParams();
+	for (const [key, value] of Object.entries(parameters)) {
+		if (value === undefined || value === null) continue;
+		body.set(key, typeof value === "string" ? value : String(value));
+	}
+	return body.toString();
+}
+
 export class SlackWebApi {
 	readonly fetcher: FetchLike;
 	readonly #sleep: (ms: number) => Promise<void>;
@@ -177,16 +199,23 @@ export class SlackWebApi {
 	async call<T>(method: string, parameters: Record<string, unknown> = {}, token?: string): Promise<T> {
 		// Response URLs are already credentials: never forward the bot token to them.
 		const responseUrl = method.startsWith("https://");
+		// Slack honours a JSON body only on write methods (chat.*, reactions.add/remove,
+		// apps.connections.open, auth.test). Read methods - conversations.*, users.info,
+		// reactions.get - ignore it and answer `invalid_arguments` / `user_not_found` /
+		// `no_item_specified` as if nothing was sent. That made every recovery backfill
+		// fail on its first `conversations.replies` and left missed messages unrecovered
+		// (live, 2026-09-17: "Slack recovery incomplete … invalid_arguments" on loop).
+		const encoding = responseUrl || !SLACK_FORM_ENCODED_METHODS.has(method) ? "json" : "form";
 		let response: Response | undefined;
 		let retryAfterMs = 0;
 		for (let attempt = 0; ; attempt++) {
 			response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
 				method: "POST",
 				headers: {
-					"content-type": "application/json",
+					"content-type": encoding === "json" ? "application/json" : "application/x-www-form-urlencoded",
 					...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
 				},
-				body: JSON.stringify(parameters),
+				body: encoding === "json" ? JSON.stringify(parameters) : formEncode(parameters),
 			});
 			// A 429, or a 200 whose body says `ratelimited`, both mean "slow down".
 			// Honour Retry-After (seconds), bounded, then give up as ambiguous. Never a

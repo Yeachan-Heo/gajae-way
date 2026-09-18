@@ -9,14 +9,25 @@ import {
 	SlackWebApi,
 } from "../src/api";
 
+/** Decodes whichever encoding the client chose, so assertions read the parameters, not the wire format. */
+function decodeBody(headers: Headers, raw: string): Record<string, unknown> {
+	if (headers.get("content-type") === "application/x-www-form-urlencoded") {
+		const decoded: Record<string, unknown> = {};
+		for (const [key, value] of new URLSearchParams(raw)) decoded[key] = value;
+		return decoded;
+	}
+	return JSON.parse(raw);
+}
+
 function fixture() {
 	const requests: { url: string; headers: Headers; body: Record<string, unknown>; method?: string }[] = [];
 	let response = () => Response.json({ ok: true });
 	const api = new SlackWebApi("xoxb-secret", async (input, init) => {
+		const headers = new Headers(init?.headers);
 		requests.push({
 			url: String(input),
-			headers: new Headers(init?.headers),
-			body: JSON.parse(String(init?.body)),
+			headers,
+			body: decodeBody(headers, String(init?.body)),
 			method: init?.method,
 		});
 		return response();
@@ -110,8 +121,22 @@ test("Slack identity and directory wrappers unwrap fields and history exposes cu
 		next_cursor: "next",
 	});
 	await f.api.conversationsReplies("C1", "1.2", { cursor: "next" });
-	expect(f.requests[3]?.body).toEqual({ channel: "C1", limit: 3, inclusive: true });
+	// Read methods go form-encoded: Slack ignores a JSON body on them and answers
+	// invalid_arguments, which is how every recovery backfill was failing.
+	for (const index of [0, 1, 3, 4]) {
+		expect(f.requests[index]?.headers.get("content-type")).toBe("application/x-www-form-urlencoded");
+	}
+	expect(f.requests[2]?.headers.get("content-type")).toBe("application/json");
+	expect(f.requests[3]?.body).toEqual({ channel: "C1", limit: "3", inclusive: "true" });
 	expect(f.requests[4]?.body).toEqual({ channel: "C1", ts: "1.2", cursor: "next" });
+});
+
+test("form encoding omits undefined instead of sending the string undefined", async () => {
+	const f = fixture();
+	f.respond(() => Response.json({ ok: true, messages: [] }));
+	await f.api.conversationsHistory("C1", { oldest: "1.0", cursor: undefined, limit: 200 });
+	expect(f.requests[0]?.body).toEqual({ channel: "C1", oldest: "1.0", limit: "200" });
+	expect("cursor" in (f.requests[0]?.body ?? {})).toBe(false);
 });
 
 test("Slack response URLs receive JSON without leaking the bot credential", async () => {
