@@ -478,6 +478,71 @@ test("red-team: an unknown unaccepted send is held once, then a live-idle sessio
 	}
 });
 
+class UnobservedAnswerPort extends ConflictUnknownPort {
+	/** The answer the persona wrote while the gateway's view of the session was dark. */
+	answer: { text: string; atMs: number } | undefined;
+	probes = 0;
+
+	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
+		this.probes++;
+		if (!this.answer || this.answer.atMs < input.notBeforeMs) return undefined;
+		return { text: this.answer.text, pages: 1, complete: true };
+	}
+}
+
+test("red-team: an unknown op on a live-idle session whose transcript already holds this turn's answer delivers it instead of releasing", async () => {
+	// Unobservable is not failed. gajae-code#5681: a wedged event ring makes
+	// tail return nothing and status read `unknown`, while the persona keeps
+	// working and writes its reply. Releasing that as unlanded posted
+	// `[turn failed]` to the room with the answer sitting in the transcript
+	// (4 of 4 such failures, 2026-09-17/18).
+	const port = new UnobservedAnswerPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	const target = await fixture({ port });
+	try {
+		enqueue(target, "dark-trigger", "answer me while the ring is dark");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(
+			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
+			"client_ref_conflict was not reconciled",
+		);
+		const first = target.database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
+		// The persona answered after dispatch; only the gateway could not see it.
+		port.answer = { text: "written while you were not looking", atMs: Date.now() + 1 };
+		await target.manager.tick(ORIGIN_KEY);
+		await eventually(() => target.terminal.length === 1, "unobserved answer was not delivered");
+		expect(target.terminal).toEqual(["written while you were not looking"]);
+		expect(port.probes).toBeGreaterThan(0);
+		// Delivered as THIS turn: no re-dispatch, no fresh epoch, no [turn failed].
+		expect(port.sends).toEqual([]);
+		expect(target.logs.some((line) => line.includes("unobserved_answer_delivered"))).toBe(true);
+		expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session"))).toBe(false);
+		expect(target.database.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
+		expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	} finally {
+		await target.close();
+	}
+});
+
+test("red-team: an unobserved-answer probe that finds only a PRE-dispatch row still releases (that row is the previous turn's)", async () => {
+	const port = new UnobservedAnswerPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	const target = await fixture({ port });
+	try {
+		port.answer = { text: "the previous turn's answer", atMs: Date.now() - 60_000 };
+		enqueue(target, "dark-trigger-2", "nothing new was written");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(
+			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
+			"client_ref_conflict was not reconciled",
+		);
+		await target.manager.tick(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "stale-answer session was not released");
+		expect(target.terminal).toEqual([]);
+		expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session sweeps=2"))).toBe(true);
+	} finally {
+		await target.close();
+	}
+});
+
 test("red-team: a terminal tail frame arriving during the status grace wins once without status-fallback delivery", async () => {
 	const base = Date.parse("2026-09-02T00:00:00.000Z");
 	const now = base;

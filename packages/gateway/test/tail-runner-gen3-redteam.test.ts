@@ -379,8 +379,87 @@ test("event-driven: after one backfill poll, host stream frames are delivered as
 			"live frames were not delivered from the stream",
 		);
 		await Bun.sleep(30);
-		// No interval polling while the stream is healthy.
+		// No interval polling while the stream is healthy and the session is idle.
 		expect(argv.length).toBe(pollsAfterOpen);
+	} finally {
+		await tail.close();
+	}
+});
+
+test("while a turn is running, the stream and the poll observe together: transcript rows the relay never carries still arrive", async () => {
+	// gjc 0.16.7's relay emits lifecycle + the finalized answer only; the
+	// mid-work assistant text and tool calls exist solely in `tail --all-events`.
+	const delivered: string[] = [];
+	let polls = 0;
+	let opened = 0;
+	let closeStream: (() => void) | undefined;
+	const run: CliRunner = async (args) => {
+		if (!args.includes("tail")) return { exitCode: 0, stdout: "{}", stderr: "" };
+		polls++;
+		// The first poll is the readiness backfill; every later one (side poll while
+		// the stream is open) returns the mid-work row the relay never carries.
+		const items =
+			polls === 1
+				? []
+				: [
+						{
+							kind: "transcript",
+							id: `row-${polls}`,
+							payload: { role: "assistant", content: [{ type: "text", text: `MIDWORK_${polls}` }] },
+						},
+					];
+		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { items, terminal: false } }), stderr: "" };
+	};
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-sidepoll",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+		stream: () => {
+			opened++;
+			let done = false;
+			let notify: (() => void) | undefined;
+			closeStream = () => {
+				done = true;
+				notify?.();
+			};
+			const lines = (async function* () {
+				// A healthy relay that simply says nothing for the whole turn.
+				while (!done)
+					await new Promise<void>((resolve) => {
+						notify = resolve;
+					});
+			})();
+			return { lines, close: () => closeStream?.() };
+		},
+	});
+	const tail = await runner.attach({
+		sessionId: "sidepoll-1",
+		brokerGeneration: 1,
+		repo: "/tmp/gajaeway-tail-sidepoll",
+		onFrame: async (frame) => {
+			if (frame.assistantText) delivered.push(frame.assistantText);
+		},
+	});
+	try {
+		await tail.markAccepted("turn-side");
+		await eventually(() => opened === 1, "stream was not opened");
+		const idlePolls = polls;
+		await Bun.sleep(20);
+		// Idle: the open stream is trusted, no side polls.
+		expect(polls).toBe(idlePolls);
+		// A turn starts: the side poll wakes and the rows it fetches are delivered
+		// even though the relay emitted nothing.
+		tail.setTurnRunning(true);
+		await eventually(() => delivered.length >= 2, "side polls did not deliver mid-work rows while streaming");
+		expect(delivered[0]).toMatch(/^MIDWORK_/);
+		expect(opened).toBe(1);
+		// Turn ends: polling stops again while the stream stays open.
+		tail.setTurnRunning(false);
+		await Bun.sleep(10);
+		const afterEnd = polls;
+		await Bun.sleep(20);
+		expect(polls).toBe(afterEnd);
 	} finally {
 		await tail.close();
 	}
