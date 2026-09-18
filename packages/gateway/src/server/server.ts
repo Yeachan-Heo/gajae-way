@@ -54,8 +54,8 @@ import {
 	type PersonaSteerInput,
 	type PersonaTailFrameInput,
 	type PersonaTerminalInput,
-	type PersonaTurnSettledInput,
 	type PersonaTurnLifecycle,
+	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
@@ -1254,12 +1254,10 @@ async function sendChat(
 	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
-	const engagement = params.engagement as
-		| { mentioned?: boolean; authorId?: string; authorName?: unknown }
-		| undefined;
-	const botAudienceGuardSpent =
-		engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
-	const addressedBotAudienceDecline = botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+	const engagement = params.engagement as { mentioned?: boolean; authorId?: string; authorName?: unknown } | undefined;
+	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
+	const addressedBotAudienceDecline =
+		botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp);
 	if (addressedBotAudienceDecline) {
 		runtime.botAudienceTurns.recordBotAudienceDecline();
 		console.error(
@@ -1404,8 +1402,7 @@ async function editChat(
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as { mentioned?: boolean } | undefined;
-	const botAudienceGuardSpent =
-		engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
+	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
 	if (botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp)) {
 		runtime.botAudienceTurns.recordBotAudienceDecline();
 		console.error(

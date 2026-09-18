@@ -27,8 +27,7 @@ function parseState(raw: string | undefined): BotAudienceTurnState {
 	if (raw === undefined) return { admissions: [], count: 0 };
 	try {
 		const parsed: unknown = JSON.parse(raw);
-		if (!parsed || typeof parsed !== "object")
-			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		if (!parsed || typeof parsed !== "object") return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
 		const value = parsed as { admissions?: unknown; count?: unknown };
 		const admissions = Array.isArray(value.admissions)
 			? value.admissions.filter((entry): entry is string => typeof entry === "string")
@@ -36,8 +35,7 @@ function parseState(raw: string | undefined): BotAudienceTurnState {
 		if (typeof value.count !== "number" || !Number.isSafeInteger(value.count))
 			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
 		const count = value.count;
-		if (count < 0)
-			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		if (count < 0) return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
 		return {
 			admissions: admissions.slice(0, MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS),
 			count: Math.max(0, Math.min(MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS, count)),
@@ -80,7 +78,8 @@ export class BotAudienceTurnGuard {
 		const state = this.#state(originKey);
 		if (state.count === 0) return;
 		if (admissionId !== undefined && state.admissions.length > 0 && !state.admissions.includes(admissionId)) return;
-		const admissions = admissionId === undefined ? state.admissions.slice(1) : state.admissions.filter((id) => id !== admissionId);
+		const admissions =
+			admissionId === undefined ? state.admissions.slice(1) : state.admissions.filter((id) => id !== admissionId);
 		const count = Math.max(0, state.count - 1);
 		if (count === 0) this.#delete(originKey);
 		else this.#save(originKey, { admissions, count });
@@ -118,7 +117,8 @@ export class BotAudienceTurnGuard {
 
 	#delete(originKey: string): void {
 		if (this.#store?.metaDelete) this.#store.metaDelete(botAudienceStateKey(originKey));
-		else if (this.#store) this.#store.metaSet(botAudienceStateKey(originKey), JSON.stringify({ admissions: [], count: 0 }));
+		else if (this.#store)
+			this.#store.metaSet(botAudienceStateKey(originKey), JSON.stringify({ admissions: [], count: 0 }));
 		else this.#memory.delete(originKey);
 	}
 }
