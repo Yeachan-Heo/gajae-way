@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 /**
@@ -34,6 +34,8 @@ export interface AdapterLockPorts {
 	readonly pid: number;
 	/** Whether a recorded holder is still a live process. */
 	readonly alive: (pid: number) => boolean;
+	/** Test-only seam for a slow critical section after election and before the pidfile write. */
+	readonly beforePidfileWrite?: () => void | Promise<void>;
 }
 
 export function defaultLockPorts(): AdapterLockPorts {
@@ -53,6 +55,8 @@ export function processIsAlive(pid: number): boolean {
 /** How long a contender waits on a live reclaimer before failing closed (200 x 5ms = 1s). */
 const RECLAIM_WAIT_ATTEMPTS = 200;
 const RECLAIM_WAIT_STEP_MS = 5;
+const RECLAIM_WAIT_WINDOW_MS = RECLAIM_WAIT_ATTEMPTS * RECLAIM_WAIT_STEP_MS;
+const RECLAIM_HEARTBEAT_MS = Math.max(1, Math.floor(RECLAIM_WAIT_WINDOW_MS / 4));
 
 export class AdapterLock {
 	private constructor(
@@ -90,11 +94,24 @@ export class AdapterLock {
 		await writeFile(join(candidate, "owner"), `${ports.pid}\n`, { mode: 0o600 });
 		const candidateInode = (await stat(candidate)).ino;
 		let elected = false;
+		let heartbeat: ReturnType<typeof setInterval> | undefined;
 		try {
 			for (let attempt = 0; !elected; attempt++) {
 				try {
+					await utimes(candidate, new Date(), new Date());
 					await rename(candidate, election);
+					try {
+						await utimes(election, new Date(), new Date());
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT")
+							throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+						throw error;
+					}
 					elected = true;
+					heartbeat = setInterval(() => {
+						void utimes(election, new Date(), new Date()).catch(() => {});
+					}, RECLAIM_HEARTBEAT_MS);
+					heartbeat.unref?.();
 					break;
 				} catch (error) {
 					const code = (error as NodeJS.ErrnoException).code;
@@ -127,17 +144,51 @@ export class AdapterLock {
 			// Elected. The election must still be OURS (a stale reclaimer may have
 			// moved it) and the pidfile must still name the dead holder read above;
 			// any other pid is a claim an earlier winner made moments ago.
-			if ((await stat(election).catch(() => undefined))?.ino !== candidateInode) {
-				elected = false;
-				throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
-			}
+			await assertElectionOwner(election, candidateInode, path);
 			const current = await readHolder(path);
-			if (current !== holder && current !== ports.pid) throw new AdapterAlreadyRunningError(current ?? 0, path);
+			if (current !== holder) throw new AdapterAlreadyRunningError(current ?? 0, path);
+			await ports.beforePidfileWrite?.();
+			await assertElectionOwner(election, candidateInode, path);
+			if ((await readHolder(path)) !== holder)
+				throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
 			const temporary = `${path}.${ports.pid}.${randomUUID()}.tmp`;
 			await writeFile(temporary, `${ports.pid}\n`, { flag: "wx", mode: 0o600 });
-			await rename(temporary, path);
+			const previous = `${path}.${ports.pid}.${randomUUID()}.previous`;
+			let previousMoved = false;
+			let installedInode: number | bigint | undefined;
+			try {
+				const expectedInode = await stat(path)
+					.then((info) => info.ino)
+					.catch(() => undefined);
+				if (expectedInode !== undefined) {
+					await rename(path, previous);
+					previousMoved = true;
+					const movedInode = (await stat(previous)).ino;
+					if (movedInode !== expectedInode || (await readHolder(previous)) !== holder) {
+						await restoreNoReplace(previous, path);
+						previousMoved = false;
+						throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+					}
+				}
+				await assertElectionOwner(election, candidateInode, path);
+				await linkNoReplace(temporary, path);
+				installedInode = (await stat(path)).ino;
+				await assertElectionOwner(election, candidateInode, path);
+				if (previousMoved) {
+					await rm(previous, { force: true });
+					previousMoved = false;
+				}
+			} catch (error) {
+				if (installedInode !== undefined) await removeFileIfInode(path, installedInode);
+				if (previousMoved) await restoreNoReplace(previous, path);
+				throw error;
+			} finally {
+				await rm(temporary, { force: true });
+				await rm(previous, { force: true });
+			}
 			return new AdapterLock(path, ports.pid);
 		} finally {
+			if (heartbeat !== undefined) clearInterval(heartbeat);
 			// Only the elected contender removes the election, and only while it is
 			// still the directory it installed (same inode).
 			if (elected) await removeIfInode(election, candidateInode);
@@ -169,6 +220,34 @@ async function readHolder(path: string): Promise<number | undefined> {
 		return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 	} catch {
 		return undefined;
+	}
+}
+
+async function assertElectionOwner(dir: string, inode: number | bigint, path: string): Promise<void> {
+	if ((await stat(dir).catch(() => undefined))?.ino === inode) return;
+	throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+}
+
+async function linkNoReplace(source: string, destination: string): Promise<void> {
+	try {
+		await link(source, destination);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new AdapterAlreadyRunningError((await readHolder(destination)) ?? 0, destination);
+		}
+		throw error;
+	}
+}
+
+/** Restores a moved pidfile only while the destination is still free. */
+async function restoreNoReplace(source: string, destination: string): Promise<void> {
+	try {
+		await link(source, destination);
+		await rm(source, { force: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOENT")
+			throw error;
+		await rm(source, { force: true });
 	}
 }
 
@@ -247,6 +326,26 @@ async function removeIfInode(dir: string, inode: number | bigint): Promise<void>
 		return;
 	}
 	await rm(dir, { recursive: true, force: true }).catch(() => {});
+}
+
+/** Removes a pidfile only while it is still the inode this contender installed. */
+async function removeFileIfInode(path: string, inode: number | bigint): Promise<void> {
+	const tombstone = `${path}.${randomUUID()}.lost`;
+	try {
+		await rename(path, tombstone);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return;
+	}
+	try {
+		if ((await stat(tombstone)).ino === inode) {
+			await rm(tombstone, { force: true });
+			return;
+		}
+		await restoreNoReplace(tombstone, path);
+	} catch {
+		await rm(tombstone, { force: true }).catch(() => {});
+	}
 }
 
 /** Removes `.dead` tombstones of reclaimed elections; failures are ignored. */
