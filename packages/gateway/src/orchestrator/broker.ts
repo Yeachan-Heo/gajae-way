@@ -22,7 +22,7 @@ export {
 } from "./broker-liveness";
 
 export const MIN_GJC_VERSION = "0.15.6";
-const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
+export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
@@ -181,7 +181,23 @@ export async function preflightGjcRuntime(
 	if (sdk && !isHealthySessionList(await sdk(brokerHealthArgs(), { timeoutMs: COMMAND_TIMEOUT_MS }))) {
 		throw new Error("gjc runtime preflight failed: invalid session-list envelope");
 	}
+	// The relay argv contract is boot-gated: a usage rejection (exit 2) here
+	// means EVERY tail stream would die at spawn and the gateway would silently
+	// fall back to slow polling. Measured 2026-09-15: `sdk serve --agent-dir`
+	// exit 2 for days with no boot-time signal. Fail closed instead.
+	if (sdk) {
+		const relay = await sdk(streamRelayArgs(HEALTH_PROBE_SESSION_ID), { timeoutMs: COMMAND_TIMEOUT_MS });
+		if (isUsageRejection(relay)) throw new Error("gjc runtime preflight failed: stream relay rejected its argv");
+	}
 	return { version: version.slice(1, 4).join(".") };
+}
+/** The exact argv `openStream` spawns; `serve` is env-bound and takes no --agent-dir (gjc 0.16.6 exits 2). */
+export function streamRelayArgs(sessionId: string): readonly string[] {
+	return ["sdk", "serve", "--stdio", "--session", sessionId];
+}
+/** gjc prints usage and exits 2 on an unknown flag; every runtime failure exits 1 or prints a JSON envelope. */
+export function isUsageRejection(result: CliResult): boolean {
+	return result.exitCode === 2 && /unknown argument|USAGE/i.test(`${result.stdout}\n${result.stderr}`);
 }
 
 /** A client of the user's global runtime. No directory, daemon, lock, or session ownership. */
@@ -498,7 +514,7 @@ export class GlobalGjcClient {
 		// stream, declared a retention gap, and held the turn - the persona went
 		// mute on long turns and presence never advanced (live, 2026-09-17).
 		const child = this.#spawn({
-			cmd: [this.executable, "sdk", "serve", "--stdio", "--session", sessionId],
+			cmd: [this.executable, ...streamRelayArgs(sessionId)],
 			cwd: this.#cwd,
 			env: this.#env,
 			stdin: "pipe",
@@ -553,6 +569,9 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 		throw new Error("Global GJC client rejects caller retarget arguments");
 	}
 	const bound = [...args];
+	// `gjc sdk serve` has no --agent-dir flag (exit 2 + usage on gjc 0.16.6):
+	// the relay takes its agent dir from the exported GJC_*_AGENT_DIR env.
+	if (bound[1] === "serve") return bound;
 	if (bound[1] === "session") bound.splice(2, 0, "--agent-dir", agentDir);
 	else bound.push("--agent-dir", agentDir);
 	return bound;

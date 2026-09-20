@@ -1277,12 +1277,12 @@ export class GatewayDatabase {
 	}
 
 	/** Cycle projection source: pending inbound count per origin key. */
-	inboundPendingByOrigin(): Array<{ origin_key: string; n: number }> {
+	inboundPendingByOrigin(): Array<{ origin_key: string; n: number; oldest_received_at: string }> {
 		return this.#database
 			.query(
-				`SELECT origin_key, COUNT(*) AS n FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
+				`SELECT origin_key, COUNT(*) AS n, MIN(received_at) AS oldest_received_at FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
 			)
-			.all() as Array<{ origin_key: string; n: number }>;
+			.all() as Array<{ origin_key: string; n: number; oldest_received_at: string }>;
 	}
 
 	/** Cycle projection source: delivery state census across all origins. */

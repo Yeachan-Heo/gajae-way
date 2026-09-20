@@ -33,6 +33,13 @@ const KNOWN_DELIVERY_STATES = new Set(["pending", "inflight", "confirmed", "fail
 const KNOWN_INBOUND_STATES = new Set(["pending", "processing", "done"]);
 /** Lane-job states after which the worker owns no unresolved work; only these may vouch for a retired lane. */
 const SETTLED_JOB_STATES = new Set(["attempt_ended", "done", "aborted"]);
+/**
+ * Oldest replayable pending trigger age, with zero in flight, past which the
+ * queue is starved rather than busy. A cold persona bind measures ~10-60s and
+ * the dispatch retry backoff caps well under this; ten minutes with nothing
+ * moving has only ever meant a stuck actor.
+ */
+export const INBOUND_STARVATION_MS = 10 * 60_000;
 
 export interface RuntimeCycleSources {
 	readonly sessionRows: Array<{
@@ -50,6 +57,8 @@ export interface RuntimeCycleSources {
 		readonly bootstrap_diagnostics_json: string;
 	}>;
 	readonly inboundPendingByOrigin: ReadonlyMap<string, number>;
+	/** Age of the oldest replayable pending trigger with nothing in flight; the bricked-origin signature. */
+	readonly oldestStarvedPendingMs: number | null;
 	readonly contextByOrigin: ReadonlyMap<string, ReturnType<GatewayDatabase["contextDiagnostics"]>>;
 	readonly contextDiff: ReturnType<GatewayDatabase["contextDiagnostics"]>;
 	readonly inboundCounts: ReadonlyMap<string, number>;
@@ -100,7 +109,12 @@ export class RuntimeCycleProjector {
 	#sources(nowMs: number): RuntimeCycleSources {
 		const sessions = this.#database.sessionIdentityRows();
 		const inbound = this.#database.inboundStateCounts();
-		const pendingByOrigin = new Map(this.#database.inboundPendingByOrigin().map((r) => [r.origin_key, r.n]));
+		const pendingRows = this.#database.inboundPendingByOrigin();
+		const pendingByOrigin = new Map(pendingRows.map((r) => [r.origin_key, r.n]));
+		const oldestPendingMs = pendingRows.reduce<number | null>((oldest, row) => {
+			const age = nowMs - Date.parse(row.oldest_received_at);
+			return Number.isFinite(age) && (oldest === null || age > oldest) ? age : oldest;
+		}, null);
 		const contextByOrigin = this.#database.contextDiagnosticsByOrigin();
 		const deliveries = this.#database.deliveryStateCounts();
 		const unsettled = new Map(
@@ -123,6 +137,7 @@ export class RuntimeCycleProjector {
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
 			inboundPendingByOrigin: pendingByOrigin,
+			oldestStarvedPendingMs: (inboundMap.get("processing") ?? 0) === 0 ? oldestPendingMs : null,
 			contextByOrigin,
 			contextDiff: this.#database.contextDiagnostics(),
 			memoryClosing: this.#memory.queueDepth > 0,
@@ -203,6 +218,12 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// Lane saturation is an operator condition: every further work.run is
 	// refused until a lane is retired, so it must not read as a healthy idle.
 	if (sources.activeLanes >= sources.maxLanes) gates.add("lane_capacity_exhausted");
+	// Pending work with nothing in flight for longer than any healthy dispatch
+	// takes is a stuck actor, not a busy one. Measured 2026-09-15: 159 pending /
+	// 0 in flight for hours projected as `dispatching` while four origins were
+	// bricked on a disowned tail. Automation must read that as degraded.
+	if (sources.oldestStarvedPendingMs !== null && sources.oldestStarvedPendingMs >= INBOUND_STARVATION_MS)
+		gates.add("inbound_starved");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);

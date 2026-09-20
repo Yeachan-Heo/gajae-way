@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { projectRuntimeCycle, type RuntimeCycleSources } from "../src/ops/cycle";
+import { INBOUND_STARVATION_MS, projectRuntimeCycle, type RuntimeCycleSources } from "../src/ops/cycle";
 
 const generatedAt = "2026-08-26T00:00:00.000Z";
 
@@ -8,6 +8,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		sessionRows: [],
 		inboundCounts: new Map(),
 		inboundPendingByOrigin: new Map(),
+		oldestStarvedPendingMs: null,
 		contextByOrigin: new Map(),
 		contextDiff: {
 			unread: 0,
@@ -52,6 +53,21 @@ const boundSession = {
 };
 
 describe("runtime cycle projection", () => {
+	test("pending work with nothing in flight past the starvation window is a gate, not dispatching", () => {
+		const busy = projectRuntimeCycle(
+			sources({ inboundCounts: new Map([["pending", 159]]), oldestStarvedPendingMs: INBOUND_STARVATION_MS - 1 }),
+			generatedAt,
+		);
+		expect(busy.phase).toBe("dispatching");
+		expect(busy.gates).toEqual([]);
+		const starved = projectRuntimeCycle(
+			sources({ inboundCounts: new Map([["pending", 159]]), oldestStarvedPendingMs: INBOUND_STARVATION_MS }),
+			generatedAt,
+		);
+		expect(starved.phase).toBe("degraded");
+		expect(starved.gates).toEqual(["inbound_starved"]);
+	});
+
 	test("empty durable state projects idle with no gates", () => {
 		const result = projectRuntimeCycle(sources(), generatedAt);
 		expect(result.phase).toBe("idle");
