@@ -44,31 +44,23 @@ test("with no earlier turns the context section says so rather than being blank"
 	expect(state).toContain("user: ㅎㅇ");
 });
 
-test("with no earlier turns, context-dependent vetoes cannot fire", () => {
-	// isAnswer=0.73 on a standalone question is exactly the observed failure.
-	const withoutContext = shadowScore([0.85, 0.6, 0.73, 0.1], false);
-	const withContext = shadowScore([0.85, 0.6, 0.73, 0.1], true);
-	expect(withoutContext.score).toBeGreaterThan(withContext.score);
-	// chatter is low here, so without context nothing vetoes at all.
-	expect(withoutContext.score).toBeCloseTo(0.85, 5);
-	expect(withoutContext.verdict).toBe("would-engage");
+test("the other three probes are diagnostics and cannot veto a real question", () => {
+	// With real history the ack/isAnswer probes fire on the context they were
+	// given; applying them as vetoes crushed measured true positives to 0.083.
+	const vetoed = shadowScore([0.73, 0.95, 0.88, 0.62]);
+	expect(vetoed.score).toBeCloseTo(0.73, 5);
+	expect(vetoed.verdict).toBe("would-engage");
+	// Still reported, so a verdict stays auditable against the raw probes.
+	expect(vetoed.ack).toBeCloseTo(0.95, 5);
+	expect(vetoed.isAnswer).toBeCloseTo(0.88, 5);
+	expect(vetoed.chatter).toBeCloseTo(0.62, 5);
 });
 
-test("a veto only bites above 0.5 rather than multiplying every factor down", () => {
-	// Three mid-confidence reads must not compound a real question into a skip.
-	const mid = shadowScore([0.8, 0.5, 0.5, 0.5], true);
-	expect(mid.score).toBeCloseTo(0.8, 5);
-	expect(mid.verdict).toBe("would-engage");
-	// A confident veto still suppresses.
-	const vetoed = shadowScore([0.8, 0.95, 0.2, 0.2], true);
-	expect(vetoed.score).toBeLessThan(0.25);
-	expect(vetoed.verdict).toBe("would-skip");
-});
-
-test("verdict bands are ordered and exhaustive", () => {
-	expect(shadowScore([0.05, 0, 0, 0], false).verdict).toBe("would-skip");
-	expect(shadowScore([0.4, 0, 0, 0], false).verdict).toBe("would-defer");
-	expect(shadowScore([0.9, 0, 0, 0], false).verdict).toBe("would-engage");
+test("verdict bands sit between the two measured populations", () => {
+	// Ambient community traffic measured 0.024..0.391, answer-me traffic 0.662..0.820.
+	expect(shadowScore([0.391, 0.1, 0.1, 0.9]).verdict).toBe("would-skip");
+	expect(shadowScore([0.5, 0, 0, 0]).verdict).toBe("would-defer");
+	expect(shadowScore([0.662, 0.9, 0.9, 0.9]).verdict).toBe("would-engage");
 });
 
 test("the log line separates addressed traffic from ambient traffic", async () => {
@@ -106,4 +98,50 @@ test("the log line separates addressed traffic from ambient traffic", async () =
 	expect(lines[0]).toContain("addressed=1");
 	expect(lines[0]).toContain("verdict=would-skip");
 	expect(lines[1]).toContain("addressed=0");
+});
+
+test("earlier turns are rendered oldest-first under the context header and counted", async () => {
+	const seen: string[] = [];
+	const server = Bun.serve({
+		port: 0,
+		async fetch(request) {
+			seen.push(((await request.json()) as { state: string }).state);
+			return Response.json({
+				probs: [
+					[0.27, 0.73],
+					[0.5, 0.5],
+					[0.5, 0.5],
+					[0.6, 0.4],
+				],
+			});
+		},
+	});
+	const savedUrl = process.env.KEV_SHADOW_URL;
+	process.env.KEV_SHADOW_URL = `http://127.0.0.1:${server.port}`;
+	const lines: string[] = [];
+	const error = console.error;
+	console.error = (line: unknown) => {
+		lines.push(String(line));
+	};
+	try {
+		await recordKevShadow({
+			originKey: "discord:c1",
+			text: "잘되냐 이제",
+			addressed: true,
+			earlier: ["Bellman: 유닛으로 올려라", "you: 올렸습니다. /health 200입니다."],
+		});
+	} finally {
+		console.error = error;
+		if (savedUrl === undefined) {
+			delete process.env.KEV_SHADOW_URL;
+		} else process.env.KEV_SHADOW_URL = savedUrl;
+		server.stop(true);
+	}
+	const state = seen[0] as string;
+	expect(state.indexOf("유닛으로 올려라")).toBeLessThan(state.indexOf("/health 200"));
+	expect(state).not.toContain("(no earlier messages)");
+	// The context depth is on the line: a shadow read with no history is not
+	// evidence about the gate, it is evidence the caller starved it.
+	expect(lines[0]).toContain("ctx=2");
+	expect(lines[0]).toContain("verdict=would-engage");
 });

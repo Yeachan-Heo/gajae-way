@@ -81,6 +81,11 @@ const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
+// 16 turns is where the shadow's separation stopped improving (help on answer-me
+// messages: 0.465 context-free, 0.574 at 3, 0.668 at 8, 0.729 at 16) and it costs
+// ~1.4k tokens / ~520 ms on the local judge, which nothing waits for.
+const KEV_SHADOW_CONTEXT_TURNS = 16;
+const KEV_SHADOW_CONTEXT_WINDOW_MS = 6 * 60 * 60_000;
 const RESTART_EXIT_CODE = 75;
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -1326,6 +1331,21 @@ async function sendChat(
 	void recordKevShadow({
 		originKey: key,
 		text: userText,
+		// Judged context-free, a short follow-up ("잘되냐 이제") reads as chatter: the
+		// question it continues is not in the text. The same message with its real
+		// history scores 0.24 -> 0.73. This is the same window the turn itself would
+		// read, including the persona's own replies, and it is read-only.
+		earlier: nonLoopback
+			? options.database
+					.recentConversation(
+						key,
+						origin.conversationId,
+						KEV_SHADOW_CONTEXT_TURNS,
+						new Date(Date.now() - KEV_SHADOW_CONTEXT_WINDOW_MS).toISOString(),
+					)
+					.filter((entry) => entry.id !== inboundMessageId)
+					.map((entry) => `${entry.author}: ${entry.body.replace(/\s+/g, " ").slice(0, 200)}`)
+			: [],
 		authorLabel: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
 		// A DM, an @mention, or a reply to this bot is traffic aimed at it. Kept as a
 		// log field so the shadow can be read as two populations instead of one.
