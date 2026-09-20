@@ -613,3 +613,55 @@ test("preflight fails closed when the stream relay rejects its argv (usage exit 
 		args[1] === "serve" ? { exitCode: 1, stdout: "", stderr: "not_found: session is not indexed\n" } : healthy;
 	await expect(preflightGjcRuntime(run, "0.15.6", runtime)).resolves.toEqual({ version: "0.16.6" });
 });
+
+test("relay stdout and stderr are decoded independently: a multibyte character split across stdout chunks survives interleaved stderr and stderr EOF", async () => {
+	// A JSON frame carrying Korean text, cut in the middle of "가" (3 bytes) at a
+	// chunk boundary, with a stderr line delivered between the two halves and
+	// stderr closing before stdout finishes. One shared streaming decoder would
+	// take the continuation bytes from stderr (or flush U+FFFD on stderr EOF).
+	const frame = `{"type":"event","kind":"message_end","text":"안녕 가재 🦞"}\n`;
+	const bytes = new TextEncoder().encode(frame);
+	const prefixBytes = new TextEncoder().encode(frame.slice(0, frame.indexOf("가"))).length + 1;
+	const first = bytes.subarray(0, prefixBytes);
+	const second = bytes.subarray(prefixBytes);
+	const stdoutQueue: Array<Uint8Array | null> = [];
+	let stdoutWake: (() => void) | undefined;
+	const stdout = new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			while (stdoutQueue.length === 0) await new Promise<void>((resolve) => (stdoutWake = resolve));
+			const chunk = stdoutQueue.shift();
+			if (chunk === null || chunk === undefined) controller.close();
+			else controller.enqueue(chunk);
+		},
+	});
+	const pushStdout = (chunk: Uint8Array | null) => {
+		stdoutQueue.push(chunk);
+		stdoutWake?.();
+	};
+	let finish = (_code: number) => {};
+	const exited = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	const spawn = (() => ({
+		exited,
+		stdout,
+		stderr: new Blob(['{"ok":false,"error":{"code":"warning"}}\n']).stream(),
+		kill: () => finish(0),
+	})) as unknown as SpawnFn;
+	const value = client({ spawn });
+	await value.start();
+	const relay = value.openStream("owned-session");
+	const lines: string[] = [];
+	const consumed = (async () => {
+		for await (const line of relay.lines) lines.push(line);
+	})();
+	pushStdout(first);
+	await Bun.sleep(20); // stderr line and stderr EOF land while stdout's character is half-read
+	pushStdout(second);
+	pushStdout(null);
+	await consumed;
+	await value.stop();
+	expect(lines).toContain(frame.trimEnd());
+	expect(lines).toContain('{"ok":false,"error":{"code":"warning"}}');
+	expect(lines.join("\n")).not.toContain("\uFFFD");
+});
