@@ -53,6 +53,14 @@ export interface KevShadowInput {
 	 * addressed traffic from ambient traffic before any promotion argument holds.
 	 */
 	readonly addressed?: boolean;
+	/**
+	 * The author is another bot. Cron follow-up posts name this bot and would
+	 * therefore count as addressed, but they are machine self-prompts: measured
+	 * over 20 of them the judge scored 0.182..0.252, so a promoted gate would
+	 * skip EVERY scheduled sweep. They must be a separate population, never a
+	 * silent part of the addressed one.
+	 */
+	readonly authorIsBot?: boolean;
 }
 
 export function kevShadowEnabled(): boolean {
@@ -132,6 +140,17 @@ async function probe(state: string): Promise<number[] | null> {
 }
 
 /**
+ * The three populations behave differently enough that pooling them hides the
+ * only question that matters at promotion time. Measured with 16 turns of real
+ * history: `machine` 0.182..0.252, `addressed` (human) 0.362..0.915 median
+ * 0.692, `ambient` 0.011..0.781 median 0.137.
+ */
+export function shadowClass(input: KevShadowInput): "machine" | "addressed" | "ambient" {
+	if (input.authorIsBot) return "machine";
+	return input.addressed ? "addressed" : "ambient";
+}
+
+/**
  * Fire-and-forget. Callers use `void recordKevShadow(...)` and never await:
  * the turn must not wait on this, and a failed probe must not surface.
  */
@@ -145,6 +164,6 @@ export async function recordKevShadow(input: KevShadowInput): Promise<void> {
 	console.error(
 		`kev-shadow origin=${input.originKey} help=${f(s.help)} ack=${f(s.ack)} isAnswer=${f(s.isAnswer)} ` +
 			`chatter=${f(s.chatter)} score=${f(s.score)} verdict=${s.verdict} addressed=${input.addressed ? 1 : 0} ` +
-			`ctx=${input.earlier?.length ?? 0} ms=${Date.now() - started}`,
+			`ctx=${input.earlier?.length ?? 0} class=${shadowClass(input)} ms=${Date.now() - started}`,
 	);
 }

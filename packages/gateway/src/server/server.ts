@@ -1350,6 +1350,7 @@ async function sendChat(
 		// A DM, an @mention, or a reply to this bot is traffic aimed at it. Kept as a
 		// log field so the shadow can be read as two populations instead of one.
 		addressed: origin.kind === "dm" || engagement?.mentioned === true || engagement?.replyTo?.fromSelf === true,
+		authorIsBot,
 	});
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
