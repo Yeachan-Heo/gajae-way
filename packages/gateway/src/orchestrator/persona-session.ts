@@ -1044,7 +1044,29 @@ class OriginActor {
 			turn,
 			trigger: bound,
 		});
-		const tail = await this.#attachTail(binding.sessionId, epoch, false);
+		let tail: TailHandle;
+		try {
+			tail = await this.#attachTail(binding.sessionId, epoch, false);
+		} catch (error) {
+			// The relay refusing to attach because the broker no longer serves the
+			// session (`endpoint_stale`) is the same proof as a disowning send: the
+			// prompt never landed. Release the bound row and rebind, never hold.
+			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
+			this.#manager.database.inboundTurnRequeue(opRef);
+			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			this.#bindFailures += 1;
+			const attempts = this.#bindFailures;
+			this.#manager.log(
+				`persona_attach_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
+			);
+			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
+			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
+			else
+				this.#scheduleDispatchRetry(
+					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
+				);
+			return;
+		}
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,

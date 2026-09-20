@@ -10,3 +10,4 @@ dist-packed/
 
 .gjc/
 /.worktrees
+dist-*/
