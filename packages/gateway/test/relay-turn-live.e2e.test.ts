@@ -153,3 +153,33 @@ liveTest(
 	},
 	300_000,
 );
+
+liveTest(
+	"the real serve CLI's refusal for an unknown session rejects attach as session_unavailable, not a hello timeout",
+	async () => {
+		const executable = process.env.GJC_EXECUTABLE;
+		const agentDir = process.env.GJC_CODING_AGENT_DIR;
+		if (!executable || !agentDir) throw new Error("live test requires GJC_EXECUTABLE and GJC_CODING_AGENT_DIR");
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-relay-refusal-"));
+		const repo = join(home, "workspace");
+		await mkdir(repo, { mode: 0o700 });
+		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000 });
+		try {
+			await broker.preflight();
+			await broker.start();
+			const runner = new TailRunner({ stream: (id) => broker.openStream(id), repo });
+			const startedAt = Date.now();
+			const error = await runner
+				.attach({ sessionId: "00000000-0000-4000-8000-00000000dead", brokerGeneration: 1, repo })
+				.catch((e: unknown) => e);
+			expect(error).toBeInstanceOf(Error);
+			expect((error as { code?: string }).code).toBe("session_unavailable");
+			// The refusal envelope is read from the CLI's stderr; no 15 s hello wait.
+			expect(Date.now() - startedAt).toBeLessThan(10_000);
+		} finally {
+			await broker.stop();
+			await rm(home, { recursive: true, force: true });
+		}
+	},
+	60_000,
+);

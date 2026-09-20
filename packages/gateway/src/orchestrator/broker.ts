@@ -532,7 +532,11 @@ export class GlobalGjcClient {
 			env: this.#env,
 			stdin: "pipe",
 			stdout: "pipe",
-			stderr: "ignore",
+			// The serve CLI prints its own refusal envelope (`endpoint_stale`,
+			// `not_found`, `broker_unavailable`) on STDERR and exits. Ignoring it
+			// left the runner waiting the full hello timeout on a retired session
+			// (live, 2026-09-20). Both streams feed one line iterator.
+			stderr: "pipe",
 		});
 		this.#track(child);
 		let closed = false;
@@ -551,25 +555,52 @@ export class GlobalGjcClient {
 		this.#relays.add(close);
 		void child.exited.then(close, close);
 		const lines = (async function* () {
-			const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
 			const decoder = new TextDecoder();
-			let buffer = "";
+			const queue: Array<string | null> = [];
+			let wake: (() => void) | undefined;
+			const push = (line: string | null) => {
+				queue.push(line);
+				wake?.();
+				wake = undefined;
+			};
+			const streams: ReadableStream<Uint8Array>[] = [];
+			for (const stream of [child.stdout, child.stderr]) if (stream instanceof ReadableStream) streams.push(stream);
+			let open = streams.length;
+			const pump = async (stream: ReadableStream<Uint8Array>) => {
+				const reader = stream.getReader();
+				let buffer = "";
+				try {
+					for (;;) {
+						const { value, done } = await reader.read();
+						if (done) break;
+						buffer += decoder.decode(value, { stream: true });
+						let newline = buffer.indexOf("\n");
+						while (newline >= 0) {
+							push(buffer.slice(0, newline));
+							buffer = buffer.slice(newline + 1);
+							newline = buffer.indexOf("\n");
+						}
+					}
+					buffer += decoder.decode();
+					if (buffer) push(buffer);
+				} finally {
+					reader.releaseLock();
+					if (--open === 0) push(null);
+				}
+			};
+			if (open === 0) push(null);
+			for (const stream of streams) void pump(stream).catch(() => push(null));
 			try {
 				for (;;) {
-					const { value, done } = await reader.read();
-					if (done) break;
-					buffer += decoder.decode(value, { stream: true });
-					let newline = buffer.indexOf("\n");
-					while (newline >= 0) {
-						yield buffer.slice(0, newline);
-						buffer = buffer.slice(newline + 1);
-						newline = buffer.indexOf("\n");
+					if (queue.length === 0) await new Promise<void>((resolve) => (wake = resolve));
+					const line = queue.shift();
+					if (line === null || line === undefined) {
+						if (line === null) break;
+						continue;
 					}
+					yield line;
 				}
-				buffer += decoder.decode();
-				if (buffer) yield buffer;
 			} finally {
-				reader.releaseLock();
 				close();
 			}
 		})();
