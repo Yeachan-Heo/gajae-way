@@ -42,6 +42,13 @@ export interface KevShadowInput {
 	/** Earlier turns, oldest first, already rendered as "who: text". */
 	readonly earlier?: readonly string[];
 	readonly authorLabel?: string;
+	/**
+	 * The message named this bot: an @mention, a reply to one of its messages, or
+	 * a DM. Recorded, never acted on. The first live hour scored a direct owner
+	 * question at help=0.2387 (would-skip), so the shadow has to separate
+	 * addressed traffic from ambient traffic before any promotion argument holds.
+	 */
+	readonly addressed?: boolean;
 }
 
 export function kevShadowEnabled(): boolean {
@@ -123,6 +130,7 @@ export async function recordKevShadow(input: KevShadowInput): Promise<void> {
 	const f = (n: number) => n.toFixed(4);
 	console.error(
 		`kev-shadow origin=${input.originKey} help=${f(s.help)} ack=${f(s.ack)} isAnswer=${f(s.isAnswer)} ` +
-			`chatter=${f(s.chatter)} score=${f(s.score)} verdict=${s.verdict} ms=${Date.now() - started}`,
+			`chatter=${f(s.chatter)} score=${f(s.score)} verdict=${s.verdict} addressed=${input.addressed ? 1 : 0} ` +
+			`ms=${Date.now() - started}`,
 	);
 }

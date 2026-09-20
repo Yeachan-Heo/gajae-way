@@ -70,3 +70,40 @@ test("verdict bands are ordered and exhaustive", () => {
 	expect(shadowScore([0.4, 0, 0, 0], false).verdict).toBe("would-defer");
 	expect(shadowScore([0.9, 0, 0, 0], false).verdict).toBe("would-engage");
 });
+
+test("the log line separates addressed traffic from ambient traffic", async () => {
+	const server = Bun.serve({
+		port: 0,
+		fetch: () =>
+			Response.json({
+				probs: [
+					[0.8, 0.2],
+					[0.5, 0.5],
+					[0.5, 0.5],
+					[0.6, 0.4],
+				],
+			}),
+	});
+	const savedUrl = process.env.KEV_SHADOW_URL;
+	process.env.KEV_SHADOW_URL = `http://127.0.0.1:${server.port}`;
+	const lines: string[] = [];
+	const error = console.error;
+	console.error = (line: unknown) => {
+		lines.push(String(line));
+	};
+	try {
+		await recordKevShadow({ originKey: "discord:c1", text: "잘되냐 이제", addressed: true });
+		await recordKevShadow({ originKey: "discord:c1", text: "ㅋㅋㅋ" });
+	} finally {
+		console.error = error;
+		if (savedUrl === undefined) {
+			delete process.env.KEV_SHADOW_URL;
+		} else process.env.KEV_SHADOW_URL = savedUrl;
+		server.stop(true);
+	}
+	expect(lines).toHaveLength(2);
+	// A direct question scoring would-skip is exactly the case that must stay visible.
+	expect(lines[0]).toContain("addressed=1");
+	expect(lines[0]).toContain("verdict=would-skip");
+	expect(lines[1]).toContain("addressed=0");
+});
