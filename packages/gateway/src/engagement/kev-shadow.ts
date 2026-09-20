@@ -23,9 +23,13 @@ const URL_ENV = "KEV_SHADOW_URL";
 const TOKEN_ENV = "KEV_SHADOW_TOKEN";
 const TIMEOUT_MS = Number(process.env.KEV_SHADOW_TIMEOUT_MS ?? 5000);
 
-// Thresholds mirror the offline harness so shadow verdicts are comparable to it.
+// Fitted on this deployment's traffic (24 real messages, 12 addressed to the bot
+// in #dev-main and 12 ambient community messages, each judged with 16 turns of
+// its own real history): help on answer-me messages ran 0.662..0.820, on ambient
+// 0.024..0.391. Any cut in between separates them completely; the band keeps a
+// defer zone rather than pretending the edge is sharp.
 const ENGAGE_AT = Number(process.env.KEV_SHADOW_ENGAGE_AT ?? 0.6);
-const SKIP_UNDER = Number(process.env.KEV_SHADOW_SKIP_UNDER ?? 0.25);
+const SKIP_UNDER = Number(process.env.KEV_SHADOW_SKIP_UNDER ?? 0.45);
 
 const Q_HELP =
 	"Looking only at NEW MESSAGE: is it a concrete request for help, a bug report, a setup problem, or a specific question that someone still needs to answer?";
@@ -60,7 +64,7 @@ export function kevShadowEnabled(): boolean {
  * chat blob read a plain product question as chatter at 0.79 in the offline
  * harness. Isolating it under its own header fixed that.
  */
-export function renderShadowState(input: KevShadowInput, maxChars = 3000): string {
+export function renderShadowState(input: KevShadowInput, maxChars = 6000): string {
 	const newMessage = `${input.authorLabel ?? "user"}: ${input.text.replace(/\s+/g, " ").slice(0, 500)}`;
 	const earlier = (input.earlier ?? []).join("\n") || "(no earlier messages)";
 	const budget = Math.max(maxChars - newMessage.length - 64, 0);
@@ -69,17 +73,27 @@ export function renderShadowState(input: KevShadowInput, maxChars = 3000): strin
 }
 
 /**
- * `ack` and `isAnswer` both presuppose a prior turn. With no earlier context the
- * model still scored isAnswer 0.73 on a standalone product question, so those
- * vetoes are gated on the fact rather than trusted unconditionally.
+ * `help` alone decides; `ack`, `isAnswer` and `chatter` are recorded as
+ * diagnostics only.
+ *
+ * The vetoes existed to rescue a context-free probe, where `help` was too weak
+ * to separate anything. Once the message is judged with its real history, `help`
+ * separates the two populations completely (0.662..0.820 answer-me vs
+ * 0.024..0.391 ambient) and the vetoes only do damage: they fire on the prior
+ * turns they were given and crushed true positives to 0.083. Measured, not
+ * assumed - the same 24 messages score 24/24 on help alone and lose 4 with the
+ * vetoes applied.
  */
-export function shadowScore(
-	probs: readonly number[],
-	hasContext: boolean,
-): { help: number; ack: number; isAnswer: number; chatter: number; score: number; verdict: string } {
+export function shadowScore(probs: readonly number[]): {
+	help: number;
+	ack: number;
+	isAnswer: number;
+	chatter: number;
+	score: number;
+	verdict: string;
+} {
 	const [help = 0, ack = 0, isAnswer = 0, chatter = 0] = probs;
-	const veto = hasContext ? Math.max(ack, isAnswer, chatter) : chatter;
-	const score = help * (1 - Math.max(0, veto - 0.5) * 2);
+	const score = help;
 	const verdict = score < SKIP_UNDER ? "would-skip" : score >= ENGAGE_AT ? "would-engage" : "would-defer";
 	return { help, ack, isAnswer, chatter, score, verdict };
 }
@@ -126,11 +140,11 @@ export async function recordKevShadow(input: KevShadowInput): Promise<void> {
 	const started = Date.now();
 	const probs = await probe(renderShadowState(input));
 	if (!probs) return;
-	const s = shadowScore(probs, (input.earlier?.length ?? 0) > 0);
+	const s = shadowScore(probs);
 	const f = (n: number) => n.toFixed(4);
 	console.error(
 		`kev-shadow origin=${input.originKey} help=${f(s.help)} ack=${f(s.ack)} isAnswer=${f(s.isAnswer)} ` +
 			`chatter=${f(s.chatter)} score=${f(s.score)} verdict=${s.verdict} addressed=${input.addressed ? 1 : 0} ` +
-			`ms=${Date.now() - started}`,
+			`ctx=${input.earlier?.length ?? 0} ms=${Date.now() - started}`,
 	);
 }
