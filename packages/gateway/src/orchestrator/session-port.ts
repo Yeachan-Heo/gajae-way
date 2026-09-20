@@ -140,6 +140,8 @@ export interface SessionSendInput {
 	readonly systemPreamble?: string;
 	readonly model?: GjcModelSelection;
 	readonly codingRegister?: boolean;
+	/** How long a `busy` refusal is retried before it surfaces as a failure. */
+	readonly busyWaitMs?: number;
 }
 
 export interface SessionSteerInput {
@@ -250,6 +252,15 @@ export const MAX_POISONED_CREATE_ROTATIONS = 3;
 function createRotationMetaKey(originKey: string): string {
 	return `create_rotation:${originKey}`;
 }
+/**
+ * The runtime refuses `turn.prompt` with `busy` while a previous turn on the
+ * same session is still running. That is occupancy, not failure: the prompt
+ * was never accepted and the op-ref is still unused. Wait for the session to
+ * go idle (bounded) and resend under the same op-ref before giving up.
+ */
+export const SESSION_BUSY_CODE = "busy";
+const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
+const BUSY_POLL_MS = 2_000;
 
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
@@ -620,12 +631,28 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
-		return await sendPrompt(this.#controller(input.repo), {
+		const prompt = {
 			sessionId: input.sessionId,
 			text: renderPrompt(input.systemPreamble, input.text),
 			taskKey: "gateway",
 			opRef: input.opRef,
-		});
+		};
+		const controller = this.#controller(input.repo);
+		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+		let waited = false;
+		for (;;) {
+			try {
+				return await sendPrompt(controller, prompt);
+			} catch (error) {
+				if (!isSessionBusy(error)) throw error;
+				if (this.#now() >= deadline) throw error;
+				if (!waited) {
+					waited = true;
+					console.error(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
+				}
+				await this.#sleep(BUSY_POLL_MS);
+			}
+		}
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
@@ -1354,6 +1381,11 @@ function sanitizeSdkFailure(error: unknown): Error {
 		);
 	}
 	return new Error(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error");
+}
+
+/** Exact `busy` envelope code: the runtime refused the prompt because a turn is still running. */
+export function isSessionBusy(error: unknown): boolean {
+	return error instanceof GjcCliError && envelopeErrorCode(error.details) === SESSION_BUSY_CODE;
 }
 
 /**

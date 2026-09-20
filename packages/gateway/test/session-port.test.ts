@@ -915,3 +915,94 @@ for (const fixture of [
 			fixture.refused,
 		);
 	});
+
+test("send waits out a `busy` refusal and resends under the same op-ref once the turn is free", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-wait",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	const sends: string[] = [];
+	const sleeps: number[] = [];
+	let clock = 0;
+	const run: CliRunner = async (args) => {
+		if (!args.includes("send")) throw new Error(`unexpected command ${args.join(" ")}`);
+		sends.push(args[args.indexOf("--op-ref") + 1] ?? "");
+		if (sends.length < 3)
+			return {
+				exitCode: 1,
+				stdout: JSON.stringify({
+					ok: false,
+					error: { code: "busy", message: "turn.prompt is unavailable while the agent is busy" },
+				}),
+				stderr: "",
+			};
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1", commandId: "c" } }),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ run, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			sleeps.push(ms);
+			clock += ms;
+		},
+	});
+	const receipt = await port.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-busy1" });
+	expect(receipt.operationRef).toBe("gw-p-busy1");
+	expect(sends).toEqual(["gw-p-busy1", "gw-p-busy1", "gw-p-busy1"]);
+	expect(sleeps).toEqual([2_000, 2_000]);
+});
+
+test("send surfaces `busy` once the bounded wait is exhausted, never having sent", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-exhaust",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	let clock = 0;
+	let sends = 0;
+	const run: CliRunner = async () => {
+		sends++;
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({ ok: false, error: { code: "busy", message: "busy" } }),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ run, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	await expect(
+		port.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-busy2", busyWaitMs: 5_000 }),
+	).rejects.toThrow(/busy/);
+	// Attempts at 0s, 2s, 4s, 6s; the 6s refusal lands past the 5s deadline and surfaces.
+	expect(sends).toBe(4);
+});

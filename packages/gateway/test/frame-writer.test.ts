@@ -120,3 +120,22 @@ test("rejects fractional socket write counts instead of corrupting the offset", 
 	expect(writer.closed).toBe(true);
 	expect(failures[0]).toBeInstanceOf(Error);
 });
+
+test("a negative write count (peer hung up) closes quietly without a failure report", async () => {
+	const failures: unknown[] = [];
+	let closed = 0;
+	const writer = new OrderedFrameWriter(
+		{
+			write: () => -32,
+			close: () => {
+				closed++;
+			},
+		},
+		(error) => failures.push(error),
+	);
+	writer.write(response("hangup", "x"));
+	await writer.settled();
+	expect(writer.closed).toBe(true);
+	expect(closed).toBe(1);
+	expect(failures).toHaveLength(0);
+});
