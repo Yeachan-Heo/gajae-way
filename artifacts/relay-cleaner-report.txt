@@ -1,0 +1,45 @@
+AI SLOP CLEANUP REPORT
+======================
+
+Scope: git diff origin/main..5d6b48f (cumulative frozen change set, sourceHash sha256:712db96a892fc67369953e5f91d9c027f183737813cd6244f0fe09525a07c9de); src files under packages/gateway/src (boot.ts, monitors/propagate.ts, ops/cycle.ts, orchestrator/{broker,persona-session,session-port,tail-runner,test-broker,work-lane}.ts, server/server.ts, store/db.ts), packages/cli/src/main.ts, packages/protocol/src/catalog.ts, packages/admin/src/turns.ts, docs/architecture.md, docs/runbooks/gajaeway-v1.md, and the gateway test tree.
+Mode: read-only detector/report; no edits performed
+Blocking Findings: none
+Advisory Findings:
+  1. packages/gateway/src/orchestrator/tail-runner.ts:694 decodeStreamLine — category: duplication. It re-parses JSON the way ManagedTailHandle.#receiveLine already does and exists only as a test seam over decodeStreamFrame. Advisory: it is exported, documented, and exercised by relay-turn.test.ts; folding it would only move the parse into tests.
+  2. packages/gateway/src/orchestrator/persona-session.ts:45 STATUS_TERMINAL_GRACE_MS hold path — category: needless abstraction (residual). With the owned relay, agent_end and terminal status arrive on the same connection; the one-pass "hold for tail evidence" still runs for the current-turn case where status reads terminal before agent_end is delivered. It is reachable and tested (statusTerminalHolds), so it stays; revisit once live logs show the hold never fires.
+  3. packages/gateway/src/store/db.ts broker_tail_cursors table retained without accessors — category: dead schema. Intentional per the runbook rollback note (pre-relay binary can still read it); advisory only.
+Fallback Findings:
+  - session-port.request readStatus / persona #statusOf: relay-torn -> CLI `turn.result` on the SAME opRef -> grounded compatibility/fail-safe fallback -> advisory. Scoped to isRelayTransportFailure (RelayClosedError | RelayRequestTimeoutError) only; any other error still throws; failure is logged (status_relay_unavailable); primary and fallback paths both covered (session-port.test.ts torn-relay request; redteam-issue92 dead relay; relay-redteam RT04/RT06).
+  - work-lane.ts observer attach failure -> send without relay -> grounded fail-safe -> advisory. Lane never depended on streamed text for its final (turn.result is authoritative); covered by relay-redteam RT14.
+  - broker.openStream flush promise .catch(() => close()) -> grounded: the relay's end is already surfaced through `lines`; a late EPIPE only closes. Advisory. No test exercises a real backpressured FileSink (see Missing Test Findings).
+  - catch blocks added in the diff (tail-runner #request write failure -> RelayClosedError with sanitized detail; ScriptedTailHandle/test-broker enqueue-after-close) preserve or classify the error; none swallow silently.
+UI/Design Findings: N/A (no UI surface changed)
+Missing Test Findings:
+  - broker.openStream write/flush against a real Bun subprocess whose stdin is backpressured then closed -> advisory -> would require a real child; the daemon e2e (stdio-shutdown/delivery-crash) covers spawn+write+close on the fake child only.
+  - FileSink path is otherwise exercised live by relay-turn-live.e2e.test.ts (real gjc relay), which passes.
+Recursion Guard: confirmed no nested ralplan/autoresearch/deep-interview/ultragoal spawned; broad findings handed to leader
+Changed Files Reviewed:
+- packages/gateway/src/orchestrator/tail-runner.ts - reviewed
+- packages/gateway/src/orchestrator/session-port.ts - reviewed
+- packages/gateway/src/orchestrator/persona-session.ts - reviewed
+- packages/gateway/src/orchestrator/work-lane.ts - reviewed
+- packages/gateway/src/orchestrator/broker.ts - reviewed
+- packages/gateway/src/orchestrator/test-broker.ts - reviewed
+- packages/gateway/src/server/server.ts - reviewed
+- packages/gateway/src/store/db.ts - reviewed
+- packages/gateway/src/ops/cycle.ts - reviewed
+- packages/gateway/src/boot.ts - reviewed
+- packages/gateway/src/monitors/propagate.ts - reviewed
+- packages/gateway/src/server/interim-speech.ts - deleted (gate removed by design)
+- packages/cli/src/main.ts - reviewed (30m chat wait)
+- packages/protocol/src/catalog.ts - reviewed (inbound_starved gate)
+- packages/admin/src/turns.ts - no relevant edits (formatter-only)
+- docs/architecture.md, docs/runbooks/gajaeway-v1.md - reviewed
+- packages/gateway/test/** - reviewed; poll-era tests deleted with their machinery, new relay-turn/relay-redteam/relay-turn-live tests added
+
+Gate Result: PASS
+Leader Action:
+- PASS: continue to verification, architect review, and executor red-team QA.
+Remaining Risks:
+- Real-subprocess FileSink backpressure path is proven only by the live e2e, not a unit test.
+- STATUS_TERMINAL_GRACE_MS hold path may be vestigial under the owned relay; measure in production logs before removing.

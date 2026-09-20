@@ -1520,7 +1520,12 @@ class OriginActor {
 
 	async #attachTail(sessionId: string, epoch: number, retired: boolean): Promise<TailHandle> {
 		const generation = this.#manager.brokerGeneration;
-		return await this.#manager.port.attachTail({
+		// Callbacks are fenced by the handle they came from: a late callback from
+		// a handle this turn no longer holds (or a previous turn's handle on the
+		// same session) must never act on the current binding.
+		let self: TailHandle | undefined;
+		const owns = (bound: BoundTurn | undefined): bound is BoundTurn => bound !== undefined && bound.tail === self;
+		const handle = await this.#manager.port.attachTail({
 			sessionId,
 			brokerGeneration: generation,
 			repo: this.#manager.repo,
@@ -1530,27 +1535,38 @@ class OriginActor {
 			// side effects (ledger, delivery, terminal) before the next. The handle
 			// never calls back from inside a mailbox turn, so re-entrancy is safe.
 			onFrame: async (frame) => {
-				await this.enqueue(async () => await this.#onTailFrame(sessionId, epoch, generation, retired, frame));
+				await this.enqueue(async () => {
+					const bound = this.#findBound(sessionId, epoch, generation);
+					if (bound && !owns(bound)) return;
+					await this.#onTailFrame(sessionId, epoch, generation, retired, frame);
+				});
 			},
 			onRelayLost: () => {
-				void this.enqueue(async () => await this.#onRelayLost(sessionId, epoch, generation, retired, false)).catch(
-					(error: unknown) =>
-						this.#manager.log(`persona_relay_lost_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+				void this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onRelayLost(sessionId, epoch, generation, retired, false);
+				}).catch((error: unknown) =>
+					this.#manager.log(`persona_relay_lost_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
 				);
 			},
 			onRelayDead: () => {
-				void this.enqueue(async () => await this.#onRelayLost(sessionId, epoch, generation, retired, true)).catch(
-					(error: unknown) =>
-						this.#manager.log(`persona_relay_dead_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+				void this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onRelayLost(sessionId, epoch, generation, retired, true);
+				}).catch((error: unknown) =>
+					this.#manager.log(`persona_relay_dead_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
 				);
 			},
 			onStall: ({ elapsedMs }) => {
-				void this.enqueue(async () => await this.#onStall(sessionId, epoch, generation, retired, elapsedMs)).catch(
-					() => {},
-				);
+				void this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onStall(sessionId, epoch, generation, retired, elapsedMs);
+				}).catch(() => {});
 			},
 			onDiagnostic: (line) => this.#manager.log(line),
 		});
+		self = handle;
+		return handle;
 	}
 
 	/**

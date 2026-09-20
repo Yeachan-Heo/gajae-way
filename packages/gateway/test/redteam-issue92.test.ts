@@ -242,6 +242,40 @@ test("red-team: relay loss holds the accepted turn until status and turn.result 
 	}
 });
 
+test("red-team: a stale death notice from a finished turn's relay never detaches the next turn's live relay", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	const target = await fixture({ port });
+	try {
+		enqueue(target, "first-trigger", "first");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "first send missing");
+		const first = required(port.sends[0], "first send missing");
+		const firstRelay = port.tailsOf(first.sessionId)[0];
+		port.complete(first.opRef, "first answer");
+		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "first turn did not settle");
+
+		enqueue(target, "second-trigger", "second");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 2, "second send missing");
+		const second = required(port.sends[1], "second send missing");
+		expect(second.sessionId).toBe(first.sessionId);
+		// The old handle's late death notice must be ignored: it is not the
+		// current turn's handle even though session/epoch/generation all match.
+		firstRelay?.die();
+		await Bun.sleep(20);
+		expect(target.logs.filter((line) => line.includes("reason=relay_dead"))).toEqual([]);
+		// The live turn still streams and completes over its own relay.
+		port.emitAssistant(second.sessionId, "second interim");
+		port.complete(second.opRef, "second answer");
+		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "second turn did not settle");
+		expect(target.terminal).toEqual(["first answer", "second answer"]);
+		expect(target.logs.filter((line) => line.includes("terminal_status_reconciled"))).toEqual([]);
+		expect(port.sends).toHaveLength(2);
+	} finally {
+		await target.close();
+	}
+});
+
 test("red-team: a relay declared dead settles the turn from CLI status without a tick and never re-sends", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });

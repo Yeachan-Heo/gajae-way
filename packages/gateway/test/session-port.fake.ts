@@ -895,9 +895,13 @@ export class ScriptedTailHandle implements TailHandle {
 		void this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 	}
 
-	/** Simulates the relay giving up (six immediate deaths): the handle closes and will not reopen. */
+	/**
+	 * Simulates the relay giving up (six immediate deaths): the handle closes and
+	 * will not reopen. Fires even on an already-closed handle: production's
+	 * give-up runs on the runner's own loop and can land after the actor let
+	 * the handle go, which is exactly the late notice the actor must fence.
+	 */
 	die(): void {
-		if (this.#closed) return;
 		void this.close();
 		void this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 	}
