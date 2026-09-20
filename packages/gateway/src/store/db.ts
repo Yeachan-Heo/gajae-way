@@ -1964,6 +1964,36 @@ export class GatewayDatabase {
 		return [...inbound, ...replies].sort((a, b) => a.at.localeCompare(b.at)).slice(-limit);
 	}
 
+	/**
+	 * Recent INBOUND messages only, oldest first, for judging one message against
+	 * what people said around it. Deliberately excludes the persona's own replies:
+	 * they are long, and measured on 14 real owner messages including them at 200
+	 * chars dropped the judge's help score from 0.730 to 0.521 median and turned 5
+	 * of 14 into false skips. Read-only - it consumes nothing and sets no floor.
+	 */
+	recentInbound(
+		originKey: string,
+		limit: number,
+		sinceIso: string,
+	): Array<{ id: string; author: string; body: string }> {
+		const state = this.#database
+			.query<{ floor_at: string | null; floor_row_id: number | null }, [string]>(
+				"SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?",
+			)
+			.get(originKey);
+		const floorAt = [state?.floor_at ?? "", sinceIso].sort().at(-1) ?? sinceIso;
+		return this.#database
+			.query<
+				{ message_id: string; author_name: string | null; author_id: string | null; body: string },
+				[string, string, number, number]
+			>(
+				"SELECT message_id, author_name, author_id, body FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
+			)
+			.all(originKey, floorAt, state?.floor_row_id ?? 0, limit)
+			.map((row) => ({ id: row.message_id, author: row.author_name ?? row.author_id ?? "unknown", body: row.body }))
+			.reverse();
+	}
+
 	contextWindow(
 		originKey: string,
 		triggerMessageId: string,

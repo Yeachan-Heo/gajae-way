@@ -1333,13 +1333,13 @@ async function sendChat(
 		text: userText,
 		// Judged context-free, a short follow-up ("잘되냐 이제") reads as chatter: the
 		// question it continues is not in the text. The same message with its real
-		// history scores 0.24 -> 0.73. This is the same window the turn itself would
-		// read, including the persona's own replies, and it is read-only.
+		// history scores 0.24 -> 0.80. What people said, not what this bot answered:
+		// its own replies are walls of text and including them cost 5 of 14 real
+		// owner messages a false skip.
 		earlier: nonLoopback
 			? options.database
-					.recentConversation(
+					.recentInbound(
 						key,
-						origin.conversationId,
 						KEV_SHADOW_CONTEXT_TURNS,
 						new Date(Date.now() - KEV_SHADOW_CONTEXT_WINDOW_MS).toISOString(),
 					)
