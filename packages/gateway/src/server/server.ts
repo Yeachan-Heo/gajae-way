@@ -34,6 +34,7 @@ import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
+import { recordKevShadow } from "../engagement/kev-shadow";
 import { BotAudienceTurnGuard, decideEngagement, threadFollowUpEngaged } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
@@ -1317,6 +1318,14 @@ async function sendChat(
 		});
 		return;
 	}
+	// Shadow-only measurement of a value gate on top of the authority decision.
+	// Deliberately not awaited: this turn must not wait on a model call, and the
+	// probe can never change `engaged`. No-op unless KEV_SHADOW_URL is set.
+	void recordKevShadow({
+		originKey: key,
+		text: userText,
+		authorLabel: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+	});
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
