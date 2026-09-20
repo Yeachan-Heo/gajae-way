@@ -34,7 +34,7 @@ import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
-import { recordKevShadow } from "../engagement/kev-shadow";
+import { kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
 import { BotAudienceTurnGuard, decideEngagement, threadFollowUpEngaged } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
@@ -1288,7 +1288,14 @@ async function sendChat(
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as
-		| { mentioned?: boolean; authorId?: string; authorName?: unknown; replyTo?: { fromSelf?: boolean } }
+		| {
+				mentioned?: boolean;
+				authorId?: string;
+				authorName?: unknown;
+				channelLabel?: string;
+				serverLabel?: string;
+				replyTo?: { fromSelf?: boolean };
+		  }
 		| undefined;
 	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
 	const addressedBotAudienceDecline =
@@ -1328,30 +1335,46 @@ async function sendChat(
 	// Shadow-only measurement of a value gate on top of the authority decision.
 	// Deliberately not awaited: this turn must not wait on a model call, and the
 	// probe can never change `engaged`. No-op unless KEV_SHADOW_URL is set.
-	void recordKevShadow({
-		originKey: key,
-		text: userText,
+	if (kevShadowEnabled()) {
+		// A DM, an @mention, or a reply to this bot is traffic aimed at it, and which of
+		// the three it is changes how a short message reads.
+		const addressedBy =
+			origin.kind === "dm"
+				? "dm"
+				: engagement?.mentioned === true
+					? "mention"
+					: engagement?.replyTo?.fromSelf === true
+						? "reply"
+						: undefined;
 		// Judged context-free, a short follow-up ("잘되냐 이제") reads as chatter: the
 		// question it continues is not in the text. The same message with its real
 		// history scores 0.24 -> 0.80. What people said, not what this bot answered:
 		// its own replies are walls of text and including them cost 5 of 14 real
-		// owner messages a false skip.
-		earlier: nonLoopback
+		// owner messages a false skip (#243).
+		const earlier = nonLoopback
 			? options.database
 					.recentInbound(
 						key,
 						KEV_SHADOW_CONTEXT_TURNS,
 						new Date(Date.now() - KEV_SHADOW_CONTEXT_WINDOW_MS).toISOString(),
 					)
-					.filter((entry) => entry.id !== inboundMessageId)
-					.map((entry) => `${entry.author}: ${entry.body.replace(/\s+/g, " ").slice(0, 200)}`)
-			: [],
-		authorLabel: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
-		// A DM, an @mention, or a reply to this bot is traffic aimed at it. Kept as a
-		// log field so the shadow can be read as two populations instead of one.
-		addressed: origin.kind === "dm" || engagement?.mentioned === true || engagement?.replyTo?.fromSelf === true,
-		authorIsBot,
-	});
+					// The message under judgement was just recorded as context above.
+					.filter((entry) => entry.id === undefined || entry.id !== inboundMessageId)
+					.map((entry) => ({ author: entry.author, body: entry.body, at: entry.at }))
+			: [];
+		void recordKevShadow({
+			originKey: key,
+			text: userText,
+			authorLabel: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+			place:
+				[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
+				`${origin.platform} ${origin.kind}`,
+			earlier,
+			addressed: addressedBy !== undefined,
+			...(addressedBy ? { addressedBy } : {}),
+			authorIsBot,
+		});
+	}
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
