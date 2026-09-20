@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
+import { formatFailureNotice } from "../src/orchestrator/rebind";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
@@ -63,6 +64,7 @@ async function harness(
 		retired?: () => void;
 		released?: (opRef: string) => void;
 		failure?: (message: string) => void;
+		failureError?: (error: Error) => void;
 	} = {},
 	log?: (line: string) => void,
 	extra: { brokerGeneration?: () => number } = {},
@@ -82,7 +84,10 @@ async function harness(
 			return {
 				text: trigger.body,
 				onTerminal: ({ text }) => hooks.terminal?.(text),
-				onFailure: ({ error }) => hooks.failure?.(error.message),
+				onFailure: ({ error }) => {
+					hooks.failure?.(error.message);
+					hooks.failureError?.(error);
+				},
 				onRetired: () => hooks.retired?.(),
 				onReleased: ({ turn: released }) => hooks.released?.(released.opRef),
 			};
@@ -324,6 +329,51 @@ test("a message admitted while a persistent turn is running becomes an operator-
 		() => database?.inboundTurnRow(latestOpRef)?.turn_state === "done",
 		"accepted turn did not reconcile terminal",
 	);
+});
+
+// gajae-code redacts a post-start failure's message to one fixed sentence, so
+// the runtime code is the entire diagnosis. Six lost turns on one host produced
+// six identical code-free lines (#244); the code is what tells them apart.
+test("a post-start prompt failure delivers the runtime's code and logs its bounded classifiers", async () => {
+	const port = new ScriptedSessionPort();
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
+	enqueue("post-start-failure", "work that failed after it started");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	port.fail(first.opRef, "Agent run failed after execution started.", {
+		code: "prompt_failed",
+		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
+	});
+	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle");
+	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
+	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
+	expect(notices[0]).not.toContain("/new");
+	expect(logs.find((line) => line.startsWith("terminal_failure "))).toContain(
+		"code=prompt_failed provider_code=unknown phase=post_start category=agent_runtime provenance=agent_failed",
+	);
+});
+
+test("a rebindable post-start code keeps its /new hint, and a codeless failure still has a diagnosis", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const notices: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
+	enqueue("rebindable-failure", "first");
+	await manager!.notifyInbound(KEY);
+	port.fail(port.sends[0]!.opRef, "Agent run failed after execution started.", { code: "spawn_failed" });
+	await eventually(() => notices.length === 1, "rebindable failure did not reach the lifecycle");
+	expect(notices[0]).toBe(
+		"[turn failed] spawn_failed: Agent run failed after execution started. Send /new to rebind this conversation.",
+	);
+
+	enqueue("codeless-failure", "second");
+	await manager!.notifyInbound(KEY);
+	const second = port.sends[1]!;
+	// A child killed mid-write reports neither code nor message.
+	port.fail(second.opRef, "");
+	await eventually(() => notices.length === 2, "codeless failure did not reach the lifecycle");
+	expect(notices[1]).toBe("[turn failed] session status failed");
 });
 
 test("failed notice must persist before reset completion and may retry without replaying the prompt", async () => {
