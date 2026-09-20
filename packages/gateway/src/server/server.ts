@@ -1282,7 +1282,9 @@ async function sendChat(
 	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
-	const engagement = params.engagement as { mentioned?: boolean; authorId?: string; authorName?: unknown } | undefined;
+	const engagement = params.engagement as
+		| { mentioned?: boolean; authorId?: string; authorName?: unknown; replyTo?: { fromSelf?: boolean } }
+		| undefined;
 	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
 	const addressedBotAudienceDecline =
 		botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp);
@@ -1325,6 +1327,9 @@ async function sendChat(
 		originKey: key,
 		text: userText,
 		authorLabel: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+		// A DM, an @mention, or a reply to this bot is traffic aimed at it. Kept as a
+		// log field so the shadow can be read as two populations instead of one.
+		addressed: origin.kind === "dm" || engagement?.mentioned === true || engagement?.replyTo?.fromSelf === true,
 	});
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
