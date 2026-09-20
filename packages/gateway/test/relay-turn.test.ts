@@ -58,6 +58,11 @@ class FakeRelay implements SessionRelayStream {
 		this.#push(JSON.stringify(frame));
 	}
 
+	/** A raw (non-JSON) line, as an older gjc prints its uncaught refusal. */
+	hostLine(line: string): void {
+		this.#push(line);
+	}
+
 	/** The relay process ends (host hangup / crash). */
 	end(): void {
 		this.#push(null);
@@ -449,6 +454,17 @@ test("a serve refusal envelope (endpoint_stale) rejects attach as session_unavai
 	const relay = new FakeRelay("connection:1", { hello: false });
 	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
 	relay.host({ ok: false, error: { code: "endpoint_stale", message: "session s1 endpoint is not live" } });
+	relay.end();
+	const error = await attach.catch((e: unknown) => e);
+	expect(error).toBeInstanceOf(RelayRefusedError);
+	expect((error as RelayRefusedError).code).toBe("session_unavailable");
+});
+
+test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: …') rejects attach as session_unavailable", async () => {
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+	relay.hostLine("[Uncaught Exception] Error: endpoint_stale: session s1 endpoint is not live");
+	relay.hostLine("    at BEh (/$bunfs/root/gjc-darwin-arm64:29876:2324)");
 	relay.end();
 	const error = await attach.catch((e: unknown) => e);
 	expect(error).toBeInstanceOf(RelayRefusedError);
