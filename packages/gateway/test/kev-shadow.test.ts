@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { kevShadowEnabled, recordKevShadow, renderShadowState, shadowScore } from "../src/engagement/kev-shadow";
+import {
+	kevShadowEnabled,
+	recordKevShadow,
+	renderShadowState,
+	shadowClass,
+	shadowScore,
+} from "../src/engagement/kev-shadow";
 
 test("disabled unless KEV_SHADOW_URL is set, so an unconfigured deploy is a no-op", async () => {
 	const saved = process.env.KEV_SHADOW_URL;
@@ -144,4 +150,14 @@ test("earlier turns are rendered oldest-first under the context header and count
 	// evidence about the gate, it is evidence the caller starved it.
 	expect(lines[0]).toContain("ctx=2");
 	expect(lines[0]).toContain("verdict=would-engage");
+});
+
+test("a cron self-prompt is its own class, not addressed traffic", () => {
+	// The follow-up posts mention this bot, so `addressed` alone would file them
+	// with the owner's questions and a promoted gate would skip every sweep.
+	expect(
+		shadowClass({ originKey: "d:c", text: "🔄 [clawhip] Follow-up <@bot>", addressed: true, authorIsBot: true }),
+	).toBe("machine");
+	expect(shadowClass({ originKey: "d:c", text: "잘되냐이제", addressed: true })).toBe("addressed");
+	expect(shadowClass({ originKey: "d:c", text: "ㅋㅋㅋ" })).toBe("ambient");
 });
