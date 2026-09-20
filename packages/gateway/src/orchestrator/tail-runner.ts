@@ -31,7 +31,15 @@ export type TailEventKind =
 	| "tool_execution_update"
 	| "tool_execution_end"
 	| "activity"
+	| "progress"
 	| "unknown";
+
+/**
+ * Host event names the gateway knowingly carries no semantics for. They are
+ * expected traffic, so they must never be reported as unrecognized:
+ * `unknown_runtime_event` is reserved for a genuine relay/protocol gap.
+ */
+const PROGRESS_EVENT_KINDS: ReadonlySet<string> = new Set(["message_update"]);
 
 export interface TailFrame {
 	readonly kind: TailEventKind;
@@ -783,8 +791,16 @@ function decodeEvent(kind: string, event: Record<string, unknown>, correlation: 
 			idle: false,
 		};
 	}
-	// message_update (streaming deltas) and anything else: progress only.
-	return { kind: "unknown", rawKind: kind, ...correlation, payload: {}, steerEcho: false, idle: false };
+	// message_update (streaming deltas): known progress, no semantics. Anything
+	// else is a frame this gateway does not understand and must be diagnosed.
+	return {
+		kind: PROGRESS_EVENT_KINDS.has(kind) ? "progress" : "unknown",
+		rawKind: kind,
+		...correlation,
+		payload: {},
+		steerEcho: false,
+		idle: false,
+	};
 }
 
 /**
