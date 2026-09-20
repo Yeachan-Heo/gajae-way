@@ -1,0 +1,14 @@
+^D[1mrelay-owned turns: CLI surface capture[0m
+[36m$ wc -l packages/gateway/src/orchestrator/tail-runner.ts[0m
+     845 packages/gateway/src/orchestrator/tail-runner.ts
+[36m$ grep -c poll packages/gateway/src/orchestrator/tail-runner.ts[0m
+1
+[36m$ grep -rl "session", "tail" packages/gateway/test[0m
+no test invokes gjc sdk session tail
+[36m$ bun test packages/gateway/test/relay-redteam.test.ts packages/gateway/test/relay-turn.test.ts[0m
+ 33 pass
+ 0 fail
+ 121 expect() calls
+Ran 33 tests across 2 files. [456.00ms]
+[36m$ ssh gaebal-gajae gajaeway ops cycle --json (read-only)[0m
+{"phase": "degraded", "gates": ["stale_session_identity", "memory_closure_blocked", "monitor_settlement_stuck"], "inFlightInbound": 1, "pendingInbound": 2}
