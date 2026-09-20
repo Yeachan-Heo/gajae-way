@@ -1975,7 +1975,7 @@ export class GatewayDatabase {
 		originKey: string,
 		limit: number,
 		sinceIso: string,
-	): Array<{ id: string; author: string; body: string }> {
+	): Array<{ id: string; at: string; author: string; body: string }> {
 		const state = this.#database
 			.query<{ floor_at: string | null; floor_row_id: number | null }, [string]>(
 				"SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?",
@@ -1984,13 +1984,24 @@ export class GatewayDatabase {
 		const floorAt = [state?.floor_at ?? "", sinceIso].sort().at(-1) ?? sinceIso;
 		return this.#database
 			.query<
-				{ message_id: string; author_name: string | null; author_id: string | null; body: string },
+				{
+					message_id: string;
+					author_name: string | null;
+					author_id: string | null;
+					body: string;
+					received_at: string;
+				},
 				[string, string, number, number]
 			>(
-				"SELECT message_id, author_name, author_id, body FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
+				"SELECT message_id, author_name, author_id, body, received_at FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
 			)
 			.all(originKey, floorAt, state?.floor_row_id ?? 0, limit)
-			.map((row) => ({ id: row.message_id, author: row.author_name ?? row.author_id ?? "unknown", body: row.body }))
+			.map((row) => ({
+				id: row.message_id,
+				at: row.received_at,
+				author: row.author_name ?? row.author_id ?? "unknown",
+				body: row.body,
+			}))
 			.reverse();
 	}
 
