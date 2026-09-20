@@ -401,7 +401,11 @@ for (const outcome of ["accepted", "refused"] as const) {
 		// No new message or keyed tick: the held-only origin must be enumerated at boot.
 		await manager.recover();
 		expect(port.attempts).toHaveLength(attemptsBeforeRecovery + 1);
-		expect(port.attempts.at(-1)).toEqual(originalAttempt);
+		// The replay carries the SAME clientRef/session/text; only the transport
+		// differs (the original rode the turn's relay, recovery has none).
+		const { relay: _originalRelay, ...originalRequest } = originalAttempt;
+		const { relay: _replayRelay, ...replayRequest } = port.attempts.at(-1)!;
+		expect(replayRequest).toEqual(originalRequest);
 		expect(originalAttempt.sessionId).toBe(running.sessionId);
 		expect(database.inboundSteersHeld(running.opRef)).toEqual([]);
 		expect(database.inboundHeldSteerOrigins()).toEqual([]);

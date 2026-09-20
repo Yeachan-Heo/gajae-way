@@ -570,21 +570,12 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 	}
 });
 
-/**
- * The live off-by-one (2026-09-03 07:45-07:47 UTC): every reply carried the
- * PREVIOUS turn's answer. A turn ends, the tail re-attaches cursorless
- * (tail_gap_nonstrict resync=null), the resync replays transcript rows from
- * before the turn, those rows carry no opRef so the attribution fence cannot
- * drop them, `lastAssistantText` is overwritten, and onTerminal ships it under
- * the current trigger.
- */
-test("a cursorless resync replaying the previous turn's transcript row never becomes the current turn's reply", async () => {
+test("a foreign turn's answer cannot replace the current turn's result-only terminal reply", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-offbyone-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
-	const logs: string[] = [];
 	const manager = new PersonaSessionManager({
 		database,
 		port,
@@ -596,9 +587,7 @@ test("a cursorless resync replaying the previous turn's transcript row never bec
 				terminals.push({ trigger: turn.triggerMessageId, text });
 			},
 		}),
-		log: (line) => {
-			logs.push(line);
-		},
+		log: () => {},
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
@@ -615,89 +604,27 @@ test("a cursorless resync replaying the previous turn's transcript row never bec
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first turn was not sent");
 		const first = port.sends[0]!;
-		const firstAnsweredAt = Date.now();
 		port.complete(first.opRef, "처리돼서 새 빌드로 올라왔습니다");
 		await eventually(() => terminals.length === 1, "first reply missing");
 
-		// Fixture time must clear the 2s clock-skew slack under the next turn's floor.
-		await Bun.sleep(2_100);
 		enqueue("m-o2", "오ㅠ이제 그럼 실전이냐");
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "second turn was not sent");
 		const second = port.sends[1]!;
 		expect(second.sessionId).toBe(first.sessionId);
-		// The cursorless re-attach replays the PREVIOUS turn's durable row: no
-		// opRef, host ts from before this turn's dispatch.
-		port.emitReplayedTranscriptRow(second.sessionId, "처리돼서 새 빌드로 올라왔습니다", firstAnsweredAt);
-		await eventually(
-			() => logs.some((line) => line.startsWith("tail_frame_pre_turn")),
-			"replayed pre-turn row was not fenced",
-		);
-		// This turn's answer lands only in the durable transcript (the live
-		// answer frame was lost with the torn tail); only agent_end arrives.
+		// A completed operation on the same session cannot contribute content to this turn.
+		port.emitAssistant(second.sessionId, "처리돼서 새 빌드로 올라왔습니다", "foreign-answer", first.opRef);
+		// No owned answer frame arrives; the answer is recovered from this operation's turn.result.
 		port.completeWithoutAnswerFrame(second.opRef, "네 형님, 여기 있습니다 🦞");
 		await eventually(() => terminals.length === 2, "second reply missing");
 		expect(terminals).toEqual([
 			{ trigger: "m-o1", text: "처리돼서 새 빌드로 올라왔습니다" },
 			{ trigger: "m-o2", text: "네 형님, 여기 있습니다 🦞" },
 		]);
-	} finally {
-		await manager.stop();
-	}
-});
-
-test("a frame attributed to the accepted op passes the turn floor even with an old host timestamp", async () => {
-	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-attributed-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
-	attachTestBrokerOwnership(database, port, join(directory, "agent"));
-	const terminals: Array<{ trigger: string; text: string }> = [];
-	const logs: string[] = [];
-	const manager = new PersonaSessionManager({
-		database,
-		port,
-		instanceId: "attributed",
-		repo: join(directory, "workspace"),
-		onTurnStart: ({ trigger, turn }) => ({
-			text: trigger.body,
-			onTerminal: ({ text }) => {
-				terminals.push({ trigger: turn.triggerMessageId, text });
-			},
-		}),
-		log: (line) => {
-			logs.push(line);
-		},
-	});
-	try {
-		expect(
-			database.inboundEnqueue({
-				messageId: "m-t1",
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body: "질문",
-				receivedAt: new Date().toISOString(),
-			}),
-		).toBe(true);
-		await manager.notifyInbound("discord/channel/chan-1");
-		await eventually(() => port.sends.length === 1, "turn was not sent");
-		const send = port.sends[0]!;
-		// Recovery lookup is unnecessary here; the tail frame is
-		// the only evidence: attributed to the op, but stamped an hour ago by a
-		// skewed host clock. Attribution wins over the timestamp floor.
-		let transcriptReads = 0;
-		port.fetchAssistantSince = async () => {
-			transcriptReads++;
-			return undefined;
-		};
-		port.emitReplayedTranscriptRow(send.sessionId, "답", Date.now() - 3_600_000, send.opRef);
-		// An un-attributed row with the same old stamp is fenced.
-		port.emitReplayedTranscriptRow(send.sessionId, "낡은 답", Date.now() - 3_600_000);
-		await eventually(() => logs.some((line) => line.startsWith("tail_frame_pre_turn")), "old row was not fenced");
-		port.completeWithoutAnswerFrame(send.opRef, "답");
-		await eventually(() => terminals.length === 1, "reply missing");
-		expect(terminals).toEqual([{ trigger: "m-t1", text: "답" }]);
-		expect(transcriptReads).toBe(0);
-		expect(port.workerOutputReads).toHaveLength(0);
+		expect(port.workerOutputReads.map((read) => read.opRef)).toEqual([second.opRef]);
+		await manager.reconcile("discord/channel/chan-1");
+		await manager.reconcile("discord/channel/chan-1");
+		expect(terminals).toHaveLength(2);
 	} finally {
 		await manager.stop();
 	}

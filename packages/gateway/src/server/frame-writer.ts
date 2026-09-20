@@ -118,7 +118,15 @@ export class OrderedFrameWriter {
 		let offset = 0;
 		while (offset < bytes.byteLength && !this.#closed) {
 			const written = this.sink.write(bytes.subarray(offset));
-			if (!Number.isInteger(written) || written < 0 || written > bytes.byteLength - offset)
+			// Bun reports a closed or reset peer as a negative errno from write()
+			// (EPIPE/ECONNRESET), not as a thrown error. That is an ordinary client
+			// hangup - the CLI closing its stdin after the final frame - so the
+			// writer closes quietly instead of reporting corrupted transport state.
+			if (Number.isInteger(written) && written < 0) {
+				this.close();
+				return;
+			}
+			if (!Number.isInteger(written) || written > bytes.byteLength - offset)
 				throw new Error(`invalid socket write count: ${written}`);
 			if (written > 0) offset += written;
 			if (offset < bytes.byteLength) await this.#waitForDrain();

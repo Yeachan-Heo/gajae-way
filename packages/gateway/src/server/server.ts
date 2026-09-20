@@ -70,7 +70,6 @@ import { DeliveryLedger } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
-import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -1572,7 +1571,6 @@ async function createInboundTurnLifecycle(
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
-	const interimSpeech = new InterimSpeechGate();
 	/**
 	 * Raw messages whose reaction tokens have already been claimed this turn. The
 	 * terminal path re-runs over text the tail already shipped as interim (to
@@ -1664,7 +1662,10 @@ async function createInboundTurnLifecycle(
 			voiceTurn,
 		);
 		for (let index = 0; index < planned.length; index++) {
-			if (deliveredParts.length >= maxTurnParts) return;
+			// The per-turn part budget bounds MID-WORK speech only. The terminal
+			// answer always records its claim: with an ungated stream a chatty turn
+			// could otherwise exhaust the budget on interims and lose its final.
+			if (source === "interim" && deliveredParts.length >= maxTurnParts) return;
 			const step = planned[index] as { body: string; replyTo?: string };
 			// Interim parts are keyed on (trigger, text, part): distinct findings get
 			// distinct rows, a replayed finding (stream backfill, id-less frame after
@@ -1751,15 +1752,17 @@ async function createInboundTurnLifecycle(
 	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
 		if (ended) return false;
 		tailActivitySeen = true;
-		if (frame.assistantText && !frame.steerEcho) {
+		// Every assistant message the owned relay delivers before the final answer
+		// is mid-work speech. The persona's own instructions decide what it says
+		// mid-turn; the gateway delivers it. The stream delivers each message
+		// once, so there is nothing to de-duplicate here.
+		if (frame.assistantText?.trim() && !frame.steerEcho) {
 			lastKnown = {
 				toolCalls: lastKnown.toolCalls,
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				const decision = interimSpeech.admit(frame.assistantText);
-				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
-				else deliverAssistantText(frame.assistantText, "interim");
+				deliverAssistantText(frame.assistantText, "interim");
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -1778,7 +1781,7 @@ async function createInboundTurnLifecycle(
 			toolCalls:
 				typeof reportedTools === "number" && Number.isFinite(reportedTools)
 					? Math.max(lastKnown.toolCalls, reportedTools)
-					: frame.payload.toolCallStarted === true || (/tool/i.test(frame.rawKind) && frame.rawKind !== "tool_activity")
+					: frame.payload.toolCallStarted === true
 						? lastKnown.toolCalls + 1
 						: lastKnown.toolCalls,
 			outputTokens:

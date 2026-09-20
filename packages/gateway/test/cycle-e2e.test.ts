@@ -98,6 +98,53 @@ test("projector reads durable rows through the database and stays fail-closed", 
 	}
 });
 
+test("starvation is judged per origin from turn_state: an old accepted trigger is busy, an old unbound row alone is starved", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-starve-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	try {
+		const key = "discord/dm/c1/peer=p1";
+		database.putSession(key, "sess-bound-000000000");
+		const old = new Date(Date.now() - 20 * 60_000).toISOString();
+		// An accepted trigger that has been running for 20 minutes is a long turn, not starvation.
+		database.inboundEnqueue({
+			messageId: "long",
+			originKey: key,
+			originRefJson: JSON.stringify(discordDm),
+			body: "x",
+			receivedAt: old,
+		});
+		database.inboundBindTurn({ messageId: "long", originKey: key, epoch: 0, opRef: "gw-p-long", sessionId: "s1" });
+		database.inboundTurnAccept("gw-p-long");
+		// A message queued behind it for 20 minutes is waiting on that turn, not stuck.
+		database.inboundEnqueue({
+			messageId: "queued",
+			originKey: key,
+			originRefJson: JSON.stringify(discordDm),
+			body: "y",
+			receivedAt: old,
+		});
+		const busy = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(busy.gates).toEqual([]);
+		expect(busy.phase).toBe("dispatching");
+		expect(busy.inFlightInbound).toBe(1);
+		// Another origin with an old unbound row and nothing in flight is stuck.
+		const other = { ...discordDm, conversationId: "c2", peerId: "p2" };
+		const otherKey = "discord/dm/c2/peer=p2";
+		database.putSession(otherKey, "sess-other-000000000");
+		database.inboundEnqueue({
+			messageId: "stuck",
+			originKey: otherKey,
+			originRefJson: JSON.stringify(other),
+			body: "z",
+			receivedAt: old,
+		});
+		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(starved.gates).toEqual(["inbound_starved"]);
+	} finally {
+		database.close();
+	}
+});
+
 test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-e2e-"));
 	const config = testConfig(directory);

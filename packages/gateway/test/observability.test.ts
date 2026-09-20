@@ -6,7 +6,7 @@ import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { noRelay, ScriptedSessionPort } from "./session-port.fake";
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
@@ -89,11 +89,7 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		).toBe(true);
 
 		const runner = new TailRunner({
-			run: async () => ({
-				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { items: [], terminal: true } }),
-				stderr: "",
-			}),
+			stream: noRelay,
 			repo: join(home, "workspace"),
 		});
 		runner.recordCompactionReceipt({ sessionId: first.sessionId, originKey, result: { started: true } });

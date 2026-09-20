@@ -6,6 +6,7 @@ import type { CliRunner } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
+import { noRelay } from "./session-port.fake";
 
 /**
  * The safety property of ending a retired session's host: the gateway may only
@@ -42,7 +43,7 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 		authority,
 		cli: run,
 		instanceId: "terminate",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});
 	// The port refuses any session it does not own (#assertOwned): register the

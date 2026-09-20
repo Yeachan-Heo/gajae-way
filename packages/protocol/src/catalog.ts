@@ -620,7 +620,8 @@ export type CycleGateReason =
 	| "memory_closure_blocked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
-	| "lane_capacity_exhausted";
+	| "lane_capacity_exhausted"
+	| "inbound_starved";
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */

@@ -20,11 +20,10 @@ import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
+	isRelayTransportFailure,
 	TailCapacityError,
 	type TailFrame,
 	type TailHandle,
-	tailFrameTimestampMs,
-	tailOperationRef,
 } from "./tail-runner";
 
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
@@ -44,11 +43,15 @@ const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
  * completes with an explicit corroboration log.
  */
 const STATUS_TERMINAL_GRACE_MS = 250;
+/** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
+const STATUS_RECHECK_MIN_MS = 250;
+const STATUS_RECHECK_MAX_MS = 5_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
  * slack: the host stamps rows and the gateway stamps dispatched_at on two
  * clocks. Same tolerance as SessionPort.fetchAssistantSince.
  */
+/** Tolerated clock skew between the host's startedAt and the gateway's dispatch stamp. */
 const TURN_FLOOR_SKEW_MS = 2_000;
 const DISPATCH_FAILURE_RETRY_MS = 2_000;
 /** Torn steer transports are replayed on the same clientRef this many times before the row is held. */
@@ -463,6 +466,7 @@ type BoundTurn = PersonaTurnIdentity & {
 	lifecycle: PersonaTurnLifecycle;
 	retired: boolean;
 	detached: boolean;
+	/** The owned relay delivered this turn's agent_end/agent_failed. */
 	tailTerminalObserved: boolean;
 	/** A consumer-visible reply closed this turn's steer window, even if terminal settlement is still arriving. */
 	replyVisible: boolean;
@@ -472,20 +476,19 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * delivered and its terminal completes the turn like a current one.
 	 */
 	answerWanted: boolean;
+	/**
+	 * The relay that owned this turn is gone (died mid-turn, or the turn was
+	 * adopted after a restart): its content will never arrive on a stream, so
+	 * terminal settlement reads status and the original result instead of
+	 * waiting on tail evidence.
+	 */
 	tailEvidenceUnavailable: boolean;
 	/** Reconcile passes that saw decidable-terminal status while tail terminal evidence was still absent. */
 	statusTerminalHolds: number;
-	/**
-	 * Last assistant text observed on the live tail for THIS turn. Only frames
-	 * attributed to the op, or un-attributed rows stamped at/after the dispatch
-	 * floor, may set it; a cursorless resync replays pre-turn transcript rows
-	 * (no opRef) and those must never become this turn's answer.
-	 */
+	/** Status rechecks scheduled for a turn whose end no relay will announce (backoff ordinal). */
+	statusRechecks: number;
+	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
-	/** True only when lastAssistantText came from a frame explicitly attributed to this turn's opRef. */
-	lastAssistantOpAttributed: boolean;
-	/** Host timestamp of lastAssistantText, for legacy frames without an opRef. */
-	lastAssistantAtMs?: number;
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
 };
@@ -761,14 +764,14 @@ class OriginActor {
 		switch (decision.action) {
 			case "observe": {
 				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
-				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true, knownTerminal);
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, knownTerminal);
 				await this.#reconcileBound(bound);
 				if (!bound.retired && this.#current === bound) await this.#steerPending();
 				return;
 			}
 			case "fresh_turn": {
 				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
-				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true, knownTerminal);
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, knownTerminal);
 				// Recovered failures use the same exact evidence and reset-next cap.
 				// The original trigger is completed, never dispatched again.
 				await this.#reconcileBound(bound);
@@ -835,7 +838,6 @@ class OriginActor {
 		turn: InboundTurn,
 		sessionId: string,
 		retired: boolean,
-		accepted: boolean,
 		knownTerminal: boolean,
 	): Promise<BoundTurn> {
 		const trigger = this.#manager.database.inboundTurnRow(turn.opRef);
@@ -851,8 +853,10 @@ class OriginActor {
 		let tail: TailHandle | undefined;
 		let detached = false;
 		try {
-			// Terminal recovery still rechecks status and original output below; a
-			// retained tail is not a prerequisite for those authoritative reads.
+			// A recovered turn was submitted by a connection this process no longer
+			// holds, so the host will not stream its content here. The relay is
+			// opened for commands (status, steer) and for the stall alarm only;
+			// terminal settlement reads status and the original result.
 			if (!knownTerminal) tail = await this.#attachTail(sessionId, turn.epoch, retired);
 		} catch (error) {
 			if (!retired || !(error instanceof TailCapacityError)) throw error;
@@ -875,13 +879,13 @@ class OriginActor {
 			tailTerminalObserved: false,
 			replyVisible: false,
 			answerWanted: false,
-			tailEvidenceUnavailable: knownTerminal,
+			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
-			lastAssistantOpAttributed: false,
+			statusRechecks: 0,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
+		tail?.beginTurn(turn.opRef);
 		tail?.setTurnRunning(true);
-		if (accepted && tail) await tail.markAccepted(turn.opRef);
 		if (retired) {
 			this.#retired.set(retiredKey(bound), bound);
 			if (detached) this.#scheduleRetiredReattach(bound);
@@ -1057,10 +1061,10 @@ class OriginActor {
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
-			lastAssistantOpAttributed: false,
+			statusRechecks: 0,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
-		await tail.beginTurn(opRef);
+		tail.beginTurn(opRef);
 		this.#current = current;
 		this.#state = "turn-running";
 		tail.setTurnRunning(true);
@@ -1122,16 +1126,17 @@ class OriginActor {
 			return;
 		}
 		try {
-			await this.#manager.port.send({
+			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
 				repo: this.#manager.repo,
 				text: lifecycle.text,
 				opRef,
+				relay: tail,
 				...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 			});
+			tail.correlate(opRef, receipt);
 			this.#manager.database.inboundTurnAccept(opRef);
-			await tail.markAccepted(opRef);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
@@ -1419,6 +1424,7 @@ class OriginActor {
 				repo: this.#manager.repo,
 				text: renderSteer(current.lifecycle.renderSteer?.(row) ?? row.body),
 				clientRef,
+				...(current.tail ? { relay: current.tail } : {}),
 			};
 			let outcome: "accepted" | "refused" | "ambiguous" = "accepted";
 			let failure: unknown;
@@ -1514,39 +1520,53 @@ class OriginActor {
 
 	async #attachTail(sessionId: string, epoch: number, retired: boolean): Promise<TailHandle> {
 		const generation = this.#manager.brokerGeneration;
-		const cursor = this.#manager.database.tailCursorGet(sessionId);
-		return await this.#manager.port.attachTail({
+		// Callbacks are fenced by the handle they came from: a late callback from
+		// a handle this turn no longer holds (or a previous turn's handle on the
+		// same session) must never act on the current binding.
+		let self: TailHandle | undefined;
+		const owns = (bound: BoundTurn | undefined): bound is BoundTurn => bound !== undefined && bound.tail === self;
+		const handle = await this.#manager.port.attachTail({
 			sessionId,
 			brokerGeneration: generation,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
-			...(cursor ? { cursor } : {}),
 			priority: retired ? "retired" : "current",
-			onCursorCommitted: async (nextCursor) => {
-				if (this.#stopped || this.#manager.stopped) return;
-				this.#manager.database.tailCursorCommit(sessionId, nextCursor);
-			},
-			// Awaited on purpose: the TailRunner commits the durable cursor only after
-			// this resolves, so ledger/delivery/terminal side effects precede the
-			// cursor. Mailbox re-entrancy is safe because TailHandle.markAccepted
-			// flushes buffered frames outside the caller's turn (see tail-runner.ts).
+			// Awaited on purpose: the handle delivers frames in order, each one's
+			// side effects (ledger, delivery, terminal) before the next. The handle
+			// never calls back from inside a mailbox turn, so re-entrancy is safe.
 			onFrame: async (frame) => {
-				await this.enqueue(async () => await this.#onTailFrame(sessionId, epoch, generation, retired, frame));
+				await this.enqueue(async () => {
+					const bound = this.#findBound(sessionId, epoch, generation);
+					if (bound && !owns(bound)) return;
+					await this.#onTailFrame(sessionId, epoch, generation, retired, frame);
+				});
 			},
-			onRetentionGap: (gap) => {
-				void this.enqueue(
-					async () => await this.#onRetentionGap(sessionId, epoch, generation, retired, gap.resync),
-				).catch((error: unknown) =>
-					this.#manager.log(`persona_retention_gap_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+			onRelayLost: () => {
+				void this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onRelayLost(sessionId, epoch, generation, retired, false);
+				}).catch((error: unknown) =>
+					this.#manager.log(`persona_relay_lost_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+				);
+			},
+			onRelayDead: () => {
+				void this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onRelayLost(sessionId, epoch, generation, retired, true);
+				}).catch((error: unknown) =>
+					this.#manager.log(`persona_relay_dead_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
 				);
 			},
 			onStall: ({ elapsedMs }) => {
-				void this.enqueue(async () => await this.#onStall(sessionId, epoch, generation, retired, elapsedMs)).catch(
-					() => {},
-				);
+				void this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onStall(sessionId, epoch, generation, retired, elapsedMs);
+				}).catch(() => {});
 			},
 			onDiagnostic: (line) => this.#manager.log(line),
 		});
+		self = handle;
+		return handle;
 	}
 
 	/**
@@ -1601,25 +1621,39 @@ class OriginActor {
 		return true;
 	}
 
-	async #onRetentionGap(
+	/**
+	 * The relay that owned the running turn died. Whatever the host streamed
+	 * while it was down is gone (content is best-effort by host contract), so
+	 * the turn settles from status and the original result; the handle itself
+	 * reopens for commands. A retired hold is left for the status reconcile.
+	 */
+	async #onRelayLost(
 		sessionId: string,
 		epoch: number,
 		brokerGeneration: number,
 		retired: boolean,
-		resync: unknown,
+		dead: boolean,
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
-		bound.tailEvidenceUnavailable = true;
-		bound.detached = true;
-		this.#manager.log(`retention_gap origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
-		this.#manager.log(
-			`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=tail_retention_gap resync=${resyncCoordinate(resync)}`,
-		);
-		if (retired || bound.retired)
+		if (dead) {
+			// The handle closed itself and will not reopen: every later status read
+			// goes through the CLI, and a later reconcile may attach a fresh relay
+			// for commands. Keeping a closed handle here made status throw forever.
+			bound.tail = undefined;
+			bound.detached = true;
+		}
+		if (!bound.tailEvidenceUnavailable) {
+			bound.tailEvidenceUnavailable = true;
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=tail_retention_gap`,
+				`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=${dead ? "relay_dead" : "relay_lost_mid_turn"}`,
 			);
+			if (retired || bound.retired)
+				this.#manager.log(
+					`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=relay_lost`,
+				);
+		}
+		await this.#reconcileBound(bound);
 	}
 
 	async #onTailFrame(
@@ -1637,26 +1671,11 @@ class OriginActor {
 				);
 			return;
 		}
-		if (this.#predatesTurn(bound, frame)) {
-			// A cursorless tail re-attach (tail_gap_nonstrict resync=null) replays
-			// transcript rows from BEFORE this turn. They carry no opRef, so the
-			// runner's attribution fence cannot catch them; their host `ts` can.
-			// Letting one through made the previous turn's answer ship under the
-			// current trigger (live, 2026-09-03: every reply one turn late).
-			this.#manager.log(
-				`tail_frame_pre_turn origin=${this.originKey} epoch=${epoch} session=${sessionId} event=${frame.eventId ?? "unidentified"}`,
-			);
-			return;
-		}
 		if ((bound.retired || retired) && !bound.answerWanted) {
 			if (frame.assistantText)
 				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
-			if (frame.assistantText && !frame.steerEcho) {
-				bound.lastAssistantText = frame.assistantText;
-				bound.lastAssistantOpAttributed = tailOperationRef(frame) === bound.turn.opRef;
-				bound.lastAssistantAtMs = tailFrameTimestampMs(frame);
-			}
+			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			const replyVisible = await bound.lifecycle.onFrame?.({ ...bound, frame });
 			if (replyVisible === true) bound.replyVisible = true;
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
@@ -1707,16 +1726,32 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * `turn.result` for a bound turn: on the owned relay when it is live, and
+	 * on the CLI (the authoritative recovery transport) when the relay is gone,
+	 * between reopens, or refuses the read. A transport failure on the relay is
+	 * never a verdict about the operation.
+	 */
+	async #statusOf(bound: BoundTurn): Promise<StatusReport> {
+		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
+		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
+		try {
+			return await this.#manager.port.status({ ...base, relay: bound.tail });
+		} catch (error) {
+			if (!isRelayTransportFailure(error)) throw error;
+			this.#manager.log(
+				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return await this.#manager.port.status(base);
+		}
+	}
+
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
 		let report: StatusReport;
 		try {
-			report = await this.#manager.port.status({
-				sessionId: bound.sessionId,
-				repo: this.#manager.repo,
-				opRef: bound.turn.opRef,
-			});
+			report = await this.#statusOf(bound);
 		} catch (error) {
 			if (this.#stopped || this.#manager.stopped) return;
 			// The broker disowning the id (session_unavailable) with the session
@@ -1743,6 +1778,9 @@ class OriginActor {
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
 			);
+			// A turn no relay will announce the end of must not wait for the 60 s
+			// sweep after one unreadable status: keep rechecking at the bounded cadence.
+			if (bound.tailEvidenceUnavailable) this.#scheduleStatusRecheck(bound);
 			return;
 		}
 		if (this.#stopped || this.#manager.stopped) return;
@@ -1789,16 +1827,20 @@ class OriginActor {
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);
-		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound") {
+		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
-			if (bound.tail) await bound.tail.markAccepted(bound.turn.opRef);
-		}
 		if (!isTerminalStatus(report.status.status)) {
 			if (bound.detached && !bound.tailEvidenceUnavailable) {
 				// A turn the user still wants answered is re-attached like the
 				// current one; only a discarded (`/new`) hold is deferred.
 				if (bound.retired && !bound.answerWanted) this.#scheduleRetiredReattach(bound);
 				else await this.#reattachCurrentTail(bound);
+			} else if (bound.tailEvidenceUnavailable) {
+				// No relay will ever announce this turn's end (adopted after a
+				// restart, relay lost, or retired by /new): status is the only
+				// terminal signal, so poll it at a bounded cadence rather than
+				// waiting for the 60 s recovery sweep.
+				this.#scheduleStatusRecheck(bound);
 			}
 			return;
 		}
@@ -1838,19 +1880,14 @@ class OriginActor {
 		}
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
-				// Normal delivery is deliberately simple: the current turn's tail is
-				// the live authority. #predatesTurn already fences cursorless replay,
-				// and op-attributed frames win over skewed timestamps. Original operation
-				// output is recovery-only when no actual tail answer survived.
+				// The owned relay is the live authority: its last assistant message
+				// for this correlation is the answer. Original operation output is
+				// recovery-only, for turns whose relay was lost or never owned.
 				const startedAt = report.status.startedAt;
 				const notBeforeMs =
 					typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : bound.dispatchedAtMs;
 				const port = this.#manager.port;
-				const tailTextIsCurrent =
-					bound.lastAssistantOpAttributed ||
-					bound.lastAssistantAtMs === undefined ||
-					(bound.dispatchedAtMs !== undefined && bound.lastAssistantAtMs >= bound.dispatchedAtMs);
-				let text = bound.tailTerminalObserved && tailTextIsCurrent ? bound.lastAssistantText : undefined;
+				let text = bound.tailTerminalObserved ? bound.lastAssistantText : undefined;
 				if (text === undefined && notBeforeMs !== undefined) {
 					const epoch = this.#epoch();
 					const generation = this.#manager.brokerGeneration;
@@ -1988,6 +2025,7 @@ class OriginActor {
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
 		bound.tail?.setTurnRunning(false);
+		this.#clearRetiredReattach(bound);
 		try {
 			await bound.tail?.close();
 		} catch (error) {
@@ -2047,13 +2085,22 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * A reopened relay is a fresh connection: the host streams the running
+	 * turn's content only to the connection that submitted it, so a reattached
+	 * handle carries commands and the stall alarm, never this turn's content.
+	 */
 	async #reattachCurrentTail(bound: BoundTurn): Promise<void> {
 		const tail = await this.#attachTail(bound.sessionId, bound.epoch, false);
 		bound.tail = tail;
 		bound.brokerGeneration = this.#manager.brokerGeneration;
 		bound.detached = false;
+		bound.tailEvidenceUnavailable = true;
+		tail.beginTurn(bound.turn.opRef);
 		tail.setTurnRunning(true);
-		await tail.markAccepted(bound.turn.opRef);
+		// Nothing on this handle will ever announce the turn's end: settle it from
+		// status now and on every later sweep instead of waiting for content.
+		await this.#reconcileBound(bound);
 	}
 
 	#scheduleRetiredReattach(bound: BoundTurn, attempt = 0): void {
@@ -2074,8 +2121,9 @@ class OriginActor {
 					bound.tail = tail;
 					bound.brokerGeneration = this.#manager.brokerGeneration;
 					bound.detached = false;
+					bound.tailEvidenceUnavailable = true;
+					tail.beginTurn(bound.turn.opRef);
 					tail.setTurnRunning(true);
-					await tail.markAccepted(bound.turn.opRef);
 				} catch (error) {
 					if (error instanceof TailCapacityError) {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
@@ -2084,17 +2132,41 @@ class OriginActor {
 					this.#manager.log(
 						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
 					);
+					return;
 				}
+				// A reopened relay never carries the retired turn's content; its
+				// terminal is read from status, starting now.
+				await this.#reconcileBound(bound);
 			}).catch(() => {});
 		}, RETIRED_REATTACH_DELAY_MS);
 		this.#retiredReattachTimers.set(key, timer);
 	}
 
 	#clearRetiredReattach(bound: BoundTurn): void {
-		const key = retiredKey(bound);
-		const timer = this.#retiredReattachTimers.get(key);
-		if (timer !== undefined) this.#manager.cancel(timer);
-		this.#retiredReattachTimers.delete(key);
+		for (const key of [retiredKey(bound), `status:${retiredKey(bound)}`]) {
+			const timer = this.#retiredReattachTimers.get(key);
+			if (timer !== undefined) this.#manager.cancel(timer);
+			this.#retiredReattachTimers.delete(key);
+		}
+	}
+
+	/** Bounded status poll for a turn no relay will ever announce the end of; one timer per turn, backing off. */
+	#scheduleStatusRecheck(bound: BoundTurn): void {
+		const key = `status:${retiredKey(bound)}`;
+		if (this.#retiredReattachTimers.has(key)) return;
+		const delay = Math.min(STATUS_RECHECK_MAX_MS, STATUS_RECHECK_MIN_MS * 2 ** bound.statusRechecks);
+		bound.statusRechecks += 1;
+		const timer = this.#manager.schedule(() => {
+			this.#retiredReattachTimers.delete(key);
+			if (this.#stopped || this.#manager.stopped) return;
+			void this.enqueue(async () => {
+				if (this.#current !== bound && this.#retired.get(retiredKey(bound)) !== bound) return;
+				await this.#reconcileBound(bound);
+			}).catch((error: unknown) =>
+				this.#manager.log(`persona_status_recheck_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+			);
+		}, delay);
+		this.#retiredReattachTimers.set(key, timer);
 	}
 
 	/**
@@ -2131,19 +2203,6 @@ class OriginActor {
 		const dispatchedAt = this.#manager.database.inboundTurnDispatchedAt(opRef);
 		const at = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
 		return Number.isFinite(at) ? at : undefined;
-	}
-
-	/**
-	 * An un-attributed transcript row stamped before this turn's dispatch floor
-	 * is history replayed by a cursorless resync, not this turn's output. A
-	 * frame attributed to the accepted op is always this turn's, and a frame
-	 * with no host timestamp (live lifecycle frames) cannot be judged and passes.
-	 */
-	#predatesTurn(bound: BoundTurn, frame: TailFrame): boolean {
-		if (bound.dispatchedAtMs === undefined) return false;
-		if (tailOperationRef(frame) === bound.turn.opRef) return false;
-		const at = tailFrameTimestampMs(frame);
-		return at !== undefined && at + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs;
 	}
 
 	#findBound(sessionId: string, epoch: number, brokerGeneration: number): BoundTurn | undefined {
@@ -2258,7 +2317,7 @@ export function renderSteer(body: string): string {
  * envelope or a thrown transport error is not: the steer may or may not have
  * been recorded, and only a clientRef replay can tell.
  */
-function isDefinitiveSteerRejection(error: unknown): boolean {
+export function isDefinitiveSteerRejection(error: unknown): boolean {
 	if (!(error instanceof GjcCliError) || error.exitCode !== 0) return false;
 	const details = error.details as { code?: unknown; refused?: unknown } | undefined;
 	return (
@@ -2281,16 +2340,6 @@ function sdkStatusErrorCode(error: unknown): string | undefined {
 	if (typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code)) return code;
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable/.test(message) ? "session_unavailable" : undefined;
-}
-
-function resyncCoordinate(value: unknown): string {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return "unavailable";
-	const coordinate = value as { revision?: unknown; generation?: unknown; seq?: unknown };
-	return [coordinate.revision, coordinate.generation, coordinate.seq].every(
-		(part) => typeof part === "number" && Number.isSafeInteger(part) && part >= 0,
-	)
-		? `${coordinate.revision}:${coordinate.generation}:${coordinate.seq}`
-		: "unavailable";
 }
 
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */

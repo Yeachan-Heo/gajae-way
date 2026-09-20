@@ -8,10 +8,11 @@ import {
 	type OriginRef,
 	originKey,
 } from "@gajae-gateway/protocol";
+import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
-import type { SessionPort } from "../orchestrator/session-port";
+import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
 import type { GatewayDatabase } from "../store/db";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
 import {
@@ -52,6 +53,9 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 type DispatchFailureCode =
 	| "session_bind_failed"
 	| "authoring_turn_failed"
+	// The runtime still had a turn running on the authoring session after the
+	// bounded busy wait. Nothing was sent; the event is replayed as-is.
+	| "session_busy"
 	// Context-class authoring failure: empty response, context-length rejection
 	// or a zero-token completion. Distinct from `authoring_response_invalid`
 	// because only this class is evidence that compaction did not happen.
@@ -607,7 +611,6 @@ export class MonitorPropagator {
 						originKey: sessionOriginKey,
 						text: prompt,
 						opRef,
-						observeTail: false,
 					})
 				).assistant.text;
 				dispatchPhase = "validate";
@@ -742,7 +745,7 @@ export class MonitorPropagator {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
 				const failureClass = classifyAuthoringFailure(error);
-				const code: DispatchFailureCode = failureCode(error, failureClass);
+				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
 				for (const row of leased) {
 					this.#database.monitorEventFencedFail(
 						row.event_id,
@@ -1003,7 +1006,7 @@ export class MonitorPropagator {
 	}
 }
 
-function failureCode(error: unknown, failureClass: AuthoringFailureClass): DispatchFailureCode {
+function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
 	// Context exhaustion outranks the phase codes: it is the one class the safety
 	// net acts on, and an operator must be able to see it in the event row.
 	if (failureClass === "context") return "authoring_context_exhausted";
@@ -1017,6 +1020,17 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass): Dispa
 	// exhaustion.
 	if (isOrphanedExecutorFailure(error)) return "orphaned_executor";
 	if (isAsideTimeoutFailure(error)) return "aside_timeout";
+	// The session port waited for the runtime to go idle and it never did.
+	// Nothing was sent, so the event replays cleanly on the next reconcile.
+	if (isSessionBusy(error)) return "session_busy";
+	// A structured SDK refusal is classified by the phase it interrupted: the
+	// sanitized message no longer carries the verb name, and "internal_error"
+	// hid every configure/request refusal (live: 169 rows in one day, all
+	// GjcCliError exitCode 0 at #dispatchBatch, none actionable).
+	if (error instanceof GjcCliError) {
+		if (phase === "bind" || phase === "configure") return "session_bind_failed";
+		if (phase === "request") return "authoring_turn_failed";
+	}
 	const message = error instanceof Error ? error.message : String(error);
 	if (message.includes("session send") || message.includes("SessionPort")) return "authoring_turn_failed";
 	if (message.includes("session bind")) return "session_bind_failed";
@@ -1100,16 +1114,28 @@ function failureDetail(error: unknown): string {
 		"session_closed",
 		"session_expired",
 		"session_terminal",
+		"session_unavailable",
 		"operation_not_found",
 		"timeout",
 		"deadline_exceeded",
 		"internal_error",
 		"context_length_exceeded",
 		"rebind_cap_exceeded",
+		"busy",
+		"client_ref_conflict",
+		"terminal_uncertain",
+		"uncertain_after_send",
+		"spawn_failed",
+		"invalid_request",
+		"resource_gone",
+		"usage",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
-	const code = fields.code ?? terminalError.code;
+	// A GjcCliError carries the SDK envelope code in `details`, which is the
+	// only part of the refusal that tells an operator what the runtime said.
+	const code =
+		fields.code ?? terminalError.code ?? (error instanceof GjcCliError ? envelopeErrorCode(error.details) : undefined);
 	const exitCode = fields.exitCode;
 	const signal = fields.signal;
 	const status = terminal.status;

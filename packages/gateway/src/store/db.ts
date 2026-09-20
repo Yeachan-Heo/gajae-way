@@ -9,7 +9,12 @@ import {
 	originKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
-import { assertValidOpRef, type LaneJobRecord, type PromptStatusBody, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import {
+	assertValidOpRef,
+	type LaneJobRecord,
+	type PromptStatusBody,
+	parseLaneJobRecord,
+} from "@gajae-gateway/subsession";
 
 export interface BrokerAuthority {
 	readonly canonicalAgentDir: string;
@@ -622,16 +627,6 @@ export class GatewayDatabase {
 		if (row.authority_key !== brokerAuthorityKey(authority)) throw new BrokerAuthorityError("authority_mismatch");
 	}
 
-	#ownedCursorAuthority(sessionId: string): string {
-		const row = this.#database
-			.query<{ authority_key: string }, [string]>(
-				"SELECT a.authority_key FROM broker_authority a JOIN broker_owned_bindings b ON b.authority_key = a.authority_key WHERE a.singleton = 1 AND b.session_id = ?",
-			)
-			.get(sessionId);
-		if (!row) throw new BrokerAuthorityError("unowned_session");
-		return row.authority_key;
-	}
-
 	isBrokerQuarantined(kind: BrokerQuarantineKind, id: string): boolean {
 		return (
 			this.#database.query("SELECT 1 FROM broker_quarantine WHERE kind = ? AND subject_id = ?").get(kind, id) !== null
@@ -841,12 +836,7 @@ export class GatewayDatabase {
 	}
 
 	/** CAS staging, including output-read claims and proof-before-checkpoint commits. */
-	workAttemptUpdate(
-		opRef: string,
-		expectedVersion: number,
-		patch: WorkAttemptPatch,
-		tailCursor?: string,
-	): WorkAttemptRuntime | undefined {
+	workAttemptUpdate(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
@@ -854,10 +844,6 @@ export class GatewayDatabase {
 			const next = this.#workPatched(current, patch);
 			workAssert(next.decision === "undecided" && next.settledAt === null);
 			if (!this.#workCas(current, next)) return undefined;
-			if (tailCursor !== undefined) {
-				workAssert(next.output.proof !== null || next.output.knownSilence !== null);
-				this.tailCursorCommit(next.sessionId, tailCursor);
-			}
 			return next;
 		});
 	}
@@ -1276,13 +1262,27 @@ export class GatewayDatabase {
 		}>;
 	}
 
-	/** Cycle projection source: pending inbound count per origin key. */
-	inboundPendingByOrigin(): Array<{ origin_key: string; n: number }> {
+	/**
+	 * Cycle projection source: pending inbound per origin key, with the age of
+	 * the oldest UNBOUND row and whether a turn is in flight there. Actors keep
+	 * an active trigger at `state = 'pending'` and move only `turn_state`, so
+	 * "in flight" is `turn_state IN ('bound','accepted')`, never the legacy
+	 * `processing` state (normalised away by migration 19).
+	 */
+	inboundPendingByOrigin(): Array<{
+		origin_key: string;
+		n: number;
+		oldest_unbound_received_at: string | null;
+		active: number;
+	}> {
 		return this.#database
 			.query(
-				`SELECT origin_key, COUNT(*) AS n FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
+				`SELECT origin_key, COUNT(*) AS n,
+					MIN(CASE WHEN turn_state IS NULL THEN received_at END) AS oldest_unbound_received_at,
+					SUM(CASE WHEN turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') THEN 1 ELSE 0 END) AS active
+				FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
 			)
-			.all() as Array<{ origin_key: string; n: number }>;
+			.all() as Array<{ origin_key: string; n: number; oldest_unbound_received_at: string | null; active: number }>;
 	}
 
 	/** Cycle projection source: delivery state census across all origins. */
@@ -2321,42 +2321,6 @@ export class GatewayDatabase {
 				)
 				.run(originKey, sessionId, epoch, new Date().toISOString()).changes === 1
 		);
-	}
-
-	/** Opaque runtime-issued tail checkpoint for a bound SDK session. */
-	tailCursorGet(sessionId: string): string | undefined {
-		const authority = this.#ownedCursorAuthority(sessionId);
-		return this.#database
-			.query<{ cursor: string }, [string, string]>(
-				"SELECT cursor FROM broker_tail_cursors WHERE authority_key = ? AND session_id = ?",
-			)
-			.get(authority, sessionId)?.cursor;
-	}
-
-	/** Commits a cursor only after the caller has applied all preceding tail effects. */
-	tailCursorCommit(sessionId: string, cursor: string): void {
-		if (cursor.length === 0) throw new Error("tail cursor must not be empty");
-		const commit = () => {
-			const authority = this.#ownedCursorAuthority(sessionId);
-			this.#database
-				.query(
-					"INSERT INTO broker_tail_cursors(authority_key, session_id, cursor, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
-				)
-				.run(authority, sessionId, cursor, new Date().toISOString());
-		};
-		if (this.#inTransaction) commit();
-		else this.withTransaction(commit);
-	}
-
-	tailCursorClear(sessionId: string): void {
-		const clear = () => {
-			const authority = this.#ownedCursorAuthority(sessionId);
-			this.#database
-				.query("DELETE FROM broker_tail_cursors WHERE authority_key = ? AND session_id = ?")
-				.run(authority, sessionId);
-		};
-		if (this.#inTransaction) clear();
-		else this.withTransaction(clear);
 	}
 
 	deliveryCreate(row: { id: string; turnId: string; originKey: string; payloadJson: string }): boolean {

@@ -7,6 +7,7 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
+import type { SessionRelayStream } from "../src/orchestrator/broker";
 import type {
 	SessionBindInput,
 	SessionBinding,
@@ -20,7 +21,17 @@ import type {
 	WorkerOutputResult,
 } from "../src/orchestrator/session-port";
 import { BrokerSessionPort, parseWorkerOutputResponse } from "../src/orchestrator/session-port";
-import { type TailAttachInput, type TailFrame, type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
+import {
+	RelayClosedError,
+	type RelayRequestOptions,
+	type RelayResponse,
+	type TailAttachInput,
+	type TailFrame,
+	type TailHandle,
+	TailRunner,
+	type TailStreamSpawner,
+	type TurnCorrelation,
+} from "../src/orchestrator/tail-runner";
 import type { BrokerAuthority, GatewayDatabase } from "../src/store/db";
 
 /** Initializes only a fresh test DB; never adopts legacy bindings or writes a GJC profile. */
@@ -96,9 +107,14 @@ export async function createOwnedSessionFixture(
 		authority,
 		cli: run,
 		instanceId: "creation-fixture",
-		tailRunner: new TailRunner({ run, repo: binding.repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: binding.repo }),
 	});
 	return await port.bind(binding);
+}
+
+/** Fixture ports never open a relay; the command spy under test is the CLI runner. */
+export function noRelay(sessionId: string): never {
+	throw new Error(`test fixture opened a relay for ${sessionId}`);
 }
 
 /** What gjc answers when the session itself refuses a steer (`ok:false` envelope): a decision, not a transport failure. */
@@ -129,6 +145,8 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly #transcripts = new Map<string, string[]>();
 	readonly #tails = new Map<string, Set<ScriptedTailHandle>>();
 	readonly #tailFrames = new Map<string, TailFrame[]>();
+	/** Relay that submitted each op (undefined: a throwaway send relay, so nobody observes the content). */
+	readonly #owner = new Map<string, ScriptedTailHandle | undefined>();
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
 	readonly onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
@@ -226,12 +244,18 @@ export class ScriptedSessionPort implements SessionPort {
 		if (this.#operations.has(input.opRef))
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		this.sends.push(input);
+		const correlation = { commandId: `command-${input.opRef}`, turnId: `turn-${input.opRef}` };
 		this.#operations.set(input.opRef, {
 			sessionId: input.sessionId,
 			state: "in_flight",
 			text: "",
 			startedAt: Date.now(),
+			...correlation,
 		});
+		// The relay that submitted the prompt owns the turn: it is the only
+		// handle that receives this operation's content frames.
+		this.#owner.set(input.opRef, input.relay instanceof ScriptedTailHandle ? input.relay : undefined);
+		input.relay?.correlate(input.opRef, correlation);
 		// Acceptance is independent of terminal completion, just like SDK send.
 		// A response-script failure after acceptance is a failed operation, not a
 		// fabricated send refusal that invites a duplicate prompt.
@@ -240,7 +264,7 @@ export class ScriptedSessionPort implements SessionPort {
 			.catch((error: unknown) => {
 				this.fail(input.opRef, error instanceof Error ? error.message : String(error));
 			});
-		return { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
+		return { sessionId: input.sessionId, operationRef: input.opRef, ...correlation } as SendReceipt;
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
@@ -298,6 +322,8 @@ export class ScriptedSessionPort implements SessionPort {
 					? {
 							status: "terminal_ok",
 							...startedAt,
+							commandId: operation.commandId,
+							turnId: operation.turnId,
 							clientRef: input.opRef,
 							terminalAt: operation.terminalAt,
 							receiptState: "present",
@@ -310,7 +336,7 @@ export class ScriptedSessionPort implements SessionPort {
 								terminalAt: operation.terminalAt,
 								error: { message: operation.error ?? "scripted failure" },
 							}
-						: { status: "in_flight", ...startedAt },
+						: { status: "in_flight", ...startedAt, commandId: operation.commandId, turnId: operation.turnId },
 			summaryCompleted: operation.state !== "in_flight",
 		};
 	}
@@ -331,6 +357,8 @@ export class ScriptedSessionPort implements SessionPort {
 				: {
 						kind: "prompt",
 						clientRef: input.opRef,
+						...(operation.commandId ? { commandId: operation.commandId } : {}),
+						...(operation.turnId ? { turnId: operation.turnId } : {}),
 						status: operation.state,
 						...(this.omitStartedAt ? {} : { startedAt: operation.startedAt }),
 						...(operation.terminalAt === undefined ? {} : { terminalAt: operation.terminalAt }),
@@ -378,7 +406,7 @@ export class ScriptedSessionPort implements SessionPort {
 	async attachTail(input: TailAttachInput): Promise<TailHandle> {
 		const handles = this.#tails.get(input.sessionId) ?? new Set<ScriptedTailHandle>();
 		let handle!: ScriptedTailHandle;
-		handle = new ScriptedTailHandle(input, () => handles.delete(handle), this.#tailFrames.get(input.sessionId) ?? []);
+		handle = new ScriptedTailHandle(input, () => handles.delete(handle));
 		handles.add(handle);
 		this.#tails.set(input.sessionId, handles);
 		return handle;
@@ -432,23 +460,34 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
-		const receipt = await this.send(input);
+		const relay = await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo });
+		relay.beginTurn(input.opRef);
+		const receipt = await this.send({ ...input, relay });
 		for (let attempts = 0; attempts < 10_000; attempts++) {
 			const status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			if (status.status.status === "terminal_ok") {
+				await relay.close();
 				return {
 					receipt,
 					status,
 					assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }),
 				};
 			}
-			if (status.status.status === "failed") throw new Error(status.status.error?.message ?? "scripted failure");
+			if (status.status.status === "failed") {
+				await relay.close();
+				throw new Error(status.status.error?.message ?? "scripted failure");
+			}
 			await Bun.sleep(1);
 		}
+		await relay.close();
 		throw new Error("scripted request did not settle");
 	}
 
-	/** `eventId: null` emits a frame with NO id, as gjc 0.16 does for synthesized/idless rows. */
+	/**
+	 * An assistant message the host streams to the turn's owner relay. Without
+	 * an explicit opRef the session's in-flight operation is the turn.
+	 * `eventId: null` emits a frame with NO stable message id.
+	 */
 	emitAssistant(
 		sessionId: string,
 		text: string,
@@ -458,31 +497,12 @@ export class ScriptedSessionPort implements SessionPort {
 		const transcript = this.#transcripts.get(sessionId) ?? [];
 		transcript.push(text);
 		this.#transcripts.set(sessionId, transcript);
-		this.#emit(sessionId, {
-			kind: "transcript",
-			rawKind: "transcript",
+		const ref = opRef ?? this.#inFlightOpRef(sessionId);
+		this.#emit(sessionId, ref, {
+			kind: "message_end",
+			rawKind: "message_end",
 			...(eventId === null ? {} : { eventId }),
-			payload: { role: "assistant", content: [{ text }], ...(opRef ? { opRef } : {}) },
-			assistantText: text,
-			steerEcho: false,
-			idle: false,
-		});
-	}
-
-	/**
-	 * A durable transcript row as replayed by a cursorless tail re-attach:
-	 * host `ts` stamp, and no opRef unless the test attributes it explicitly.
-	 */
-	emitReplayedTranscriptRow(sessionId: string, text: string, tsMs: number, opRef?: string): void {
-		this.#emit(sessionId, {
-			kind: "transcript",
-			rawKind: "transcript",
-			payload: {
-				role: "assistant",
-				content: [{ text }],
-				ts: new Date(tsMs).toISOString(),
-				...(opRef ? { opRef } : {}),
-			},
+			payload: { role: "assistant", content: [{ text }] },
 			assistantText: text,
 			steerEcho: false,
 			idle: false,
@@ -496,19 +516,20 @@ export class ScriptedSessionPort implements SessionPort {
 		operation.state = "terminal_ok";
 		operation.text = text;
 		operation.terminalAt = Date.now();
-		this.#emit(operation.sessionId, {
+		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_end",
 			rawKind: "agent_end",
-			payload: { opRef },
+			payload: { outcome: { reason: "end_turn" } },
 			steerEcho: false,
 			idle: true,
 		});
 	}
 
+	/** The user/steer row the host echoes on message_end: attribution evidence, never chat output. */
 	emitSteerEcho(sessionId: string, text: string, eventId = `steer-${crypto.randomUUID()}`): void {
-		this.#emit(sessionId, {
-			kind: "transcript",
-			rawKind: "transcript",
+		this.#emit(sessionId, this.#inFlightOpRef(sessionId), {
+			kind: "message_end",
+			rawKind: "message_end",
 			eventId,
 			payload: { role: "user", content: [{ text }] },
 			steerEcho: true,
@@ -520,18 +541,18 @@ export class ScriptedSessionPort implements SessionPort {
 		sessionId: string,
 		tool?: { readonly toolName: string; readonly intent?: string; readonly args?: unknown },
 	): void {
-		this.#emit(sessionId, {
-			kind: "event",
+		this.#emit(sessionId, this.#inFlightOpRef(sessionId), {
+			kind: "tool_execution_start",
 			rawKind: "tool_execution_start",
-			payload: tool ? { ...tool, toolCallStarted: true } : {},
+			payload: tool ? { ...tool, toolCallStarted: true } : { toolCallStarted: true },
 			steerEcho: false,
 			idle: false,
 		});
 	}
 
 	emitToolEnd(sessionId: string, toolName: string): void {
-		this.#emit(sessionId, {
-			kind: "event",
+		this.#emit(sessionId, this.#inFlightOpRef(sessionId), {
+			kind: "tool_execution_end",
 			rawKind: "tool_execution_end",
 			payload: { toolName },
 			steerEcho: false,
@@ -540,7 +561,9 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	emitActivity(sessionId: string, progress: { readonly toolCalls: number; readonly outputTokens: number }): void {
-		this.#emit(sessionId, {
+		// Correlated to the in-flight turn: progress counters attributed to a turn
+		// only reach the relay that owns it, like every other turn frame.
+		this.#emit(sessionId, this.#inFlightOpRef(sessionId), {
 			kind: "activity",
 			rawKind: "activity",
 			payload: { toolCalls: progress.toolCalls, outputTokens: progress.outputTokens },
@@ -556,10 +579,10 @@ export class ScriptedSessionPort implements SessionPort {
 		operation.text = text;
 		operation.terminalAt = Date.now();
 		this.emitAssistant(operation.sessionId, text, `final-${opRef}`, opRef);
-		this.#emit(operation.sessionId, {
+		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_end",
 			rawKind: "agent_end",
-			payload: { opRef },
+			payload: { outcome: { reason: "end_turn" } },
 			steerEcho: false,
 			idle: true,
 		});
@@ -571,10 +594,10 @@ export class ScriptedSessionPort implements SessionPort {
 		operation.state = "failed";
 		operation.error = error;
 		operation.terminalAt = Date.now();
-		this.#emit(operation.sessionId, {
+		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_failed",
 			rawKind: "agent_failed",
-			payload: { opRef },
+			payload: { error: { message: error } },
 			steerEcho: false,
 			idle: true,
 		});
@@ -582,6 +605,21 @@ export class ScriptedSessionPort implements SessionPort {
 
 	emitStall(sessionId: string, elapsedMs = 120_000): void {
 		for (const tail of this.#tails.get(sessionId) ?? []) tail.stall(elapsedMs);
+	}
+
+	/** The relay that owns `opRef` dies mid-turn: its content is lost, the turn settles by status. */
+	loseRelay(opRef: string): void {
+		this.#owner.get(opRef)?.lose();
+	}
+
+	/** The relay that owns `opRef` is declared dead: closed, never reopened; the turn settles by CLI status. */
+	killRelay(opRef: string): void {
+		this.#owner.get(opRef)?.die();
+	}
+
+	/** Handles currently attached to a session. */
+	tailsOf(sessionId: string): readonly ScriptedTailHandle[] {
+		return [...(this.#tails.get(sessionId) ?? [])];
 	}
 
 	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
@@ -627,11 +665,40 @@ export class ScriptedSessionPort implements SessionPort {
 		return this.#tailFrames.get(sessionId) ?? [];
 	}
 
-	#emit(sessionId: string, frame: TailFrame): void {
+	/** The session's most recent in-flight operation, the turn an un-attributed emit belongs to. */
+	#inFlightOpRef(sessionId: string): string | undefined {
+		return [...this.#operations.entries()]
+			.reverse()
+			.find(([, entry]) => entry.sessionId === sessionId && entry.state === "in_flight")?.[0];
+	}
+
+	/**
+	 * Host delivery contract: a frame correlated to an operation reaches ONLY
+	 * the relay that submitted it (stamped with that op's commandId/turnId);
+	 * an uncorrelated frame (activity) reaches every relay on the session.
+	 */
+	#emit(sessionId: string, opRef: string | undefined, frame: TailFrame): void {
+		const operation = opRef ? this.#operations.get(opRef) : undefined;
+		const stamped: TailFrame = operation
+			? {
+					...frame,
+					...(operation.commandId ? { commandId: operation.commandId } : {}),
+					...(operation.turnId ? { turnId: operation.turnId } : {}),
+				}
+			: frame;
 		const frames = this.#tailFrames.get(sessionId) ?? [];
-		frames.push(frame);
+		frames.push(stamped);
 		this.#tailFrames.set(sessionId, frames);
-		for (const tail of this.#tails.get(sessionId) ?? []) tail.emit(frame);
+		if (!opRef) {
+			for (const tail of this.#tails.get(sessionId) ?? []) tail.emit(stamped);
+			return;
+		}
+		if (!this.#owner.has(opRef)) {
+			// Seeded/recovered operation: nobody submitted it on a relay this
+			// process holds, so no handle receives its content (as in production).
+			return;
+		}
+		this.#owner.get(opRef)?.emit(stamped);
 	}
 }
 
@@ -730,61 +797,88 @@ type Operation = {
 	error?: string;
 	readonly startedAt: number;
 	terminalAt?: number;
+	readonly commandId?: string;
+	readonly turnId?: string;
 };
 
-class ScriptedTailHandle implements TailHandle {
+/** Same fencing as ManagedTailHandle: only frames correlated to the turn it was told about are delivered. */
+export class ScriptedTailHandle implements TailHandle {
 	readonly sessionId: string;
 	readonly brokerGeneration: number;
 	readonly ready = Promise.resolve();
-	readonly cursor = undefined;
 	readonly #input: TailAttachInput;
 	readonly #remove: () => void;
-	readonly #buffer: TailFrame[] = [];
-	/** Same contract as ManagedTailHandle: frames flush in order, outside the accepting caller's turn. */
+	/** Same contract as ManagedTailHandle: frames deliver in order, outside the caller's turn. */
 	#flush: Promise<void> = Promise.resolve();
-	#accepted = false;
-	#acceptedOpRef: string | undefined;
+	#opRef: string | undefined;
+	#correlation: TurnCorrelation = {};
+	#running = false;
 	#closed = false;
 
-	constructor(input: TailAttachInput, remove: () => void, historical: readonly TailFrame[]) {
+	constructor(input: TailAttachInput, remove: () => void) {
 		this.#input = input;
 		this.#remove = remove;
 		this.sessionId = input.sessionId;
 		this.brokerGeneration = input.brokerGeneration;
-		this.#buffer.push(...historical);
 	}
 
-	async beginTurn(opRef: string): Promise<void> {
+	get opRef(): string | undefined {
+		return this.#opRef;
+	}
+
+	get running(): boolean {
+		return this.#running;
+	}
+
+	async control(
+		_operation: string,
+		_input: Record<string, unknown>,
+		_options?: RelayRequestOptions,
+	): Promise<RelayResponse> {
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods");
+	}
+
+	async query(_name: string, _input: Record<string, unknown>, _options?: RelayRequestOptions): Promise<RelayResponse> {
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods");
+	}
+
+	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
 		if (this.#closed) return;
-		this.#acceptedOpRef = opRef;
-		this.#buffer.splice(0);
+		this.#opRef = opRef;
+		this.#correlation = { ...correlation };
 	}
 
-	async markAccepted(opRef: string): Promise<void> {
-		if (this.#closed) return;
-		this.#accepted = true;
-		this.#acceptedOpRef = opRef;
-		const buffered = this.#buffer
-			.splice(0)
-			.filter((frame) => frameOperationRef(frame) === undefined || frameOperationRef(frame) === opRef);
-		// Not awaited: markAccepted runs inside the origin mailbox and onFrame
-		// re-enters it (production ManagedTailHandle has the identical shape).
-		this.#flush = this.#flush.then(async () => {
-			for (const frame of buffered) await this.#input.onFrame?.(frame);
-		});
-		this.#flush.catch(() => {});
+	correlate(opRef: string, correlation: TurnCorrelation): void {
+		if (this.#opRef !== opRef) return;
+		this.#correlation = { ...this.#correlation, ...correlation };
 	}
 
-	setTurnRunning(_running: boolean): void {}
+	setTurnRunning(running: boolean): void {
+		this.#running = running;
+	}
 
 	emit(frame: TailFrame): void {
 		if (this.#closed) return;
-		if (!this.#accepted) {
-			this.#buffer.push(frame);
-			return;
-		}
-		if (frameOperationRef(frame) !== undefined && frameOperationRef(frame) !== this.#acceptedOpRef) return;
+		if (frame.commandId !== undefined || frame.turnId !== undefined) {
+			if (this.#opRef === undefined) return;
+			const known = this.#correlation;
+			if (known.commandId === undefined && known.turnId === undefined) {
+				this.#correlation = {
+					...(frame.commandId ? { commandId: frame.commandId } : {}),
+					...(frame.turnId ? { turnId: frame.turnId } : {}),
+				};
+			} else if (
+				(known.commandId !== undefined && frame.commandId !== undefined && known.commandId !== frame.commandId) ||
+				(known.turnId !== undefined && frame.turnId !== undefined && known.turnId !== frame.turnId) ||
+				!(
+					(known.commandId !== undefined && frame.commandId !== undefined) ||
+					(known.turnId !== undefined && frame.turnId !== undefined)
+				)
+			)
+				return;
+		} else if (!frame.idle) return;
 		this.#flush = this.#flush.then(async () => {
+			if (this.#closed) return;
 			await this.#input.onFrame?.(frame);
 		});
 		this.#flush.catch(() => {});
@@ -795,6 +889,23 @@ class ScriptedTailHandle implements TailHandle {
 			void this.#input.onStall?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration, elapsedMs });
 	}
 
+	/** Simulates the relay process dying under a running turn. */
+	lose(): void {
+		if (this.#closed) return;
+		void this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+	}
+
+	/**
+	 * Simulates the relay giving up (six immediate deaths): the handle closes and
+	 * will not reopen. Fires even on an already-closed handle: production's
+	 * give-up runs on the runner's own loop and can land after the actor let
+	 * the handle go, which is exactly the late notice the actor must fence.
+	 */
+	die(): void {
+		void this.close();
+		void this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -802,8 +913,95 @@ class ScriptedTailHandle implements TailHandle {
 	}
 }
 
-function frameOperationRef(frame: TailFrame): string | undefined {
-	for (const value of [frame.payload.opRef, frame.payload.operationRef])
-		if (typeof value === "string" && value.length > 0) return value;
-	return undefined;
+/**
+ * A scripted `gjc sdk serve --stdio` host for BrokerSessionPort tests: answers
+ * hello, routes each control/query request to `respond`, and records what the
+ * gateway wrote. Push host-initiated frames with `host()`.
+ */
+export type ScriptedRelayRequest = {
+	readonly type: "control_request" | "query_request";
+	readonly operation: string;
+	readonly input: Record<string, unknown>;
+};
+export type ScriptedRelayReply =
+	| { readonly ok: true; readonly result?: Record<string, unknown> }
+	| { readonly ok: false; readonly error: { readonly code: string; readonly message?: string } };
+
+export function scriptedRelay(
+	respond: (request: ScriptedRelayRequest) => ScriptedRelayReply | Promise<ScriptedRelayReply>,
+) {
+	const requests: ScriptedRelayRequest[] = [];
+	const streams: ScriptedRelayStream[] = [];
+	const spawn: TailStreamSpawner = (sessionId) => {
+		const stream = new ScriptedRelayStream(sessionId, `connection:${streams.length + 1}`, async (frame) => {
+			const request: ScriptedRelayRequest = {
+				type: frame.type as ScriptedRelayRequest["type"],
+				operation: String(frame.type === "control_request" ? frame.operation : frame.query),
+				input: (frame.input as Record<string, unknown>) ?? {},
+			};
+			requests.push(request);
+			const reply = await respond(request);
+			const responseType = frame.type === "control_request" ? "control_response" : "query_response";
+			return { type: responseType, id: frame.id, ...reply };
+		});
+		streams.push(stream);
+		return stream;
+	};
+	return { spawn, requests, streams };
+}
+
+export class ScriptedRelayStream implements SessionRelayStream {
+	readonly lines: AsyncIterable<string>;
+	readonly written: Record<string, unknown>[] = [];
+	closed = false;
+	#queue: Array<string | null> = [];
+	#waiters: Array<(line: string | null) => void> = [];
+
+	constructor(
+		readonly sessionId: string,
+		readonly connectionId: string,
+		private readonly respond: (frame: Record<string, unknown>) => Promise<Record<string, unknown>>,
+	) {
+		const next = () =>
+			new Promise<string | null>((resolve) => {
+				const queued = this.#queue.shift();
+				if (queued !== undefined) resolve(queued);
+				else this.#waiters.push(resolve);
+			});
+		this.lines = {
+			[Symbol.asyncIterator]: () => ({
+				next: async () => {
+					const line = await next();
+					return line === null ? { done: true, value: undefined } : { done: false, value: line };
+				},
+			}),
+		};
+	}
+
+	host(frame: Record<string, unknown>): void {
+		const line = JSON.stringify(frame);
+		const waiter = this.#waiters.shift();
+		if (waiter) waiter(line);
+		else this.#queue.push(line);
+	}
+
+	write(line: string): void {
+		if (this.closed) throw new Error("relay closed");
+		const frame = JSON.parse(line) as Record<string, unknown>;
+		this.written.push(frame);
+		if (frame.type === "hello") {
+			this.host({ type: "hello", protocolVersion: 3, connectionId: this.connectionId });
+			return;
+		}
+		if (frame.type === "control_request" || frame.type === "query_request")
+			void this.respond(frame).then((response) => this.host(response));
+	}
+
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		const waiter = this.#waiters.shift();
+		if (waiter) waiter(null);
+		else this.#queue.push(null);
+	}
 }

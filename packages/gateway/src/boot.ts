@@ -75,8 +75,8 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			await broker.start();
 			const supervisor = broker;
 			const tailRunner = new TailRunner({
-				run: supervisor.cli,
-				// Event-driven: frames stream from the host as emitted; no interval polling.
+				// One resident `gjc sdk serve --stdio` relay per session: commands go
+				// down it, the turn's own content comes back up it. No polling.
 				stream: (sessionId) => supervisor.openStream(sessionId),
 				repo: personaWorkspace,
 				stallTimeoutMs: config.stallTimeoutMs,

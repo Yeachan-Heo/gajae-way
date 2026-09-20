@@ -6,6 +6,7 @@ import {
 	type BrokerDiscovery,
 	brokerHealthArgs,
 	GlobalGjcClient,
+	HEALTH_PROBE_SESSION_ID,
 	isHealthySessionList,
 	isLoopbackWebSocketUrl,
 	preflightGjcRuntime,
@@ -358,7 +359,9 @@ test("CLI, version preflight and stdio relay use exactly one executable, cwd and
 	let relayKills = 0;
 	const spawn = ((options: { cmd: string[]; cwd: string; env: Record<string, string> }) => {
 		invocations.push(options);
-		const relay = options.cmd.includes("serve");
+		// The preflight relay probe targets the health session id and must exit
+		// on its own; only a real owned-session relay stays open until killed.
+		const relay = options.cmd.includes("serve") && !options.cmd.includes(HEALTH_PROBE_SESSION_ID);
 		let finish = (_code: number) => {};
 		const exited = relay
 			? new Promise<number>((resolve) => {
@@ -386,7 +389,9 @@ test("CLI, version preflight and stdio relay use exactly one executable, cwd and
 	await value.stop();
 	expect(lines).toEqual(["event"]);
 	expect(value.gjcVersion).toBe("0.16.3");
-	expect(invocations.length).toBe(3);
+	expect(invocations.length).toBe(4);
+	const probe = invocations.find((invocation) => invocation.cmd.includes(HEALTH_PROBE_SESSION_ID));
+	expect(probe?.cmd.slice(1)).toEqual(["sdk", "serve", "--stdio", "--session", HEALTH_PROBE_SESSION_ID]);
 	for (const invocation of invocations) {
 		expect(invocation.cmd[0]).toBe("/opt/user-selected/gjc");
 		expect(invocation.cwd).toBe(cwd);
@@ -589,4 +594,22 @@ test("resolves trusted user environment and home-relative config names without a
 			else process.env[name] = before[name];
 		}
 	}
+});
+
+test("preflight fails closed when the stream relay rejects its argv (usage exit 2)", async () => {
+	const run = async (args: readonly string[]) =>
+		args[0] === "--version" ? { exitCode: 0, stdout: "gjc/0.16.6\n", stderr: "" } : healthy;
+	const sdk = async (args: readonly string[]) =>
+		args[1] === "serve"
+			? {
+					exitCode: 2,
+					stdout: "USAGE\n  $ gjc sdk [ACTION] [FLAGS]\n",
+					stderr: "gjc sdk serve: unknown argument: --agent-dir\n",
+				}
+			: healthy;
+	await expect(preflightGjcRuntime(run, "0.15.6", sdk)).rejects.toThrow("stream relay rejected its argv");
+	// A relay that exits for a runtime reason (unindexed probe id) is not an argv rejection.
+	const runtime = async (args: readonly string[]) =>
+		args[1] === "serve" ? { exitCode: 1, stdout: "", stderr: "not_found: session is not indexed\n" } : healthy;
+	await expect(preflightGjcRuntime(run, "0.15.6", runtime)).resolves.toEqual({ version: "0.16.6" });
 });

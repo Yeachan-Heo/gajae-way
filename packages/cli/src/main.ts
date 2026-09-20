@@ -186,6 +186,8 @@ export async function restoreDatabase(socket: string, backupPath: string): Promi
 	console.log(`Restored backup to: ${databasePath}`);
 }
 
+const CHAT_TURN_TIMEOUT_MS = 30 * 60_000;
+
 async function chat(socket: string): Promise<void> {
 	let client: GajaewayClient;
 	try {
@@ -206,12 +208,15 @@ async function chat(socket: string): Promise<void> {
 			console.error("(message was not engaged)");
 			return;
 		}
+		// The gateway's own request wait is 30 minutes; a max-effort reasoning
+		// turn routinely runs past two. Match the server so the REPL does not
+		// abandon a turn the gateway is still delivering.
 		await new Promise<void>((resolve) => {
 			const timer = setTimeout(() => {
 				turnWaiters.delete(turnId);
-				console.error("(turn timed out after 120s)");
+				console.error(`(turn timed out after ${CHAT_TURN_TIMEOUT_MS / 60_000}m)`);
 				resolve();
-			}, 120_000);
+			}, CHAT_TURN_TIMEOUT_MS);
 			turnWaiters.set(turnId, () => {
 				clearTimeout(timer);
 				turnWaiters.delete(turnId);

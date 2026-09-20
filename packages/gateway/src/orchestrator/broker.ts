@@ -22,7 +22,7 @@ export {
 } from "./broker-liveness";
 
 export const MIN_GJC_VERSION = "0.15.6";
-const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
+export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
@@ -53,6 +53,14 @@ export interface GlobalGjcClientOptions {
 	readonly log?: (line: string) => void;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
+
+/** A resident bidirectional JSONL relay to one SDK session host. */
+export interface SessionRelayStream {
+	readonly lines: AsyncIterable<string>;
+	/** Writes one JSONL frame to the host; throws once the relay is closed. */
+	write(line: string): void;
+	close(): void;
+}
 export class GjcCliUnavailableError extends Error {
 	readonly code = "broker_unavailable";
 	constructor(message: string) {
@@ -181,7 +189,23 @@ export async function preflightGjcRuntime(
 	if (sdk && !isHealthySessionList(await sdk(brokerHealthArgs(), { timeoutMs: COMMAND_TIMEOUT_MS }))) {
 		throw new Error("gjc runtime preflight failed: invalid session-list envelope");
 	}
+	// The relay argv contract is boot-gated: a usage rejection (exit 2) here
+	// means EVERY tail stream would die at spawn and the gateway would silently
+	// fall back to slow polling. Measured 2026-09-15: `sdk serve --agent-dir`
+	// exit 2 for days with no boot-time signal. Fail closed instead.
+	if (sdk) {
+		const relay = await sdk(streamRelayArgs(HEALTH_PROBE_SESSION_ID), { timeoutMs: COMMAND_TIMEOUT_MS });
+		if (isUsageRejection(relay)) throw new Error("gjc runtime preflight failed: stream relay rejected its argv");
+	}
 	return { version: version.slice(1, 4).join(".") };
+}
+/** The exact argv `openStream` spawns; `serve` is env-bound and takes no --agent-dir (gjc 0.16.6 exits 2). */
+export function streamRelayArgs(sessionId: string): readonly string[] {
+	return ["sdk", "serve", "--stdio", "--session", sessionId];
+}
+/** gjc prints usage and exits 2 on an unknown flag; every runtime failure exits 1 or prints a JSON envelope. */
+export function isUsageRejection(result: CliResult): boolean {
+	return result.exitCode === 2 && /unknown argument|USAGE/i.test(`${result.stdout}\n${result.stderr}`);
 }
 
 /** A client of the user's global runtime. No directory, daemon, lock, or session ownership. */
@@ -486,8 +510,13 @@ export class GlobalGjcClient {
 			);
 		}
 	}
-	/** Only gateway-created stdio relays are terminated, never their GJC daemon or session host. */
-	openStream(sessionId: string): { readonly lines: AsyncIterable<string>; close(): void } {
+	/**
+	 * One resident `gjc sdk serve --stdio` relay for a session: JSONL frames go
+	 * down its stdin to the host (hello, control/query requests) and the host's
+	 * frames come back up stdout. Only gateway-created relays are terminated,
+	 * never their GJC daemon or session host.
+	 */
+	openStream(sessionId: string): SessionRelayStream {
 		this.#assertAgentDirIdentity();
 		if (!sessionId || sessionId.startsWith("-") || /[\r\n\0]/.test(sessionId)) throw new Error("invalid session ID");
 		if (this.#stopped || !this.#available) throw new GjcCliUnavailableError("broker unavailable");
@@ -498,7 +527,7 @@ export class GlobalGjcClient {
 		// stream, declared a retention gap, and held the turn - the persona went
 		// mute on long turns and presence never advanced (live, 2026-09-17).
 		const child = this.#spawn({
-			cmd: [this.executable, "sdk", "serve", "--stdio", "--session", sessionId],
+			cmd: [this.executable, ...streamRelayArgs(sessionId)],
 			cwd: this.#cwd,
 			env: this.#env,
 			stdin: "pipe",
@@ -544,7 +573,19 @@ export class GlobalGjcClient {
 				close();
 			}
 		})();
-		return { lines, close };
+		const write = (line: string): void => {
+			if (closed) throw new Error("relay closed");
+			const stdin = child.stdin;
+			if (!stdin || typeof stdin === "number") throw new Error("relay stdin unavailable");
+			stdin.write(`${line}\n`);
+			// FileSink.flush is synchronous unless the pipe is backpressured, in
+			// which case it returns a promise that rejects on EPIPE once the child
+			// is gone. An escaped rejection would be unhandled; the relay ending is
+			// already reported through `lines`, so a late flush failure only closes.
+			const flushed = stdin.flush();
+			if (flushed instanceof Promise) flushed.catch(() => close());
+		};
+		return { lines, write, close };
 	}
 }
 function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {
@@ -553,6 +594,9 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 		throw new Error("Global GJC client rejects caller retarget arguments");
 	}
 	const bound = [...args];
+	// `gjc sdk serve` has no --agent-dir flag (exit 2 + usage on gjc 0.16.6):
+	// the relay takes its agent dir from the exported GJC_*_AGENT_DIR env.
+	if (bound[1] === "serve") return bound;
 	if (bound[1] === "session") bound.splice(2, 0, "--agent-dir", agentDir);
 	else bound.push("--agent-dir", agentDir);
 	return bound;

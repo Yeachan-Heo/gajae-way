@@ -259,7 +259,7 @@ describe("work attempt durable transactions", () => {
 		expect(buildDeliveryPayload("turn", LOOPBACK_ORIGIN, "NO_REPLY", "silent")).toBeUndefined();
 	});
 
-	test("known silence and checkpoint commit atomically, survive reopen and suppress exactly once", async () => {
+	test("known silence survives reopen and suppresses exactly once", async () => {
 		const f = await fixture();
 		f.database.workAttemptPrepare(f.runtime, f.record);
 		const proof = {
@@ -277,16 +277,11 @@ describe("work attempt durable transactions", () => {
 			byteLength: 8,
 		};
 		const output = { ...f.runtime.output, disposition: "silent" as const, knownSilence: proof, proof, excerpt: null };
-		f.raw.exec("CREATE TRIGGER fault BEFORE INSERT ON broker_tail_cursors BEGIN SELECT RAISE(ABORT, 'fault'); END");
-		expect(() => f.database.workAttemptUpdate(f.runtime.opRef, 0, { output }, "cursor-final")).toThrow();
-		expect(f.database.workAttemptGet(f.runtime.opRef)?.output.knownSilence).toBeNull();
-		expect(f.database.tailCursorGet(SESSION)).toBeUndefined();
-		f.raw.exec("DROP TRIGGER fault");
-		f.database.workAttemptUpdate(f.runtime.opRef, 0, { output }, "cursor-final");
+		expect(f.database.workAttemptUpdate(f.runtime.opRef, 0, { output })?.version).toBe(1);
+		expect(f.database.workAttemptUpdate(f.runtime.opRef, 0, { output })).toBeUndefined();
 		const reopened = await GatewayDatabase.open(f.path);
 		handles.push(reopened);
 		expect(reopened.workAttemptGet(f.runtime.opRef)?.output.knownSilence).toEqual(proof);
-		expect(reopened.tailCursorGet(SESSION)).toBe("cursor-final");
 		expect(() => reopened.workAttemptUpdate(f.runtime.opRef, 1, { output: f.runtime.output })).toThrow();
 		const suppressed = { ...f.settlement, output, decision: "suppressed" as const };
 		expect(reopened.workAttemptSettle(f.runtime.opRef, 1, f.closed, suppressed)?.decision).toBe("suppressed");

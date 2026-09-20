@@ -3,7 +3,13 @@ import type { TailFrame } from "../src/orchestrator/tail-runner";
 import { deriveActivity } from "../src/server/activity";
 
 function frame(rawKind: string, payload: Record<string, unknown> = {}, extra: Partial<TailFrame> = {}): TailFrame {
-	return { kind: "event", rawKind, payload, steerEcho: false, idle: false, ...extra };
+	const kind =
+		rawKind === "tool_execution_start" || rawKind === "tool_execution_end" || rawKind === "activity"
+			? rawKind
+			: rawKind === "transcript"
+				? "message_end"
+				: "unknown";
+	return { kind, rawKind, payload, steerEcho: false, idle: false, ...extra };
 }
 
 describe("deriveActivity", () => {

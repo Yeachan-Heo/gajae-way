@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
+import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
@@ -11,7 +12,9 @@ import {
 	attachTestBrokerOwnership,
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
+	noRelay,
 	ScriptedSessionPort,
+	scriptedRelay,
 } from "./session-port.fake";
 
 let home = "";
@@ -98,7 +101,13 @@ test("failed-turn evidence comes from the owned shared session file without expo
 	const run: CliRunner = async () => {
 		throw new Error("Failure evidence must not start an SDK operation");
 	};
-	const options = { database, authority, cli: run, instanceId: "evidence", tailRunner: new TailRunner({ run, repo }) };
+	const options = {
+		database,
+		authority,
+		cli: run,
+		instanceId: "evidence",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	};
 	const port = new BrokerSessionPort(options);
 	const input = { sessionId, repo, startedAtMs, terminalAtMs: startedAtMs + 30 };
 	expect(await port.failedTurnEvidence(input)).toEqual({ reason: "unsupported_input_status" });
@@ -127,23 +136,6 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 			};
 		if (args.includes("model.set"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
-		if (args.includes("send"))
-			return {
-				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1", commandId: "cmd-1" } }),
-				stderr: "",
-			};
-		if (args.includes("status"))
-			return {
-				exitCode: 0,
-				stdout: JSON.stringify({
-					ok: true,
-					result: { operationRef: "gw-work-1", status: { status: "terminal_ok" }, summary: { completed: true } },
-				}),
-				stderr: "",
-			};
-		if (args.includes("tail"))
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { items: [], terminal: true } }), stderr: "" };
 		if (args.includes("session.last_assistant"))
 			return {
 				exitCode: 0,
@@ -156,7 +148,19 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
-	const tailRunner = new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
+	// The turn is submitted and observed on the session's own relay: the prompt
+	// goes down as turn.prompt, the terminal status comes back as turn.result.
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return {
+				ok: true,
+				result: { commandId: "cmd-1", turnId: "turn-1", accepted: true, clientRef: request.input.clientRef },
+			};
+		if (request.operation === "turn.result")
+			return { ok: true, result: { kind: "prompt", status: "terminal_ok", clientRef: request.input.clientRef } };
+		return { ok: false, error: { code: "unsupported_operation" } };
+	});
+	const tailRunner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
 	const port = new BrokerSessionPort({
 		authority,
 		database,
@@ -198,19 +202,27 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 	const createInput = JSON.parse(create[create.indexOf("--json-input") + 1]!) as Record<string, unknown>;
 	expect(createInput).toMatchObject({ cwd: "/tmp/repo", modelPreset: "gpt-heavy" });
 	expect(binding.startupModelApplied).toBe(true);
-	const send = calls.find((args) => args.includes("send"))!;
-	expect(send).toEqual(
-		expect.arrayContaining(["--op-ref", "gw-work-1", "--text", "trusted bootstrap\n\nimplement it"]),
-	);
+	expect(result.receipt).toMatchObject({ operationRef: "gw-work-1", commandId: "cmd-1", turnId: "turn-1" });
+	expect(relay.requests[0]).toEqual({
+		type: "control_request",
+		operation: "turn.prompt",
+		input: { text: "trusted bootstrap\n\nimplement it", clientRef: "gw-work-1" },
+	});
+	expect(relay.requests[1]).toEqual({
+		type: "query_request",
+		operation: "turn.result",
+		input: { kind: "prompt", clientRef: "gw-work-1" },
+	});
+	expect(calls.some((args) => args.includes("send") || args.includes("tail") || args.includes("status"))).toBe(false);
 	expect(calls.find((args) => args.includes("model.profile.set"))).toEqual(
 		expect.arrayContaining(["raw", "control", "sdk-1", "--op", "model.profile.set"]),
 	);
 	expect(calls.find((args) => args.includes("session.last_assistant"))).toEqual(
 		expect.arrayContaining(["raw", "query", "sdk-1", "--query", "session.last_assistant"]),
 	);
-	expect(calls.find((args) => args.includes("tail"))).toEqual(
-		expect.arrayContaining(["sdk", "session", "tail", "sdk-1", "--until-idle"]),
-	);
+	// The relay is closed once the request settles.
+	expect(relay.streams).toHaveLength(1);
+	expect(relay.streams[0]!.closed).toBe(true);
 });
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
@@ -243,7 +255,7 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 		database,
 		cli: run,
 		instanceId: "instance-1",
-		tailRunner: new TailRunner({ run, repo: "/tmp/repo" }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: "/tmp/repo" }),
 	});
 	await port.bind({ originKey: "discord/channel/c", epoch: 2, repo: "/tmp/repo" });
 	await port.bind({ originKey: "discord/channel/c", epoch: 2, repo: "/tmp/repo" });
@@ -279,7 +291,7 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 		database,
 		cli: run,
 		instanceId: "instance-1",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	await createOwnedSessionFixture(database, authority, {
 		sessionId: "saved-1",
@@ -304,20 +316,15 @@ test("broker SessionPort preserves a structured client-ref conflict emitted with
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const run: CliRunner = async (args) => {
-		if (args.includes("send"))
-			return {
-				exitCode: 1,
-				stdout: JSON.stringify({ ok: false, error: { code: "client_ref_conflict", message: "already used" } }),
-				stderr: "",
-			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
+	const relay = scriptedRelay(() => ({ ok: false, error: { code: "client_ref_conflict", message: "already used" } }));
 	const port = new BrokerSessionPort({
 		authority,
 		database,
 		cli: run,
 		instanceId: "instance-1",
-		tailRunner: new TailRunner({ run, repo: join(home, "workspace") }),
+		tailRunner: new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") }),
 	});
 	await createOwnedSessionFixture(database, authority, {
 		sessionId: "sdk-1",
@@ -356,7 +363,7 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 		database,
 		cli: run,
 		instanceId: "instance-1",
-		tailRunner: new TailRunner({ run, repo: join(home, "workspace") }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace") }),
 		sleep: async (milliseconds) => {
 			sleeps.push(milliseconds);
 		},
@@ -416,7 +423,7 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 			database,
 			cli,
 			instanceId: "i",
-			tailRunner: new TailRunner({ run: cli, repo }),
+			tailRunner: new TailRunner({ stream: noRelay, repo }),
 		});
 		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
 		expect(binding.sessionId).toBe("fresh-session");
@@ -450,7 +457,7 @@ test("a recovered answer is the full body, never the 500-character summary", asy
 			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
-	const tailRunner = new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
+	const tailRunner = new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
 	const port = new BrokerSessionPort({ database, authority, cli: run, instanceId: "instance-body", tailRunner });
 	try {
 		await createOwnedSessionFixture(database, authority, {
@@ -511,7 +518,7 @@ test("fetchAssistantSince follows transcript continuation pages and returns the 
 		database,
 		cli: run,
 		instanceId: "instance-pages",
-		tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 	});
 	try {
 		await createOwnedSessionFixture(database, authority, {
@@ -561,7 +568,7 @@ test("close uses the global lifecycle route: the per-session control route prohi
 		database,
 		cli: run,
 		instanceId: "instance-1",
-		tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 	});
 	await createOwnedSessionFixture(database, authority, {
 		sessionId: "sdk-1",
@@ -595,7 +602,7 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 		authority,
 		cli: run,
 		instanceId: "ownership",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	for (const target of [
 		{ sessionId: "foreign-live", repo },
@@ -620,7 +627,7 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 			() => port.attachTail({ ...target, brokerGeneration: 0 }),
 			() => port.runCompaction({ ...target, originKey: "foreign" }),
 			() => port.close(target),
-			() => port.request({ ...target, text: "must not replay", opRef: "gw-foreign", observeTail: false }),
+			() => port.request({ ...target, text: "must not replay", opRef: "gw-foreign" }),
 		];
 		for (const operation of operations) await expect(operation()).rejects.toBeInstanceOf(BrokerAuthorityError);
 	}
@@ -644,7 +651,7 @@ test("legacy private bindings cannot initialize a global port or be resumed and 
 				authority,
 				cli: run,
 				instanceId: "legacy",
-				tailRunner: new TailRunner({ run, repo: home }),
+				tailRunner: new TailRunner({ stream: noRelay, repo: home }),
 			}),
 	).toThrow(BrokerAuthorityError);
 	expect(() => database!.assertBrokerAuthority(authority, { initializeEmpty: true })).toThrow(BrokerAuthorityError);
@@ -672,7 +679,7 @@ test("bind rejects an unowned persisted ID before inspect and without epoch rota
 		authority,
 		cli: run,
 		instanceId: "binding",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	try {
 		await expect(port.bind({ originKey: "origin", epoch: 0, repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
@@ -718,7 +725,7 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		authority,
 		cli: run,
 		instanceId: "history",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	expect((await port.fetchLastAssistant({ sessionId: "retired-owned", repo })).text).toBe("historical answer");
 	expect(database.assertOwnedSession("retired-owned", repo, authority)).toMatchObject({
@@ -754,7 +761,7 @@ test("authority failures propagate through recovery catches without rebind or re
 		authority,
 		cli: run,
 		instanceId: "failure",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	const target = { sessionId: "owned", repo };
 	for (const operation of [
@@ -816,7 +823,7 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 		authority,
 		cli: run,
 		instanceId: "isolated-history",
-		tailRunner: new TailRunner({ run, repo }),
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	};
 	const port = new BrokerSessionPort(options);
 	expect((await port.fetchLastAssistant({ sessionId: "owned", repo })).text).toBe("owned answer");
@@ -842,45 +849,32 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 	expect(calls).toHaveLength(2);
 });
 for (const fixture of [
-	{ envelope: { ok: false, error: { code: "busy" } }, exitCode: 0, refused: true },
-	{ envelope: { ok: false, error: { code: "session_unavailable" } }, exitCode: 0, refused: false },
-	{ envelope: { error: { code: "busy" } }, exitCode: 0, refused: false },
-	{ envelope: { ok: false, error: { code: "busy" } }, exitCode: 1, refused: false },
+	{ reply: { ok: false, error: { code: "busy" } }, refused: true },
+	{ reply: { ok: false, error: { code: "session_unavailable" } }, refused: false },
+	{ reply: { ok: true, result: { accepted: false, status: "rejected", error: { code: "busy" } } }, refused: false },
 	{
-		envelope: { ok: true, result: { accepted: false, status: "rejected", error: { code: "busy" } } },
-		exitCode: 0,
-		refused: false,
-	},
-	{
-		envelope: {
+		reply: {
 			ok: true,
 			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy" } },
 		},
-		exitCode: 0,
 		refused: true,
 	},
 	{
-		envelope: {
+		reply: {
 			ok: true,
 			result: { accepted: false, status: "rejected", clientRef: "wrong-ref", error: { code: "busy" } },
 		},
-		exitCode: 0,
 		refused: false,
 	},
-	{ envelope: { ok: true, result: { accepted: true, clientRef: "wrong-ref" } }, exitCode: 0, refused: false },
-	{ envelope: { ok: true, result: { accepted: true } }, exitCode: 0, refused: false },
+	{ reply: { ok: true, result: { accepted: true, clientRef: "wrong-ref" } }, refused: false },
+	{ reply: { ok: true, result: { accepted: true } }, refused: false },
+	{ reply: { ok: true, result: { accepted: true, status: "rejected", clientRef: "expected-ref" } }, refused: false },
 	{
-		envelope: { ok: true, result: { accepted: true, status: "rejected", clientRef: "expected-ref" } },
-		exitCode: 0,
+		reply: { ok: true, result: { accepted: true, status: "accepted", clientRef: "expected-ref", ok: false } },
 		refused: false,
 	},
-	{
-		envelope: { ok: true, result: { accepted: true, status: "accepted", clientRef: "expected-ref", ok: false } },
-		exitCode: 0,
-		refused: false,
-	},
-	{ envelope: { ok: true, result: {} }, exitCode: 0, refused: false },
-])
+	{ reply: { ok: true, result: {} }, refused: false },
+] as const)
 	test(`steer preserves authoritative rejection versus ambiguity: ${JSON.stringify(fixture)}`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 		database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -891,17 +885,23 @@ for (const fixture of [
 			originKey: "steer-receipt",
 			epoch: 0,
 		});
-		const run: CliRunner = async () => ({
-			exitCode: fixture.exitCode,
-			stdout: JSON.stringify(fixture.envelope),
-			stderr: "",
+		const run: CliRunner = async () => {
+			throw new Error("steer must not spawn a CLI");
+		};
+		const relay = scriptedRelay((request) => {
+			expect(request).toEqual({
+				type: "control_request",
+				operation: "turn.steer",
+				input: { text: "input", clientRef: "expected-ref" },
+			});
+			return fixture.reply as ReturnType<Parameters<typeof scriptedRelay>[0]>;
 		});
 		const port = new BrokerSessionPort({
 			database,
 			authority,
 			cli: run,
 			instanceId: "instance-1",
-			tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+			tailRunner: new TailRunner({ stream: relay.spawn, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 		});
 		let failure: unknown;
 		try {
@@ -910,8 +910,177 @@ for (const fixture of [
 			failure = error;
 		}
 		expect(failure).toBeInstanceOf(GjcCliError);
-		expect((failure as GjcCliError).exitCode).toBe(fixture.exitCode);
 		expect(((failure as GjcCliError).details as { refused?: boolean } | undefined)?.refused === true).toBe(
 			fixture.refused,
 		);
 	});
+
+test("a relay that dies before the steer reply is ambiguity, never a definitive rejection", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: "/tmp/repo",
+		originKey: "steer-torn",
+		epoch: 0,
+	});
+	const relay = scriptedRelay(() => new Promise(() => {}));
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: async () => {
+			throw new Error("steer must not spawn a CLI");
+		},
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo: join(home, "workspace"), requestTimeoutMs: 50 }),
+	});
+	const attempt = port.steer({ sessionId: "sdk-1", repo: "/tmp/repo", text: "input", clientRef: "expected-ref" });
+	await Bun.sleep(5);
+	relay.streams[0]!.close();
+	const failure = await attempt.catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(Error);
+	expect((failure as { details?: { refused?: boolean } }).details?.refused).toBeUndefined();
+	expect(isDefinitiveSteerRejection(failure)).toBe(false);
+});
+
+test("send waits out a `busy` refusal and resends under the same op-ref once the turn is free", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-wait",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	const sends: string[] = [];
+	const sleeps: number[] = [];
+	let clock = 0;
+	const run: CliRunner = async (args) => {
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const relay = scriptedRelay((request) => {
+		if (request.operation !== "turn.prompt") throw new Error(`unexpected request ${request.operation}`);
+		sends.push(String(request.input.clientRef));
+		if (sends.length < 3)
+			return { ok: false, error: { code: "busy", message: "turn.prompt is unavailable while the agent is busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			sleeps.push(ms);
+			clock += ms;
+		},
+	});
+	const receipt = await port.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-busy1" });
+	expect(receipt.operationRef).toBe("gw-p-busy1");
+	expect(sends).toEqual(["gw-p-busy1", "gw-p-busy1", "gw-p-busy1"]);
+	expect(sleeps).toEqual([2_000, 2_000]);
+});
+
+test("send surfaces `busy` once the bounded wait is exhausted, never having sent", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-exhaust",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	let clock = 0;
+	let sends = 0;
+	const run: CliRunner = async () => {
+		throw new Error("unexpected command");
+	};
+	const relay = scriptedRelay(() => {
+		sends++;
+		return { ok: false, error: { code: "busy", message: "busy" } };
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	await expect(
+		port.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-busy2", busyWaitMs: 5_000 }),
+	).rejects.toThrow(/busy/);
+	// Attempts at 0s, 2s, 4s, 6s; the 6s refusal lands past the 5s deadline and surfaces.
+	expect(sends).toBe(4);
+});
+
+test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "torn", epoch: 0 });
+	const cliStatus: string[] = [];
+	let cliReports = 0;
+	const run: CliRunner = async (args) => {
+		if (args.includes("status")) {
+			cliStatus.push(args[args.indexOf("status") + 2] ?? "");
+			cliReports += 1;
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						operationRef: "gw-torn-1",
+						status: { status: cliReports < 2 ? "in_flight" : "terminal_ok", clientRef: "gw-torn-1" },
+						summary: { completed: cliReports >= 2 },
+					},
+				}),
+				stderr: "",
+			};
+		}
+		if (args.includes("session.last_assistant"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: ["survived"], complete: true } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	let relayQueries = 0;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return { ok: true, result: { commandId: "c", turnId: "t", accepted: true, clientRef: request.input.clientRef } };
+		relayQueries += 1;
+		// The relay tears on the first status read: the answer never comes.
+		relay.streams[0]!.close();
+		return new Promise(() => {});
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 200 }),
+	});
+	const result = await port.request({ sessionId: "sdk-1", repo, text: "go", opRef: "gw-torn-1", pollMs: 0 });
+	expect(result.status.status.status).toBe("terminal_ok");
+	expect(result.assistant.text).toBe("survived");
+	expect(relayQueries).toBe(1);
+	// The SAME clientRef was observed on the CLI after the tear; nothing was re-sent.
+	expect(cliStatus.every((ref) => ref === "gw-torn-1")).toBe(true);
+	expect(cliReports).toBe(2);
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+});

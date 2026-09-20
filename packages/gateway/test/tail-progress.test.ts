@@ -98,6 +98,9 @@ test("chat.progress is silent until a tail observation supplies its counters", a
 			() => frames.some((frame) => frame.event === "chat.progress" && frame.payload.activity?.kind === "thinking"),
 			"tool end did not surface as thinking",
 		);
+		// One invocation is one tool call: the end frame (and any update) must not
+		// count it again. Counters came from the activity frame (2) + one start.
+		expect(Math.max(...frames.filter((f) => f.event === "chat.progress").map((f) => f.payload.toolCalls))).toBe(3);
 		port.complete(send.opRef, "done");
 	} finally {
 		socket?.end();

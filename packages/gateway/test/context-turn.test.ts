@@ -180,6 +180,31 @@ test("a delivered intermediate reply followed by runtime failure consumes the se
 	client.close();
 });
 
+test("a chatty turn past the mid-work part budget still delivers its final answer and settles", async () => {
+	// The per-turn part budget caps mid-work speech; it must never eat the
+	// terminal slot. With the interim gate gone a 12-message turn is ordinary.
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, _preamble, _progress, options) => {
+			for (let index = 1; index <= 12; index++) options?.onAssistantText?.(`progress note ${index}`);
+			return "the final answer";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "chatty-trigger", "owner request");
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text === "the final answer"),
+	);
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
+	expect(texts.filter((text) => text.startsWith("progress note"))).toHaveLength(10);
+	expect(texts.filter((text) => text === "the final answer")).toHaveLength(1);
+	expect(database.inboundTurnRow(sessionPort.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+	client.close();
+});
+
 test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
@@ -224,9 +249,10 @@ test("/new retires a pre-reset trigger queued behind an in-flight turn", async (
 	send(client, "reset-while-busy", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-while-busy"));
 	release?.();
-	await Bun.sleep(50);
+	// The retired turn settles from status once released; the queued-behind
+	// message rode into it as a steer and must never become a fresh turn.
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
 	expect(turns).toHaveLength(1);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
 	client.close();
 });
 

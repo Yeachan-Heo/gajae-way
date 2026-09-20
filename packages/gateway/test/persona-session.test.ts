@@ -838,21 +838,17 @@ test("stop drains an admitted generation callback and fences queued and delayed 
 	await manager!.onBrokerGeneration(3);
 	await manager!.tick(KEY);
 	await manager!.reconcile(KEY);
-	await callbacks.onCursorCommitted?.("late-cursor");
 	await callbacks.onStall?.({ sessionId: port.sends[0]!.sessionId, brokerGeneration: 0, elapsedMs: 100_000 });
 	// A saved callback can outlive the tail handle and database.
 	await callbacks.onFrame?.({
-		kind: "transcript",
-		rawKind: "transcript",
+		kind: "message_end",
+		rawKind: "message_end",
 		payload: { role: "assistant", opRef: latestOpRef },
 		assistantText: "late answer",
 		steerEcho: false,
 		idle: false,
 	});
-	await callbacks.onRetentionGap?.({
-		sessionId: port.sends[0]!.sessionId,
-		resync: { revision: 1, generation: 0, seq: 1 },
-	});
+	await callbacks.onRelayLost?.({ sessionId: port.sends[0]!.sessionId, brokerGeneration: 0 });
 	expect(statusCalls).toBe(1);
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers).toHaveLength(0);
@@ -874,6 +870,7 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	port.complete(first.opRef, "stale output");
+	await manager!.tick(KEY);
 	await eventually(
 		() => database?.inboundTurnRow(latestOpRef)?.turn_state === "done",
 		"retired turn did not reconcile",
@@ -894,6 +891,7 @@ test("a retired stalled turn detaches into a durable hold and reconciles termina
 	port.emitStall(send.sessionId);
 	await manager?.recover();
 	port.complete(send.opRef, "must remain fenced");
+	await manager!.tick(KEY);
 	await eventually(
 		() => database?.inboundTurnRow(opRef)?.turn_state === "done",
 		"retired hold did not reconcile terminal",
@@ -995,6 +993,7 @@ for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_r
 		await manager.recover();
 		await manager.tick(KEY);
 		port.complete(first.opRef, "first answer");
+		await manager.tick(KEY);
 		await eventually(() => database!.inboundTurnRow(first.opRef)?.turn_state === "done", "terminal not recovered");
 		await manager.tick(KEY);
 		expect(database!.inboundSteersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
@@ -1118,7 +1117,7 @@ test("startup recovery releases a retired bound turn the broker disowns instead 
 	expect(logs.filter((line) => line.includes(`opRef=${ghostOpRef}`) && line.startsWith("recovery_hold"))).toEqual([]);
 });
 
-test("startup recovery reconstructs an accepted durable turn and reconciles its terminal tail", async () => {
+test("startup recovery reconstructs an accepted durable turn and reconciles status plus turn.result", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("m-1", "recover me");
@@ -1142,8 +1141,10 @@ test("startup recovery reconstructs an accepted durable turn and reconciles its 
 	});
 	await manager.recover();
 	port.complete(opRef, "recovered reply");
+	await manager.tick(KEY);
 	await eventually(() => terminal.length === 1, "recovered actor did not deliver terminal output");
 	expect(terminal).toEqual(["recovered reply"]);
+	expect(port.workerOutputReads.some((input) => input.opRef === opRef)).toBe(true);
 	expect(database?.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
@@ -1265,6 +1266,7 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(manager.state(KEY)).toBe("turn-running");
 	expect(port.sends).toHaveLength(1);
 	port.complete(send.opRef, "recovered reply");
+	await manager.tick(KEY);
 	await eventually(
 		() => database?.inboundTurnRow(send.opRef)?.turn_state === "done",
 		"recovered turn did not complete",
