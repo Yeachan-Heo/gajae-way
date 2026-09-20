@@ -555,7 +555,6 @@ export class GlobalGjcClient {
 		this.#relays.add(close);
 		void child.exited.then(close, close);
 		const lines = (async function* () {
-			const decoder = new TextDecoder();
 			const queue: Array<string | null> = [];
 			let wake: (() => void) | undefined;
 			const push = (line: string | null) => {
@@ -568,6 +567,10 @@ export class GlobalGjcClient {
 			let open = streams.length;
 			const pump = async (stream: ReadableStream<Uint8Array>) => {
 				const reader = stream.getReader();
+				// One streaming decoder PER stream: a multibyte character split at a
+				// stdout chunk boundary must take its continuation bytes from stdout,
+				// never from an interleaved stderr chunk or stderr's EOF flush.
+				const decoder = new TextDecoder();
 				let buffer = "";
 				try {
 					for (;;) {
