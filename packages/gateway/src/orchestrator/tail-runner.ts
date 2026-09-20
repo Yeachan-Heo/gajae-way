@@ -548,6 +548,18 @@ class ManagedTailHandle implements TailHandle {
 		try {
 			parsed = JSON.parse(trimmed);
 		} catch {
+			// gjc <= 0.16.x prints the serve refusal as an uncaught-exception text
+			// line (`[Uncaught Exception] Error: endpoint_stale: session … is not
+			// live`) instead of a JSON envelope; the code is still the first token.
+			const textual = /(?:^|\s)Error:\s+([a-z_]{3,64}):\s+(.*)$/i.exec(trimmed);
+			if (textual && !this.#connectionId && !this.#refusal) {
+				this.#refusal = new RelayRefusedError(
+					this.sessionId,
+					sanitizeDiagnostic(textual[1]!.toLowerCase()) || "relay_refused",
+					sanitizeDiagnostic(textual[2] ?? "").slice(0, 200) || undefined,
+				);
+				this.#helloResolve?.();
+			}
 			return;
 		}
 		const frame = recordOf(parsed);
