@@ -351,3 +351,95 @@ test("decodeStreamLine: notifications frames are not turn content; thinking bloc
 	const [idle] = decodeStreamLine(JSON.stringify({ type: "activity", state: "idle" }));
 	expect(idle).toMatchObject({ kind: "activity", idle: true });
 });
+
+test("a relay that dies six times in a row is declared dead: the handle closes and reports onRelayDead once", async () => {
+	const relays: FakeRelay[] = [];
+	const dead: unknown[] = [];
+	const lost: unknown[] = [];
+	const handle = await runner(() => {
+		const relay = new FakeRelay(`connection:${relays.length + 1}`);
+		relays.push(relay);
+		return relay;
+	}).attach({
+		sessionId: "s1",
+		brokerGeneration: 2,
+		repo: "/tmp/repo",
+		onRelayLost: (input) => {
+			lost.push(input);
+		},
+		onRelayDead: (input) => {
+			dead.push(input);
+		},
+	});
+	handle.beginTurn("op-1", CORRELATION);
+	handle.setTurnRunning(true);
+	for (let i = 0; i < 8; i++) {
+		relays.at(-1)!.end();
+		await Bun.sleep(5);
+	}
+	expect(dead).toEqual([{ sessionId: "s1", brokerGeneration: 2 }]);
+	expect(lost.length).toBeGreaterThanOrEqual(1);
+	expect(relays.length).toBeLessThanOrEqual(7);
+	await expect(handle.query("turn.result", {})).rejects.toBeInstanceOf(RelayClosedError);
+});
+
+test("request replies do not count as turn progress: a silent turn still stalls under continuous status polling", async () => {
+	let now = 0;
+	const relay = new FakeRelay();
+	const stalls: number[] = [];
+	const tail = runner(() => relay, { now: () => now, stallTimeoutMs: 1_000 });
+	const handle = await tail.attach({
+		sessionId: "s1",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onStall: ({ elapsedMs }) => {
+			stalls.push(elapsedMs);
+		},
+	});
+	handle.beginTurn("op-1", CORRELATION);
+	handle.setTurnRunning(true);
+	for (let step = 1; step <= 4; step++) {
+		now = step * 400;
+		const pending = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
+		await Bun.sleep(0);
+		relay.host({
+			type: "query_response",
+			id: relay.lastRequest("query_request")!.id,
+			ok: true,
+			result: { status: "in_flight" },
+		});
+		await pending;
+		tail.checkStalls();
+	}
+	expect(stalls).toEqual([1_200]);
+	// Real turn content resets the clock.
+	relay.host(messageEnd("assistant", "still here"));
+	await Bun.sleep(5);
+	now = 2_500;
+	tail.checkStalls();
+	expect(stalls).toEqual([1_200]);
+	await handle.close();
+});
+
+test("a spawner that throws counts toward give-up like a relay that dies", async () => {
+	let spawns = 0;
+	const dead: unknown[] = [];
+	const first = new FakeRelay();
+	const handle = await runner(() => {
+		spawns += 1;
+		if (spawns === 1) return first;
+		throw new Error("spawn refused");
+	}).attach({
+		sessionId: "s1",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onRelayDead: (input) => {
+			dead.push(input);
+		},
+	});
+	first.end();
+	await Bun.sleep(20);
+	expect(dead).toHaveLength(1);
+	expect(spawns).toBeLessThanOrEqual(8);
+	await handle.close();
+});

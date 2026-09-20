@@ -1662,7 +1662,10 @@ async function createInboundTurnLifecycle(
 			voiceTurn,
 		);
 		for (let index = 0; index < planned.length; index++) {
-			if (deliveredParts.length >= maxTurnParts) return;
+			// The per-turn part budget bounds MID-WORK speech only. The terminal
+			// answer always records its claim: with an ungated stream a chatty turn
+			// could otherwise exhaust the budget on interims and lose its final.
+			if (source === "interim" && deliveredParts.length >= maxTurnParts) return;
 			const step = planned[index] as { body: string; replyTo?: string };
 			// Interim parts are keyed on (trigger, text, part): distinct findings get
 			// distinct rows, a replayed finding (stream backfill, id-less frame after
@@ -1778,7 +1781,7 @@ async function createInboundTurnLifecycle(
 			toolCalls:
 				typeof reportedTools === "number" && Number.isFinite(reportedTools)
 					? Math.max(lastKnown.toolCalls, reportedTools)
-					: frame.payload.toolCallStarted === true || (/tool/i.test(frame.rawKind) && frame.rawKind !== "tool_activity")
+					: frame.payload.toolCallStarted === true
 						? lastKnown.toolCalls + 1
 						: lastKnown.toolCalls,
 			outputTokens:

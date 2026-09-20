@@ -1025,3 +1025,62 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 	// Attempts at 0s, 2s, 4s, 6s; the 6s refusal lands past the 5s deadline and surfaces.
 	expect(sends).toBe(4);
 });
+
+test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "torn", epoch: 0 });
+	const cliStatus: string[] = [];
+	let cliReports = 0;
+	const run: CliRunner = async (args) => {
+		if (args.includes("status")) {
+			cliStatus.push(args[args.indexOf("status") + 2] ?? "");
+			cliReports += 1;
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						operationRef: "gw-torn-1",
+						status: { status: cliReports < 2 ? "in_flight" : "terminal_ok", clientRef: "gw-torn-1" },
+						summary: { completed: cliReports >= 2 },
+					},
+				}),
+				stderr: "",
+			};
+		}
+		if (args.includes("session.last_assistant"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: ["survived"], complete: true } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	let relayQueries = 0;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return { ok: true, result: { commandId: "c", turnId: "t", accepted: true, clientRef: request.input.clientRef } };
+		relayQueries += 1;
+		// The relay tears on the first status read: the answer never comes.
+		relay.streams[0]!.close();
+		return new Promise(() => {});
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 200 }),
+	});
+	const result = await port.request({ sessionId: "sdk-1", repo, text: "go", opRef: "gw-torn-1", pollMs: 0 });
+	expect(result.status.status.status).toBe("terminal_ok");
+	expect(result.assistant.text).toBe("survived");
+	expect(relayQueries).toBe(1);
+	// The SAME clientRef was observed on the CLI after the tear; nothing was re-sent.
+	expect(cliStatus.every((ref) => ref === "gw-torn-1")).toBe(true);
+	expect(cliReports).toBe(2);
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+});

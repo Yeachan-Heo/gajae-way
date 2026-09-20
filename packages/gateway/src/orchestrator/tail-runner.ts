@@ -64,8 +64,10 @@ export interface TailAttachInput {
 	priority?: "current" | "retired";
 	onFrame?: (frame: TailFrame) => void | Promise<void>;
 	onStall?: (input: { sessionId: string; brokerGeneration: number; elapsedMs: number }) => void | Promise<void>;
-	/** The relay died; frames emitted while it was down are lost (best-effort content). */
+	/** The relay died mid-turn; frames emitted while it was down are lost (best-effort content). It reopens. */
 	onRelayLost?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
+	/** The relay could not be kept open (repeated immediate deaths); the handle is closed and will not reopen. */
+	onRelayDead?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
 	onDiagnostic?: (line: string) => void;
 }
 
@@ -145,6 +147,11 @@ export class RelayRequestTimeoutError extends Error {
 		super(`relay request ${id} on ${sessionId} received no response within ${timeoutMs}ms`);
 		this.name = "RelayRequestTimeoutError";
 	}
+}
+
+/** A relay transport failure: the request may or may not have reached the host; it says nothing about the operation. */
+export function isRelayTransportFailure(error: unknown): boolean {
+	return error instanceof RelayClosedError || error instanceof RelayRequestTimeoutError;
 }
 
 /** Supervises the resident relays: capacity, idle reaping, and stall alarms. */
@@ -437,6 +444,7 @@ class ManagedTailHandle implements TailHandle {
 				this.#input.onDiagnostic?.(
 					`tail_stream_spawn_failed session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
 				);
+				this.#reopenFailures += 1;
 				if (!(await this.#backoff())) return;
 				continue;
 			}
@@ -463,7 +471,8 @@ class ManagedTailHandle implements TailHandle {
 					this.#ready = true;
 					this.#readyResolve();
 				}
-				this.#reopenFailures = 0;
+				// A relay that says hello and then dies within seconds still counts
+				// toward give-up: the streak resets only after a relay lived 5 s.
 				await consume;
 			} catch (error) {
 				clearTimeout(helloTimer);
@@ -505,6 +514,7 @@ class ManagedTailHandle implements TailHandle {
 		if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
 			this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`);
 			await this.close();
+			await this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 			return false;
 		}
 		const backoff = Math.min(30_000, REOPEN_BASE_BACKOFF_MS * 2 ** this.#reopenFailures);
@@ -524,8 +534,6 @@ class ManagedTailHandle implements TailHandle {
 		}
 		const frame = recordOf(parsed);
 		if (!frame || typeof frame.type !== "string") return;
-		this.#lastEventAt = this.#runner.now();
-		this.#stallReported = false;
 		if (frame.type === "hello") {
 			if (typeof frame.connectionId === "string" && frame.connectionId.length > 0) {
 				this.#connectionId = frame.connectionId;
@@ -567,6 +575,10 @@ class ManagedTailHandle implements TailHandle {
 				);
 			return;
 		}
+		// Only the turn's own activity moves the stall clock: hello, request
+		// replies and unrelated notifications say nothing about the turn.
+		this.#lastEventAt = this.#runner.now();
+		this.#stallReported = false;
 		this.#deliveries = this.#deliveries
 			.then(async () => {
 				if (this.#closed) return;
@@ -595,9 +607,18 @@ class ManagedTailHandle implements TailHandle {
 			};
 			return true;
 		}
-		if (known.commandId !== undefined && frame.commandId !== undefined) return known.commandId === frame.commandId;
-		if (known.turnId !== undefined && frame.turnId !== undefined) return known.turnId === frame.turnId;
-		return false;
+		// Every id both sides know must agree; a contradiction on either is a
+		// foreign turn even when the other id happens to match.
+		let compared = 0;
+		if (known.commandId !== undefined && frame.commandId !== undefined) {
+			if (known.commandId !== frame.commandId) return false;
+			compared++;
+		}
+		if (known.turnId !== undefined && frame.turnId !== undefined) {
+			if (known.turnId !== frame.turnId) return false;
+			compared++;
+		}
+		return compared > 0;
 	}
 
 	async close(): Promise<void> {

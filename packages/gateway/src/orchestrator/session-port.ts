@@ -25,7 +25,13 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
 import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
-import type { RelayResponse, TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
+import {
+	isRelayTransportFailure,
+	type RelayResponse,
+	type TailAttachInput,
+	type TailHandle,
+	type TailRunner,
+} from "./tail-runner";
 
 /**
  * Generic broker-backed session surface. Callers own prompt composition,
@@ -1103,6 +1109,20 @@ export class BrokerSessionPort implements SessionPort {
 		});
 		relay.beginTurn(input.opRef);
 		relay.setTurnRunning(true);
+		// `turn.result` on the relay while it is up; on the CLI (the authoritative
+		// recovery transport) when the relay tore. A torn relay is never a verdict
+		// about the operation: the accepted op keeps being observed under the SAME
+		// clientRef, so a monitor event is not re-authored under a fresh one.
+		const target = { sessionId: input.sessionId, repo: input.repo, opRef: input.opRef };
+		const readStatus = async (): Promise<StatusReport> => {
+			try {
+				return await this.status({ ...target, relay });
+			} catch (error) {
+				if (!isRelayTransportFailure(error)) throw error;
+				console.error(`status_relay_unavailable session=${input.sessionId} opRef=${input.opRef}`);
+				return await this.status(target);
+			}
+		};
 		try {
 			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
@@ -1116,7 +1136,7 @@ export class BrokerSessionPort implements SessionPort {
 				// otherwise ran the event, produced a final answer, then executed it
 				// again because the torn send was treated as definitive failure.
 				try {
-					status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
+					status = await readStatus();
 				} catch (error) {
 					if (error instanceof BrokerAuthorityError) throw error;
 					throw sendError;
@@ -1126,11 +1146,11 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			const deadline = this.#now() + (input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS);
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
-			status ??= await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
+			status ??= await readStatus();
 			while (!isTerminalStatus(status.status.status) && this.#now() < deadline) {
 				this.checkStalls();
 				await this.#sleep(pollMs);
-				status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
+				status = await readStatus();
 			}
 			if (!isTerminalStatus(status.status.status))
 				throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);

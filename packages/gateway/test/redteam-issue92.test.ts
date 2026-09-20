@@ -242,6 +242,37 @@ test("red-team: relay loss holds the accepted turn until status and turn.result 
 	}
 });
 
+test("red-team: a relay declared dead settles the turn from CLI status without a tick and never re-sends", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	const target = await fixture({ port });
+	try {
+		enqueue(target, "dead-relay-trigger", "keep the turn open");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "initial batch did not start");
+		const send = required(port.sends[0], "initial send missing");
+
+		port.killRelay(send.opRef);
+		await eventually(
+			() => target.logs.some((line) => line.startsWith("recovery_hold ") && line.includes("reason=relay_dead")),
+			"relay death was not observed",
+		);
+		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
+		// The turn's end arrives only through status; no relay will announce it
+		// and no explicit tick is issued: the actor's own recheck must find it.
+		port.completeWithoutAnswerFrame(send.opRef, "terminal after relay death");
+		await eventually(
+			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			"dead-relay turn did not settle from status on its own recheck",
+		);
+		expect(target.terminal).toEqual(["terminal after relay death"]);
+		expect(port.sends).toHaveLength(1);
+		expect(target.logs.filter((line) => line.includes("status_unavailable"))).toEqual([]);
+		assertCoverage(target, ["dead-relay-trigger"]);
+	} finally {
+		await target.close();
+	}
+});
+
 test("canonical: a refused steer stays pending until the running turn terminates, then sends exactly once on the same session", async () => {
 	const port = new FailFirstSteerPort();
 	const target = await fixture({ port });

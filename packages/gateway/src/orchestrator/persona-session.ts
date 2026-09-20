@@ -18,7 +18,13 @@ import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold 
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
-import { deterministicInterimDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
+import {
+	deterministicInterimDeliveryId,
+	isRelayTransportFailure,
+	TailCapacityError,
+	type TailFrame,
+	type TailHandle,
+} from "./tail-runner";
 
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 /**
@@ -1527,9 +1533,15 @@ class OriginActor {
 				await this.enqueue(async () => await this.#onTailFrame(sessionId, epoch, generation, retired, frame));
 			},
 			onRelayLost: () => {
-				void this.enqueue(async () => await this.#onRelayLost(sessionId, epoch, generation, retired)).catch(
+				void this.enqueue(async () => await this.#onRelayLost(sessionId, epoch, generation, retired, false)).catch(
 					(error: unknown) =>
 						this.#manager.log(`persona_relay_lost_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+				);
+			},
+			onRelayDead: () => {
+				void this.enqueue(async () => await this.#onRelayLost(sessionId, epoch, generation, retired, true)).catch(
+					(error: unknown) =>
+						this.#manager.log(`persona_relay_dead_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
 				);
 			},
 			onStall: ({ elapsedMs }) => {
@@ -1599,17 +1611,32 @@ class OriginActor {
 	 * the turn settles from status and the original result; the handle itself
 	 * reopens for commands. A retired hold is left for the status reconcile.
 	 */
-	async #onRelayLost(sessionId: string, epoch: number, brokerGeneration: number, retired: boolean): Promise<void> {
+	async #onRelayLost(
+		sessionId: string,
+		epoch: number,
+		brokerGeneration: number,
+		retired: boolean,
+		dead: boolean,
+	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
-		if (!bound || bound.tailEvidenceUnavailable) return;
-		bound.tailEvidenceUnavailable = true;
-		this.#manager.log(
-			`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=relay_lost_mid_turn`,
-		);
-		if (retired || bound.retired)
+		if (!bound) return;
+		if (dead) {
+			// The handle closed itself and will not reopen: every later status read
+			// goes through the CLI, and a later reconcile may attach a fresh relay
+			// for commands. Keeping a closed handle here made status throw forever.
+			bound.tail = undefined;
+			bound.detached = true;
+		}
+		if (!bound.tailEvidenceUnavailable) {
+			bound.tailEvidenceUnavailable = true;
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=relay_lost`,
+				`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=${dead ? "relay_dead" : "relay_lost_mid_turn"}`,
 			);
+			if (retired || bound.retired)
+				this.#manager.log(
+					`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=relay_lost`,
+				);
+		}
 		await this.#reconcileBound(bound);
 	}
 
@@ -1683,17 +1710,32 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * `turn.result` for a bound turn: on the owned relay when it is live, and
+	 * on the CLI (the authoritative recovery transport) when the relay is gone,
+	 * between reopens, or refuses the read. A transport failure on the relay is
+	 * never a verdict about the operation.
+	 */
+	async #statusOf(bound: BoundTurn): Promise<StatusReport> {
+		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
+		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
+		try {
+			return await this.#manager.port.status({ ...base, relay: bound.tail });
+		} catch (error) {
+			if (!isRelayTransportFailure(error)) throw error;
+			this.#manager.log(
+				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return await this.#manager.port.status(base);
+		}
+	}
+
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
 		let report: StatusReport;
 		try {
-			report = await this.#manager.port.status({
-				sessionId: bound.sessionId,
-				repo: this.#manager.repo,
-				opRef: bound.turn.opRef,
-				...(bound.tail && !bound.detached ? { relay: bound.tail } : {}),
-			});
+			report = await this.#statusOf(bound);
 		} catch (error) {
 			if (this.#stopped || this.#manager.stopped) return;
 			// The broker disowning the id (session_unavailable) with the session
@@ -1720,6 +1762,9 @@ class OriginActor {
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
 			);
+			// A turn no relay will announce the end of must not wait for the 60 s
+			// sweep after one unreadable status: keep rechecking at the bounded cadence.
+			if (bound.tailEvidenceUnavailable) this.#scheduleStatusRecheck(bound);
 			return;
 		}
 		if (this.#stopped || this.#manager.stopped) return;

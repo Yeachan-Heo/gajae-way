@@ -111,8 +111,13 @@ export class RuntimeCycleProjector {
 		const inbound = this.#database.inboundStateCounts();
 		const pendingRows = this.#database.inboundPendingByOrigin();
 		const pendingByOrigin = new Map(pendingRows.map((r) => [r.origin_key, r.n]));
-		const oldestPendingMs = pendingRows.reduce<number | null>((oldest, row) => {
-			const age = nowMs - Date.parse(row.oldest_received_at);
+		const inFlightInbound = pendingRows.reduce((sum, row) => sum + row.active, 0);
+		// Starvation is per origin: an unbound row waiting behind that origin's
+		// running turn is queued, not starved; only an origin with nothing in
+		// flight and an old unbound row is stuck.
+		const oldestStarvedPendingMs = pendingRows.reduce<number | null>((oldest, row) => {
+			if (row.active > 0 || row.oldest_unbound_received_at === null) return oldest;
+			const age = nowMs - Date.parse(row.oldest_unbound_received_at);
 			return Number.isFinite(age) && (oldest === null || age > oldest) ? age : oldest;
 		}, null);
 		const contextByOrigin = this.#database.contextDiagnosticsByOrigin();
@@ -128,7 +133,7 @@ export class RuntimeCycleProjector {
 		return {
 			sessionRows: sessions,
 			inboundCounts: inboundMap,
-			inFlightInbound: inboundMap.get("processing") ?? 0,
+			inFlightInbound,
 			pendingInbound: inboundMap.get("pending") ?? 0,
 			unknownInboundStates: unknownInbound,
 			deliveryCounts: new Map(deliveries.map((r) => [r.state, r.n])),
@@ -137,7 +142,7 @@ export class RuntimeCycleProjector {
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
 			inboundPendingByOrigin: pendingByOrigin,
-			oldestStarvedPendingMs: (inboundMap.get("processing") ?? 0) === 0 ? oldestPendingMs : null,
+			oldestStarvedPendingMs,
 			contextByOrigin,
 			contextDiff: this.#database.contextDiagnostics(),
 			memoryClosing: this.#memory.queueDepth > 0,

@@ -1262,13 +1262,27 @@ export class GatewayDatabase {
 		}>;
 	}
 
-	/** Cycle projection source: pending inbound count per origin key. */
-	inboundPendingByOrigin(): Array<{ origin_key: string; n: number; oldest_received_at: string }> {
+	/**
+	 * Cycle projection source: pending inbound per origin key, with the age of
+	 * the oldest UNBOUND row and whether a turn is in flight there. Actors keep
+	 * an active trigger at `state = 'pending'` and move only `turn_state`, so
+	 * "in flight" is `turn_state IN ('bound','accepted')`, never the legacy
+	 * `processing` state (normalised away by migration 19).
+	 */
+	inboundPendingByOrigin(): Array<{
+		origin_key: string;
+		n: number;
+		oldest_unbound_received_at: string | null;
+		active: number;
+	}> {
 		return this.#database
 			.query(
-				`SELECT origin_key, COUNT(*) AS n, MIN(received_at) AS oldest_received_at FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
+				`SELECT origin_key, COUNT(*) AS n,
+					MIN(CASE WHEN turn_state IS NULL THEN received_at END) AS oldest_unbound_received_at,
+					SUM(CASE WHEN turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') THEN 1 ELSE 0 END) AS active
+				FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
 			)
-			.all() as Array<{ origin_key: string; n: number; oldest_received_at: string }>;
+			.all() as Array<{ origin_key: string; n: number; oldest_unbound_received_at: string | null; active: number }>;
 	}
 
 	/** Cycle projection source: delivery state census across all origins. */

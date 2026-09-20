@@ -575,10 +575,15 @@ export class GlobalGjcClient {
 		})();
 		const write = (line: string): void => {
 			if (closed) throw new Error("relay closed");
-			const stdin = child.stdin as unknown as { write(chunk: string): unknown; flush?(): unknown } | null;
-			if (!stdin || typeof stdin.write !== "function") throw new Error("relay stdin unavailable");
+			const stdin = child.stdin;
+			if (!stdin || typeof stdin === "number") throw new Error("relay stdin unavailable");
 			stdin.write(`${line}\n`);
-			stdin.flush?.();
+			// FileSink.flush is synchronous unless the pipe is backpressured, in
+			// which case it returns a promise that rejects on EPIPE once the child
+			// is gone. An escaped rejection would be unhandled; the relay ending is
+			// already reported through `lines`, so a late flush failure only closes.
+			const flushed = stdin.flush();
+			if (flushed instanceof Promise) flushed.catch(() => close());
 		};
 		return { lines, write, close };
 	}

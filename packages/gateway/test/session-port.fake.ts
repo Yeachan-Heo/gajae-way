@@ -612,6 +612,11 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#owner.get(opRef)?.lose();
 	}
 
+	/** The relay that owns `opRef` is declared dead: closed, never reopened; the turn settles by CLI status. */
+	killRelay(opRef: string): void {
+		this.#owner.get(opRef)?.die();
+	}
+
 	/** Handles currently attached to a session. */
 	tailsOf(sessionId: string): readonly ScriptedTailHandle[] {
 		return [...(this.#tails.get(sessionId) ?? [])];
@@ -863,8 +868,12 @@ export class ScriptedTailHandle implements TailHandle {
 					...(frame.turnId ? { turnId: frame.turnId } : {}),
 				};
 			} else if (
-				!(known.commandId !== undefined && known.commandId === frame.commandId) &&
-				!(known.turnId !== undefined && known.turnId === frame.turnId)
+				(known.commandId !== undefined && frame.commandId !== undefined && known.commandId !== frame.commandId) ||
+				(known.turnId !== undefined && frame.turnId !== undefined && known.turnId !== frame.turnId) ||
+				!(
+					(known.commandId !== undefined && frame.commandId !== undefined) ||
+					(known.turnId !== undefined && frame.turnId !== undefined)
+				)
 			)
 				return;
 		} else if (!frame.idle) return;
@@ -884,6 +893,13 @@ export class ScriptedTailHandle implements TailHandle {
 	lose(): void {
 		if (this.#closed) return;
 		void this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+	}
+
+	/** Simulates the relay giving up (six immediate deaths): the handle closes and will not reopen. */
+	die(): void {
+		if (this.#closed) return;
+		void this.close();
+		void this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 	}
 
 	async close(): Promise<void> {
