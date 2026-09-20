@@ -3,6 +3,7 @@ import type { SessionRelayStream } from "../src/orchestrator/broker";
 import {
 	decodeStreamLine,
 	RelayClosedError,
+	RelayRefusedError,
 	RelayRequestTimeoutError,
 	type TailFrame,
 	TailRunner,
@@ -442,4 +443,14 @@ test("a spawner that throws counts toward give-up like a relay that dies", async
 	expect(dead).toHaveLength(1);
 	expect(spawns).toBeLessThanOrEqual(8);
 	await handle.close();
+});
+
+test("a serve refusal envelope (endpoint_stale) rejects attach as session_unavailable instead of waiting for hello", async () => {
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+	relay.host({ ok: false, error: { code: "endpoint_stale", message: "session s1 endpoint is not live" } });
+	relay.end();
+	const error = await attach.catch((e: unknown) => e);
+	expect(error).toBeInstanceOf(RelayRefusedError);
+	expect((error as RelayRefusedError).code).toBe("session_unavailable");
 });

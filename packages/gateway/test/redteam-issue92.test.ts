@@ -8,6 +8,7 @@ import { OpRefRejectedError } from "@gajae-gateway/subsession";
 import { parseConfigFile } from "../src/config";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
+import { RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase, type InboundTurn } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
@@ -271,6 +272,36 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 		expect(target.terminal).toEqual(["first answer", "second answer"]);
 		expect(target.logs.filter((line) => line.includes("terminal_status_reconciled"))).toEqual([]);
 		expect(port.sends).toHaveLength(2);
+	} finally {
+		await target.close();
+	}
+});
+
+test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh epoch and never holds the message", async () => {
+	class StaleFirstPort extends ScriptedSessionPort {
+		refusals = 0;
+		override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+			if (this.refusals === 0) {
+				this.refusals += 1;
+				throw new RelayRefusedError(input.sessionId, "endpoint_stale", "endpoint is not live");
+			}
+			return await super.attachTail(input);
+		}
+	}
+	const port = new StaleFirstPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	const target = await fixture({ port });
+	try {
+		enqueue(target, "stale-attach-trigger", "hello after a stale endpoint");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "the message was not dispatched after the stale relay");
+		expect(port.refusals).toBe(1);
+		expect(target.logs.some((line) => line.startsWith("persona_attach_session_gone"))).toBe(true);
+		// The stale session's binding was rotated: the send rode a NEW session.
+		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
+		port.complete(port.sends[0]!.opRef, "answer on the fresh session");
+		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "turn did not settle");
+		expect(target.terminal).toEqual(["answer on the fresh session"]);
+		expect(target.logs.some((line) => line.includes("host hello did not arrive"))).toBe(false);
 	} finally {
 		await target.close();
 	}

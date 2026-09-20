@@ -141,6 +141,21 @@ export class RelayClosedError extends Error {
 	}
 }
 
+/**
+ * `gjc sdk serve` refused to attach: it printed one SDK error envelope and
+ * exited. `endpoint_stale` / `not_found` mean the broker no longer serves this
+ * session id - the same condition the CLI reports as `session_unavailable`,
+ * so callers classify it identically (release the bound turn, rebind).
+ */
+export class RelayRefusedError extends Error {
+	readonly code: string;
+	constructor(sessionId: string, code: string, message: string | undefined) {
+		super(`relay for ${sessionId} refused: ${code}${message ? ` - ${message}` : ""}`);
+		this.name = "RelayRefusedError";
+		this.code = code === "endpoint_stale" || code === "not_found" ? "session_unavailable" : code;
+	}
+}
+
 export class RelayRequestTimeoutError extends Error {
 	readonly code = "relay_timeout";
 	constructor(sessionId: string, id: string, timeoutMs: number) {
@@ -311,6 +326,7 @@ class ManagedTailHandle implements TailHandle {
 	#stream: TailStream | undefined;
 	#connectionId: string | undefined;
 	#helloResolve: (() => void) | undefined;
+	#refusal: RelayRefusedError | undefined;
 	#reopenFailures = 0;
 	#requestSeq = 0;
 	readonly #pending = new Map<string, PendingRequest>();
@@ -449,6 +465,7 @@ class ManagedTailHandle implements TailHandle {
 				continue;
 			}
 			this.#stream = stream;
+			this.#refusal = undefined;
 			const openedAt = this.#runner.now();
 			const hello = new Promise<void>((resolve) => {
 				this.#helloResolve = resolve;
@@ -466,6 +483,7 @@ class ManagedTailHandle implements TailHandle {
 				stream.write(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [...HELLO_CAPABILITIES] }));
 				await hello;
 				clearTimeout(helloTimer);
+				if (this.#refusal) throw this.#refusal;
 				if (!this.#connectionId) throw new Error("host hello did not arrive");
 				if (!this.#ready) {
 					this.#ready = true;
@@ -533,7 +551,20 @@ class ManagedTailHandle implements TailHandle {
 			return;
 		}
 		const frame = recordOf(parsed);
-		if (!frame || typeof frame.type !== "string") return;
+		if (!frame) return;
+		if (frame.ok === false && typeof frame.type !== "string") {
+			// The serve CLI's own refusal envelope: it will exit right after this.
+			const error = recordOf(frame.error);
+			const code = typeof error?.code === "string" ? error.code : "relay_refused";
+			this.#refusal = new RelayRefusedError(
+				this.sessionId,
+				sanitizeDiagnostic(code) || "relay_refused",
+				typeof error?.message === "string" ? sanitizeDiagnostic(error.message).slice(0, 200) : undefined,
+			);
+			this.#helloResolve?.();
+			return;
+		}
+		if (typeof frame.type !== "string") return;
 		if (frame.type === "hello") {
 			if (typeof frame.connectionId === "string" && frame.connectionId.length > 0) {
 				this.#connectionId = frame.connectionId;
