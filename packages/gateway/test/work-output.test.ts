@@ -10,9 +10,9 @@ import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
 	noRelay,
-	ScriptedSessionPort,
 	type ScriptedRelayReply,
 	type ScriptedRelayRequest,
+	ScriptedSessionPort,
 	scriptedRelay,
 	steerRefused,
 } from "./session-port.fake";

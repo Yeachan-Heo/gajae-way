@@ -7,6 +7,7 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
+import type { SessionRelayStream } from "../src/orchestrator/broker";
 import type {
 	SessionBindInput,
 	SessionBinding,
@@ -31,7 +32,6 @@ import {
 	type TailStreamSpawner,
 	type TurnCorrelation,
 } from "../src/orchestrator/tail-runner";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
 import type { BrokerAuthority, GatewayDatabase } from "../src/store/db";
 
 /** Initializes only a fresh test DB; never adopts legacy bindings or writes a GJC profile. */

@@ -5,8 +5,8 @@ import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { noRelay } from "./session-port.fake";
 import { GatewayDatabase } from "../src/store/db";
+import { noRelay } from "./session-port.fake";
 
 test("a poisoned session-create key advances one epoch and retries with a fresh key", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-epoch-"));
