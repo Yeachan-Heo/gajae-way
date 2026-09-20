@@ -53,6 +53,14 @@ export interface GlobalGjcClientOptions {
 	readonly log?: (line: string) => void;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
+
+/** A resident bidirectional JSONL relay to one SDK session host. */
+export interface SessionRelayStream {
+	readonly lines: AsyncIterable<string>;
+	/** Writes one JSONL frame to the host; throws once the relay is closed. */
+	write(line: string): void;
+	close(): void;
+}
 export class GjcCliUnavailableError extends Error {
 	readonly code = "broker_unavailable";
 	constructor(message: string) {
@@ -502,8 +510,13 @@ export class GlobalGjcClient {
 			);
 		}
 	}
-	/** Only gateway-created stdio relays are terminated, never their GJC daemon or session host. */
-	openStream(sessionId: string): { readonly lines: AsyncIterable<string>; close(): void } {
+	/**
+	 * One resident `gjc sdk serve --stdio` relay for a session: JSONL frames go
+	 * down its stdin to the host (hello, control/query requests) and the host's
+	 * frames come back up stdout. Only gateway-created relays are terminated,
+	 * never their GJC daemon or session host.
+	 */
+	openStream(sessionId: string): SessionRelayStream {
 		this.#assertAgentDirIdentity();
 		if (!sessionId || sessionId.startsWith("-") || /[\r\n\0]/.test(sessionId)) throw new Error("invalid session ID");
 		if (this.#stopped || !this.#available) throw new GjcCliUnavailableError("broker unavailable");
@@ -560,7 +573,14 @@ export class GlobalGjcClient {
 				close();
 			}
 		})();
-		return { lines, close };
+		const write = (line: string): void => {
+			if (closed) throw new Error("relay closed");
+			const stdin = child.stdin as unknown as { write(chunk: string): unknown; flush?(): unknown } | null;
+			if (!stdin || typeof stdin.write !== "function") throw new Error("relay stdin unavailable");
+			stdin.write(`${line}\n`);
+			stdin.flush?.();
+		};
+		return { lines, write, close };
 	}
 }
 function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {

@@ -17,7 +17,7 @@ import {
 } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
-import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
+import { initializeTestBrokerAuthority, noRelay, ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-18T00:00:00.000Z");
 const REPO = "/tmp/gajaeway-broker-wedge-repo";
@@ -147,7 +147,7 @@ test("poisoned create-key rotation stops at exactly three rotations and rethrows
 		authority,
 		cli: run,
 		instanceId: "broker-wedge-rotation",
-		tailRunner: new TailRunner({ run, repo: REPO }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: REPO }),
 		sleep: async () => {},
 	});
 	try {
@@ -206,7 +206,7 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 		authority,
 		cli: run,
 		instanceId: "broker-wedge-reset",
-		tailRunner: new TailRunner({ run, repo: REPO }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: REPO }),
 		sleep: async () => {},
 	});
 	await expect(port.bind({ originKey: ORIGIN, epoch: 0, repo: REPO })).rejects.toThrow();

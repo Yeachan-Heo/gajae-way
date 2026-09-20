@@ -167,10 +167,8 @@ liveTest(
 				instanceId: database.instanceId,
 				authority: brokerAuthority,
 				tailRunner: new TailRunner({
-					run: broker.cli,
 					stream: (id) => broker.openStream(id),
 					repo,
-					pollIntervalMs: 250,
 				}),
 			});
 			stage = "own-session-bind-and-model";

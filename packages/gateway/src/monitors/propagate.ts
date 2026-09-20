@@ -611,7 +611,6 @@ export class MonitorPropagator {
 						originKey: sessionOriginKey,
 						text: prompt,
 						opRef,
-						observeTail: false,
 					})
 				).assistant.text;
 				dispatchPhase = "validate";

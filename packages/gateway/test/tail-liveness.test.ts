@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CliRunner } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
+import type { SessionRelayStream } from "../src/orchestrator/broker";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { startUnixServer } from "../src/server/server";
@@ -19,6 +19,46 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 		await Bun.sleep(5);
 	}
 	expect(predicate(), message).toBe(true);
+}
+
+class FakeRelay implements SessionRelayStream {
+	readonly lines: AsyncIterable<string>;
+	readonly #queue: Array<string | null> = [];
+	readonly #waiters: Array<(line: string | null) => void> = [];
+
+	constructor() {
+		this.lines = {
+			[Symbol.asyncIterator]: () => ({
+				next: async () => {
+					const line = await new Promise<string | null>((resolve) => {
+						const queued = this.#queue.shift();
+						if (queued !== undefined) resolve(queued);
+						else this.#waiters.push(resolve);
+					});
+					return line === null ? { done: true, value: undefined } : { done: false, value: line };
+				},
+			}),
+		};
+	}
+
+	write(line: string): void {
+		if (JSON.parse(line).type === "hello")
+			this.host({ type: "hello", protocolVersion: 3, connectionId: "tail-liveness" });
+	}
+
+	host(frame: Record<string, unknown>): void {
+		this.#push(JSON.stringify(frame));
+	}
+
+	close(): void {
+		this.#push(null);
+	}
+
+	#push(line: string | null): void {
+		const waiter = this.#waiters.shift();
+		if (waiter) waiter(line);
+		else this.#queue.push(line);
+	}
 }
 
 test("persona state stays running until a terminal tail event is injected", async () => {
@@ -49,12 +89,18 @@ test("persona state stays running until a terminal tail event is injected", asyn
 
 		// Status can become terminal before a tail arrives, but that fact alone is
 		// intentionally not a persona state transition.
-		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "unobserved terminal");
+		const status = port.status.bind(port);
+		port.status = async (input) => ({
+			operationRef: input.opRef,
+			status: { status: "terminal_ok", receiptState: "present" },
+			summaryCompleted: true,
+		});
 		await manager.tick(ORIGIN_KEY);
+		port.status = status;
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
 		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 
-		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 9 });
+		port.emitTool(send.sessionId, { toolName: "read" });
 		await Bun.sleep(0);
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
 		port.complete(send.opRef, "terminal tail evidence");
@@ -69,27 +115,14 @@ test("persona state stays running until a terminal tail event is injected", asyn
 
 test("tail runner alarms exactly at the stall threshold, diagnoses unknown kinds, and records authenticated compaction receipts", async () => {
 	let now = 0;
-	let wakePoll!: () => void;
 	const stalls: number[] = [];
 	const logs: string[] = [];
-	const run: CliRunner = async () => ({
-		exitCode: 0,
-		stdout: JSON.stringify({
-			ok: true,
-			result: { items: [{ kind: "compaction_observed", payload: { trigger: "native_auto" } }], terminal: false },
-		}),
-		stderr: "",
-	});
+	const relay = new FakeRelay();
 	const runner = new TailRunner({
-		run,
+		stream: () => relay,
 		repo: "/tmp/tail-liveness",
 		stallTimeoutMs: 120_000,
-		pollIntervalMs: 1,
 		now: () => now,
-		sleep: () =>
-			new Promise<void>((resolve) => {
-				wakePoll = resolve;
-			}),
 		log: (line) => logs.push(line),
 	});
 	const tail = await runner.attach({
@@ -103,6 +136,18 @@ test("tail runner alarms exactly at the stall threshold, diagnoses unknown kinds
 		onDiagnostic: (line) => logs.push(line),
 	});
 	try {
+		tail.beginTurn("op-1", { commandId: "cmd-1", turnId: "turn-1" });
+		relay.host({
+			type: "event",
+			kind: "compaction_observed",
+			commandId: "cmd-1",
+			turnId: "turn-1",
+			payload: { event_type: "compaction_observed", event: { trigger: "native_auto" } },
+		});
+		await eventually(
+			() => logs.includes("unknown_runtime_event session=tail-session kind=compaction_observed"),
+			"unknown relay event was not diagnosed",
+		);
 		expect(logs).toContain("unknown_runtime_event session=tail-session kind=compaction_observed");
 		runner.recordCompactionReceipt({ sessionId: "tail-session", originKey: ORIGIN_KEY, result: { started: true } });
 		expect(logs).toContain(
@@ -119,7 +164,6 @@ test("tail runner alarms exactly at the stall threshold, diagnoses unknown kinds
 		expect(stalls).toEqual([120_000]);
 	} finally {
 		await tail.close();
-		wakePoll();
 	}
 });
 
@@ -174,7 +218,8 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 		expect(frames.filter((frame) => frame.event === "chat.progress")).toEqual([]);
 
 		const send = port.sends[0]!;
-		port.emitActivity(send.sessionId, { toolCalls: 3, outputTokens: 77 });
+		for (let call = 0; call < 3; call++) port.emitTool(send.sessionId, { toolName: "read" });
+		port.emitAssistant(send.sessionId, "x".repeat(308));
 		await eventually(
 			() =>
 				frames.some(
@@ -184,6 +229,7 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 			"tail activity did not become progress",
 		);
 		port.complete(send.opRef, "done");
+		await eventually(() => database.inboundPendingCount(ORIGIN_KEY) === 0, "completed turn did not settle");
 	} finally {
 		socket?.end();
 		await server.stop();

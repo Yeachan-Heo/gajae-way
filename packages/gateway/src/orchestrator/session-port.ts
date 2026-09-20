@@ -5,6 +5,7 @@ import {
 	type BrokerSession,
 	type CliResult,
 	type CliRunner,
+	CLIENT_REF_CONFLICT_CODE,
 	type ControllerOptions,
 	envelopeErrorCode,
 	fetchOpState,
@@ -12,18 +13,19 @@ import {
 	inspectSession,
 	isTerminalStatus,
 	type LastAssistantResult,
+	OpRefError,
 	OpRefRejectedError,
 	parseEnvelope,
+	parseStatusReport,
 	type SendReceipt,
 	type StatusReport,
-	sendPrompt,
 	TranscriptIncompleteError,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
 import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
-import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
+import type { RelayResponse, TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
 
 /**
  * Generic broker-backed session surface. Callers own prompt composition,
@@ -68,7 +70,7 @@ export interface SessionPort {
 		repo: string;
 		tier: GjcServiceTier;
 	}): Promise<{ readonly changed: boolean }>;
-	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
+	status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport>;
 	/** Exact invocation-owned original output; never falls back to a latest-assistant heuristic. */
 	fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
@@ -142,6 +144,12 @@ export interface SessionSendInput {
 	readonly codingRegister?: boolean;
 	/** How long a `busy` refusal is retried before it surfaces as a failure. */
 	readonly busyWaitMs?: number;
+	/**
+	 * The session's resident relay. The prompt is submitted on it so the host
+	 * streams the turn's content to this handle; without one the port opens a
+	 * throwaway relay for the send (the turn then has no live observer).
+	 */
+	readonly relay?: TailHandle;
 }
 
 export interface SessionSteerInput {
@@ -149,6 +157,7 @@ export interface SessionSteerInput {
 	readonly repo: string;
 	readonly text: string;
 	readonly clientRef: string;
+	readonly relay?: TailHandle;
 }
 
 export interface WorkerOutputInput {
@@ -194,8 +203,6 @@ export interface SessionRequestInput extends SessionSendInput {
 	readonly originKey?: string;
 	readonly waitTimeoutMs?: number;
 	readonly pollMs?: number;
-	/** Monitor/batch authoring needs only terminal status + final answer, not live tail replay. */
-	readonly observeTail?: boolean;
 }
 
 export interface SessionRequestResult {
@@ -630,21 +637,41 @@ export class BrokerSessionPort implements SessionPort {
 	async send(input: SessionSendInput): Promise<SendReceipt> {
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
+		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
 		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
-		const prompt = {
-			sessionId: input.sessionId,
-			text: renderPrompt(input.systemPreamble, input.text),
-			taskKey: "gateway",
-			opRef: input.opRef,
-		};
-		const controller = this.#controller(input.repo);
-		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
-		let waited = false;
-		for (;;) {
-			try {
-				return await sendPrompt(controller, prompt);
-			} catch (error) {
+		const text = renderPrompt(input.systemPreamble, input.text);
+		// The prompt is submitted on the session's resident relay so that this
+		// connection OWNS the turn: the host streams the turn's content only to
+		// the connection that submitted it. A caller without a relay gets one
+		// for the duration of the send.
+		const relay =
+			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		try {
+			const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+			let waited = false;
+			for (;;) {
+				this.#database.assertBrokerAuthority(this.#authority);
+				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+				this.#database.assertBrokerAuthority(this.#authority);
+				if (response.ok) {
+					const result = response.result ?? {};
+					const receipt = recordOf(result.receipt) ?? result;
+					return {
+						sessionId: input.sessionId,
+						operationRef: input.opRef,
+						...(typeof receipt.commandId === "string" ? { commandId: receipt.commandId } : {}),
+						...(typeof receipt.turnId === "string" ? { turnId: receipt.turnId } : {}),
+						acceptedAt: new Date(this.#now()).toISOString(),
+						taskKey: "gateway",
+					};
+				}
+				const error = relayFailure("turn.prompt", response);
+				if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
+					throw new OpRefRejectedError(input.opRef, CLIENT_REF_CONFLICT_CODE, error.details);
 				if (!isSessionBusy(error)) throw error;
+				// `busy` is occupancy, not failure: the prompt was never accepted and
+				// the op-ref is still unused. Wait for the session to go idle
+				// (bounded) and resend under the same op-ref before giving up.
 				if (this.#now() >= deadline) throw error;
 				if (!waited) {
 					waited = true;
@@ -652,40 +679,30 @@ export class BrokerSessionPort implements SessionPort {
 				}
 				await this.#sleep(BUSY_POLL_MS);
 			}
+		} finally {
+			if (!input.relay) await relay.close();
 		}
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.#assertOwned(input);
 		assertControlAllowed("turn.steer", { operatorApproval: true });
-		const raw = await this.#cli([
-			"sdk",
-			"session",
-			"raw",
-			"control",
-			input.sessionId,
-			"--op",
-			"turn.steer",
-			"--json-input",
-			JSON.stringify({ text: input.text, clientRef: input.clientRef }),
-		]);
-		let receipt: unknown;
+		if (input.text.trim().length === 0) throw new OpRefError("steer text must not be empty");
+		const relay =
+			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		let response: RelayResponse;
 		try {
-			receipt = parseEnvelope<unknown>(raw, "turn.steer");
-		} catch (error) {
-			// Recognized outer control refusals are decisions; malformed output and
-			// transport/authority failures retain their uncertain error contract.
-			const code = sdkErrorCode(error);
-			let envelope: { ok?: unknown };
-			try {
-				envelope = JSON.parse(raw.stdout);
-			} catch {
-				throw error;
-			}
+			this.#database.assertBrokerAuthority(this.#authority);
+			response = await relay.control("turn.steer", { text: input.text, clientRef: input.clientRef });
+			this.#database.assertBrokerAuthority(this.#authority);
+		} finally {
+			if (!input.relay) await relay.close();
+		}
+		if (!response.ok) {
+			// Recognized control refusals are decisions; anything else keeps its
+			// uncertain error contract (the steer may or may not have landed).
+			const code = response.error?.code;
 			if (
-				error instanceof GjcCliError &&
-				error.exitCode === 0 &&
-				envelope?.ok === false &&
 				code &&
 				[
 					"busy",
@@ -698,9 +715,9 @@ export class BrokerSessionPort implements SessionPort {
 				].includes(code)
 			)
 				throw new GjcCliError("gjc sdk turn.steer refused acceptance", 0, "", { code, refused: true });
-			throw error;
+			throw relayFailure("turn.steer", response);
 		}
-		const body = workerRecord(receipt);
+		const body = workerRecord(response.result);
 		// Synthetic negative receipts are not authoritative control rejections.
 		if (body?.clientRef !== input.clientRef)
 			throw new GjcCliError("gjc sdk turn.steer identity mismatch", 0, "", { code: "receipt_identity_mismatch" });
@@ -778,9 +795,30 @@ export class BrokerSessionPort implements SessionPort {
 		return { changed: result.changed };
 	}
 
-	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
+	async status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport> {
 		this.#assertOwned(input);
-		return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
+		// With a live relay the read is one round-trip on the owned connection;
+		// without one (retired holds, work lanes, terminal recovery) the CLI's
+		// `session status` performs the identical `turn.result` query.
+		if (!input.relay) return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
+		this.#database.assertBrokerAuthority(this.#authority);
+		const response = await input.relay.query("turn.result", { kind: "prompt", clientRef: input.opRef });
+		this.#database.assertBrokerAuthority(this.#authority);
+		if (!response.ok) throw relayFailure("turn.result", response);
+		const status = response.result ?? {};
+		const raw = typeof status.status === "string" ? status.status : "unknown";
+		return parseStatusReport({
+			exitCode: 0,
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					operationRef: input.opRef,
+					status,
+					summary: { completed: raw === "terminal_ok" || raw === "failed" },
+				},
+			}),
+			stderr: "",
+		});
 	}
 
 	async fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult> {
@@ -1052,28 +1090,25 @@ export class BrokerSessionPort implements SessionPort {
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
 		this.#assertOwned(input);
-		// Chat-like callers attach before send for live output. Monitor authoring
-		// sets observeTail=false: it consumes no intermediate frames, and old
-		// session history must not be able to fail an otherwise valid final-result
-		// request merely because its tail revision metadata predates the provider.
-		const tail =
-			input.observeTail === false
-				? undefined
-				: await this.attachTail({
-						sessionId: input.sessionId,
-						brokerGeneration: 0,
-						repo: input.repo,
-						...(input.originKey ? { originKey: input.originKey } : {}),
-						onStall: ({ elapsedMs }) =>
-							console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
-					});
-		tail?.setTurnRunning(true);
+		// One relay owns the whole request: the send, the terminal wait, and the
+		// final read. Monitor/batch authoring consumes no mid-turn content, so
+		// the handle's frames are only used for the stall alarm.
+		const relay = await this.attachTail({
+			sessionId: input.sessionId,
+			brokerGeneration: 0,
+			repo: input.repo,
+			...(input.originKey ? { originKey: input.originKey } : {}),
+			onStall: ({ elapsedMs }) =>
+				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+		});
+		relay.beginTurn(input.opRef);
+		relay.setTurnRunning(true);
 		try {
 			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
 			try {
-				receipt = await this.send(input);
-				tail?.markAccepted(input.opRef);
+				receipt = await this.send({ ...input, relay });
+				relay.correlate(input.opRef, receipt);
 			} catch (sendError) {
 				if (sendError instanceof BrokerAuthorityError) throw sendError;
 				// A transport/control failure may occur after the runtime accepted the
@@ -1081,22 +1116,21 @@ export class BrokerSessionPort implements SessionPort {
 				// otherwise ran the event, produced a final answer, then executed it
 				// again because the torn send was treated as definitive failure.
 				try {
-					status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+					status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
 				} catch (error) {
 					if (error instanceof BrokerAuthorityError) throw error;
 					throw sendError;
 				}
 				if (status.status.status === "unknown") throw sendError;
 				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
-				tail?.markAccepted(input.opRef);
 			}
 			const deadline = this.#now() + (input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS);
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
-			status ??= await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+			status ??= await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
 			while (!isTerminalStatus(status.status.status) && this.#now() < deadline) {
 				this.checkStalls();
 				await this.#sleep(pollMs);
-				status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+				status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relay });
 			}
 			if (!isTerminalStatus(status.status.status))
 				throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);
@@ -1107,8 +1141,8 @@ export class BrokerSessionPort implements SessionPort {
 				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }),
 			};
 		} finally {
-			tail?.setTurnRunning(false);
-			await tail?.close();
+			relay.setTurnRunning(false);
+			await relay.close();
 		}
 	}
 
@@ -1386,6 +1420,18 @@ function sanitizeSdkFailure(error: unknown): Error {
 /** Exact `busy` envelope code: the runtime refused the prompt because a turn is still running. */
 export function isSessionBusy(error: unknown): boolean {
 	return error instanceof GjcCliError && envelopeErrorCode(error.details) === SESSION_BUSY_CODE;
+}
+
+/** A refused relay control/query as the same GjcCliError the CLI transport raised, so callers classify once. */
+function relayFailure(operation: string, response: RelayResponse): GjcCliError {
+	const details = response.error ?? {};
+	return new GjcCliError(`gjc sdk ${operation} reported failure: ${JSON.stringify(details)}`, 0, "", details);
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
 }
 
 /**

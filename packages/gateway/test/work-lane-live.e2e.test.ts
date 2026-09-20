@@ -291,7 +291,10 @@ liveTest(
 				cli,
 				instanceId: database.instanceId,
 				authority: brokerAuthority,
-				tailRunner: new TailRunner({ run: cli, stream: (id) => broker.openStream(id), repo, pollIntervalMs: 250 }),
+				tailRunner: new TailRunner({
+					stream: (id) => broker.openStream(id),
+					repo,
+				}),
 			});
 			// Retry the same read-only tuple; never bind, resume or submit another turn.
 			const rawStatus = port.status.bind(port);

@@ -100,9 +100,7 @@ describe("durable single broker authority", () => {
 		cutover(database);
 		expect(() => database.assertOwnedSession(SESSION, "/work", GLOBAL)).toThrow("unowned_session");
 		expect(() => database.recordOwnedBinding(binding(GLOBAL, SESSION, 1))).toThrow("unowned_session");
-		expect(() => database.tailCursorGet(SESSION)).toThrow("unowned_session");
 		database.recordOwnedBinding(binding(GLOBAL, NEXT_SESSION, 1));
-		expect(database.tailCursorGet(NEXT_SESSION)).toBeUndefined();
 		expect(raw.query("SELECT cursor FROM session_tail_cursors").get()).toEqual({ cursor: "private-cursor" });
 	});
 
@@ -134,17 +132,14 @@ describe("durable single broker authority", () => {
 		const { database } = await fixture();
 		database.assertBrokerAuthority(GLOBAL, { initializeEmpty: true });
 		database.recordOwnedBinding(binding());
-		database.tailCursorCommit(SESSION, "owned-cursor");
 		database.rebindEpoch(ORIGIN);
 		expect(database.recordOwnedBinding(binding(GLOBAL, NEXT_SESSION, 0))).toBe(false);
 		expect(() => database.assertOwnedSession(NEXT_SESSION, "/work", GLOBAL)).toThrow("unowned_session");
 		expect(database.recordOwnedBinding(binding(GLOBAL, NEXT_SESSION, 1))).toBe(true);
 		expect(database.assertOwnedSession(SESSION, "/work", GLOBAL).epoch).toBe(0);
-		expect(database.tailCursorGet(SESSION)).toBe("owned-cursor");
-		expect(database.tailCursorGet(NEXT_SESSION)).toBeUndefined();
 	});
 
-	test("binding and cursor transactions roll back without phantom ownership/checkpoints", async () => {
+	test("binding transactions roll back without phantom ownership", async () => {
 		const { database, raw } = await fixture();
 		database.assertBrokerAuthority(GLOBAL, { initializeEmpty: true });
 		raw.exec("CREATE TRIGGER fault AFTER INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'fault'); END");
@@ -153,14 +148,6 @@ describe("durable single broker authority", () => {
 		expect(() => database.assertOwnedSession(SESSION, "/work", GLOBAL)).toThrow("unowned_session");
 		raw.exec("DROP TRIGGER fault");
 		database.recordOwnedBinding(binding());
-		database.tailCursorCommit(SESSION, "before");
-		expect(() =>
-			database.withTransaction(() => {
-				database.tailCursorCommit(SESSION, "after");
-				throw new Error("rollback");
-			}),
-		).toThrow("rollback");
-		expect(database.tailCursorGet(SESSION)).toBe("before");
 	});
 
 	test("empty runtime with an open lane is not quiescent", async () => {
@@ -354,7 +341,6 @@ describe("durable single broker authority", () => {
 		const { database } = await fixture();
 		database.assertBrokerAuthority(PRIVATE, { initializeEmpty: true });
 		database.recordOwnedBinding(binding(PRIVATE));
-		database.tailCursorCommit(SESSION, "private-qualified");
 		expect(() => cutover(database)).toThrow("authority_mismatch");
 		database.cutoverBrokerAuthority({
 			expectedAuthority: PRIVATE,
@@ -364,7 +350,6 @@ describe("durable single broker authority", () => {
 		});
 		expect(() => database.assertOwnedSession(SESSION, "/work", PRIVATE)).toThrow("authority_mismatch");
 		expect(() => database.assertOwnedSession(SESSION, "/work", GLOBAL)).toThrow("unowned_session");
-		expect(() => database.tailCursorGet(SESSION)).toThrow("unowned_session");
 		expect(() =>
 			database.cutoverBrokerAuthority({
 				expectedAuthority: GLOBAL,

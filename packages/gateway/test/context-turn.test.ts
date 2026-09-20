@@ -224,9 +224,10 @@ test("/new retires a pre-reset trigger queued behind an in-flight turn", async (
 	send(client, "reset-while-busy", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-while-busy"));
 	release?.();
-	await Bun.sleep(50);
+	// The retired turn settles from status once released; the queued-behind
+	// message rode into it as a steer and must never become a fresh turn.
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
 	expect(turns).toHaveLength(1);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
 	client.close();
 });
 

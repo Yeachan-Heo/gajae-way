@@ -8,7 +8,6 @@ import { OpRefRejectedError } from "@gajae-gateway/subsession";
 import { parseConfigFile } from "../src/config";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
-import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase, type InboundTurn } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
@@ -126,22 +125,6 @@ function assertCoverage(target: Fixture, messageIds: readonly string[]): void {
 	expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
 }
 
-class RetentionGapPort extends ScriptedSessionPort {
-	readonly tailInputs = new Map<string, TailAttachInput[]>();
-
-	async attachTail(input: TailAttachInput) {
-		const inputs = this.tailInputs.get(input.sessionId) ?? [];
-		inputs.push(input);
-		this.tailInputs.set(input.sessionId, inputs);
-		return await super.attachTail(input);
-	}
-
-	async emitRetentionGap(sessionId: string): Promise<void> {
-		for (const input of this.tailInputs.get(sessionId) ?? [])
-			await input.onRetentionGap?.({ sessionId, resync: { revision: 1, generation: 2, seq: 3 } });
-	}
-}
-
 class FailFirstSteerPort extends ScriptedSessionPort {
 	steerAttempts = 0;
 
@@ -222,20 +205,21 @@ async function sourceFiles(directory: string): Promise<string[]> {
 	return files;
 }
 
-test("red-team: a strict tail retention gap does not infer terminal or create another turn", async () => {
-	const port = new RetentionGapPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+test("red-team: relay loss holds the accepted turn until status and turn.result settle it", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
-		enqueue(target, "gap-trigger", "keep the turn open");
+		enqueue(target, "lost-relay-trigger", "keep the turn open");
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "initial batch did not start");
-		const send = required(port.sends[0], "initial gap send missing");
+		const send = required(port.sends[0], "initial send missing");
 		const batch = target.turns.values().next().value as InboundTurn;
 
-		await port.emitRetentionGap(send.sessionId);
+		port.loseRelay(send.opRef);
 		await eventually(
-			() => target.logs.some((line) => line.startsWith(`retention_gap origin=${ORIGIN_KEY}`)),
-			"gap was not observed",
+			() =>
+				target.logs.some((line) => line.startsWith("recovery_hold ") && line.includes("reason=relay_lost_mid_turn")),
+			"relay loss was not observed",
 		);
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
 		expect(port.sends).toHaveLength(1);
@@ -243,12 +227,16 @@ test("red-team: a strict tail retention gap does not infer terminal or create an
 			expect.arrayContaining([expect.objectContaining({ state: "pending", turn_state: "accepted" })]),
 		);
 
-		port.complete(send.opRef, "terminal tail evidence");
+		port.completeWithoutAnswerFrame(send.opRef, "terminal result evidence");
+		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
-			"gap case did not complete after terminal evidence",
+			"lost relay turn did not settle from status",
 		);
-		assertCoverage(target, ["gap-trigger"]);
+		expect(target.terminal).toEqual(["terminal result evidence"]);
+		expect(port.workerOutputReads.some((input) => input.opRef === send.opRef)).toBe(true);
+		expect(port.sends).toHaveLength(1);
+		assertCoverage(target, ["lost-relay-trigger"]);
 	} finally {
 		await target.close();
 	}
@@ -277,6 +265,7 @@ test("canonical: a refused steer stays pending until the running turn terminates
 		await target.manager.onBrokerGeneration(2);
 		expect(port.sends).toHaveLength(1);
 		port.complete(first.opRef, "first terminal");
+		await target.manager.tick(ORIGIN_KEY);
 		await eventually(() => target.terminal.includes("first terminal"), "current turn's answer was dropped");
 		await eventually(() => port.sends.length === 2, "refused steer row was not sent after terminal");
 		const second = required(port.sends[1], "pending send missing");
@@ -356,6 +345,7 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 			]),
 		);
 		port.complete(opRef, "reconciled terminal");
+		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
 			"accepted crash-window batch did not reconcile",
@@ -395,6 +385,7 @@ test("red-team: /new preserves an accepted batch, discards only unbatched pre-fl
 		const fresh = required(port.sends[1], "new epoch send missing");
 		port.complete(old.opRef, "stale old output");
 		port.complete(fresh.opRef, "fresh output");
+		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
 			"/new sequence did not reconcile both batches",
@@ -432,6 +423,7 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 		const fresh = required(port.sends[1], "post-stall send missing");
 		port.complete(fresh.opRef, "fresh generation output");
 		port.complete(old.opRef, "stale generation output");
+		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
 			"retired hold did not reconcile terminal",
@@ -756,6 +748,7 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 				expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
 				const send = required(port.sends[completedSends], `seed ${seed} send ${completedSends} missing`);
 				port.complete(send.opRef, `terminal-${seed}-${completedSends}`);
+				await target.manager.tick(ORIGIN_KEY);
 				completedSends++;
 				await eventually(
 					() => target.database.inboundTurnRow(send.opRef)?.turn_state === "done",

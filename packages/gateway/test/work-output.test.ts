@@ -9,7 +9,11 @@ import { GatewayDatabase } from "../src/store/db";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
+	noRelay,
 	ScriptedSessionPort,
+	type ScriptedRelayReply,
+	type ScriptedRelayRequest,
+	scriptedRelay,
 	steerRefused,
 } from "./session-port.fake";
 
@@ -52,7 +56,10 @@ function terminal(text = "original answer", overrides: Record<string, unknown> =
 	};
 }
 
-async function broker(run: CliRunner): Promise<BrokerSessionPort> {
+async function broker(
+	run: CliRunner,
+	relay?: (request: ScriptedRelayRequest) => ScriptedRelayReply | Promise<ScriptedRelayReply>,
+): Promise<BrokerSessionPort> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-work-output-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	cleanup.push(async () => {
@@ -71,9 +78,22 @@ async function broker(run: CliRunner): Promise<BrokerSessionPort> {
 		database,
 		cli: run,
 		instanceId: "output-test",
-		tailRunner: new TailRunner({ run, repo: input.repo, stallTimeoutMs: 1_000 }),
+		tailRunner: new TailRunner({
+			stream: relay ? scriptedRelay(relay).spawn : noRelay,
+			repo: input.repo,
+			stallTimeoutMs: 1_000,
+		}),
 		now: () => floor + 2_000,
 	});
+}
+
+/** A steer answered by the session's relay: the envelope IS the control_response body. */
+function steerRelay(envelope: () => unknown) {
+	return (request: ScriptedRelayRequest): ScriptedRelayReply => {
+		expect(request.type).toBe("control_request");
+		expect(request.operation).toBe("turn.steer");
+		return envelope() as ScriptedRelayReply;
+	};
 }
 
 function parse(result: unknown, overrides: Partial<WorkerOutputInput> = {}) {
@@ -284,7 +304,12 @@ test("production steer accepts the observed SDK 0.16.3 raw control response with
 			acceptedAt: 1788932429645,
 		},
 	};
-	const port = await broker(async () => response(observed));
+	const port = await broker(
+		async () => {
+			throw new Error("steer must not spawn a CLI");
+		},
+		steerRelay(() => observed),
+	);
 	await expect(
 		port.steer({ sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef }),
 	).resolves.toBeUndefined();
@@ -292,14 +317,19 @@ test("production steer accepts the observed SDK 0.16.3 raw control response with
 
 test("production steer requires structured acceptance, preserves caller clientRef, and rejects nested refusal", async () => {
 	let envelope: unknown = { ok: true, result: { accepted: true, status: "accepted", clientRef: "caller-steer-ref" } };
-	const port = await broker(async (args) => {
-		expect(args[args.indexOf("--op") + 1]).toBe("turn.steer");
-		expect(JSON.parse(args[args.indexOf("--json-input") + 1]!)).toEqual({
-			text: "steer",
-			clientRef: "caller-steer-ref",
-		});
-		return response(envelope);
-	});
+	const port = await broker(
+		async () => {
+			throw new Error("steer must not spawn a CLI");
+		},
+		(request) => {
+			expect(request).toEqual({
+				type: "control_request",
+				operation: "turn.steer",
+				input: { text: "steer", clientRef: "caller-steer-ref" },
+			});
+			return envelope as ScriptedRelayReply;
+		},
+	);
 	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-steer-ref" };
 	await port.steer(steer);
 	for (const refusal of [
@@ -326,7 +356,7 @@ test("completed fake status reflects original operation evidence without inventi
 	for (const finish of ["complete", "completeWithoutAnswerFrame"] as const) {
 		const port = new ScriptedSessionPort();
 		const before = Date.now();
-		await port.send({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, text: "work" });
+		const receipt = await port.send({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, text: "work" });
 		expect((await port.status(input)).status.receiptState).toBeUndefined();
 		port[finish](input.opRef, "original answer");
 		const report = await port.status(input);
@@ -338,8 +368,9 @@ test("completed fake status reflects original operation evidence without inventi
 		});
 		expect(report.status.startedAt).toBeGreaterThanOrEqual(before);
 		expect(report.status.terminalAt).toBeGreaterThanOrEqual(report.status.startedAt!);
-		expect(report.status.commandId).toBeUndefined();
-		expect(report.status.turnId).toBeUndefined();
+		// The host names the turn on accept and reports the same identity at terminal.
+		expect(report.status.commandId).toBe(receipt.commandId!);
+		expect(report.status.turnId).toBe(receipt.turnId!);
 		expect(await port.fetchWorkerOutput({ ...input, notBeforeMs: before, terminalIdentity: undefined })).toMatchObject({
 			status: "proven",
 			text: "original answer",
@@ -356,7 +387,12 @@ test("completed fake status reflects original operation evidence without inventi
 
 test("steer authoritative refusal or matching rejection is marked while malformed acceptance stays uncertain", async () => {
 	let envelope: unknown;
-	const port = await broker(async () => response(envelope));
+	const port = await broker(
+		async () => {
+			throw new Error("steer must not spawn a CLI");
+		},
+		steerRelay(() => envelope),
+	);
 	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref" };
 	for (const rejected of [
 		{ ok: true, result: { accepted: false, status: "rejected", clientRef: "caller-ref" } },

@@ -1,114 +1,115 @@
 import { createHash } from "node:crypto";
-import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
+import type { SessionRelayStream } from "./broker";
 import { sanitizeDiagnostic } from "./rebind";
 
-/** The observed SDK-hosted top-level vocabulary from p2b §8. */
-export const OBSERVED_TAIL_KINDS = [
-	"transcript",
-	"session_ready",
-	"event",
-	"identity_header",
-	"agent_start",
-	"agent_end",
-	"agent_failed",
-	"activity",
-	"query_response",
-	"tool_activity",
-	"turn_stream",
-] as const;
+/**
+ * Relay-owned session transport.
+ *
+ * One resident `gjc sdk serve --stdio --session <id>` relay per bound session
+ * is the ONLY channel for a persona turn. Commands (`turn.prompt`,
+ * `turn.steer`, `turn.result`) go down its stdin as `control_request` /
+ * `query_request` frames; the host answers on stdout by request id. Because
+ * the prompt was submitted on this connection, the host streams the turn's
+ * own content (`event/message_end`, `event/tool_execution_*`, `agent_start`,
+ * `agent_end`) directly to it, stamped with the turn's commandId/turnId.
+ *
+ * Nothing here polls, pages, or cursors. Content arrives once, in order, and
+ * is attributed by correlation; the checks that used to reconstruct that from
+ * three overlapping snapshot sources (turn floors, ring high-water marks,
+ * text-hash dedupe, timestamp fences) do not exist any more.
+ */
 
-const OBSERVED_TAIL_KIND_SET = new Set<string>(OBSERVED_TAIL_KINDS);
+export const HELLO_CAPABILITIES = ["tool_activity_v2"] as const;
 
-export type TailEventKind = (typeof OBSERVED_TAIL_KINDS)[number] | "unknown";
+/** Frame kinds the actor keys on (host `AgentSessionEvent` names plus lifecycle). */
+export type TailEventKind =
+	| "agent_start"
+	| "agent_end"
+	| "agent_failed"
+	| "message_end"
+	| "tool_execution_start"
+	| "tool_execution_update"
+	| "tool_execution_end"
+	| "activity"
+	| "unknown";
 
 export interface TailFrame {
 	readonly kind: TailEventKind;
 	readonly rawKind: string;
-	readonly generation?: number;
-	readonly seq?: number;
-	/** Stable only when the runtime supplied id or generation+seq. Never invent an identity for delivery. */
+	/** Host correlation, present on every frame the host attributes to a turn. */
+	readonly commandId?: string;
+	readonly turnId?: string;
+	/** Stable host identity of the underlying message/tool call, when it carries one. */
 	readonly eventId?: string;
 	readonly payload: Record<string, unknown>;
+	/** Assistant speech of a `message_end` frame. */
 	readonly assistantText?: string;
-	/** A user/control echo is attribution evidence, never chat output. */
+	/** True for user/tool/custom rows: attribution evidence, never chat output. */
 	readonly steerEcho: boolean;
 	readonly idle: boolean;
 }
 
-export interface TailRetentionGap {
-	readonly sessionId: string;
-	readonly cursor?: string;
-	readonly resync?: unknown;
-}
-
-export interface TailResyncCoordinate {
-	readonly revision: number;
-	readonly generation: number;
-	readonly seq: number;
+export interface TurnCorrelation {
+	readonly commandId?: string;
+	readonly turnId?: string;
 }
 
 export interface TailAttachInput {
 	readonly sessionId: string;
 	readonly brokerGeneration: number;
 	readonly repo: string;
-	/** Caller-owned origin identity for grep-stable tail observability. */
+	/** Caller-owned origin identity for grep-stable observability. */
 	readonly originKey?: string;
-	/** Opaque signed cursor persisted only after all preceding frame side effects commit. */
-	cursor?: string;
 	/** Current tails may wait for capacity; parked retired holds must not consume it. */
 	priority?: "current" | "retired";
-	/** Durable callback invoked only after preceding frames were delivered successfully. */
-	onCursorCommitted?: (cursor: string) => void | Promise<void>;
-	/** `false` is permitted only through attachResync after explicit operator approval. */
-	strict?: boolean;
-	/** Authenticated diagnostic coordinate retained for an explicit non-strict resync. */
-	resync?: TailResyncCoordinate;
 	onFrame?: (frame: TailFrame) => void | Promise<void>;
-	onRetentionGap?: (gap: TailRetentionGap) => void | Promise<void>;
 	onStall?: (input: { sessionId: string; brokerGeneration: number; elapsedMs: number }) => void | Promise<void>;
+	/** The relay died; frames emitted while it was down are lost (best-effort content). */
+	onRelayLost?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
 	onDiagnostic?: (line: string) => void;
 }
+
+export interface RelayRequestOptions {
+	readonly timeoutMs?: number;
+}
+
+export type RelayResponse = {
+	readonly ok: boolean;
+	readonly result?: Record<string, unknown>;
+	readonly error?: { readonly code?: string; readonly message?: string };
+};
 
 export interface TailHandle {
 	readonly sessionId: string;
 	readonly brokerGeneration: number;
-	/** Resolves only after the first broker-bound tail exchange completed safely. */
+	/** Resolves once the host hello was exchanged on the relay. */
 	readonly ready: Promise<void>;
-	readonly cursor: string | undefined;
+	/** Sends `control_request` and resolves with its `control_response`. */
+	control(operation: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse>;
+	/** Sends `query_request` and resolves with its `query_response`. */
+	query(name: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse>;
 	/**
-	 * Fresh-send boundary after initial attach/backfill and before the prompt.
-	 * Historical buffered frames are intentionally fenced; the cursor is safe
-	 * to commit because none belongs to the not-yet-started turn.
+	 * Names the turn whose content this handle delivers. Frames with a different
+	 * correlation are dropped; uncorrelated frames were never turn content.
 	 */
-	beginTurn(opRef: string): Promise<void>;
-	markAccepted(opRef: string): Promise<void>;
+	beginTurn(opRef: string, correlation?: TurnCorrelation): void;
+	/** Adds host correlation learned after beginTurn (from the accept receipt or agent_start). */
+	correlate(opRef: string, correlation: TurnCorrelation): void;
 	setTurnRunning(running: boolean): void;
 	close(): Promise<void>;
 }
 
-/** A resident event stream for one session (`gjc sdk serve --stdio --session <id>`). */
-export interface TailStream {
-	readonly lines: AsyncIterable<string>;
-	close(): void;
-}
+export type TailStream = SessionRelayStream;
 export type TailStreamSpawner = (sessionId: string) => TailStream;
 
 export interface TailRunnerOptions {
-	readonly run: CliRunner;
-	/**
-	 * Event-driven transport. When present, each handle performs ONE non-strict
-	 * backfill poll (pre-attach history, steer echoes), then consumes the live
-	 * stream: frames arrive the instant the host emits them, no interval polling.
-	 * Absent (tests), the handle falls back to the bounded poll loop.
-	 */
-	readonly stream?: TailStreamSpawner;
-	/** Default session workspace. A handle may override it for future generic ports. */
+	readonly stream: TailStreamSpawner;
+	/** Default session workspace. */
 	readonly repo: string;
 	readonly maxTailProcesses?: number;
 	readonly idleTtlMs?: number;
 	readonly stallTimeoutMs?: number;
-	readonly pollTimeoutMs?: number;
-	readonly pollIntervalMs?: number;
+	readonly requestTimeoutMs?: number;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
 	readonly log?: (line: string) => void;
@@ -117,18 +118,11 @@ export interface TailRunnerOptions {
 const DEFAULT_MAX_TAIL_PROCESSES = 64;
 const DEFAULT_IDLE_TTL_MS = 60_000;
 const DEFAULT_STALL_TIMEOUT_MS = 120_000;
-const DEFAULT_POLL_TIMEOUT_MS = 30_000;
-const DEFAULT_POLL_INTERVAL_MS = 250;
-/**
- * Wait window for a poll issued while a turn is running. gjc >= 0.17.2 returns
- * what it collected when the window closes (`terminal: false`); before that it
- * threw `tail_timeout` and discarded it, so the window doubled as the turn's
- * observation latency: a 30 s window meant one poll per turn, nothing mid-turn.
- */
-const SIDE_POLL_WINDOW_MS = 1_500;
-const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const HELLO_TIMEOUT_MS = 15_000;
 const STREAM_REOPEN_GIVE_UP = 6;
-const DELIVERED_ID_CAP = 2_000;
+const REOPEN_BASE_BACKOFF_MS = 250;
+const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
 
 export class TailCapacityError extends Error {
 	constructor() {
@@ -137,21 +131,30 @@ export class TailCapacityError extends Error {
 	}
 }
 
-/**
- * Broker-bound tail supervisor. `CliRunner` is deliberately the only runtime
- * transport: no endpoint path/token is read by the gateway. Each finite CLI tail
- * response reattaches with the opaque cursor the runtime returned, producing one
- * long-lived logical tail while keeping process ownership in the broker layer.
- */
+export class RelayClosedError extends Error {
+	readonly code = "relay_closed";
+	constructor(sessionId: string, detail: string) {
+		super(`relay for ${sessionId} closed before the host answered: ${detail}`);
+		this.name = "RelayClosedError";
+	}
+}
+
+export class RelayRequestTimeoutError extends Error {
+	readonly code = "relay_timeout";
+	constructor(sessionId: string, id: string, timeoutMs: number) {
+		super(`relay request ${id} on ${sessionId} received no response within ${timeoutMs}ms`);
+		this.name = "RelayRequestTimeoutError";
+	}
+}
+
+/** Supervises the resident relays: capacity, idle reaping, and stall alarms. */
 export class TailRunner {
-	readonly #run: CliRunner;
-	readonly #stream: TailStreamSpawner | undefined;
+	readonly #stream: TailStreamSpawner;
 	readonly #repo: string;
 	readonly #maxTailProcesses: number;
 	readonly #idleTtlMs: number;
 	#stallTimeoutMs: number;
-	readonly #pollTimeoutMs: number;
-	readonly #pollIntervalMs: number;
+	readonly #requestTimeoutMs: number;
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #log: (line: string) => void;
@@ -160,14 +163,12 @@ export class TailRunner {
 	#lastSaturationAlertAt: number | undefined;
 
 	constructor(options: TailRunnerOptions) {
-		this.#run = options.run;
 		this.#stream = options.stream;
 		this.#repo = options.repo;
 		this.#maxTailProcesses = positiveInteger(options.maxTailProcesses, DEFAULT_MAX_TAIL_PROCESSES, "maxTailProcesses");
 		this.#idleTtlMs = positiveInteger(options.idleTtlMs, DEFAULT_IDLE_TTL_MS, "idleTtlMs");
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
-		this.#pollTimeoutMs = positiveInteger(options.pollTimeoutMs, DEFAULT_POLL_TIMEOUT_MS, "pollTimeoutMs");
-		this.#pollIntervalMs = nonNegativeInteger(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, "pollIntervalMs");
+		this.#requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, "requestTimeoutMs");
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 		this.#log = options.log ?? ((line: string) => console.error(line));
@@ -177,7 +178,6 @@ export class TailRunner {
 		return this.#handles.size;
 	}
 
-	/** Internal clock boundary exposed to managed handles and deterministic tests. */
 	now(): number {
 		return this.#now();
 	}
@@ -190,11 +190,11 @@ export class TailRunner {
 		this.#stallTimeoutMs = positiveInteger(timeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 	}
 
-	get pollIntervalMs(): number {
-		return this.#pollIntervalMs;
+	get requestTimeoutMs(): number {
+		return this.#requestTimeoutMs;
 	}
 
-	get streamSpawner(): TailStreamSpawner | undefined {
+	get streamSpawner(): TailStreamSpawner {
 		return this.#stream;
 	}
 
@@ -203,8 +203,8 @@ export class TailRunner {
 	}
 
 	/**
-	 * Attaches before a prompt is sent. When all slots are running, this waits
-	 * without changing durable inbound state; callers retain their bound turn.
+	 * Opens the session's relay. When all slots are running, this waits without
+	 * changing durable inbound state; callers retain their bound turn.
 	 */
 	async attach(input: TailAttachInput): Promise<TailHandle> {
 		await this.#acquireSlot(input.priority ?? "current");
@@ -218,24 +218,6 @@ export class TailRunner {
 			await handle.close();
 			throw error;
 		}
-	}
-
-	/**
-	 * Replays a strict retention gap only after an explicit operator-approved
-	 * handoff. The signed opaque cursor remains the runtime authority; the public
-	 * coordinate is validated and recorded so an arbitrary historical replay can
-	 * never be started implicitly.
-	 */
-	async attachResync(
-		input: TailAttachInput & {
-			readonly cursor: string;
-			readonly resync: TailResyncCoordinate;
-			readonly operatorApproved: true;
-		},
-	): Promise<TailHandle> {
-		if (!validResyncCoordinate(input.resync)) throw new Error("tail resync coordinate is invalid");
-		const { operatorApproved: _operatorApproved, ...tailInput } = input;
-		return await this.attach({ ...tailInput, strict: false });
 	}
 
 	/** Test/loop seam: checks exact threshold, so 119.9 seconds never emits a 120s alarm. */
@@ -288,79 +270,6 @@ export class TailRunner {
 		this.#waiters.shift()?.();
 	}
 
-	async poll(handle: ManagedTailHandle, options?: { readonly checkpointOnly?: boolean }): Promise<void> {
-		// A poll alongside a running turn is a bounded observation, not a wait:
-		// with `--until-idle` the CLI cannot exit until the turn ends, so the
-		// window is what decides how soon mid-turn rows come back. The backfill
-		// poll (no turn running) keeps the long window so a quiet session is
-		// observed cheaply.
-		const windowMs = handle.turnRunning || options?.checkpointOnly ? SIDE_POLL_WINDOW_MS : this.#pollTimeoutMs;
-		const args = [
-			"sdk",
-			"session",
-			"tail",
-			handle.sessionId,
-			...(handle.pollCursor ? ["--cursor", handle.pollCursor] : []),
-			// A resumed tail pages a fresh snapshot and drops rows up to this id, so
-			// the poll returns only the transcript written since the last one - the
-			// rows that carry tool calls and interim text. Without it, resume returns
-			// ring events only and every turn reads as toolCalls=0 (gjc >= 0.17.2).
-			...(handle.pollCursor && handle.lastTranscriptId ? ["--after-transcript-id", handle.lastTranscriptId] : []),
-			"--until-idle",
-			// `--strict` only means something relative to a checkpoint. A cursorless
-			// attach has no checkpoint, and the runtime reports the ring's pre-attach
-			// drop as a retention gap on every poll (measured on gjc 0.16.0), so a
-			// strict cursorless tail could never observe its own turn. Cursorless
-			// polls run non-strict; duplicate/historical frames are fenced by the
-			// accepted-op-ref attribution filter and deterministic delivery ids.
-			...(handle.strict && handle.pollCursor ? ["--strict"] : []),
-			"--all-events",
-			"--timeout-ms",
-			String(windowMs),
-		];
-		const result = await this.#run(args, { timeoutMs: windowMs + 5_000 });
-		const decoded = decodeTailResult(result);
-		if (decoded.invalidCursor) {
-			// The host no longer honours our checkpoint (expired, or the host
-			// restarted). Not a gap and not a failure: drop it, and the next poll is
-			// a fresh cursorless tail whose replay is fenced downstream as before.
-			handle.dropCursor();
-			return;
-		}
-		if (decoded.gap && handle.strict && handle.cursor) {
-			await handle.retentionGap(decoded.gap);
-			return;
-		}
-		if (decoded.gap) {
-			// Non-strict poll: the gap is diagnostic (the ring dropped pre-attach
-			// history), not a hold. Frames after the resync point still arrive.
-			handle.noteGap(decoded.gap);
-		}
-		if (decoded.error) throw decoded.error;
-		if (decoded.frames.length > 0 || decoded.cursor) {
-			// One line per productive poll: enough to see, from the log alone, whether
-			// a running turn's tool rows ever reached the handle.
-			const kinds: Record<string, number> = {};
-			for (const frame of decoded.frames) kinds[frame.rawKind] = (kinds[frame.rawKind] ?? 0) + 1;
-			const tools = decoded.frames.filter((frame) => frame.payload.toolCallStarted === true).length;
-			handle.noteDiagnostic(
-				`tail_poll session=${handle.sessionId} resumed=${handle.pollCursor ? 1 : 0} after=${handle.lastTranscriptId ?? "-"} frames=${decoded.frames.length} tools=${tools} kinds=${JSON.stringify(kinds)} cursor=${decoded.cursor ? 1 : 0}`,
-			);
-		}
-		if (decoded.checkpoint) handle.noteRingCheckpoint(decoded.checkpoint);
-		// A checkpoint-only poll (turn start) wants the mark and the cursor, not
-		// the frames: they predate the turn by construction and would only be
-		// buffered and discarded.
-		await handle.receiveBatch(options?.checkpointOnly ? [] : decoded.frames, decoded.cursor);
-		// `terminal` here is the checkpoint's idle bit at the moment the CLI took
-		// it. It is NOT evidence the turn ended: a side poll ~500 ms after send
-		// runs before the persona has begun, reads idle, and marking the handle
-		// idle on that stopped the side-poll loop for the entire turn (every
-		// tool row went unobserved until the relay's finalized frame). Whether a
-		// turn is running is the actor's call (setTurnRunning) plus the relay's
-		// own idle frame (receive → frame.idle); a poll only reports.
-	}
-
 	#logSaturation(): void {
 		const now = this.#now();
 		if (this.#lastSaturationAlertAt !== undefined && now - this.#lastSaturationAlertAt < 60_000) return;
@@ -369,34 +278,40 @@ export class TailRunner {
 	}
 }
 
+type PendingRequest = {
+	readonly kind: "control_response" | "query_response";
+	readonly resolve: (response: RelayResponse) => void;
+	readonly reject: (error: Error) => void;
+	readonly timer: ReturnType<typeof setTimeout>;
+};
+
 class ManagedTailHandle implements TailHandle {
 	readonly sessionId: string;
 	readonly brokerGeneration: number;
 	readonly repo: string;
 	readonly #runner: TailRunner;
 	readonly #input: TailAttachInput;
-	readonly #readyResolve: () => void;
-	readonly #readyReject: (error: unknown) => void;
 	readonly ready: Promise<void>;
-	readonly #preReceipt: TailFrame[] = [];
-	#cursor: string | undefined;
-	#pendingCursor: string | undefined;
-	#acceptedOpRef: string | undefined;
-	readonly #strict: boolean;
-	#accepted = false;
-	/** Ordered flush of pre-receipt frames; later frames queue behind it. */
-	#flush: Promise<void> = Promise.resolve();
-	#closed = false;
-	#pausedForGap = false;
-	/** Set once a frame's side effect failed: no later checkpoint may commit past the lost frame. */
-	#deliveryFailed = false;
-	#running = false;
-	#polling = false;
+	#readyResolve: () => void = () => {};
+	#readyReject: (error: unknown) => void = () => {};
 	#ready = false;
+	#closed = false;
+	#running = false;
 	#lastEventAt: number;
 	#idleSince: number | undefined;
 	#stallReported = false;
 	#unknownDiagnostics = 0;
+	#stream: TailStream | undefined;
+	#connectionId: string | undefined;
+	#helloResolve: (() => void) | undefined;
+	#reopenFailures = 0;
+	#requestSeq = 0;
+	readonly #pending = new Map<string, PendingRequest>();
+	/** Ordered delivery: a later frame's side effects wait on the earlier one's. */
+	#deliveries: Promise<void> = Promise.resolve();
+	#opRef: string | undefined;
+	#correlation: TurnCorrelation = {};
+	#droppedForeign = 0;
 
 	constructor(runner: TailRunner, input: TailAttachInput) {
 		this.#runner = runner;
@@ -404,65 +319,16 @@ class ManagedTailHandle implements TailHandle {
 		this.sessionId = input.sessionId;
 		this.brokerGeneration = input.brokerGeneration;
 		this.repo = input.repo;
-		this.#cursor = input.cursor;
-		this.#strict = input.strict !== false;
 		this.#lastEventAt = runner.now();
-		let resolve: () => void = () => {};
-		let reject: (error: unknown) => void = () => {};
-		this.ready = new Promise<void>((done, failed) => {
-			resolve = done;
-			reject = failed;
+		this.ready = new Promise<void>((resolve, reject) => {
+			this.#readyResolve = resolve;
+			this.#readyReject = reject;
 		});
-		this.#readyResolve = resolve;
-		this.#readyReject = reject;
-	}
-
-	get cursor(): string | undefined {
-		return this.#cursor;
-	}
-
-	/**
-	 * The cursor the NEXT poll must send. A checkpoint cursor is one-shot: the
-	 * host consumes it on exchange and mints a replacement, so once a poll has
-	 * returned a newer cursor the committed one is already dead. Sending it
-	 * anyway (which happened whenever a poll landed before markAccepted, so its
-	 * cursor stayed pending) got `invalid_cursor`, dropped the cursor, and the
-	 * turn's frames were re-read cursorless. Commit semantics ("what a delivery
-	 * failure can recover from") are unchanged; this is only what the poll sends.
-	 */
-	#lastSentCursor: string | undefined;
-	get pollCursor(): string | undefined {
-		this.#lastSentCursor = this.#pendingCursor ?? this.#cursor;
-		return this.#lastSentCursor;
+		this.ready.catch(() => {});
 	}
 
 	get turnRunning(): boolean {
 		return this.#running;
-	}
-
-	/** Last transcript row id seen through this handle; the boundary a resumed poll pages after. */
-	#lastTranscriptId: string | undefined;
-	get lastTranscriptId(): string | undefined {
-		return this.#lastTranscriptId;
-	}
-
-	noteDiagnostic(line: string): void {
-		this.#input.onDiagnostic?.(line);
-	}
-
-	/** Forget the checkpoint: the next poll is cursorless. Keeps the transcript boundary. */
-	dropCursor(): void {
-		const pending = this.#pendingCursor?.slice(-12) ?? "-";
-		const committed = this.#cursor?.slice(-12) ?? "-";
-		this.#cursor = undefined;
-		this.#pendingCursor = undefined;
-		this.#input.onDiagnostic?.(
-			`tail_cursor_invalid session=${this.sessionId} sent=${this.#lastSentCursor?.slice(-12) ?? "-"} pending=${pending} committed=${committed}`,
-		);
-	}
-
-	get strict(): boolean {
-		return this.#strict;
 	}
 
 	get running(): boolean {
@@ -477,82 +343,30 @@ class ManagedTailHandle implements TailHandle {
 		void this.#run();
 	}
 
-	async beginTurn(opRef: string): Promise<void> {
-		if (this.#closed || this.#accepted) return;
-		// Read the ring's end NOW, not as of the last poll: between turns no poll
-		// runs, and the previous answer may have arrived on the relay (which
-		// strips positions), so #ringHigh can sit below the previous turn's
-		// finalized frame. One bounded poll; a failure leaves the last mark.
-		if (!this.#polling) {
-			this.#polling = true;
-			try {
-				await this.#runner.poll(this, { checkpointOnly: true });
-			} catch {
-				// Best-effort: the mark from the last successful poll stands.
-			} finally {
-				this.#polling = false;
-			}
-		}
-		this.#preReceipt.splice(0);
-		// Everything the ring holds right now predates the prompt about to be sent.
-		this.#turnFloor = this.#ringHigh;
-		this.#acceptedOpRef = opRef;
-		await this.#commitPendingCursor();
+	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
+		this.#opRef = opRef;
+		this.#correlation = { ...correlation };
+		this.#droppedForeign = 0;
 	}
-	async markAccepted(opRef: string): Promise<void> {
-		this.#deliveredIds.clear();
-		if (this.#closed || this.#accepted) return;
-		this.#accepted = true;
-		this.#acceptedOpRef = opRef;
-		// The flush is deliberately NOT awaited by the caller: markAccepted is
-		// invoked from inside the origin mailbox (dispatch/recovery), and onFrame
-		// re-enters that same mailbox. Delivering synchronously here would
-		// self-deadlock; delivering in the poll loop's turn keeps frame side
-		// effects ordered (later frames wait on #flush) and ahead of the cursor
-		// commit that follows them.
-		const buffered = this.#preReceipt.splice(0);
-		this.#flush = this.#flush
-			.then(async () => {
-				for (const frame of buffered) {
-					// close() ends this owner's authority mid-flush: a queued frame
-					// must not leak to the old owner, and no cursor may commit.
-					if (this.#closed) return;
-					await this.#deliver(frame);
-				}
-				await this.#commitPendingCursor();
-			})
-			.catch((error: unknown) => {
-				// A failed side effect leaves the cursor uncommitted (retry-safe), and
-				// the checkpoint that covered the failed frame is discarded so a later
-				// successful batch cannot commit past it. The chain itself stays
-				// settled so later frames are not poisoned.
-				this.#pendingCursor = undefined;
-				this.#deliveryFailed = true;
-				this.#input.onDiagnostic?.(
-					`tail_flush_failed session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
-				);
-			});
+
+	correlate(opRef: string, correlation: TurnCorrelation): void {
+		if (this.#opRef !== opRef) return;
+		this.#correlation = {
+			...(this.#correlation.commandId ? { commandId: this.#correlation.commandId } : {}),
+			...(this.#correlation.turnId ? { turnId: this.#correlation.turnId } : {}),
+			...(correlation.commandId ? { commandId: correlation.commandId } : {}),
+			...(correlation.turnId ? { turnId: correlation.turnId } : {}),
+		};
 	}
 
 	setTurnRunning(running: boolean): void {
 		if (this.#closed) return;
 		this.#running = running;
 		this.#stallReported = false;
+		// A stall is silence DURING a turn: the clock starts at the turn start.
+		this.#lastEventAt = this.#runner.now();
 		if (running) this.#idleSince = undefined;
-		else this.setIdle();
-	}
-
-	setCursor(cursor: string): void {
-		// The cursor must be opaque and runtime-issued. Public checkpoint objects are not accepted by --cursor.
-		if (cursor.length > 0) {
-			this.#pendingCursor = cursor;
-		}
-	}
-
-	setIdle(): void {
-		this.#running = false;
-		this.#stallReported = false;
-		this.#idleSince ??= this.#runner.now();
+		else this.#idleSince ??= this.#runner.now();
 	}
 
 	checkStall(now: number): void {
@@ -563,77 +377,227 @@ class ManagedTailHandle implements TailHandle {
 		void this.#input.onStall?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration, elapsedMs });
 	}
 
-	async receiveBatch(frames: readonly TailFrame[], cursor: string | undefined): Promise<void> {
-		for (const frame of frames) await this.receive(frame);
-		// The boundary advances with the batch, not with its delivery: a row that
-		// failed to deliver is retried from the ledger, never re-fetched by paging.
-		for (let index = frames.length - 1; index >= 0; index--) {
-			const frame = frames[index];
-			if (frame?.kind === "transcript" && frame.eventId && !/^\d+:\d+$/.test(frame.eventId)) {
-				this.#lastTranscriptId = frame.eventId;
-				break;
-			}
-		}
-		if (cursor) this.setCursor(cursor);
-		// An empty terminal poll must not checkpoint past buffered pre-receipt
-		// frames whose deferred flush is still delivering their side effects.
-		await this.#flush;
-		await this.#commitPendingCursor();
+	control(operation: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse> {
+		return this.#request("control_request", "control_response", { operation, input, confirm: false }, options);
 	}
 
-	async receive(frame: TailFrame): Promise<void> {
-		if (this.#closed) return;
-		this.#lastEventAt = this.#runner.now();
-		this.#stallReported = false;
-		this.#noteRingPosition(frame);
-		if (frame.idle) this.setIdle();
-		if (this.#acceptedOpRef !== undefined && frame.rawKind !== "transcript" && this.#predatesTurnFloor(frame)) {
-			if (frame.assistantText)
+	query(name: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse> {
+		return this.#request("query_request", "query_response", { query: name, input }, options);
+	}
+
+	async #request(
+		type: "control_request" | "query_request",
+		responseType: "control_response" | "query_response",
+		body: Record<string, unknown>,
+		options?: RelayRequestOptions,
+	): Promise<RelayResponse> {
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		await this.ready;
+		const stream = this.#stream;
+		const connectionId = this.#connectionId;
+		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open");
+		const id = `gw-${this.brokerGeneration}-${++this.#requestSeq}`;
+		const timeoutMs = options?.timeoutMs ?? this.#runner.requestTimeoutMs;
+		return await new Promise<RelayResponse>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.#pending.delete(id);
+				reject(new RelayRequestTimeoutError(this.sessionId, id, timeoutMs));
+			}, timeoutMs);
+			this.#pending.set(id, { kind: responseType, resolve, reject, timer });
+			try {
+				stream.write(JSON.stringify({ type, id, connectionId, ...body }));
+			} catch (error) {
+				clearTimeout(timer);
+				this.#pending.delete(id);
+				reject(new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed"));
+			}
+		});
+	}
+
+	#failPending(detail: string): void {
+		for (const [id, pending] of this.#pending) {
+			clearTimeout(pending.timer);
+			this.#pending.delete(id);
+			pending.reject(new RelayClosedError(this.sessionId, detail));
+		}
+	}
+
+	async #run(): Promise<void> {
+		while (!this.#closed) {
+			let stream: TailStream;
+			try {
+				stream = this.#runner.streamSpawner(this.sessionId);
+			} catch (error) {
+				if (!this.#ready) {
+					this.#ready = true;
+					this.#readyReject(error);
+					await this.close();
+					return;
+				}
 				this.#input.onDiagnostic?.(
-					`tail_frame_pre_floor session=${this.sessionId} kind=${frame.rawKind} at=${frame.generation}:${frame.seq} floor=${this.#turnFloor?.generation}:${this.#turnFloor?.seq}`,
+					`tail_stream_spawn_failed session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
 				);
+				if (!(await this.#backoff())) return;
+				continue;
+			}
+			this.#stream = stream;
+			const openedAt = this.#runner.now();
+			const hello = new Promise<void>((resolve) => {
+				this.#helloResolve = resolve;
+			});
+			const helloTimer = setTimeout(() => this.#helloResolve?.(), HELLO_TIMEOUT_MS);
+			try {
+				const consume = (async () => {
+					for await (const line of stream.lines) {
+						if (this.#closed) break;
+						this.#receiveLine(line);
+					}
+					// The relay ended: whether or not hello arrived, nobody is waiting on it any more.
+					this.#helloResolve?.();
+				})();
+				stream.write(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [...HELLO_CAPABILITIES] }));
+				await hello;
+				clearTimeout(helloTimer);
+				if (!this.#connectionId) throw new Error("host hello did not arrive");
+				if (!this.#ready) {
+					this.#ready = true;
+					this.#readyResolve();
+				}
+				this.#reopenFailures = 0;
+				await consume;
+			} catch (error) {
+				clearTimeout(helloTimer);
+				if (!this.#ready) {
+					this.#ready = true;
+					this.#readyReject(error);
+					stream.close();
+					this.#stream = undefined;
+					await this.close();
+					return;
+				}
+				this.#input.onDiagnostic?.(
+					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
+				);
+			} finally {
+				this.#helloResolve = undefined;
+				this.#stream = undefined;
+				this.#connectionId = undefined;
+				stream.close();
+				this.#failPending("relay ended");
+			}
+			if (this.#closed) return;
+			// A relay that ends is a lost observer for the running turn: whatever the
+			// host streamed while it was down is gone (content is best-effort by
+			// host contract). The actor reconciles through status and the
+			// transcript; this handle only reopens so later commands have a channel.
+			if (this.#running) {
+				this.#input.onDiagnostic?.(`tail_relay_lost session=${this.sessionId} opRef=${this.#opRef ?? "-"}`);
+				await this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+			}
+			const sinceOpen = this.#runner.now() - openedAt;
+			this.#reopenFailures = sinceOpen < 5_000 ? this.#reopenFailures + 1 : 0;
+			if (!(await this.#backoff())) return;
+		}
+	}
+
+	/** Exponential backoff between reopen attempts; false once the relay is declared dead. */
+	async #backoff(): Promise<boolean> {
+		if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
+			this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`);
+			await this.close();
+			return false;
+		}
+		const backoff = Math.min(30_000, REOPEN_BASE_BACKOFF_MS * 2 ** this.#reopenFailures);
+		this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId} backoffMs=${backoff}`);
+		await this.#runner.sleep(backoff);
+		return !this.#closed;
+	}
+
+	#receiveLine(line: string): void {
+		const trimmed = line.trim();
+		if (!trimmed) return;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(trimmed);
+		} catch {
 			return;
 		}
+		const frame = recordOf(parsed);
+		if (!frame || typeof frame.type !== "string") return;
+		this.#lastEventAt = this.#runner.now();
+		this.#stallReported = false;
+		if (frame.type === "hello") {
+			if (typeof frame.connectionId === "string" && frame.connectionId.length > 0) {
+				this.#connectionId = frame.connectionId;
+				this.#helloResolve?.();
+			}
+			return;
+		}
+		if (frame.type === "control_response" || frame.type === "query_response") {
+			const id = typeof frame.id === "string" ? frame.id : undefined;
+			const pending = id ? this.#pending.get(id) : undefined;
+			if (!pending) return;
+			clearTimeout(pending.timer);
+			this.#pending.delete(id!);
+			pending.resolve(decodeResponse(frame));
+			return;
+		}
+		if (frame.type === "transport_error") {
+			this.#input.onDiagnostic?.(
+				`tail_transport_error session=${this.sessionId} code=${sanitizeDiagnostic(String(frame.code ?? "unknown"))}`,
+			);
+			return;
+		}
+		for (const decoded of decodeStreamFrame(frame)) this.#accept(decoded);
+	}
+
+	#accept(frame: TailFrame): void {
 		if (frame.kind === "unknown" && this.#unknownDiagnostics < UNKNOWN_KIND_DIAGNOSTIC_CAP) {
 			this.#unknownDiagnostics++;
 			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`);
 		}
-		if (!this.#accepted) {
-			this.#preReceipt.push(frame);
+		if (frame.commandId === undefined && frame.turnId === undefined) {
+			// Uncorrelated: lifecycle noise (activity, identity_header, notifications
+			// turn_stream). Only the idle marker matters to the actor.
+			if (!frame.idle) return;
+		} else if (!this.#matchesTurn(frame)) {
+			if (this.#droppedForeign++ === 0)
+				this.#input.onDiagnostic?.(
+					`tail_frame_foreign session=${this.sessionId} kind=${frame.rawKind} commandId=${frame.commandId ?? "-"} turnId=${frame.turnId ?? "-"} expected=${this.#correlation.commandId ?? "-"}/${this.#correlation.turnId ?? "-"}`,
+				);
 			return;
 		}
-		await this.#flush;
-		if (this.#closed) return;
-		await this.#deliver(frame);
+		this.#deliveries = this.#deliveries
+			.then(async () => {
+				if (this.#closed) return;
+				await this.#input.onFrame?.(frame);
+			})
+			.catch((error: unknown) => {
+				this.#input.onDiagnostic?.(
+					`tail_frame_delivery_failed session=${this.sessionId} detail=${sanitizeDiagnostic(messageOf(error)) || "sdk_error"}`,
+				);
+			});
 	}
 
-	#gapNoted = false;
-
-	noteGap(gap: { cursor?: string; resync?: unknown }): void {
-		if (this.#gapNoted) return;
-		this.#gapNoted = true;
-		this.#input.onDiagnostic?.(
-			`tail_gap_nonstrict session=${this.sessionId} resync=${JSON.stringify(gap.resync ?? null)}`,
-		);
-	}
-
-	async retentionGap(gap: { cursor?: string; resync?: unknown }): Promise<void> {
-		if (this.#closed) return;
-		// A strict gap is not a terminal event. It never falls through into a
-		// cursorless poll, which would silently replay historical transcript data.
-		this.#cursor = undefined;
-		this.#pendingCursor = undefined;
-		this.#pausedForGap = true;
-		await this.#input.onRetentionGap?.({
-			sessionId: this.sessionId,
-			...(gap.cursor ? { cursor: gap.cursor } : {}),
-			...(gap.resync === undefined ? {} : { resync: gap.resync }),
-		});
-		if (!this.#ready) {
-			this.#ready = true;
-			this.#readyResolve();
+	/**
+	 * A frame belongs to the turn when its correlation matches what the accept
+	 * receipt / agent_start named. Before any correlation is known (the receipt
+	 * has not landed yet) the first correlated frame after beginTurn adopts it:
+	 * this connection only ever owns the one turn it submitted.
+	 */
+	#matchesTurn(frame: TailFrame): boolean {
+		if (this.#opRef === undefined) return false;
+		const known = this.#correlation;
+		if (known.commandId === undefined && known.turnId === undefined) {
+			this.#correlation = {
+				...(frame.commandId ? { commandId: frame.commandId } : {}),
+				...(frame.turnId ? { turnId: frame.turnId } : {}),
+			};
+			return true;
 		}
-		await this.close();
+		if (known.commandId !== undefined && frame.commandId !== undefined) return known.commandId === frame.commandId;
+		if (known.turnId !== undefined && frame.turnId !== undefined) return known.turnId === frame.turnId;
+		return false;
 	}
 
 	async close(): Promise<void> {
@@ -641,322 +605,71 @@ class ManagedTailHandle implements TailHandle {
 		this.#closed = true;
 		this.#stream?.close();
 		this.#stream = undefined;
-		if (!this.#ready) this.#readyReject(new Error(`tail ${this.sessionId} was closed before readiness`));
+		this.#failPending("handle closed");
+		if (!this.#ready) {
+			this.#ready = true;
+			this.#readyReject(new Error(`tail ${this.sessionId} was closed before readiness`));
+		}
 		this.#runner.release(this);
-	}
-
-	async #commitPendingCursor(): Promise<void> {
-		const cursor = this.#pendingCursor;
-		// A lost frame is only recoverable from the last committed cursor; once a
-		// delivery failed, this handle commits nothing more (re-attach resumes it).
-		if (!cursor || !this.#accepted || this.#deliveryFailed || this.#closed) return;
-		await this.#input.onCursorCommitted?.(cursor);
-		this.#cursor = cursor;
-		this.#pendingCursor = undefined;
-	}
-
-	/** Frame ids already handed to the actor; a backfill after a stream reopen replays history and must never re-deliver. */
-	readonly #deliveredIds = new Set<string>();
-
-	/**
-	 * Highest event-ring position (generation, seq) observed through this handle,
-	 * and the position at the moment the current turn began. A ring event at or
-	 * below the turn floor was emitted BEFORE this turn's prompt was sent: it
-	 * belongs to an earlier turn, whatever a resumed poll replays. Transcript
-	 * rows are fenced by their host timestamp in the actor; ring events (the
-	 * finalized answer, lifecycle) carry no timestamp, only a position, and a
-	 * resume that replays the ring re-delivered eight earlier turns' finalized
-	 * answers into one (live, 2026-09-18). Live: 15 messages for 4 steers, 14 of
-	 * them earlier turns' answers.
-	 */
-	#ringHigh: { generation: number; seq: number } | undefined;
-	#turnFloor: { generation: number; seq: number } | undefined;
-
-	/**
-	 * The host's checkpoint is the ring's end at poll time and is the
-	 * authoritative high-water mark. Frames alone are not enough: the relay
-	 * strips (generation, seq) from the frames it forwards, so a finalized
-	 * answer that arrived on the relay never advanced the mark, the next turn's
-	 * floor sat below it, and a resumed poll re-delivered it as this turn's
-	 * interim (live, 2026-09-18: the previous answer posted twice, 66 s apart).
-	 */
-	noteRingCheckpoint(position: { generation: number; seq: number }): void {
-		const high = this.#ringHigh;
-		if (
-			!high ||
-			position.generation > high.generation ||
-			(position.generation === high.generation && position.seq > high.seq)
-		)
-			this.#ringHigh = { generation: position.generation, seq: position.seq };
-	}
-
-	#noteRingPosition(frame: TailFrame): void {
-		if (frame.generation === undefined || frame.seq === undefined) return;
-		const high = this.#ringHigh;
-		if (!high || frame.generation > high.generation || (frame.generation === high.generation && frame.seq > high.seq))
-			this.#ringHigh = { generation: frame.generation, seq: frame.seq };
-	}
-
-	#predatesTurnFloor(frame: TailFrame): boolean {
-		const floor = this.#turnFloor;
-		if (!floor || frame.generation === undefined || frame.seq === undefined) return false;
-		return frame.generation < floor.generation || (frame.generation === floor.generation && frame.seq <= floor.seq);
-	}
-
-	async #deliver(frame: TailFrame): Promise<void> {
-		// Finalized answers are also keyed by messageRef so a backfill transcript row
-		// and the live turn_stream frame for the same answer never both deliver.
-		// gjc 0.16 synthesizes `generation:seq` ids that restart per revision, so
-		// every turn's first answer is "1:1": never a dedupe key. Only a real id
-		// or the answer text counts, and only within the current accepted turn.
-		const synthetic = frame.eventId !== undefined && /^\d+:\d+$/.test(frame.eventId);
-		const key =
-			frame.eventId && !synthetic
-				? frame.eventId
-				: frame.assistantText
-					? `text:${Bun.hash(frame.assistantText)}`
-					: undefined;
-		if (key) {
-			if (this.#deliveredIds.has(key)) {
-				this.#input.onDiagnostic?.(`tail_frame_duplicate session=${this.sessionId} event=${key}`);
-				return;
-			}
-			this.#deliveredIds.add(key);
-			if (this.#deliveredIds.size > DELIVERED_ID_CAP)
-				this.#deliveredIds.delete(this.#deliveredIds.values().next().value as string);
-		}
-		const attributedOpRef = tailOperationRef(frame);
-		if (attributedOpRef && this.#acceptedOpRef && attributedOpRef !== this.#acceptedOpRef) {
-			this.#input.onDiagnostic?.(
-				`tail_frame_ignored session=${this.sessionId} event=${frame.eventId ?? "unidentified"} opRef=${attributedOpRef}`,
-			);
-			return;
-		}
-		await this.#input.onFrame?.(frame);
-	}
-
-	#stream: TailStream | undefined;
-	#reopenFailures = 0;
-
-	async #run(): Promise<void> {
-		const spawner = this.#runner.streamSpawner;
-		if (spawner) {
-			await this.#runStreaming(spawner);
-			return;
-		}
-		while (!this.#closed) {
-			this.#polling = true;
-			try {
-				await this.#runner.poll(this);
-				if (!this.#ready) {
-					this.#ready = true;
-					this.#readyResolve();
-				}
-			} catch (error) {
-				if (!this.#ready) {
-					this.#ready = true;
-					this.#readyReject(error);
-					await this.close();
-					return;
-				}
-				this.#input.onDiagnostic?.(
-					`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
-				);
-			} finally {
-				this.#polling = false;
-			}
-			if (this.#closed || this.#pausedForGap) return;
-			await this.#runner.sleep(this.#runner.pollIntervalMs);
-		}
-	}
-
-	/**
-	 * Event-driven observation: one backfill poll establishes readiness and
-	 * replays pre-attach history, then the resident stream delivers every host
-	 * frame as it is emitted. A stream that ends while the handle is open is
-	 * re-opened after a backfill, so nothing emitted in between is lost.
-	 */
-	async #runStreaming(spawner: TailStreamSpawner): Promise<void> {
-		while (!this.#closed) {
-			this.#polling = true;
-			try {
-				await this.#runner.poll(this);
-				if (!this.#ready) {
-					this.#ready = true;
-					this.#readyResolve();
-				}
-			} catch (error) {
-				if (!this.#ready) {
-					this.#ready = true;
-					this.#readyReject(error);
-					await this.close();
-					return;
-				}
-				this.#input.onDiagnostic?.(
-					`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
-				);
-			} finally {
-				this.#polling = false;
-			}
-			if (this.#closed || this.#pausedForGap) return;
-			const stream = spawner(this.sessionId);
-			this.#stream = stream;
-			const openedAt = this.#runner.now();
-			// gjc >= 0.16.7's relay emits only lifecycle frames and the single
-			// `turn_stream/finalized` answer; every transcript row (mid-work
-			// assistant text, tool calls, tool results) is reachable only through
-			// `tail --all-events`. While a turn is running, poll alongside the
-			// stream: the relay keeps the answer immediate, the poll keeps the turn
-			// observable. Both paths are fenced by the accepted-op-ref filter and
-			// deterministic delivery ids, which is exactly how the gateway ran when
-			// the relay was dying every second (2026-09-17: relay alive → interim
-			// speech dropped to zero because the loop parked in the stream).
-			const live = { open: true };
-			const sidePoll = this.#pollWhileStreaming(live);
-			try {
-				for await (const line of stream.lines) {
-					if (this.#closed) break;
-					const frames = decodeStreamLine(line);
-					for (const frame of frames) await this.receive(frame);
-				}
-			} catch (error) {
-				this.#input.onDiagnostic?.(
-					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
-				);
-			} finally {
-				live.open = false;
-				this.#stream = undefined;
-				stream.close();
-				await sidePoll;
-			}
-			if (this.#closed || this.#pausedForGap) return;
-			// A relay that ends immediately (endpoint_stale: the host died) must not
-			// spin. Back off exponentially; after the cap, surface a retention gap
-			// so the actor reconciles via status and rebinds instead of waiting on
-			// a dead endpoint forever.
-			const sinceOpen = this.#runner.now() - openedAt;
-			this.#reopenFailures = sinceOpen < 5_000 ? this.#reopenFailures + 1 : 0;
-			if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
-				this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`);
-				await this.retentionGap({ resync: { revision: 0, generation: 0, seq: 0 } });
-				return;
-			}
-			const backoff = Math.min(30_000, this.#runner.pollIntervalMs * 2 ** this.#reopenFailures);
-			this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId} backoffMs=${backoff}`);
-			await this.#runner.sleep(backoff);
-		}
-	}
-
-	/**
-	 * Polls at the runner interval for as long as the stream is open AND a turn
-	 * is running. Idle sessions are not polled: the relay's lifecycle frames are
-	 * enough to notice the next turn start, and `setTurnRunning(true)` from the
-	 * actor wakes this loop. A poll failure is diagnostic, never fatal - the
-	 * stream is still the authority for liveness, and a strict poll that reports
-	 * a retention gap pauses the handle through the normal path.
-	 */
-	async #pollWhileStreaming(live: { open: boolean }): Promise<void> {
-		while (live.open && !this.#closed && !this.#pausedForGap) {
-			await this.#runner.sleep(this.#runner.pollIntervalMs);
-			if (!live.open || this.#closed || this.#pausedForGap || !this.#running || this.#polling) continue;
-			this.#polling = true;
-			try {
-				await this.#runner.poll(this);
-			} catch (error) {
-				this.#input.onDiagnostic?.(
-					`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
-				);
-			} finally {
-				this.#polling = false;
-			}
-		}
 	}
 }
 
-type DecodedTail = {
-	readonly frames: readonly TailFrame[];
-	readonly cursor?: string;
-	/** The event-ring position the host reported as current when this poll was taken. */
-	readonly checkpoint?: { readonly generation: number; readonly seq: number };
-	/** The host rejected our checkpoint cursor; the next poll must be cursorless. */
-	readonly invalidCursor?: true;
-	readonly terminal: boolean;
-	readonly gap?: { readonly cursor?: string; readonly resync?: unknown };
-	readonly error?: Error;
-};
-
-function decodeTailResult(result: CliResult): DecodedTail {
-	let envelope: Record<string, unknown>;
-	try {
-		envelope = JSON.parse(result.stdout) as Record<string, unknown>;
-	} catch {
-		return {
-			frames: [],
-			terminal: false,
-			error: new Error(`session tail did not print a JSON envelope (exit ${result.exitCode})`),
-		};
-	}
-	const error = recordOf(envelope.error);
-	const errorCode = typeof error?.code === "string" ? error.code : undefined;
-	if (result.exitCode !== 0 || envelope.ok !== true) {
-		if (errorCode === "retention_gap") {
-			return { frames: [], terminal: false, gap: { resync: recordOf(error?.details)?.resync ?? error?.resync } };
-		}
-		// `--until-idle` bounded by `--timeout-ms` on a quiet session: nothing to
-		// report this poll. Not an error, not terminal, not a gap.
-		if (errorCode === "tail_timeout") return { frames: [], terminal: false };
-		// snapshot_capacity_exceeded: the host's pin table is full (128), so it
-		// cannot mint the checkpoint a resume needs. A cursorless tail still works
-		// (it pages the checkpoint it is handed and does not need a spare pin), so
-		// treat it like a lost cursor rather than a failed poll; pins expire on a
-		// 15-minute TTL and resume comes back by itself.
-		if (errorCode === "invalid_cursor" || errorCode === "cursor_expired" || errorCode === "snapshot_capacity_exceeded")
-			return { frames: [], terminal: false, invalidCursor: true };
-		// Keep the CLI's own message: `protocol_error` alone has meant three
-		// different things (malformed session row, malformed control response,
-		// list traversal) and the code never said which. Bounded and sanitised,
-		// because it lands in the diagnostic log.
-		const message =
-			typeof error?.message === "string" && error.message !== errorCode
-				? sanitizeDiagnostic(error.message).slice(0, 200)
-				: "";
-		return {
-			frames: [],
-			terminal: false,
-			error: new Error(
-				`session tail failed${errorCode ? `: ${errorCode}` : ` (exit ${result.exitCode})`}${message ? ` - ${message}` : ""}`,
-			),
-		};
-	}
-	const payload = recordOf(envelope.result) ?? {};
-	const gap = recordOf(payload.gap);
-	const items = Array.isArray(payload.items) ? payload.items : [];
-	// A non-strict reply may carry BOTH a diagnostic gap (pre-checkpoint history
-	// dropped) and the live frames after the resync point. The poll decides
-	// whether the gap is a hold (strict, checkpointed) or a diagnostic.
-	const checkpoint = recordOf(payload.checkpoint);
-	const checkpointPosition =
-		typeof checkpoint?.generation === "number" && typeof checkpoint?.seq === "number"
-			? { generation: checkpoint.generation, seq: checkpoint.seq }
-			: undefined;
+function decodeResponse(frame: Record<string, unknown>): RelayResponse {
+	const error = recordOf(frame.error);
 	return {
-		frames: items.flatMap(normalizeTailFrame),
-		...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}),
-		...(checkpointPosition ? { checkpoint: checkpointPosition } : {}),
-		terminal: payload.terminal === true,
-		...(gap?.code === "retention_gap"
-			? { gap: { ...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}), resync: gap.resync } }
+		ok: frame.ok === true,
+		...(recordOf(frame.result) ? { result: recordOf(frame.result) } : {}),
+		...(error
+			? {
+					error: {
+						...(typeof error.code === "string" ? { code: error.code } : {}),
+						...(typeof error.message === "string" ? { message: error.message } : {}),
+					},
+				}
 			: {}),
 	};
 }
 
 /**
- * Host WebSocket frames relayed by `gjc sdk serve --stdio` are the same
- * lifecycle vocabulary the `tail` CLI projects into items (`activity`,
- * `agent_start`/`agent_end`, `turn_stream`, transcript rows), just unwrapped:
- * `{type, ...payload}` instead of `{kind, payload}`. Project them onto the one
- * TailFrame shape so the actor never learns which transport delivered them.
+ * Host frames relayed by `gjc sdk serve --stdio`: lifecycle (`agent_start`,
+ * `agent_end`, `agent_failed`, `activity`) and turn content wrapped as
+ * `{type:"event", kind, payload:{event_type, event}, commandId, turnId}`.
  */
+export function decodeStreamFrame(frame: Record<string, unknown>): readonly TailFrame[] {
+	const type = typeof frame.type === "string" ? frame.type : "";
+	const correlation = {
+		...(typeof frame.commandId === "string" ? { commandId: frame.commandId } : {}),
+		...(typeof frame.turnId === "string" ? { turnId: frame.turnId } : {}),
+	};
+	if (type === "event" && typeof frame.kind === "string") {
+		const wrapper = recordOf(frame.payload) ?? {};
+		const event = recordOf(wrapper.event) ?? wrapper;
+		return [decodeEvent(frame.kind, event, correlation)];
+	}
+	if (type === "agent_start" || type === "agent_end" || type === "agent_failed") {
+		const { type: _type, commandId: _c, turnId: _t, ...payload } = frame;
+		return [
+			{
+				kind: type,
+				rawKind: type,
+				...correlation,
+				payload,
+				steerEcho: false,
+				idle: type !== "agent_start",
+			},
+		];
+	}
+	if (type === "activity") {
+		const { type: _type, ...payload } = frame;
+		const idle = [payload.state, payload.status, payload.activity].some((value) => value === "idle");
+		return [{ kind: "activity", rawKind: "activity", payload, steerEcho: false, idle }];
+	}
+	// Notifications-extension frames (identity_header, action_needed,
+	// turn_stream, tool_activity, reasoning_summary, context_update): the owned
+	// content stream already carries everything the gateway delivers.
+	return [];
+}
+
 export function decodeStreamLine(line: string): readonly TailFrame[] {
 	const trimmed = line.trim();
 	if (!trimmed) return [];
@@ -968,120 +681,52 @@ export function decodeStreamLine(line: string): readonly TailFrame[] {
 	}
 	const frame = recordOf(parsed);
 	if (!frame || typeof frame.type !== "string") return [];
-	if (frame.type === "hello" || frame.type === "pong") return [];
-	const { type, generation, seq, id, ...payload } = frame;
-	if (type === "event" && typeof frame.kind === "string") {
-		// Ring-projected events carry kind/payload/generation/seq already.
-		return normalizeTailFrame({ kind: frame.kind, payload: recordOf(frame.payload) ?? payload, generation, seq, id });
-	}
-	if (type === "turn_stream") {
-		// A finalized assistant answer is the live equivalent of an assistant
-		// transcript row; partial phases are progress only.
-		if (payload.phase === "finalized" && typeof payload.text === "string" && payload.text.length > 0) {
-			const ref = typeof payload.messageRef === "string" ? payload.messageRef : undefined;
-			return normalizeTailFrame({
-				kind: "transcript",
-				...(ref ? { id: `turn_stream:${ref}` } : {}),
-				payload: {
-					role: "assistant",
-					content: [{ type: "text", text: payload.text }],
-					...(payload.clientRef ? { clientRef: payload.clientRef } : {}),
-				},
-			});
-		}
-		return normalizeTailFrame({ kind: "turn_stream", payload });
-	}
-	const turnId = typeof payload.turnId === "string" ? payload.turnId : undefined;
-	const stableId = typeof id === "string" ? id : turnId ? `${type}:${turnId}` : undefined;
-	return normalizeTailFrame({ kind: type, payload, ...(stableId ? { id: stableId } : {}), generation, seq });
+	return decodeStreamFrame(frame);
 }
 
-function normalizeTailFrame(value: unknown): readonly TailFrame[] {
-	const item = recordOf(value);
-	if (!item || typeof item.kind !== "string") return [];
-	const payload = recordOf(item.payload) ?? {};
-	const rawKind = item.kind;
-	const kind: TailEventKind = OBSERVED_TAIL_KIND_SET.has(rawKind) ? (rawKind as TailEventKind) : "unknown";
-	const generation = typeof item.generation === "number" ? item.generation : undefined;
-	const seq = typeof item.seq === "number" ? item.seq : undefined;
-	const id =
-		typeof item.id === "string" && item.id.length > 0
-			? item.id
-			: generation !== undefined && seq !== undefined
-				? `${generation}:${seq}`
-				: undefined;
-	const transcriptText =
-		rawKind === "transcript" && payload.role === "assistant" ? contentText(payload.content) : undefined;
-	// gjc >= 0.16.7 records tool calls as `toolCall` content blocks on the
-	// assistant transcript row and no longer emits `tool_activity` /
-	// `tool_execution_start` frames (measured 2026-09-17: a read+answer turn
-	// produced 4 transcript rows and zero tool frames). Project the block onto
-	// the fields the counter and the activity hint already read, so a tool-using
-	// turn is seen as one: without this `toolCallsSoFar` stayed 0 for every
-	// turn, every mid-work message was suppressed as `pre-tool`, and presence
-	// never left the queued marker.
-	const toolCall =
-		rawKind === "transcript" && payload.role === "assistant" ? firstToolCall(payload.content) : undefined;
-	if (toolCall) {
-		payload.toolCallStarted = true;
-		if (typeof payload.toolName !== "string") payload.toolName = toolCall.name;
-		if (payload.args === undefined) payload.args = toolCall.args;
+function decodeEvent(kind: string, event: Record<string, unknown>, correlation: TurnCorrelation): TailFrame {
+	if (kind === "message_end") {
+		const message = recordOf(event.message) ?? {};
+		const role = typeof message.role === "string" ? message.role : "";
+		const text = role === "assistant" ? contentText(message.content) : undefined;
+		const id = typeof message.id === "string" ? message.id : undefined;
+		return {
+			kind: "message_end",
+			rawKind: "message_end",
+			...correlation,
+			...(id ? { eventId: id } : {}),
+			payload: { role, ...(message.content === undefined ? {} : { content: message.content }) },
+			...(text ? { assistantText: text } : {}),
+			steerEcho: role !== "assistant",
+			idle: false,
+		};
 	}
-	const toolResult = rawKind === "transcript" && payload.role === "toolResult";
-	// Current GJC hosts emit the live/final assistant channel as turn_stream.
-	// Only the explicit finalized final-answer frame is chat output: live drafts
-	// and reasoning summaries are progress, never deliverable text.
-	const finalizedTurnText =
-		rawKind === "turn_stream" && payload.phase === "finalized" && payload.finalAnswer === true
-			? contentText(payload.text)
-			: undefined;
-	const text = transcriptText ?? finalizedTurnText;
-	const clientRef =
-		typeof payload.clientRef === "string"
-			? payload.clientRef
-			: typeof item.clientRef === "string"
-				? item.clientRef
-				: undefined;
-	const idle =
-		rawKind === "activity" && [payload.state, payload.status, payload.activity].some((value) => value === "idle");
-	if (rawKind === "tool_activity" && (payload.phase === "started" || payload.phase === "start"))
-		payload.toolCallStarted = true;
-	return [
-		{
+	if (kind === "tool_execution_start" || kind === "tool_execution_update" || kind === "tool_execution_end") {
+		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+		return {
 			kind,
-			// Surface the transcript-shaped tool lifecycle under the kinds the rest of
-			// the gateway keys on, so nothing downstream learns about transcript blocks.
-			rawKind: toolCall ? "tool_execution_start" : toolResult ? "tool_execution_end" : rawKind,
-			...(generation === undefined ? {} : { generation }),
-			...(seq === undefined ? {} : { seq }),
-			...(id === undefined ? {} : { eventId: id }),
-			payload,
-			...(text === undefined || text === "" ? {} : { assistantText: text }),
-			steerEcho: clientRef !== undefined || (rawKind === "transcript" && payload.role === "user"),
-			idle,
-		},
-	];
-}
-
-/** The first tool call block on an assistant transcript row, if any. */
-function firstToolCall(content: unknown): { readonly name: string; readonly args: unknown } | undefined {
-	if (!Array.isArray(content)) return undefined;
-	for (const block of content) {
-		const record = recordOf(block);
-		if (!record) continue;
-		const type = typeof record.type === "string" ? record.type : "";
-		if (type !== "toolCall" && type !== "tool_call" && type !== "tool_use") continue;
-		const name = typeof record.name === "string" && record.name.length > 0 ? record.name : "tool";
-		return { name, args: record.arguments ?? record.input ?? record.args };
+			rawKind: kind,
+			...correlation,
+			...(toolCallId ? { eventId: `${kind}:${toolCallId}` } : {}),
+			payload: {
+				...(typeof event.toolName === "string" ? { toolName: event.toolName } : {}),
+				...(event.args === undefined ? {} : { args: event.args }),
+				...(typeof event.intent === "string" ? { intent: event.intent } : {}),
+				...(kind === "tool_execution_start" ? { toolCallStarted: true } : {}),
+				...(kind === "tool_execution_end" && event.isError === true ? { isError: true } : {}),
+			},
+			steerEcho: false,
+			idle: false,
+		};
 	}
-	return undefined;
+	// message_update (streaming deltas) and anything else: progress only.
+	return { kind: "unknown", rawKind: kind, ...correlation, payload: {}, steerEcho: false, idle: false };
 }
 
 /**
  * The chat-visible text of a content array. Only `text` blocks are speech:
- * a `thinking` block also carries `.text`, and joining it in shipped the
- * model's private reasoning to the channel as if the persona had said it
- * (surfaced by the transcript tool-call projection, 2026-09-17).
+ * a `thinking` block also carries `.text`, and joining it in would ship the
+ * model's private reasoning to the channel as if the persona had said it.
  */
 function contentText(content: unknown): string | undefined {
 	if (typeof content === "string") return content;
@@ -1095,33 +740,8 @@ function contentText(content: unknown): string | undefined {
 	return parts.join("");
 }
 
-export function tailOperationRef(frame: TailFrame): string | undefined {
-	for (const value of [frame.payload.opRef, frame.payload.operationRef, frame.payload.clientRef])
-		if (typeof value === "string" && value.length > 0) return value;
-	return undefined;
-}
-
-/**
- * Host-stamped time of a transcript row (`ts`, ISO-8601 from the session's
- * entry timestamp). Live lifecycle frames carry none; only durable rows do,
- * and those are exactly the frames a cursorless resync can replay.
- */
-export function tailFrameTimestampMs(frame: TailFrame): number | undefined {
-	const ts = frame.payload.ts;
-	if (typeof ts !== "string") return undefined;
-	const at = Date.parse(ts);
-	return Number.isFinite(at) ? at : undefined;
-}
-
-function validResyncCoordinate(value: TailResyncCoordinate): boolean {
-	return [value.revision, value.generation, value.seq].every((part) => Number.isSafeInteger(part) && part >= 0);
-}
-
-function opaqueCursorOf(payload: Record<string, unknown>): string | undefined {
-	for (const value of [payload.cursor, payload.nextCursor, payload.next_cursor, recordOf(payload.page)?.cursor]) {
-		if (typeof value === "string" && value.length > 0) return value;
-	}
-	return undefined;
+function messageOf(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -1136,17 +756,10 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 	return result;
 }
 
-function nonNegativeInteger(value: number | undefined, fallback: number, name: string): number {
-	const result = value ?? fallback;
-	if (!Number.isSafeInteger(result) || result < 0) throw new Error(`${name} must be a non-negative integer`);
-	return result;
-}
-
 /**
  * Identity of one INTERIM delivery of a persona turn: the inbound trigger,
- * the part's exact text, and its index. Two different mid-turn findings get two
- * ids; the same finding replayed (stream reopen backfill, gateway restart with
- * an id-less frame) hashes to the row that already exists.
+ * the part's exact text, and its index. The terminal path hashes the final
+ * answer the same way to recognise a slot the owned stream already shipped.
  */
 export function deterministicInterimDeliveryId(
 	originKey: string,

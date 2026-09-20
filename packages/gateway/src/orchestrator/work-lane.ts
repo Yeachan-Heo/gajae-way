@@ -296,6 +296,11 @@ export class WorkLaneManager {
 			job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 			this.#db.workAttemptPrepare(runtime, job);
 			const observer = this.#register(runtime);
+			// Submit on the observer's own relay so the host streams this turn's
+			// lifecycle to it; the frame callback then wakes reconciliation as the
+			// turn progresses instead of on the poll interval alone.
+			this.#attach(observer);
+			await observer.attaching;
 			let accepted = false;
 			let rejected = false;
 			let source: "receipt" | "status" = "receipt";
@@ -306,9 +311,11 @@ export class WorkLaneManager {
 					opRef,
 					text: input.text,
 					codingRegister: true,
+					...(observer.tail ? { relay: observer.tail } : {}),
 					// Only this bind receipt can prove the requested model was applied at startup.
 					...(input.model && binding.startupModelApplied !== true ? { model: input.model } : {}),
 				});
+				observer.tail?.correlate(opRef, receipt);
 				accepted = receipt.operationRef === opRef && receipt.sessionId === runtime.sessionId;
 			} catch (error) {
 				rejected = definitiveRefusal(error);
@@ -504,7 +511,7 @@ export class WorkLaneManager {
 			observer.tail = tail;
 			await tail.ready;
 			if (this.#writeCurrent(observer) && this.#db.workAttemptGet(runtime.opRef)?.settledAt === null) {
-				await tail.markAccepted(runtime.opRef);
+				tail.beginTurn(runtime.opRef);
 				tail.setTurnRunning(true);
 			}
 		})()

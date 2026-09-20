@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
+import { noRelay } from "./session-port.fake";
 import { GatewayDatabase } from "../src/store/db";
 
 test("a poisoned session-create key advances one epoch and retries with a fresh key", async () => {
@@ -46,7 +47,7 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 		authority,
 		cli: run,
 		instanceId: "create-epoch",
-		tailRunner: new TailRunner({ run, repo: join(home, "workspace") }),
+		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace") }),
 		sleep: async () => {},
 	});
 	try {

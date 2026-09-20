@@ -224,6 +224,8 @@ class HostClockPort extends ScriptedSessionPort {
 				result: {
 					kind: "prompt",
 					clientRef: opRef,
+					commandId: `command-${opRef}`,
+					turnId: `turn-${opRef}`,
 					status: "terminal_ok",
 					startedAt,
 					terminalAt,
@@ -268,38 +270,20 @@ class DisownedStatusPort extends ScriptedSessionPort {
 	}
 }
 
-test("C1a: an un-attributed replay 1,999ms before dispatch passes the documented 2s skew tolerance", async () => {
-	const fixture = await directFixture();
-	try {
-		await admit(fixture, "skew-edge", "current prompt");
-		const send = required(fixture.port.sends[0], "turn was not sent");
-		const dispatchFloor = Date.parse(
-			required(fixture.database.inboundTurnDispatchedAt(send.opRef), "dispatch floor missing"),
-		);
-		fixture.port.emitReplayedTranscriptRow(send.sessionId, "within skew replay", dispatchFloor - 1_999);
-		await eventually(
-			() => fixture.frames.some((frame) => frame.text === "within skew replay"),
-			"inside-skew row was not admitted to the tail lifecycle",
-		);
-		expect(fixture.logs.some((line) => line.startsWith("tail_frame_pre_turn"))).toBe(false);
-		fixture.port.completeWithoutAnswerFrame(send.opRef, "current durable answer");
-		await eventually(() => fixture.terminals.length === 1, "terminal answer was not delivered");
-		expect(fixture.terminals).toEqual([{ trigger: "skew-edge", text: "current durable answer" }]);
-	} finally {
-		await fixture.close();
-	}
-});
-
 test("C1b: tail frames from a foreign session or an explicit foreign operation cannot cross into the current turn", async () => {
 	const fixture = await directFixture();
 	try {
 		await admit(fixture, "session-op-fence", "current prompt");
 		const send = required(fixture.port.sends[0], "turn was not sent");
-		const dispatchFloor = Date.parse(
-			required(fixture.database.inboundTurnDispatchedAt(send.opRef), "dispatch floor missing"),
+		fixture.port.seedOperation("gw-p-foreign-session", "foreign-session", "terminal_ok", "foreign-session output");
+		fixture.port.seedOperation("gw-p-foreign-op", send.sessionId, "terminal_ok", "foreign-op output");
+		fixture.port.emitAssistant(
+			"foreign-session",
+			"foreign-session output",
+			"foreign-session-event",
+			"gw-p-foreign-session",
 		);
-		fixture.port.emitReplayedTranscriptRow("foreign-session", "foreign-session output", dispatchFloor + 1, send.opRef);
-		fixture.port.emitReplayedTranscriptRow(send.sessionId, "foreign-op output", dispatchFloor + 1, "gw-p-foreign-op");
+		fixture.port.emitAssistant(send.sessionId, "foreign-op output", "foreign-op-event", "gw-p-foreign-op");
 		await Bun.sleep(25);
 		expect(fixture.frames).toEqual([]);
 		fixture.port.completeWithoutAnswerFrame(send.opRef, "current answer");
@@ -310,24 +294,26 @@ test("C1b: tail frames from a foreign session or an explicit foreign operation c
 	}
 });
 
-test("C1c: three cursorless replays of prior answers cannot move a reply onto the next trigger", async () => {
+test("C1c: three turns recover their own results exactly once despite foreign answers on the same session", async () => {
 	const fixture = await directFixture();
 	try {
 		const answers = ["answer one", "answer two", "answer three"];
-		let previousAnswerAt: number | undefined;
+		let previousOpRef: string | undefined;
 		for (let index = 0; index < answers.length; index++) {
-			if (previousAnswerAt !== undefined) await Bun.sleep(2_050);
 			const messageId = `three-turn-${index + 1}`;
 			await admit(fixture, messageId, `prompt ${index + 1}`);
 			await eventually(() => fixture.port.sends.length === index + 1, `turn ${index + 1} was not sent`);
 			const send = required(fixture.port.sends[index], `turn ${index + 1} send missing`);
-			if (previousAnswerAt !== undefined)
-				fixture.port.emitReplayedTranscriptRow(send.sessionId, answers[index - 1]!, previousAnswerAt);
+			if (previousOpRef !== undefined)
+				fixture.port.emitAssistant(send.sessionId, answers[index - 1]!, `foreign-${index}`, previousOpRef);
 			fixture.port.completeWithoutAnswerFrame(send.opRef, answers[index]!);
 			await eventually(() => fixture.terminals.length === index + 1, `turn ${index + 1} did not deliver`);
-			previousAnswerAt = Date.now();
+			previousOpRef = send.opRef;
 		}
-		expect(fixture.logs.filter((line) => line.startsWith("tail_frame_pre_turn")).length).toBeGreaterThanOrEqual(2);
+		expect(fixture.frames).toEqual([]);
+		expect(fixture.port.workerOutputReads.map((read) => read.opRef)).toEqual(
+			fixture.port.sends.map((send) => send.opRef),
+		);
 		expect(fixture.terminals).toEqual([
 			{ trigger: "three-turn-1", text: "answer one" },
 			{ trigger: "three-turn-2", text: "answer two" },
@@ -336,7 +322,7 @@ test("C1c: three cursorless replays of prior answers cannot move a reply onto th
 	} finally {
 		await fixture.close();
 	}
-}, 15_000);
+});
 
 test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND the gateway never reopens the previous turn's row, and a host clock AHEAD never hides the real answer", async () => {
 	const port = new HostClockPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
@@ -492,6 +478,8 @@ test("C2d: /new discards only an undispatched row; the already-running turn stil
 			"retired running turn did not reattach for terminal observation",
 		);
 		port.complete(running.opRef, "running answer");
+		// The reopened relay did not submit this operation; status settles the retired turn.
+		await fixture.manager.reconcile(DIRECT_ORIGIN_KEY);
 		await eventually(
 			() => fixture.database.inboundTurnRow(running.opRef)?.turn_state === "done",
 			"retired running turn did not reconcile terminal state",

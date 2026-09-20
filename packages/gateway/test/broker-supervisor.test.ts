@@ -601,7 +601,11 @@ test("preflight fails closed when the stream relay rejects its argv (usage exit 
 		args[0] === "--version" ? { exitCode: 0, stdout: "gjc/0.16.6\n", stderr: "" } : healthy;
 	const sdk = async (args: readonly string[]) =>
 		args[1] === "serve"
-			? { exitCode: 2, stdout: "USAGE\n  $ gjc sdk [ACTION] [FLAGS]\n", stderr: "gjc sdk serve: unknown argument: --agent-dir\n" }
+			? {
+					exitCode: 2,
+					stdout: "USAGE\n  $ gjc sdk [ACTION] [FLAGS]\n",
+					stderr: "gjc sdk serve: unknown argument: --agent-dir\n",
+				}
 			: healthy;
 	await expect(preflightGjcRuntime(run, "0.15.6", sdk)).rejects.toThrow("stream relay rejected its argv");
 	// A relay that exits for a runtime reason (unindexed probe id) is not an argv rejection.
