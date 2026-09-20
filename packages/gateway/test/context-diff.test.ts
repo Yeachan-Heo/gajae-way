@@ -180,3 +180,22 @@ test("a later omission generation is not cleared by an older in-flight window co
 	const next = db.contextWindow(ORIGIN_KEY, "next-trigger", new Date(NOW.getTime() + 1));
 	expect(next.expiredCount).toBeGreaterThanOrEqual(1);
 });
+
+test("recentInbound reads people's messages oldest-first and consumes nothing", async () => {
+	const db = await open();
+	for (let index = 0; index < 5; index++)
+		record(db, `inb-${index}`, `message-${index}`, new Date(NOW.getTime() - (5 - index) * 1_000).toISOString());
+	record(db, "reaction", "[reaction] 👍 on something", new Date(NOW.getTime() - 500).toISOString());
+	const since = new Date(NOW.getTime() - 60_000).toISOString();
+
+	const recent = db.recentInbound(ORIGIN_KEY, 3, since);
+	expect(recent.map((row) => row.body)).toEqual(["message-2", "message-3", "message-4"]);
+	// Reactions are not conversation for this purpose.
+	expect(recent.some((row) => row.body.startsWith("[reaction]"))).toBe(false);
+	// A shadow read must not eat the unread diff the real turn depends on.
+	expect(db.contextDiagnostics(ORIGIN_KEY).unread).toBe(6);
+
+	// A reset floor hides everything before it.
+	db.contextSetFloor(ORIGIN_KEY, new Date(NOW.getTime() - 1_500).toISOString());
+	expect(db.recentInbound(ORIGIN_KEY, 10, since).length).toBe(0);
+});
