@@ -167,6 +167,54 @@ test("tail runner alarms exactly at the stall threshold, diagnoses unknown kinds
 	}
 });
 
+test("streaming message_update deltas are progress, not unrecognized runtime events", async () => {
+	const logs: string[] = [];
+	const relay = new FakeRelay();
+	const runner = new TailRunner({
+		stream: () => relay,
+		repo: "/tmp/tail-progress-kind",
+		stallTimeoutMs: 120_000,
+		now: () => 0,
+		log: (line) => logs.push(line),
+	});
+	const tail = await runner.attach({
+		sessionId: "tail-session",
+		brokerGeneration: 1,
+		repo: "/tmp/tail-progress-kind",
+		originKey: ORIGIN_KEY,
+		onStall: () => {},
+		onDiagnostic: (line) => logs.push(line),
+	});
+	try {
+		tail.beginTurn("op-1", { commandId: "cmd-1", turnId: "turn-1" });
+		for (let index = 0; index < 20; index++)
+			relay.host({
+				type: "event",
+				kind: "message_update",
+				commandId: "cmd-1",
+				turnId: "turn-1",
+				payload: { event_type: "message_update", event: { delta: `chunk-${index}` } },
+			});
+		relay.host({
+			type: "event",
+			kind: "compaction_observed",
+			commandId: "cmd-1",
+			turnId: "turn-1",
+			payload: { event_type: "compaction_observed", event: { trigger: "native_auto" } },
+		});
+		await eventually(
+			() => logs.includes("unknown_runtime_event session=tail-session kind=compaction_observed"),
+			"a genuinely unrecognized relay event must still be diagnosed",
+		);
+		expect(logs.filter((line) => line.includes("kind=message_update"))).toEqual([]);
+		expect(logs.filter((line) => line.startsWith("unknown_runtime_event"))).toEqual([
+			"unknown_runtime_event session=tail-session kind=compaction_observed",
+		]);
+	} finally {
+		await tail.close();
+	}
+});
+
 test("chat.progress is emitted only from observed tail activity and preserves tail counters", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-tail-progress-"));
 	const config: GatewayConfig = {
