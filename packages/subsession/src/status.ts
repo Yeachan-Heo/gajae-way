@@ -27,10 +27,21 @@ export type FailureBody = {
 	readonly code?: string;
 	readonly message?: string;
 };
+/**
+ * Terminal outcome body. A failed outcome carries the runtime's own bounded
+ * classifiers (`phase`, `category`) and its safe code next to the redacted
+ * message, and those are the only facts that make a post-start failure
+ * triageable, so they are typed here rather than dropped at the boundary.
+ */
 export type PromptOutcomeBody = {
 	readonly kind?: string;
 	readonly reason?: string;
 	readonly provenance?: string;
+	readonly code?: string;
+	readonly message?: string;
+	readonly providerCode?: string;
+	readonly phase?: string;
+	readonly category?: string;
 };
 
 export type PromptStatusBody = {

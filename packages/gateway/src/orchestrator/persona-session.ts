@@ -16,7 +16,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
-import { sanitizeDiagnostic } from "./rebind";
+import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
@@ -1952,6 +1952,9 @@ class OriginActor {
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
+				this.#manager.log(
+					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}`,
+				);
 				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
 			}
 		} catch (error) {
@@ -2308,12 +2311,43 @@ class OriginActor {
 	}
 }
 
-function terminalError(status: StatusReport): Error {
-	return new Error(
-		sanitizeDiagnostic(
-			status.status.error?.message ?? status.status.error?.code ?? `session status ${status.status.status}`,
-		),
-	);
+/**
+ * A terminal failure carries the runtime's own code, so the delivered notice
+ * reads `[turn failed] <code>: <message>` and a rebindable code still earns its
+ * `/new` hint. gajae-code redacts the message of a post-start failure down to a
+ * fixed sentence (`Agent run failed after execution started.`), so the code is
+ * the ENTIRE diagnosis — dropping it here made six distinct lost turns deliver
+ * six identical, untriageable lines (#244).
+ */
+function terminalError(status: StatusReport): GjcRuntimeError {
+	const failure = status.status.error;
+	const outcome = status.status.outcome;
+	const code = sanitizeDiagnostic(failure?.code ?? outcome?.code ?? "") || undefined;
+	const message =
+		sanitizeDiagnostic(failure?.message ?? outcome?.message ?? "") ||
+		// Never empty: a code-only failure still reports the code as its diagnosis,
+		// and a failure with neither keeps the gateway's own framing (#14).
+		code ||
+		sanitizeDiagnostic(`session status ${status.status.status}`);
+	return new GjcRuntimeError(`${code ? `${code}: ` : ""}${message}`, {
+		...(code ? { code } : {}),
+		message,
+	});
+}
+
+/** The runtime's bounded failure classifiers, for the operator log only. */
+function terminalFailureDiagnosis(status: StatusReport): string {
+	const outcome = status.status.outcome;
+	const fields: [string, string | undefined][] = [
+		["code", status.status.error?.code ?? outcome?.code],
+		["provider_code", outcome?.providerCode],
+		["phase", outcome?.phase],
+		["category", outcome?.category],
+		["provenance", outcome?.provenance],
+	];
+	return fields
+		.map(([name, value]) => `${name}=${(value === undefined ? "" : sanitizeDiagnostic(value)) || "unknown"}`)
+		.join(" ");
 }
 
 function safeDiagnostic(error: unknown): string {

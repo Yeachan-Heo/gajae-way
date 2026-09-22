@@ -334,7 +334,11 @@ export class ScriptedSessionPort implements SessionPort {
 								status: "failed",
 								...startedAt,
 								terminalAt: operation.terminalAt,
-								error: { message: operation.error ?? "scripted failure" },
+								error: {
+									...(operation.errorCode ? { code: operation.errorCode } : {}),
+									...(operation.error === undefined ? {} : { message: operation.error }),
+								},
+								...(operation.failureOutcome ? { outcome: operation.failureOutcome } : {}),
 							}
 						: { status: "in_flight", ...startedAt, commandId: operation.commandId, turnId: operation.turnId },
 			summaryCompleted: operation.state !== "in_flight",
@@ -588,16 +592,25 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
-	fail(opRef: string, error = "scripted failure"): void {
+	/**
+	 * A scripted terminal failure. `detail` carries what the runtime reports next
+	 * to the (possibly redacted) message: its bounded code and terminal outcome
+	 * classifiers, which are the whole diagnosis for a post-start failure (#244).
+	 */
+	fail(opRef: string, error: string | undefined = "scripted failure", detail: ScriptedFailureDetail = {}): void {
 		const operation = this.#operations.get(opRef);
 		if (!operation) throw new Error(`unknown scripted operation ${opRef}`);
 		operation.state = "failed";
 		operation.error = error;
+		if (detail.code !== undefined) operation.errorCode = detail.code;
+		if (detail.outcome !== undefined) operation.failureOutcome = detail.outcome;
 		operation.terminalAt = Date.now();
 		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_failed",
 			rawKind: "agent_failed",
-			payload: { error: { message: error } },
+			payload: {
+				error: { ...(detail.code ? { code: detail.code } : {}), ...(error === undefined ? {} : { message: error }) },
+			},
 			steerEcho: false,
 			idle: true,
 		});
@@ -790,11 +803,19 @@ export function sessionPortFromScript(script: {
 	});
 }
 
+/** What the runtime reports alongside a failed turn's message. */
+export type ScriptedFailureDetail = {
+	readonly code?: string;
+	readonly outcome?: Record<string, string>;
+};
+
 type Operation = {
 	readonly sessionId: string;
 	state: "in_flight" | "terminal_ok" | "failed";
 	text: string;
 	error?: string;
+	errorCode?: string;
+	failureOutcome?: Record<string, string>;
 	readonly startedAt: number;
 	terminalAt?: number;
 	readonly commandId?: string;
