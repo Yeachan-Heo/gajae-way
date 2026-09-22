@@ -346,9 +346,11 @@ describe("verifyBackupIntegrity", () => {
 				source.close();
 			}
 			// Zero the body of the index root page but keep the file header and page
-			// count intact: SQLite opens it fine and integrity_check reports missing
-			// index entries instead of throwing. The page number comes from the
-			// schema rather than being assumed.
+			// count intact. The page number comes from the schema rather than being
+			// assumed. Which refusal fires is a SQLite build detail: some builds let
+			// integrity_check report the missing index entries, others raise
+			// SQLITE_CORRUPT while the pragma runs. Both must refuse the backup and
+			// name the file, and neither may be silently restored.
 			const inspect = new Database(good, { readonly: true });
 			let rootPage: number;
 			try {
@@ -363,7 +365,9 @@ describe("verifyBackupIntegrity", () => {
 			bytes.fill(0, 4096 * (rootPage - 1) + 100, 4096 * rootPage);
 			const damaged = join(home, "damaged.db");
 			await writeFile(damaged, bytes);
-			expect(() => verifyBackupIntegrity(damaged)).toThrow(/Backup failed SQLite integrity_check: .*damaged\.db \(/);
+			expect(() => verifyBackupIntegrity(damaged)).toThrow(
+				/Backup (?:failed SQLite integrity_check|is not a readable SQLite database): .*damaged\.db \(/,
+			);
 		});
 	});
 
