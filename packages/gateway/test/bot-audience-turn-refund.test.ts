@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { BotAudienceTurnGuard } from "../src/engagement/policy";
+import { type BotAudienceLimits, BotAudienceTurnGuard } from "../src/engagement/policy";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -11,6 +11,8 @@ import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.f
 
 const ORIGIN = "discord/channel/bot-budget";
 const ORIGIN_REF = { platform: "discord", kind: "channel", conversationId: "bot-budget" };
+/** These cases are about the one-turn budget, so they configure it explicitly; the default is unlimited. */
+const CAP_ONE: BotAudienceLimits = { maxConsecutiveTurns: 1, maxTurnsPerWindow: 30 };
 
 let directory = "";
 let database: GatewayDatabase | undefined;
@@ -21,7 +23,7 @@ type TestFrame = {
 	readonly id?: string;
 	readonly result?: {
 		readonly engaged?: boolean;
-		readonly engagement?: { readonly botAudienceDeclines: number };
+		readonly engagement?: { readonly botAudienceDeclines: number; readonly botAudienceRateLimited: number };
 	};
 };
 
@@ -124,18 +126,18 @@ test("an unanswered bot turn refunds its admission and the next bot follow-up is
 	const { guard, port, opRef } = await startBotTurn(false);
 	port.fail(opRef, "prompt deadline exceeded");
 	await eventually(() => database?.inboundTurnRow(opRef)?.turn_state === "done", "failed bot turn did not settle");
-	expect(guard.canAdmit(ORIGIN)).toBe(true);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(true);
 	guard.recordBotAdmission(ORIGIN, "bot-follow-up");
-	expect(guard.canAdmit(ORIGIN)).toBe(false);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(false);
 });
 
 test("a bot turn that claims its terminal slot stays spent until a human message", async () => {
 	const { guard, port, opRef } = await startBotTurn(true);
 	port.complete(opRef, "answered");
 	await eventually(() => database?.inboundTurnRow(opRef)?.turn_state === "done", "answered bot turn did not settle");
-	expect(guard.canAdmit(ORIGIN)).toBe(false);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(false);
 	guard.recordHumanMessage(ORIGIN);
-	expect(guard.canAdmit(ORIGIN)).toBe(true);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(true);
 });
 
 test("replaying settlement refunds at most once and never below zero", async () => {
@@ -143,15 +145,15 @@ test("replaying settlement refunds at most once and never below zero", async () 
 	port.fail(opRef, "prompt deadline exceeded");
 	await eventually(() => database?.inboundTurnRow(opRef)?.turn_state === "done", "failed bot turn did not settle");
 	guard.releaseUnansweredAdmission(ORIGIN, "bot-trigger");
-	expect(guard.canAdmit(ORIGIN)).toBe(true);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(true);
 	guard.recordBotAdmission(ORIGIN, "new-bot-trigger");
 	guard.releaseUnansweredAdmission(ORIGIN, "bot-trigger");
-	expect(guard.canAdmit(ORIGIN)).toBe(false);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(false);
 	guard.releaseUnansweredAdmission(ORIGIN, "new-bot-trigger");
-	expect(guard.canAdmit(ORIGIN)).toBe(true);
+	expect(guard.canAdmit(ORIGIN, CAP_ONE).admit).toBe(true);
 });
 
-test("guard state survives restart and a human message deletes the durable origin row", async () => {
+test("guard state survives restart; a human message clears the budget and keeps the rate window", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-bot-audience-state-"));
 	const dbPath = join(directory, "gateway.db");
 	database = await GatewayDatabase.open(dbPath);
@@ -160,12 +162,18 @@ test("guard state survives restart and a human message deletes the durable origi
 	database.close();
 	database = await GatewayDatabase.open(dbPath);
 	const restarted = new BotAudienceTurnGuard(database);
-	expect(restarted.canAdmit(ORIGIN)).toBe(false);
+	expect(restarted.canAdmit(ORIGIN, CAP_ONE).admit).toBe(false);
 	restarted.recordHumanMessage(ORIGIN);
-	expect(database.metaGet(`bot-audience-state:${ORIGIN}`)).toBeUndefined();
+	// The consecutive budget is spent by conversation flow and reset by a human.
+	// The runaway window is not, so the row survives until the window itself ages out.
+	expect(restarted.consecutiveTurns(ORIGIN)).toBe(0);
+	expect(restarted.windowedTurns(ORIGIN)).toBe(1);
 	database.close();
 	database = await GatewayDatabase.open(dbPath);
-	expect(new BotAudienceTurnGuard(database).canAdmit(ORIGIN)).toBe(true);
+	const reopened = new BotAudienceTurnGuard(database);
+	expect(reopened.canAdmit(ORIGIN, CAP_ONE).admit).toBe(true);
+	reopened.recordHumanMessage(ORIGIN, Date.now() + 2 * 60_000);
+	expect(database.metaGet(`bot-audience-state:${ORIGIN}`)).toBeUndefined();
 });
 
 test("only addressed bot declines increment the durable operator counter", async () => {
@@ -187,7 +195,7 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "discord:bot-budget": { engagement: "open", audience: "all" } },
+		channels: { "discord:bot-budget": { engagement: "open", audience: "all", botAudienceMaxConsecutiveTurns: 1 } },
 	};
 	database = await GatewayDatabase.open(config.dbPath);
 	const port = attachTestBrokerOwnership(
@@ -239,13 +247,74 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 	});
 	expect(resultOf(await waitForFrame(client.frames, "unaddressed-decline")).engaged).toBe(false);
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
-	expect(resultOf(await waitForFrame(client.frames, "status")).engagement).toEqual({ botAudienceDeclines: 1 });
+	expect(resultOf(await waitForFrame(client.frames, "status")).engagement).toEqual({
+		botAudienceDeclines: 1,
+		botAudienceRateLimited: 0,
+	});
 	const firstSend = port.sends[0];
 	if (firstSend) {
 		port.fail(firstSend.opRef);
 		await eventually(
 			() => database?.inboundTurnRow(firstSend.opRef)?.turn_state === "done",
 			"status fixture did not settle",
+		);
+	}
+	client.close();
+});
+
+test("an open bot audience runs consecutive bot turns by default and stops only at the rate limit", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-bot-audience-unlimited-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		// No consecutive cap: the channel is open to bots, and only the runaway
+		// rate limit — set low here — bounds the conversation.
+		channels: { "discord:bot-budget": { engagement: "open", audience: "all", botAudienceMaxTurnsPerWindow: 2 } },
+	};
+	database = await GatewayDatabase.open(config.dbPath);
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(directory, "agent"),
+	);
+	server = await startUnixServer({ config, database, sessionPort: port });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	for (let attempt = 0; attempt < 400 && client.frames.length < 1; attempt++) await Bun.sleep(5);
+	const botSend = (id: string, messageId: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin: ORIGIN_REF,
+				text: `bot message ${messageId}`,
+				messageId,
+				engagement: { mentioned: true, group: true, authorId: "bot", authorIsBot: true },
+			},
+		});
+	botSend("bot-1", "bot-loop-1");
+	expect(resultOf(await waitForFrame(client.frames, "bot-1")).engaged).toBe(true);
+	// Two consecutive bot turns with no human in between: impossible before #252.
+	botSend("bot-2", "bot-loop-2");
+	expect(resultOf(await waitForFrame(client.frames, "bot-2")).engaged).toBe(true);
+	botSend("bot-3", "bot-loop-3");
+	expect(resultOf(await waitForFrame(client.frames, "bot-3")).engaged).toBe(false);
+	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	expect(resultOf(await waitForFrame(client.frames, "status")).engagement).toEqual({
+		botAudienceDeclines: 1,
+		botAudienceRateLimited: 1,
+	});
+	for (const send of port.sends) {
+		port.fail(send.opRef);
+		await eventually(
+			() => database?.inboundTurnRow(send.opRef)?.turn_state === "done",
+			"rate-limit fixture did not settle",
 		);
 	}
 	client.close();

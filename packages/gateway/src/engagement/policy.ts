@@ -1,13 +1,40 @@
 import { type EngagementContext, evaluateChannelEngagement, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../config";
 
-export const MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS = 1;
+/** Rolling window the runaway rate limiter measures bot admissions over. */
+export const BOT_AUDIENCE_RATE_WINDOW_MS = 60_000;
+/**
+ * Bot admissions allowed per origin inside one window when nothing is
+ * configured. Collaboration between agents runs far below it; a bot-to-bot
+ * reply loop crosses it within seconds, which is exactly what it exists to stop.
+ */
+export const DEFAULT_BOT_AUDIENCE_TURNS_PER_WINDOW = 30;
+/** Bound on the retained admission ids so a long bot conversation cannot grow the meta row without limit. */
+const MAX_TRACKED_ADMISSIONS = 64;
 
 /** Durable per-origin state for the bot-audience admission guard. */
 export interface BotAudienceTurnState {
+	/** Ids of admitted bot turns still eligible for a refund. */
 	readonly admissions: readonly string[];
+	/** Consecutive bot turns since the last human message. */
 	readonly count: number;
+	/** Admission timestamps inside the rate window; a human message does NOT clear these. */
+	readonly recent: readonly number[];
 }
+
+/** Resolved per-origin bot-audience budget. */
+export interface BotAudienceLimits {
+	/** Consecutive bot turns allowed before a human message is required. Undefined is unlimited. */
+	readonly maxConsecutiveTurns?: number;
+	/** Bot admissions allowed per origin inside {@link BOT_AUDIENCE_RATE_WINDOW_MS}. Always finite. */
+	readonly maxTurnsPerWindow: number;
+}
+
+export type BotAudienceDeclineReason = "budget_spent" | "rate_limited";
+
+export type BotAudienceAdmission =
+	| { readonly admit: true }
+	| { readonly admit: false; readonly reason: BotAudienceDeclineReason };
 
 /** Minimal durable metadata surface used by the engagement guard. */
 export interface BotAudienceTurnStore {
@@ -18,58 +45,98 @@ export interface BotAudienceTurnStore {
 
 const BOT_AUDIENCE_STATE_PREFIX = "bot-audience-state:";
 const BOT_AUDIENCE_DECLINES_KEY = "bot-audience-declines";
+const BOT_AUDIENCE_RATE_LIMITED_KEY = "bot-audience-rate-limited";
 
 function botAudienceStateKey(originKey: string): string {
 	return `${BOT_AUDIENCE_STATE_PREFIX}${originKey}`;
 }
 
+const EMPTY_STATE: BotAudienceTurnState = { admissions: [], count: 0, recent: [] };
+
+/**
+ * Unreadable state fails closed on the consecutive budget: a corrupt row must
+ * not hand out an unbounded run of bot turns. `count` is deliberately large
+ * rather than 1 so every configured cap treats it as spent; the next human
+ * message clears it.
+ */
+const UNREADABLE_STATE: BotAudienceTurnState = { admissions: [], count: Number.MAX_SAFE_INTEGER, recent: [] };
+
 function parseState(raw: string | undefined): BotAudienceTurnState {
-	if (raw === undefined) return { admissions: [], count: 0 };
+	if (raw === undefined) return EMPTY_STATE;
 	try {
 		const parsed: unknown = JSON.parse(raw);
-		if (!parsed || typeof parsed !== "object") return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
-		const value = parsed as { admissions?: unknown; count?: unknown };
+		if (!parsed || typeof parsed !== "object") return UNREADABLE_STATE;
+		const value = parsed as { admissions?: unknown; count?: unknown; recent?: unknown };
 		const admissions = Array.isArray(value.admissions)
 			? value.admissions.filter((entry): entry is string => typeof entry === "string")
 			: [];
-		if (typeof value.count !== "number" || !Number.isSafeInteger(value.count))
-			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
-		const count = value.count;
-		if (count < 0) return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		const recent = Array.isArray(value.recent)
+			? value.recent.filter((entry): entry is number => typeof entry === "number" && Number.isFinite(entry))
+			: [];
+		if (typeof value.count !== "number" || !Number.isSafeInteger(value.count) || value.count < 0)
+			return UNREADABLE_STATE;
 		return {
-			admissions: admissions.slice(0, MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS),
-			count: Math.max(0, Math.min(MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS, count)),
+			admissions: admissions.slice(-MAX_TRACKED_ADMISSIONS),
+			count: value.count,
+			recent,
 		};
 	} catch {
-		return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		return UNREADABLE_STATE;
 	}
 }
 
+function withinWindow(recent: readonly number[], now: number): readonly number[] {
+	return recent.filter((at) => at > now - BOT_AUDIENCE_RATE_WINDOW_MS && at <= now);
+}
+
 /**
- * Bounds opt-in bot collaboration per conversation. One bot-authored turn may
- * run through an open/mention-open audience; another cannot run until a human
- * message arrives. Declined messages still enter the context ledger.
+ * Bounds opt-in bot collaboration per conversation on two independent axes.
+ *
+ * - A configurable consecutive-turn budget, unlimited unless a channel or the
+ *   global default sets one. Multi-agent threads are a normal usage pattern, so
+ *   `audience: "all"` means "bot messages are turns", not "one bot turn".
+ * - An always-on rolling-window rate limit, which is what actually stops two
+ *   bots answering each other forever. It is not reset by a human message.
+ *
+ * Declined messages still enter the context ledger.
  */
 export class BotAudienceTurnGuard {
 	readonly #store: BotAudienceTurnStore | undefined;
 	readonly #memory = new Map<string, BotAudienceTurnState>();
 	#declines: number | undefined;
+	#rateLimited: number | undefined;
 
 	constructor(store?: BotAudienceTurnStore) {
 		this.#store = store;
 	}
 
-	canAdmit(originKey: string): boolean {
-		return this.#state(originKey).count < MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS;
+	canAdmit(originKey: string, limits: BotAudienceLimits, now = Date.now()): BotAudienceAdmission {
+		const state = this.#state(originKey);
+		if (limits.maxConsecutiveTurns !== undefined && state.count >= limits.maxConsecutiveTurns)
+			return { admit: false, reason: "budget_spent" };
+		if (withinWindow(state.recent, now).length >= limits.maxTurnsPerWindow)
+			return { admit: false, reason: "rate_limited" };
+		return { admit: true };
 	}
 
-	recordBotAdmission(originKey: string, admissionId?: string): void {
+	/** Consecutive bot turns already admitted for this origin, for operator diagnosis. */
+	consecutiveTurns(originKey: string): number {
+		return this.#state(originKey).count;
+	}
+
+	/** Bot turns admitted for this origin inside the current rate window. */
+	windowedTurns(originKey: string, now = Date.now()): number {
+		return withinWindow(this.#state(originKey).recent, now).length;
+	}
+
+	recordBotAdmission(originKey: string, admissionId?: string, now = Date.now()): void {
 		const state = this.#state(originKey);
 		if (admissionId !== undefined && state.admissions.includes(admissionId)) return;
 		const admissions = admissionId === undefined ? state.admissions : [...state.admissions, admissionId];
 		this.#save(originKey, {
-			admissions: admissions.slice(-MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS),
-			count: Math.min(MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS, state.count + 1),
+			admissions: admissions.slice(-MAX_TRACKED_ADMISSIONS),
+			count: state.count + 1,
+			recent: [...withinWindow(state.recent, now), now].slice(-MAX_TRACKED_ADMISSIONS),
 		});
 	}
 
@@ -81,20 +148,46 @@ export class BotAudienceTurnGuard {
 		const admissions =
 			admissionId === undefined ? state.admissions.slice(1) : state.admissions.filter((id) => id !== admissionId);
 		const count = Math.max(0, state.count - 1);
-		if (count === 0) this.#delete(originKey);
-		else this.#save(originKey, { admissions, count });
+		// The refunded turn produced no reply, so it also gives back its rate slot.
+		const recent = state.recent.slice(0, -1);
+		if (count === 0 && recent.length === 0) this.#delete(originKey);
+		else this.#save(originKey, { admissions, count, recent });
 	}
 
-	recordHumanMessage(originKey: string): void {
-		this.#delete(originKey);
+	/** A human message clears the consecutive budget. The runaway rate window survives it. */
+	recordHumanMessage(originKey: string, now = Date.now()): void {
+		const state = this.#state(originKey);
+		const recent = withinWindow(state.recent, now);
+		if (recent.length === 0) {
+			this.#delete(originKey);
+			return;
+		}
+		if (state.count === 0 && state.admissions.length === 0 && recent.length === state.recent.length) return;
+		this.#save(originKey, { admissions: [], count: 0, recent });
 	}
 
-	/** Count operator-visible declines; callers pass false for unaddressed bot chatter. */
-	recordBotAudienceDecline(addressed = true): void {
+	/**
+	 * Count operator-visible declines; callers pass false for unaddressed bot
+	 * chatter. A rate-limited decline is always counted on its own axis, because
+	 * the runaway guard firing is an operational event regardless of addressing.
+	 */
+	recordBotAudienceDecline(addressed = true, reason: BotAudienceDeclineReason = "budget_spent"): void {
+		if (reason === "rate_limited") {
+			const limited = this.botAudienceRateLimited() + 1;
+			this.#rateLimited = limited;
+			this.#store?.metaSet(BOT_AUDIENCE_RATE_LIMITED_KEY, String(limited));
+		}
 		if (!addressed) return;
 		const next = this.botAudienceDeclines() + 1;
 		this.#declines = next;
 		this.#store?.metaSet(BOT_AUDIENCE_DECLINES_KEY, String(next));
+	}
+
+	botAudienceRateLimited(): number {
+		if (this.#rateLimited !== undefined) return this.#rateLimited;
+		const parsed = Number.parseInt(this.#store?.metaGet(BOT_AUDIENCE_RATE_LIMITED_KEY) ?? "0", 10);
+		this.#rateLimited = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+		return this.#rateLimited;
 	}
 
 	botAudienceDeclines(): number {
@@ -106,7 +199,7 @@ export class BotAudienceTurnGuard {
 
 	#state(originKey: string): BotAudienceTurnState {
 		if (this.#store) return parseState(this.#store.metaGet(botAudienceStateKey(originKey)));
-		return this.#memory.get(originKey) ?? { admissions: [], count: 0 };
+		return this.#memory.get(originKey) ?? EMPTY_STATE;
 	}
 
 	#save(originKey: string, state: BotAudienceTurnState): void {
@@ -117,8 +210,7 @@ export class BotAudienceTurnGuard {
 
 	#delete(originKey: string): void {
 		if (this.#store?.metaDelete) this.#store.metaDelete(botAudienceStateKey(originKey));
-		else if (this.#store)
-			this.#store.metaSet(botAudienceStateKey(originKey), JSON.stringify({ admissions: [], count: 0 }));
+		else if (this.#store) this.#store.metaSet(botAudienceStateKey(originKey), JSON.stringify(EMPTY_STATE));
 		else this.#memory.delete(originKey);
 	}
 }
@@ -195,6 +287,27 @@ export function threadFollowUpEngaged(
 		conversationId: origin.parentId,
 	});
 	return store.messageTriggeredTurn(parentKey, origin.conversationId);
+}
+
+/**
+ * Per-origin bot budget: channel entry first, then the global default, then the
+ * built-in. Only the rate limit has a built-in value; the consecutive-turn cap
+ * is unlimited unless configured.
+ */
+export function resolveBotAudienceLimits(
+	origin: Pick<OriginRef, "platform" | "conversationId" | "parentId">,
+	config: GatewayConfig,
+): BotAudienceLimits {
+	const channel = resolveChannelPolicy(origin, config);
+	const maxConsecutiveTurns = channel?.botAudienceMaxConsecutiveTurns ?? config.botAudience?.maxConsecutiveTurns;
+	const maxTurnsPerWindow =
+		channel?.botAudienceMaxTurnsPerWindow ??
+		config.botAudience?.maxTurnsPerWindow ??
+		DEFAULT_BOT_AUDIENCE_TURNS_PER_WINDOW;
+	return {
+		...(maxConsecutiveTurns === undefined ? {} : { maxConsecutiveTurns }),
+		maxTurnsPerWindow,
+	};
 }
 
 export function resolveChannelPolicy(

@@ -303,7 +303,7 @@ function statusRow(
 	const engagement = status?.engagement;
 	const engagementLabel = !engagement
 		? "bot audience counter not reported"
-		: `${formatCount(engagement.botAudienceDeclines)} addressed bot declines`;
+		: `${formatCount(engagement.botAudienceDeclines)} addressed bot declines · ${formatCount(engagement.botAudienceRateLimited)} rate limited`;
 
 	return {
 		key: "status",
@@ -329,7 +329,11 @@ function statusRow(
 			attention: attention.length === 0 ? "muted" : danger ? "danger" : "warn",
 			delivery: !delivery ? "muted" : delivery.pending === 0 ? "ok" : "warn",
 			context: !context ? "muted" : context.unread > 0 || context.expired > 0 || context.truncated > 0 ? "warn" : "ok",
-			botAudience: !engagement ? "muted" : engagement.botAudienceDeclines === 0 ? "ok" : "warn",
+			botAudience: !engagement
+				? "muted"
+				: engagement.botAudienceDeclines === 0 && engagement.botAudienceRateLimited === 0
+					? "ok"
+					: "warn",
 			working: working === 0 ? "muted" : "active",
 		},
 	};

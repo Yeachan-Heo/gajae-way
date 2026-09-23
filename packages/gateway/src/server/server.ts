@@ -35,7 +35,12 @@ import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConf
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
-import { BotAudienceTurnGuard, decideEngagement, threadFollowUpEngaged } from "../engagement/policy";
+import {
+	BotAudienceTurnGuard,
+	decideEngagement,
+	resolveBotAudienceLimits,
+	threadFollowUpEngaged,
+} from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -205,7 +210,7 @@ interface Runtime {
 	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
-	/** Fixed one-turn budget for bot authors admitted by an open audience. */
+	/** Configurable consecutive-turn budget plus the always-on runaway rate limit for bot authors. */
 	readonly botAudienceTurns: BotAudienceTurnGuard;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
@@ -683,7 +688,10 @@ async function handleRequest(
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.contextDiagnostics(),
-					engagement: { botAudienceDeclines: runtime.botAudienceTurns.botAudienceDeclines() },
+					engagement: {
+						botAudienceDeclines: runtime.botAudienceTurns.botAudienceDeclines(),
+						botAudienceRateLimited: runtime.botAudienceTurns.botAudienceRateLimited(),
+					},
 				},
 			});
 			return;
@@ -1297,14 +1305,17 @@ async function sendChat(
 				replyTo?: { fromSelf?: boolean };
 		  }
 		| undefined;
-	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
-	const addressedBotAudienceDecline =
-		botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp);
-	if (addressedBotAudienceDecline) {
-		runtime.botAudienceTurns.recordBotAudienceDecline();
-		console.error(
-			`gateway bot audience admission declined origin=${key} message=${typeof params.messageId === "string" ? params.messageId : "unidentified"} reason=budget_spent declines=${runtime.botAudienceTurns.botAudienceDeclines()}`,
-		);
+	const botAudienceAdmission = engagementDecision.botAudienceAdmission
+		? runtime.botAudienceTurns.canAdmit(key, resolveBotAudienceLimits(origin, runtime.config))
+		: undefined;
+	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
+	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
+		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
+		if (addressed || botAudienceAdmission.reason === "rate_limited")
+			console.error(
+				`gateway bot audience admission declined origin=${key} message=${typeof params.messageId === "string" ? params.messageId : "unidentified"} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
+			);
 	}
 	const engaged = engagementDecision.engaged && !botAudienceGuardSpent;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
@@ -1487,12 +1498,17 @@ async function editChat(
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as { mentioned?: boolean } | undefined;
-	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
-	if (botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp)) {
-		runtime.botAudienceTurns.recordBotAudienceDecline();
-		console.error(
-			`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=budget_spent declines=${runtime.botAudienceTurns.botAudienceDeclines()}`,
-		);
+	const botAudienceAdmission = engagementDecision.botAudienceAdmission
+		? runtime.botAudienceTurns.canAdmit(key, resolveBotAudienceLimits(origin, runtime.config))
+		: undefined;
+	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
+	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
+		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
+		if (addressed || botAudienceAdmission.reason === "rate_limited")
+			console.error(
+				`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
+			);
 	}
 	if (!engagementDecision.engaged || botAudienceGuardSpent) {
 		declined();
