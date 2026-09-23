@@ -203,9 +203,15 @@ export async function preflightGjcRuntime(
 export function streamRelayArgs(sessionId: string): readonly string[] {
 	return ["sdk", "serve", "--stdio", "--session", sessionId];
 }
-/** gjc prints usage and exits 2 on an unknown flag; every runtime failure exits 1 or prints a JSON envelope. */
+/**
+ * gjc exits 2 on an argv it cannot parse; every runtime failure exits 1 or
+ * prints a JSON envelope. Up to 0.17.2 the text says `unknown argument`/USAGE;
+ * 0.17.4 reports a structured `"code":"usage"` error instead.
+ */
 export function isUsageRejection(result: CliResult): boolean {
-	return result.exitCode === 2 && /unknown argument|USAGE/i.test(`${result.stdout}\n${result.stderr}`);
+	return (
+		result.exitCode === 2 && /unknown argument|USAGE|"code"\s*:\s*"usage"/i.test(`${result.stdout}\n${result.stderr}`)
+	);
 }
 
 /** A client of the user's global runtime. No directory, daemon, lock, or session ownership. */
@@ -631,8 +637,10 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 	// `gjc sdk serve` has no --agent-dir flag (exit 2 + usage on gjc 0.16.6):
 	// the relay takes its agent dir from the exported GJC_*_AGENT_DIR env.
 	if (bound[1] === "serve") return bound;
-	if (bound[1] === "session") bound.splice(2, 0, "--agent-dir", agentDir);
-	else bound.push("--agent-dir", agentDir);
+	// Every `sdk session` leaf owns its own --agent-dir option; gjc 0.17.4
+	// rejects it at the family level (`sdk session --agent-dir <dir> list`,
+	// exit 2 usage). The leaf-level spelling parses on 0.17.2 and 0.17.4.
+	bound.push("--agent-dir", agentDir);
 	return bound;
 }
 /** Fail closed on project dotenv path declarations; do not promote Bun-loaded project values to user authority. */

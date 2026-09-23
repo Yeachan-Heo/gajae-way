@@ -110,17 +110,26 @@ function normalizeSession(raw: RawSession): BrokerSession | undefined {
 
 export type ControllerOptions = {
 	readonly run: CliRunner;
-	/** Absolute path passed as `--repo` for saved-session resolution. */
+	/**
+	 * Absolute worktree path. Passed as `--repo` only to scoped commands
+	 * (`list`, `tail`); exact-session commands resolve the session by ID and
+	 * gjc 0.17.4 rejects `--repo` on them.
+	 */
 	readonly repo: string;
 	readonly agentDir?: string;
 };
 
-function baseArgs(options: ControllerOptions): string[] {
-	return ["sdk", "session", ...(options.agentDir ? ["--agent-dir", options.agentDir] : [])];
+/**
+ * `gjc sdk session <leaf...> [--agent-dir <dir>]`. The agent dir is a leaf
+ * option: gjc 0.17.4 rejects it between `session` and the leaf (exit 2 usage);
+ * the trailing spelling parses on 0.17.2 and 0.17.4.
+ */
+export function sessionArgs(options: ControllerOptions, leaf: readonly string[]): string[] {
+	return ["sdk", "session", ...leaf, ...(options.agentDir ? ["--agent-dir", options.agentDir] : [])];
 }
 
 export async function listSessions(options: ControllerOptions): Promise<readonly BrokerSession[]> {
-	const result = await options.run([...baseArgs(options), "list", "--repo", options.repo]);
+	const result = await options.run(sessionArgs(options, ["list", "--repo", options.repo]));
 	const payload = parseEnvelope<{ sessions?: readonly RawSession[] }>(result, "session list");
 	return (payload.sessions ?? [])
 		.map(normalizeSession)
@@ -131,7 +140,7 @@ export async function inspectSession(
 	options: ControllerOptions,
 	sessionId: string,
 ): Promise<BrokerSession | undefined> {
-	const result = await options.run([...baseArgs(options), "inspect", sessionId, "--repo", options.repo]);
+	const result = await options.run(sessionArgs(options, ["inspect", sessionId]));
 	const payload = parseEnvelope<{ session?: RawSession }>(result, "session inspect");
 	return payload.session ? normalizeSession(payload.session) : undefined;
 }

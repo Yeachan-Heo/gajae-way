@@ -336,7 +336,7 @@ export class BrokerSessionPort implements SessionPort {
 				// A persisted id is reusable if live, and resumable if it still has
 				// saved authority. Monitor authoring reaches SessionPort directly, so
 				// resume here before paying for a cold replacement session.
-				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId, "--repo", input.repo]);
+				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId]);
 				const envelope = JSON.parse(result.stdout) as {
 					ok?: unknown;
 					result?: { session?: { live?: unknown; deleted?: unknown } };
@@ -447,7 +447,7 @@ export class BrokerSessionPort implements SessionPort {
 		let lastCode: string | undefined;
 		for (;;) {
 			try {
-				const result = await this.#cli(["sdk", "session", "inspect", sessionId, "--repo", repo], { timeoutMs: 10_000 });
+				const result = await this.#cli(["sdk", "session", "inspect", sessionId], { timeoutMs: 10_000 });
 				const envelope = JSON.parse(result.stdout) as {
 					ok?: unknown;
 					result?: { session?: { live?: unknown } };
@@ -538,7 +538,7 @@ export class BrokerSessionPort implements SessionPort {
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
 		this.#assertOwned(input);
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], {
+			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
 				timeoutMs: 10_000,
 			});
 			const envelope = JSON.parse(result.stdout) as {
@@ -576,7 +576,7 @@ export class BrokerSessionPort implements SessionPort {
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], {
+			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
 				timeoutMs: 10_000,
 			});
 			const envelope = JSON.parse(result.stdout) as {
@@ -847,8 +847,6 @@ export class BrokerSessionPort implements SessionPort {
 						input.sessionId,
 						"--query",
 						"turn.result",
-						"--repo",
-						input.repo,
 						"--json-input",
 						JSON.stringify({ kind: "prompt", clientRef: input.opRef }),
 					],
@@ -882,19 +880,7 @@ export class BrokerSessionPort implements SessionPort {
 	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
 		this.#assertOwned(input);
 		const result = await this.#cli(
-			[
-				"sdk",
-				"session",
-				"raw",
-				"query",
-				input.sessionId,
-				"--query",
-				"queue.messages.list",
-				"--repo",
-				input.repo,
-				"--json-input",
-				"{}",
-			],
+			["sdk", "session", "raw", "query", input.sessionId, "--query", "queue.messages.list", "--json-input", "{}"],
 			{ timeoutMs: 10_000 },
 		);
 		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
@@ -946,8 +932,6 @@ export class BrokerSessionPort implements SessionPort {
 					input.sessionId,
 					"--query",
 					"transcript.list",
-					"--repo",
-					input.repo,
 					"--json-input",
 					"{}",
 					...(cursor ? ["--cursor", cursor] : []),
@@ -1003,8 +987,6 @@ export class BrokerSessionPort implements SessionPort {
 					input.sessionId,
 					"--query",
 					"session.last_assistant",
-					"--repo",
-					input.repo,
 					...(cursor ? ["--cursor", cursor] : []),
 				]),
 			);

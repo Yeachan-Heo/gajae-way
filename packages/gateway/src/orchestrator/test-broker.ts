@@ -159,6 +159,7 @@ export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
 		return relayChild(sessionId, `connection:${++connections}`, relays, handleRelayLine);
 	};
 	const command: CliRunner = async (rawArgs) => {
+		if (violatesSessionArgvContract(rawArgs)) return usage();
 		const args = withoutAgentDir(rawArgs);
 		if (args[0] === "--version") return success("gjc/0.17.2\n");
 		if (args[0] !== "sdk") return failure("stub_unsupported");
@@ -209,8 +210,7 @@ export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
 		}
 		if (args.includes("transcript.list")) {
 			const sessionId = args[args.indexOf("query") + 1];
-			if (!sessionId || !repositories.has(sessionId) || repositories.get(sessionId) !== argument(args, "--repo"))
-				return failure("session_unavailable");
+			if (!sessionId || !repositories.has(sessionId)) return failure("session_unavailable");
 			const items = [...operations.values()]
 				.filter((operation) => operation.sessionId === sessionId && operation.state === "terminal_ok")
 				.sort((left, right) => left.terminalAt! - right.terminalAt!)
@@ -244,7 +244,7 @@ export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
 		if (args[2] === "inspect") {
 			const sessionId = args[3];
 			const repo = sessionId ? repositories.get(sessionId) : undefined;
-			if (!repo || repo !== argument(args, "--repo")) return failure("session_unavailable");
+			if (!repo) return failure("session_unavailable");
 			return success({ session: { sessionId, live: true, deleted: false, locator: { repo } } });
 		}
 		return failure("stub_unsupported");
@@ -265,6 +265,30 @@ function success(result: unknown): CliResult {
 
 function failure(code: string): CliResult {
 	return { exitCode: 0, stdout: JSON.stringify({ ok: false, error: { code } }), stderr: "" };
+}
+
+/** The gjc 0.17.4 registry's parser rejection: exit 2, structured `usage` on stderr, empty stdout. */
+function usage(): CliResult {
+	return {
+		exitCode: 2,
+		stdout: "",
+		stderr: `ERROR ${JSON.stringify({ code: "usage", category: "usage", message: "The command arguments are invalid." })}\n`,
+	};
+}
+
+/** Scoped `sdk session` leaves; every other leaf resolves one session by ID and rejects `--repo`. */
+const REPO_SCOPED_SESSION_LEAVES = new Set(["list", "tail"]);
+
+/**
+ * The argv shape gjc 0.17.4 rejects: `--agent-dir` between `session` and the
+ * leaf, or `--repo` on an exact-session leaf (`inspect`, `send`, `status`,
+ * `raw query`, ...). Enforced here so tests fail on the argv a real 0.17.4
+ * runtime refuses, instead of pinning it.
+ */
+export function violatesSessionArgvContract(args: readonly string[]): boolean {
+	if (args[0] !== "sdk" || args[1] !== "session") return false;
+	if (args[2]?.startsWith("--agent-dir")) return true;
+	return !REPO_SCOPED_SESSION_LEAVES.has(args[2] ?? "") && args.some((arg) => /^--repo(=|$)/.test(arg));
 }
 
 function argument(args: readonly string[], name: string): string | undefined {

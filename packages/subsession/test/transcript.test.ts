@@ -36,17 +36,7 @@ describe("fetchLastAssistant", () => {
 		const calls: string[][] = [];
 		const options = pagedController([{ text: "done", page: { complete: true } }], calls);
 		await fetchLastAssistant(options, SESSION);
-		expect(calls[0]).toEqual([
-			"sdk",
-			"session",
-			"raw",
-			"query",
-			SESSION,
-			"--query",
-			"session.last_assistant",
-			"--repo",
-			WORKTREE,
-		]);
+		expect(calls[0]).toEqual(["sdk", "session", "raw", "query", SESSION, "--query", "session.last_assistant"]);
 		expect(calls.flat().join(" ")).not.toContain(".gjc");
 	});
 

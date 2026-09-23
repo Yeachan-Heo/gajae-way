@@ -127,7 +127,7 @@ liveTest(
 		};
 		// Independent launcher invocation: never route this corroboration through the gateway client.
 		const independent = async (args: string[]) => {
-			const child = Bun.spawn([executable, "sdk", "session", "--agent-dir", agentDir, ...args], {
+			const child = Bun.spawn([executable, "sdk", "session", ...args, "--agent-dir", agentDir], {
 				cwd: repo,
 				env: {
 					...process.env,
@@ -176,7 +176,7 @@ liveTest(
 			sessionId = binding.sessionId;
 			expect(unrelated.includes(sessionId)).toBe(false);
 			await port.setModel({ sessionId, repo, selection: model });
-			const inspect = await independent(["inspect", sessionId, "--repo", repo]);
+			const inspect = await independent(["inspect", sessionId]);
 			expect(inspect.session.sessionId).toBe(sessionId);
 			expect(inspect.session.live).toBe(true);
 			expect(
@@ -270,7 +270,7 @@ liveTest(
 			).toBe(true);
 			await broker.start();
 			expect(broker.generation).toBe(generation);
-			expect((await independent(["inspect", sessionId, "--repo", repo])).session.live).toBe(true);
+			expect((await independent(["inspect", sessionId])).session.live).toBe(true);
 		} catch (error) {
 			const code = error instanceof SessionTerminalError ? error.status.status.error?.code : undefined;
 			failures.push({

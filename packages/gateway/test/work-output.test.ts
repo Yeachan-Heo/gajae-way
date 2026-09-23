@@ -113,8 +113,6 @@ test("worker output uses the actual operation-owned single-page query and preser
 			input.sessionId,
 			"--query",
 			"turn.result",
-			"--repo",
-			input.repo,
 			"--json-input",
 			JSON.stringify({ kind: "prompt", clientRef: input.opRef }),
 		]);

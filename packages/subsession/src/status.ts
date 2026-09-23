@@ -13,7 +13,7 @@
  */
 
 import type { ControllerOptions } from "./cli";
-import { parseEnvelope } from "./cli";
+import { parseEnvelope, sessionArgs } from "./cli";
 
 export type PromptStatus = "accepted" | "in_flight" | "terminal_ok" | "failed" | "unknown";
 
@@ -291,16 +291,13 @@ export async function fetchOpState(
 	opRef: string,
 	timeoutMs?: number,
 ): Promise<StatusReport> {
-	const raw = await options.run([
-		"sdk",
-		"session",
-		...(options.agentDir ? ["--agent-dir", options.agentDir] : []),
-		"status",
-		sessionId,
-		opRef,
-		"--repo",
-		options.repo,
-		...(timeoutMs === undefined ? [] : ["--timeout-ms", String(timeoutMs)]),
-	]);
+	const raw = await options.run(
+		sessionArgs(options, [
+			"status",
+			sessionId,
+			opRef,
+			...(timeoutMs === undefined ? [] : ["--timeout-ms", String(timeoutMs)]),
+		]),
+	);
 	return parseStatusReport(raw);
 }

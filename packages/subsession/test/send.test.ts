@@ -98,18 +98,7 @@ describe("sendPrompt", () => {
 			taskKey: "pr-a",
 			opRef: "gw-pr-a-01hq",
 		});
-		expect(calls[0]).toEqual([
-			"sdk",
-			"session",
-			"send",
-			SESSION,
-			"--repo",
-			WORKTREE,
-			"--text",
-			"do the thing",
-			"--op-ref",
-			"gw-pr-a-01hq",
-		]);
+		expect(calls[0]).toEqual(["sdk", "session", "send", SESSION, "--text", "do the thing", "--op-ref", "gw-pr-a-01hq"]);
 		expect(receipt).toMatchObject({
 			sessionId: SESSION,
 			operationRef: "gw-pr-a-01hq",
@@ -181,7 +170,7 @@ describe("pollStatus", () => {
 			calls,
 		);
 		const outcome = await pollStatus(options, receipt);
-		expect(calls[0]).toEqual(["sdk", "session", "status", SESSION, "gw-pr-a-01hq", "--repo", WORKTREE]);
+		expect(calls[0]).toEqual(["sdk", "session", "status", SESSION, "gw-pr-a-01hq"]);
 		expect(outcome).toMatchObject({ state: "running", terminal: false, hold: false });
 	});
 
