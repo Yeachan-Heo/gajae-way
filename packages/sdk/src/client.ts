@@ -30,6 +30,13 @@ export interface StdioTransport {
 
 export interface GajaewayClientOptions {
 	requestTimeoutMs?: number;
+	/** Identifies this process in `gateway.status` generation diagnostics. */
+	clientName?: string;
+}
+
+/** Process start time, so the gateway can compare client and gateway generations. */
+export function processStartedAt(): string {
+	return new Date(Date.now() - process.uptime() * 1000).toISOString();
 }
 
 interface Transport {
@@ -113,11 +120,13 @@ export class GajaewayClient {
 	readonly #undelivered = new Map<string, Array<{ payload: unknown; frame: Frame }>>();
 	#negotiated?: Promise<void>;
 	#requestTimeoutMs: number;
+	#clientName: string;
 	#id = 0;
 
 	private constructor(transport?: Transport, options?: GajaewayClientOptions) {
 		this.#transport = transport;
 		this.#requestTimeoutMs = options?.requestTimeoutMs ?? 30_000;
+		this.#clientName = options?.clientName ?? "@gajae-gateway/sdk";
 	}
 
 	on(event: string, handler: EventHandler): () => void {
@@ -197,7 +206,7 @@ export class GajaewayClient {
 						type: "hello",
 						payload: {
 							supportedVersions: [PROFILE_VERSION],
-							clientInfo: { name: "@gajae-gateway/sdk" },
+							clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
 						},
 					}),
 				)

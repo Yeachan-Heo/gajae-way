@@ -95,12 +95,51 @@ const RESTART_EXIT_CODE = 75;
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
+	/** Reported client identity and process generation, recorded at negotiation. */
+	client?: { readonly name: string; readonly startedAt?: string; readonly connectedAt: string };
 	write(frame: Frame): void;
 	close(): void;
 	settle(): Promise<void>;
 }
 export interface GatewayServer {
 	stop(reason?: string): Promise<void>;
+}
+
+/**
+ * Generation census for the connected stack.
+ *
+ * A gateway restart does not kill an adapter: it reconnects and keeps serving,
+ * which is why the pending-delivery count and the schema version both look
+ * healthy while replies lag a beat behind (issue #251). `staleGeneration` is
+ * the signal that
+ * previously required comparing process start times by hand: the client process
+ * predates this gateway process, so it is still the old generation's adapter.
+ */
+function connectedClients(
+	connections: Iterable<Connection>,
+	gatewayStartedAt: string,
+): readonly {
+	readonly name: string;
+	readonly startedAt?: string;
+	readonly connectedAt: string;
+	readonly staleGeneration: boolean;
+}[] {
+	const gatewayStart = Date.parse(gatewayStartedAt);
+	const clients = [];
+	for (const connection of connections) {
+		if (!connection.negotiated || !connection.client) continue;
+		const startedAt = connection.client.startedAt;
+		const clientStart = startedAt === undefined ? Number.NaN : Date.parse(startedAt);
+		clients.push({
+			name: connection.client.name,
+			...(startedAt === undefined ? {} : { startedAt }),
+			connectedAt: connection.client.connectedAt,
+			// Unknown generation is not reported as stale: a client that never sent a
+			// start time is a diagnostic gap, not evidence of a mismatch.
+			staleGeneration: Number.isFinite(clientStart) && Number.isFinite(gatewayStart) && clientStart < gatewayStart,
+		});
+	}
+	return clients;
 }
 
 async function settleConnection(connection: Connection, timeoutMs: number): Promise<void> {
@@ -647,6 +686,12 @@ async function handleFrame(
 					capabilities: result.capabilities,
 				});
 			connection.negotiated = true;
+			const info = hello.clientInfo;
+			connection.client = {
+				name: typeof info?.name === "string" && info.name ? info.name : "unidentified",
+				...(typeof info?.startedAt === "string" && info.startedAt ? { startedAt: info.startedAt } : {}),
+				connectedAt: new Date().toISOString(),
+			};
 			connection.write({ v: PROFILE_VERSION, type: "negotiated", payload: result.negotiated });
 			for (const payload of runtime.delivery.redeliveries())
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
@@ -673,6 +718,7 @@ async function handleRequest(
 	runtime: Runtime,
 	stop: (reason?: string) => Promise<void>,
 ): Promise<void> {
+	const gatewayStartedAt = options.startedAt ?? new Date().toISOString();
 	switch (request.verb) {
 		case "gateway.status":
 			connection.write({
@@ -683,7 +729,7 @@ async function handleRequest(
 					profileVersion: PROFILE_VERSION,
 					capabilities: CAPABILITIES,
 					pid: process.pid,
-					startedAt: options.startedAt ?? new Date().toISOString(),
+					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
@@ -692,6 +738,7 @@ async function handleRequest(
 						botAudienceDeclines: runtime.botAudienceTurns.botAudienceDeclines(),
 						botAudienceRateLimited: runtime.botAudienceTurns.botAudienceRateLimited(),
 					},
+					clients: connectedClients(runtime.connections, gatewayStartedAt),
 				},
 			});
 			return;

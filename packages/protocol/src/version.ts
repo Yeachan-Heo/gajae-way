@@ -29,8 +29,14 @@ export interface HelloPayload {
 	readonly supportedVersions: readonly string[];
 	/** Capabilities the client requires; missing ones cause typed rejection. */
 	readonly requiredCapabilities?: readonly string[];
-	/** Free-form client identity for diagnostics (never authority). */
-	readonly clientInfo?: { readonly name?: string; readonly version?: string };
+	/**
+	 * Free-form client identity for diagnostics (never authority). `startedAt` is
+	 * the CLIENT PROCESS start time, not the connection time: an adapter that
+	 * survived a gateway restart reconnects immediately, so only the process
+	 * generation distinguishes a healthy reconnect from an adapter still running
+	 * against the previous gateway generation (issue #251).
+	 */
+	readonly clientInfo?: { readonly name?: string; readonly version?: string; readonly startedAt?: string };
 }
 
 export interface NegotiatedPayload {

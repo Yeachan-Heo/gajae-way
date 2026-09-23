@@ -23,13 +23,20 @@ export interface ResolvePathOptions {
 	readonly loginPathRunner?: LoginPathRunner;
 }
 
+/** Service managers this CLI can write definitions for. */
+export type ServicePlatform = "darwin" | "linux";
+
 export interface InstallServicesOptions {
 	readonly binDir: string;
 	readonly launchAgentsDir?: string;
+	/** systemd user-unit directory; defaults to ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user. */
+	readonly unitDir?: string;
+	/** Service manager to generate for; defaults to the running platform. */
+	readonly platform?: ServicePlatform;
 	readonly env?: NodeJS.ProcessEnv;
 	/** Test seam for the `${SHELL} -lc` invocation used by the default path. */
 	readonly loginPathRunner?: LoginPathRunner;
-	/** Test seam for counting or inspecting the plist writes. */
+	/** Test seam for counting or inspecting the definition writes. */
 	readonly writeFile?: PlistWriter;
 }
 
@@ -38,24 +45,46 @@ interface ServiceSpec {
 	readonly label: string;
 	readonly binary: string;
 	readonly args: readonly string[];
+	/**
+	 * True for every process that holds a live connection to the gateway. A
+	 * gateway restart leaves such a process attached to the previous generation:
+	 * it neither dies nor loses messages, so no health check catches it, and the
+	 * symptom is replies arriving one beat late (issue #251). The service
+	 * definition, not an operator convention, has to restart it.
+	 */
+	readonly dependsOnGateway: boolean;
 }
 
+export const GATEWAY_UNIT = "gajaeway-gateway.service";
+
 const SERVICE_SPECS: readonly ServiceSpec[] = [
-	{ id: "gateway", label: "dev.gajaeway.gateway", binary: "gajaeway-gateway", args: ["daemon"] },
+	{
+		id: "gateway",
+		label: "dev.gajaeway.gateway",
+		binary: "gajaeway-gateway",
+		args: ["daemon"],
+		dependsOnGateway: false,
+	},
 	{
 		id: "adapter-discord",
 		label: "dev.gajaeway.adapter-discord",
 		binary: "gajaeway-discord",
 		args: [],
+		dependsOnGateway: true,
 	},
 	{
 		id: "adapter-slack",
 		label: "dev.gajaeway.adapter-slack",
 		binary: "gajaeway-slack",
 		args: [],
+		dependsOnGateway: true,
 	},
-	{ id: "admin", label: "dev.gajaeway.admin", binary: "gajaeway-admin", args: ["serve"] },
+	{ id: "admin", label: "dev.gajaeway.admin", binary: "gajaeway-admin", args: ["serve"], dependsOnGateway: true },
 ];
+
+export function serviceSpecs(): readonly ServiceSpec[] {
+	return SERVICE_SPECS;
+}
 
 function homeForEnvironment(env: NodeJS.ProcessEnv): string {
 	return env.GAJAEWAY_HOME || join(env.HOME || homedir(), ".gajaeway");
@@ -161,6 +190,107 @@ export function renderLaunchAgent(spec: ServiceSpec, binDir: string, home: strin
 `;
 }
 
+/**
+ * systemd reads `Environment=` with its own quoting rules, so a value is wrapped
+ * in double quotes with backslashes and quotes escaped. PATH entries containing
+ * a space would otherwise silently split into two assignments.
+ */
+function unitEnvironment(name: string, value: string): string {
+	return `Environment="${name}=${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+export function systemdUnitName(spec: ServiceSpec): string {
+	return `gajaeway-${spec.id}.service`;
+}
+
+export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: string, path: string): string {
+	const execStart = [join(binDir, spec.binary), ...spec.args].join(" ");
+	const unit = [
+		"[Unit]",
+		`Description=gajaeway ${spec.id}`,
+		// BindsTo restarts and stops this unit with the gateway; PartOf propagates a
+		// gateway restart even when this unit is started on its own; After orders
+		// the boot so the adapter connects to a listening socket.
+		...(spec.dependsOnGateway ? [`BindsTo=${GATEWAY_UNIT}`, `After=${GATEWAY_UNIT}`, `PartOf=${GATEWAY_UNIT}`] : []),
+		"",
+		"[Service]",
+		`ExecStart=${execStart}`,
+		`WorkingDirectory=${binDir}`,
+		unitEnvironment("GAJAEWAY_HOME", home),
+		unitEnvironment("PATH", path),
+		"Restart=always",
+		"RestartSec=2",
+		// Only the gateway: GJC daemon and session hosts share the gateway cgroup,
+		// so the default control-group kill would take unrelated sessions with it.
+		...(spec.dependsOnGateway ? [] : ["KillMode=process"]),
+		"",
+		"[Install]",
+		// Enabling the gateway pulls the whole stack in; a dependent is never
+		// wanted by default.target on its own, because it cannot run without one.
+		`WantedBy=${spec.dependsOnGateway ? GATEWAY_UNIT : "default.target"}`,
+		"",
+	];
+	return unit.join("\n");
+}
+
+function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
+	const base = env.XDG_CONFIG_HOME || join(userHome, ".config");
+	return join(base, "systemd", "user");
+}
+
+/**
+ * The ordered commands that realign the whole stack.
+ *
+ * systemd expresses the dependency itself, so one restart of the gateway unit
+ * is the entire operation. launchd has no BindsTo/PartOf equivalent and
+ * `WatchPaths` does not restart an already-running job, so the ordering is
+ * explicit here instead — and `bootout` never appears, because removing a job
+ * leaves it with no automatic recovery.
+ */
+export function restartStackCommands(platform: ServicePlatform, uid?: number): readonly (readonly string[])[] {
+	if (platform === "linux") return [["systemctl", "--user", "restart", GATEWAY_UNIT]];
+	if (platform === "darwin") {
+		const target = uid ?? process.getuid?.() ?? 0;
+		const ordered = [
+			...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
+			...SERVICE_SPECS.filter((spec) => spec.dependsOnGateway),
+		];
+		return ordered.map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
+	}
+	throw new Error(`unsupported service platform: ${platform}`);
+}
+
+export type CommandRunner = (command: readonly string[]) => number | PromiseLike<number>;
+
+async function defaultCommandRunner(command: readonly string[]): Promise<number> {
+	const child = Bun.spawn([...command], { stdout: "inherit", stderr: "inherit" });
+	return await child.exited;
+}
+
+/** Runs {@link restartStackCommands} in order, stopping at the first failure. */
+export async function restartStack(
+	options: { readonly platform?: ServicePlatform; readonly uid?: number; readonly runner?: CommandRunner } = {},
+): Promise<readonly (readonly string[])[]> {
+	const platform = options.platform === undefined ? currentPlatform() : requirePlatform(options.platform);
+	const runner = options.runner ?? defaultCommandRunner;
+	const commands = restartStackCommands(platform, options.uid);
+	for (const command of commands) {
+		const status = await runner(command);
+		if (status !== 0) throw new Error(`restart-stack failed with status ${status}: ${command.join(" ")}`);
+	}
+	return commands;
+}
+
+function requirePlatform(platform: string): ServicePlatform {
+	if (platform !== "darwin" && platform !== "linux") throw new Error(`unsupported service platform: ${platform}`);
+	return platform;
+}
+
+function currentPlatform(): ServicePlatform {
+	if (process.platform === "darwin" || process.platform === "linux") return process.platform;
+	throw new Error(`unsupported service platform: ${process.platform}`);
+}
+
 async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 	const configPath = join(home, "config.json");
 	let raw: string;
@@ -191,10 +321,14 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 export async function installServices(options: InstallServicesOptions): Promise<readonly string[]> {
 	if (options.binDir.length === 0) throw new Error("services requires a non-empty --bin-dir DIR");
 	const env = options.env ?? process.env;
+	const platform = options.platform === undefined ? currentPlatform() : requirePlatform(options.platform);
 	const userHome = env.HOME || homedir();
 	const home = homeForEnvironment(env);
 	const binDir = expandHome(options.binDir, userHome);
-	const launchAgentsDir = expandHome(options.launchAgentsDir ?? join(userHome, "Library", "LaunchAgents"), userHome);
+	const targetDir =
+		platform === "darwin"
+			? expandHome(options.launchAgentsDir ?? join(userHome, "Library", "LaunchAgents"), userHome)
+			: expandHome(options.unitDir ?? systemdUnitDir(env, userHome), userHome);
 	const runtime = await readRuntime(home);
 	const path = await resolvePath({
 		binDir,
@@ -203,22 +337,26 @@ export async function installServices(options: InstallServicesOptions): Promise<
 		env,
 		loginPathRunner: options.loginPathRunner,
 	});
-	await mkdir(launchAgentsDir, { recursive: true, mode: 0o700 });
-	const plists = SERVICE_SPECS.map((spec) => ({
-		path: join(launchAgentsDir, `dev.gajaeway.${spec.id}.plist`),
-		contents: renderLaunchAgent(spec, binDir, home, path),
-	}));
+	await mkdir(targetDir, { recursive: true, mode: 0o700 });
+	const definitions = SERVICE_SPECS.map((spec) =>
+		platform === "darwin"
+			? {
+					path: join(targetDir, `dev.gajaeway.${spec.id}.plist`),
+					contents: renderLaunchAgent(spec, binDir, home, path),
+				}
+			: { path: join(targetDir, systemdUnitName(spec)), contents: renderSystemdUnit(spec, binDir, home, path) },
+	);
 	const write = options.writeFile;
-	for (const plist of plists) {
-		if (write) await write(plist.path, plist.contents);
+	for (const definition of definitions) {
+		if (write) await write(definition.path, definition.contents);
 		else {
-			await writeFile(plist.path, plist.contents, { encoding: "utf8", mode: 0o600 });
-			await chmod(plist.path, 0o600);
+			await writeFile(definition.path, definition.contents, { encoding: "utf8", mode: 0o600 });
+			await chmod(definition.path, 0o600);
 		}
 	}
-	return plists.map((plist) => plist.path);
+	return definitions.map((definition) => definition.path);
 }
 
 export function serviceUsage(): string {
-	return "usage: gajaeway services install|repair --bin-dir DIR [--launch-agents-dir DIR]";
+	return "usage: gajaeway services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]";
 }

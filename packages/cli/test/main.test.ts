@@ -142,6 +142,9 @@ describe("service installation", () => {
 			};
 			const options = {
 				binDir: "~/gaja&<bin>",
+				// This case is about the launchd definitions, so it pins the platform
+				// rather than depending on the host the suite happens to run on.
+				platform: "darwin" as const,
 				launchAgentsDir: join(home, "LaunchAgents"),
 				env,
 				loginPathRunner: async (): Promise<string> => "/should-not-be-read",
