@@ -30,28 +30,26 @@ export interface GatewayHomeLease {
 /** Shared by boot and offline administration; does not touch daemon.pid or SDK files. */
 export async function acquireGatewayHome(home: string): Promise<GatewayHomeLease> {
 	const path = join(home, HOME_LOCK_FILE);
-	let created = false;
 	const handle = await open(
 		path,
 		constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
 		0o600,
-	).then(
-		(file) => {
-			created = true;
-			return file;
-		},
-		(error: NodeJS.ErrnoException) => {
-			if (error.code !== "EEXIST") throw error;
-			return open(path, constants.O_RDWR | constants.O_NOFOLLOW);
-		},
-	);
+	).catch((error: NodeJS.ErrnoException) => {
+		if (error.code !== "EEXIST") throw error;
+		return open(path, constants.O_RDWR | constants.O_NOFOLLOW);
+	});
 	try {
 		const info = await handle.stat();
 		if (!info.isFile() || info.nlink !== 1 || info.size > 4096) throw new Error("gateway_home_owner_indeterminate");
 		if (flock(handle.fd, 2 | 4) !== 0) throw new Error("gateway_home_owned"); // LOCK_EX | LOCK_NB
 		const raw = await handle.readFile("utf8");
 		if (raw.length > 4096) throw new Error("gateway_home_owner_indeterminate");
-		if (!created || raw.length) {
+		// An empty lock file carries no owner record: it is either a file this
+		// call just created, one another racer created between our O_EXCL failure
+		// and our open, or one abandoned by a process that died before persisting.
+		// We hold the kernel lock, so no live owner exists; refusing here would
+		// let two simultaneous acquisitions both lose and brick the home forever.
+		if (raw.length) {
 			let owner: Record<string, unknown>;
 			try {
 				owner = JSON.parse(raw);

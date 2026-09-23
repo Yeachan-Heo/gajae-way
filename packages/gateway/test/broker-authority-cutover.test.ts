@@ -326,8 +326,15 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		const secondBackup = join(f.root, "second-backup.db");
 		other[other.indexOf("--backup") + 1] = secondBackup;
 		const outcomes = await Promise.allSettled([main(f.apply), main(other)]);
-		expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
-		expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+		// Counting outcomes alone cannot tell "correctly excluded" from "both lost",
+		// so the losing call must name the ownership refusal it lost to.
+		const rejections = outcomes
+			.filter((outcome) => outcome.status === "rejected")
+			.map((outcome) => String((outcome as PromiseRejectedResult).reason?.message ?? outcome.reason));
+		expect({ winners: outcomes.filter((outcome) => outcome.status === "fulfilled").length, rejections }).toEqual({
+			winners: 1,
+			rejections: ["gateway_home_owned"],
+		});
 		expect(Number(await Bun.file(f.backup).exists()) + Number(await Bun.file(secondBackup).exists())).toBe(1);
 		const database = new Database(f.path, { readonly: true });
 		try {
