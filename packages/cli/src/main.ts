@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { Database } from "bun:sqlite";
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
@@ -159,6 +160,46 @@ export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
 
+/**
+ * The same acceptance the gateway applies at boot (`PRAGMA integrity_check`
+ * must answer `ok`), run read-only against the backup before it replaces
+ * anything. A 16-byte header match is not a database: a truncated or
+ * bit-flipped file passes it, gets copied into place, and the next boot
+ * fails while the restore already reported success.
+ *
+ * An empty file is also refused: SQLite treats a zero-length file as a valid
+ * empty database and `integrity_check` answers `ok` for it, but restoring it
+ * would boot a gateway with every table freshly created and nothing in them.
+ *
+ * Opening a WAL-mode backup read-only may leave empty `-wal`/`-shm` sidecars
+ * next to the backup; `ops backup` writes delete-mode files, which gain none.
+ */
+export function verifyBackupIntegrity(backupPath: string): void {
+	let database: Database;
+	try {
+		database = new Database(backupPath, { readonly: true });
+	} catch (error) {
+		throw new Error(
+			`Backup is not readable: ${backupPath} (${error instanceof Error ? error.message : String(error)})`,
+		);
+	}
+	let detail: string;
+	let pageCount: number;
+	try {
+		pageCount = database.query<{ page_count: number }, []>("PRAGMA page_count").get()?.page_count ?? 0;
+		detail =
+			database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check ?? "unknown";
+	} catch (error) {
+		throw new Error(
+			`Backup is not a readable SQLite database: ${backupPath} (${error instanceof Error ? error.message : String(error)})`,
+		);
+	} finally {
+		database.close();
+	}
+	if (pageCount === 0) throw new Error(`Backup is an empty SQLite database: ${backupPath}`);
+	if (detail !== "ok") throw new Error(`Backup failed SQLite integrity_check: ${backupPath} (${detail})`);
+}
+
 export async function restoreDatabase(socket: string, backupPath: string): Promise<void> {
 	if (!isAbsolute(backupPath)) throw new Error("ops restore requires an absolute backup path");
 	try {
@@ -169,14 +210,7 @@ export async function restoreDatabase(socket: string, backupPath: string): Promi
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
 			throw new Error(`Cannot verify gateway socket ${socket}; refusing restore.`);
 	}
-	let header: Uint8Array;
-	try {
-		header = new Uint8Array(await Bun.file(backupPath).slice(0, 16).arrayBuffer());
-	} catch {
-		throw new Error(`Backup is not readable: ${backupPath}`);
-	}
-	if (new TextDecoder().decode(header) !== "SQLite format 3\u0000")
-		throw new Error(`Backup is not a SQLite database: ${backupPath}`);
+	verifyBackupIntegrity(backupPath);
 	const databasePath = join(gatewayHome(), "gateway.db");
 	const preservedPath = `${databasePath}.pre-restore-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 	await copyFile(databasePath, preservedPath);

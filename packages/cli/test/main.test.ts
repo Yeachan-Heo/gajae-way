@@ -1,5 +1,6 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajae-gateway/protocol";
@@ -17,6 +18,7 @@ import {
 	socketPath,
 	USAGE_EXIT_CODE,
 	usageFor,
+	verifyBackupIntegrity,
 } from "../src/main";
 import { installServices, resolvePath } from "../src/services";
 
@@ -220,7 +222,18 @@ describe("list flag validation", () => {
 		});
 });
 
-test("offline restore preserves the current database then copies a header-validated backup", async () => {
+/** A real, well-formed SQLite file with one marker row. */
+function writeSqlite(path: string, marker: string): void {
+	const database = new Database(path);
+	try {
+		database.exec("CREATE TABLE marker(value TEXT NOT NULL)");
+		database.query("INSERT INTO marker(value) VALUES (?)").run(marker);
+	} finally {
+		database.close();
+	}
+}
+
+test("offline restore preserves the current database then copies an integrity-checked backup", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-"));
 	const previousHome = process.env.GAJAEWAY_HOME;
 	process.env.GAJAEWAY_HOME = home;
@@ -228,9 +241,9 @@ test("offline restore preserves the current database then copies a header-valida
 		const databasePath = join(home, "gateway.db");
 		const backupPath = join(home, "backup.db");
 		await writeFile(databasePath, "current database");
-		await writeFile(backupPath, Buffer.concat([Buffer.from("SQLite format 3\0"), Buffer.from(" backup")]));
+		writeSqlite(backupPath, "backup");
 		await restoreDatabase(join(home, "gateway.sock"), backupPath);
-		expect(await Bun.file(databasePath).text()).toBe("SQLite format 3\0 backup");
+		expect(await readFile(databasePath)).toEqual(await readFile(backupPath));
 		const preserved = (await Array.fromAsync(new Bun.Glob("gateway.db.pre-restore-*").scan({ cwd: home })))[0];
 		expect(preserved).toBeString();
 		expect(await Bun.file(join(home, preserved as string)).text()).toBe("current database");
@@ -240,6 +253,139 @@ test("offline restore preserves the current database then copies a header-valida
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+describe("verifyBackupIntegrity", () => {
+	async function withHome(run: (home: string) => Promise<void>): Promise<void> {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-verify-"));
+		try {
+			await run(home);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+
+	test("a well-formed database passes and is left closed", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "good.db");
+			writeSqlite(path, "ok");
+			expect(() => verifyBackupIntegrity(path)).not.toThrow();
+			// Still openable afterwards: the verifier held no lock and left no journal.
+			const database = new Database(path, { readonly: true });
+			try {
+				expect(database.query<{ value: string }, []>("SELECT value FROM marker").get()?.value).toBe("ok");
+			} finally {
+				database.close();
+			}
+		});
+	});
+
+	test("a file that is only the 16-byte SQLite header is refused", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "header-only.db");
+			await writeFile(path, Buffer.concat([Buffer.from("SQLite format 3\0"), Buffer.alloc(64, 0xff)]));
+			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is not a readable SQLite database: .*header-only\.db/);
+		});
+	});
+
+	test("a truncated copy of a real database is refused", async () => {
+		await withHome(async (home) => {
+			const good = join(home, "good.db");
+			writeSqlite(good, "x".repeat(4096));
+			const bytes = await readFile(good);
+			const truncated = join(home, "truncated.db");
+			await writeFile(truncated, bytes.subarray(0, Math.floor(bytes.length / 2)));
+			expect(() => verifyBackupIntegrity(truncated)).toThrow(
+				/Backup is not a readable SQLite database: .*truncated\.db/,
+			);
+		});
+	});
+
+	test("a zero-length file is refused even though SQLite calls it a valid empty database", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "empty.db");
+			await writeFile(path, "");
+			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is an empty SQLite database: .*empty\.db/);
+		});
+	});
+
+	test("a file of zero bytes with a non-zero length is refused", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "zeros.db");
+			await writeFile(path, Buffer.alloc(200));
+			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is not a readable SQLite database: .*zeros\.db/);
+		});
+	});
+
+	test("a WAL-mode backup passes and any sidecars land beside the backup, not elsewhere", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "wal.db");
+			const database = new Database(path);
+			try {
+				database.exec("PRAGMA journal_mode = WAL; CREATE TABLE marker(value TEXT NOT NULL)");
+				database.query("INSERT INTO marker(value) VALUES (?)").run("wal");
+			} finally {
+				database.close();
+			}
+			const before = await readFile(path);
+			expect(() => verifyBackupIntegrity(path)).not.toThrow();
+			expect(await readFile(path)).toEqual(before);
+			const entries = await readdir(home);
+			for (const entry of entries) expect(entry.startsWith("wal.db")).toBe(true);
+		});
+	});
+
+	test("a database whose integrity_check reports problems is refused with the report", async () => {
+		await withHome(async (home) => {
+			const good = join(home, "good.db");
+			const source = new Database(good);
+			try {
+				source.exec("PRAGMA page_size = 4096; CREATE TABLE m(v TEXT); CREATE INDEX i ON m(v)");
+				for (let index = 0; index < 40; index++)
+					source.query("INSERT INTO m(v) VALUES (?)").run(`row-${index}-${"x".repeat(200)}`);
+			} finally {
+				source.close();
+			}
+			// Zero the body of the index root page but keep the file header and page
+			// count intact. The page number comes from the schema rather than being
+			// assumed. Which refusal fires is a SQLite build detail: some builds let
+			// integrity_check report the missing index entries, others raise
+			// SQLITE_CORRUPT while the pragma runs. Both must refuse the backup and
+			// name the file, and neither may be silently restored.
+			const inspect = new Database(good, { readonly: true });
+			let rootPage: number;
+			try {
+				rootPage =
+					inspect.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_schema WHERE name = 'i'").get()
+						?.rootpage ?? 0;
+			} finally {
+				inspect.close();
+			}
+			expect(rootPage).toBeGreaterThan(1);
+			const bytes = Buffer.from(await readFile(good));
+			bytes.fill(0, 4096 * (rootPage - 1) + 100, 4096 * rootPage);
+			const damaged = join(home, "damaged.db");
+			await writeFile(damaged, bytes);
+			expect(() => verifyBackupIntegrity(damaged)).toThrow(
+				/Backup (?:failed SQLite integrity_check|is not a readable SQLite database): .*damaged\.db \(/,
+			);
+		});
+	});
+
+	test("a non-database file is refused", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "text.db");
+			await writeFile(path, "not a database at all");
+			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is not a readable SQLite database: .*text\.db/);
+		});
+	});
+
+	test("a missing file is refused as unreadable", async () => {
+		await withHome(async (home) => {
+			expect(() => verifyBackupIntegrity(join(home, "absent.db"))).toThrow(/Backup is not readable/);
+		});
+	});
+});
+
 function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 	return {
 		phase: "idle",
