@@ -465,7 +465,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 	async connect(): Promise<void> {
 		const generation = ++this.#connectionGeneration;
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath);
+			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-slack" });
 			if (generation !== this.#connectionGeneration) {
 				await client.close();
 				return;

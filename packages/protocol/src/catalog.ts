@@ -27,6 +27,17 @@ export interface GatewayStatusResult {
 	 * the consecutive-turn budget, and admissions stopped by the runaway rate limit.
 	 */
 	readonly engagement?: { readonly botAudienceDeclines: number; readonly botAudienceRateLimited: number };
+	/**
+	 * Connected clients with their process generation. `staleGeneration` marks a
+	 * client whose process predates this gateway process: the adapter survived a
+	 * gateway-only restart and is serving the previous generation.
+	 */
+	readonly clients?: readonly {
+		readonly name: string;
+		readonly startedAt?: string;
+		readonly connectedAt: string;
+		readonly staleGeneration: boolean;
+	}[];
 }
 
 export interface ConversationContextDiagnostics {

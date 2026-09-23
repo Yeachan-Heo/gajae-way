@@ -1107,7 +1107,7 @@ export class ReconnectingGateway {
 
 	async connect(): Promise<void> {
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath);
+			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-discord" });
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();

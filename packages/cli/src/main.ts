@@ -25,7 +25,13 @@ import {
 	SESSION_COLUMNS,
 	type SessionListRow,
 } from "./list";
-import { type InstallServicesOptions, installServices, serviceUsage } from "./services";
+import {
+	type InstallServicesOptions,
+	installServices,
+	restartStack,
+	type ServicePlatform,
+	serviceUsage,
+} from "./services";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -51,7 +57,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -77,6 +83,8 @@ function gatewayHome(): string {
 
 export interface MainOptions {
 	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+	/** Test seam for `ops restart-stack`; the real path spawns the service manager. */
+	readonly restartStack?: Parameters<typeof restartStack>[0];
 }
 
 export type ServicesAction = "install" | "repair";
@@ -85,6 +93,8 @@ export interface ParsedServicesArgs {
 	readonly action: ServicesAction;
 	readonly binDir: string;
 	readonly launchAgentsDir?: string;
+	readonly unitDir?: string;
+	readonly platform?: ServicePlatform;
 }
 
 export function parseServicesArgs(args: readonly string[]): ParsedServicesArgs {
@@ -92,18 +102,31 @@ export function parseServicesArgs(args: readonly string[]): ParsedServicesArgs {
 	if (action !== "install" && action !== "repair") throw new Error(serviceUsage());
 	let binDir: string | undefined;
 	let launchAgentsDir: string | undefined;
+	let unitDir: string | undefined;
+	let platform: ServicePlatform | undefined;
 	for (let i = 1; i < args.length; i++) {
 		const flag = args[i];
-		if (flag === "--bin-dir" || flag === "--launch-agents-dir") {
+		if (flag === "--bin-dir" || flag === "--launch-agents-dir" || flag === "--unit-dir") {
 			const value = args[++i];
 			if (value === undefined || value.length === 0 || value.startsWith("--"))
 				throw new Error(`${flag} expects a non-empty DIR`);
 			if (flag === "--bin-dir") binDir = value;
+			else if (flag === "--unit-dir") unitDir = value;
 			else launchAgentsDir = value;
+		} else if (flag === "--platform") {
+			const value = args[++i];
+			if (value !== "darwin" && value !== "linux") throw new Error("--platform expects darwin or linux");
+			platform = value;
 		} else throw new Error(`unknown option: ${flag}`);
 	}
 	if (binDir === undefined) throw new Error("services requires --bin-dir DIR");
-	return { action, binDir, ...(launchAgentsDir === undefined ? {} : { launchAgentsDir }) };
+	return {
+		action,
+		binDir,
+		...(launchAgentsDir === undefined ? {} : { launchAgentsDir }),
+		...(unitDir === undefined ? {} : { unitDir }),
+		...(platform === undefined ? {} : { platform }),
+	};
 }
 
 /**
@@ -420,6 +443,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					await restoreDatabase(parsed.socket, path);
 					break;
 				}
+				if (command === "restart-stack") {
+					// Deliberately socket-free: the reason to run this is a gateway that
+					// has to come back, so it must not need the gateway to answer first.
+					if (parsed.rest.length > 1) throw new Error("usage: gajaeway ops restart-stack");
+					const commands = await restartStack(options.restartStack ?? {});
+					for (const ran of commands) console.log(`restart-stack: ${ran.join(" ")}`);
+					break;
+				}
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (command === "backup" && path) console.log(JSON.stringify(await client.request("ops.backup", { path })));
@@ -432,7 +463,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						// Fail-closed: a gated/degraded cycle exits non-zero even though the
 						// request itself succeeded, so scripts can never read it as healthy.
 						process.exitCode = cycleExitCode(cycle);
-					} else throw new Error("usage: gajaeway ops backup <path>|cycle [--json]|integrity|restore <backupPath>");
+					} else
+						throw new Error(
+							"usage: gajaeway ops backup <path>|cycle [--json]|integrity|restore <backupPath>|restart-stack",
+						);
 				} finally {
 					await client.close();
 				}
@@ -638,10 +672,13 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const written = await installServices({
 					binDir: service.binDir,
 					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),
+					...(service.unitDir === undefined ? {} : { unitDir: service.unitDir }),
+					...(service.platform === undefined ? {} : { platform: service.platform }),
 					env: process.env,
 					...options.services,
 				});
-				console.log(`services ${service.action}: wrote ${written.length} LaunchAgent plists`);
+				console.log(`services ${service.action}: wrote ${written.length} service definitions`);
+				for (const definition of written) console.log(definition);
 				break;
 			}
 			default:

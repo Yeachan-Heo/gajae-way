@@ -1888,3 +1888,77 @@ for (const verb of ["work.start", "work.run"] as const) {
 		f.client.close();
 	});
 }
+
+test("status reports each connected client's generation and flags an adapter older than the gateway", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-generation-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "mock reply",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		startedAt: "2026-01-02T00:00:00.000Z",
+		onStop: () => database.close(),
+	});
+
+	// An adapter that survived a gateway-only restart: its process predates the
+	// gateway process even though the reconnect itself is fresh.
+	const stale = await connect(config.socketPath);
+	stale.send({
+		v: "0.1",
+		type: "hello",
+		payload: {
+			supportedVersions: ["0.1"],
+			clientInfo: { name: "adapter-slack", startedAt: "2026-01-01T00:00:00.000Z" },
+		},
+	});
+	await waitFor(stale.frames, 1);
+
+	const fresh = await connect(config.socketPath);
+	fresh.send({
+		v: "0.1",
+		type: "hello",
+		payload: {
+			supportedVersions: ["0.1"],
+			clientInfo: { name: "adapter-discord", startedAt: "2026-01-02T00:00:30.000Z" },
+		},
+	});
+	await waitFor(fresh.frames, 1);
+
+	// A client that reports no start time is a diagnostic gap, never "stale".
+	const anonymous = await connect(config.socketPath);
+	anonymous.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(anonymous.frames, 1);
+
+	fresh.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	await waitFor(fresh.frames, 2);
+	const clients = fresh.frames[1].result.clients as Array<{
+		name: string;
+		startedAt?: string;
+		connectedAt: string;
+		staleGeneration: boolean;
+	}>;
+	expect(clients).toHaveLength(3);
+	expect(clients.find((client) => client.name === "adapter-slack")?.staleGeneration).toBe(true);
+	expect(clients.find((client) => client.name === "adapter-discord")?.staleGeneration).toBe(false);
+	const unidentified = clients.find((client) => client.name === "unidentified");
+	expect(unidentified?.startedAt).toBeUndefined();
+	expect(unidentified?.staleGeneration).toBe(false);
+	for (const client of clients) expect(typeof client.connectedAt).toBe("string");
+
+	stale.close();
+	fresh.close();
+	anonymous.close();
+});

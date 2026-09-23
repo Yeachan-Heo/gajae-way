@@ -176,7 +176,23 @@ chmod 600 ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
 ```
 
-Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway. `gajaeway services install` writes plists for the gateway, the Discord and Slack adapters, and the admin console; Telegram is run under your own service definition. The CLI is an on-demand client; it does not start the daemon.
+Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway. `gajaeway services install --bin-dir DIR` writes definitions for the gateway, the Discord and Slack adapters, and the admin console; Telegram is run under your own service definition. The CLI is an on-demand client; it does not start the daemon. The definitions it writes follow the host: launchd plists in `~/Library/LaunchAgents` on macOS, systemd user units in `${XDG_CONFIG_HOME:-~/.config}/systemd/user` on Linux. `--platform darwin|linux` with `--launch-agents-dir`/`--unit-dir` generates for the other host.
+
+### The adapters restart with the gateway
+
+A gateway restart does not kill an adapter. The adapter reconnects and keeps serving the previous generation: nothing dies, nothing is lost, `delivery.pending` stays 0, and the only symptom is replies arriving a beat late. The service definitions therefore bind the stack together instead of relying on an operator following a restart order.
+
+On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=process`, because GJC daemon and session hosts share its cgroup.
+
+launchd has no `BindsTo`/`PartOf` equivalent, and `WatchPaths` does not restart an already-running job. Use the single entry point instead, on either host:
+
+```sh
+gajaeway ops restart-stack
+```
+
+On Linux that is the one `systemctl --user restart gajaeway-gateway`; on macOS it kickstarts the gateway and then every dependent job, in order. It never uses `launchctl bootout`, which removes the job and leaves it with no automatic recovery.
+
+To diagnose a stack that is already mismatched, read `clients` in `gajaeway status`: every connected client reports its process `startedAt` and a `staleGeneration` flag that is true when the client process predates the running gateway process. That replaces comparing `ps -o lstart` by hand.
 
 ### One gateway per home, owned by the service manager
 
