@@ -139,7 +139,7 @@ gajaeway ops integrity
 gajaeway ops backup /absolute/backup/gateway.db
 ```
 
-For restore, stop the service first. The CLI refuses restore while the gateway socket exists. It opens the backup read-only, refuses an empty database, and requires `PRAGMA integrity_check` to answer `ok` (the same acceptance the gateway applies at boot; a WAL-mode backup may gain empty `-wal`/`-shm` sidecars beside it, which are safe to delete; restore installs only the backup file itself, so a hand-made WAL-mode backup must be checkpointed first), copies the current database to `gateway.db.pre-restore-<timestamp>`, then copies the backup into `$GAJAEWAY_HOME/gateway.db`:
+For restore, stop the service first. The CLI refuses restore while the gateway socket exists. It opens the backup read-only, refuses an empty database, and requires `PRAGMA integrity_check` to answer `ok` (the same acceptance the gateway applies at boot; a WAL-mode backup may gain empty `-wal`/`-shm` sidecars beside it, which are safe to delete; restore installs only the backup file itself, so a hand-made WAL-mode backup must be checkpointed first). It then resolves the live database from the same configuration the gateway reads (`dbPath` from `$GAJAEWAY_HOME/config.json`, otherwise `$GAJAEWAY_HOME/gateway.db`), copies that database to `<db>.pre-restore-<timestamp>`, then copies the backup over it. An unreadable or malformed `config.json` refuses the restore rather than guessing:
 
 ```sh
 # stop the service and confirm its gateway.sock is gone
