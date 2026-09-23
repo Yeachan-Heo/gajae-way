@@ -5,7 +5,19 @@ import {
 	originKey,
 	type ReactionRef,
 } from "@gajae-gateway/protocol";
-import type { DeliveryLedger, LedgerOutcome } from "../store/ledger";
+import type { DeliveryLedger, ExpiredDeliveryRow, LedgerOutcome } from "../store/ledger";
+
+const DELIVERY_FRESHNESS_MS = 24 * 60 * 60 * 1_000;
+
+export interface DeliverySweep {
+	readonly payloads: readonly ChatMessagePayload[];
+	readonly expired: readonly ExpiredDeliveryRow[];
+}
+
+export interface DeliveryRequeue {
+	readonly requeued: readonly string[];
+	readonly payloads: readonly ChatMessagePayload[];
+}
 
 /** Pure construction shared by ordinary dispatch and atomic work settlement. */
 export function buildDeliveryPayload(
@@ -114,17 +126,49 @@ export class DeliveryService {
 	fail(deliveryId: string, ambiguous?: boolean): LedgerOutcome {
 		return this.#ledger.fail(deliveryId, ambiguous);
 	}
+	/** `onConnect`: replay every unsettled row to a newly negotiated adapter, ignoring retry backoff. */
+	sweep(now = Date.now(), onConnect = false): DeliverySweep {
+		const expired = this.#ledger.expireStale(DELIVERY_FRESHNESS_MS, now);
+		return {
+			payloads: this.#redeliveries(now, onConnect),
+			expired,
+		};
+	}
+	requeue(deliveryId?: string, since?: string): DeliveryRequeue {
+		if ((deliveryId === undefined) === (since === undefined))
+			throw new TypeError("exactly one of deliveryId or since is required");
+		const requeued =
+			deliveryId === undefined ? this.#ledger.requeueSince(since as string) : this.#ledger.requeue(deliveryId);
+		const rows = new Map(this.#ledger.getMany(requeued).map((row) => [row.deliveryId, row]));
+		return {
+			requeued,
+			payloads: requeued.flatMap((id) => {
+				const row = rows.get(id);
+				if (!row) return [];
+				return [
+					{
+						...(JSON.parse(row.payloadJson) as ChatMessagePayload),
+						redelivered: true,
+						duplicateWarning: true,
+					},
+				];
+			}),
+		};
+	}
 	redeliveries(): ChatMessagePayload[] {
-		return this.#ledger.listUndelivered(24 * 60 * 60 * 1000).map((row) => ({
-			...(JSON.parse(row.payloadJson) as ChatMessagePayload),
-			redelivered: true,
-			...(row.state === "inflight" || row.state === "failed_ambiguous" ? { duplicateWarning: true } : {}),
-		}));
+		return this.#redeliveries();
 	}
 	prune(): number {
 		return this.#ledger.prune(7 * 24 * 60 * 60 * 1000);
 	}
 	status() {
 		return this.#ledger.counts();
+	}
+	#redeliveries(now = Date.now(), ignoreBackoff = false): ChatMessagePayload[] {
+		return this.#ledger.listUndelivered(DELIVERY_FRESHNESS_MS, now, ignoreBackoff).map((row) => ({
+			...(JSON.parse(row.payloadJson) as ChatMessagePayload),
+			redelivered: true,
+			...(row.state === "inflight" || row.state === "failed_ambiguous" ? { duplicateWarning: true } : {}),
+		}));
 	}
 }

@@ -293,9 +293,16 @@ function statusRow(
 	const delivery = status?.delivery;
 	const deliveryLabel = !delivery
 		? "delivery ledger not reported"
-		: delivery.pending === 0
+		: delivery.pending === 0 && delivery.expired === 0
 			? "deliveries clear"
-			: `${pluralise(delivery.pending, "delivery", "deliveries")} pending · oldest ${formatDuration(delivery.oldestPendingAgeMs ?? 0)}`;
+			: [
+					...(delivery.pending > 0
+						? [
+								`${pluralise(delivery.pending, "delivery", "deliveries")} pending · oldest ${formatDuration(delivery.oldestPendingAgeMs ?? 0)}`,
+							]
+						: []),
+					...(delivery.expired > 0 ? [pluralise(delivery.expired, "expired delivery", "expired deliveries")] : []),
+				].join(" · ");
 	const context = status?.contextDiff;
 	const contextLabel = !context
 		? "conversation diff not reported"
@@ -327,7 +334,7 @@ function statusRow(
 		tones: {
 			alive: status ? "ok" : "danger",
 			attention: attention.length === 0 ? "muted" : danger ? "danger" : "warn",
-			delivery: !delivery ? "muted" : delivery.pending === 0 ? "ok" : "warn",
+			delivery: !delivery ? "muted" : delivery.expired > 0 ? "danger" : delivery.pending === 0 ? "ok" : "warn",
 			context: !context ? "muted" : context.unread > 0 || context.expired > 0 || context.truncated > 0 ? "warn" : "ok",
 			botAudience: !engagement
 				? "muted"

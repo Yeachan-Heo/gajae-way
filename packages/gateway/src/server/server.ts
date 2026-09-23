@@ -72,7 +72,7 @@ import { WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
-import { DeliveryLedger } from "../store/ledger";
+import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
@@ -81,6 +81,7 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
+const DEFAULT_DELIVERY_SWEEP_INTERVAL_MS = 15_000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
@@ -179,6 +180,8 @@ export interface GatewayServerOptions {
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
+	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
+	readonly deliverySweepIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
 }
 interface InboundContext {
@@ -244,6 +247,7 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly deliverySweepTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly stopBrokerGenerationListener?: () => void;
@@ -292,6 +296,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.deliverySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
@@ -401,6 +406,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.stdin.off("data", onData);
 			process.stdin.off("end", onEnd);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.deliverySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
@@ -577,6 +583,16 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.then(() => lanes.sweep())
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
+	const deliverySweepTimer = setInterval(() => {
+		if (![...connections].some((connection) => connection.negotiated)) return;
+		try {
+			const sweep = delivery.sweep();
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
+			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
+		} catch (error) {
+			console.error(`delivery sweep failed: ${diagnostic(error)}`);
+		}
+	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
 	// tail's threshold check; it never aborts a turn (alarm overlay only).
@@ -626,6 +642,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		deliverySweepTimer,
 		stallTimer,
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
@@ -693,7 +710,9 @@ async function handleFrame(
 				connectedAt: new Date().toISOString(),
 			};
 			connection.write({ v: PROFILE_VERSION, type: "negotiated", payload: result.negotiated });
-			for (const payload of runtime.delivery.redeliveries())
+			const sweep = runtime.delivery.sweep(Date.now(), true);
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
+			for (const payload of sweep.payloads)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 			return;
 		}
@@ -788,6 +807,11 @@ async function handleRequest(
 			// adapter may be retrying a stale outcome).
 			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (failOutcome === "transitioned") {
+				const failedRow = runtime.delivery.get(params.deliveryId);
+				if (failedRow?.state === "expired")
+					reportDeliveryExpired(runtime, failedRow, safeDiagnosticField(params.reason));
+			}
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
 			// operator projection show them as unsettled; the ledger row carries the
@@ -810,6 +834,29 @@ async function handleRequest(
 			} catch (error) {
 				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid backup path");
 			}
+			return;
+		}
+		case "ops.redeliver": {
+			const params = request.params as { deliveryId?: unknown; since?: unknown } | undefined;
+			if (!params || typeof params !== "object" || Array.isArray(params))
+				throw new ProtocolError("invalid_params", "exactly one of deliveryId or since is required");
+			const hasDeliveryId = Object.hasOwn(params, "deliveryId");
+			const hasSince = Object.hasOwn(params, "since");
+			if (hasDeliveryId === hasSince)
+				throw new ProtocolError("invalid_params", "exactly one of deliveryId or since is required");
+			if (hasDeliveryId && (typeof params.deliveryId !== "string" || !params.deliveryId))
+				throw new ProtocolError("invalid_params", "deliveryId must be a non-empty string");
+			const since = hasSince ? parseReceivedAt(params.since) : undefined;
+			const result = runtime.delivery.requeue(hasDeliveryId ? (params.deliveryId as string) : undefined, since);
+			if (hasDeliveryId && result.requeued.length === 0 && !runtime.delivery.get(params.deliveryId as string))
+				throw new ProtocolError("invalid_params", "unknown deliveryId");
+			for (const payload of result.payloads) broadcastDelivery(runtime, payload);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { requeued: result.requeued },
+			});
 			return;
 		}
 		case "work.start":
@@ -2142,6 +2189,34 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+}
+
+function reportDeliveryExpired(
+	runtime: Runtime,
+	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
+	reason: string,
+): void {
+	const deliveryId = safeDiagnosticField(expired.deliveryId);
+	const origin = safeDiagnosticField(expired.originKey);
+	const attempts = Number.isSafeInteger(expired.attempts) && expired.attempts >= 0 ? expired.attempts : 0;
+	console.error(
+		`delivery_expired deliveryId=${deliveryId} origin=${origin} attempts=${attempts} reason=${safeDiagnosticField(reason)}`,
+	);
+	if (expired.deliveryId.startsWith("gw-x-")) return;
+	const ownerTarget = runtime.config.ownerTarget?.origin;
+	if (!ownerTarget) return;
+	const noticeId = deterministicDeliveryExpiredNoticeId(expired.deliveryId);
+	const notice = `[delivery lost] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다. 재전송: gajaeway ops redeliver ${deliveryId}`;
+	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
+	if (payload) broadcastDelivery(runtime, payload);
+}
+
+function safeDiagnosticField(value: string): string {
+	return sanitizeDiagnostic(value).slice(0, 160).replace(/\s+/g, "_") || "unknown_error";
+}
+
+function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
+	return `gw-x-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 32)}`;
 }
 
 function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {

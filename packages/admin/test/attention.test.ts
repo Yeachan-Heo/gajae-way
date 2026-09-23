@@ -1,10 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import type { GatewayStatusResult } from "@gajae-gateway/protocol";
 import { ATTENTION_GAPS, buildAttention, PENDING_DELIVERY_MS, STUCK_EVENT_MS } from "../src/attention";
 import { FIXED_NOW, MONITOR, monitorEvent, STATUS } from "./fixture";
 
-const status = (pending: number, oldestPendingAgeMs: number | null) => ({
+const status = (
+	pending: number,
+	oldestPendingAgeMs: number | null,
+	expired = 0,
+	recentExpired: NonNullable<GatewayStatusResult["delivery"]>["recentExpired"] = [],
+) => ({
 	...STATUS,
-	delivery: { pending, oldestPendingAgeMs },
+	delivery: { pending, oldestPendingAgeMs, expired, recentExpired },
 });
 
 describe("buildAttention", () => {
@@ -31,6 +37,25 @@ describe("buildAttention", () => {
 		const [item] = buildAttention(status(1, PENDING_DELIVERY_MS), [], FIXED_NOW);
 		expect(item?.title).toBe("1 reply never reached their platform");
 		expect(item?.severity).toBe(2);
+	});
+
+	test("expired deliveries raise attention with identifiers and origins only", () => {
+		const [item] = buildAttention(
+			status(0, null, 2, [
+				{
+					deliveryId: "delivery-1",
+					originKey: "discord/channel/room",
+					attempts: 5,
+					expiredAt: "2026-08-27T14:00:00.000Z",
+				},
+			]),
+			[],
+			FIXED_NOW,
+		);
+		expect(item?.key).toBe("delivery:expired");
+		expect(item?.title).toBe("2 deliveries expired");
+		expect(item?.detail).toBe("delivery-1 · discord/channel/room");
+		expect(item?.at).toBe("2026-08-27T14:00:00.000Z");
 	});
 
 	test("a failed monitor event is an incident immediately, with no age grace", () => {

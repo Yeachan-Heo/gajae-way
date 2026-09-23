@@ -137,6 +137,8 @@ With the daemon running, take an online SQLite backup and validate it:
 ```sh
 gajaeway ops integrity
 gajaeway ops backup /absolute/backup/gateway.db
+gajaeway ops redeliver <deliveryId>
+gajaeway ops redeliver --since 2026-09-23T10:00:00.000Z
 ```
 
 For restore, stop the service first. The CLI refuses restore while the gateway socket exists. It opens the backup read-only, refuses an empty database, and requires `PRAGMA integrity_check` to answer `ok` (the same acceptance the gateway applies at boot; a WAL-mode backup may gain empty `-wal`/`-shm` sidecars beside it, which are safe to delete; restore installs only the backup file itself, so a hand-made WAL-mode backup must be checkpointed first). It then resolves the live database from the same configuration the gateway reads (`dbPath` from `$GAJAEWAY_HOME/config.json`, otherwise `$GAJAEWAY_HOME/gateway.db`), copies that database to `<db>.pre-restore-<timestamp>`, then copies the backup over it. An unreadable or malformed `config.json` refuses the restore rather than guessing:
@@ -184,7 +186,7 @@ Do not down-mark a live database. Schema 19 rebuilt `inbound_messages` (the batc
 
 ## Crash recovery
 
-On startup, the delivery ledger redelivers unsettled output. Ambiguous prior delivery is visibly duplicate-labeled, so adapters must preserve that label. Memory closure resumes durable intents and receipts successful Git closure; irrecoverable intent work is quarantined. Monitor reconciliation resumes admitted, dispatched, or failed events and repairs authored events whose memory closure is missing.
+On adapter negotiation, and every 15 seconds while an adapter remains connected, the delivery ledger redelivers due unsettled output. Ambiguous prior delivery is visibly duplicate-labeled, so adapters must preserve that label. Five definitive failures or age beyond 24 hours expire an unsettled row; the gateway logs expiry, exposes expired counts and recent ids/origins in `gateway.status`, and sends an owner-target notice when configured. Requeue one eligible row with `gajaeway ops redeliver <deliveryId>`, or requeue rows updated since a timestamp with `gajaeway ops redeliver --since <iso>`. Confirmed rows are never requeued. Memory closure resumes durable intents and receipts successful Git closure; irrecoverable intent work is quarantined. Monitor reconciliation resumes admitted, dispatched, or failed events and repairs authored events whose memory closure is missing.
 
 Worker recovery independently resumes observation of the saved operation/session identity before admitting conflicting worker mutations. It never resends the prompt, binds a replacement, or requires a no-op run to reconcile an open attempt. Proven-live `unknown` remains observable without settlement or overlap; it proves neither acceptance nor completion. `work send acceptance uncertain` likewise requires observation, not resubmission. Trusted terminal evidence can finish saved reconciliation without live reattachment. Without trusted terminal proof, unrecoverable dead/disowned/indeterminate authority is closed locally as `terminal_uncertain` and held for the operator; the local end timestamp is not proof of worker stoppage. Transient transport failure does not invent a worker deadline. Repository progress cannot clear sticky uncertainty/failure holds; `--resume` is an explicit continuation choice only after the prior attempt is reconciled, not a way around an open attempt.
 

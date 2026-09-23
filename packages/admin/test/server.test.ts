@@ -255,12 +255,16 @@ describe("mutation gate over http", () => {
 			"monitor.remove",
 			"monitor.test",
 			"ops.backup",
+			"ops.redeliver",
 			"ops.integrity",
 		]);
 		expect(body.operations.map((operation) => operation.id)).not.toContain("chat.send");
 		const remove = body.operations.find((operation) => operation.id === "monitor.remove");
 		expect(remove).toMatchObject({ severity: "high", confirmToken: "target-name" });
 		expect(remove?.fields).toHaveLength(1);
+		expect(body.operations.find((operation) => operation.id === "ops.redeliver")?.fields).toEqual([
+			{ name: "deliveryId", label: "Delivery ID", kind: "text", required: true },
+		]);
 	});
 });
 

@@ -70,11 +70,39 @@ describe("status bar", () => {
 
 	test("delivery pressure is stated with an age, not a bare count", async () => {
 		const state = await snapshot({
-			"gateway.status": { ...STATUS, delivery: { pending: 2, oldestPendingAgeMs: 11 * 60_000 } },
+			"gateway.status": {
+				...STATUS,
+				delivery: { pending: 2, oldestPendingAgeMs: 11 * 60_000, expired: 0, recentExpired: [] },
+			},
 		});
 		expect(state.status.fields.delivery).toBe("2 deliveries pending · oldest 11m");
 		expect(state.status.fields.attention).toBe("⚠ 1 item needs you");
 		expect(state.status.tone).toBe("danger");
+	});
+
+	test("expired count is visible in the status bar and raises attention", async () => {
+		const state = await snapshot({
+			"gateway.status": {
+				...STATUS,
+				delivery: {
+					pending: 0,
+					oldestPendingAgeMs: null,
+					expired: 2,
+					recentExpired: [
+						{
+							deliveryId: "delivery-1",
+							originKey: "discord/channel/room",
+							attempts: 5,
+							expiredAt: "2026-08-27T14:00:00.000Z",
+						},
+					],
+				},
+			},
+		});
+		expect(state.status.fields.delivery).toBe("2 expired deliveries");
+		expect(state.status.tone).toBe("danger");
+		expect(state.attention.rows[0]?.fields.title).toBe("2 deliveries expired");
+		expect(state.attention.rows[0]?.fields.detail).toBe("delivery-1 · discord/channel/room");
 	});
 
 	test("a gateway without a delivery ledger says the ledger is unreported, not zero", async () => {

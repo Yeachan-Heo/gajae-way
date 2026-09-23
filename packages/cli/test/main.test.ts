@@ -47,6 +47,58 @@ describe("cli arguments", () => {
 			process.exitCode = previousExit ?? 0;
 		}
 	});
+
+	test("ops redeliver sends either the delivery id or an ISO since value", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-redeliver-"));
+		const path = join(home, "fake.sock");
+		const received: Array<{ verb: string; params: unknown }> = [];
+		const output: string[] = [];
+		const originalLog = console.log;
+		console.log = (line: unknown) => output.push(String(line));
+		const listener = Bun.listen<{ buffer: string }>({
+			unix: path,
+			socket: {
+				open(socket) {
+					socket.data = { buffer: "" };
+				},
+				data(socket, data) {
+					socket.data.buffer += Buffer.from(data).toString("utf8");
+					let newline = socket.data.buffer.indexOf("\n");
+					while (newline >= 0) {
+						const line = socket.data.buffer.slice(0, newline);
+						socket.data.buffer = socket.data.buffer.slice(newline + 1);
+						const frame = JSON.parse(line) as { type: string; id?: string; verb?: string; params?: unknown };
+						if (frame.type === "hello")
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`,
+							);
+						else if (frame.type === "request") {
+							received.push({ verb: frame.verb as string, params: frame.params });
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { requeued: [] } })}\n`,
+							);
+						}
+						newline = socket.data.buffer.indexOf("\n");
+					}
+				},
+			},
+		});
+		try {
+			await main(["--socket", path, "ops", "redeliver", "delivery-42"]);
+			await main(["--socket", path, "ops", "redeliver", "--since", "2026-09-23T10:00:00.000Z"]);
+			expect(received).toEqual([
+				{ verb: "ops.redeliver", params: { deliveryId: "delivery-42" } },
+				{ verb: "ops.redeliver", params: { since: "2026-09-23T10:00:00.000Z" } },
+			]);
+			expect(output).toEqual(['{"requeued":[]}', '{"requeued":[]}']);
+			expect(CLI_USAGE).toContain("ops redeliver <deliveryId>");
+			expect(CLI_USAGE).toContain("ops redeliver --since <iso>");
+		} finally {
+			console.log = originalLog;
+			listener.stop(true);
+			await rm(home, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("service installation", () => {
