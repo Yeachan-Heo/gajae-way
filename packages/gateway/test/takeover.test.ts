@@ -198,7 +198,6 @@ test("exclusive leases refuse both boot and admin contenders and release only th
 test("malformed, incomplete and live owner metadata are never stolen", async () => {
 	const home = await temporaryHome("gajaeway-exclusive-malformed-");
 	for (const raw of [
-		"",
 		"{bad",
 		JSON.stringify({ pid: process.pid }),
 		JSON.stringify({
@@ -213,6 +212,27 @@ test("malformed, incomplete and live owner metadata are never stolen", async () 
 			raw.includes("other-owner") ? "gateway_home_owner_live" : "gateway_home_owner_indeterminate",
 		);
 		expect(await readFile(join(home, HOME_LOCK_FILE), "utf8")).toBe(raw);
+	}
+});
+
+test("a lock file with no owner record is adopted, not refused, and stays exclusive", async () => {
+	const home = await temporaryHome("gajaeway-exclusive-empty-");
+	// The racer that loses O_CREAT|O_EXCL, and a process that dies between
+	// creating the lock and persisting its record, both leave exactly this state.
+	await writeFile(join(home, HOME_LOCK_FILE), "", { mode: 0o600 });
+	const inode = (await lstat(join(home, HOME_LOCK_FILE))).ino;
+	const lease = await acquireGatewayHome(home);
+	try {
+		expect(lease.token).toBeTruthy();
+		await expect(acquireGatewayHome(home)).rejects.toThrow("gateway_home_owned");
+		expect((await lstat(join(home, HOME_LOCK_FILE))).ino).toBe(inode);
+		expect(JSON.parse(await readFile(join(home, HOME_LOCK_FILE), "utf8"))).toMatchObject({
+			pid: process.pid,
+			token: lease.token,
+			state: "held",
+		});
+	} finally {
+		await lease.release();
 	}
 });
 
