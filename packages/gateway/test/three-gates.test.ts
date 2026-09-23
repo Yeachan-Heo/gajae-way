@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import type { EngagementContext } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { ENGAGEMENT_GATES, CONFIG_SCHEMA_VERSION as SCHEMA } from "../src/config";
-import { BotAudienceTurnGuard, decideEngagement } from "../src/engagement/policy";
+import {
+	type BotAudienceLimits,
+	BotAudienceTurnGuard,
+	decideEngagement,
+	resolveBotAudienceLimits,
+} from "../src/engagement/policy";
 
 const OWNER = "660473980301344768";
 const STRANGER = "999999999999999999";
@@ -126,13 +131,61 @@ test("a Discord thread inherits its parent channel policy unless explicitly over
 	expect(decideEngagement(thread, ctx({ authorIsBot: true }), overridden).engaged).toBe(false);
 });
 
-test("bot audience turns are capped until a human message resets the conversation", () => {
+const CAP_ONE: BotAudienceLimits = { maxConsecutiveTurns: 1, maxTurnsPerWindow: 30 };
+const UNLIMITED: BotAudienceLimits = { maxTurnsPerWindow: 30 };
+
+test("a configured consecutive cap holds until a human message resets the conversation", () => {
 	const guard = new BotAudienceTurnGuard();
-	expect(guard.canAdmit("discord:channel:c1")).toBe(true);
+	expect(guard.canAdmit("discord:channel:c1", CAP_ONE).admit).toBe(true);
 	guard.recordBotAdmission("discord:channel:c1");
-	expect(guard.canAdmit("discord:channel:c1")).toBe(false);
+	expect(guard.canAdmit("discord:channel:c1", CAP_ONE)).toEqual({ admit: false, reason: "budget_spent" });
 	guard.recordHumanMessage("discord:channel:c1");
-	expect(guard.canAdmit("discord:channel:c1")).toBe(true);
+	expect(guard.canAdmit("discord:channel:c1", CAP_ONE).admit).toBe(true);
+});
+
+test("without a configured cap bot turns keep being admitted without a human in between", () => {
+	const guard = new BotAudienceTurnGuard();
+	for (let turn = 0; turn < 10; turn++) {
+		expect(guard.canAdmit("discord:channel:c1", UNLIMITED).admit).toBe(true);
+		guard.recordBotAdmission("discord:channel:c1", `bot-${turn}`);
+	}
+	expect(guard.consecutiveTurns("discord:channel:c1")).toBe(10);
+});
+
+test("the rolling-window rate limit stops a runaway loop and is not reset by a human message", () => {
+	const guard = new BotAudienceTurnGuard();
+	const limits: BotAudienceLimits = { maxTurnsPerWindow: 3 };
+	const start = 1_000_000;
+	for (let turn = 0; turn < 3; turn++) {
+		expect(guard.canAdmit("discord:channel:c1", limits, start + turn).admit).toBe(true);
+		guard.recordBotAdmission("discord:channel:c1", `bot-${turn}`, start + turn);
+	}
+	expect(guard.canAdmit("discord:channel:c1", limits, start + 3)).toEqual({ admit: false, reason: "rate_limited" });
+	guard.recordHumanMessage("discord:channel:c1", start + 4);
+	expect(guard.canAdmit("discord:channel:c1", limits, start + 5)).toEqual({ admit: false, reason: "rate_limited" });
+	// The window, not the conversation, is what releases the runaway guard.
+	expect(guard.canAdmit("discord:channel:c1", limits, start + 60_001).admit).toBe(true);
+});
+
+test("bot budgets resolve channel entry first, then the global default, then the built-in", () => {
+	const origin = { platform: "discord" as const, conversationId: "c1" };
+	expect(resolveBotAudienceLimits(origin, config({ mentionAllowlist: [OWNER] }))).toEqual({ maxTurnsPerWindow: 30 });
+	expect(
+		resolveBotAudienceLimits(
+			origin,
+			config({ botAudience: { maxConsecutiveTurns: 4, maxTurnsPerWindow: 9 }, mentionAllowlist: [OWNER] }),
+		),
+	).toEqual({ maxConsecutiveTurns: 4, maxTurnsPerWindow: 9 });
+	expect(
+		resolveBotAudienceLimits(
+			origin,
+			config({
+				botAudience: { maxConsecutiveTurns: 4, maxTurnsPerWindow: 9 },
+				channels: { "discord:c1": { engagement: "open", audience: "all", botAudienceMaxConsecutiveTurns: 2 } },
+				mentionAllowlist: [OWNER],
+			}),
+		),
+	).toEqual({ maxConsecutiveTurns: 2, maxTurnsPerWindow: 9 });
 });
 
 describe("default", () => {

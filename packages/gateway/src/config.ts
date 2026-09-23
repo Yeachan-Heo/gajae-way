@@ -93,6 +93,22 @@ export interface GatewayConfigFile {
 	readonly runtime?: RuntimeConfig;
 	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
 	readonly work?: WorkLaneConfig;
+	/** Global default bot-audience budget; channel entries override it field by field. */
+	readonly botAudience?: BotAudienceConfig;
+}
+
+export interface BotAudienceConfig {
+	/**
+	 * Consecutive bot-authored turns per conversation before a human message is
+	 * required. Unset is unlimited: multi-agent collaboration in one thread is a
+	 * normal pattern, and runaway loops are bounded by the rate limit instead.
+	 */
+	readonly maxConsecutiveTurns?: number;
+	/**
+	 * Bot admissions per conversation inside a rolling minute. Always active;
+	 * unset uses DEFAULT_BOT_AUDIENCE_TURNS_PER_WINDOW.
+	 */
+	readonly maxTurnsPerWindow?: number;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -130,6 +146,10 @@ export interface ChannelPolicy extends ChannelEngagementPolicy {
 	readonly engagement?: EngagementGate;
 	/** Authors who receive the open/mention-open behavior. Unset is `human-only`. */
 	readonly audience?: EngagementAudience;
+	/** Per-channel override of `botAudience.maxConsecutiveTurns`. Unset inherits; the global default is unlimited. */
+	readonly botAudienceMaxConsecutiveTurns?: number;
+	/** Per-channel override of `botAudience.maxTurnsPerWindow` (rolling minute). */
+	readonly botAudienceMaxTurnsPerWindow?: number;
 }
 
 export interface ConfigOverrides {
@@ -265,14 +285,47 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 					"config_invalid",
 					`channels.${conversationId}.${removed} was removed: every message is steered or sent immediately; delete it from the configuration`,
 				);
-		if (Object.keys(item).some((key) => key !== "engagement" && key !== "audience"))
+		const known = ["engagement", "audience", "botAudienceMaxConsecutiveTurns", "botAudienceMaxTurnsPerWindow"] as const;
+		if (Object.keys(item).some((key) => !known.includes(key as (typeof known)[number])))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
+		const maxConsecutiveTurns = parsePositiveTurnCount(
+			item.botAudienceMaxConsecutiveTurns,
+			`channels.${conversationId}.botAudienceMaxConsecutiveTurns`,
+		);
+		const maxTurnsPerWindow = parsePositiveTurnCount(
+			item.botAudienceMaxTurnsPerWindow,
+			`channels.${conversationId}.botAudienceMaxTurnsPerWindow`,
+		);
 		channels[conversationId] = {
 			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
 			...(item.audience === undefined ? {} : { audience: item.audience as EngagementAudience }),
+			...(maxConsecutiveTurns === undefined ? {} : { botAudienceMaxConsecutiveTurns: maxConsecutiveTurns }),
+			...(maxTurnsPerWindow === undefined ? {} : { botAudienceMaxTurnsPerWindow: maxTurnsPerWindow }),
 		};
 	}
 	return channels;
+}
+
+/** Turn budgets are whole positive counts; 0 would mean "never admit", which `audience` already expresses. */
+function parsePositiveTurnCount(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 1)
+		throw new ConfigError("config_invalid", `${field} must be an integer of at least 1`);
+	return value as number;
+}
+
+function parseBotAudience(value: unknown): BotAudienceConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "botAudience");
+	for (const key of Object.keys(input))
+		if (key !== "maxConsecutiveTurns" && key !== "maxTurnsPerWindow")
+			throw new ConfigError("config_invalid", "botAudience contains an unknown field");
+	const maxConsecutiveTurns = parsePositiveTurnCount(input.maxConsecutiveTurns, "botAudience.maxConsecutiveTurns");
+	const maxTurnsPerWindow = parsePositiveTurnCount(input.maxTurnsPerWindow, "botAudience.maxTurnsPerWindow");
+	return {
+		...(maxConsecutiveTurns === undefined ? {} : { maxConsecutiveTurns }),
+		...(maxTurnsPerWindow === undefined ? {} : { maxTurnsPerWindow }),
+	};
 }
 
 function parseStallTimeout(value: unknown): number {
@@ -408,6 +461,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
+		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
 			: {
@@ -511,10 +565,11 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 
 /**
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
- * engagement/policy.ts), channels (engagement gates) and `stallTimeoutMs` (tail
- * liveness alarms). Each applies to the next actor event.
+ * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
+ * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
+ * applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy", "botAudience"] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [

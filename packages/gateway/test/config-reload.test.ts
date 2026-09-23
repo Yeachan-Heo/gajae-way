@@ -154,3 +154,26 @@ test("work lane limit changes require restart and retain the live limits", async
 	expect(result.changed).not.toContain("work");
 	expect(result.config.work).toEqual({ maxLanes: 4 });
 });
+
+test("bot audience budgets parse, default to unset, and reject non-positive counts", () => {
+	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("botAudience");
+	expect(parseConfigFile({ schemaVersion: 1, botAudience: { maxConsecutiveTurns: 3 } }).botAudience).toEqual({
+		maxConsecutiveTurns: 3,
+	});
+	expect(
+		parseConfigFile({
+			schemaVersion: 1,
+			channels: { c1: { engagement: "open", audience: "all", botAudienceMaxTurnsPerWindow: 5 } },
+		}).channels?.c1,
+	).toEqual({ engagement: "open", audience: "all", botAudienceMaxTurnsPerWindow: 5 });
+	for (const invalid of [0, -1, 2.5, "3"])
+		expect(() => parseConfigFile({ schemaVersion: 1, botAudience: { maxTurnsPerWindow: invalid } })).toThrow(
+			"botAudience.maxTurnsPerWindow must be an integer of at least 1",
+		);
+	expect(() => parseConfigFile({ schemaVersion: 1, botAudience: { maxTurns: 4 } })).toThrow(
+		"botAudience contains an unknown field",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, channels: { c1: { botAudienceCap: 4 } } })).toThrow(
+		"channels.c1 contains an unknown field",
+	);
+});
