@@ -235,6 +235,8 @@ export class GlobalGjcClient {
 	#started = false;
 	#epoch = 0;
 	#failures = 0;
+	/** Why the most recent observation failed; logged so an outage names its cause. */
+	#unavailableReason = "not observed";
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
@@ -388,6 +390,7 @@ export class GlobalGjcClient {
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			if (!discovery) {
 				this.#available = false;
+				this.#unavailableReason = describeDiscoveryFailure(await this.judgeLiveness());
 				return false;
 			}
 			const healthy = await bounded(
@@ -407,7 +410,10 @@ export class GlobalGjcClient {
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			this.#assertAgentDirIdentity();
 			this.#available = healthy;
-			if (!healthy) return false;
+			if (!healthy) {
+				this.#unavailableReason = `endpoint probe failed for live discovery pid ${discovery.pid}`;
+				return false;
+			}
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
 				this.#identity = identity;
@@ -424,6 +430,7 @@ export class GlobalGjcClient {
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {
 				this.#available = false;
+				this.#unavailableReason = `observation failed: ${error instanceof Error ? error.message : String(error)}`;
 				this.#log(error);
 			}
 			return false;
@@ -438,7 +445,12 @@ export class GlobalGjcClient {
 			this.#timer = undefined;
 			void this.#observe(epoch).then((healthy) => {
 				if (healthy) this.#failures = 0;
-				else this.#log(new GjcCliUnavailableError("global broker unavailable; observing without repair"));
+				else
+					this.#log(
+						new GjcCliUnavailableError(
+							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
+						),
+					);
 				this.#schedule(epoch);
 			});
 		}, wait);
@@ -688,6 +700,14 @@ function canonicalAgentDir(path: string): string {
 		if (parent === path) throw error;
 		return join(canonicalAgentDir(parent), basename(path));
 	}
+}
+/** Names why no fresh discovery record was usable, from the daemon's own file. */
+function describeDiscoveryFailure(verdict: BrokerLivenessVerdict): string {
+	if (verdict.state === "absent") return "discovery absent";
+	if (verdict.state === "live") return `discovery pid ${verdict.pid} rejected`;
+	return verdict.reason === "pid_dead"
+		? `discovery pid ${verdict.pid} is dead`
+		: `discovery pid ${verdict.pid} stopped heartbeating at ${new Date(verdict.heartbeatAt).toISOString()}`;
 }
 function validConfigName(value: string | undefined): string | undefined {
 	const name = value?.trim();

@@ -332,6 +332,35 @@ test("reconnection is read-only and only a changed incarnation advances generati
 	expect(commands).toBe(0);
 });
 
+test("each unavailable observation names why the broker was rejected", async () => {
+	// 2026-09-23: 484 identical "observing without repair" lines over 81 minutes
+	// could not tell a dead discovery pid from a live broker that refused the
+	// probe, so nobody could see the daemon was being killed under the gateway.
+	const agentDir = await directory();
+	await mkdir(join(agentDir, "sdk"));
+	const record = { ...discovery(), protocolVersion: 3, host: "127.0.0.1" };
+	await writeFile(join(agentDir, "sdk", "broker.json"), JSON.stringify(record));
+	let alive = true;
+	let probeOk = true;
+	const logs: string[] = [];
+	const value = client({
+		agentDir,
+		discovery: undefined,
+		isPidAlive: () => alive,
+		healthProbe: async () => probeOk,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		log: (line) => logs.push(line),
+	});
+	await value.start();
+	probeOk = false;
+	await eventually(() => logs.some((line) => line.includes("endpoint probe failed for live discovery pid 12345")));
+	alive = false;
+	await eventually(() => logs.some((line) => line.endsWith("observing without repair: discovery pid 12345 is dead)")));
+	await rm(join(agentDir, "sdk", "broker.json"));
+	await eventually(() => logs.some((line) => line.endsWith("observing without repair: discovery absent)")));
+});
+
 test("rejects retarget arguments before executing commands", async () => {
 	let calls = 0;
 	const value = client({
