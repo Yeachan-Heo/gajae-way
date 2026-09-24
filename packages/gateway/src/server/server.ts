@@ -34,13 +34,14 @@ import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
-import { kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
+import { type KevShadowInput, kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
 import {
 	BotAudienceTurnGuard,
 	decideEngagement,
 	resolveBotAudienceLimits,
 	threadFollowUpEngaged,
 } from "../engagement/policy";
+import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -1437,9 +1438,21 @@ async function sendChat(
 		});
 		return;
 	}
-	// Shadow-only measurement of a value gate on top of the authority decision.
-	// Deliberately not awaited: this turn must not wait on a model call, and the
-	// probe can never change `engaged`. No-op unless KEV_SHADOW_URL is set.
+	// Traffic nobody aimed at the persona may be silenced in code (#260): the
+	// prompt-level "[SILENT] only" rule does not hold. Owner, bots, DMs,
+	// mentions, replies to the persona and its own threads always bypass.
+	const speechGated = speechGateApplies({
+		originKind: origin.kind,
+		mentioned: engagement?.mentioned === true,
+		replyToSelf: engagement?.replyTo?.fromSelf === true,
+		threadFollowUp,
+		authorId: engagement?.authorId,
+		authorIsBot,
+		ownerId: ownerPeerIdOf(runtime.config),
+	});
+	// The value score on top of the authority decision. Measured in shadow on
+	// every engaged message; awaited, and able to skip the turn, only when the
+	// speech gate is enforced for this message. No-op unless KEV_SHADOW_URL is set.
 	if (kevShadowEnabled()) {
 		// A DM, an @mention, or a reply to this bot is traffic aimed at it, and which of
 		// the three it is changes how a short message reads.
@@ -1467,7 +1480,7 @@ async function sendChat(
 					.filter((entry) => entry.id === undefined || entry.id !== inboundMessageId)
 					.map((entry) => ({ author: entry.author, body: entry.body, at: entry.at }))
 			: [];
-		void recordKevShadow({
+		const shadowInput: KevShadowInput = {
 			originKey: key,
 			text: userText,
 			authorLabel: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
@@ -1478,7 +1491,18 @@ async function sendChat(
 			addressed: addressedBy !== undefined,
 			...(addressedBy ? { addressedBy } : {}),
 			authorIsBot,
-		});
+		};
+		if (!speechGated) void recordKevShadow(shadowInput);
+		else if (await preTurnSkip(shadowInput)) {
+			// Already recorded as context above; the next engaged turn reads it.
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { turnId: null, engaged: false },
+			});
+			return;
+		}
 	}
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
@@ -1489,7 +1513,11 @@ async function sendChat(
 		originKey: key,
 		originRefJson: JSON.stringify(origin),
 		body: userText,
-		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+		// The delivery-side gate needs the same bypass decision after a restart,
+		// so it travels with the durable row.
+		engagementJson: params.engagement
+			? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
+			: undefined,
 	});
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
@@ -1657,6 +1685,8 @@ async function createInboundTurnLifecycle(
 				channelLabel?: string;
 				serverLabel?: string;
 				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };
+				/** Set at intake by the speech gate (#260); absent means the reply is never judged. */
+				speechGated?: boolean;
 			})
 		: undefined;
 	const speaker = composeSpeakerLabel(engagement);
@@ -1746,7 +1776,20 @@ async function createInboundTurnLifecycle(
 	 * first pass and must not be claimed - or rejected as duplicates - again.
 	 */
 	const reactionsClaimedFor = new Set<string>();
-	const deliverAssistantText = (rawMessage: string, source: "interim" | "terminal") => {
+	/**
+	 * One verdict per part text: the terminal pass re-reads text the tail already
+	 * judged as interim, and must reach the same answer without a second call.
+	 */
+	const narrationVerdicts = new Map<string, Promise<boolean>>();
+	const isNarration = (part: string): Promise<boolean> => {
+		let verdict = narrationVerdicts.get(part);
+		if (!verdict) {
+			verdict = isAbstentionNarration(key, userText, part);
+			narrationVerdicts.set(part, verdict);
+		}
+		return verdict;
+	};
+	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		let message = rawMessage;
 		const reactionReply = parseReactionReply(message);
@@ -1787,11 +1830,19 @@ async function createInboundTurnLifecycle(
 		// part is judged by whether it CONTAINS the token, not whether it equals it:
 		// any part carrying a silence token is dropped whole, and [REPLY:id] is
 		// honoured wherever it appears and always stripped from the delivered text.
-		const parts = message
+		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
 			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
 			.slice(0, 5);
+		// A persona that decided not to speak often says so instead of emitting
+		// the token (#260). On gated traffic, such a part is dropped like one.
+		const parts =
+			engagement?.speechGated === true
+				? (await Promise.all(spokenParts.map(async (part) => ((await isNarration(part)) ? undefined : part)))).filter(
+						(part): part is string => part !== undefined,
+					)
+				: spokenParts;
 		// Slack replies default INTO a thread when the persona names no target:
 		// - a channel mention is answered in a thread rooted at the triggering
 		//   message (the room stays readable; the conversation continues in the
@@ -1930,7 +1981,7 @@ async function createInboundTurnLifecycle(
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				deliverAssistantText(frame.assistantText, "interim");
+				await deliverAssistantText(frame.assistantText, "interim");
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -2024,7 +2075,7 @@ async function createInboundTurnLifecycle(
 			// answer for the same trigger finds every slot unowned and posts. The
 			// former "same text → skip" shortcut left that hole whenever the
 			// finalized frame arrived on the tail before onTerminal.
-			deliverAssistantText(text, "terminal");
+			await deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
 					runtime.memory.enqueue({
