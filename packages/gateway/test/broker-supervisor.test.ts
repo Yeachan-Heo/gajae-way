@@ -9,6 +9,7 @@ import {
 	HEALTH_PROBE_SESSION_ID,
 	isHealthySessionList,
 	isLoopbackWebSocketUrl,
+	isUsageRejection,
 	preflightGjcRuntime,
 	probeBrokerEndpoint,
 	readBrokerDiscovery,
@@ -276,7 +277,7 @@ test("no discovery launches only a read-only explicit all-scope readiness reques
 		},
 	});
 	await value.start();
-	expect(calls).toEqual([["sdk", "session", "--agent-dir", value.agentDir, "list", "--scope", "all"]]);
+	expect(calls).toEqual([["sdk", "session", "list", "--scope", "all", "--agent-dir", value.agentDir]]);
 	expect(value.generation).toBe(1);
 });
 
@@ -641,6 +642,51 @@ test("preflight fails closed when the stream relay rejects its argv (usage exit 
 	const runtime = async (args: readonly string[]) =>
 		args[1] === "serve" ? { exitCode: 1, stdout: "", stderr: "not_found: session is not indexed\n" } : healthy;
 	await expect(preflightGjcRuntime(run, "0.15.6", runtime)).resolves.toEqual({ version: "0.16.6" });
+});
+
+test("the gjc 0.17.4 structured usage envelope is a usage rejection; runtime envelopes are not", () => {
+	// Verbatim shape of the official 0.17.4 binary rejecting `sdk session inspect <id> --repo <dir>`.
+	const rejected = {
+		exitCode: 2,
+		stdout: "",
+		stderr:
+			'COMMAND ["sdk","session","inspect"]\nERROR {"code":"usage","category":"usage","message":"The command arguments are invalid.","retryability":"no","outcomeCertainty":"not-applied","references":[]}\n',
+	};
+	expect(isUsageRejection(rejected)).toBe(true);
+	// Same binary, parsed argv, broker absent: exit 1 with a runtime code.
+	expect(
+		isUsageRejection({
+			exitCode: 1,
+			stdout: "",
+			stderr: 'ERROR {"code":"endpoint_stale","category":"unavailable"}\n',
+		}),
+	).toBe(false);
+	// Exit 2 alone is not proof of an argv rejection.
+	expect(isUsageRejection({ exitCode: 2, stdout: "", stderr: 'ERROR {"code":"broker_unavailable"}\n' })).toBe(false);
+});
+
+test("every sdk session call binds --agent-dir at the leaf, never between `session` and the leaf", async () => {
+	const calls: string[][] = [];
+	const value = client({
+		command: async (args) => {
+			calls.push([...args]);
+			return healthy;
+		},
+	});
+	await value.start();
+	for (const leaf of [
+		["inspect", "s-1"],
+		["status", "s-1", "op-1"],
+		["raw", "query", "s-1", "--query", "transcript.list"],
+		["raw", "global", "--op", "session.close"],
+	]) {
+		await value.cli(["sdk", "session", ...leaf]);
+	}
+	for (const args of calls) {
+		expect(args[2]).not.toBe("--agent-dir");
+		expect(args.slice(-2)).toEqual(["--agent-dir", value.agentDir]);
+	}
+	expect(calls.length).toBe(4);
 });
 
 test("relay stdout and stderr are decoded independently: a multibyte character split across stdout chunks survives interleaved stderr and stderr EOF", async () => {

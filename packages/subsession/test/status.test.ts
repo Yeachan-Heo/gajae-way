@@ -257,7 +257,7 @@ describe("fetchOpState", () => {
 			},
 		};
 		const report = await fetchOpState(options, SESSION, "gw-1");
-		expect(calls[0]).toEqual(["sdk", "session", "status", SESSION, "gw-1", "--repo", WORKTREE]);
+		expect(calls[0]).toEqual(["sdk", "session", "status", SESSION, "gw-1"]);
 		expect(report.status.status).toBe("accepted");
 	});
 

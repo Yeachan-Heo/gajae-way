@@ -14,7 +14,7 @@
  */
 
 import type { ControllerOptions } from "./cli";
-import { parseEnvelope } from "./cli";
+import { parseEnvelope, sessionArgs } from "./cli";
 
 export type TranscriptPage = {
 	readonly text: string;
@@ -78,19 +78,16 @@ export async function fetchLastAssistant(
 	let pages = 0;
 
 	for (;;) {
-		const raw = await options.run([
-			"sdk",
-			"session",
-			...(options.agentDir ? ["--agent-dir", options.agentDir] : []),
-			"raw",
-			"query",
-			sessionId,
-			"--query",
-			"session.last_assistant",
-			"--repo",
-			options.repo,
-			...(cursor ? ["--cursor", cursor] : []),
-		]);
+		const raw = await options.run(
+			sessionArgs(options, [
+				"raw",
+				"query",
+				sessionId,
+				"--query",
+				"session.last_assistant",
+				...(cursor ? ["--cursor", cursor] : []),
+			]),
+		);
 		const payload = parseEnvelope<Record<string, unknown>>(raw, "session raw query");
 		const page = parsePage(payload);
 		pages += 1;
@@ -158,19 +155,7 @@ async function rawQuery(
 	query: string,
 	extra: readonly string[] = [],
 ): Promise<Record<string, unknown>> {
-	const raw = await options.run([
-		"sdk",
-		"session",
-		...(options.agentDir ? ["--agent-dir", options.agentDir] : []),
-		"raw",
-		"query",
-		sessionId,
-		"--query",
-		query,
-		"--repo",
-		options.repo,
-		...extra,
-	]);
+	const raw = await options.run(sessionArgs(options, ["raw", "query", sessionId, "--query", query, ...extra]));
 	return parseEnvelope<Record<string, unknown>>(raw, `session raw query ${query}`);
 }
 

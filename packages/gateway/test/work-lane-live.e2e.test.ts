@@ -355,8 +355,6 @@ liveTest(
 				activeSessionId,
 				"--op",
 				"turn.steer",
-				"--repo",
-				repo,
 				"--json-input",
 				JSON.stringify({
 					text: `Replace the remaining answer with exactly WORK_LANE_LIVE_OK ${steerMarker}.`,
@@ -423,7 +421,7 @@ liveTest(
 					(row: { sessionId: string }) => row.sessionId === sessionId,
 				),
 			).toBe(true);
-			const inspected = await independent(["inspect", sessionId, "--repo", repo]);
+			const inspected = await independent(["inspect", sessionId]);
 			expect(inspected.session.sessionId).toBe(sessionId);
 			expect(inspected.session.live).toBe(true);
 			await manager.stop();
@@ -435,7 +433,7 @@ liveTest(
 			).toBe(true);
 			await broker.start();
 			expect(broker.generation).toBe(generation);
-			expect((await independent(["inspect", sessionId, "--repo", repo])).session.live).toBe(true);
+			expect((await independent(["inspect", sessionId])).session.live).toBe(true);
 		} catch {
 			// Freeze primary evidence before cleanup can issue more SDK requests.
 			failures.push({

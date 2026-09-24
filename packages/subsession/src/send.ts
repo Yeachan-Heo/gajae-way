@@ -14,7 +14,7 @@
  */
 
 import type { ControllerOptions } from "./cli";
-import { GjcCliError, parseEnvelope } from "./cli";
+import { GjcCliError, parseEnvelope, sessionArgs } from "./cli";
 import {
 	fetchOpState,
 	isTerminalStatus,
@@ -136,20 +136,15 @@ export async function sendPrompt(options: ControllerOptions, input: SendPromptIn
 	assertValidOpRef(opRef);
 	input.ledger?.issue(input.sessionId, opRef);
 
-	const args = [
-		"sdk",
-		"session",
-		...(options.agentDir ? ["--agent-dir", options.agentDir] : []),
+	const args = sessionArgs(options, [
 		"send",
 		input.sessionId,
-		"--repo",
-		options.repo,
 		"--text",
 		input.text,
 		"--op-ref",
 		opRef,
 		...(input.waitTimeoutMs === undefined ? [] : ["--wait", "--timeout-ms", String(input.waitTimeoutMs)]),
-	];
+	]);
 
 	const raw = await options.run(args, {
 		...(input.waitTimeoutMs === undefined ? {} : { timeoutMs: input.waitTimeoutMs + 5_000 }),
