@@ -60,3 +60,24 @@ test("a closure commit tracks every axis, not only the capture axis", async () =
 	// And the corpus is clean: nothing was left behind as an uncommitted change.
 	expect((await memoryGit(root, ["status", "--porcelain"])).trim()).toBe("");
 });
+
+test("a failing memory intent is contained at the worker and later intents still close (#227)", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const queue = new MemoryClosureQueue(database, home);
+	await queue.initialize();
+
+	const broken = crypto.randomUUID();
+	database.memoryIntentCreate({ id: broken, kind: "daily_capture", payloadJson: "{}" });
+	queue.enqueueExistingId(broken);
+	const good = queue.enqueue({ kind: "daily_capture", originRefJson: "{}", userText: "u", replyText: "r" });
+
+	// Before the fix the rejected tail was an unhandled rejection (gateway exit)
+	// and the good intent behind it never ran.
+	await queue.drain();
+	expect(queue.failures).toBe(1);
+	const states = new Map(database.memoryIntentRows().map((row) => [row.id, row.state]));
+	expect(states.get(good)).toBe("receipted");
+	// The failed intent stays non-terminal so boot recovery retries it.
+	expect(states.get(broken)).toBe("queued");
+});

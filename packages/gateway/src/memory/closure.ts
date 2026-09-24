@@ -29,6 +29,8 @@ export class MemoryClosureQueue {
 	readonly #home: string;
 	#tail: Promise<void> = Promise.resolve();
 	#depth = 0;
+	/** Intents whose processing failed in this process and were left for boot recovery. */
+	failures = 0;
 	#initializing: Promise<RecoveryReport> | undefined;
 	readonly recovery: RecoveryReport = { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 };
 
@@ -42,7 +44,14 @@ export class MemoryClosureQueue {
 	}
 
 	initialize(): Promise<RecoveryReport> {
-		if (!this.#initializing) this.#initializing = this.#initialize();
+		if (!this.#initializing) {
+			// A failed initialization is not cached: now that a fault no longer exits
+			// the process, a cached rejection would fail every later intent until restart.
+			this.#initializing = this.#initialize().catch((error: unknown) => {
+				this.#initializing = undefined;
+				throw error;
+			});
+		}
 		return this.#initializing;
 	}
 
@@ -65,16 +74,7 @@ export class MemoryClosureQueue {
 		// The SQLite insert is the acceptance boundary; work starts only after it returns.
 		this.#database.memoryIntentCreate({ id, kind: mutation.kind, payloadJson: JSON.stringify(mutation) });
 		this.#kill("after-intent");
-		this.#depth++;
-		this.#tail = this.#tail.then(async () => {
-			try {
-				await this.initialize();
-				const intent = this.#database.memoryIntentRows().find((row) => row.id === id);
-				if (intent && intent.state !== "receipted" && intent.state !== "quarantined") await this.#process(intent);
-			} finally {
-				this.#depth--;
-			}
-		});
+		this.#schedule(id);
 		return id;
 	}
 
@@ -87,12 +87,28 @@ export class MemoryClosureQueue {
 	 * each call re-reads current state and skips terminal intents.
 	 */
 	enqueueExistingId(id: string): void {
+		this.#schedule(id);
+	}
+
+	/**
+	 * The worker boundary. A memory fault (a lost map rename #227, a failed git
+	 * commit #192) must never escape: nothing awaits `#tail` until shutdown, so a
+	 * rejection here was an unhandled rejection that exited the whole gateway, and
+	 * a rejected tail would also have skipped every later intent. The failed
+	 * intent keeps its non-terminal durable state, so boot recovery retries it.
+	 */
+	#schedule(id: string): void {
 		this.#depth++;
 		this.#tail = this.#tail.then(async () => {
 			try {
 				await this.initialize();
 				const intent = this.#database.memoryIntentRows().find((row) => row.id === id);
 				if (intent && intent.state !== "receipted" && intent.state !== "quarantined") await this.#process(intent);
+			} catch (error) {
+				this.failures++;
+				console.error(
+					`memory intent ${id} failed; left for boot recovery: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			} finally {
 				this.#depth--;
 			}

@@ -33,23 +33,32 @@ function gitEnv(): Record<string, string> {
  * failed: index.lock exists`, gaebal, 2026-09-05). Git's lock is per-process,
  * not per-caller, so the serialization has to be ours.
  */
-const rootChains = new Map<string, Promise<void>>();
+const gitChains = new Map<string, Promise<void>>();
 
-export async function memoryGit(root: string, args: readonly string[]): Promise<string> {
-	const previous = rootChains.get(root) ?? Promise.resolve();
+/** Runs `work` after every earlier call on the same `root` in `chains` has settled. */
+async function serializedOnRoot<T>(
+	chains: Map<string, Promise<void>>,
+	root: string,
+	work: () => Promise<T>,
+): Promise<T> {
+	const previous = chains.get(root) ?? Promise.resolve();
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => {
 		release = resolve;
 	});
 	const chain = previous.then(() => gate);
-	rootChains.set(root, chain);
+	chains.set(root, chain);
 	await previous;
 	try {
-		return await memoryGitUnserialized(root, args);
+		return await work();
 	} finally {
 		release();
-		if (rootChains.get(root) === chain) rootChains.delete(root);
+		if (chains.get(root) === chain) chains.delete(root);
 	}
+}
+
+export function memoryGit(root: string, args: readonly string[]): Promise<string> {
+	return serializedOnRoot(gitChains, root, () => memoryGitUnserialized(root, args));
 }
 
 /** git's lock file; an orphan (no live git on this repo) blocks every later write until removed by hand. */
@@ -278,7 +287,16 @@ export function mapListsAxis(map: string, axis: AxisDescriptor): boolean {
  * and a trimmed axis points at an existing index when one is available. No axis
  * is special-cased by id.
  */
-export async function regenerateMap(root: string, registry?: AxisRegistry): Promise<void> {
+export function regenerateMap(root: string, registry?: AxisRegistry): Promise<void> {
+	// One regeneration per corpus at a time: the closure queue, `initializeMemory`
+	// and the autolink sweep all regenerate the same map, and two overlapping
+	// renders of a corpus that changes between them must not interleave (#227).
+	return serializedOnRoot(mapChains, root, () => regenerateMapUnserialized(root, registry));
+}
+
+const mapChains = new Map<string, Promise<void>>();
+
+async function regenerateMapUnserialized(root: string, registry?: AxisRegistry): Promise<void> {
 	const axes = (registry ?? (await loadRegistry(root))).axes;
 	const files = await Promise.all(axes.map((axis) => axisEntries(root, axis)));
 	const indexed = axes.map((axis, index) => {
@@ -369,10 +387,18 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	// capture regenerates it: a truncate-then-write would let a reader observe a
 	// half-written map and report spurious dangling pointers or missing axes. The
 	// temp name deliberately does not end in `.md`, so no walker ever indexes it.
+	// The name is unique per write: another gateway process on the same corpus
+	// (an adopted orphan, #183) is outside the in-process serialization, and a
+	// shared name let the loser's rename hit ENOENT after the winner moved it (#227).
 	const target = join(root, "MEMORY.md");
-	const staging = `${target}.staging`;
-	await writeFile(staging, map);
-	await rename(staging, target);
+	const staging = `${target}.${process.pid}.${crypto.randomUUID()}.staging`;
+	try {
+		await writeFile(staging, map);
+		await rename(staging, target);
+	} catch (error) {
+		await unlink(staging).catch(() => {});
+		throw error;
+	}
 }
 
 /**
