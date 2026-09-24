@@ -1,19 +1,16 @@
 /**
- * Shadow measurement for a would-be value gate on engaged turns.
+ * Value score for engaged turns, measured in shadow and optionally enforced.
  *
  * `decideEngagement` answers authority: may this author open a turn here. It
  * does not answer value: is this message worth a turn at all. Archived sweep
  * records ended in NO_REPLY 495 times out of 505, so the value question is
- * worth measuring — but measuring is all this file does.
+ * worth measuring.
  *
- * Three properties make it safe to ship on by default being OFF:
- *
- *   1. It never returns a decision. Nothing here feeds `engaged`.
- *   2. It never blocks the turn. The probe is fire-and-forget; awaiting a
- *      ~500 ms model call on every inbound message would itself be the
- *      behaviour change this shadow exists to avoid.
- *   3. It is disabled unless `KEV_SHADOW_URL` is set, so a deploy with no
- *      configuration is a no-op.
+ * Measuring is all this file does by itself: `recordKevShadow` is
+ * fire-and-forget and never feeds `engaged`. Acting on the score is the
+ * speech gate's job (`speech-gate.ts`), which is off unless `KEV_GATE_MODE`
+ * is `enforce`. Everything is disabled unless `KEV_SHADOW_URL` is set, so a
+ * deploy with no configuration is a no-op.
  *
  * Output is one structured line per probe, greppable out of the gateway log:
  *   kev-shadow origin=<key> help=.. directed=.. ack=.. isAnswer=.. chatter=..
@@ -184,7 +181,12 @@ export function shadowScore(probs: readonly number[]): ShadowVerdict {
 	return { help, directed, ack, isAnswer, chatter, score, verdict };
 }
 
-async function probe(state: string): Promise<number[] | null> {
+/**
+ * One call to the gate model: the probability of `yes` for each question, in
+ * order, or null when the gate is unconfigured, slow, or answers malformed.
+ * Callers treat null as "no opinion"; no caller may fail closed on it.
+ */
+export async function probeGate(state: string, questions: readonly string[]): Promise<number[] | null> {
 	const base = process.env[URL_ENV];
 	if (!base) return null;
 	const token = process.env[TOKEN_ENV];
@@ -199,13 +201,13 @@ async function probe(state: string): Promise<number[] | null> {
 			},
 			body: JSON.stringify({
 				state,
-				questions: QUESTIONS.map((instr) => ({ instr, options: ["no", "yes"] })),
+				questions: questions.map((instr) => ({ instr, options: ["no", "yes"] })),
 			}),
 			signal: controller.signal,
 		});
 		if (!res.ok) return null;
 		const body = (await res.json()) as { probs?: number[][] };
-		if (!Array.isArray(body.probs) || body.probs.length !== QUESTIONS.length) return null;
+		if (!Array.isArray(body.probs) || body.probs.length !== questions.length) return null;
 		return body.probs.map((p) => (Array.isArray(p) && typeof p[1] === "number" ? p[1] : 0));
 	} catch {
 		return null;
@@ -230,10 +232,19 @@ export function shadowClass(input: KevShadowInput): "machine" | "addressed" | "a
  * the turn must not wait on this, and a failed probe must not surface.
  */
 export async function recordKevShadow(input: KevShadowInput): Promise<void> {
-	if (!kevShadowEnabled() || !input.text.trim()) return;
+	await judgeKevShadow(input);
+}
+
+/**
+ * Score one message and write the same log line the shadow always wrote.
+ * Null when the gate is off or did not answer. The speech gate awaits this;
+ * everything else goes through `recordKevShadow`.
+ */
+export async function judgeKevShadow(input: KevShadowInput): Promise<ShadowVerdict | null> {
+	if (!kevShadowEnabled() || !input.text.trim()) return null;
 	const started = Date.now();
-	const probs = await probe(renderShadowState(input));
-	if (!probs) return;
+	const probs = await probeGate(renderShadowState(input), QUESTIONS);
+	if (!probs) return null;
 	const s = shadowScore(probs);
 	const f = (n: number) => n.toFixed(4);
 	console.error(
@@ -242,4 +253,5 @@ export async function recordKevShadow(input: KevShadowInput): Promise<void> {
 			`addressed=${input.addressed ? (input.addressedBy ?? "1") : "0"} ctx=${input.earlier?.length ?? 0} ` +
 			`class=${shadowClass(input)} ms=${Date.now() - started}`,
 	);
+	return s;
 }

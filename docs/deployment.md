@@ -229,6 +229,21 @@ Use `'null'` only when inspection reports `oldAuthority: null`; otherwise supply
 
 Deployment acceptance requires a newly gateway-created session to be visible through the normal user's SDK and the gateway with the exact same session ID. Record unrelated user session IDs and configuration fingerprints before deployment; verify they remain unchanged afterward. The current blocker is that SDK global model controls can modify user configuration: verify configuration invariance through session creation and model controls, not just executable/profile parity or a successful cutover. Do not mask a failure with automatic global configuration restore. Verify the existing user daemon survives a gateway restart and owned work remains observable without resend. These are required observations, not a claim that production is deployed or healthy.
 
+## Speech gate
+
+A persona told in its prompt to answer `[SILENT]` when it will not speak sometimes posts its reasoning instead ("not my lane, only recording this"). The speech gate makes that decision in code. It uses the same gate model as the kev value shadow and is off by default:
+
+- `KEV_SHADOW_URL` (and `KEV_SHADOW_TOKEN` if the model needs one): the gate model. Without it, the gate and the shadow are both no-ops.
+- `KEV_GATE_MODE=enforce`: turn the gate on for this gateway. Any other value, or no value, only measures (`kev-shadow` log lines).
+- `KEV_GATE_ABSTAIN_UNDER` (default `0.35`): the cut for dropping a reply part as abstention narration.
+
+It applies only to group-channel messages that are not addressed to the persona. DMs, @mentions, replies to the persona, threads it is already talking in, the owner (`ownerTarget` peer), and bot authors always bypass it. For gated messages:
+
+1. A message the value score reads as `would-skip` opens no turn. It is still recorded as context, and the gateway logs `speech-gate skip`.
+2. A reply part the gate model reads as not responding to the message is not delivered. The gateway logs `speech-gate drop` with the dropped text, so false drops can be audited.
+
+If the gate model is unreachable, both steps fail open: the turn runs and the reply is delivered.
+
 ## Troubleshooting
 
 - **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
