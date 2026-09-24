@@ -19,7 +19,17 @@ export interface GatewayStatusResult {
 	/** Session census (grows in later phases). */
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
-	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
+	readonly delivery?: {
+		readonly pending: number;
+		readonly oldestPendingAgeMs: number | null;
+		readonly expired: number;
+		readonly recentExpired: readonly {
+			readonly deliveryId: string;
+			readonly originKey: string;
+			readonly attempts: number;
+			readonly expiredAt: string;
+		}[];
+	};
 	/** Aggregate-only conversation diff health; never includes message bodies. */
 	readonly contextDiff?: ConversationContextDiagnostics;
 	/**
@@ -267,6 +277,11 @@ export interface DeliveryFailParams {
 	readonly reason: string;
 	/** True when the send may have reached the platform (ambiguous outcome). */
 	readonly ambiguous?: boolean;
+}
+
+export interface OpsRedeliverParams {
+	readonly deliveryId?: string;
+	readonly since?: string;
 }
 
 /**
@@ -734,6 +749,7 @@ export interface VerbCatalogV01 {
 		params: { readonly path: string };
 		result: { readonly path: string; readonly bytes: number };
 	};
+	"ops.redeliver": { params: OpsRedeliverParams; result: { readonly requeued: readonly string[] } };
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
@@ -772,6 +788,7 @@ export const VERBS_V01 = [
 	"monitor.test",
 	"monitor.remove",
 	"ops.backup",
+	"ops.redeliver",
 	"ops.integrity",
 	"work.run",
 	"work.start",

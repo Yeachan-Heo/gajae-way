@@ -2381,6 +2381,53 @@ export class GatewayDatabase {
 			.run(state, attempts ?? null, new Date().toISOString(), id);
 	}
 
+	deliveryExpireBefore(
+		before: string,
+		expiredAt: string,
+	): Array<{
+		delivery_id: string;
+		origin_key: string;
+		attempts: number;
+		updated_at: string;
+	}> {
+		const rows = this.#database
+			.query<{ delivery_id: string; origin_key: string; attempts: number }, [string]>(
+				"SELECT delivery_id, origin_key, attempts FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			)
+			.all(before);
+		if (rows.length === 0) return [];
+		this.#database
+			.query(
+				"UPDATE deliveries SET state = 'expired', updated_at = ? WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			)
+			.run(expiredAt, before);
+		return rows.map((row) => ({ ...row, updated_at: expiredAt }));
+	}
+
+	deliveryRequeueById(id: string): string[] {
+		const changed = this.#database
+			.query(
+				"UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE delivery_id = ? AND state IN ('expired', 'failed_ambiguous', 'pending')",
+			)
+			.run(new Date().toISOString(), id).changes;
+		return changed === 1 ? [id] : [];
+	}
+
+	deliveryRequeueSince(since: string): string[] {
+		const rows = this.#database
+			.query<{ delivery_id: string }, [string]>(
+				"SELECT delivery_id FROM deliveries WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ? ORDER BY updated_at, delivery_id",
+			)
+			.all(since);
+		if (rows.length === 0) return [];
+		this.#database
+			.query(
+				"UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ?",
+			)
+			.run(new Date().toISOString(), since);
+		return rows.map((row) => row.delivery_id);
+	}
+
 	deliveryRows(): Array<{
 		delivery_id: string;
 		turn_id: string;

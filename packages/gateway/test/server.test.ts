@@ -2,12 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { originKey } from "@gajae-gateway/protocol";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { DeliveryLedger } from "../src/store/ledger";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -71,6 +73,41 @@ function bindWorkFixture(key: string, epoch: number, preferred?: string): string
 async function waitFrame(frames: any[], id: string): Promise<void> {
 	for (let attempt = 0; attempt < 600 && !frames.some((frame) => frame.id === id); attempt++) await Bun.sleep(5);
 	expect(frames.some((frame) => frame.id === id)).toBe(true);
+}
+
+async function startDeliveryServer(
+	options: { ownerTarget?: GatewayConfig["ownerTarget"]; deliverySweepIntervalMs?: number } = {},
+) {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-delivery-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "the single reply body",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		onStop: () => database.close(),
+		...(options.deliverySweepIntervalMs === undefined
+			? {}
+			: { deliverySweepIntervalMs: options.deliverySweepIntervalMs }),
+	});
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	return { client, config, database };
 }
 
 test("requires negotiation then serves status, shutdown, and validates chat params", async () => {
@@ -146,6 +183,228 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		result: { stopping: true },
 	});
 	expect(client.frames.some((frame) => frame.event === "gateway.stopping")).toBe(true);
+	client.close();
+});
+
+test("a connected adapter receives a failed delivery again on the periodic sweep", async () => {
+	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 100 });
+	const origin = { platform: "discord", kind: "dm", conversationId: "delivery-test", peerId: "owner" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "create-delivery",
+		verb: "chat.send",
+		params: { origin, text: "trigger", engagement: { mentioned: false, group: false, authorId: "owner" } },
+	});
+	await waitFrame(client.frames, "create-delivery");
+	for (let attempt = 0; attempt < 400 && !client.frames.some((frame) => frame.event === "chat.message"); attempt++)
+		await Bun.sleep(5);
+	const initial = client.frames.find(
+		(frame) => frame.event === "chat.message" && frame.payload?.text === "the single reply body",
+	);
+	expect(initial).toBeDefined();
+	const deliveryId = initial.payload.deliveryId as string;
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "first-fail",
+		verb: "delivery.fail",
+		params: { deliveryId, reason: "platform_rejected", ambiguous: false },
+	});
+	await waitFrame(client.frames, "first-fail");
+	expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
+		state: "pending",
+		attempts: 1,
+	});
+	const messagesBeforeRetry = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+	for (
+		let attempt = 0;
+		attempt < 1_000 &&
+		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId)
+			.length <= messagesBeforeRetry;
+		attempt++
+	)
+		await Bun.sleep(5);
+	const deliveryMessages = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	);
+	expect(deliveryMessages.length).toBeGreaterThan(messagesBeforeRetry);
+	const redelivery = deliveryMessages.at(-1);
+	expect(redelivery?.payload).toMatchObject({ deliveryId, redelivered: true });
+	expect(
+		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId),
+	).toHaveLength(2);
+	client.close();
+});
+
+test("expiry logs and notifies the owner once, while status exposes metadata without payload", async () => {
+	const logs: string[] = [];
+	const originalError = console.error;
+	console.error = (...values: unknown[]) => logs.push(values.map(String).join(" "));
+	const ownerTarget = {
+		origin: { platform: "discord" as const, kind: "dm" as const, conversationId: "owner", peerId: "owner" },
+	};
+	try {
+		const { client, database } = await startDeliveryServer({ ownerTarget });
+		const origin = { platform: "discord", kind: "dm", conversationId: "delivery-test", peerId: "owner" };
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "create-delivery",
+			verb: "chat.send",
+			params: { origin, text: "trigger", engagement: { mentioned: false, group: false, authorId: "owner" } },
+		});
+		await waitFrame(client.frames, "create-delivery");
+		for (let attempt = 0; attempt < 400 && !client.frames.some((frame) => frame.event === "chat.message"); attempt++)
+			await Bun.sleep(5);
+		const reply = client.frames.find(
+			(frame) => frame.event === "chat.message" && frame.payload?.text === "the single reply body",
+		);
+		expect(reply).toBeDefined();
+		const deliveryId = reply.payload.deliveryId as string;
+		for (let attempt = 1; attempt <= 5; attempt++) {
+			const id = `fail-${attempt}`;
+			client.send({
+				v: "0.1",
+				type: "request",
+				id,
+				verb: "delivery.fail",
+				params: { deliveryId, reason: "adapter_failure", ambiguous: false },
+			});
+			await waitFrame(client.frames, id);
+		}
+		expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
+			state: "expired",
+			attempts: 5,
+		});
+		for (
+			let attempt = 0;
+			attempt < 400 && !client.frames.some((frame) => frame.payload?.deliveryId?.startsWith("gw-x-"));
+			attempt++
+		)
+			await Bun.sleep(5);
+		const notice = client.frames.find(
+			(frame) => frame.event === "chat.message" && frame.payload?.deliveryId?.startsWith("gw-x-"),
+		);
+		expect(notice?.payload).toMatchObject({ origin: ownerTarget.origin });
+		expect(notice.payload.text).toContain(`gajaeway ops redeliver ${deliveryId}`);
+		const logLine = logs.find((line) => line.startsWith(`delivery_expired deliveryId=${deliveryId}`));
+		expect(logLine).toContain("origin=discord/dm/delivery-test/peer=owner attempts=5 reason=adapter_failure");
+		expect(logLine).not.toContain("the single reply body");
+
+		client.send({ v: "0.1", type: "request", id: "status-expired", verb: "gateway.status" });
+		await waitFrame(client.frames, "status-expired");
+		const status = client.frames.find((frame) => frame.id === "status-expired").result;
+		expect(status.delivery).toMatchObject({
+			expired: 1,
+			recentExpired: [{ deliveryId, originKey: "discord/dm/delivery-test/peer=owner", attempts: 5 }],
+		});
+		expect(JSON.stringify(status.delivery)).not.toContain("the single reply body");
+
+		const noticeId = notice.payload.deliveryId as string;
+		for (let attempt = 1; attempt <= 5; attempt++) {
+			const id = `fail-notice-${attempt}`;
+			client.send({
+				v: "0.1",
+				type: "request",
+				id,
+				verb: "delivery.fail",
+				params: { deliveryId: noticeId, reason: "owner_unavailable", ambiguous: false },
+			});
+			await waitFrame(client.frames, id);
+		}
+		expect(database.deliveryRows().find((row) => row.delivery_id === noticeId)?.state).toBe("expired");
+		expect(
+			client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId?.startsWith("gw-x-")),
+		).toHaveLength(1);
+		expect(logs.some((line) => line.startsWith(`delivery_expired deliveryId=${noticeId}`))).toBe(true);
+		client.close();
+	} finally {
+		console.error = originalError;
+	}
+});
+
+test("ops.redeliver requeues expired rows by id or since and immediately publishes them", async () => {
+	const { client, database } = await startDeliveryServer();
+	const ledger = new DeliveryLedger(database);
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const createExpired = (deliveryId: string) => {
+		ledger.createPending({
+			deliveryId,
+			turnId: `turn-${deliveryId}`,
+			originKey: originKey(origin),
+			payloadJson: JSON.stringify({
+				turnId: `turn-${deliveryId}`,
+				origin,
+				role: "assistant",
+				text: `body for ${deliveryId}`,
+				final: true,
+				deliveryId,
+			}),
+		});
+		for (let attempt = 0; attempt < 5; attempt++) ledger.fail(deliveryId);
+	};
+	createExpired("expired-by-id");
+	createExpired("expired-by-since");
+	client.send({ v: "0.1", type: "request", id: "status-before", verb: "gateway.status" });
+	await waitFrame(client.frames, "status-before");
+	const status = client.frames.find((frame) => frame.id === "status-before").result;
+	expect(status.delivery.expired).toBe(2);
+	expect(status.delivery.recentExpired.map((row: { deliveryId: string }) => row.deliveryId).sort()).toEqual([
+		"expired-by-id",
+		"expired-by-since",
+	]);
+	expect(
+		status.delivery.recentExpired.every(
+			(row: { originKey: string; attempts: number }) =>
+				row.originKey === "loopback/loopback/loopback" && row.attempts === 5,
+		),
+	).toBe(true);
+	expect(JSON.stringify(status.delivery)).not.toContain("body for");
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "requeue-id",
+		verb: "ops.redeliver",
+		params: { deliveryId: "expired-by-id" },
+	});
+	await waitFrame(client.frames, "requeue-id");
+	expect(client.frames.find((frame) => frame.id === "requeue-id").result).toEqual({ requeued: ["expired-by-id"] });
+	expect(
+		client.frames.find((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === "expired-by-id")
+			?.payload,
+	).toMatchObject({
+		redelivered: true,
+		duplicateWarning: true,
+	});
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "requeue-since",
+		verb: "ops.redeliver",
+		params: { since: new Date(Date.now() - 60_000).toISOString() },
+	});
+	await waitFrame(client.frames, "requeue-since");
+	expect(client.frames.find((frame) => frame.id === "requeue-since").result).toEqual({
+		requeued: ["expired-by-since"],
+	});
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "unknown-redelivery",
+		verb: "ops.redeliver",
+		params: { deliveryId: "missing" },
+	});
+	await waitFrame(client.frames, "unknown-redelivery");
+	expect(client.frames.find((frame) => frame.id === "unknown-redelivery").error.code).toBe("invalid_params");
+	client.send({ v: "0.1", type: "request", id: "bad-since", verb: "ops.redeliver", params: { since: "not-a-time" } });
+	await waitFrame(client.frames, "bad-since");
+	expect(client.frames.find((frame) => frame.id === "bad-since").error.code).toBe("invalid_params");
 	client.close();
 });
 

@@ -614,7 +614,9 @@ test("RT-LEDGER-02 an ambiguous reaction failure survives and is re-emitted on r
 	await settle();
 	expect(response(client.frames, "f1").result).toEqual({ recorded: true });
 	expect(database.deliveryRows()[0]?.state).toBe("failed_ambiguous");
-	// A fresh adapter connection must be told about it again, reaction intact.
+	// Ambiguous rows obey the two-second first-retry backoff, then a fresh adapter
+	// connection must be told about it again, reaction intact.
+	await Bun.sleep(2_050);
 	const reconnected = await connect(config.socketPath);
 	await reconnected.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await settle();
@@ -626,18 +628,18 @@ test("RT-LEDGER-02 an ambiguous reaction failure survives and is re-emitted on r
 	reconnected.close();
 });
 
-test("RT-LEDGER-03 a definitive reaction failure is retried a bounded number of times, then expires", async () => {
+test("RT-LEDGER-03 a definitive reaction failure is retried five times, then expires", async () => {
 	const { client, database, config } = await gateway(["[REACT:👍]"]);
 	await humanMessage(client, "c1", "m1");
 	await settle();
 	const deliveryId = reactionEvents(client.frames)[0].payload.deliveryId as string;
-	for (const [index, id] of ["f1", "f2", "f3"].entries()) {
+	for (const [index, id] of ["f1", "f2", "f3", "f4", "f5"].entries()) {
 		await request(client, id, "delivery.fail", { deliveryId, reason: "Unknown Message", ambiguous: false });
 		await settle();
 		expect(response(client.frames, id).result).toEqual({ recorded: true });
 		const row = database.deliveryRows()[0];
 		expect(row?.attempts).toBe(index + 1);
-		expect(row?.state).toBe(index + 1 >= 3 ? "expired" : "pending");
+		expect(row?.state).toBe(index + 1 >= 5 ? "expired" : "pending");
 	}
 	// Expired means the gateway stops re-offering an impossibility, and it never
 	// pretends the reaction happened.

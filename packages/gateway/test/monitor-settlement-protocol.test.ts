@@ -225,8 +225,8 @@ test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the led
 test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late confirm", async () => {
 	const ctx = await startWithMonitor();
 	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	// Three non-ambiguous fails expire the delivery (3-attempt policy).
-	for (const id of ["f1", "f2", "f3"]) {
+	// Five non-ambiguous fails expire the delivery.
+	for (const id of ["f1", "f2", "f3", "f4", "f5"]) {
 		ctx.send({
 			v: "0.1",
 			type: "request",

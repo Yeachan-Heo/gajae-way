@@ -47,7 +47,7 @@ export type CoverageGap = {
  */
 export const ATTENTION_GAPS: readonly CoverageGap[] = [
 	{ gap: "G8", missing: "operator holds — subsession state never crosses the gateway protocol" },
-	{ gap: "G3", missing: "ambiguous and expired deliveries — gateway.status returns counts only" },
+	{ gap: "G3", missing: "individual ambiguous deliveries — gateway.status does not identify those rows" },
 	{ gap: "G5", missing: "quarantined memory intents — no verb exposes memory_intents" },
 ];
 
@@ -91,6 +91,17 @@ export function buildAttention(
 			detail: `The oldest has been waiting ${age}. Either the adapter is down or it is not settling the ledger.`,
 			meta: "gateway.status · delivery",
 			at: null,
+		});
+	}
+	if (delivery && delivery.expired > 0) {
+		items.push({
+			key: "delivery:expired",
+			severity: 1,
+			tone: "danger",
+			title: `${pluralise(delivery.expired, "delivery", "deliveries")} expired`,
+			detail: delivery.recentExpired.map(({ deliveryId, originKey }) => `${deliveryId} · ${originKey}`).join("; "),
+			meta: "gateway.status · delivery",
+			at: delivery.recentExpired[0]?.expiredAt ?? null,
 		});
 	}
 

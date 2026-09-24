@@ -17,7 +17,7 @@ import { buildSnapshot } from "../src/view";
 import { FIXED_NOW, type Harness, harness, MONITOR, STATUS } from "./fixture";
 
 /** Every allowlisted method. None may be dispatched by any case below. */
-const MUTATING = ["monitor.add", "monitor.remove", "monitor.test", "ops.backup", "ops.integrity"];
+const MUTATING = ["monitor.add", "monitor.remove", "monitor.test", "ops.backup", "ops.redeliver", "ops.integrity"];
 
 function assertNothingDispatched(app: Harness): void {
 	for (const call of app.calls) expect(MUTATING).not.toContain(call.method);

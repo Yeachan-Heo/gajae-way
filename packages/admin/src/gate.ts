@@ -152,6 +152,14 @@ export const DEFAULT_ALLOWLIST: readonly MutationOperation[] = [
 		],
 	},
 	{
+		id: "ops.redeliver",
+		method: "ops.redeliver",
+		summary: "Requeue and resend a delivery",
+		severity: "medium",
+		fields: [{ name: "deliveryId", label: "Delivery ID", kind: "text", required: true }],
+		consequence: "The gateway resends this delivery; the platform may show a duplicate.",
+	},
+	{
 		id: "ops.integrity",
 		method: "ops.integrity",
 		summary: "Run an integrity check",
