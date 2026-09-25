@@ -405,7 +405,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 23;
+const LATEST_SCHEMA_VERSION = 24;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -2620,10 +2620,11 @@ export class GatewayDatabase {
 		instruction: string | null;
 		modelJson: string | null;
 		serviceTier: string | null;
+		procedureFilesJson?: string | null;
 	}): void {
 		this.#database
 			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				row.id,
@@ -2637,6 +2638,7 @@ export class GatewayDatabase {
 				row.instruction,
 				row.modelJson,
 				row.serviceTier,
+				row.procedureFilesJson ?? null,
 			);
 	}
 	monitorRows(): Array<{
@@ -2651,10 +2653,11 @@ export class GatewayDatabase {
 		instruction: string | null;
 		model_json: string | null;
 		service_tier: string | null;
+		procedure_files_json: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -2668,6 +2671,7 @@ export class GatewayDatabase {
 			instruction: string | null;
 			model_json: string | null;
 			service_tier: string | null;
+			procedure_files_json: string | null;
 		}>;
 	}
 	monitorUpdate(row: {
@@ -3148,6 +3152,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		batch_id: string | null;
 		dispatch_attempts: number;
 		updated_at: string;
+		procedure_json: string | null;
 	}> {
 		const direction = order === "oldest" ? "ASC" : "DESC";
 		return this.#database
@@ -3166,6 +3171,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			batch_id: string | null;
 			dispatch_attempts: number;
 			updated_at: string;
+			procedure_json: string | null;
 		}>;
 	}
 	authoredOutputCreate(eventId: string, outputText: string): void {
@@ -3175,6 +3181,24 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET output_text = excluded.output_text, authored_at = excluded.authored_at",
 			)
 			.run(eventId, outputText, new Date().toISOString());
+	}
+	/**
+	 * Records the procedure versions one event's authoring turn is given (issue
+	 * #82). Lease-fenced like every dispatch write: a stale attempt cannot
+	 * overwrite the version a newer attempt authored with.
+	 */
+	monitorEventFencedSetProcedure(eventId: string, leaseId: string, procedureJson: string, now = Date.now()): boolean {
+		this.#assertNotQuarantined("monitor", eventId);
+		return (
+			this.#database
+				.query(
+					`UPDATE monitor_events SET procedure_json = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(procedureJson, eventId, leaseId, new Date(now).toISOString()).changes > 0
+		);
 	}
 	authoredOutput(eventId: string): string | undefined {
 		return this.#database
@@ -3738,6 +3762,26 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(23, new Date().toISOString());
+			});
+		}
+		if (current < 24) {
+			this.withTransaction(() => {
+				// Issue #82: declared procedure files are re-read per firing, and each
+				// event records the procedure version its authoring turn was given.
+				const columns = (table: string) =>
+					new Set(
+						this.#database
+							.query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+							.all()
+							.map((row) => row.name),
+					);
+				if (!columns("monitors").has("procedure_files_json"))
+					this.#database.exec("ALTER TABLE monitors ADD COLUMN procedure_files_json TEXT");
+				if (!columns("monitor_events").has("procedure_json"))
+					this.#database.exec("ALTER TABLE monitor_events ADD COLUMN procedure_json TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(24, new Date().toISOString());
 			});
 		}
 	}

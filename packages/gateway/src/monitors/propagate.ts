@@ -41,6 +41,7 @@ import {
 	type SessionRollReason,
 	unavailableCompactionPort,
 } from "./compaction";
+import { readMonitorProcedure } from "./procedure";
 import type { MonitorRegistry } from "./registry";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -734,7 +735,17 @@ export class MonitorPropagator {
 					.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
 					.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
-				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+				// Issue #82: the session is long-lived, so declared procedure files are
+				// re-read at every firing and travel with this prompt, and the version
+				// each event was authored under is recorded on the event row.
+				dispatchPhase = "procedure";
+				const procedure = await readMonitorProcedure(this.#repo, monitor.procedureFiles ?? []);
+				if (procedure.versions.length) {
+					const versionsJson = JSON.stringify(procedure.versions);
+					for (const row of claimed)
+						this.#database.monitorEventFencedSetProcedure(row.event_id, leaseId, versionsJson, now());
+				}
+				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${procedure.prompt ? `\n${procedure.prompt}\n` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
 				dispatchPhase = "request";
 				const response = (

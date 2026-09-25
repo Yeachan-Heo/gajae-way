@@ -25,6 +25,10 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
 
 Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
 
+`procedureFiles` (optional, at most 8) lists the procedure/doctrine files the monitor follows, relative to `$GAJAEWAY_HOME/workspace` (`memory/ops/...` reaches the memory corpus through the workspace link). The event-type session is long-lived and never re-reads files it saw at session start, so these files are re-read from disk at **every** firing and their current content goes into that firing's authoring prompt. A doctrine edit therefore takes effect on the very next firing, without a session roll or restart. Each file is inlined up to 24 KiB; a larger one is versioned and the session is told to read it from disk. Paths must stay inside the workspace (symlinks may resolve into the memory corpus only); a missing or escaping file is reported, not fatal.
+
+Every event authored with declared procedure files records the versions it was given (`path`, `status`, `sha256`, `mtime`) in `monitor_events.procedure_json`, surfaced as `procedure` on `gajaeway monitors inspect` events, so you can tell a stale-procedure firing from a disobeyed rule after the fact.
+
 The four trigger kinds are:
 
 ```json

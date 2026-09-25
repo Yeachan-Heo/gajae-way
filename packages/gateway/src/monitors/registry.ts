@@ -9,6 +9,7 @@ import {
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "../store/db";
+import { validateProcedureFiles } from "./procedure";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
 const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
@@ -35,6 +36,7 @@ export class MonitorRegistry {
 		validateSpec(spec);
 		const trigger = spec.trigger.kind === "webhook" ? { ...spec.trigger, route: crypto.randomUUID() } : spec.trigger;
 		const instruction = spec.instruction?.trim() || undefined;
+		const procedureFiles = spec.procedureFiles?.length ? spec.procedureFiles.map((file) => file.trim()) : undefined;
 		const record: MonitorRecord = {
 			...spec,
 			trigger,
@@ -42,6 +44,7 @@ export class MonitorRegistry {
 			burstPolicy: spec.burstPolicy ?? "coalesce",
 			enabled: spec.enabled ?? true,
 			instruction,
+			procedureFiles,
 			createdAt: new Date().toISOString(),
 		};
 		this.#database.withTransaction(() =>
@@ -56,6 +59,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: record.model ? JSON.stringify(record.model) : null,
 				serviceTier: record.serviceTier ?? null,
+				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			}),
 		);
 		return record;
@@ -142,6 +146,7 @@ function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): M
 		instruction: row.instruction ?? undefined,
 		model: row.model_json ? JSON.parse(row.model_json) : undefined,
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
+		procedureFiles: row.procedure_files_json ? JSON.parse(row.procedure_files_json) : undefined,
 		createdAt: row.created_at,
 	};
 	validateSpec(record);
@@ -195,6 +200,7 @@ export function validateSpec(spec: MonitorSpec): void {
 		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)
 			throw new Error(`monitor instruction must be at most ${MONITOR_INSTRUCTION_MAX_LENGTH} characters`);
 	}
+	if (spec.procedureFiles !== undefined) validateProcedureFiles(spec.procedureFiles);
 }
 /** `<@id>` renders as a ping on Discord (numeric snowflake) and Slack (`U…`/`W…`). */
 const MENTION_ID_BY_PLATFORM: Partial<Record<string, RegExp>> = {
