@@ -94,7 +94,7 @@ describe("conversation model override", () => {
 		}
 	});
 
-	test("the override survives a reopen and the schema reports 22", async () => {
+	test("the override survives a reopen and the schema reports 23", async () => {
 		const { db, path } = await openAt();
 		db.conversationModelSet("discord:c1", { preset: "lunamaxxing-local" });
 		db.close();
@@ -102,7 +102,7 @@ describe("conversation model override", () => {
 		expect(reopened.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "lunamaxxing-local" });
 		const raw = new Database(path);
 		const row = raw.query<{ v: number }, []>("SELECT MAX(version) AS v FROM schema_migrations").get();
-		expect(row?.v).toBe(22);
+		expect(row?.v).toBe(23);
 		raw.close();
 		reopened.close();
 	});

@@ -1,7 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { originKey } from "@gajae-gateway/protocol";
+import { MemoryClosureQueue } from "../src/memory/closure";
 import { memoryRoot } from "../src/memory/doctrine";
 import { GatewayDatabase } from "../src/store/db";
 
@@ -55,6 +57,39 @@ async function receiptContains(id: string): Promise<boolean> {
 		throw error;
 	}
 }
+
+test("quarantined memory intents persist a reason, log it, and emit a negative receipt", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-quarantine-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const id = "invalid-memory-intent";
+	const origin = { platform: "discord", kind: "channel", conversationId: "C1" } as const;
+	const reason = "Error: unsupported memory intent unsupported";
+	database.memoryIntentCreate({
+		id,
+		kind: "unsupported",
+		payloadJson: JSON.stringify({
+			originRefJson: JSON.stringify(origin),
+			userText: "captured",
+			replyText: "reply",
+		}),
+	});
+	const warning = spyOn(console, "warn").mockImplementation(() => {});
+	try {
+		await new MemoryClosureQueue(database, home).initialize();
+		const row = database.memoryIntentRows()[0];
+		expect(row).toMatchObject({ state: "quarantined", attempts: 1, quarantine_reason: reason });
+		expect(warning).toHaveBeenCalledTimes(1);
+		expect(warning.mock.calls[0]?.[0]).toContain(
+			`id=${id} kind=unsupported origin=${originKey(origin)} reason=${reason}`,
+		);
+		const receipt = JSON.parse((await readFile(join(home, "memory-receipts.jsonl"), "utf8")).trim());
+		expect(receipt).toMatchObject({ id, state: "quarantined", reason });
+		expect(Number.isFinite(Date.parse(receipt.at))).toBe(true);
+	} finally {
+		warning.mockRestore();
+		database.close();
+	}
+});
 
 for (const [name, killPoint] of [
 	["M1", "after-intent"],

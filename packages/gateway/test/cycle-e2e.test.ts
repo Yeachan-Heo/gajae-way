@@ -71,7 +71,7 @@ test("projector reads durable rows through the database and stays fail-closed", 
 
 		// A quarantined memory intent is a gate, not silence.
 		database.memoryIntentCreate({ id: "mi1", kind: "daily_capture", payloadJson: "{}" });
-		database.memoryIntentUpdate("mi1", "quarantined");
+		database.memoryIntentQuarantine("mi1", "Error: test quarantine");
 		const gated = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(gated.gates).toContain("memory_closure_blocked");
 		expect(gated.phase).toBe("degraded");
