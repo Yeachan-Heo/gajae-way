@@ -43,15 +43,16 @@ export class MonitorRuntime {
 						// Atomic slot-claim + event admission inside the propagator.
 						// Returns whether the slot was NEWLY admitted (false for
 						// restart-overlap duplicates) so the catch-up budget counts
-						// only real admissions.
-						(slotAt) =>
+						// only real admissions. A startup catch-up event carries its
+						// missed window in the payload.
+						(slotAt, catchUp) =>
 							this.#propagator.submitSlot(
 								monitor.monitorId,
 								monitor.eventTypes[0]!,
-								{ at: slotAt.toISOString() },
+								{ at: slotAt.toISOString(), ...(catchUp ? { catchUp } : {}) },
 								slotAt,
 							) !== null,
-						{ now: this.#clock },
+						{ now: this.#clock, since: this.#propagator.slotBoundary(monitor) },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {

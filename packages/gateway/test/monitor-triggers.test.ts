@@ -20,7 +20,7 @@ test("cron supports steps, lists, ranges, dow and injected clock", () => {
 			fired++;
 			return true;
 		},
-		{ now: () => monday },
+		{ now: () => monday, since: new Date(2026, 0, 5, 10, 0) },
 	);
 	stop();
 	expect(fired).toBe(1);

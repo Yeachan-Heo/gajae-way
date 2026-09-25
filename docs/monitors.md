@@ -40,6 +40,8 @@ The four trigger kinds are:
 { "kind": "script", "command": ["/absolute/path/to/check"], "intervalMs": 60000 }
 ```
 
+Cron slots are claimed durably, once per scheduled minute. On startup the gateway resumes from each cron monitor's newest claimed slot (or its creation instant). Slots missed while the gateway was down coalesce into one event for the newest missed slot. Only slots from the last 24 hours count. The event's payload carries `catchUp: { cause: "startup", missedFrom, missedTo, missedSlots }`. Older slots are never replayed, and a restart that owes no slot creates nothing.
+
 For webhook monitors, the registry replaces the supplied route with a generated route token. The runtime receives it at `/hook/<token>`. Watcher roots must fall under configured `watcherRoots`; script commands must be inside configured `scriptRoot` and are checked by ActionGuard.
 
 ## Event sessions and propagation

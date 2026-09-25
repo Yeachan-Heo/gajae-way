@@ -628,7 +628,7 @@ describe("cron slot catch-up", () => {
 				}
 				return false;
 			},
-			{ now: () => clock.value, intervalMs: 1 },
+			{ now: () => clock.value, since: new Date(2026, 7, 26, 0, 0), intervalMs: 1 },
 		);
 		// First tick at 06:00 — fresh process, window scan (nothing due before 06:00
 		// inside the last hour except 05:30, which is inside the window! It fires:
@@ -786,7 +786,7 @@ describe("cron slot catch-up", () => {
 				}
 				return false;
 			},
-			{ now: () => new Date(2026, 7, 27, 6, 31) },
+			{ now: () => new Date(2026, 7, 27, 6, 31), since: new Date(2026, 7, 27, 6, 0) },
 		);
 		stop();
 		expect(fired).toEqual([new Date(2026, 7, 27, 6, 30).toISOString()]);
@@ -806,14 +806,14 @@ describe("cron slot catch-up", () => {
 				}
 				return false;
 			},
-			{ now: () => new Date(2026, 7, 27, 6, 31) },
+			{ now: () => new Date(2026, 7, 27, 6, 31), since: new Date(2026, 7, 27, 6, 30) },
 		);
 		stop2();
 		expect(fired2).toEqual([]);
 		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
 	});
 
-	test("startCron skips slots older than the catch-up window", async () => {
+	test("startCron skips missed slots older than the maximum catch-up age", async () => {
 		const {
 			propagator,
 			monitor,
@@ -823,8 +823,8 @@ describe("cron slot catch-up", () => {
 		);
 		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const fired: string[] = [];
-		// Process starts at 20:00; the 06:30 slot from the same day is far outside the
-		// bounded window and must NOT fire.
+		// Process starts at 20:00 with a 1h age bound; the 06:30 slot from the same
+		// day is older than the bound and must NOT fire.
 		const stop = startCron(
 			"30 6 * * *",
 			(slot) => {
@@ -835,7 +835,7 @@ describe("cron slot catch-up", () => {
 				}
 				return false;
 			},
-			{ now: () => new Date(2026, 7, 27, 20, 0) },
+			{ now: () => new Date(2026, 7, 27, 20, 0), since: new Date(2026, 7, 26, 0, 0), maxCatchUpAgeMs: 60 * 60 * 1000 },
 		);
 		stop();
 		expect(fired).toEqual([]);
@@ -863,7 +863,7 @@ describe("cron slot catch-up", () => {
 				}
 				return false;
 			},
-			{ now: () => clock.value, intervalMs: 1 },
+			{ now: () => clock.value, since: new Date(2026, 7, 27, 5, 0), intervalMs: 1 },
 		);
 		// First tick at 05:30 — window scan, nothing due yet.
 		expect(fired).toEqual([]);
@@ -931,6 +931,127 @@ describe("cron slot catch-up", () => {
 		expect(JSON.parse(payloadJson as string).at).toBe(slotAt.toISOString());
 		// fired_at itself is the scheduled slot time (blocker 3), not submit-time now.
 		expect(rows[0]?.fired_at).toBe(slotAt.toISOString());
+	});
+});
+
+describe("startup catch-up from the persisted slot boundary (#162)", () => {
+	async function cronRuntime(schedule: string, createdAt: Date) {
+		const ctx = await harness(async (_id, text) =>
+			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
+		);
+		const monitor = ctx.registry.add({
+			name: "statusboard",
+			trigger: { kind: "cron", schedule },
+			eventTypes: ["monitor.statusboard"],
+			burstPolicy: "serialize",
+			enabled: true,
+		});
+		backdateMonitor(ctx.database, monitor.monitorId, createdAt);
+		const claim = (slotAt: Date) =>
+			ctx.database.monitorSlotClaimWithEvent({
+				monitorId: monitor.monitorId,
+				slotAt: slotAt.toISOString(),
+				eventId: crypto.randomUUID(),
+				eventType: "monitor.statusboard",
+				payloadJson: JSON.stringify({ at: slotAt.toISOString() }),
+			});
+		const boot = async (at: Date) => {
+			const runtime = new MonitorRuntime({} as never, ctx.registry, ctx.propagator, { now: () => at });
+			await runtime.start();
+			await runtime.stop();
+		};
+		const rows = () => ctx.database.monitorEventRows(monitor.monitorId, "oldest");
+		return { claim, boot, rows };
+	}
+
+	test("many missed slots across a long outage coalesce into ONE marked catch-up event", async () => {
+		const { claim, boot, rows } = await cronRuntime("0 */4 * * *", new Date(2026, 7, 26, 0, 0));
+		claim(new Date(2026, 7, 27, 0, 0));
+		// Down from 00:19 to 12:05: the 04:00, 08:00 and 12:00 slots passed unseen.
+		await boot(new Date(2026, 7, 27, 12, 5));
+		const events = rows();
+		expect(events).toHaveLength(2);
+		const catchUp = events[1];
+		expect(catchUp?.fired_at).toBe(new Date(2026, 7, 27, 12, 0).toISOString());
+		expect(JSON.parse(catchUp?.payload_json ?? "null")).toEqual({
+			at: new Date(2026, 7, 27, 12, 0).toISOString(),
+			catchUp: {
+				cause: "startup",
+				missedFrom: new Date(2026, 7, 27, 4, 0).toISOString(),
+				missedTo: new Date(2026, 7, 27, 12, 0).toISOString(),
+				missedSlots: 3,
+			},
+		});
+	});
+
+	test("one missed daily slot is caught up once, and repeated restarts stay idempotent", async () => {
+		const { claim, boot, rows } = await cronRuntime("10 9 * * *", new Date(2026, 7, 20, 0, 0));
+		claim(new Date(2026, 7, 26, 9, 10));
+		await boot(new Date(2026, 7, 27, 10, 40));
+		await boot(new Date(2026, 7, 27, 10, 41));
+		await boot(new Date(2026, 7, 27, 11, 30));
+		const events = rows();
+		expect(events).toHaveLength(2);
+		expect(events[1]?.fired_at).toBe(new Date(2026, 7, 27, 9, 10).toISOString());
+		expect(JSON.parse(events[1]?.payload_json ?? "null").catchUp).toEqual({
+			cause: "startup",
+			missedFrom: new Date(2026, 7, 27, 9, 10).toISOString(),
+			missedTo: new Date(2026, 7, 27, 9, 10).toISOString(),
+			missedSlots: 1,
+		});
+	});
+
+	test("no missed slot: a restart between slots creates nothing", async () => {
+		const { claim, boot, rows } = await cronRuntime("0 */4 * * *", new Date(2026, 7, 26, 0, 0));
+		claim(new Date(2026, 7, 27, 8, 0));
+		await boot(new Date(2026, 7, 27, 9, 30));
+		expect(rows()).toHaveLength(1);
+	});
+
+	test("catch-up age is bounded: slots older than the maximum age are not replayed", async () => {
+		const { claim, boot, rows } = await cronRuntime("10 9 * * *", new Date(2026, 7, 1, 0, 0));
+		claim(new Date(2026, 7, 20, 9, 10));
+		// Down for a week; only the newest slot inside the 24h bound is owed.
+		await boot(new Date(2026, 7, 27, 8, 0));
+		const events = rows();
+		expect(events).toHaveLength(2);
+		expect(events[1]?.fired_at).toBe(new Date(2026, 7, 26, 9, 10).toISOString());
+		expect(JSON.parse(events[1]?.payload_json ?? "null").catchUp.missedSlots).toBe(1);
+	});
+
+	test("steady-state ticks after a coalesced catch-up do not replay the coalesced slots", async () => {
+		const {
+			database: db,
+			registry,
+			propagator,
+		} = await harness(async (_id, text) =>
+			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
+		);
+		const monitor = registry.add({
+			name: "half-hourly",
+			trigger: { kind: "cron", schedule: "*/30 * * * *" },
+			eventTypes: ["monitor.half"],
+			burstPolicy: "serialize",
+			enabled: true,
+		});
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 27, 3, 59));
+		const clock = { value: new Date(2026, 7, 27, 7, 10) };
+		const stop = startCron(
+			"*/30 * * * *",
+			(slot, catchUp) =>
+				propagator.submitSlot(monitor.monitorId, "monitor.half", { at: slot.toISOString(), catchUp }, slot) !== null,
+			{ now: () => clock.value, since: new Date(2026, 7, 27, 3, 59), intervalMs: 1 },
+		);
+		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
+		clock.value = new Date(2026, 7, 27, 7, 11);
+		await Bun.sleep(5);
+		clock.value = new Date(2026, 7, 27, 7, 30);
+		await Bun.sleep(5);
+		stop();
+		expect(db.monitorEventRows(monitor.monitorId, "oldest").map((row) => row.fired_at)).toEqual([
+			new Date(2026, 7, 27, 7, 0).toISOString(),
+			new Date(2026, 7, 27, 7, 30).toISOString(),
+		]);
 	});
 });
 
