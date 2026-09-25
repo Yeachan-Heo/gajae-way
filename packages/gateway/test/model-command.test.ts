@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { applyModelCommand, parseModelArgument } from "../src/server/model-command";
+import { applyModelCommand, listModelChoices, parseModelArgument } from "../src/server/model-command";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import type { GjcModelSelection } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
@@ -129,6 +129,51 @@ describe("/model clear", () => {
 	});
 });
 
+describe("listModelChoices", () => {
+	test("lists models.yml profile names plus the configured selector, sorted and deduped", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gajaeway-model-choices-"));
+		try {
+			await Bun.write(
+				join(agentDir, "models.yml"),
+				[
+					"providers:",
+					"  local:",
+					"    baseUrl: http://127.0.0.1",
+					"profiles:",
+					"  gpt-heavy:",
+					"    model_mapping: { default: a/b }",
+					"  frontier-default:",
+					"    model_mapping: { default: c/d }",
+					'  "has space":',
+					"    model_mapping: { default: e/f }",
+				].join("\n"),
+			);
+			expect(await listModelChoices(agentDir, { preset: "gpt-heavy" })).toEqual(["frontier-default", "gpt-heavy"]);
+			expect(await listModelChoices(agentDir, "z-ai/glm-5.3")).toEqual([
+				"frontier-default",
+				"gpt-heavy",
+				"z-ai/glm-5.3",
+			]);
+		} finally {
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("fails soft on a missing, unparseable or profile-less models file", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gajaeway-model-choices-"));
+		try {
+			expect(await listModelChoices(agentDir, undefined)).toEqual([]);
+			expect(await listModelChoices(undefined, { preset: "base" })).toEqual(["base"]);
+			await Bun.write(join(agentDir, "models.yml"), "profiles: [unterminated");
+			expect(await listModelChoices(agentDir, { preset: "base" })).toEqual(["base"]);
+			await Bun.write(join(agentDir, "models.yml"), "profiles:\n  - not-a-map\n");
+			expect(await listModelChoices(agentDir, undefined)).toEqual([]);
+		} finally {
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+});
+
 async function waitFor(predicate: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 300; attempt++) {
 		if (predicate()) return;
@@ -137,10 +182,23 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
 	expect(predicate(), message).toBe(true);
 }
 
-async function connect(socketPath: string): Promise<{ send(value: unknown): void; close(): void }> {
-	let socket!: ReturnType<typeof Bun.connect> extends Promise<infer T> ? T : never;
-	socket = await Bun.connect({ unix: socketPath, socket: { data() {} } });
-	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), close: () => socket.end() };
+async function connect(
+	socketPath: string,
+): Promise<{ send(value: unknown): void; close(): void; frames: Array<Record<string, unknown>> }> {
+	const frames: Array<Record<string, unknown>> = [];
+	let buffered = "";
+	const socket = await Bun.connect({
+		unix: socketPath,
+		socket: {
+			data(_socket, chunk) {
+				buffered += chunk.toString();
+				const lines = buffered.split("\n");
+				buffered = lines.pop() ?? "";
+				for (const line of lines) if (line.trim()) frames.push(JSON.parse(line));
+			},
+		},
+	});
+	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), close: () => socket.end(), frames };
 }
 
 test("/model live-rebind keeps the session transcript and applies the new model to the next persistent turn", async () => {
@@ -159,7 +217,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	let server: GatewayServer | undefined;
-	let client: { send(value: unknown): void; close(): void } | undefined;
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
 	const logs: string[] = [];
 	const previousError = console.error;
 	console.error = (...values: unknown[]) => logs.push(values.map((value) => String(value)).join(" "));
@@ -168,6 +226,18 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await Bun.sleep(5);
+		// Autocomplete source over the socket: no broker agent dir here, so only the
+		// configured selector is offered.
+		client.send({ v: "0.1", type: "request", id: "choices", verb: "session.modelChoices" });
+		const choicesClient = client;
+		await waitFor(
+			() => choicesClient.frames.some((frame) => frame.id === "choices"),
+			"session.modelChoices did not answer",
+		);
+		expect(client.frames.find((frame) => frame.id === "choices")).toMatchObject({
+			type: "response",
+			result: { choices: ["base"] },
+		});
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
 		client.send({
 			v: "0.1",

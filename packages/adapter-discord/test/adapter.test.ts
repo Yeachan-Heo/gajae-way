@@ -8,9 +8,11 @@ import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/con
 import {
 	addressedTurn,
 	chunkDiscordMessage,
+	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
 	engagementForMessage,
 	type GatewayClientLike,
+	handleModelAutocomplete,
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
@@ -558,6 +560,76 @@ test("slash commands /new and /reset map to gateway session resets with the invo
 		error: () => {},
 	});
 	expect(sent).toHaveLength(1);
+});
+
+test("/model is registered with show/set/clear and set autocompletes its choice", () => {
+	const model = DISCORD_SLASH_COMMANDS.find((command) => command.name === "model");
+	expect(model?.options?.map((option) => option.name)).toEqual(["show", "set", "clear"]);
+	const set = model?.options?.find((option) => option.name === "set");
+	expect(set?.options?.[0]).toMatchObject({ name: "choice", required: true, autocomplete: true });
+});
+
+test("/model subcommands map to the gateway's /model text verbs, not to a session reset", async () => {
+	const sent: string[] = [];
+	const gateway = {
+		requestInbound: async (_messageId: string, _origin: unknown, text: string) => {
+			sent.push(text);
+			return { engaged: true };
+		},
+	};
+	const replies: string[] = [];
+	const invoke = (subcommand: string, choice: string | null) =>
+		handleSlashCommand(
+			{
+				isChatInputCommand: () => true,
+				commandName: "model",
+				id: `itx-${subcommand}`,
+				user: { id: "owner-1", username: "bellman" },
+				channel: { id: "channel-9", type: 0 },
+				options: { getSubcommand: () => subcommand, getString: () => choice },
+				reply: async (options: { content: string }) => {
+					replies.push(options.content);
+				},
+			} as never,
+			gateway as never,
+			{ error: () => {} },
+		);
+	await invoke("show", null);
+	await invoke("set", " gpt-heavy ");
+	await invoke("clear", null);
+	// A set with no usable choice is refused locally instead of turning into a bare read.
+	await invoke("set", "  ");
+	expect(sent).toEqual(["/model", "/model set gpt-heavy", "/model clear"]);
+	expect(replies.slice(0, 3).every((reply) => !reply.includes("session reset"))).toBe(true);
+	expect(replies[3]).toContain("choose a model");
+});
+
+test("/model autocomplete filters gateway choices and fails soft to an empty list", async () => {
+	const responded: Array<Array<{ name: string; value: string }>> = [];
+	const interaction = (focused: string) => ({
+		isAutocomplete: () => true,
+		commandName: "model",
+		options: { getFocused: () => focused },
+		respond: async (choices: Array<{ name: string; value: string }>) => {
+			responded.push(choices);
+		},
+	});
+	const many = Array.from({ length: 40 }, (_, index) => `preset-${index}`);
+	await handleModelAutocomplete(interaction("HEAVY") as never, {
+		modelChoices: async () => ["frontier-heavy", "gpt-heavy", "glm-gpt"],
+	});
+	await handleModelAutocomplete(interaction("") as never, { modelChoices: async () => many });
+	await handleModelAutocomplete(interaction("x") as never, {
+		modelChoices: async () => {
+			throw new Error("gateway down");
+		},
+	});
+	expect(responded[0]).toEqual([
+		{ name: "frontier-heavy", value: "frontier-heavy" },
+		{ name: "gpt-heavy", value: "gpt-heavy" },
+	]);
+	expect(responded[1]).toHaveLength(25);
+	expect(responded[2]).toEqual([]);
 });
 
 test("a declined slash command answers not-authorized instead of claiming a reset", async () => {
