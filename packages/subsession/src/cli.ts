@@ -18,7 +18,7 @@ export type CliResult = {
 	readonly stderr: string;
 };
 
-export type CliRunner = (args: readonly string[], options?: { readonly timeoutMs?: number }) => Promise<CliResult>;
+export type CliRunner = (args: readonly string[], options?: { readonly timeoutMs?: number; readonly priority?: "interactive" | "background" }) => Promise<CliResult>;
 
 export type BrokerSession = {
 	readonly sessionId: string;

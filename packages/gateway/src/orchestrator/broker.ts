@@ -262,7 +262,8 @@ export class GlobalGjcClient {
 	readonly #children = new Set<ReturnType<SpawnFn>>();
 	readonly #terminations = new Map<ReturnType<SpawnFn>, Promise<void>>();
 	readonly #relays = new Set<() => void>();
-	readonly #queue: Array<() => void> = [];
+	readonly #queue: Array<{ resolve: () => void; priority: "interactive" | "background" }> = [];
+	#backgroundInFlight = 0;
 	#inflight = 0;
 	#generation = 0;
 	#identity: string | undefined;
@@ -320,7 +321,7 @@ export class GlobalGjcClient {
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
-		this.cli = (args, commandOptions) => this.#run(bindAgentDir(args, this.agentDir), commandOptions?.timeoutMs);
+		this.cli = (args, commandOptions) => this.#run(bindAgentDir(args, this.agentDir), commandOptions?.timeoutMs, commandOptions?.priority ?? "interactive");
 	}
 	get generation(): number {
 		return this.#generation;
@@ -534,23 +535,33 @@ export class GlobalGjcClient {
 	#log(error: unknown): void {
 		(this.#options.log ?? console.error)(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
 	}
-	async #run(args: readonly string[], requestedTimeout?: number): Promise<CliResult> {
+	async #run(args: readonly string[], requestedTimeout?: number, priority: "interactive" | "background" = "interactive"): Promise<CliResult> {
 		this.#assertAgentDirIdentity();
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
-		while (this.#inflight >= 4) {
-			let wake: (() => void) | undefined;
+		// Interactive waiters always have headroom. Background can max 2 in flight, interactive can max 2.
+		const canProceed = (): boolean => {
+			if (priority === "interactive") {
+				return this.#inflight < 4;
+			}
+			// Background: must be under 4 total AND under 2 background concurrent
+			return this.#inflight < 4 && this.#backgroundInFlight < 2;
+		};
+		while (!canProceed()) {
+			let resolve: (() => void) | undefined;
+			const entry = { resolve: () => {}, priority };
 			try {
 				await bounded(
-					new Promise<void>((resolve) => {
-						wake = resolve;
-						this.#queue.push(resolve);
+					new Promise<void>((r) => {
+						resolve = r;
+						entry.resolve = r;
+						this.#queue.push(entry);
 					}),
 					Math.max(1, deadline - Date.now()),
 				);
 			} finally {
-				if (wake) {
-					const i = this.#queue.indexOf(wake);
+				if (resolve) {
+					const i = this.#queue.findIndex((e) => e.resolve === resolve);
 					if (i >= 0) this.#queue.splice(i, 1);
 				}
 			}
@@ -560,9 +571,10 @@ export class GlobalGjcClient {
 		if (this.#stopped || (this.#started && !this.#available))
 			throw new GjcCliUnavailableError("client stopped or broker unavailable");
 		this.#inflight++;
+		if (priority === "background") this.#backgroundInFlight++;
 		try {
 			const remaining = Math.max(1, deadline - Date.now());
-			if (this.#options.command) return await bounded(this.#options.command(args, { timeoutMs: remaining }), remaining);
+			if (this.#options.command) return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
 			const child = this.#spawn({
 				cmd: [this.executable, ...args],
 				cwd: this.#cwd,
@@ -588,7 +600,16 @@ export class GlobalGjcClient {
 			}
 		} finally {
 			this.#inflight--;
-			this.#queue.shift()?.();
+			if (priority === "background") this.#backgroundInFlight--;
+			// Dequeue interactive first, or a background waiter if none interactive are waiting
+			let nextIndex = this.#queue.findIndex((e) => e.priority === "interactive");
+			if (nextIndex < 0) {
+				nextIndex = this.#queue.findIndex((e) => e.priority === "background");
+			}
+			if (nextIndex >= 0) {
+				const [next] = this.#queue.splice(nextIndex, 1);
+				next.resolve();
+			}
 		}
 	}
 	#assertAgentDirIdentity(): void {
