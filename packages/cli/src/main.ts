@@ -216,6 +216,15 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(
 		`memory: queued=${cycle.memoryIntents.queued} written=${cycle.memoryIntents.written} committed=${cycle.memoryIntents.committed} receipted=${cycle.memoryIntents.receipted} quarantined=${cycle.memoryIntents.quarantined}${cycle.memoryClosing ? " (closing)" : ""}`,
 	);
+	if (cycle.agentDisk) {
+		const { path, freeBytes, totalBytes } = cycle.agentDisk;
+		const gib = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
+		lines.push(
+			freeBytes === null || totalBytes === null
+				? `agent_disk: ${path} unobservable`
+				: `agent_disk: ${path} free=${gib(freeBytes)}GiB total=${gib(totalBytes)}GiB`,
+		);
+	}
 	// Always rendered: an empty subsystem must be distinguishable from an absent one.
 	lines.push(
 		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,

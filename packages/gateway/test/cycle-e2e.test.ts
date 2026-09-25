@@ -50,6 +50,17 @@ test("projector reads durable rows through the database and stays fail-closed", 
 		expect(bound.gates).toEqual([]);
 		expect(bound.phase).toBe("idle");
 		expect(bound.instanceId).toBeString();
+		expect(bound.agentDisk).toBeNull();
+		// Broker-bound: the projector observes the agent directory's filesystem (issue #15).
+		const observed = new RuntimeCycleProjector(database, { queueDepth: 0 }, { agentDir: directory }).project();
+		expect(observed.agentDisk?.path).toBe(directory);
+		expect(observed.agentDisk?.freeBytes).toBeGreaterThan(0);
+		const missing = new RuntimeCycleProjector(
+			database,
+			{ queueDepth: 0 },
+			{ agentDir: join(directory, "missing-agent") },
+		).project();
+		expect(missing.gates).toContain("agent_disk_headroom");
 
 		// A durable pending inbound message projects dispatching and attaches to its origin.
 		database.inboundEnqueue({

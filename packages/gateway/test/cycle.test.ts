@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { INBOUND_STARVATION_MS, projectRuntimeCycle, type RuntimeCycleSources } from "../src/ops/cycle";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	AGENT_DISK_MIN_FREE_BYTES,
+	AGENT_DISK_MIN_FREE_RATIO,
+	INBOUND_STARVATION_MS,
+	observeAgentDisk,
+	projectRuntimeCycle,
+	type RuntimeCycleSources,
+} from "../src/ops/cycle";
 
 const generatedAt = "2026-08-26T00:00:00.000Z";
 
@@ -32,6 +41,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		activeLanes: 0,
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
+		agentDisk: null,
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -54,6 +64,57 @@ const boundSession = {
 };
 
 describe("runtime cycle projection", () => {
+	// Issue #15: the GJC agent directory grew to 70+ GB with no reaper; the
+	// gateway must surface the disk-full cliff before session creation fails.
+	test("agent-directory disk headroom below the floor or unobservable is a gate", () => {
+		const total = 400 * 1024 ** 3;
+		const path = "/home/operator/.gjc/agent";
+		const healthy = projectRuntimeCycle(
+			sources({ agentDisk: { path, freeBytes: 160 * 1024 ** 3, totalBytes: total } }),
+			generatedAt,
+		);
+		expect(healthy.gates).toEqual([]);
+		expect(healthy.agentDisk).toEqual({ path, freeBytes: 160 * 1024 ** 3, totalBytes: total });
+		const ratioFloor = Math.ceil(total * AGENT_DISK_MIN_FREE_RATIO);
+		const atFloor = projectRuntimeCycle(
+			sources({ agentDisk: { path, freeBytes: ratioFloor, totalBytes: total } }),
+			generatedAt,
+		);
+		expect(atFloor.gates).toEqual([]);
+		const lowRatio = projectRuntimeCycle(
+			sources({ agentDisk: { path, freeBytes: ratioFloor - 1, totalBytes: total } }),
+			generatedAt,
+		);
+		expect(lowRatio.gates).toEqual(["agent_disk_headroom"]);
+		expect(lowRatio.phase).toBe("degraded");
+		// Small volume: half the disk free still gates when it is under the absolute floor.
+		const small = 10 * 1024 ** 3;
+		const lowBytes = projectRuntimeCycle(
+			sources({ agentDisk: { path, freeBytes: AGENT_DISK_MIN_FREE_BYTES - 1, totalBytes: small } }),
+			generatedAt,
+		);
+		expect(lowBytes.gates).toEqual(["agent_disk_headroom"]);
+		// Missing evidence never reads as healthy.
+		const unobservable = projectRuntimeCycle(
+			sources({ agentDisk: { path, freeBytes: null, totalBytes: null } }),
+			generatedAt,
+		);
+		expect(unobservable.gates).toEqual(["agent_disk_headroom"]);
+		// No broker-bound agent directory (isolated tests): nothing to observe, no gate.
+		expect(projectRuntimeCycle(sources(), generatedAt).agentDisk).toBeNull();
+	});
+
+	test("observeAgentDisk reads filesystem headroom without touching the directory", () => {
+		const observed = observeAgentDisk(tmpdir());
+		expect(observed.freeBytes).toBeGreaterThan(0);
+		expect(observed.totalBytes).toBeGreaterThanOrEqual(observed.freeBytes as number);
+		expect(observeAgentDisk(join(tmpdir(), "gajaeway-missing-agent-dir-15"))).toEqual({
+			path: join(tmpdir(), "gajaeway-missing-agent-dir-15"),
+			freeBytes: null,
+			totalBytes: null,
+		});
+	});
+
 	test("pending work with nothing in flight past the starvation window is a gate, not dispatching", () => {
 		const busy = projectRuntimeCycle(
 			sources({ inboundCounts: new Map([["pending", 159]]), oldestStarvedPendingMs: INBOUND_STARVATION_MS - 1 }),
