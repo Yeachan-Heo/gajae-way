@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import {
@@ -1084,3 +1084,78 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 	expect(cliReports).toBe(2);
 	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
 });
+
+// Issue #9: the bounded request wait was a fixed wall-clock cap. Long monitor
+// turns (canonicalize, townhall) legitimately run 25-40 minutes while emitting
+// tool activity the whole way, and were killed as SessionRequestTimeoutError
+// at the 1800 s mark with the work still landing. The wait is an inactivity
+// lease: frames attributed to the turn refresh it; silence still ends it.
+for (const progressing of [true, false]) {
+	test(`request wait is an activity lease: a turn that keeps emitting ${progressing ? "survives past" : "is not spared when silent for"} waitTimeoutMs`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "lease", epoch: 0 });
+		const run: CliRunner = async (args) => {
+			if (args.includes("session.last_assistant"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: ["landed"], complete: true } }),
+					stderr: "",
+				};
+			throw new Error(`unexpected command ${args.join(" ")}`);
+		};
+		let clock = 0;
+		let polls = 0;
+		const ids = { commandId: "cmd-lease", turnId: "turn-lease" };
+		const relay = scriptedRelay((request) => {
+			if (request.operation === "turn.prompt")
+				return { ok: true, result: { ...ids, accepted: true, clientRef: request.input.clientRef } };
+			polls += 1;
+			// Terminal only on the 6th poll (clock 5000 ms); the lease is 2500 ms.
+			return {
+				ok: true,
+				result: {
+					kind: "prompt",
+					status: polls >= 6 ? "terminal_ok" : "in_flight",
+					clientRef: request.input.clientRef,
+				},
+			};
+		});
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: run,
+			instanceId: "instance-1",
+			tailRunner: new TailRunner({ stream: relay.spawn, repo, now: () => clock }),
+			now: () => clock,
+			sleep: async (ms) => {
+				clock += ms;
+				if (progressing)
+					relay.streams[0]!.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
+				// Let the pushed frame reach the handle before the next deadline check.
+				await Bun.sleep(1);
+			},
+		});
+		const attempt = port.request({
+			sessionId: "sdk-1",
+			repo,
+			text: "long work",
+			opRef: "gw-lease-1",
+			pollMs: 1000,
+			waitTimeoutMs: 2500,
+		});
+		if (progressing) {
+			const result = await attempt;
+			expect(result.status.status.status).toBe("terminal_ok");
+			expect(result.assistant.text).toBe("landed");
+			expect(clock).toBe(5000);
+		} else {
+			const failure = await attempt.catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(SessionRequestTimeoutError);
+			expect((failure as SessionRequestTimeoutError).lastStatus.status.status).toBe("in_flight");
+			expect(clock).toBe(3000);
+		}
+	});
+}
