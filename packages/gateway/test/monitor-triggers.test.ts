@@ -16,9 +16,13 @@ test("cron supports steps, lists, ranges, dow and injected clock", () => {
 	let fired = 0;
 	const stop = startCron(
 		"15 10 * * 1",
-		() => {
-			fired++;
-			return true;
+		{
+			cursor: () => new Date(2026, 0, 5, 10, 0),
+			fire: () => {
+				fired++;
+				return true;
+			},
+			skipped: () => {},
 		},
 		{ now: () => monday, since: new Date(2026, 0, 5, 10, 0) },
 	);

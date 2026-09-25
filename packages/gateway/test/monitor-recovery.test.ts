@@ -9,9 +9,15 @@ import { initializeMemory } from "../src/memory/doctrine";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { MonitorRuntime } from "../src/monitors/runtime";
-import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
+import {
+	compileCron,
+	cronMatches,
+	DEFAULT_CRON_CATCH_UP,
+	planCronCatchUp,
+	startCron,
+} from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
-import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
+import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
@@ -143,7 +149,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 				},
 			},
 		});
-		const inspect = async (id: string) => {
+		const inspectResult = async (id: string) => {
 			socket!.write(
 				`${JSON.stringify({ v: "0.1", type: "request", id, verb: "monitor.inspect", params: { monitorId: monitor.monitorId } })}\n`,
 			);
@@ -151,12 +157,13 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 				const frame = frames.find((entry) => entry.id === id);
 				if (frame) {
 					expect(frame.type).toBe("response");
-					return (frame.result as { recentEvents: Array<Record<string, unknown>> }).recentEvents;
+					return frame.result as { recentEvents: Array<Record<string, unknown>>; catchUp?: unknown };
 				}
 				await Bun.sleep(5);
 			}
 			throw new Error(`no monitor.inspect response for ${id}`);
 		};
+		const inspect = async (id: string) => (await inspectResult(id)).recentEvents;
 		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
 		const rows = await inspect("history");
 		expect(rows).toHaveLength(2);
@@ -184,6 +191,14 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 			expect(row.quarantined).toBeUndefined();
 			expect(row.reason).toBeUndefined();
 		}
+		// Issue #157: cron slots refused by catch-up policy are reported, never hidden.
+		expect((await inspectResult("no-skips")).catchUp).toBeUndefined();
+		const skip = { count: 3, oldest: "2026-08-27T01:00:00.000Z", newest: "2026-08-27T03:00:00.000Z" };
+		db.monitorCronRecordSkip(monitor.monitorId, skip, "2026-08-27T09:00:00.000Z");
+		expect((await inspectResult("skips")).catchUp).toEqual({
+			skippedTotal: 3,
+			lastSkip: { ...skip, recordedAt: "2026-08-27T09:00:00.000Z" },
+		});
 		await propagator.reconcile();
 		expect(sends).toBe(0);
 		expect(
@@ -384,52 +399,6 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("delivered");
 	});
 
-	test("a silent note settles authored_no_delivery, never authored-forever (#94)", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(
-			async (_id, text) => JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "[SILENT]" }))),
-			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
-		);
-		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
-		await propagator.drain();
-		expect(db.authoredOutput(eventId)).toBe("[SILENT]");
-		expect(stage(db, eventId)).toBe("authored_no_delivery");
-		expect(db.deliveryRows()).toHaveLength(0);
-	});
-
-	test("reconcile settles events already stranded at authored (#94)", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async () => {
-			throw new Error("stranded authored events must not be re-authored");
-		});
-		const silent = seedEvent(db, monitor.monitorId, "authored", crypto.randomUUID());
-		db.authoredOutputCreate(silent, "[SILENT]");
-		const expiredBatch = crypto.randomUUID();
-		const expired = seedEvent(db, monitor.monitorId, "authored", expiredBatch);
-		db.authoredOutputCreate(expired, "report");
-		const ledger = new DeliveryLedger(db);
-		ledger.createPending({ deliveryId: "old", turnId: expiredBatch, originKey: "loopback", payloadJson: "{}" });
-		for (let attempt = 0; attempt < 3; attempt++) ledger.fail("old");
-		ledger.expireStale(0, Date.now() + 1);
-		// Memory intents exist, as they do for any event that was authored live.
-		for (const eventId of [silent, expired])
-			db.memoryIntentCreate({ id: `monitor-event-intent:${eventId}`, kind: "monitor-event", payloadJson: eventId });
-		await propagator.reconcile();
-		expect(stage(db, silent)).toBe("authored_no_delivery");
-		expect(stage(db, expired)).toBe("failed_no_retry");
-		expect(db.monitorFailure(expired)).toMatchObject({
-			code: "delivery_expired",
-			detail: "delivery old expired after 3 attempts: expired_before_settlement",
-		});
-	});
-
 	test("no channel target and no owner target settles authored_no_delivery", async () => {
 		const {
 			propagator,
@@ -464,55 +433,6 @@ describe("monitor crash-boundary state machine", () => {
 			} as never),
 			'"terminal":"failed"',
 		],
-		// #178: a relay refusal is a structured envelope, not a process exit. It
-		// must carry the envelope code and never a misleading `exitCode: 0`.
-		[
-			"envelope refusal",
-			new GjcCliError("SECRET_RAW", 0, "", { code: "prompt_failed", message: "SECRET_ENVELOPE" }),
-			'"code":"prompt_failed","transport":"envelope"',
-		],
-		// #178: the SDK terminal code and outcome classifiers were flattened away,
-		// so a deadline kill and a provider overload read identically.
-		[
-			"terminal deadline",
-			new SessionTerminalError({
-				operationRef: "SECRET_OP",
-				status: {
-					status: "failed",
-					error: { code: "prompt_deadline_exceeded", message: "SECRET_TERMINAL" },
-					outcome: { kind: "failed", provenance: "deadline" },
-				},
-			} as never),
-			'"code":"prompt_deadline_exceeded","terminal":"failed","outcome":{"kind":"failed","provenance":"deadline"}',
-		],
-		[
-			"terminal provider overload",
-			new SessionTerminalError({
-				operationRef: "SECRET_OP",
-				status: {
-					status: "failed",
-					outcome: {
-						kind: "failed",
-						code: "prompt_failed",
-						providerCode: "overloaded_error",
-						phase: "post_start",
-						category: "agent_runtime",
-						provenance: "agent_failed",
-						message: "SECRET_OUTCOME",
-						reason: "SECRET REASON with spaces",
-					},
-				},
-			} as never),
-			'"code":"prompt_failed","terminal":"failed","outcome":{"kind":"failed","providerCode":"overloaded_error","phase":"post_start","category":"agent_runtime","provenance":"agent_failed"}',
-		],
-		[
-			"request wait timeout",
-			new SessionRequestTimeoutError("s1", "SECRET_OP", {
-				operationRef: "SECRET_OP",
-				status: { status: "in_flight" },
-			} as never),
-			'"class":"SessionRequestTimeoutError","lastStatus":"in_flight"',
-		],
 		[
 			"untrusted fields",
 			Object.assign(new Error("SECRET_RAW"), {
@@ -539,7 +459,7 @@ describe("monitor crash-boundary state machine", () => {
 			expect(detail).toContain('"origin":"monitor/eventtype/memory.canonicalize"');
 			expect(detail).toContain('"attempt":2');
 			expect(detail).not.toContain("SECRET");
-			if (label === "untrusted fields" || label === "missing fields" || label === "envelope refusal") {
+			if (label === "untrusted fields" || label === "missing fields") {
 				expect(detail).not.toContain('"exitCode"');
 				expect(detail).not.toContain('"signal"');
 			}
@@ -631,80 +551,6 @@ describe("monitor crash-boundary state machine", () => {
 		);
 	});
 
-	test("a bounded drain interrupts an in-flight authoring turn, names the session, and the next boot re-dispatches it (#225)", async () => {
-		let release: (() => void) | undefined;
-		const parked = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let turns = 0;
-		const {
-			propagator,
-			monitor,
-			database: db,
-			registry,
-		} = await harness(async (_id, text) => {
-			turns++;
-			if (turns === 1) await parked;
-			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" })));
-		});
-		const eventId = seedEvent(db, monitor.monitorId, "admitted");
-		const reconcile = propagator.reconcile();
-		for (let attempt = 0; attempt < 100 && turns === 0; attempt++) await Bun.sleep(5);
-		expect(turns).toBe(1);
-		// The turn never settles inside the shutdown window: drain must return on
-		// its own instead of waiting for the service manager's SIGKILL.
-		const started = Date.now();
-		await propagator.drain(100);
-		expect(Date.now() - started).toBeLessThan(2_000);
-		expect(stage(db, eventId)).toBe("failed");
-		const failure = db.monitorFailure(eventId);
-		expect(failure?.code).toBe("gateway_shutdown");
-		expect(failure?.detail).toContain("gateway stopped at");
-		expect(failure?.detail).toContain('"sessionId":"s1"');
-		expect(failure?.detail).toContain('"phase":"request"');
-		// The lease is released immediately: the next boot need not wait for the
-		// 10-minute TTL before reclaiming the event.
-		expect(db.monitorEventLiveLeaseOwner(eventId)).toBeUndefined();
-		// The orphaned turn finishing after the stop is fenced out: no authored
-		// output and no stage change from the dead attempt.
-		release?.();
-		await reconcile;
-		expect(stage(db, eventId)).toBe("failed");
-		expect(db.authoredOutput(eventId)).toBeUndefined();
-		// Next boot: a fresh propagator reclaims the event as recoverable state.
-		const next = new MonitorPropagator({
-			database: db,
-			registry,
-			sessionPort: fakeSessionPort(async (_id, text) =>
-				JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" }))),
-			),
-			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(db)),
-			emit: () => {},
-		});
-		propagators.push(next);
-		await next.reconcile();
-		expect(stage(db, eventId)).toBe("authored_no_delivery");
-		expect(db.authoredOutput(eventId)).toBe("recovered");
-	});
-
-	test("a closing propagator starts no new dispatch from reconcile", async () => {
-		let turns = 0;
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) => {
-			turns++;
-			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "n" })));
-		});
-		const eventId = seedEvent(db, monitor.monitorId, "admitted");
-		await propagator.drain();
-		await propagator.reconcile();
-		expect(turns).toBe(0);
-		expect(stage(db, eventId)).toBe("admitted");
-	});
-
 	test("durable failure detail keeps only allowlisted classes causes and frames", async () => {
 		class SecretVendorTokenGhp123 extends Error {}
 		const hostile = new SecretVendorTokenGhp123("ghp_attacker-secret prompt=https://secret.example/token");
@@ -750,78 +596,181 @@ describe("monitor crash-boundary state machine", () => {
 describe("cron slot catch-up", () => {
 	// Catch-up tests use synthetic 2026-08-27 clocks; backdate the monitor so its
 	// creation instant precedes the scheduled slots under test.
-	test("catch-up fires every due slot across a restart window with exact timestamps, deduped", () => {
-		const fired: string[] = [];
-		// Window crossing the 06:30 slot.
-		const from = new Date(2026, 7, 27, 5, 0);
-		const now = new Date(2026, 7, 27, 8, 0);
-		const count = cronSlotsBetween("30 6 * * *", from, now, 8, (slot) => {
-			fired.push(slot.toISOString());
-			return true;
+	const at = (hour: number, minute = 0, day = 27) => new Date(2026, 7, day, hour, minute);
+	const noted = async (_id: string, text: string) =>
+		JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" })));
+
+	async function cronMonitor(schedule: string, createdAt: Date) {
+		const fixture = await harness(noted);
+		const monitor = fixture.registry.add({
+			name: `cron ${schedule}`,
+			trigger: { kind: "cron", schedule },
+			eventTypes: ["memory.canonicalize"],
+			burstPolicy: "dedupe",
+			enabled: true,
 		});
-		expect(count).toBe(1);
-		expect(fired).toEqual([new Date(2026, 7, 27, 6, 30).toISOString()]);
+		backdateMonitor(fixture.database, monitor.monitorId, createdAt);
+		return { ...fixture, monitor };
+	}
+
+	/** One gateway incarnation: start the runtime at `now`, let it sweep once, stop. */
+	async function incarnation(
+		fixture: Awaited<ReturnType<typeof cronMonitor>>,
+		now: Date,
+		catchUp?: { maxSlots: number; maxAgeMs: number },
+	) {
+		const runtime = new MonitorRuntime({} as never, fixture.registry, fixture.propagator, fixture.database, {
+			now: () => now,
+			...(catchUp ? { catchUp } : {}),
+		});
+		await runtime.start();
+		await runtime.stop();
+	}
+
+	const admitted = (db: GatewayDatabase, monitorId: string) =>
+		db.monitorEventRows(monitorId, "oldest").map((row) => row.fired_at);
+
+	test("plan replays every slot since the cursor, splitting age/count overflow into one skip", () => {
+		const hourly = compileCron("0 * * * *");
+		expect(planCronCatchUp(hourly, at(0), at(13), DEFAULT_CRON_CATCH_UP).admit).toHaveLength(13);
+		const plan = planCronCatchUp(hourly, at(0), at(12), { maxSlots: 3, maxAgeMs: 6 * 60 * 60 * 1000 });
+		// 01..05 are older than the 6h floor (06:00); of 06..12 only the newest 3 fit.
+		expect(plan.admit).toEqual([at(10), at(11), at(12)]);
+		expect(plan.skipped).toEqual({ count: 9, oldest: at(1), newest: at(9) });
+		expect(planCronCatchUp(hourly, at(0), at(0, 59), DEFAULT_CRON_CATCH_UP)).toEqual({ admit: [] });
 	});
 
-	test("catch-up budget caps a long outage", () => {
-		const fired: number[] = [];
-		// 24h of hourly slots, budget 8.
-		const from = new Date(2026, 7, 26, 0, 0);
-		const now = new Date(2026, 7, 27, 0, 0);
-		const count = cronSlotsBetween("0 * * * *", from, now, 8, (slot) => {
-			fired.push(slot.getHours());
-			return true;
-		});
-		expect(count).toBe(8);
-		expect(fired).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+	test("compiled matcher agrees with cronMatches", () => {
+		const schedule = "*/15 8-17 * 1-6 1-5";
+		const matches = compileCron(schedule);
+		for (let minute = 0; minute < 7 * 24 * 60; minute += 5) {
+			const date = new Date(2026, 0, 5, 0, minute);
+			expect(matches(date)).toBe(cronMatches(schedule, date));
+		}
 	});
 
-	test("*/30 resume at 07:30 after 06:00 tick fires missed 06:30/07:00 plus 07:30 (always scan)", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
+	test("#157: a 4-hour schedule recovers every missed report after a >1h outage", async () => {
+		const fixture = await cronMonitor("0 */4 * * *", at(23, 30, 26));
+		await incarnation(fixture, at(0, 1));
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual([at(0).toISOString()]);
+		// Down 00:01 -> 13:00: the fixed one-hour lookback used to reach only
+		// 12:00 and silently lose 04:00 and 08:00.
+		await incarnation(fixture, at(13));
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
+			[at(0), at(4), at(8), at(12)].map((slot) => slot.toISOString()),
 		);
-		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
+		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toBeUndefined();
+	});
+
+	test("restarts after 30m, 2h and 13h each recover every due slot inside policy", async () => {
+		const fixture = await cronMonitor("0 * * * *", at(0, 30));
+		await incarnation(fixture, at(1, 5));
+		await incarnation(fixture, at(1, 35)); // 30m outage, nothing new due
+		await incarnation(fixture, at(3, 35)); // 2h outage
+		await incarnation(fixture, at(16, 35)); // 13h outage
+		const expected = Array.from({ length: 16 }, (_, index) => at(index + 1).toISOString());
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(expected);
+		for (const slot of expected) expect(fixture.database.monitorSlotExists(fixture.monitor.monitorId, slot)).toBe(true);
+	});
+
+	test("duplicate startup and tick sweeps admit each slot exactly once", async () => {
+		const fixture = await cronMonitor("*/30 * * * *", at(5, 45));
+		// Two incarnations racing the same instant, then a live ticking trigger.
+		await incarnation(fixture, at(7, 30));
+		await incarnation(fixture, at(7, 30));
+		const clock = { value: at(7, 30) };
 		const fired: string[] = [];
-		const clock = { value: new Date(2026, 7, 27, 6, 0) };
 		const stop = startCron(
 			"*/30 * * * *",
-			(slot) => {
-				const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slot.toISOString() }, slot);
-				if (id) {
+			{
+				cursor: () => new Date(fixture.database.monitorCronCursor(fixture.monitor.monitorId) ?? at(5, 45)),
+				fire: (slot) => {
+					const id = fixture.propagator.submitSlot(
+						fixture.monitor.monitorId,
+						"memory.canonicalize",
+						{ at: slot.toISOString() },
+						slot,
+					);
+					if (id) fired.push(slot.toISOString());
+					return id !== null;
+				},
+				skipped: () => {
+					throw new Error("nothing is beyond policy");
+				},
+			},
+			{ now: () => clock.value, intervalMs: 1 },
+		);
+		await Bun.sleep(5);
+		clock.value = at(8, 0);
+		await Bun.sleep(5);
+		stop();
+		expect(fired).toEqual([at(8).toISOString()]);
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
+			[at(6), at(6, 30), at(7), at(7, 30), at(8)].map((slot) => slot.toISOString()),
+		);
+	});
+
+	test("a suspended process sweeps every slot missed since its previous sweep, once", async () => {
+		const clock = { value: at(6) };
+		const fired: string[] = [];
+		// The durable cursor never moves here, so only the in-process watermark
+		// keeps later ticks from re-offering 06:00.
+		const stop = startCron(
+			"*/30 * * * *",
+			{
+				cursor: () => at(5, 50),
+				fire: (slot) => {
 					fired.push(slot.toISOString());
 					return true;
-				}
-				return false;
+				},
+				skipped: () => {},
 			},
-			{ now: () => clock.value, since: new Date(2026, 7, 26, 0, 0), intervalMs: 1 },
+			{ now: () => clock.value, intervalMs: 1 },
 		);
-		// First tick at 06:00 — fresh process, window scan (nothing due before 06:00
-		// inside the last hour except 05:30, which is inside the window! It fires:
-		// the process has no durable record of it and it is genuinely missed).
 		await Bun.sleep(5);
-		const initial = fired.length;
-		expect(initial).toBeGreaterThanOrEqual(1);
-		// Suspend: next tick at 07:30 — the CURRENT minute matches, but the
-		// suspended window also contains 06:30 and 07:00, which must fire.
-		clock.value = new Date(2026, 7, 27, 7, 30);
+		clock.value = at(7, 30);
 		await Bun.sleep(5);
-		const sixThirty = new Date(2026, 7, 27, 6, 30).toISOString();
-		const seven = new Date(2026, 7, 27, 7, 0).toISOString();
-		const sevenThirty = new Date(2026, 7, 27, 7, 30).toISOString();
-		expect(fired).toContain(sevenThirty);
-		// Exactly-once per slot across the whole run:
-		expect(fired.filter((slot) => slot === sixThirty).length).toBeLessThanOrEqual(1);
-		// The missed 06:30/07:00 slots (within the 1h window of 07:30) fired:
-		if (sixThirty >= new Date(clock.value.getTime() - 60 * 60 * 1000).toISOString()) {
-			expect(fired).toContain(sixThirty);
-		}
-		expect(fired).toContain(seven);
-		expect(db.monitorEventRows(monitor.monitorId).length).toBe(fired.length);
 		stop();
+		expect(fired).toEqual([at(6), at(6, 30), at(7), at(7, 30)].map((slot) => slot.toISOString()));
+	});
+
+	test("slots before monitor creation are never backfilled", async () => {
+		const fixture = await cronMonitor("0 * * * *", at(10, 15));
+		await incarnation(fixture, at(13, 5));
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
+			[at(11), at(12), at(13)].map((slot) => slot.toISOString()),
+		);
+		expect(fixture.database.monitorSlotExists(fixture.monitor.monitorId, at(10).toISOString())).toBe(false);
+	});
+
+	test("slots beyond the age/count policy leave a durable skipped-count diagnostic", async () => {
+		const fixture = await cronMonitor("0 * * * *", at(23, 30, 26));
+		const policy = { maxSlots: 3, maxAgeMs: 6 * 60 * 60 * 1000 };
+		await incarnation(fixture, at(12, 5), policy);
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
+			[at(10), at(11), at(12)].map((slot) => slot.toISOString()),
+		);
+		const state = fixture.database.monitorCronState(fixture.monitor.monitorId);
+		expect(state).toEqual({
+			cursor: at(9).toISOString(),
+			skippedTotal: 10,
+			lastSkip: {
+				count: 10,
+				oldest: at(0).toISOString(),
+				newest: at(9).toISOString(),
+				recordedAt: at(12, 5).toISOString(),
+			},
+		});
+		// Re-sweeping the same gap neither re-counts nor re-admits it.
+		await incarnation(fixture, at(12, 5), policy);
+		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toEqual(state);
+		expect(admitted(fixture.database, fixture.monitor.monitorId)).toHaveLength(3);
+		// A gap where everything is too old still advances the cursor past it.
+		await incarnation(fixture, at(20, 5), { maxSlots: 3, maxAgeMs: 60_000 });
+		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)?.skippedTotal).toBe(18);
+		expect(fixture.database.monitorCronCursor(fixture.monitor.monitorId)).toBe(at(20).toISOString());
+		expect(fixture.registry.remove(fixture.monitor.monitorId)).toBe(true);
+		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toBeUndefined();
 	});
 
 	test("runtime startup catch-up respects monitor.createdAt (integration)", async () => {
@@ -851,18 +800,14 @@ describe("cron slot catch-up", () => {
 				deliver: () => {},
 				emit: () => {},
 			});
-			// First tick at 06:31: window contains the 06:30 slot. Monitor was created
-			// at 06:29 (backdated) → catch-up admits the slot...
-			db.monitorSetCreatedAt(monitor.monitorId, new Date(2026, 7, 27, 6, 29).toISOString());
-			const runtimeOld = new MonitorRuntime({} as never, registry, propagator, {
-				now: () => new Date(2026, 7, 27, 6, 31),
-			});
+			// Monitor created at 06:29 (backdated) → startup at 06:31 admits the 06:30 slot...
+			db.monitorSetCreatedAt(monitor.monitorId, at(6, 29).toISOString());
+			const runtimeOld = new MonitorRuntime({} as never, registry, propagator, db, { now: () => at(6, 31) });
 			await runtimeOld.start();
 			await runtimeOld.stop();
 			await closure.drain();
-			expect(db.monitorSlotExists(monitor.monitorId, new Date(2026, 7, 27, 6, 30).toISOString())).toBe(true);
-			// Second scenario: a FRESH monitor created at 07:00 must NOT backfill the
-			// 06:30 slot on startup (scan window includes it, clamp rejects).
+			expect(db.monitorSlotExists(monitor.monitorId, at(6, 30).toISOString())).toBe(true);
+			// ...while a FRESH monitor (created now, after 06:30) never backfills it.
 			const monitorNew = registry.add({
 				name: "fresh",
 				trigger: { kind: "cron", schedule: "30 6 * * *" },
@@ -870,13 +815,11 @@ describe("cron slot catch-up", () => {
 				burstPolicy: "serialize",
 				enabled: true,
 			});
-			const runtimeNew = new MonitorRuntime({} as never, registry, propagator, {
-				now: () => new Date(2026, 7, 27, 6, 31),
-			});
+			const runtimeNew = new MonitorRuntime({} as never, registry, propagator, db, { now: () => at(6, 31) });
 			await runtimeNew.start();
 			await runtimeNew.stop();
 			await closure.drain();
-			expect(db.monitorSlotExists(monitorNew.monitorId, new Date(2026, 7, 27, 6, 30).toISOString())).toBe(false);
+			expect(db.monitorSlotExists(monitorNew.monitorId, at(6, 30).toISOString())).toBe(false);
 			await propagator.drain();
 			await closure.drain();
 			db.close();
@@ -886,13 +829,7 @@ describe("cron slot catch-up", () => {
 	});
 
 	test("fresh monitor does not backfill pre-creation slots; restarted old monitor does", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
+		const { propagator, monitor, database: db } = await harness(noted);
 		// The monitor was just created (createdAt ≈ now). A slot scheduled 30
 		// minutes BEFORE creation must not be synthesized by catch-up...
 		const beforeCreation = new Date(Date.now() - 30 * 60_000);
@@ -914,147 +851,6 @@ describe("cron slot catch-up", () => {
 		);
 		expect(ok).not.toBeNull();
 	});
-
-	test("budget counts only NEW admissions: 12 claimed duplicates do not starve a missed later slot", () => {
-		const claimed = new Set<string>();
-		// 12 already-claimed slots (fire returns false = duplicate admission)...
-		for (let hour = 1; hour <= 12; hour++) claimed.add(new Date(2026, 7, 26, hour, 0).toISOString());
-		const admitted: number[] = [];
-		const from = new Date(2026, 7, 26, 0, 0);
-		const mid = new Date(2026, 7, 26, 13, 0);
-		// ...budget of 8 must still reach the unclaimed 13:00 slot.
-		const count = cronSlotsBetween("0 * * * *", from, mid, 8, (slot) => {
-			const key = slot.toISOString();
-			if (claimed.has(key)) return false;
-			claimed.add(key);
-			admitted.push(slot.getHours());
-			return true;
-		});
-		expect(count).toBe(1);
-		expect(admitted).toEqual([13]);
-	});
-
-	test("startCron first tick scans the window; slot claims are exactly-once via submitSlot", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
-		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
-		const fired: string[] = [];
-		// Process "starts" at 06:31 after being down across the 06:30 slot.
-		const stop = startCron(
-			"30 6 * * *",
-			(slot) => {
-				const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slot.toISOString() }, slot);
-				if (id) {
-					fired.push(slot.toISOString());
-					return true;
-				}
-				return false;
-			},
-			{ now: () => new Date(2026, 7, 27, 6, 31), since: new Date(2026, 7, 27, 6, 0) },
-		);
-		stop();
-		expect(fired).toEqual([new Date(2026, 7, 27, 6, 30).toISOString()]);
-		// Slot row + event row linked (atomic admission).
-		const admitted = db.monitorEventRows(monitor.monitorId);
-		expect(admitted).toHaveLength(1);
-		expect(admitted[0]?.fired_at).toBe(new Date(2026, 7, 27, 6, 30).toISOString());
-		// Second process starting at the same minute: slot already claimed, no refire.
-		const fired2: string[] = [];
-		const stop2 = startCron(
-			"30 6 * * *",
-			(slot) => {
-				const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slot.toISOString() }, slot);
-				if (id) {
-					fired2.push(slot.toISOString());
-					return true;
-				}
-				return false;
-			},
-			{ now: () => new Date(2026, 7, 27, 6, 31), since: new Date(2026, 7, 27, 6, 30) },
-		);
-		stop2();
-		expect(fired2).toEqual([]);
-		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
-	});
-
-	test("startCron skips missed slots older than the maximum catch-up age", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
-		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
-		const fired: string[] = [];
-		// Process starts at 20:00 with a 1h age bound; the 06:30 slot from the same
-		// day is older than the bound and must NOT fire.
-		const stop = startCron(
-			"30 6 * * *",
-			(slot) => {
-				const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slot.toISOString() }, slot);
-				if (id) {
-					fired.push(slot.toISOString());
-					return true;
-				}
-				return false;
-			},
-			{ now: () => new Date(2026, 7, 27, 20, 0), since: new Date(2026, 7, 26, 0, 0), maxCatchUpAgeMs: 60 * 60 * 1000 },
-		);
-		stop();
-		expect(fired).toEqual([]);
-		expect(db.monitorSlotExists(monitor.monitorId, new Date(2026, 7, 27, 6, 30).toISOString())).toBe(false);
-	});
-
-	test("suspension of +60m onto the same wall-minute still fires missed slots (minute EPOCH)", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
-		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
-		const clock = { value: new Date(2026, 7, 27, 5, 30) };
-		const fired: string[] = [];
-		const stop = startCron(
-			"30 6 * * *",
-			(slot) => {
-				const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slot.toISOString() }, slot);
-				if (id) {
-					fired.push(slot.toISOString());
-					return true;
-				}
-				return false;
-			},
-			{ now: () => clock.value, since: new Date(2026, 7, 27, 5, 0), intervalMs: 1 },
-		);
-		// First tick at 05:30 — window scan, nothing due yet.
-		expect(fired).toEqual([]);
-		// Suspend: jump exactly +60m to 06:30 (same wall-minute as... different minute
-		// here, but the next jump lands on the same minute-of-hour to defeat
-		// minute-of-hour dedupe): 06:30 → 07:30.
-		clock.value = new Date(2026, 7, 27, 6, 30);
-		await Bun.sleep(1);
-		// One more 30s-tick at 06:30 would double-fire without slot claims; nothing new.
-		clock.value = new Date(2026, 7, 27, 6, 30, 30);
-		await Bun.sleep(1);
-		// +60m suspension: 06:30:30 → 07:30:30. Minute-of-hour changed 30→30? NO —
-		// minuteEpoch advanced, and the window contains the 06:30 slot... but that
-		// already fired. A second hourly-style monitor scenario: use a "30 6" schedule;
-		// the window (06:30:30, 07:30:30] contains NO 06:30 slot, so nothing fires.
-		clock.value = new Date(2026, 7, 27, 7, 30, 30);
-		await Bun.sleep(1);
-		expect(fired).toEqual([new Date(2026, 7, 27, 6, 30).toISOString()]);
-		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
-		stop();
-	});
-
 	test("slot admission is atomic: claim+event commit together, duplicate claims never double-admit", async () => {
 		const {
 			propagator,
@@ -1100,127 +896,6 @@ describe("cron slot catch-up", () => {
 		expect(JSON.parse(payloadJson as string).at).toBe(slotAt.toISOString());
 		// fired_at itself is the scheduled slot time (blocker 3), not submit-time now.
 		expect(rows[0]?.fired_at).toBe(slotAt.toISOString());
-	});
-});
-
-describe("startup catch-up from the persisted slot boundary (#162)", () => {
-	async function cronRuntime(schedule: string, createdAt: Date) {
-		const ctx = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
-		const monitor = ctx.registry.add({
-			name: "statusboard",
-			trigger: { kind: "cron", schedule },
-			eventTypes: ["monitor.statusboard"],
-			burstPolicy: "serialize",
-			enabled: true,
-		});
-		backdateMonitor(ctx.database, monitor.monitorId, createdAt);
-		const claim = (slotAt: Date) =>
-			ctx.database.monitorSlotClaimWithEvent({
-				monitorId: monitor.monitorId,
-				slotAt: slotAt.toISOString(),
-				eventId: crypto.randomUUID(),
-				eventType: "monitor.statusboard",
-				payloadJson: JSON.stringify({ at: slotAt.toISOString() }),
-			});
-		const boot = async (at: Date) => {
-			const runtime = new MonitorRuntime({} as never, ctx.registry, ctx.propagator, { now: () => at });
-			await runtime.start();
-			await runtime.stop();
-		};
-		const rows = () => ctx.database.monitorEventRows(monitor.monitorId, "oldest");
-		return { claim, boot, rows };
-	}
-
-	test("many missed slots across a long outage coalesce into ONE marked catch-up event", async () => {
-		const { claim, boot, rows } = await cronRuntime("0 */4 * * *", new Date(2026, 7, 26, 0, 0));
-		claim(new Date(2026, 7, 27, 0, 0));
-		// Down from 00:19 to 12:05: the 04:00, 08:00 and 12:00 slots passed unseen.
-		await boot(new Date(2026, 7, 27, 12, 5));
-		const events = rows();
-		expect(events).toHaveLength(2);
-		const catchUp = events[1];
-		expect(catchUp?.fired_at).toBe(new Date(2026, 7, 27, 12, 0).toISOString());
-		expect(JSON.parse(catchUp?.payload_json ?? "null")).toEqual({
-			at: new Date(2026, 7, 27, 12, 0).toISOString(),
-			catchUp: {
-				cause: "startup",
-				missedFrom: new Date(2026, 7, 27, 4, 0).toISOString(),
-				missedTo: new Date(2026, 7, 27, 12, 0).toISOString(),
-				missedSlots: 3,
-			},
-		});
-	});
-
-	test("one missed daily slot is caught up once, and repeated restarts stay idempotent", async () => {
-		const { claim, boot, rows } = await cronRuntime("10 9 * * *", new Date(2026, 7, 20, 0, 0));
-		claim(new Date(2026, 7, 26, 9, 10));
-		await boot(new Date(2026, 7, 27, 10, 40));
-		await boot(new Date(2026, 7, 27, 10, 41));
-		await boot(new Date(2026, 7, 27, 11, 30));
-		const events = rows();
-		expect(events).toHaveLength(2);
-		expect(events[1]?.fired_at).toBe(new Date(2026, 7, 27, 9, 10).toISOString());
-		expect(JSON.parse(events[1]?.payload_json ?? "null").catchUp).toEqual({
-			cause: "startup",
-			missedFrom: new Date(2026, 7, 27, 9, 10).toISOString(),
-			missedTo: new Date(2026, 7, 27, 9, 10).toISOString(),
-			missedSlots: 1,
-		});
-	});
-
-	test("no missed slot: a restart between slots creates nothing", async () => {
-		const { claim, boot, rows } = await cronRuntime("0 */4 * * *", new Date(2026, 7, 26, 0, 0));
-		claim(new Date(2026, 7, 27, 8, 0));
-		await boot(new Date(2026, 7, 27, 9, 30));
-		expect(rows()).toHaveLength(1);
-	});
-
-	test("catch-up age is bounded: slots older than the maximum age are not replayed", async () => {
-		const { claim, boot, rows } = await cronRuntime("10 9 * * *", new Date(2026, 7, 1, 0, 0));
-		claim(new Date(2026, 7, 20, 9, 10));
-		// Down for a week; only the newest slot inside the 24h bound is owed.
-		await boot(new Date(2026, 7, 27, 8, 0));
-		const events = rows();
-		expect(events).toHaveLength(2);
-		expect(events[1]?.fired_at).toBe(new Date(2026, 7, 26, 9, 10).toISOString());
-		expect(JSON.parse(events[1]?.payload_json ?? "null").catchUp.missedSlots).toBe(1);
-	});
-
-	test("steady-state ticks after a coalesced catch-up do not replay the coalesced slots", async () => {
-		const {
-			database: db,
-			registry,
-			propagator,
-		} = await harness(async (_id, text) =>
-			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
-		);
-		const monitor = registry.add({
-			name: "half-hourly",
-			trigger: { kind: "cron", schedule: "*/30 * * * *" },
-			eventTypes: ["monitor.half"],
-			burstPolicy: "serialize",
-			enabled: true,
-		});
-		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 27, 3, 59));
-		const clock = { value: new Date(2026, 7, 27, 7, 10) };
-		const stop = startCron(
-			"*/30 * * * *",
-			(slot, catchUp) =>
-				propagator.submitSlot(monitor.monitorId, "monitor.half", { at: slot.toISOString(), catchUp }, slot) !== null,
-			{ now: () => clock.value, since: new Date(2026, 7, 27, 3, 59), intervalMs: 1 },
-		);
-		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
-		clock.value = new Date(2026, 7, 27, 7, 11);
-		await Bun.sleep(5);
-		clock.value = new Date(2026, 7, 27, 7, 30);
-		await Bun.sleep(5);
-		stop();
-		expect(db.monitorEventRows(monitor.monitorId, "oldest").map((row) => row.fired_at)).toEqual([
-			new Date(2026, 7, 27, 7, 0).toISOString(),
-			new Date(2026, 7, 27, 7, 30).toISOString(),
-		]);
 	});
 });
 

@@ -38,7 +38,8 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/absolute/path"],
   "scriptRoot": "/absolute/path",
-  "monitorContextFailureRollThreshold": 2
+  "monitorContextFailureRollThreshold": 2,
+  "monitorCatchUp": { "maxSlots": 24, "maxAgeMs": 86400000 }
 }
 ```
 
@@ -59,6 +60,8 @@ Notices use `[lane <name>] completed|failed|attempt_ended: …`. Uncertainty or 
 The ActionGuard notice is prompt guidance to use owned start/status/steer lanes and avoid raw `gjc` launches, not a new enforcement hook. The gateway shares the user's broker but controls only positively proven gateway-created sessions under the active database authority. A visible session ID alone is not ownership. It never adopts unrelated sessions, runs global GC, or uses `session.delete`. Host skill/script replacement, deployment, and process cleanup remain separate operational work.
 
 `monitorContextFailureRollThreshold` (1–20, default 2) is the monitor safety net, not a turn ceiling: native gjc auto-compaction keeps monitor sessions bounded, and a monitor that keeps answering is never rolled however many turns it takes. The epoch rolls only after this many **consecutive** context-class authoring failures (empty response, context-length rejection, zero-token completion) attributable to the current session AND a native-compaction request that came back `unavailable`/`failed`/`skipped`; the new session's first prompt then carries a digest of the monitor's instruction and its recent authored notes. Any healthy answer resets the streak, and failures that are executor-class or protocol-class (malformed or off-contract answers), or that come from a reconcile-replayed stale event or a dead epoch, never count. Executor-class failures report a sub-kind: `aside_timeout` and other worker/tool/lock failures, and `orphaned_executor` for a child process killed on the wrapper's timeout while the external daemon's job kept running — that one means "reclaim the external executor", never "roll the session". See `docs/monitors.md`.
+
+`monitorCatchUp` bounds cron catch-up after downtime. Each cron monitor keeps a durable cursor (its newest claimed or skipped slot, never earlier than the monitor's creation), and every sweep replays each slot due since that cursor through the atomic `monitor_slots` claim, so an outage of any length recovers its slots exactly once. `maxAgeMs` (60000–604800000, default 86400000 / 24 hours) refuses slots older than that; `maxSlots` (1–1000, default 24) admits only the newest that many and refuses the older overflow. Refused slots are never dropped silently: the monitor records the skipped count and the oldest/newest slot, logs `monitor_slots_skipped monitor=… count=… oldest=… newest=…`, and `gajaeway monitors inspect <id>` reports them as `catchUp.skippedTotal` and `catchUp.lastSkip`. The setting is restart-required.
 
 `turnTimeoutMs` was removed with the persistent-session cutover. Configuration containing it is rejected; use `stallTimeoutMs` for an alert-only tail silence threshold. It never kills or replaces a running SDK operation.
 

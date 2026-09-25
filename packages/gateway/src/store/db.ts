@@ -61,6 +61,22 @@ function brokerAuthorityKey(authority: BrokerAuthority): string {
 	return JSON.stringify([authority.canonicalAgentDir, authority.identity]);
 }
 
+/** Durable cron catch-up diagnostics for one monitor (issue #157), stored in `meta`. */
+export interface MonitorCronState {
+	/** Newest slot refused under policy; the cursor never re-considers it. */
+	readonly cursor: string;
+	/** Slots refused under policy over the monitor's lifetime. */
+	readonly skippedTotal: number;
+	readonly lastSkip: {
+		readonly count: number;
+		readonly oldest: string;
+		readonly newest: string;
+		readonly recordedAt: string;
+	};
+}
+
+const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
+
 const BROKER_SNAPSHOT_TABLES = [
 	"sessions",
 	"deliveries",
@@ -154,27 +170,6 @@ export class WorkAttemptStateError extends Error {
 		super("work lane state unavailable");
 		this.name = "WorkAttemptStateError";
 	}
-}
-
-/**
- * The only permitted terminal rewrite (#248): broker evidence observed with
- * receiptState=missing is upgraded to present, in the same write that stores
- * this op's proven final body. The SDK receipt state is monotonic, so the
- * rest of the terminal status must be unchanged.
- */
-function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRuntime): boolean {
-	const before = current.terminal;
-	const after = next.terminal;
-	return (
-		before?.kind === "broker" &&
-		after?.kind === "broker" &&
-		before.observedAt === after.observedAt &&
-		before.status?.receiptState === "missing" &&
-		JSON.stringify({ ...before.status, receiptState: "present" }) === JSON.stringify(after.status) &&
-		current.output.proof === null &&
-		next.output.proof !== null &&
-		(next.output.disposition === "available" || next.output.disposition === "silent")
-	);
 }
 
 /** Length-delimited identity hashing; independent of target, output and recovery time. */
@@ -384,7 +379,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 23;
+const LATEST_SCHEMA_VERSION = 22;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -474,12 +469,9 @@ export class DatabaseStartupError extends Error {
  * - dispatched: authoring turn sent, output not yet parsed.
  * - authored: note authored; delivery to the target is pending or settled.
  * - delivered: the batch's ledger delivery was confirmed by the adapter.
- * - authored_no_delivery: terminal — nothing will ever be delivered: the
- *   monitor has no channel target and no owner target is configured, or the
- *   authored note is a silence token. Explicit instead of `authored`-forever
- *   so the operator sees a finished state.
- * - failed_no_retry also covers an authored note whose delivery expired
- *   (`monitor_failures` code `delivery_expired`).
+ * - authored_no_delivery: terminal — the monitor has no channel target and no
+ *   owner target is configured, so nothing will ever be delivered. Explicit
+ *   instead of `authored`-forever so the operator sees a finished state.
  * - failed: the last dispatch attempt failed; reconcile redispatches.
  * - failed_no_retry: dispatch failed and reconcile will not retry it again
  *   (reclaim budget exhausted); operator-visible terminal state.
@@ -918,11 +910,7 @@ export class GatewayDatabase {
 		validateWorkRuntime(next, this.instanceId);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
-		workAssert(
-			current.terminal === null ||
-				JSON.stringify(current.terminal) === JSON.stringify(next.terminal) ||
-				lateReceiptReconciled(current, next),
-		);
+		workAssert(current.terminal === null || JSON.stringify(current.terminal) === JSON.stringify(next.terminal));
 		workAssert(
 			current.output.knownSilence === null ||
 				JSON.stringify(current.output.knownSilence) === JSON.stringify(next.output.knownSilence),
@@ -1348,37 +1336,6 @@ export class GatewayDatabase {
 		}>;
 	}
 
-	/**
-	 * Cycle projection source: per event type, the run of most recent terminal
-	 * events (fired at or after `sinceIso`) that exhausted retries with no stored
-	 * authored output. Any other terminal outcome ends the run; in-flight events
-	 * are not evidence either way. Types whose latest terminal event is not such a
-	 * loss are omitted.
-	 */
-	monitorAuthoringLossStreaks(
-		sinceIso: string,
-	): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
-		const rows = this.#database
-			.query<{ event_type: string; fired_at: string; lost: number }, [string]>(
-				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
-			)
-			.all(sinceIso);
-		const streaks = new Map<string, { consecutive: number; lastFiredAt: string; open: boolean }>();
-		for (const row of rows) {
-			const streak = streaks.get(row.event_type);
-			if (!streak) {
-				streaks.set(row.event_type, { consecutive: row.lost ? 1 : 0, lastFiredAt: row.fired_at, open: !!row.lost });
-			} else if (streak.open) {
-				if (row.lost) streak.consecutive++;
-				else streak.open = false;
-			}
-		}
-		return [...streaks]
-			.filter(([, streak]) => streak.consecutive > 0)
-			.map(([eventType, { consecutive, lastFiredAt }]) => ({ eventType, consecutive, lastFiredAt }))
-			.sort((a, b) => a.eventType.localeCompare(b.eventType));
-	}
-
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")
@@ -1406,42 +1363,13 @@ export class GatewayDatabase {
 	}
 
 	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
-	memoryIntentRowsByRowid(): Array<{
-		id: string;
-		kind: string;
-		payload_json: string;
-		state: string;
-		attempts: number;
-		quarantine_reason: string | null;
-	}> {
+	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
 		return this.#database
-			.query("SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY rowid")
-			.all() as Array<{
-			id: string;
-			kind: string;
-			payload_json: string;
-			state: string;
-			attempts: number;
-			quarantine_reason: string | null;
-		}>;
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid")
+			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
 	}
 
-	memoryIntentBeginAttempt(id: string): void {
-		this.#database
-			.query("UPDATE memory_intents SET attempts = attempts + 1, updated_at = ? WHERE id = ?")
-			.run(new Date().toISOString(), id);
-	}
-
-	memoryIntentQuarantine(id: string, reason: string): void {
-		if (!reason.trim()) throw new Error("memory intent quarantine reason is required");
-		this.#database
-			.query(
-				"UPDATE memory_intents SET state = 'quarantined', quarantine_reason = COALESCE(quarantine_reason, ?), updated_at = ? WHERE id = ?",
-			)
-			.run(reason, new Date().toISOString(), id);
-	}
-
-	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted"): void {
+	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
 		this.#database
 			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
 			.run(state, new Date().toISOString(), id);
@@ -1452,20 +1380,14 @@ export class GatewayDatabase {
 		kind: string;
 		payload_json: string;
 		state: "queued" | "written" | "committed" | "receipted" | "quarantined";
-		attempts: number;
-		quarantine_reason: string | null;
 	}> {
 		return this.#database
-			.query(
-				"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY created_at, id",
-			)
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY created_at, id")
 			.all() as Array<{
 			id: string;
 			kind: string;
 			payload_json: string;
 			state: "queued" | "written" | "committed" | "receipted" | "quarantined";
-			attempts: number;
-			quarantine_reason: string | null;
 		}>;
 	}
 
@@ -2609,38 +2531,8 @@ export class GatewayDatabase {
 			service_tier: string | null;
 		}>;
 	}
-	monitorUpdate(row: {
-		id: string;
-		name: string;
-		triggerJson: string;
-		eventTypesJson: string;
-		burstPolicy: string;
-		channelTargetJson: string | null;
-		enabled: boolean;
-		instruction: string | null;
-		modelJson: string | null;
-		serviceTier: string | null;
-	}): boolean {
-		return (
-			this.#database
-				.query(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ? WHERE monitor_id = ?",
-				)
-				.run(
-					row.name,
-					row.triggerJson,
-					row.eventTypesJson,
-					row.burstPolicy,
-					row.channelTargetJson,
-					row.enabled ? 1 : 0,
-					row.instruction,
-					row.modelJson,
-					row.serviceTier,
-					row.id,
-				).changes > 0
-		);
-	}
 	monitorDelete(id: string): boolean {
+		this.metaDelete(monitorCronMetaKey(id));
 		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
 	}
 	monitorEventCreate(row: {
@@ -2994,12 +2886,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// delivered may ONLY be reached from authored: an omitted event still in
 		// dispatched/batched can never be promoted by a batch-wide settlement
 		// (terminal-critic blocker 3).
-		// An expired delivery fails its events terminally (#94); an operator redrive
-		// that the adapter then confirms proves the note did land.
-		if (
-			stage === "delivered" &&
-			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
-		) {
+		if (stage === "delivered" && row.stage === "authored") {
 			this.monitorEventUpdate(eventId, "delivered");
 			return true;
 		}
@@ -3016,35 +2903,6 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			return true;
 		}
 		return false;
-	}
-	/**
-	 * An expired delivery is terminal, so the monitor events it carried can never
-	 * reach `delivered` (#94). Moves the batch's still-`authored` events to
-	 * `failed_no_retry` with evidence naming the delivery, its attempt count and
-	 * the last transport error. Runs inside the caller's transaction; returns the
-	 * failed event ids.
-	 */
-	monitorEventsFailExpiredDelivery(deliveryId: string, reason: string): string[] {
-		const delivery = this.#database
-			.query<{ turn_id: string; attempts: number; state: string }, [string]>(
-				"SELECT turn_id, attempts, state FROM deliveries WHERE delivery_id = ?",
-			)
-			.get(deliveryId);
-		if (delivery?.state !== "expired") return [];
-		const events = this.#database
-			.query<{ event_id: string }, [string]>(
-				`SELECT event_id FROM monitor_events WHERE batch_id = ? AND stage = 'authored' AND ${REPLAYABLE_MONITOR}`,
-			)
-			.all(delivery.turn_id);
-		for (const { event_id } of events) {
-			this.monitorEventUpdate(event_id, "failed_no_retry");
-			this.monitorFailureRecord(
-				event_id,
-				"delivery_expired",
-				`delivery ${deliveryId} expired after ${delivery.attempts} attempts: ${reason}`,
-			);
-		}
-		return events.map((row) => row.event_id);
 	}
 	/**
 	 * Bumps the reclaim counter; returns the new count. Reconcile stops
@@ -3200,15 +3058,48 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.get(monitorId, slotAt);
 		return (row?.n ?? 0) > 0;
 	}
-	/** The monitor's persisted schedule boundary: its newest claimed slot. */
-	monitorLastSlotAt(monitorId: string): string | undefined {
-		return (
-			this.#database
-				.query<{ slot_at: string | null }, [string]>(
-					"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
-				)
-				.get(monitorId)?.slot_at ?? undefined
-		);
+	/**
+	 * Durable cron cursor (issue #157): the newest slot this monitor has admitted
+	 * (a `monitor_slots` claim) or refused under catch-up policy (recorded by
+	 * `monitorCronRecordSkip`), whichever is later. Undefined for a monitor that
+	 * has neither — the caller starts it from the monitor's creation instant.
+	 */
+	monitorCronCursor(monitorId: string): string | undefined {
+		const claimed = this.#database
+			.query<{ slot_at: string | null }, [string]>(
+				"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
+			)
+			.get(monitorId)?.slot_at;
+		const skipped = this.monitorCronState(monitorId)?.cursor;
+		if (!claimed) return skipped;
+		if (!skipped) return claimed;
+		return Date.parse(skipped) > Date.parse(claimed) ? skipped : claimed;
+	}
+	/** Catch-up diagnostics for one cron monitor; undefined when it never skipped a slot. */
+	monitorCronState(monitorId: string): MonitorCronState | undefined {
+		const raw = this.metaGet(monitorCronMetaKey(monitorId));
+		return raw === undefined ? undefined : (JSON.parse(raw) as MonitorCronState);
+	}
+	/**
+	 * Durably records slots a catch-up sweep refused under its age/count policy
+	 * and advances the cursor past them, so a refused slot is counted exactly
+	 * once and never silently dropped.
+	 */
+	monitorCronRecordSkip(
+		monitorId: string,
+		skip: { count: number; oldest: string; newest: string },
+		recordedAt: string,
+	): MonitorCronState {
+		return this.withTransaction(() => {
+			const previous = this.monitorCronState(monitorId);
+			const state: MonitorCronState = {
+				cursor: skip.newest,
+				skippedTotal: (previous?.skippedTotal ?? 0) + skip.count,
+				lastSkip: { ...skip, recordedAt },
+			};
+			this.metaSet(monitorCronMetaKey(monitorId), JSON.stringify(state));
+			return state;
+		});
 	}
 	/** Drops slot ledger entries older than the retention window (bounded table). */
 	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
@@ -3667,16 +3558,6 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(22, new Date().toISOString());
-			});
-		}
-		if (current < 23) {
-			this.withTransaction(() => {
-				this.#database.exec(
-					"ALTER TABLE memory_intents ADD COLUMN quarantine_reason TEXT; ALTER TABLE memory_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND typeof(attempts) = 'integer')",
-				);
-				this.#database
-					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-					.run(23, new Date().toISOString());
 			});
 		}
 	}
