@@ -205,6 +205,32 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	client.close();
 });
 
+test("a turn that wrote its answer and then failed on a hung tool delivers that answer, not a bare failure (#210)", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async () => {
+			throw new Error("Agent run failed after execution started.");
+		},
+	});
+	// The reply sits in the transcript; the tail never showed it.
+	sessionPort.fetchAssistantSince = async () => ({
+		text: "written before the tool timed out",
+		pages: 1,
+		complete: true,
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "hung-tool-trigger", "owner request");
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	// A visible answer consumes the context it was written from.
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
+	expect(texts).toEqual(["written before the tool timed out"]);
+	client.close();
+});
+
 test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
