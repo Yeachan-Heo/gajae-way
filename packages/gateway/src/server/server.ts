@@ -15,6 +15,7 @@ import {
 	isPlatformMessageId,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
+	type MonitorEventRecord,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -554,11 +555,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					originKey: `monitor/session/${sessionId}`,
 				}),
 		},
-		emit: (payload) => {
-			for (const connection of connections)
-				if (connection.negotiated)
-					connection.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
-		},
+		emit: (payload) => broadcastMonitorEvent(runtime, payload),
 		deliver: (payload) => {
 			for (const connection of connections)
 				if (connection.negotiated)
@@ -794,8 +791,29 @@ async function handleRequest(
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
+			const delivery = options.database.deliveryRows().find((row) => row.delivery_id === id);
+			const authoredEvents = delivery
+				? options.database
+						.monitorEventRows()
+						.filter((row) => row.batch_id === delivery.turn_id && row.stage === "authored")
+						.map((row) => row.event_id)
+				: [];
 			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
+				const authoredEventIds = new Set(authoredEvents);
+				for (const row of options.database.monitorEventRows()) {
+					if (authoredEventIds.has(row.event_id) && row.stage === "delivered") {
+						broadcastMonitorEvent(runtime, {
+							eventId: row.event_id,
+							monitorId: row.monitor_id,
+							eventType: row.event_type,
+							firedAt: row.fired_at,
+							stage: row.stage,
+						});
+					}
+				}
+			}
 			// Monitor batch settlement: a confirmed delivery for a monitor batch
 			// (turn_id === the events' batch_id) advances its authored events to
 			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
@@ -2345,6 +2363,12 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+}
+
+/** Fans a committed monitor-event stage transition out to every negotiated adapter. */
+function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): void {
+	for (const recipient of runtime.connections)
+		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
 }
 
 function reportDeliveryExpired(

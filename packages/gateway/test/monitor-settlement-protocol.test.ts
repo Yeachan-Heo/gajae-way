@@ -125,6 +125,11 @@ test("delivery.confirm on a monitor batch advances authored events to delivered 
 	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	// The REAL handler settled both events — not a manual DB update.
 	expect(stages.map((row) => row.stage)).toEqual(["delivered", "delivered"]);
+	const deliveredEvents = ctx.frames
+		.filter((frame) => frame.type === "event" && frame.event === "monitor.event")
+		.map((frame) => frame.payload as { eventId: string; stage: string })
+		.filter((event) => ctx.eventIds.includes(event.eventId));
+	expect(deliveredEvents.map((event) => event.stage)).toEqual(["delivered", "delivered"]);
 });
 
 test("late delivery.fail cannot regress a delivered monitor event (server protocol)", async () => {
