@@ -16,6 +16,7 @@ import {
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	type MonitorRecord,
+	type MonitorScheduleProjection,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -753,13 +754,14 @@ function localCronFireTime(at: Date, timezone: string): string {
 	return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
 }
 
-function withNextFireAt(monitor: MonitorRecord, now: Date): MonitorRecord {
-	if (monitor.trigger.kind !== "cron" || !monitor.enabled) return { ...monitor, nextFireAt: null };
+function scheduleProjection(monitor: MonitorRecord, now: Date): MonitorScheduleProjection {
+	if (monitor.trigger.kind !== "cron") return { effectiveTimezone: null, nextFireAt: null };
 	const timezone = monitor.trigger.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!monitor.enabled) return { effectiveTimezone: timezone, nextFireAt: null };
 	const next = nextCronFire(monitor.trigger.schedule, now, timezone);
 	return {
-		...monitor,
-		nextFireAt: next ? { timezone, local: localCronFireTime(next, timezone), utc: next.toISOString() } : null,
+		effectiveTimezone: timezone,
+		nextFireAt: next ? { local: localCronFireTime(next, timezone), utc: next.toISOString() } : null,
 	};
 }
 
@@ -1054,11 +1056,15 @@ async function handleRequest(
 		}
 		case "monitor.list": {
 			const now = new Date();
+			const monitors = runtime.registry.list();
+			const schedules = Object.fromEntries(
+				monitors.map((monitor) => [monitor.monitorId, scheduleProjection(monitor, now)] as const),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitors: runtime.registry.list().map((monitor) => withNextFireAt(monitor, now)) },
+				result: { monitors, schedules },
 			});
 			return;
 		}
@@ -1084,7 +1090,7 @@ async function handleRequest(
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitor: withNextFireAt(monitor, new Date()), recentEvents },
+				result: { monitor, schedule: scheduleProjection(monitor, new Date()), recentEvents },
 			});
 			return;
 		}

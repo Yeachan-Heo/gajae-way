@@ -165,17 +165,24 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 			throw new Error(`no ${verb} response for ${id}`);
 		};
 		connected.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
-		const list = (await request("list", "monitor.list")).monitors as Array<Record<string, unknown>>;
-		expect(list[0]?.nextFireAt).toMatchObject({
-			timezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : undefined,
-			utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+		const listResponse = await request("list", "monitor.list");
+		const list = listResponse.monitors as Array<Record<string, unknown>>;
+		const schedules = listResponse.schedules as Record<string, Record<string, unknown>>;
+		expect(list[0]).not.toHaveProperty("nextFireAt");
+		expect(schedules[monitor.monitorId]).toMatchObject({
+			effectiveTimezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : null,
+			nextFireAt: {
+				local: expect.stringMatching(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/),
+				utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+			},
 		});
 		const inspected = await request("history", "monitor.inspect");
 		const inspectedMonitor = inspected.monitor as Record<string, unknown>;
 		const rows = inspected.recentEvents as Array<Record<string, unknown>>;
-		expect(inspectedMonitor).toMatchObject({
+		expect(inspectedMonitor).not.toHaveProperty("nextFireAt");
+		expect(inspected.schedule).toMatchObject({
+			effectiveTimezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : null,
 			nextFireAt: {
-				timezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : undefined,
 				local: expect.stringMatching(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/),
 				utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
 			},

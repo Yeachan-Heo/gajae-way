@@ -4,6 +4,7 @@ import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
 	MonitorRecord,
+	MonitorScheduleProjection,
 	OpsCycleResult,
 	OriginRef,
 	WorkJobsResult,
@@ -20,6 +21,7 @@ import {
 	columnNames,
 	type ListOptions,
 	MONITOR_COLUMNS,
+	type MonitorListRow,
 	parseListOptions,
 	renderList,
 	SESSION_COLUMNS,
@@ -520,10 +522,18 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
 					else if (command === "list") {
 						const options = listOptions as ListOptions;
-						const result = await client.request<{ monitors: MonitorRecord[] }>("monitor.list");
-						for (const line of renderList(MONITOR_COLUMNS, result.monitors, options, {
+						const result = await client.request<{
+							monitors: MonitorRecord[];
+							schedules: Record<string, MonitorScheduleProjection>;
+						}>("monitor.list");
+						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
+							monitor,
+							schedule: result.schedules[monitor.monitorId] ?? null,
+						}));
+						for (const line of renderList(MONITOR_COLUMNS, rows, options, {
 							key: "monitors",
 							result,
+							serializeRow: (row) => row.monitor,
 						}))
 							console.log(line);
 					} else if (command === "inspect" && args[0])

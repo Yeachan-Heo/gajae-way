@@ -1,4 +1,9 @@
-import type { GatewayStatusResult, MonitorEventRecord, MonitorRecord } from "@gajae-gateway/protocol";
+import type {
+	GatewayStatusResult,
+	MonitorEventRecord,
+	MonitorRecord,
+	MonitorScheduleProjection,
+} from "@gajae-gateway/protocol";
 import type { AuditEntry } from "../src/gate";
 import { type AdminApp, type AdminServerOptions, createAdminApp, type GatewayRequest } from "../src/server";
 
@@ -22,21 +27,40 @@ export const STATUS: GatewayStatusResult = {
 	},
 };
 
+const MONITOR_TRIGGER = { kind: "cron", schedule: "30 8 * * 1-5", timezone: "Asia/Seoul" } as const;
+
 export const MONITOR: MonitorRecord = {
 	monitorId: "mon-weekday-review-0001",
 	name: "weekday-review",
-	trigger: { kind: "cron", schedule: "30 8 * * 1-5", timezone: "Asia/Seoul" },
-	nextFireAt: {
-		timezone: "Asia/Seoul",
-		local: "2026-08-28 08:30:00",
-		utc: "2026-08-27T23:30:00.000Z",
-	},
+	trigger: MONITOR_TRIGGER,
 	eventTypes: ["review.due"],
 	burstPolicy: "coalesce",
 	channelTarget: { origin: { platform: "discord", kind: "channel", conversationId: "1493635653441945762" } },
 	enabled: true,
 	createdAt: new Date(FIXED_NOW.getTime() - 20 * 86_400_000).toISOString(),
 };
+
+export const MONITOR_SCHEDULE: MonitorScheduleProjection = {
+	effectiveTimezone: "Asia/Seoul",
+	nextFireAt: {
+		local: "2026-08-28 08:30:00",
+		utc: "2026-08-27T23:30:00.000Z",
+	},
+};
+
+const NO_MONITOR_SCHEDULE: MonitorScheduleProjection = { effectiveTimezone: null, nextFireAt: null };
+
+function scheduleFor(monitor: MonitorRecord): MonitorScheduleProjection {
+	const trigger = monitor.trigger;
+	if (trigger.kind !== "cron") return NO_MONITOR_SCHEDULE;
+	if (
+		monitor.monitorId === MONITOR.monitorId &&
+		trigger.schedule === MONITOR_TRIGGER.schedule &&
+		trigger.timezone === MONITOR_TRIGGER.timezone
+	)
+		return MONITOR_SCHEDULE;
+	return { ...NO_MONITOR_SCHEDULE, effectiveTimezone: trigger.timezone ?? null };
+}
 
 export function monitorEvent(overrides: Partial<MonitorEventRecord> = {}): MonitorEventRecord {
 	return {
@@ -80,6 +104,7 @@ export type Harness = {
 export type HarnessOptions = {
 	readonly request?: GatewayRequest;
 	readonly monitors?: readonly MonitorRecord[];
+	readonly schedules?: Readonly<Record<string, MonitorScheduleProjection>>;
 	readonly events?: readonly MonitorEventRecord[];
 	readonly status?: GatewayStatusResult | null;
 	readonly gate?: AdminServerOptions["gate"];
@@ -95,6 +120,8 @@ export function harness(options: HarnessOptions = {}): Harness {
 	const calls: Call[] = [];
 	const audit: AuditEntry[] = [];
 	const monitors = options.monitors ?? [MONITOR];
+	const schedules: Readonly<Record<string, MonitorScheduleProjection>> =
+		options.schedules ?? Object.fromEntries(monitors.map((monitor) => [monitor.monitorId, scheduleFor(monitor)]));
 	const events = options.events ?? [monitorEvent()];
 	let listeners: ((event: string, payload: unknown) => void)[] = [];
 
@@ -109,12 +136,17 @@ export function harness(options: HarnessOptions = {}): Harness {
 				case "session.list":
 					return SESSIONS;
 				case "monitor.list":
-					return { monitors };
+					return { monitors, schedules };
 				case "monitor.inspect": {
 					const monitorId = (params as { monitorId?: string } | undefined)?.monitorId;
+					if (!monitorId) throw new Error("unknown monitorId");
 					const monitor = monitors.find((candidate) => candidate.monitorId === monitorId);
 					if (!monitor) throw new Error("unknown monitorId");
-					return { monitor, recentEvents: events.filter((event) => event.monitorId === monitorId) };
+					return {
+						monitor,
+						schedule: schedules[monitorId] ?? NO_MONITOR_SCHEDULE,
+						recentEvents: events.filter((event) => event.monitorId === monitorId),
+					};
 				}
 				default:
 					return { method, echoed: params ?? null };

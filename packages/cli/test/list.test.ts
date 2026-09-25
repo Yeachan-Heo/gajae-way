@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { MonitorRecord } from "@gajae-gateway/protocol";
+import type { MonitorRecord, MonitorScheduleProjection } from "@gajae-gateway/protocol";
 import {
 	columnNames,
 	MONITOR_COLUMNS,
+	type MonitorListRow,
 	parseListOptions,
 	renderList,
 	SESSION_COLUMNS,
@@ -14,11 +15,6 @@ function monitor(overrides: Partial<MonitorRecord> = {}): MonitorRecord {
 		monitorId: "mon-1234-abcd",
 		name: "nightly-audit",
 		trigger: { kind: "cron", schedule: "0 3 * * *", timezone: "Asia/Seoul" },
-		nextFireAt: {
-			timezone: "Asia/Seoul",
-			local: "2026-08-30 03:00:00",
-			utc: "2026-08-29T18:00:00.000Z",
-		},
 		eventTypes: ["cron.tick"],
 		burstPolicy: "coalesce",
 		createdAt: "2026-08-29T00:00:00.000Z",
@@ -26,6 +22,24 @@ function monitor(overrides: Partial<MonitorRecord> = {}): MonitorRecord {
 		channelTarget: { origin: { platform: "discord", kind: "channel", conversationId: "999" } },
 		...overrides,
 	} as MonitorRecord;
+}
+
+function monitorSchedule(overrides: Partial<MonitorScheduleProjection> = {}): MonitorScheduleProjection {
+	return {
+		effectiveTimezone: "Asia/Seoul",
+		nextFireAt: {
+			local: "2026-08-30 03:00:00",
+			utc: "2026-08-29T18:00:00.000Z",
+		},
+		...overrides,
+	};
+}
+
+function monitorRow(
+	monitorRecord: MonitorRecord = monitor(),
+	schedule: MonitorScheduleProjection | null = monitorSchedule(),
+): MonitorListRow {
+	return { monitor: monitorRecord, schedule };
 }
 
 function session(overrides: Partial<SessionListRow> = {}): SessionListRow {
@@ -39,7 +53,17 @@ function session(overrides: Partial<SessionListRow> = {}): SessionListRow {
 	} as SessionListRow;
 }
 
-const monitorEnvelope = (monitors: MonitorRecord[]) => ({ key: "monitors", result: { monitors } });
+const monitorEnvelope = (rows: MonitorListRow[]) => {
+	const monitors = rows.map((row) => row.monitor);
+	const schedules = Object.fromEntries(
+		rows.flatMap(({ monitor: record, schedule }) => (schedule ? [[record.monitorId, schedule] as const] : [])),
+	);
+	return {
+		key: "monitors",
+		result: { monitors, schedules },
+		serializeRow: (row: MonitorListRow) => row.monitor,
+	};
+};
 const sessionEnvelope = (sessions: SessionListRow[]) => ({ key: "sessions", result: { sessions } });
 
 describe("list option parsing", () => {
@@ -79,16 +103,18 @@ describe("list option parsing", () => {
 describe("monitors list rendering", () => {
 	test("default output is an aligned one-row-per-monitor table", () => {
 		const rows = [
-			monitor(),
-			monitor({
-				monitorId: "mon-5678-efgh",
-				name: "webhook-relay",
-				trigger: { kind: "webhook", route: "r-1" },
-				nextFireAt: null,
-				eventTypes: ["push", "issue"],
-				channelTarget: null,
-				enabled: false,
-			}),
+			monitorRow(),
+			monitorRow(
+				monitor({
+					monitorId: "mon-5678-efgh",
+					name: "webhook-relay",
+					trigger: { kind: "webhook", route: "r-1" },
+					eventTypes: ["push", "issue"],
+					channelTarget: null,
+					enabled: false,
+				}),
+				monitorSchedule({ effectiveTimezone: null, nextFireAt: null }),
+			),
 		];
 		const lines = renderList(MONITOR_COLUMNS, rows, parseListOptions([], MONITOR_COLUMNS), monitorEnvelope(rows));
 		expect(lines).toHaveLength(3);
@@ -110,6 +136,33 @@ describe("monitors list rendering", () => {
 		for (const line of lines) expect(line).not.toInclude("\n");
 	});
 
+	test("timezone and next fire use the schedule projection and keep exceptional cases readable", () => {
+		const rows = [
+			monitorRow(monitor(), monitorSchedule({ effectiveTimezone: "Europe/Berlin" })),
+			monitorRow(monitor({ monitorId: "mon-disabled", enabled: false })),
+			monitorRow(monitor({ monitorId: "mon-never" }), monitorSchedule({ nextFireAt: null })),
+			monitorRow(
+				monitor({ monitorId: "mon-webhook", trigger: { kind: "webhook", route: "r-1" } }),
+				monitorSchedule({ effectiveTimezone: null, nextFireAt: null }),
+			),
+			monitorRow(monitor({ monitorId: "mon-missing-projection" }), null),
+		];
+		const lines = renderList(
+			MONITOR_COLUMNS,
+			rows,
+			parseListOptions(["--fields", "timezone,nextFire"], MONITOR_COLUMNS),
+			monitorEnvelope(rows),
+		);
+		expect(lines).toEqual([
+			"TIMEZONE       NEXT_FIRE",
+			"Europe/Berlin  2026-08-30 03:00:00 / 2026-08-29T18:00Z",
+			"Asia/Seoul     paused",
+			"Asia/Seoul     never",
+			"-              -",
+			"-              -",
+		]);
+	});
+
 	test("empty list renders a header plus an explicit (none) marker", () => {
 		expect(renderList(MONITOR_COLUMNS, [], parseListOptions([], MONITOR_COLUMNS), monitorEnvelope([]))).toEqual([
 			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  ENABLED",
@@ -118,39 +171,41 @@ describe("monitors list rendering", () => {
 	});
 
 	test("--json without projection keeps the gateway shape verbatim", () => {
-		const rows = [monitor()];
-		expect(
-			renderList(MONITOR_COLUMNS, rows, parseListOptions(["--json"], MONITOR_COLUMNS), monitorEnvelope(rows)),
-		).toEqual([JSON.stringify({ monitors: rows })]);
+		const rows = [monitorRow()];
+		const envelope = monitorEnvelope(rows);
+		expect(renderList(MONITOR_COLUMNS, rows, parseListOptions(["--json"], MONITOR_COLUMNS), envelope)).toEqual([
+			JSON.stringify(envelope.result),
+		]);
 	});
 
 	test("--fields selects columns for the table and for --json", () => {
-		const rows = [monitor()];
+		const rows = [monitorRow()];
+		const envelope = monitorEnvelope(rows);
 		expect(
-			renderList(
-				MONITOR_COLUMNS,
-				rows,
-				parseListOptions(["--fields", "name,enabled"], MONITOR_COLUMNS),
-				monitorEnvelope(rows),
-			),
+			renderList(MONITOR_COLUMNS, rows, parseListOptions(["--fields", "name,enabled"], MONITOR_COLUMNS), envelope),
 		).toEqual(["NAME           ENABLED", "nightly-audit  true"]);
 		expect(
 			renderList(
 				MONITOR_COLUMNS,
 				rows,
 				parseListOptions(["--json", "--fields", "name,enabled"], MONITOR_COLUMNS),
-				monitorEnvelope(rows),
+				envelope,
 			),
-		).toEqual([JSON.stringify({ monitors: [{ name: "nightly-audit", enabled: true }] })]);
+		).toEqual([JSON.stringify({ ...envelope.result, monitors: [{ name: "nightly-audit", enabled: true }] })]);
 	});
 
 	test("--limit/--offset page the rows in both output modes", () => {
-		const rows = [monitor({ name: "a" }), monitor({ name: "b" }), monitor({ name: "c" })];
+		const rows = [
+			monitorRow(monitor({ monitorId: "mon-a", name: "a" })),
+			monitorRow(monitor({ monitorId: "mon-b", name: "b" })),
+			monitorRow(monitor({ monitorId: "mon-c", name: "c" })),
+		];
+		const envelope = monitorEnvelope(rows);
 		const table = renderList(
 			MONITOR_COLUMNS,
 			rows,
 			parseListOptions(["--fields", "name", "--limit", "1", "--offset", "1"], MONITOR_COLUMNS),
-			monitorEnvelope(rows),
+			envelope,
 		);
 		expect(table).toEqual(["NAME", "b"]);
 		expect(
@@ -158,16 +213,21 @@ describe("monitors list rendering", () => {
 				MONITOR_COLUMNS,
 				rows,
 				parseListOptions(["--json", "--limit", "2", "--offset", "1"], MONITOR_COLUMNS),
-				monitorEnvelope(rows),
+				envelope,
 			),
-		).toEqual([JSON.stringify({ monitors: [rows[1], rows[2]] })]);
+		).toEqual([
+			JSON.stringify({
+				...envelope.result,
+				monitors: [rows[1]?.monitor, rows[2]?.monitor],
+			}),
+		]);
 		// Offset past the end pages to an empty result rather than throwing.
 		expect(
 			renderList(
 				MONITOR_COLUMNS,
 				rows,
 				parseListOptions(["--offset", "9", "--fields", "name"], MONITOR_COLUMNS),
-				monitorEnvelope(rows),
+				envelope,
 			),
 		).toEqual(["NAME", "(none)"]);
 	});

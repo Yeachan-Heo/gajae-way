@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { TurnTracker } from "../src/turns";
 import { buildMonitorConsequence, buildSnapshot, type ConsoleSnapshot } from "../src/view";
-import { FIXED_NOW, MONITOR, monitorEvent, SESSIONS, STATUS } from "./fixture";
+import { FIXED_NOW, MONITOR, MONITOR_SCHEDULE, monitorEvent, SESSIONS, STATUS } from "./fixture";
 
 type Stub = { readonly request: (method: string, params?: unknown) => Promise<unknown>; readonly calls: string[] };
 
@@ -10,8 +10,8 @@ function stub(overrides: Record<string, unknown | (() => never)> = {}): Stub {
 	const defaults: Record<string, unknown> = {
 		"gateway.status": STATUS,
 		"session.list": SESSIONS,
-		"monitor.list": { monitors: [MONITOR] },
-		"monitor.inspect": { monitor: MONITOR, recentEvents: [monitorEvent()] },
+		"monitor.list": { monitors: [MONITOR], schedules: { [MONITOR.monitorId]: MONITOR_SCHEDULE } },
+		"monitor.inspect": { monitor: MONITOR, schedule: MONITOR_SCHEDULE, recentEvents: [monitorEvent()] },
 	};
 	return {
 		calls,
@@ -210,6 +210,7 @@ describe("session rows", () => {
 						},
 					},
 				],
+				schedules: { [MONITOR.monitorId]: MONITOR_SCHEDULE },
 			},
 		});
 		expect(state.monitors.state).toBe("error");
@@ -233,17 +234,60 @@ describe("monitor rows", () => {
 		expect(row?.tone).toBe("ok");
 	});
 
+	test("next-fire text comes from the list schedule projection, not the monitor or inspect result", async () => {
+		const listedSchedule = {
+			effectiveTimezone: "Europe/Paris",
+			nextFireAt: { local: "2026-08-28 09:15:00", utc: "2026-08-28T07:15:00.000Z" },
+		};
+		const inspectedSchedule = {
+			effectiveTimezone: "America/Los_Angeles",
+			nextFireAt: { local: "2026-08-28 01:00:00", utc: "2026-08-28T08:00:00.000Z" },
+		};
+		const state = await snapshot({
+			"monitor.list": { monitors: [MONITOR], schedules: { [MONITOR.monitorId]: listedSchedule } },
+			"monitor.inspect": { monitor: MONITOR, schedule: inspectedSchedule, recentEvents: [monitorEvent()] },
+		});
+		expect(state.monitors.rows[0]?.fields.next).toContain("2026-08-28 09:15:00 Europe/Paris");
+		expect(state.monitors.rows[0]?.fields.next).toContain("2026-08-28T07:15:00.000Z");
+		expect(state.monitors.rows[0]?.fields.next).not.toContain("America/Los_Angeles");
+		expect(MONITOR).not.toHaveProperty("nextFireAt");
+	});
+
+	test("a missing list schedule projection is reported as unavailable", async () => {
+		const state = await snapshot({ "monitor.list": { monitors: [MONITOR], schedules: {} } });
+		expect(state.monitors.rows[0]?.fields.next).toBe("schedule unavailable");
+	});
+
 	test("a disabled monitor says it will not fire instead of showing a next time", async () => {
 		const state = await snapshot({
-			"monitor.list": { monitors: [{ ...MONITOR, enabled: false }] },
-			"monitor.inspect": { monitor: { ...MONITOR, enabled: false }, recentEvents: [monitorEvent()] },
+			"monitor.list": {
+				monitors: [{ ...MONITOR, enabled: false }],
+				schedules: { [MONITOR.monitorId]: MONITOR_SCHEDULE },
+			},
+			"monitor.inspect": {
+				monitor: { ...MONITOR, enabled: false },
+				schedule: MONITOR_SCHEDULE,
+				recentEvents: [monitorEvent()],
+			},
 		});
 		expect(state.monitors.rows[0]?.fields.next).toBe("paused — will not fire");
 		expect(state.monitors.rows[0]?.state).toBe("disabled");
 	});
 
+	test("a non-cron monitor remains on demand without schedule metadata", async () => {
+		const monitor = { ...MONITOR, trigger: { kind: "webhook" as const, route: "incoming" } };
+		const schedule = { effectiveTimezone: null, nextFireAt: null };
+		const state = await snapshot({
+			"monitor.list": { monitors: [monitor], schedules: { [monitor.monitorId]: schedule } },
+			"monitor.inspect": { monitor, schedule, recentEvents: [monitorEvent()] },
+		});
+		expect(state.monitors.rows[0]?.fields.next).toBe("on demand");
+	});
+
 	test("a monitor that never fired says so rather than showing a bogus outcome", async () => {
-		const state = await snapshot({ "monitor.inspect": { monitor: MONITOR, recentEvents: [] } });
+		const state = await snapshot({
+			"monitor.inspect": { monitor: MONITOR, schedule: MONITOR_SCHEDULE, recentEvents: [] },
+		});
 		expect(state.monitors.rows[0]?.fields.outcome).toBe("◌ never fired");
 		expect(state.monitors.rows[0]?.fields.outcomeAge).toBe("—");
 	});
@@ -259,7 +303,11 @@ describe("monitor rows", () => {
 
 	test("a failed last event colours the row danger", async () => {
 		const state = await snapshot({
-			"monitor.inspect": { monitor: MONITOR, recentEvents: [monitorEvent({ stage: "failed" })] },
+			"monitor.inspect": {
+				monitor: MONITOR,
+				schedule: MONITOR_SCHEDULE,
+				recentEvents: [monitorEvent({ stage: "failed" })],
+			},
 		});
 		expect(state.monitors.rows[0]?.tone).toBe("danger");
 		expect(state.monitors.rows[0]?.fields.outcome).toBe("✕ failed");
@@ -300,7 +348,13 @@ describe("buildMonitorConsequence", () => {
 			firedAt: new Date(FIXED_NOW.getTime() - 30 * 86_400_000).toISOString(),
 		});
 		const consequence = await buildMonitorConsequence(
-			stub({ "monitor.inspect": { monitor: MONITOR, recentEvents: [monitorEvent(), old] } }).request,
+			stub({
+				"monitor.inspect": {
+					monitor: MONITOR,
+					schedule: MONITOR_SCHEDULE,
+					recentEvents: [monitorEvent(), old],
+				},
+			}).request,
 			MONITOR.monitorId,
 			{ summary: "Remove a monitor", action: "Remove", consequence: "gone" },
 			FIXED_NOW,
@@ -316,7 +370,7 @@ describe("buildMonitorConsequence", () => {
 
 	test("a monitor with no recent events says nothing fired rather than omitting the row", async () => {
 		const consequence = await buildMonitorConsequence(
-			stub({ "monitor.inspect": { monitor: MONITOR, recentEvents: [] } }).request,
+			stub({ "monitor.inspect": { monitor: MONITOR, schedule: MONITOR_SCHEDULE, recentEvents: [] } }).request,
 			MONITOR.monitorId,
 			{ summary: "Remove a monitor", action: "Remove", consequence: "gone" },
 			FIXED_NOW,
@@ -326,7 +380,13 @@ describe("buildMonitorConsequence", () => {
 
 	test("a monitor with no channel target says nowhere, not an empty cell", async () => {
 		const consequence = await buildMonitorConsequence(
-			stub({ "monitor.inspect": { monitor: { ...MONITOR, channelTarget: null }, recentEvents: [] } }).request,
+			stub({
+				"monitor.inspect": {
+					monitor: { ...MONITOR, channelTarget: null },
+					schedule: MONITOR_SCHEDULE,
+					recentEvents: [],
+				},
+			}).request,
 			MONITOR.monitorId,
 			{ summary: "Remove a monitor", action: "Remove", consequence: "gone" },
 			FIXED_NOW,
