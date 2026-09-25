@@ -449,7 +449,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(23);
+		expect(migrated.schemaVersion).toBe(24);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, target: null };
 		migrated.workAttemptPrepare(historical, f.record);

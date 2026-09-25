@@ -28,6 +28,7 @@ export const MONITOR: MonitorRecord = {
 	trigger: { kind: "cron", schedule: "30 8 * * 1-5" },
 	eventTypes: ["review.due"],
 	burstPolicy: "coalesce",
+	overlap: "queue",
 	channelTarget: { origin: { platform: "discord", kind: "channel", conversationId: "1493635653441945762" } },
 	enabled: true,
 	createdAt: new Date(FIXED_NOW.getTime() - 20 * 86_400_000).toISOString(),

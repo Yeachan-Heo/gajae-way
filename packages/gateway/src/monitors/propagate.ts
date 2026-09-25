@@ -341,15 +341,20 @@ export class MonitorPropagator {
 		if (typeof eventType !== "string" || !eventType) throw new Error("event type is required");
 		const eventId = crypto.randomUUID();
 		const firedAt = new Date().toISOString();
-		this.#database.withTransaction(() =>
+		const skippedBy = this.#database.withTransaction(() =>
 			this.#database.monitorEventCreate({
 				eventId,
 				monitorId,
 				eventType,
 				payloadJson: JSON.stringify(payload ?? null),
 				firedAt,
+				overlap: monitor.overlap,
 			}),
 		);
+		if (skippedBy) {
+			this.#noteSkipped({ eventId, monitorId, eventType, firedAt }, skippedBy);
+			return eventId;
+		}
 		this.#emit({ eventId, monitorId, eventType, firedAt, stage: "admitted" });
 		const key = `${monitorId}\u0000${eventType}`;
 		if (monitor.burstPolicy === "serialize") {
@@ -424,14 +429,19 @@ export class MonitorPropagator {
 		// it existed — catch-up admission is clamped to monitor.createdAt.
 		if (slotAt.getTime() < Date.parse(monitor.createdAt)) return null;
 		const eventId = crypto.randomUUID();
-		const admitted = this.#database.monitorSlotClaimWithEvent({
+		const claim = this.#database.monitorSlotClaimWithEvent({
 			monitorId,
 			slotAt: slotAt.toISOString(),
 			eventId,
 			eventType,
 			payloadJson: JSON.stringify(payload ?? null),
+			overlap: monitor.overlap,
 		});
-		if (!admitted) return null;
+		if (!claim.admitted) return null;
+		if (claim.skippedBy) {
+			this.#noteSkipped({ eventId, monitorId, eventType, firedAt: slotAt.toISOString() }, claim.skippedBy);
+			return eventId;
+		}
 		this.#emit({ eventId, monitorId, eventType, firedAt: slotAt.toISOString(), stage: "admitted" });
 		const key = `${monitorId}\u0000${eventType}`;
 		if (monitor.burstPolicy === "serialize") {
@@ -453,6 +463,21 @@ export class MonitorPropagator {
 		};
 		this.#batches.set(key, batch);
 		return eventId;
+	}
+	/**
+	 * Overlap policy `skip` (issue #83): the fire lost its slot to a predecessor
+	 * that still owes an authoring turn. It is recorded terminal `skipped` and
+	 * never dispatched. It is a scheduling outcome, not a dispatch failure, so it
+	 * writes no monitor_failures row.
+	 */
+	#noteSkipped(
+		event: { eventId: string; monitorId: string; eventType: string; firedAt: string },
+		skippedBy: string,
+	): void {
+		this.#emit({ ...event, stage: "skipped" });
+		console.error(
+			`monitor event skipped (overlap=skip): event ${event.eventId} of monitor ${event.monitorId}; event ${skippedBy} is still in flight`,
+		);
 	}
 	/**
 	 * Recovery sweep. Oldest-first, at-most-one concurrent sweep per process:

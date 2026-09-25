@@ -11,6 +11,7 @@ import {
 import type { GatewayDatabase } from "../store/db";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
+const OVERLAP_POLICIES = new Set(["queue", "skip"]);
 const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
 const MONITOR_UPDATE_FIELDS = new Set([
 	"name",
@@ -40,6 +41,7 @@ export class MonitorRegistry {
 			trigger,
 			monitorId: crypto.randomUUID(),
 			burstPolicy: spec.burstPolicy ?? "coalesce",
+			overlap: spec.overlap ?? "queue",
 			enabled: spec.enabled ?? true,
 			instruction,
 			createdAt: new Date().toISOString(),
@@ -51,6 +53,7 @@ export class MonitorRegistry {
 				triggerJson: JSON.stringify(record.trigger),
 				eventTypesJson: JSON.stringify(record.eventTypes),
 				burstPolicy: record.burstPolicy,
+				overlap: record.overlap,
 				channelTargetJson: record.channelTarget ? JSON.stringify(record.channelTarget) : null,
 				enabled: record.enabled,
 				instruction: instruction ?? null,
@@ -137,6 +140,7 @@ function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): M
 		trigger: JSON.parse(row.trigger_json),
 		eventTypes: JSON.parse(row.event_types_json),
 		burstPolicy: row.burst_policy as MonitorRecord["burstPolicy"],
+		overlap: row.overlap as MonitorRecord["overlap"],
 		channelTarget: row.channel_target_json ? JSON.parse(row.channel_target_json) : null,
 		enabled: Boolean(row.enabled),
 		instruction: row.instruction ?? undefined,
@@ -172,6 +176,8 @@ export function validateSpec(spec: MonitorSpec): void {
 		}
 	}
 	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
+	if (spec.overlap !== undefined && !OVERLAP_POLICIES.has(spec.overlap))
+		throw new Error('monitor overlap must be "queue" or "skip"');
 	validateTrigger(spec.trigger);
 	if (spec.channelTarget) {
 		validateOriginRef(spec.channelTarget.origin);
