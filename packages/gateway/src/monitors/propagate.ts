@@ -405,6 +405,13 @@ export class MonitorPropagator {
 	 * identity, not just the payload. Returns the eventId, or null when the
 	 * slot was already claimed (duplicate tick / restart catch-up overlap).
 	 */
+	/**
+	 * Persisted schedule boundary a fresh process resumes from (issue #162): the
+	 * newest claimed slot, else the monitor's creation instant.
+	 */
+	slotBoundary(monitor: { monitorId: string; createdAt: string }): Date {
+		return new Date(this.#database.monitorLastSlotAt(monitor.monitorId) ?? monitor.createdAt);
+	}
 	submitSlot(monitorId: string, eventType: string, payload: unknown, slotAt: Date): string | null {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) throw new Error("unknown or disabled monitor");

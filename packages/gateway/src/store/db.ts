@@ -3132,6 +3132,16 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.get(monitorId, slotAt);
 		return (row?.n ?? 0) > 0;
 	}
+	/** The monitor's persisted schedule boundary: its newest claimed slot. */
+	monitorLastSlotAt(monitorId: string): string | undefined {
+		return (
+			this.#database
+				.query<{ slot_at: string | null }, [string]>(
+					"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
+				)
+				.get(monitorId)?.slot_at ?? undefined
+		);
+	}
 	/** Drops slot ledger entries older than the retention window (bounded table). */
 	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
 		const cutoff = new Date(now - olderThanMs).toISOString();
