@@ -26,6 +26,7 @@ import {
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
 	isOrphanedExecutorFailure,
+	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
 	MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD,
@@ -127,6 +128,18 @@ export interface MonitorSessionSafetyState {
 	 * `sns-threads`, 19 identical failures in one day).
 	 */
 	lastProtocolReason: ProtocolFailureReason | undefined;
+	/**
+	 * Consecutive `session_busy` dispatch failures in this epoch: the runtime
+	 * never went idle for a whole bounded busy wait. Reset by any other outcome.
+	 * A streak is a stalled session, and the only remedy is a new one (#263).
+	 */
+	busyFailures: number;
+	/**
+	 * Session id captured when a busy roll was armed: the host to end at the
+	 * roll boundary. Taken from the bind, not the sessions row, because a
+	 * session that never finished a turn has no row yet.
+	 */
+	stalledSessionId: string | undefined;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
@@ -626,6 +639,8 @@ export class MonitorPropagator {
 				// answer: it must not arm the safety net.
 				if (response.trim()) this.#safetyState(sessionOriginKey).contextFailures = 0;
 				else throw new Error("authoring response is empty");
+				// The runtime accepted and finished a turn, so it is not stalled.
+				this.#safetyState(sessionOriginKey).busyFailures = 0;
 				// Lease fencing: after an await, this attempt may no longer own the
 				// claim (expired + stolen). Every write below is conditional on the
 				// live lease; a stale attempt's completion becomes a no-op.
@@ -793,6 +808,8 @@ export class MonitorPropagator {
 			executorFailures: 0,
 			protocolFailures: 0,
 			lastProtocolReason: undefined,
+			busyFailures: 0,
+			stalledSessionId: undefined,
 			nativeCompaction: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
@@ -833,6 +850,35 @@ export class MonitorPropagator {
 	}): Promise<void> {
 		const { sessionOriginKey, failureClass, error, sessionId, boundEpoch, replayed, monitor } = input;
 		const state = this.#safetyState(sessionOriginKey);
+		const currentEpoch =
+			boundEpoch !== undefined && boundEpoch === (this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0);
+		const liveBinding = !replayed && currentEpoch;
+		if (isSessionBusy(error)) {
+			// A busy refusal is not evidence about context or contract: the prompt
+			// was never accepted. It IS evidence that the session is wedged on a turn
+			// it will not finish once it has outlasted a whole bounded wait twice.
+			// Before this the busy bit was filed as `executor_failed`-class noise with
+			// no remedy, the slot burned its reclaim budget into `failed_no_retry`,
+			// and the next slot aimed at the same dead session (#263: 24/24 slots
+			// lost on one event type while every other type delivered).
+			state.busyFailures += 1;
+			console.error(
+				`monitor session busy for ${sessionOriginKey} (monitor ${monitor.monitorId}): busy_failures=${state.busyFailures}/${MONITOR_BUSY_FAILURE_ROLL_THRESHOLD} replayed=${replayed} context_failures=${state.contextFailures} (unchanged)`,
+			);
+			// Replayed events still count: a busy refusal says nothing about the
+			// payload, only about the session that refused it. The epoch check
+			// still applies so a dead session's refusals never roll its successor.
+			if (currentEpoch && !state.pendingRoll && state.busyFailures >= MONITOR_BUSY_FAILURE_ROLL_THRESHOLD) {
+				state.pendingRoll = "session_busy_stalled";
+				state.stalledSessionId = sessionId;
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_busy_stalled busy_failures=${state.busyFailures}/${MONITOR_BUSY_FAILURE_ROLL_THRESHOLD} session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
+		// Any other outcome means the runtime accepted a prompt: not stalled.
+		state.busyFailures = 0;
 		if (failureClass === "executor") {
 			state.executorFailures += 1;
 			const reason = classifyExecutorFailure(error);
@@ -863,11 +909,7 @@ export class MonitorPropagator {
 			// that cannot follow its own contract any more, and before this the
 			// gateway retried it forever with no remediation at all (measured:
 			// jip-gajae `sns-threads`, 19/19 ticks in one day).
-			const staleBinding =
-				replayed ||
-				boundEpoch === undefined ||
-				boundEpoch !== (this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0);
-			if (!staleBinding && state.protocolFailures >= this.#protocolFailureRollThreshold) {
+			if (liveBinding && state.protocolFailures >= this.#protocolFailureRollThreshold) {
 				state.pendingRoll = "protocol_failures_off_contract";
 				console.error(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=protocol_failures_off_contract protocol_failures=${state.protocolFailures}/${this.#protocolFailureRollThreshold} last_reason=${protocolReason} turns=${state.turns}`,
@@ -875,11 +917,10 @@ export class MonitorPropagator {
 			}
 			return;
 		}
-		const liveEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
-		if (replayed || boundEpoch === undefined || boundEpoch !== liveEpoch) {
+		if (!liveBinding) {
 			state.staleContextFailures += 1;
 			console.error(
-				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} bound_epoch=${boundEpoch ?? "none"} live_epoch=${liveEpoch}`,
+				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} current_epoch=${currentEpoch}`,
 			);
 			return;
 		}
@@ -933,7 +974,25 @@ export class MonitorPropagator {
 		// bumpEpoch is the existing rotation primitive: epoch + 1 and turn_count 0.
 		// The next broker-backed SessionPort bind mints a fresh session and
 		// idempotency key for this monitor origin.
+		const stalledSessionId = reason === "session_busy_stalled" ? state.stalledSessionId : undefined;
+		state.stalledSessionId = undefined;
 		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
+		// A stalled session is still holding its wedged turn; nothing will prompt
+		// it again now that the origin is bound to a new epoch, so end its host
+		// rather than leave it occupying the runtime forever. Best-effort: the
+		// roll already happened, and a refused kill only costs one idle host.
+		if (stalledSessionId && this.#sessionPort.terminateHost) {
+			void this.#sessionPort.terminateHost({ sessionId: stalledSessionId, repo: this.#repo }).then(
+				(result) =>
+					console.error(
+						`monitor stalled session host for ${sessionOriginKey}: session=${stalledSessionId} outcome=${result.outcome}`,
+					),
+				() =>
+					console.error(
+						`monitor stalled session host for ${sessionOriginKey}: session=${stalledSessionId} outcome=error`,
+					),
+			);
+		}
 		state.pendingRoll = undefined;
 		state.lastRoll = reason;
 		// The new epoch starts with a clean slate: the previous session's failure
@@ -942,6 +1001,7 @@ export class MonitorPropagator {
 		state.executorFailures = 0;
 		state.orphanedExecutorFailures = 0;
 		state.protocolFailures = 0;
+		state.busyFailures = 0;
 		state.turns = 0;
 		console.error(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,

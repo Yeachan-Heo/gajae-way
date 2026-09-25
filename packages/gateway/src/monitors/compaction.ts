@@ -50,6 +50,18 @@ export const MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD = 2;
 export const MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD = 3;
 
 /**
+ * Consecutive `session_busy` dispatch failures before the safety net rolls the
+ * session. Each one is a full bounded busy wait (10 minutes) in which the
+ * runtime never went idle, so two in a row is a session that has stalled on a
+ * turn it will not finish — not a slow turn. Measured trigger (issue #263):
+ * one event-type session answered 139 dispatches with `session_busy` over 24h
+ * (`session stall` logged the whole time, `last_activity_at` frozen), every
+ * slot reached `failed_no_retry`, and nothing ever released the session
+ * because a busy refusal was filed as an executor failure with no remedy.
+ */
+export const MONITOR_BUSY_FAILURE_ROLL_THRESHOLD = 2;
+
+/**
  * Outcome of asking the runtime to compact a session natively.
  *
  * `unavailable` is the honest default: the gateway currently has no wired path
@@ -290,7 +302,8 @@ export type SessionRollReason =
 	| "context_failures_native_compaction_unavailable"
 	| "context_failures_native_compaction_failed"
 	| "context_failures_native_compaction_skipped"
-	| "protocol_failures_off_contract";
+	| "protocol_failures_off_contract"
+	| "session_busy_stalled";
 
 const ROLL_REASON_BY_STATUS: Partial<Record<NativeCompactionStatus, SessionRollReason>> = {
 	unavailable: "context_failures_native_compaction_unavailable",

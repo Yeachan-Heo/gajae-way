@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eventTypeOrigin, originKey } from "@gajae-gateway/protocol";
+import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import {
 	buildMonitorCompactionDigest,
@@ -12,6 +13,7 @@ import {
 	decideSessionRoll,
 	isAsideTimeoutFailure,
 	isOrphanedExecutorFailure,
+	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
 	MONITOR_DIGEST_MAX_NOTES,
@@ -68,24 +70,37 @@ async function harness(
 		compaction?: CompactionPort;
 		/** Per-turn response. Defaults to a valid note per claimed event. */
 		respond?: (prompt: string, index: number) => string;
+		/**
+		 * When true for a session, the runtime refuses the prompt with the exact
+		 * `busy` envelope the real port surfaces after its bounded busy wait: the
+		 * turn never starts, so it is not recorded in `turns`.
+		 */
+		busy?: (sessionId: string) => boolean;
 	} = {},
 ) {
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const turns: Array<{ sessionId: string; prompt: string }> = [];
+	const sessionPort = sessionPortFromScript({
+		// One session id per epoch: exactly what a real bind does, so a roll is
+		// observable as a new transcript.
+		bind: async (_key: string, epoch = 0) => ({ sessionId: `event-session-e${epoch}` }),
+		respond: async (sessionId: string, text: string) => {
+			const index = turns.length;
+			turns.push({ sessionId, prompt: text });
+			return options.respond ? options.respond(text, index) : echoNotes(text);
+		},
+	});
+	const request = sessionPort.request.bind(sessionPort);
+	sessionPort.request = async (input) => {
+		if (options.busy?.(input.sessionId))
+			throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", { code: "busy" });
+		return request(input);
+	};
 	const pipeline = new MonitorPropagator({
 		database,
 		registry,
-		sessionPort: sessionPortFromScript({
-			// One session id per epoch: exactly what a real bind does, so a roll is
-			// observable as a new transcript.
-			bind: async (_key: string, epoch = 0) => ({ sessionId: `event-session-e${epoch}` }),
-			respond: async (sessionId: string, text: string) => {
-				const index = turns.length;
-				turns.push({ sessionId, prompt: text });
-				return options.respond ? options.respond(text, index) : echoNotes(text);
-			},
-		}),
+		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
@@ -97,7 +112,7 @@ async function harness(
 			? {}
 			: { protocolFailureRollThreshold: options.protocolFailureRollThreshold }),
 	});
-	return { database, registry, pipeline, turns };
+	return { database, registry, pipeline, turns, sessionPort };
 }
 
 test("buildMonitorCompactionDigest carries the contract plus bounded recent notes", () => {
@@ -784,6 +799,70 @@ test("interleaved orphaned-executor and context failures advance only the contex
 		// Still not rolled: that happens at the next dispatch boundary.
 		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
 		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a session that stays busy across dispatches is rolled so the next slot lands on a live session (#263)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-busy-"));
+	try {
+		const compaction = stubPort("unavailable");
+		// The live shape: the epoch-0 session is wedged on a turn it never
+		// finishes and refuses every prompt with `busy`; a fresh session answers.
+		const { database, registry, pipeline, turns, sessionPort } = await harness(directory, {
+			contextFailureRollThreshold: 1,
+			compaction,
+			busy: (sessionId) => sessionId === "event-session-e0",
+		});
+		const monitor = registry.add({
+			name: "threads",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["threads.tick"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(eventTypeOrigin("threads.tick"));
+		expect(MONITOR_BUSY_FAILURE_ROLL_THRESHOLD).toBe(2);
+		const first = await pipeline.submitAwaitable(monitor.monitorId, "threads.tick", { tick: 0 });
+		expect(database.monitorFailure(first)?.code).toBe("session_busy");
+		let state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.busyFailures).toBe(1);
+		expect(state.pendingRoll).toBeUndefined();
+		// Reconcile replays the failed slot into the same session and it is busy
+		// again. A replay still counts: the refusal is about the session, not the
+		// payload, and this is exactly the retry loop that burned every slot.
+		await pipeline.reconcile();
+		expect(database.monitorFailure(first)?.code).toBe("session_busy");
+		state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.busyFailures).toBe(2);
+		expect(state.pendingRoll).toBe("session_busy_stalled");
+		// Not context evidence, not contract evidence: nothing else moved.
+		expect(state.contextFailures).toBe(0);
+		expect(state.staleContextFailures).toBe(0);
+		expect(state.executorFailures).toBe(0);
+		expect(state.protocolFailures).toBe(0);
+		expect(compaction.calls).toHaveLength(0);
+		expect(turns).toHaveLength(0);
+		// The next slot rolls at the dispatch boundary, binds a fresh session and
+		// delivers, instead of aiming at the stalled session again.
+		const next = await pipeline.submitAwaitable(monitor.monitorId, "threads.tick", { tick: 1 });
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.lastRoll).toBe("session_busy_stalled");
+		expect(state.busyFailures).toBe(0);
+		expect(database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === next)?.stage).toBe(
+			"authored_no_delivery",
+		);
+		expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e1"]);
+		// The stalled host is ended so it stops occupying the runtime.
+		await Bun.sleep(0);
+		expect(sessionPort.closes.map((entry) => entry.sessionId)).toEqual(["event-session-e0"]);
+		// The stranded slot is replayed into the live session too.
+		await pipeline.reconcile();
+		expect(database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
+			"authored_no_delivery",
+		);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
