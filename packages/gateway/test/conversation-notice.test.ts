@@ -28,3 +28,23 @@ test("the threading guidance stays separate from the reaction guidance", () => {
 	expect(lines.filter((line) => line.includes("[REPLY:")).length).toBe(1);
 	expect(lines.filter((line) => line.includes("[REACT:")).length).toBe(1);
 });
+
+// Live 2026-09-25: a 13-minute foreground `gh run watch` held an omc-dev turn, and
+// owner steers were answered with a bare [REACT:👀] while the persona polled lanes.
+test("every conversation is told to stay responsive: no foreground waits, answer steers in words", () => {
+	const channel: OriginRef = { platform: "discord", kind: "channel", conversationId: "1480171104348930221" };
+	for (const origin of [slackDm, channel, loopback]) {
+		const notice = currentConversationNotice(origin);
+		expect(notice).toContain("## Staying responsive while you work");
+		expect(notice).toContain("Never block a conversation turn on a foreground wait");
+		expect(notice).toContain("`gh run watch`");
+		expect(notice).toContain("Always answer it in words, right away");
+	}
+	// The notifying lane names THIS conversation, so completion comes back here.
+	expect(currentConversationNotice(channel)).toContain(
+		"gajaeway work start <name> --notify discord/channel/1480171104348930221",
+	);
+	// Only chat platforms get the gateway's 👀 acknowledgement, so only they are told about it.
+	expect(currentConversationNotice(channel)).toContain("The gateway already marks the message 👀");
+	expect(currentConversationNotice(loopback)).not.toContain("👀");
+});

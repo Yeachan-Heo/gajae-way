@@ -2115,8 +2115,36 @@ async function createInboundTurnLifecycle(
 	// transaction as the acceptance; only transient ownership is released here.
 	const steerContextMessageId = (steered: InboundMessageRow): string | undefined =>
 		nonLoopback ? (editedMessageId(steered.message_id) ?? steered.message_id) : undefined;
+	// A steer lands inside a running turn whose model may take minutes to say
+	// anything (a folded foreground wait, a long tool). The owner must see at once
+	// that the message arrived, independent of the model: the gateway acknowledges
+	// the accepted steer with 👀 on the steered message itself. Same ledger and
+	// budget as every reaction; a cap or duplicate is logged, never thrown.
+	const acknowledgeSteer = (steered: InboundMessageRow) => {
+		if (!nonLoopback) return;
+		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
+		if (!isPlatformMessageId(targetMessageId)) return;
+		const eyes = resolveReactionEmoji("👀");
+		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
+		const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: eyes.unicode });
+		if (rejection) {
+			console.error(
+				`gateway steer acknowledgement skipped (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+			);
+			return;
+		}
+		broadcastDelivery(
+			runtime,
+			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+				targetMessageId,
+				emoji: eyes.unicode,
+				emojiName: eyes.name,
+			}),
+		);
+	};
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		runtime.inbound.delete(steered.message_id);
+		acknowledgeSteer(steered);
 	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
 		let threw = false;
@@ -2452,6 +2480,16 @@ export function currentConversationNotice(origin: OriginRef): string {
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
+		// Live 2026-09-25: the persona held turns open for 13 minutes in a
+		// foreground `gh run watch`, and answered 22 owner steers with a bare
+		// [REACT:👀] while it kept polling lanes with `sleep N; gajaeway work jobs`.
+		// A conversation turn is the owner's line to the persona; it must not be
+		// spent waiting. Waits are backgrounded or handed to a notifying lane.
+		"## Staying responsive while you work",
+		"Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or hand the work to a lane started with `gajaeway work start <name> --notify " +
+			originKey(origin) +
+			" …` so its completion arrives here as a new message. Say what you started and end the turn.",
+		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
 }
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
