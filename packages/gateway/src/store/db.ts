@@ -362,8 +362,29 @@ export interface InboundMessageRow {
 	readonly bound_session_id: string | null;
 	/** Stamped at bind, before the send; the earliest wall clock this turn's answer can carry. */
 	readonly dispatched_at: string | null;
-	/** JSON map part -> ledger delivery id that satisfied that terminal reply slot. */
+	/**
+	 * JSON map part -> ledger delivery id that satisfied that terminal reply slot.
+	 * A turn that closed without any delivery carries `{"none": reason}` instead;
+	 * a `done` trigger with NULL here is a ledger defect (see inboundTerminalLinkAudit).
+	 */
 	readonly terminal_delivery_id: string | null;
+}
+
+/** Why a closed turn has no terminal delivery; recorded as `{"none": reason}`. */
+export type TerminalUnlinkedReason = "silent" | "loopback" | "turn_failed" | "retired" | "no_delivery";
+
+/** Delivery ids that answered a turn, from its `terminal_delivery_id` JSON; empty for a sentinel or NULL. */
+export function terminalDeliveryIds(json: string | null): string[] {
+	if (!json) return [];
+	try {
+		const parsed: unknown = JSON.parse(json);
+		if (typeof parsed !== "object" || parsed === null) return [];
+		return Object.entries(parsed)
+			.filter(([part, id]) => /^\d+$/.test(part) && typeof id === "string" && id.length > 0)
+			.map(([, id]) => id as string);
+	} catch {
+		return [];
+	}
 }
 
 /** A trigger row's turn, as the actor tracks it. */
@@ -1611,6 +1632,7 @@ export class GatewayDatabase {
 			const key = String(part);
 			const owner = claims[key];
 			if (owner) return owner;
+			delete claims.none;
 			claims[key] = deliveryId;
 			this.#database
 				.query("UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger'")
@@ -1620,20 +1642,46 @@ export class GatewayDatabase {
 	}
 
 	/**
+	 * Records that the turn closed without a delivery, and why. Never overwrites
+	 * a delivery claim or an earlier reason.
+	 */
+	inboundTurnMarkUnlinked(opRef: string, reason: TerminalUnlinkedReason): void {
+		this.#database
+			.query(
+				"UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND terminal_delivery_id IS NULL",
+			)
+			.run(JSON.stringify({ none: reason }), opRef);
+	}
+
+	/**
+	 * Done triggers dispatched at or after `sinceIso`, and how many of them
+	 * carry neither a delivery claim nor a no-delivery reason.
+	 */
+	inboundTerminalLinkAudit(sinceIso: string): { done: number; unlinked: number } {
+		const row = this.#database
+			.query<{ done: number; unlinked: number | null }, [string]>(
+				"SELECT COUNT(*) AS done, SUM(terminal_delivery_id IS NULL) AS unlinked FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done' AND dispatched_at >= ?",
+			)
+			.get(sinceIso);
+		return { done: row?.done ?? 0, unlinked: row?.unlinked ?? 0 };
+	}
+
+	/**
 	 * Terminal reconciliation: legacy state and turn state become done in one
-	 * statement for the trigger. A steer still `bound` at this point was issued
+	 * statement for the trigger. A trigger no delivery claimed is stamped with
+	 * `unlinkedReason` in the same statement, so `done` never leaves the link NULL. A steer still `bound` at this point was issued
 	 * into the turn but never answered (torn transport): whether the model saw
 	 * it is unknowable now that the turn is over, so it is NOT closed and NOT
 	 * dispatched - it stays attributed to this op-ref as an operator-visible
 	 * hold (`inboundSteersHeld`). Returns how many TRIGGER rows closed, so a
 	 * repeat call is a no-op.
 	 */
-	inboundTurnComplete(opRef: string): number {
+	inboundTurnComplete(opRef: string, unlinkedReason: TerminalUnlinkedReason = "no_delivery"): number {
 		return this.#database
 			.query(
-				"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
+				"UPDATE inbound_messages SET state = 'done', turn_state = 'done', terminal_delivery_id = COALESCE(terminal_delivery_id, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
 			)
-			.run(opRef).changes;
+			.run(JSON.stringify({ none: unlinkedReason }), opRef).changes;
 	}
 
 	/**
@@ -1693,7 +1741,8 @@ export class GatewayDatabase {
 				(cap !== undefined && cap !== "0")
 			)
 				return undefined;
-			if (this.inboundTurnComplete(input.opRef) !== 1) throw new Error("failed turn completion lost its fence");
+			if (this.inboundTurnComplete(input.opRef, "turn_failed") !== 1)
+				throw new Error("failed turn completion lost its fence");
 			this.metaSet(dedupeKey, "1");
 			this.metaSet(capKey, "1");
 			// Do not present the already-failed trigger as new unread work when the

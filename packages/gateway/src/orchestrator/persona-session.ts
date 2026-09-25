@@ -13,7 +13,7 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
-import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
+import { type GatewayDatabase, type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
@@ -2066,7 +2066,10 @@ class OriginActor {
 		const completed = resetApplied
 			? 1
 			: this.#manager.database.withTransaction(() => {
-					const changed = this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+					const changed = this.#manager.database.inboundTurnComplete(
+						bound.turn.opRef,
+						bound.retired && !bound.answerWanted ? "retired" : "no_delivery",
+					);
 					if (
 						changed === 1 &&
 						!bound.retired &&
@@ -2135,7 +2138,11 @@ class OriginActor {
 		try {
 			await bound.lifecycle.onSettled?.({
 				...bound,
-				terminalDeliveryId: settledTrigger.terminal_delivery_id,
+				// A `{"none": reason}` sentinel is not an answer.
+				terminalDeliveryId:
+					terminalDeliveryIds(settledTrigger.terminal_delivery_id).length > 0
+						? settledTrigger.terminal_delivery_id
+						: null,
 			});
 		} catch (error) {
 			this.#manager.log(

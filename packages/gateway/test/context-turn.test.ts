@@ -205,29 +205,40 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	client.close();
 });
 
-test("a turn that wrote its answer and then failed on a hung tool delivers that answer, not a bare failure (#210)", async () => {
+test("#247: every done trigger names the delivery that closed it or why none did", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
-		respond: async () => {
-			throw new Error("Agent run failed after execution started.");
+		respond: async (_session, text, _preamble, _progress, options) => {
+			if (text.includes("interim then silent")) {
+				options?.onAssistantText?.("visible interim answer");
+				return "[SILENT]";
+			}
+			if (text.includes("react only")) return "[REACT:👍]";
+			if (text.includes("stay quiet")) return "[SILENT]";
+			throw new Error("runtime failed before reply");
 		},
 	});
-	// The reply sits in the transcript; the tail never showed it.
-	sessionPort.fetchAssistantSince = async () => ({
-		text: "written before the tool timed out",
-		pages: 1,
-		complete: true,
-	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
-	send(client, "hung-tool-trigger", "owner request");
-	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
-	// A visible answer consumes the context it was written from.
-	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
-	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
-	expect(texts).toEqual(["written before the tool timed out"]);
+	const settle = async (id: string, text: string) => {
+		const turn = sessionPort.sends.length;
+		send(client, id, text);
+		await waitUntil(() => sessionPort.sends.length > turn);
+		const opRef = sessionPort.sends[turn]?.opRef ?? "";
+		await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+		return database.inboundTurnRow(opRef)?.terminal_delivery_id ?? null;
+	};
+	const deliveryIdOf = (body: string) =>
+		client.frames.find((frame) => frame.event === "chat.message" && frame.payload.text === body)?.payload.deliveryId;
+
+	const interim = await settle("interim-silent", "interim then silent");
+	expect(JSON.parse(interim ?? "null")).toEqual({ 0: deliveryIdOf("visible interim answer") });
+	const reaction = await settle("react-only", "react only");
+	expect(JSON.parse(reaction ?? "null")).toEqual({ 0: deliveryIdOf("👍") });
+	expect(JSON.parse((await settle("silent", "stay quiet")) ?? "null")).toEqual({ none: "silent" });
+	expect(JSON.parse((await settle("failed", "fail please")) ?? "null")).toEqual({ none: "turn_failed" });
+	expect(database.inboundTerminalLinkAudit(new Date(0).toISOString())).toEqual({ done: 4, unlinked: 0 });
 	client.close();
 });
 

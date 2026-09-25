@@ -104,6 +104,39 @@ test("messages arriving while a turn is running become steers in arrival order",
 	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
 });
 
+test("#247: completion keeps a delivery claim, and a claim replaces a no-delivery reason", async () => {
+	const db = await open();
+	for (const [id, opRef] of [
+		["m1", "gw-p-claimed"],
+		["m2", "gw-p-marked"],
+	] as const) {
+		db.inboundEnqueue(message(id, id));
+		db.inboundBindTurn({ messageId: id, originKey: ORIGIN_KEY, epoch: id === "m1" ? 0 : 1, opRef, sessionId: "s" });
+	}
+	expect(db.inboundTurnClaimTerminal("gw-p-claimed", 0, "gw-t-a")).toBe("gw-t-a");
+	expect(db.inboundTurnComplete("gw-p-claimed", "silent")).toBe(1);
+	expect(db.inboundTurnRow("gw-p-claimed")?.terminal_delivery_id).toBe('{"0":"gw-t-a"}');
+
+	db.inboundTurnMarkUnlinked("gw-p-marked", "silent");
+	db.inboundTurnMarkUnlinked("gw-p-marked", "turn_failed");
+	expect(db.inboundTurnRow("gw-p-marked")?.terminal_delivery_id).toBe('{"none":"silent"}');
+	expect(db.inboundTurnClaimTerminal("gw-p-marked", 0, "gw-t-b")).toBe("gw-t-b");
+	expect(db.inboundTurnRow("gw-p-marked")?.terminal_delivery_id).toBe('{"0":"gw-t-b"}');
+});
+
+test("the terminal link audit counts done triggers with a NULL link", async () => {
+	const db = await open();
+	db.inboundEnqueue(message("m1", "hello"));
+	db.inboundBindTurn({ messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef: "gw-p-a", sessionId: "s" });
+	expect(db.inboundTurnComplete("gw-p-a")).toBe(1);
+	const since = new Date(Date.now() - 60_000).toISOString();
+	expect(db.inboundTerminalLinkAudit(since)).toEqual({ done: 1, unlinked: 0 });
+	const raw = new (await import("bun:sqlite")).Database(join(home, "gateway.db"));
+	raw.query("UPDATE inbound_messages SET terminal_delivery_id = NULL").run();
+	raw.close();
+	expect(db.inboundTerminalLinkAudit(since)).toEqual({ done: 1, unlinked: 1 });
+});
+
 test("an old pending message remains eligible for a turn", async () => {
 	const db = await open();
 	const now = Date.now();
@@ -125,7 +158,12 @@ test("completed turns are never pending or nonterminal", async () => {
 	expect(db.inboundTurnAccept(opRef)).toBe(true);
 	expect(db.inboundTurnComplete(opRef)).toBe(1);
 
-	expect(db.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_role: "trigger", turn_state: "done" });
+	expect(db.inboundTurnRow(opRef)).toMatchObject({
+		state: "done",
+		turn_role: "trigger",
+		turn_state: "done",
+		terminal_delivery_id: '{"none":"no_delivery"}',
+	});
 	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
 	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([]);
 	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(0);
