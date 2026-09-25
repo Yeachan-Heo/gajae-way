@@ -1720,10 +1720,14 @@ class OriginActor {
 				}
 			}
 		}
-		if (isTerminalTailFrame(frame)) {
-			bound.tailTerminalObserved = true;
-			await this.#reconcileBound(bound);
-		}
+		// Only the owned relay's correlated agent_end/agent_failed proves the turn's
+		// content stream is complete. An `idle` broadcast reaches every relay on the
+		// session - including one reopened after the owner died, which never saw the
+		// final message - so it only wakes a status reconcile. Treating it as tail
+		// evidence settled the turn with its last mid-work line as the answer (#228).
+		const ownedTerminal = frame.rawKind === "agent_end" || frame.rawKind === "agent_failed";
+		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
+		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
 	}
 
 	async #onStall(
@@ -2352,10 +2356,6 @@ function terminalFailureDiagnosis(status: StatusReport): string {
 
 function safeDiagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error";
-}
-
-function isTerminalTailFrame(frame: TailFrame): boolean {
-	return frame.rawKind === "agent_end" || frame.rawKind === "agent_failed" || frame.idle;
 }
 
 /**
