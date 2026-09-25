@@ -89,6 +89,18 @@ type DispatchFailureCode =
 	| "internal_error";
 
 /**
+ * Failures that say nothing about the dispatch path being down, so reconcile
+ * reclaims them on the next sweep instead of on the #179 outage backoff: a
+ * `gateway_shutdown` interrupt is retried by the next boot (#225), and a
+ * `session_busy` refusal is replayed into the session the busy roll just bound
+ * (#263). The reclaim budget still bounds both.
+ */
+const IMMEDIATE_RETRY_FAILURE_CODES: ReadonlySet<string> = new Set<DispatchFailureCode>([
+	"gateway_shutdown",
+	"session_busy",
+]);
+
+/**
  * How long shutdown waits for in-flight authoring turns before marking them
  * interrupted. Together with the persona drain (5s) and connection settle (5s)
  * this keeps an ordered stop inside a 30s `TimeoutStopSec` (#225).
@@ -534,6 +546,7 @@ export class MonitorPropagator {
 					}
 					if (
 						row.stage === "failed" &&
+						!IMMEDIATE_RETRY_FAILURE_CODES.has(this.#database.monitorFailure(row.event_id)?.code ?? "") &&
 						this.#now() - Date.parse(row.updated_at) < (MONITOR_EVENT_RETRY_BACKOFF_MS[row.dispatch_attempts] ?? 0)
 					)
 						continue;
