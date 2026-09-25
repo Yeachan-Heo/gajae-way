@@ -536,6 +536,80 @@ describe("monitor crash-boundary state machine", () => {
 		);
 	});
 
+	test("a bounded drain interrupts an in-flight authoring turn, names the session, and the next boot re-dispatches it (#225)", async () => {
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+			registry,
+		} = await harness(async (_id, text) => {
+			turns++;
+			if (turns === 1) await parked;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		const reconcile = propagator.reconcile();
+		for (let attempt = 0; attempt < 100 && turns === 0; attempt++) await Bun.sleep(5);
+		expect(turns).toBe(1);
+		// The turn never settles inside the shutdown window: drain must return on
+		// its own instead of waiting for the service manager's SIGKILL.
+		const started = Date.now();
+		await propagator.drain(100);
+		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(stage(db, eventId)).toBe("failed");
+		const failure = db.monitorFailure(eventId);
+		expect(failure?.code).toBe("gateway_shutdown");
+		expect(failure?.detail).toContain("gateway stopped at");
+		expect(failure?.detail).toContain('"sessionId":"s1"');
+		expect(failure?.detail).toContain('"phase":"request"');
+		// The lease is released immediately: the next boot need not wait for the
+		// 10-minute TTL before reclaiming the event.
+		expect(db.monitorEventLiveLeaseOwner(eventId)).toBeUndefined();
+		// The orphaned turn finishing after the stop is fenced out: no authored
+		// output and no stage change from the dead attempt.
+		release?.();
+		await reconcile;
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.authoredOutput(eventId)).toBeUndefined();
+		// Next boot: a fresh propagator reclaims the event as recoverable state.
+		const next = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async (_id, text) =>
+				JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" }))),
+			),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(next);
+		await next.reconcile();
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(db.authoredOutput(eventId)).toBe("recovered");
+	});
+
+	test("a closing propagator starts no new dispatch from reconcile", async () => {
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) => {
+			turns++;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "n" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		await propagator.drain();
+		await propagator.reconcile();
+		expect(turns).toBe(0);
+		expect(stage(db, eventId)).toBe("admitted");
+	});
+
 	test("durable failure detail keeps only allowlisted classes causes and frames", async () => {
 		class SecretVendorTokenGhp123 extends Error {}
 		const hostile = new SecretVendorTokenGhp123("ghp_attacker-secret prompt=https://secret.example/token");

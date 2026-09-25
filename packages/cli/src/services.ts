@@ -222,7 +222,9 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		"RestartSec=2",
 		// Only the gateway: GJC daemon and session hosts share the gateway cgroup,
 		// so the default control-group kill would take unrelated sessions with it.
-		...(spec.dependsOnGateway ? [] : ["KillMode=process"]),
+		// The gateway exits on its own inside 25s (SHUTDOWN_DEADLINE_MS in the
+		// gateway main); the unit's stop window is pinned so that ceiling always fits.
+		...(spec.dependsOnGateway ? [] : ["KillMode=process", "TimeoutStopSec=30s"]),
 		"",
 		"[Install]",
 		// Enabling the gateway pulls the whole stack in; a dependent is never

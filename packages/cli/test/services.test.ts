@@ -52,12 +52,15 @@ test("a linux install writes one bound systemd user unit per service", async () 
 				expect(unit).toContain(`PartOf=${GATEWAY_UNIT}`);
 				expect(unit).toContain(`WantedBy=${GATEWAY_UNIT}`);
 				expect(unit).not.toContain("KillMode=process");
+				expect(unit).not.toContain("TimeoutStopSec=");
 			} else {
 				expect(unit).not.toContain("BindsTo=");
 				expect(unit).not.toContain("PartOf=");
 				expect(unit).toContain("WantedBy=default.target");
 				// GJC daemon and session hosts share the gateway cgroup.
 				expect(unit).toContain("KillMode=process");
+				// The gateway's own shutdown ceiling (25s) must fit inside the unit's stop window (#225).
+				expect(unit).toContain("TimeoutStopSec=30s");
 			}
 		}
 	} finally {
