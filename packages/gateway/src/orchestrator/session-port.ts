@@ -54,6 +54,12 @@ export interface SessionPort {
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/**
+	 * Background jobs (async `task` sub-lanes, async bash) still running inside the
+	 * session host (`runtime.jobs.list`). Ending the host ends them, so a caller
+	 * about to do that reads this first. Throws when the host cannot answer.
+	 */
+	runningJobs?(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]>;
+	/**
 	 * Ends the host process of a session this gateway created and has retired.
 	 * Ownership is the point: the shared GJC daemon and broker are never touched,
 	 * only a `session-host-internal` whose pid the broker reports for THIS
@@ -109,6 +115,12 @@ export interface SessionPort {
 	 * delete, so the gateway retires lanes by closing and rebinding instead.
 	 */
 	close(input: { sessionId: string; repo: string }): Promise<void>;
+}
+
+export interface RunningHostJob {
+	readonly id: string;
+	readonly type: string;
+	readonly label: string;
 }
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
@@ -892,6 +904,15 @@ export class BrokerSessionPort implements SessionPort {
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
 	}
 
+	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
+		this.#assertOwned(input);
+		const result = await this.#cli(
+			["sdk", "session", "raw", "query", input.sessionId, "--query", "runtime.jobs.list", "--json-input", "{}"],
+			{ timeoutMs: 10_000 },
+		);
+		return parseRunningJobs(result.stdout);
+	}
+
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
@@ -1168,6 +1189,26 @@ export class BrokerSessionPort implements SessionPort {
 	#controller(repo: string): ControllerOptions {
 		return { run: this.#cli, repo };
 	}
+}
+
+/**
+ * `runtime.jobs.list` answers one page item `{running, recent, delivery}`. Only
+ * `running` matters to a caller about to end the host. Anything unparseable
+ * throws: an unreadable job list is not an empty one.
+ */
+export function parseRunningJobs(stdout: string): readonly RunningHostJob[] {
+	const envelope = JSON.parse(stdout) as { ok?: unknown; page?: { items?: unknown } };
+	const items = envelope.ok === true ? envelope.page?.items : undefined;
+	const running = Array.isArray(items) ? (recordOf(items[0])?.running as unknown) : undefined;
+	if (!Array.isArray(running)) throw new Error("runtime.jobs.list returned no running-job list");
+	return running.map((entry) => {
+		const job = recordOf(entry) ?? {};
+		return {
+			id: typeof job.id === "string" ? job.id : "unknown",
+			type: typeof job.type === "string" ? job.type : "unknown",
+			label: typeof job.label === "string" ? job.label : "",
+		};
+	});
 }
 
 /**

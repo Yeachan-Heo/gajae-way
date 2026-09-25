@@ -136,12 +136,6 @@ export interface PersonaTerminalInput extends PersonaTurnIdentity {
 export interface PersonaFailureInput extends PersonaTurnIdentity {
 	readonly error: Error;
 	readonly status?: StatusReport;
-	/**
-	 * The answer this turn wrote before it failed, read from the transcript
-	 * because no relay showed it (#210). A written reply must not die with the
-	 * turn that produced it.
-	 */
-	readonly recoveredText?: string;
 }
 
 export interface PersonaTurnSettledInput extends PersonaTurnIdentity {
@@ -493,14 +487,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusTerminalHolds: number;
 	/** Status rechecks scheduled for a turn whose end no relay will announce (backoff ordinal). */
 	statusRechecks: number;
-	/** A stalled retired hold already attempted its one allowed host termination. */
-	retiredHostTerminationAttempted?: boolean;
-	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
-	staleOutput?: { count: number; firstAt: number; lastAt: number };
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
-	/** A tool the tail saw start and not end: the prime suspect when the turn then fails (#210). */
-	openTool?: { readonly name: string; readonly startedAtMs: number };
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
 };
@@ -991,8 +979,6 @@ class OriginActor {
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
 		this.#graceTimers.clear();
 		this.#dispatchRetry = undefined;
-		if (this.#current) this.#flushStaleOutput(this.#current, "shutdown");
-		for (const retired of this.#retired.values()) this.#flushStaleOutput(retired, "shutdown");
 		await Promise.all([
 			...(this.#current?.tail ? [this.#current.tail.close()] : []),
 			...[...this.#retired.values()].flatMap((bound) => (bound.tail ? [bound.tail.close()] : [])),
@@ -1573,7 +1559,7 @@ class OriginActor {
 			onFrame: async (frame) => {
 				await this.enqueue(async () => {
 					const bound = this.#findBound(sessionId, epoch, generation);
-					if (bound && (!owns(bound) || bound.detached)) return;
+					if (bound && !owns(bound)) return;
 					await this.#onTailFrame(sessionId, epoch, generation, retired, frame);
 				});
 			},
@@ -1658,37 +1644,6 @@ class OriginActor {
 	}
 
 	/**
-	 * A turn can fail AFTER it wrote its answer: a tool call that times out
-	 * ends the whole run (#210), and a relay that went dark mid-turn never
-	 * showed the reply. When no assistant text reached the consumer, read the
-	 * transcript for a row written since this turn dispatched. A reply already
-	 * shown on the tail is not re-read: it was delivered (or deliberately not).
-	 */
-	async #recoverFailedTurnAnswer(bound: BoundTurn): Promise<string | undefined> {
-		const port = this.#manager.port;
-		if (bound.replyVisible || bound.lastAssistantText !== undefined) return undefined;
-		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return undefined;
-		try {
-			const found = await port.fetchAssistantSince({
-				sessionId: bound.sessionId,
-				repo: this.#manager.repo,
-				notBeforeMs: bound.dispatchedAtMs,
-			});
-			const text = found?.text?.trim();
-			if (!text) return undefined;
-			this.#manager.log(
-				`failed_turn_answer_recovered origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} chars=${text.length}`,
-			);
-			return text;
-		} catch (error) {
-			this.#manager.log(
-				`failed_turn_answer_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
-			);
-			return undefined;
-		}
-	}
-
-	/**
 	 * The relay that owned the running turn died. Whatever the host streamed
 	 * while it was down is gone (content is best-effort by host contract), so
 	 * the turn settles from status and the original result; the handle itself
@@ -1723,28 +1678,6 @@ class OriginActor {
 		await this.#reconcileBound(bound);
 	}
 
-	#recordStaleOutput(bound: BoundTurn): void {
-		const now = this.#manager.now();
-		if (bound.staleOutput) {
-			bound.staleOutput.count++;
-			bound.staleOutput.lastAt = now;
-			return;
-		}
-		bound.staleOutput = { count: 1, firstAt: now, lastAt: now };
-		this.#manager.log(
-			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=start count=1 first=${new Date(now).toISOString()}`,
-		);
-	}
-
-	#flushStaleOutput(bound: BoundTurn, reason: string): void {
-		const staleOutput = bound.staleOutput;
-		if (!staleOutput) return;
-		bound.staleOutput = undefined;
-		this.#manager.log(
-			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=stop count=${staleOutput.count} first=${new Date(staleOutput.firstAt).toISOString()} last=${new Date(staleOutput.lastAt).toISOString()} reason=${reason}`,
-		);
-	}
-
 	async #onTailFrame(
 		sessionId: string,
 		epoch: number,
@@ -1761,15 +1694,10 @@ class OriginActor {
 			return;
 		}
 		if ((bound.retired || retired) && !bound.answerWanted) {
-			if (frame.assistantText) this.#recordStaleOutput(bound);
+			if (frame.assistantText)
+				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
-			if (frame.rawKind === "tool_execution_start")
-				bound.openTool = {
-					name: typeof frame.payload.toolName === "string" ? frame.payload.toolName : "tool",
-					startedAtMs: this.#manager.now(),
-				};
-			else if (frame.rawKind === "tool_execution_end") bound.openTool = undefined;
 			const replyVisible = await bound.lifecycle.onFrame?.({ ...bound, frame });
 			if (replyVisible === true) bound.replyVisible = true;
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
@@ -1792,14 +1720,10 @@ class OriginActor {
 				}
 			}
 		}
-		// Only the owned relay's correlated agent_end/agent_failed proves the turn's
-		// content stream is complete. An `idle` broadcast reaches every relay on the
-		// session - including one reopened after the owner died, which never saw the
-		// final message - so it only wakes a status reconcile. Treating it as tail
-		// evidence settled the turn with its last mid-work line as the answer (#228).
-		const ownedTerminal = frame.rawKind === "agent_end" || frame.rawKind === "agent_failed";
-		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
-		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
+		if (isTerminalTailFrame(frame)) {
+			bound.tailTerminalObserved = true;
+			await this.#reconcileBound(bound);
+		}
 	}
 
 	async #onStall(
@@ -1814,23 +1738,13 @@ class OriginActor {
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`);
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
-			this.#flushStaleOutput(bound, "stall");
-			const tail = bound.tail;
-			tail?.setTurnRunning(false);
-			await tail?.close();
-			bound.tail = undefined;
+			bound.tail?.setTurnRunning(false);
+			await bound.tail?.close();
 			bound.detached = true;
-			// A reopened retired relay cannot own this turn's content. Keep the
-			// accepted turn durable and reconcile it by status without reopening
-			// the stream that produced the stale-output flood.
-			bound.tailEvidenceUnavailable = true;
-			// This discarded turn no longer needs a producer. Terminate its host,
-			// but retain the accepted row and never infer terminal status from SIGTERM.
-			if (!bound.answerWanted) await this.#terminateRetiredSession(sessionId, "stall", bound);
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 			);
-			await this.#reconcileBound(bound);
+			this.#scheduleRetiredReattach(bound);
 		}
 	}
 
@@ -2038,20 +1952,10 @@ class OriginActor {
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
-				const openTool = bound.openTool && {
-					name: toolLabel(bound.openTool.name),
-					elapsedMs: Math.max(0, this.#manager.now() - bound.openTool.startedAtMs),
-				};
 				this.#manager.log(
-					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
+					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}`,
 				);
-				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
-				await bound.lifecycle.onFailure?.({
-					...bound,
-					error: terminalError(report, openTool),
-					status: report,
-					...(recoveredText ? { recoveredText } : {}),
-				});
+				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
 			}
 		} catch (error) {
 			this.#manager.log(
@@ -2146,7 +2050,6 @@ class OriginActor {
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
 		bound.tail?.setTurnRunning(false);
-		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);
 		try {
 			await bound.tail?.close();
@@ -2157,7 +2060,7 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled");
 			return;
 		}
 		if (this.#current === bound) {
@@ -2177,14 +2080,13 @@ class OriginActor {
 	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
-		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
 		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
 		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded", bound);
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded");
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
@@ -2293,19 +2195,34 @@ class OriginActor {
 	}
 
 	/**
-	 * End an obsolete session host after its final turn is settled, or after a
-	 * stalled retired turn is discarded. The latter remains in `#retired` for
-	 * status reconciliation, so callers may exclude that one hold while the
-	 * same-session guard still protects every other live or retired turn.
+	 * A retired turn has just been reconciled (answer delivered, failed, or
+	 * provably never landed) and dropped from `#retired`. Nothing will prompt
+	 * its session again: this origin is bound to a newer epoch. End the host so
+	 * it stops occupying the model provider. Skipped when the session is still
+	 * the live binding (same epoch reused) or some other retired turn on this
+	 * origin still needs it; best-effort, logged, never fatal.
+	 *
+	 * Background jobs the persona started in that host (async `task` sub-lanes,
+	 * async bash) die with it, and their results with them (#41). They are read
+	 * first and named in a `retired_session_host_jobs_lost` line, so a killed
+	 * sub-lane leaves a record instead of vanishing.
 	 */
-	async #terminateRetiredSession(sessionId: string, reason: string, except?: BoundTurn): Promise<void> {
+	async #terminateRetiredSession(sessionId: string, reason: string): Promise<void> {
 		const port = this.#manager.port;
 		if (!port.terminateHost) return;
-		if (except?.retiredHostTerminationAttempted) return;
 		if (this.#current?.sessionId === sessionId) return;
 		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
-		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
-		if (except) except.retiredHostTerminationAttempted = true;
+		for (const other of this.#retired.values()) if (other.sessionId === sessionId) return;
+		let jobs: string | undefined;
+		if (port.runningJobs) {
+			try {
+				const running = await port.runningJobs({ sessionId, repo: this.#manager.repo });
+				if (running.length > 0)
+					jobs = `count=${running.length} jobs=${JSON.stringify(running.map((job) => `${job.type}:${job.id}:${job.label}`))}`;
+			} catch (error) {
+				jobs = `count=unknown detail=${safeDiagnostic(error)}`;
+			}
+		}
 		try {
 			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 			this.#manager.log(
@@ -2315,6 +2232,10 @@ class OriginActor {
 					result.outcome === "not_a_host" ? ` command=${JSON.stringify(result.command)}` : ""
 				}`,
 			);
+			if (jobs && result.outcome === "terminated")
+				this.#manager.log(
+					`retired_session_host_jobs_lost origin=${this.originKey} session=${sessionId} reason=${reason} ${jobs}`,
+				);
 		} catch (error) {
 			this.#manager.log(
 				`retired_session_host origin=${this.originKey} session=${sessionId} reason=${reason} outcome=error detail=${safeDiagnostic(error)}`,
@@ -2417,24 +2338,16 @@ class OriginActor {
  * the ENTIRE diagnosis — dropping it here made six distinct lost turns deliver
  * six identical, untriageable lines (#244).
  */
-function terminalError(
-	status: StatusReport,
-	openTool?: { readonly name: string; readonly elapsedMs: number },
-): GjcRuntimeError {
+function terminalError(status: StatusReport): GjcRuntimeError {
 	const failure = status.status.error;
 	const outcome = status.status.outcome;
 	const code = sanitizeDiagnostic(failure?.code ?? outcome?.code ?? "") || undefined;
-	const reported =
+	const message =
 		sanitizeDiagnostic(failure?.message ?? outcome?.message ?? "") ||
 		// Never empty: a code-only failure still reports the code as its diagnosis,
 		// and a failure with neither keeps the gateway's own framing (#14).
 		code ||
 		sanitizeDiagnostic(`session status ${status.status.status}`);
-	// The redacted post-start sentence names no cause. A tool that started and
-	// never finished is the one the reader needs (#210: a 300s `op whoami`).
-	const message = openTool
-		? `${reported} (a ${openTool.name} call had been running for ${Math.round(openTool.elapsedMs / 1000)}s without finishing)`
-		: reported;
 	return new GjcRuntimeError(`${code ? `${code}: ` : ""}${message}`, {
 		...(code ? { code } : {}),
 		message,
@@ -2456,14 +2369,12 @@ function terminalFailureDiagnosis(status: StatusReport): string {
 		.join(" ");
 }
 
-/** A tool name bound for a log field and a chat notice: one token, bounded. */
-function toolLabel(name: string): string {
-	const label = name.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 48);
-	return label || "tool";
-}
-
 function safeDiagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error";
+}
+
+function isTerminalTailFrame(frame: TailFrame): boolean {
+	return frame.rawKind === "agent_end" || frame.rawKind === "agent_failed" || frame.idle;
 }
 
 /**

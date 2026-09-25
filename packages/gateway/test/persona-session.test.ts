@@ -715,6 +715,57 @@ test("/new with nothing in flight ends the previous session's host at once", asy
 	expect(port.closes).toHaveLength(1);
 });
 
+test("#41: ending a retired host that still runs an async sub-lane leaves a jobs-lost record naming it", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, undefined, (line) => logs.push(line));
+	enqueue("review", "start a background review");
+	await manager!.notifyInbound(KEY);
+	// The turn ends normally while the sub-lane it started keeps running in the host.
+	port.hostJobs.set("session-e0", [{ id: "0-ArchitectReview", type: "task", label: "review #61" }]);
+	port.complete(port.sends[0]!.opRef, "started the review");
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
+	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
+	const lost = logs.filter((l) => l.startsWith("retired_session_host_jobs_lost"));
+	expect(lost).toHaveLength(1);
+	expect(lost[0]).toContain("session=session-e0");
+	expect(lost[0]).toContain("count=1");
+	expect(lost[0]).toContain("task:0-ArchitectReview:review #61");
+});
+
+test("#41: an unreadable job list is recorded as unknown, never as no jobs", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, undefined, (line) => logs.push(line));
+	enqueue("first", "first");
+	await manager!.notifyInbound(KEY);
+	port.hostJobs.set("session-e0", new Error("broker_unavailable"));
+	port.complete(port.sends[0]!.opRef, "answered");
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
+	const lost = logs.filter((l) => l.startsWith("retired_session_host_jobs_lost"));
+	expect(lost).toHaveLength(1);
+	expect(lost[0]).toContain("count=unknown");
+	expect(lost[0]).toContain("broker_unavailable");
+});
+
+test("#41: a retired host with no running jobs ends without a jobs-lost record", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, undefined, (line) => logs.push(line));
+	enqueue("first", "first");
+	await manager!.notifyInbound(KEY);
+	port.complete(port.sends[0]!.opRef, "answered");
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
+	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
+	expect(logs.some((l) => l.startsWith("retired_session_host_jobs_lost"))).toBe(false);
+});
+
 test("/new with a turn in flight ends the old host only after that turn is reconciled", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const logs2: string[] = [];
