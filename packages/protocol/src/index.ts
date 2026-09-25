@@ -38,6 +38,7 @@ export {
 	type ReplyContext,
 	type SessionBootstrapProjection,
 	type SessionListResult,
+	type SessionModelChoicesResult,
 	type SessionRecallParams,
 	type SessionRecallResult,
 	SILENCE_TOKENS,

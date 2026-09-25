@@ -320,6 +320,15 @@ export interface SessionListResult {
 	}[];
 }
 
+/**
+ * `/model set` choices (session.modelChoices): preset names from the gjc
+ * profile's `models.yml` `profiles:` map plus the configured gateway selector.
+ * Fails soft: an unreadable catalog yields an empty list, never an error.
+ */
+export interface SessionModelChoicesResult {
+	readonly choices: readonly string[];
+}
+
 export interface SessionBootstrapProjection {
 	readonly epoch: number;
 	readonly pending: boolean;
@@ -731,6 +740,7 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
+	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
 	"memory.autolink": {
 		params: undefined;
@@ -779,6 +789,7 @@ export const VERBS_V01 = [
 	"delivery.fail",
 	"session.recall",
 	"session.list",
+	"session.modelChoices",
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",

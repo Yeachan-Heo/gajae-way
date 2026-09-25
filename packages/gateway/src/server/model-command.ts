@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { GjcModelSelection } from "../store/db";
 
 /** The store surface `/model` needs; narrowed so tests need no real database. */
@@ -15,6 +16,32 @@ export interface ModelCommandOutcome {
 	readonly text: string;
 	/** A same-session control transition the per-origin actor must serialize. */
 	readonly rebind?: ModelRebindIntent;
+}
+
+/**
+ * `/model set` autocomplete choices: the preset names in the gjc profile's
+ * `models.yml` `profiles:` map, plus the configured gateway selector. Fails soft
+ * to whatever could be read: a missing or unreadable models file must not break
+ * the command, because a typed choice is still accepted.
+ */
+export async function listModelChoices(
+	agentDir: string | undefined,
+	configModel: GjcModelSelection | undefined,
+): Promise<string[]> {
+	const choices = new Set<string>();
+	if (configModel) choices.add(typeof configModel === "string" ? configModel : configModel.preset);
+	if (agentDir) {
+		try {
+			const parsed = Bun.YAML.parse(await Bun.file(join(agentDir, "models.yml")).text()) as unknown;
+			const profiles = (parsed as { profiles?: unknown } | null)?.profiles;
+			if (profiles && typeof profiles === "object" && !Array.isArray(profiles))
+				for (const name of Object.keys(profiles)) choices.add(name);
+		} catch {
+			// Fail soft: no catalog means no suggestions, never a broken command.
+		}
+	}
+	// A name with whitespace could never round-trip through `/model set <choice>`.
+	return [...choices].filter((choice) => choice !== "" && !/\s/.test(choice)).sort();
 }
 
 /** Renders a selection the way the owner typed it. */

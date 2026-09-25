@@ -77,7 +77,7 @@ import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
-import { applyModelCommand } from "./model-command";
+import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -953,6 +953,11 @@ async function handleRequest(
 				bootstrap: bootstrapProjection(row),
 			}));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
+			return;
+		}
+		case "session.modelChoices": {
+			const choices = await listModelChoices(options.broker?.agentDir, runtime.config.model);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices } });
 			return;
 		}
 		case "session.recall": {

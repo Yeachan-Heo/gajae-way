@@ -13,6 +13,7 @@ import {
 	presenceMarkersFor,
 	presenceTransition,
 	type ReactionAction,
+	type SessionModelChoicesResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
@@ -969,19 +970,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		gateway.sendReaction(reaction, user, "remove", discord.user);
 	});
 	discord.on("interactionCreate", (interaction) => {
-		if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
+		else if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
 	});
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
-		// Slash-command mapping: /new and /reset are first-class Discord commands
-		// that route into the gateway's session-reset verbs for the invoking
+		// Slash-command mapping: /new, /reset and /model are first-class Discord
+		// commands that route into the gateway's chat-command verbs for the invoking
 		// conversation (typing "/new" as chat text never reaches messageCreate).
 		void discord.application?.commands
-			.set([
-				{ name: "new", description: "Start a fresh persona session in this conversation" },
-				{ name: "reset", description: "Reset this conversation's persona session" },
-				{ name: "restart", description: "Restart the gateway process (owner only)" },
-			])
+			.set([...DISCORD_SLASH_COMMANDS])
 			.catch((error: unknown) =>
 				console.error(
 					`Discord slash-command registration failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -994,10 +992,107 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	await discord.login(config.token);
 }
 
+/** Discord application-command option types used by the registration below. */
+const SUBCOMMAND_OPTION = 1;
+const STRING_OPTION = 3;
+/** Discord caps an autocomplete response at 25 choices. */
+const AUTOCOMPLETE_LIMIT = 25;
+
+/**
+ * Every slash command the adapter registers. `/model` mirrors the gateway's
+ * `/model`, `/model set <choice>` and `/model clear` text commands; the
+ * choice autocompletes from the gateway's model catalog so nobody has to
+ * remember preset names, but free text is still accepted.
+ */
+export const DISCORD_SLASH_COMMANDS = [
+	{ name: "new", description: "Start a fresh persona session in this conversation" },
+	{ name: "reset", description: "Reset this conversation's persona session" },
+	{ name: "restart", description: "Restart the gateway process (owner only)" },
+	{
+		name: "model",
+		description: "Show or change the model for this conversation",
+		options: [
+			{ type: SUBCOMMAND_OPTION, name: "show", description: "Show the effective model and where it comes from" },
+			{
+				type: SUBCOMMAND_OPTION,
+				name: "set",
+				description: "Use a gjc preset or model selector for this conversation",
+				options: [
+					{
+						type: STRING_OPTION,
+						name: "choice",
+						description: "Preset name, provider/model selector, or preset:/model: prefixed name",
+						required: true,
+						autocomplete: true,
+					},
+				],
+			},
+			{ type: SUBCOMMAND_OPTION, name: "clear", description: "Drop this conversation's override" },
+		],
+	},
+] as const satisfies ReadonlyArray<{
+	readonly name: string;
+	readonly description: string;
+	readonly options?: ReadonlyArray<{
+		readonly type: number;
+		readonly name: string;
+		readonly description: string;
+		readonly options?: ReadonlyArray<{
+			readonly type: number;
+			readonly name: string;
+			readonly description: string;
+			readonly required?: boolean;
+			readonly autocomplete?: boolean;
+		}>;
+	}>;
+}>;
+
+/** Duck-typed slice of a Discord autocomplete interaction. */
+export interface AutocompleteInteractionLike {
+	isAutocomplete?(): boolean;
+	readonly commandName?: string;
+	readonly options: { getFocused(): string };
+	respond(choices: Array<{ name: string; value: string }>): Promise<unknown>;
+}
+
+/**
+ * Answers `/model set` autocomplete from the gateway's catalog. Fails soft: an
+ * unreachable gateway or unreadable catalog yields an empty list, which Discord
+ * shows as "no options" while still accepting a typed choice.
+ */
+export async function handleModelAutocomplete(
+	interaction: AutocompleteInteractionLike,
+	gateway: Pick<ReconnectingGateway, "modelChoices">,
+	log: Pick<Console, "error"> = console,
+): Promise<void> {
+	if (!interaction.isAutocomplete?.() || interaction.commandName !== "model") return;
+	let choices: readonly string[] = [];
+	try {
+		choices = await gateway.modelChoices();
+	} catch (error) {
+		log.error(`Discord /model autocomplete failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	const needle = interaction.options.getFocused().trim().toLowerCase();
+	const matches = choices
+		.filter((choice) => choice.toLowerCase().includes(needle))
+		.slice(0, AUTOCOMPLETE_LIMIT)
+		.map((choice) => ({ name: choice, value: choice }));
+	try {
+		await interaction.respond(matches);
+	} catch (error) {
+		log.error(`Discord /model autocomplete reply failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
 /** Duck-typed slice of a Discord chat-input command interaction. */
 export interface SlashInteractionLike {
 	isChatInputCommand?(): boolean;
 	readonly commandName?: string;
+	/** Present for commands with subcommands/options (`/model`). */
+	readonly options?: {
+		getSubcommand(required?: boolean): string | null;
+		getString(name: string, required?: boolean): string | null;
+	};
 	readonly id: string;
 	readonly user?: {
 		readonly id: string;
@@ -1032,12 +1127,27 @@ export async function handleSlashCommand(
 	log: Pick<Console, "error"> = console,
 ): Promise<void> {
 	if (!interaction.isChatInputCommand?.()) return;
-	if (interaction.commandName !== "new" && interaction.commandName !== "reset") return;
+	const command = interaction.commandName;
+	if (command !== "new" && command !== "reset" && command !== "model") return;
 	if (!interaction.channel || !interaction.user) return;
 	try {
+		let text = `/${command}`;
+		if (command === "model") {
+			const subcommand = interaction.options?.getSubcommand(false) ?? "show";
+			if (subcommand === "set") {
+				const choice = interaction.options?.getString("choice")?.trim() ?? "";
+				// An empty choice would reach the gateway as a bare `/model` read and
+				// look like an accepted change that did nothing.
+				if (!choice) {
+					await interaction.reply({ content: "choose a model: `/model set <choice>`", ephemeral: true });
+					return;
+				}
+				text = `/model set ${choice}`;
+			} else if (subcommand === "clear") text = "/model clear";
+		}
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
 		const interactionServerTag = resolveServerTag(interaction.user);
-		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
+		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, text, {
 			mentioned: true,
 			group: origin.kind !== "dm",
 			authorId: interaction.user.id,
@@ -1048,10 +1158,11 @@ export async function handleSlashCommand(
 			...(interactionServerTag ? { authorServerTag: interactionServerTag } : {}),
 		});
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
-		// group surface) — never claim a reset that did not happen.
+		// group surface) — never claim a reset that did not happen. `/model` never
+		// resets the session; the gateway posts the resulting selection itself.
 		await interaction.reply(
 			result?.engaged
-				? { content: "🦞 session reset", ephemeral: true }
+				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
 				: { content: "not authorized for session commands here", ephemeral: true },
 		);
 	} catch (error) {
@@ -1624,6 +1735,14 @@ export class ReconnectingGateway {
 		void client.request("engagement.reaction", described).catch((error) => {
 			console.error(`Discord engagement.reaction failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
+	}
+
+	/** `/model set` autocomplete source; throws when the gateway link is down. */
+	async modelChoices(): Promise<readonly string[]> {
+		const client = this.#client;
+		if (!client) throw new Error("gateway link not connected");
+		const result = await client.request<SessionModelChoicesResult>("session.modelChoices");
+		return result.choices;
 	}
 
 	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
