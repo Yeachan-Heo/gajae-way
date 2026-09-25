@@ -487,6 +487,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusTerminalHolds: number;
 	/** Status rechecks scheduled for a turn whose end no relay will announce (backoff ordinal). */
 	statusRechecks: number;
+	/** A stalled retired hold already attempted its one allowed host termination. */
+	retiredHostTerminationAttempted?: boolean;
 	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
 	staleOutput?: { count: number; firstAt: number; lastAt: number };
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
@@ -2096,7 +2098,7 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled");
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
 			return;
 		}
 		if (this.#current === bound) {
@@ -2123,7 +2125,7 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded");
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded", bound);
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
@@ -2240,9 +2242,11 @@ class OriginActor {
 	async #terminateRetiredSession(sessionId: string, reason: string, except?: BoundTurn): Promise<void> {
 		const port = this.#manager.port;
 		if (!port.terminateHost) return;
+		if (except?.retiredHostTerminationAttempted) return;
 		if (this.#current?.sessionId === sessionId) return;
 		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
 		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
+		if (except) except.retiredHostTerminationAttempted = true;
 		try {
 			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 			this.#manager.log(

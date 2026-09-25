@@ -928,7 +928,7 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 	expect(terminal).toEqual([]);
 });
 
-test("a retired stalled turn closes its tail and summarizes discarded frames", async () => {
+test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,
 		onSend: (input, scripted) => {
@@ -1004,6 +1004,17 @@ test("a retired stalled turn closes its tail and summarizes discarded frames", a
 	expect(staleLogs).toHaveLength(2);
 	expect(staleLogs[0]).toContain("action=start");
 	expect(staleLogs[1]).toMatch(/action=stop count=3 first=\S+ last=\S+ reason=stall/);
+	expect(
+		logs.filter((line) => line.startsWith("retired_session_host ") && line.includes(`session=${send.sessionId}`)),
+	).toHaveLength(1);
+	const retiredHostLogIndex = logs.findIndex(
+		(line) => line.startsWith("retired_session_host ") && line.includes(`session=${send.sessionId}`),
+	);
+	const retiredHoldLogIndex = logs.findIndex(
+		(line) => line.includes(`retired_hold originKey=${KEY}`) && line.includes("reason=stall"),
+	);
+	expect(retiredHostLogIndex).toBeLessThan(retiredHoldLogIndex);
+	expect(logs.slice(retiredHoldLogIndex + 1).some((line) => line.includes(`session=${send.sessionId}`))).toBe(false);
 	expect(terminal).toEqual(["replacement reply"]);
 });
 
