@@ -23,6 +23,7 @@ const MONITOR_UPDATE_FIELDS = new Set([
 	"model",
 	"serviceTier",
 	"enabled",
+	"procedureFiles",
 ]);
 /** Upper bound on a per-monitor authoring instruction, in characters. */
 export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
@@ -111,7 +112,13 @@ export class MonitorRegistry {
 			const instruction = Object.hasOwn(patch, "instruction")
 				? patch.instruction?.trim() || undefined
 				: current.instruction;
-			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction };
+			if (patch.procedureFiles !== undefined) validateProcedureFiles(patch.procedureFiles);
+			const procedureFiles = Object.hasOwn(patch, "procedureFiles")
+				? patch.procedureFiles?.length
+					? patch.procedureFiles.map((file) => file.trim())
+					: undefined
+				: current.procedureFiles;
+			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
 			const persisted = this.#database.monitorUpdate({
@@ -125,6 +132,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: updated.model ? JSON.stringify(updated.model) : null,
 				serviceTier: updated.serviceTier ?? null,
+				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
 			return persisted ? updated : undefined;
 		});

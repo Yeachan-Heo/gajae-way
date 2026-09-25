@@ -2685,11 +2685,12 @@ export class GatewayDatabase {
 		instruction: string | null;
 		modelJson: string | null;
 		serviceTier: string | null;
+		procedureFilesJson: string | null;
 	}): boolean {
 		return (
 			this.#database
 				.query(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ? WHERE monitor_id = ?",
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ? WHERE monitor_id = ?",
 				)
 				.run(
 					row.name,
@@ -2701,6 +2702,7 @@ export class GatewayDatabase {
 					row.instruction,
 					row.modelJson,
 					row.serviceTier,
+					row.procedureFilesJson,
 					row.id,
 				).changes > 0
 		);

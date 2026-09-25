@@ -125,6 +125,16 @@ test("procedure files are confined to the workspace and report their state inste
 		expect(() => registry.add({ ...base, procedureFiles: ["/etc/passwd"] })).toThrow("relative paths");
 		expect(() => registry.add({ ...base, procedureFiles: ["../gateway.db"] })).toThrow("relative paths");
 		expect(() => registry.add({ ...base, procedureFiles: "ops.md" as never })).toThrow("list of relative paths");
+
+		expect(() => registry.update({ monitorId: monitor.monitorId, procedureFiles: ["../gateway.db"] })).toThrow(
+			"relative paths",
+		);
+		registry.update({ monitorId: monitor.monitorId, procedureFiles: [" big.md "] });
+		expect(registry.get(monitor.monitorId)?.procedureFiles).toEqual(["big.md"]);
+		registry.update({ monitorId: monitor.monitorId, name: "renamed" });
+		expect(registry.get(monitor.monitorId)?.procedureFiles).toEqual(["big.md"]);
+		registry.update({ monitorId: monitor.monitorId, procedureFiles: [] });
+		expect(registry.get(monitor.monitorId)?.procedureFiles).toBeUndefined();
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
