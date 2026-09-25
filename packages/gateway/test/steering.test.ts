@@ -347,6 +347,69 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 	expect(port.binds).toHaveLength(1);
 });
 
+// Live 2026-09-25: after a broker restart, held steers on finished turns retried
+// every sweep for an hour with `host hello did not arrive` - their session was gone.
+test("a held steer on a finished turn whose session is gone is closed with that turn, never re-sent or held forever", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	class DeadAfterTurnPort extends ScriptedSessionPort {
+		torn = true;
+		gone = false;
+		constructor() {
+			super({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+		}
+		async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
+			if (this.torn) throw new GjcCliError("gjc sdk turn.steer exited 1", 1, "host hello did not arrive");
+			await super.steer(input);
+		}
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			if (this.gone) return { live: false, disowned: false };
+			return await super.liveness(input);
+		}
+	}
+	const port = new DeadAfterTurnPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
+	const logs: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		log: (line) => {
+			logs.push(line);
+		},
+	});
+	enqueue("trigger", "first");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial send missing");
+	const opRef = port.sends[0]!.opRef;
+	enqueue("maybe-landed", "second");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => logs.some((line) => line.startsWith("steer_hold")), "torn steer was not held");
+	port.complete(opRef, "answer one");
+	await eventually(() => database?.inboundTurnRow(opRef)?.turn_state === "done", "old turn did not complete");
+	expect(database.inboundSteersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
+
+	// A broker restart takes the session away; the replay can never be answered.
+	port.gone = true;
+	await manager.tick(ORIGIN_KEY);
+	await eventually(
+		() => logs.some((line) => line.startsWith("steer_abandoned") && line.includes("message=maybe-landed")),
+		"held steer on a dead session was not closed",
+	);
+	expect(database.inboundSteersHeld(opRef)).toEqual([]);
+	expect(database.inboundTurnRows(opRef).find((row) => row.message_id === "maybe-landed")).toMatchObject({
+		state: "done",
+		turn_state: "done",
+	});
+	// Never re-dispatched: the model may already have answered it.
+	expect(port.sends).toHaveLength(1);
+	const holds = logs.filter((line) => line.startsWith("steer_hold")).length;
+	await manager.tick(ORIGIN_KEY);
+	expect(logs.filter((line) => line.startsWith("steer_hold")).length).toBe(holds);
+});
+
 for (const outcome of ["accepted", "refused"] as const) {
 	test(`recovery alone resolves a terminal turn's only held steer as ${outcome} on the original clientRef`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-held-only-recovery-"));
