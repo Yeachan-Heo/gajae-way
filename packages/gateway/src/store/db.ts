@@ -2515,6 +2515,37 @@ export class GatewayDatabase {
 			service_tier: string | null;
 		}>;
 	}
+	monitorUpdate(row: {
+		id: string;
+		name: string;
+		triggerJson: string;
+		eventTypesJson: string;
+		burstPolicy: string;
+		channelTargetJson: string | null;
+		enabled: boolean;
+		instruction: string | null;
+		modelJson: string | null;
+		serviceTier: string | null;
+	}): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ? WHERE monitor_id = ?",
+				)
+				.run(
+					row.name,
+					row.triggerJson,
+					row.eventTypesJson,
+					row.burstPolicy,
+					row.channelTargetJson,
+					row.enabled ? 1 : 0,
+					row.instruction,
+					row.modelJson,
+					row.serviceTier,
+					row.id,
+				).changes > 0
+		);
+	}
 	monitorDelete(id: string): boolean {
 		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
 	}

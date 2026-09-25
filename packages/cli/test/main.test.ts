@@ -278,6 +278,81 @@ describe("list flag validation", () => {
 		});
 });
 
+describe("monitor update", () => {
+	async function run(commands: string[][]) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const lines: string[] = [];
+		const errors: string[] = [];
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+			requests.push({ verb, params });
+			return { monitorId: "monitor-42" } as T;
+		};
+		client.close = async () => {};
+		const connect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(client);
+		const log = spyOn(console, "log").mockImplementation((line) => {
+			lines.push(String(line));
+		});
+		const error = spyOn(console, "error").mockImplementation((line) => {
+			errors.push(String(line));
+		});
+		const previousExit = process.exitCode;
+		try {
+			for (const args of commands) await main(["--socket", "/test/monitor-update.sock", "monitors", "update", ...args]);
+			return { requests, lines, errors, connections: connect.mock.calls.length, exitCode: process.exitCode };
+		} finally {
+			connect.mockRestore();
+			log.mockRestore();
+			error.mockRestore();
+			process.exitCode = previousExit;
+		}
+	}
+
+	test("sends schedule, enabled, combined shorthand, and partial JSON updates flat", async () => {
+		const result = await run([
+			["monitor-42", "--schedule", "30 8 * * 1-5"],
+			["monitor-42", "--enabled", "false"],
+			["monitor-42", "--enabled", "true", "--schedule", "0 9 * * *"],
+			["monitor-42", "--json", '{"enabled":true,"instruction":"Review the queue."}'],
+		]);
+		expect(result.requests).toEqual([
+			{ verb: "monitor.update", params: { monitorId: "monitor-42", schedule: "30 8 * * 1-5" } },
+			{ verb: "monitor.update", params: { monitorId: "monitor-42", enabled: false } },
+			{
+				verb: "monitor.update",
+				params: { monitorId: "monitor-42", schedule: "0 9 * * *", enabled: true },
+			},
+			{
+				verb: "monitor.update",
+				params: { monitorId: "monitor-42", enabled: true, instruction: "Review the queue." },
+			},
+		]);
+		expect(result.lines).toEqual(Array(4).fill('{"monitorId":"monitor-42"}'));
+		expect(result.errors).toEqual([]);
+		expect(result.connections).toBe(4);
+	});
+
+	const invalidCases: Array<[string, string[]]> = [
+		["missing id", ["--enabled", "true"]],
+		["missing patch", ["monitor-42"]],
+		["unknown option", ["monitor-42", "--verbose"]],
+		["missing schedule value", ["monitor-42", "--schedule"]],
+		["missing enabled value", ["monitor-42", "--enabled"]],
+		["invalid enabled value", ["monitor-42", "--enabled", "yes"]],
+		["conflicting JSON and shorthand", ["monitor-42", "--json", "{}", "--schedule", "0 9 * * *"]],
+		["repeated shorthand", ["monitor-42", "--enabled", "true", "--enabled", "false"]],
+		["unexpected positional argument", ["monitor-42", "--enabled", "true", "extra"]],
+	];
+	for (const [name, args] of invalidCases)
+		test(`rejects ${name} with usage before connecting`, async () => {
+			const result = await run([args]);
+			expect(result.requests).toEqual([]);
+			expect(result.errors).toHaveLength(1);
+			expect(result.errors[0]).toContain("usage: gajaeway monitors update <id>");
+			expect(result.connections).toBe(0);
+		});
+});
+
 /** A real, well-formed SQLite file with one marker row. */
 function writeSqlite(path: string, marker: string): void {
 	const database = new Database(path);

@@ -1020,6 +1020,22 @@ async function handleRequest(
 			}
 			return;
 		}
+		case "monitor.update": {
+			try {
+				const monitor = runtime.registry.update(request.params as never);
+				if (!monitor) throw new Error("unknown monitorId");
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { monitorId: monitor.monitorId },
+				});
+				void runtime.monitorRuntime.refresh();
+			} catch (error) {
+				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid monitor update");
+			}
+			return;
+		}
 		case "monitor.list":
 			connection.write({
 				v: PROFILE_VERSION,

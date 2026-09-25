@@ -2,6 +2,7 @@ import {
 	eventTypeOrigin,
 	type MonitorRecord,
 	type MonitorSpec,
+	type MonitorUpdateParams,
 	OriginRefError,
 	type TriggerSpec,
 	validateOriginRef,
@@ -10,6 +11,17 @@ import type { GatewayDatabase } from "../store/db";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
 const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
+const MONITOR_UPDATE_FIELDS = new Set([
+	"name",
+	"trigger",
+	"eventTypes",
+	"burstPolicy",
+	"channelTarget",
+	"instruction",
+	"model",
+	"serviceTier",
+	"enabled",
+]);
 /** Upper bound on a per-monitor authoring instruction, in characters. */
 export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
 
@@ -60,6 +72,57 @@ export class MonitorRegistry {
 	}
 	get(monitorId: string): MonitorRecord | undefined {
 		return this.list().find((monitor) => monitor.monitorId === monitorId);
+	}
+	update(params: MonitorUpdateParams): MonitorRecord | undefined {
+		if (!params || typeof params !== "object" || typeof params.monitorId !== "string" || !params.monitorId)
+			throw new Error("monitorId is required");
+		const { monitorId, schedule, ...patch } = params;
+		for (const field of Object.keys(patch))
+			if (!MONITOR_UPDATE_FIELDS.has(field)) throw new Error(`unknown monitor update field: ${field}`);
+		if (schedule !== undefined && typeof schedule !== "string") throw new Error("monitor schedule must be a string");
+		if (schedule !== undefined && patch.trigger !== undefined)
+			throw new Error("use either schedule or trigger when updating a monitor");
+		if (schedule === undefined && Object.keys(patch).length === 0) throw new Error("monitor update requires a change");
+
+		return this.#database.withTransaction(() => {
+			const current = this.get(monitorId);
+			if (!current) return undefined;
+			let trigger = current.trigger;
+			if (patch.trigger !== undefined) {
+				if (!patch.trigger || typeof patch.trigger !== "object") throw new Error("invalid monitor trigger");
+				trigger =
+					patch.trigger.kind === "webhook"
+						? {
+								...patch.trigger,
+								route: current.trigger.kind === "webhook" ? current.trigger.route : crypto.randomUUID(),
+							}
+						: patch.trigger;
+			}
+			if (schedule !== undefined) {
+				if (current.trigger.kind !== "cron") throw new Error("only cron monitors have a schedule");
+				if (!schedule.trim()) throw new Error("monitor schedule is required");
+				trigger = { ...current.trigger, schedule };
+			}
+			const instruction = Object.hasOwn(patch, "instruction")
+				? patch.instruction?.trim() || undefined
+				: current.instruction;
+			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction };
+			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
+			validateSpec(updated);
+			const persisted = this.#database.monitorUpdate({
+				id: current.monitorId,
+				name: updated.name,
+				triggerJson: JSON.stringify(updated.trigger),
+				eventTypesJson: JSON.stringify(updated.eventTypes),
+				burstPolicy: updated.burstPolicy,
+				channelTargetJson: updated.channelTarget ? JSON.stringify(updated.channelTarget) : null,
+				enabled: updated.enabled,
+				instruction: instruction ?? null,
+				modelJson: updated.model ? JSON.stringify(updated.model) : null,
+				serviceTier: updated.serviceTier ?? null,
+			});
+			return persisted ? updated : undefined;
+		});
 	}
 	remove(monitorId: string): boolean {
 		return this.#database.withTransaction(() => this.#database.monitorDelete(monitorId));
