@@ -1,9 +1,16 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { expandHome, SourceTree } from "./migrate/source-fs";
 import { detectHermes, readHermes } from "./migrate/hermes";
 import { detectOpenClaw, readOpenClaw } from "./migrate/openclaw";
-import { emptyChannelPlan, emitChannels, emitMonitors, emitImportedAxis, type MigrationSource } from "./migrate/plan";
+import {
+	emitChannels,
+	emitImportedAxis,
+	emitMonitors,
+	emptyChannelPlan,
+	type MigrationSource,
+	type SourceExtract,
+} from "./migrate/plan";
+import { expandHome, SourceTree } from "./migrate/source-fs";
 
 export interface MigrateOptions {
 	source?: string;
@@ -27,8 +34,7 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 		sourceType = "openclaw";
 	} else {
 		throw new Error(
-			`No Hermes or OpenClaw configuration detected at ${sourceRoot}. ` +
-				"Expected .hermes.config.json or config.json",
+			`No Hermes or OpenClaw configuration detected at ${sourceRoot}. Expected .hermes.config.json or config.json`,
 		);
 	}
 
@@ -38,7 +44,7 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 	const tree = new SourceTree(sourceRoot);
 
 	// Read source configuration
-	let extract;
+	let extract: SourceExtract;
 	if (sourceType === "hermes") {
 		extract = await readHermes(tree, targetHome);
 	} else {
@@ -58,7 +64,10 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 			if (!byCategory.has(entry.category)) {
 				byCategory.set(entry.category, []);
 			}
-			byCategory.get(entry.category)!.push(entry);
+			const cat = byCategory.get(entry.category);
+			if (cat) {
+				cat.push(entry);
+			}
 		}
 
 		for (const [category, entries] of byCategory) {

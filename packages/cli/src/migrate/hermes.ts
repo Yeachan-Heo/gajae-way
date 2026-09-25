@@ -13,7 +13,16 @@ import {
 	intervalCron,
 	type SourceExtract,
 } from "./plan";
-import { entries, isDirectory, isRecord, parseDotenv, regularFile, type SourceTree, stringList, walkFiles } from "./source-fs";
+import {
+	entries,
+	isDirectory,
+	isRecord,
+	parseDotenv,
+	regularFile,
+	type SourceTree,
+	stringList,
+	walkFiles,
+} from "./source-fs";
 
 /**
  * Hermes Agent (NousResearch/hermes-agent) keeps everything under one home,
@@ -63,7 +72,13 @@ export async function readHermes(tree: SourceTree, home: string): Promise<Source
 		if (text === undefined) continue;
 		const info = await regularFile(path);
 		extract.inventory.persona.push(tree.rel(path));
-		extract.files.push({ category: "persona", sources: [tree.rel(path)], target: `workspace/${name}`, content: text, mtime: info?.mtime });
+		extract.files.push({
+			category: "persona",
+			sources: [tree.rel(path)],
+			target: `workspace/${name}`,
+			content: text,
+			mtime: info?.mtime,
+		});
 	}
 
 	const memoryDir = join(root, "memories");
@@ -107,7 +122,9 @@ export async function readHermes(tree: SourceTree, home: string): Promise<Source
 			const parsed = Bun.YAML.parse(configText);
 			if (isRecord(parsed)) config = parsed;
 		} catch (error) {
-			extract.warnings.push(`config.yaml could not be parsed (${error instanceof Error ? error.message : String(error)}); channel policies were not read`);
+			extract.warnings.push(
+				`config.yaml could not be parsed (${error instanceof Error ? error.message : String(error)}); channel policies were not read`,
+			);
 		}
 	}
 	const consumedConfig = new Set<string>();
@@ -122,7 +139,8 @@ export async function readHermes(tree: SourceTree, home: string): Promise<Source
 			extract.unmapped.push({
 				category: "credentials",
 				source: `.env ${key}`,
-				reason: "holds several comma-separated tokens (multi-workspace); gajae-way runs one bot per adapter, so none was imported",
+				reason:
+					"holds several comma-separated tokens (multi-workspace); gajae-way runs one bot per adapter, so none was imported",
 			});
 			continue;
 		}
@@ -153,7 +171,11 @@ export async function readHermes(tree: SourceTree, home: string): Promise<Source
 			});
 	for (const key of Object.keys(config))
 		if (!consumedConfig.has(key))
-			extract.unmapped.push({ category: "other", source: `config.yaml ${key}`, reason: "setting has no gajae-way equivalent" });
+			extract.unmapped.push({
+				category: "other",
+				source: `config.yaml ${key}`,
+				reason: "setting has no gajae-way equivalent",
+			});
 	return extract;
 }
 
@@ -180,7 +202,11 @@ function readHermesChannelPolicy(
 		const free = stringList(discord.free_response_channels);
 		for (const id of free) {
 			if (id === "*") {
-				extract.unmapped.push({ category: "channels", source: "config.yaml discord.free_response_channels", reason: '"*" (every channel) has no per-channel equivalent; list channels explicitly' });
+				extract.unmapped.push({
+					category: "channels",
+					source: "config.yaml discord.free_response_channels",
+					reason: '"*" (every channel) has no per-channel equivalent; list channels explicitly',
+				});
 				continue;
 			}
 			channels.channels[`discord:${id}`] = { engagement: "open" };
@@ -188,7 +214,11 @@ function readHermesChannelPolicy(
 		}
 		for (const key of Object.keys(discord))
 			if (key !== "free_response_channels" && key !== "require_mention")
-				extract.unmapped.push({ category: "channels", source: `config.yaml discord.${key}`, reason: "Discord adapter setting has no gajae-way equivalent" });
+				extract.unmapped.push({
+					category: "channels",
+					source: `config.yaml discord.${key}`,
+					reason: "Discord adapter setting has no gajae-way equivalent",
+				});
 	}
 	const slackChannels = env.get("SLACK_ALLOWED_CHANNELS");
 	if (slackChannels !== undefined) {
@@ -203,18 +233,29 @@ function readHermesChannelPolicy(
 		const engagement = telegram?.require_mention === true ? "mention-open" : "open";
 		for (const id of stringList(telegramGroups)) channels.channels[`telegram:${id}`] = { engagement };
 	}
-	for (const key of ["DISCORD_ALLOW_ALL_USERS", "TELEGRAM_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS"]) {
+	for (const key of [
+		"DISCORD_ALLOW_ALL_USERS",
+		"TELEGRAM_ALLOW_ALL_USERS",
+		"SLACK_ALLOW_ALL_USERS",
+		"GATEWAY_ALLOW_ALL_USERS",
+	]) {
 		if (!env.has(key)) continue;
 		consumedEnv.add(key);
 		extract.unmapped.push({
 			category: "channels",
 			source: `.env ${key}`,
-			reason: "allow-everyone is not carried over; gajae-way DMs default to the allowlist. Set dmPolicy \"open\" in config.json deliberately if wanted",
+			reason:
+				'allow-everyone is not carried over; gajae-way DMs default to the allowlist. Set dmPolicy "open" in config.json deliberately if wanted',
 		});
 	}
 }
 
-async function readHermesCron(tree: SourceTree, env: Map<string, string>, consumedEnv: Set<string>, extract: SourceExtract): Promise<void> {
+async function readHermesCron(
+	tree: SourceTree,
+	env: Map<string, string>,
+	consumedEnv: Set<string>,
+	extract: SourceExtract,
+): Promise<void> {
 	const path = join(tree.root, "cron", "jobs.json");
 	const text = await tree.text(path);
 	if (text === undefined) return;
@@ -233,18 +274,28 @@ async function readHermesCron(tree: SourceTree, env: Map<string, string>, consum
 		const source = `${tree.rel(path)} ${JSON.stringify(label)}`;
 		extract.inventory.schedules.push(source);
 		const skip = (reason: string) => extract.unmapped.push({ category: "monitors", source, reason });
-		if (job.no_agent === true || (typeof job.script === "string" && job.script))
-			{ skip("script job: gajae-way script monitors run a command under scriptRoot, recreate it with a script trigger"); continue; }
-		if (typeof job.monitor_script === "string" || typeof job.monitor_url === "string")
-			{ skip("change-detection pre-check (monitor_script/monitor_url) has no equivalent"); continue; }
+		if (job.no_agent === true || (typeof job.script === "string" && job.script)) {
+			skip("script job: gajae-way script monitors run a command under scriptRoot, recreate it with a script trigger");
+			continue;
+		}
+		if (typeof job.monitor_script === "string" || typeof job.monitor_url === "string") {
+			skip("change-detection pre-check (monitor_script/monitor_url) has no equivalent");
+			continue;
+		}
 		const schedule = isRecord(job.schedule) ? job.schedule : {};
 		let cron: string | undefined;
 		if (schedule.kind === "cron" && typeof schedule.expr === "string") {
 			cron = gatewayCron(schedule.expr);
-			if (!cron) { skip(`cron expression ${JSON.stringify(schedule.expr)} uses syntax the gateway cron trigger does not evaluate`); continue; }
+			if (!cron) {
+				skip(`cron expression ${JSON.stringify(schedule.expr)} uses syntax the gateway cron trigger does not evaluate`);
+				continue;
+			}
 		} else if (schedule.kind === "interval" && typeof schedule.minutes === "number") {
 			cron = intervalCron(schedule.minutes);
-			if (!cron) { skip(`every ${schedule.minutes}m does not divide an hour or a day, so it has no cron form`); continue; }
+			if (!cron) {
+				skip(`every ${schedule.minutes}m does not divide an hour or a day, so it has no cron form`);
+				continue;
+			}
 		} else {
 			skip(`schedule kind ${JSON.stringify(schedule.kind)} (one-shot) has no recurring monitor equivalent`);
 			continue;
@@ -284,9 +335,10 @@ function hermesTarget(
 		let result: OriginRef | string;
 		if (target === "origin" || target === "origin_fallback") {
 			const origin = isRecord(job.origin) ? job.origin : undefined;
-			result = origin && typeof origin.platform === "string" && origin.chat_id !== undefined
-				? deliveryOrigin(origin.platform, String(origin.chat_id))
-				: "origin delivery recorded no origin chat";
+			result =
+				origin && typeof origin.platform === "string" && origin.chat_id !== undefined
+					? deliveryOrigin(origin.platform, String(origin.chat_id))
+					: "origin delivery recorded no origin chat";
 		} else {
 			const [platform = "", ...rest] = target.split(":");
 			let chat = rest.join(":");
@@ -295,9 +347,12 @@ function hermesTarget(
 				consumedEnv.add(HOME_CHANNEL_KEYS[platform] as string);
 				consumedEnv.add(`${HOME_CHANNEL_KEYS[platform]}_NAME`);
 			}
-			result = chat ? deliveryOrigin(platform, chat) : `delivery target ${JSON.stringify(target)} has no chat id or home channel`;
+			result = chat
+				? deliveryOrigin(platform, chat)
+				: `delivery target ${JSON.stringify(target)} has no chat id or home channel`;
 		}
-		if (typeof result === "string") extract.warnings.push(`${source}: ${result}; delivered to the owner target instead`);
+		if (typeof result === "string")
+			extract.warnings.push(`${source}: ${result}; delivered to the owner target instead`);
 		else resolved.push(result);
 	}
 	if (resolved.length > 1)
@@ -317,14 +372,17 @@ async function readHermesSkills(tree: SourceTree, extract: SourceExtract): Promi
 			.filter(Boolean),
 	);
 	const files = (await walkFiles(skillsDir)).filter((file) => !file.split("/").some((part) => part.startsWith(".")));
-	const skillRoots = files.filter((file) => file.endsWith("/SKILL.md") || file === "SKILL.md").map((file) => file.slice(0, -"/SKILL.md".length));
+	const skillRoots = files
+		.filter((file) => file.endsWith("/SKILL.md") || file === "SKILL.md")
+		.map((file) => file.slice(0, -"/SKILL.md".length));
 	const seen = new Set<string>();
 	for (const skillRoot of skillRoots) {
 		const name = skillRoot.split("/").at(-1) ?? skillRoot;
 		if (bundled.has(name)) continue;
 		await copySkill(tree, join(skillsDir, skillRoot), name, extract, seen);
 	}
-	if (bundled.size) extract.warnings.push(`${bundled.size} Hermes-bundled skill(s) skipped; they ship with Hermes, not with your data`);
+	if (bundled.size)
+		extract.warnings.push(`${bundled.size} Hermes-bundled skill(s) skipped; they ship with Hermes, not with your data`);
 }
 
 export async function copySkill(
@@ -337,7 +395,11 @@ export async function copySkill(
 	const source = tree.rel(dir);
 	extract.inventory.skills.push(source);
 	if (name === "self-ops" || seen.has(name)) {
-		extract.unmapped.push({ category: "skills", source, reason: `a skill named ${name} is already imported or built in` });
+		extract.unmapped.push({
+			category: "skills",
+			source,
+			reason: `a skill named ${name} is already imported or built in`,
+		});
 		return;
 	}
 	seen.add(name);
@@ -356,7 +418,12 @@ export async function copySkill(
 }
 
 /** Top-level entries no reader consumed, reported so nothing is dropped silently. */
-export async function reportLeftovers(tree: SourceTree, dir: string, extract: SourceExtract, reason: (name: string) => string): Promise<void> {
+export async function reportLeftovers(
+	tree: SourceTree,
+	dir: string,
+	extract: SourceExtract,
+	reason: (name: string) => string,
+): Promise<void> {
 	for (const name of await entries(dir)) {
 		const path = join(dir, name);
 		if (tree.isFullyConsumed(path)) continue;

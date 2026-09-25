@@ -101,7 +101,8 @@ export function parseDotenv(text: string): Map<string, string> {
 		if (!match) continue;
 		let value = match[2] ?? "";
 		const quote = value[0];
-		if ((quote === '"' || quote === "'") && value.lastIndexOf(quote) > 0) value = value.slice(1, value.lastIndexOf(quote));
+		if ((quote === '"' || quote === "'") && value.lastIndexOf(quote) > 0)
+			value = value.slice(1, value.lastIndexOf(quote));
 		else value = value.replace(/\s+#.*$/, "").trim();
 		values.set(match[1] as string, value);
 	}

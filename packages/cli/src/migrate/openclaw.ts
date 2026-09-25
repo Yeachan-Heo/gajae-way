@@ -1,15 +1,15 @@
 import { join } from "node:path";
 import type { MonitorSpec, OriginRef } from "@gajae-gateway/protocol";
 import {
+	type ChannelPlan,
+	cronMonitor,
+	deliveryOrigin,
 	emptyChannelPlan,
 	emptyExtract,
-	type SourceExtract,
-	slug,
-	deliveryOrigin,
-	cronMonitor,
 	intervalCron,
 	MONITOR_INSTRUCTION_MAX,
-	type ChannelPlan,
+	type SourceExtract,
+	slug,
 } from "./plan";
 import { isDirectory, isRecord, parseDotenv, regularFile, type SourceTree, stringList, walkFiles } from "./source-fs";
 
@@ -33,7 +33,7 @@ interface OpenClawConfig {
 	monitors?: Record<string, unknown>;
 }
 
-export async function readOpenClaw(tree: SourceTree, home: string): Promise<SourceExtract> {
+export async function readOpenClaw(tree: SourceTree, _home: string): Promise<SourceExtract> {
 	const extract = emptyExtract("openclaw", tree.root);
 	const configPath = join(tree.root, OPENCLAW_CONFIG);
 	const envPath = join(tree.root, ".env");
@@ -54,7 +54,9 @@ export async function readOpenClaw(tree: SourceTree, home: string): Promise<Sour
 	const envText = await tree.text(envPath);
 	if (envText) {
 		const parsed = parseDotenv(envText);
-		parsed.forEach((val, key) => env.set(key, val));
+		for (const [key, val] of parsed.entries()) {
+			env.set(key, val);
+		}
 	}
 
 	// Establish consumed sets for tracking unmapped entries
@@ -74,7 +76,7 @@ export async function readOpenClaw(tree: SourceTree, home: string): Promise<Sour
 	// Extract channel policies and credentials
 	const channels: ChannelPlan = emptyChannelPlan();
 	if (isRecord(config.channels)) {
-		readOpenClawChannels(config.channels, env, channels, consumedConfig, consumedEnv, extract);
+		readOpenClawChannels(config.channels, env, channels, consumedConfig, consumedEnv);
 	}
 
 	// Extract monitors
@@ -138,7 +140,6 @@ function readOpenClawChannels(
 	channels: ChannelPlan,
 	consumedConfig: Set<string>,
 	consumedEnv: Set<string>,
-	extract: SourceExtract,
 ): void {
 	for (const [platform, platformConfig] of Object.entries(config)) {
 		if (!isRecord(platformConfig)) continue;
@@ -177,7 +178,9 @@ function readOpenClawChannels(
 			const allowlist = env.get(allowlistKey);
 			if (allowlist) {
 				consumedEnv.add(allowlistKey);
-				stringList(allowlist).forEach((user) => channels.allowlist.add(`${platform}:${user}`));
+				for (const user of stringList(allowlist)) {
+					channels.allowlist.add(`${platform}:${user}`);
+				}
 			}
 		}
 	}
@@ -250,7 +253,7 @@ async function readOpenClawSkills(
 
 async function readOpenClawMemory(
 	tree: SourceTree,
-	memoryConfig: Record<string, unknown>,
+	_memoryConfig: Record<string, unknown>,
 	extract: SourceExtract,
 ): Promise<void> {
 	const memoryDir = join(tree.root, "memory");
