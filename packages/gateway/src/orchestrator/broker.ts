@@ -21,9 +21,24 @@ export {
 	readBrokerDiscovery,
 } from "./broker-liveness";
 
-export const MIN_GJC_VERSION = "0.15.6";
+export const MIN_GJC_VERSION = "0.16.0";
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
+// GJC's authoritative shared session flags are in packages/coding-agent/src/commands/sdk.ts;
+// value-taking options here keep literal --json payloads from becoming output flags.
+const SESSION_VALUE_OPTIONS = new Set([
+	"--cursor",
+	"--idempotency-key",
+	"--json-input",
+	"--op",
+	"--op-ref",
+	"--prompt",
+	"--query",
+	"--repo",
+	"--scope",
+	"--text",
+	"--timeout-ms",
+]);
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
 export type BrokerGenerationListener = (generation: number) => void;
@@ -649,9 +664,29 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 	// `gjc sdk serve` has no --agent-dir flag (exit 2 + usage on gjc 0.16.6):
 	// the relay takes its agent dir from the exported GJC_*_AGENT_DIR env.
 	if (bound[1] === "serve") return bound;
-	// Every `sdk session` leaf owns its own --agent-dir option; gjc 0.17.4
-	// rejects it at the family level (`sdk session --agent-dir <dir> list`,
-	// exit 2 usage). The leaf-level spelling parses on 0.17.2 and 0.17.4.
+	if (bound[1] === "session") {
+		// gjc 0.17.6 requires --json for machine-readable session errors.
+		// Skip option payloads so a literal --json value is not an output flag.
+		let jsonFlags = 0;
+		for (let i = 2; i < bound.length; i++) {
+			const arg = bound[i]!;
+			if (arg === "--") throw new Error("Global GJC client rejects session option delimiters");
+			if (SESSION_VALUE_OPTIONS.has(arg)) {
+				if (bound[i + 1] === undefined) throw new Error(`Global GJC client requires a value after ${arg}`);
+				i++;
+			} else if (arg === "--json") {
+				if (++jsonFlags > 1) throw new Error("Global GJC client rejects duplicate --json flags");
+			} else if (arg.startsWith("--json=")) {
+				throw new Error("Global GJC client rejects --json values");
+			}
+		}
+		if (jsonFlags === 0) bound.push("--json");
+		// Every `sdk session` leaf owns its own --agent-dir option; gjc 0.17.4
+		// rejects it at the family level (`sdk session --agent-dir <dir> list`,
+		// exit 2 usage). Keep this leaf-level binding last.
+		bound.push("--agent-dir", agentDir);
+		return bound;
+	}
 	bound.push("--agent-dir", agentDir);
 	return bound;
 }

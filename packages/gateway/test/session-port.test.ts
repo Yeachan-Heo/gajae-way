@@ -262,6 +262,128 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
 });
 
+test("broker SessionPort rebinds a saved binding on an explicit session_unavailable envelope", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-public-error-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const calls: string[][] = [];
+	const publicFailure = {
+		ok: false,
+		error: {
+			code: "session_unavailable",
+			message: "SDK session saved-1 is unavailable through the session Router.",
+		},
+	};
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		if (args.includes("inspect") && args.includes("saved-1"))
+			return { exitCode: 1, stdout: JSON.stringify(publicFailure), stderr: "" };
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-1" } }), stderr: "" };
+		if (args.includes("inspect") && args.includes("fresh-1"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "fresh-1", live: true } } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "public-session-gone",
+		epoch: 0,
+	});
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "public-error",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await expect(port.bind({ originKey: "public-session-gone", epoch: 0, repo })).resolves.toMatchObject({
+		sessionId: "fresh-1",
+		epoch: 1,
+	});
+	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
+});
+
+test("generic inspect errors preserve saved authority and do not trigger a replacement session", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-generic-error-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({
+				ok: false,
+				error: { code: "operation_failed", message: "The requested operation failed." },
+			}),
+			stderr: "",
+		};
+	};
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "generic-inspect-error",
+		epoch: 0,
+	});
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "generic-error",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await expect(port.bind({ originKey: "generic-inspect-error", epoch: 0, repo })).resolves.toMatchObject({
+		sessionId: "saved-1",
+		epoch: 0,
+	});
+	expect(calls).toHaveLength(1);
+	expect(database.getSessionRecord("generic-inspect-error")).toMatchObject({ sessionId: "saved-1", epoch: 0 });
+});
+
+test("structured nonzero session failures survive normalization at the global lifecycle route", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-envelope-error-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const publicFailure = {
+		ok: false,
+		error: {
+			code: "session_unavailable",
+			message: "SDK session saved-1 is unavailable through the session Router.",
+		},
+	};
+	const calls: string[][] = [];
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: async (args) => {
+			calls.push([...args]);
+			return { exitCode: 1, stdout: JSON.stringify(publicFailure), stderr: "" };
+		},
+		instanceId: "envelope-error",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "global-close-error",
+		epoch: 0,
+	});
+	await expect(port.close({ sessionId: "saved-1", repo })).rejects.toMatchObject({
+		name: "GjcCliError",
+		details: publicFailure.error,
+	});
+	expect(calls).toHaveLength(1);
+	expect(calls[0]).toEqual(expect.arrayContaining(["raw", "global", "--op", "session.close"]));
+});
+
 test("broker SessionPort resumes saved dead authority through the SDK control before returning the same binding", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
