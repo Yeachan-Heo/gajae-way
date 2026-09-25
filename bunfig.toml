@@ -1,0 +1,2 @@
+[test]
+preload = ["./packages/conformance/src/test-preload.ts"]

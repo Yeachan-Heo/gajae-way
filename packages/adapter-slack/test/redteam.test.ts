@@ -39,7 +39,7 @@ import { normalizeSlackText } from "../src/text";
 
 // The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
 // be able to reach a real operator home, whatever a fixture forgets to pass.
-process.env.GAJAEWAY_HOME = `/tmp/slack-test-home-${crypto.randomUUID()}`;
+process.env.GAJAEWAY_HOME = join(tmpdir(), `slack-test-home-${crypto.randomUUID()}`);
 
 const origin = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const engagement = { mentioned: false, group: true, authorId: "U1" };
@@ -139,7 +139,7 @@ async function fixture(
 	channels?: Record<string, { engagement: "open" }>,
 	options: { nested?: boolean; keepRecovery?: boolean; now?: () => number } = {},
 ) {
-	const home = await mkdtemp("/tmp/slack-recovery-");
+	const home = await mkdtemp(join(tmpdir(), "slack-recovery-"));
 	const cursorPath = options.nested ? join(home, "adapters/slack/recovery-cursor.json") : join(home, "cursor.json");
 	cleanups.push(() => rm(home, { recursive: true, force: true }));
 	const api = new Api();
