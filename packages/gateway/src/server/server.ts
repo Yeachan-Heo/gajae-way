@@ -588,7 +588,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {
 			const sweep = delivery.sweep();
-			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
@@ -712,7 +712,7 @@ async function handleFrame(
 			};
 			connection.write({ v: PROFILE_VERSION, type: "negotiated", payload: result.negotiated });
 			const sweep = runtime.delivery.sweep(Date.now(), true);
-			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 			return;
@@ -811,7 +811,7 @@ async function handleRequest(
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				if (failedRow?.state === "expired")
-					reportDeliveryExpired(runtime, failedRow, safeDiagnosticField(params.reason));
+					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason));
 			}
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
@@ -2244,6 +2244,7 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 
 function reportDeliveryExpired(
 	runtime: Runtime,
+	database: GatewayDatabase,
 	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
 	reason: string,
 ): void {
@@ -2252,6 +2253,12 @@ function reportDeliveryExpired(
 	const attempts = Number.isSafeInteger(expired.attempts) && expired.attempts >= 0 ? expired.attempts : 0;
 	console.error(
 		`delivery_expired deliveryId=${deliveryId} origin=${origin} attempts=${attempts} reason=${safeDiagnosticField(reason)}`,
+	);
+	// A monitor batch riding on this delivery can never be confirmed now: fail its
+	// events terminally with the delivery evidence instead of leaving them
+	// `authored` forever (#94).
+	database.withTransaction(() =>
+		database.monitorEventsFailExpiredDelivery(expired.deliveryId, safeDiagnosticField(reason)),
 	);
 	if (expired.deliveryId.startsWith("gw-x-")) return;
 	const ownerTarget = runtime.config.ownerTarget?.origin;

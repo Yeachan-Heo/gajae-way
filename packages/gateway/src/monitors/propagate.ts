@@ -392,6 +392,14 @@ export class MonitorPropagator {
 			// settlement (pre-atomic path) can leave confirmed deliveries with
 			// authored events. Repair them deterministically on startup.
 			for (const delivery of this.#database.deliveryRows()) {
+				// Events stranded `authored` behind a delivery that expired before #94
+				// settle terminally with evidence (no-op once none remain `authored`).
+				if (delivery.state === "expired") {
+					this.#database.withTransaction(() =>
+						this.#database.monitorEventsFailExpiredDelivery(delivery.delivery_id, "expired_before_settlement"),
+					);
+					continue;
+				}
 				if (delivery.state !== "confirmed") continue;
 				const batch = this.#database.monitorEventRows().filter((row) => row.batch_id === delivery.turn_id);
 				const needsRepair = batch.some((row) => row.stage === "authored");
@@ -408,7 +416,12 @@ export class MonitorPropagator {
 				const hasMemory = this.#database
 					.memoryIntentRows()
 					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
-				if (output && !hasMemory) this.#author(row.event_id, output, row.stage === "authored_no_delivery", row);
+				// A silent note is never delivered, so `authored` would wait forever for a
+				// confirmation that cannot come (#94): settle it as authored_no_delivery.
+				if (output && !hasMemory)
+					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilenceToken(output), row);
+				else if (output && row.stage === "authored" && isSilenceToken(output))
+					this.#database.withTransaction(() => this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery"));
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
 					// means the authoring turn may still complete elsewhere; a new
@@ -740,6 +753,13 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
+				} else {
+					// A silent batch creates no delivery, so nothing would ever confirm it:
+					// settle terminally instead of stranding it at `authored` (#94).
+					for (const row of fenced) {
+						if (this.#database.authoredOutput(row.event_id) === undefined) continue;
+						this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
+					}
 				}
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.

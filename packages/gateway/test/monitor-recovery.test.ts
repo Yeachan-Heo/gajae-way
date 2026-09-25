@@ -384,6 +384,52 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("delivered");
 	});
 
+	test("a silent note settles authored_no_delivery, never authored-forever (#94)", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async (_id, text) => JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "[SILENT]" }))),
+			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
+		);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && db.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		await propagator.drain();
+		expect(db.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(db.deliveryRows()).toHaveLength(0);
+	});
+
+	test("reconcile settles events already stranded at authored (#94)", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async () => {
+			throw new Error("stranded authored events must not be re-authored");
+		});
+		const silent = seedEvent(db, monitor.monitorId, "authored", crypto.randomUUID());
+		db.authoredOutputCreate(silent, "[SILENT]");
+		const expiredBatch = crypto.randomUUID();
+		const expired = seedEvent(db, monitor.monitorId, "authored", expiredBatch);
+		db.authoredOutputCreate(expired, "report");
+		const ledger = new DeliveryLedger(db);
+		ledger.createPending({ deliveryId: "old", turnId: expiredBatch, originKey: "loopback", payloadJson: "{}" });
+		for (let attempt = 0; attempt < 3; attempt++) ledger.fail("old");
+		ledger.expireStale(0, Date.now() + 1);
+		// Memory intents exist, as they do for any event that was authored live.
+		for (const eventId of [silent, expired])
+			db.memoryIntentCreate({ id: `monitor-event-intent:${eventId}`, kind: "monitor-event", payloadJson: eventId });
+		await propagator.reconcile();
+		expect(stage(db, silent)).toBe("authored_no_delivery");
+		expect(stage(db, expired)).toBe("failed_no_retry");
+		expect(db.monitorFailure(expired)).toMatchObject({
+			code: "delivery_expired",
+			detail: "delivery old expired after 3 attempts: expired_before_settlement",
+		});
+	});
+
 	test("no channel target and no owner target settles authored_no_delivery", async () => {
 		const {
 			propagator,
