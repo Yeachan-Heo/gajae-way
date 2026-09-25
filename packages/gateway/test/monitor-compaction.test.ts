@@ -76,6 +76,8 @@ async function harness(
 		 * turn never starts, so it is not recorded in `turns`.
 		 */
 		busy?: (sessionId: string) => boolean;
+		/** Propagator clock; reconcile reclaims a `failed` slot only after its retry backoff (#179). */
+		now?: () => number;
 	} = {},
 ) {
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
@@ -111,6 +113,7 @@ async function harness(
 		...(options.protocolFailureRollThreshold === undefined
 			? {}
 			: { protocolFailureRollThreshold: options.protocolFailureRollThreshold }),
+		...(options.now ? { now: options.now } : {}),
 	});
 	return { database, registry, pipeline, turns, sessionPort };
 }
@@ -811,10 +814,12 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		const compaction = stubPort("unavailable");
 		// The live shape: the epoch-0 session is wedged on a turn it never
 		// finishes and refuses every prompt with `busy`; a fresh session answers.
+		let clock = Date.now();
 		const { database, registry, pipeline, turns, sessionPort } = await harness(directory, {
 			contextFailureRollThreshold: 1,
 			compaction,
 			busy: (sessionId) => sessionId === "event-session-e0",
+			now: () => clock,
 		});
 		const monitor = registry.add({
 			name: "threads",
@@ -858,7 +863,9 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		// The stalled host is ended so it stops occupying the runtime.
 		await Bun.sleep(0);
 		expect(sessionPort.closes.map((entry) => entry.sessionId)).toEqual(["event-session-e0"]);
-		// The stranded slot is replayed into the live session too.
+		// The stranded slot is replayed into the live session too, once its
+		// retry backoff has elapsed (#179: the second retry waits 10 minutes).
+		clock += 10 * 60_000 + 1;
 		await pipeline.reconcile();
 		expect(database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
 			"authored_no_delivery",
