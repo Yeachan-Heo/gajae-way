@@ -1147,14 +1147,11 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
-		// Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors.
+		// Remove broker-authority objects before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
-		raw.exec(
-			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
-		);
 		for (const table of [
 			"broker_authority",
 			"broker_owned_bindings",

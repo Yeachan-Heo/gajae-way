@@ -231,6 +231,74 @@ describe("monitor rows", () => {
 		expect(row?.tone).toBe("ok");
 	});
 
+	test("an ordinary delivered event keeps its unchanged outcome", async () => {
+		const state = await snapshot({
+			"monitor.inspect": { monitor: MONITOR, recentEvents: [monitorEvent()] },
+		});
+		expect(state.monitors.rows[0]?.fields.outcome).toBe("✓ delivered");
+		expect(state.monitors.rows[0]?.tone).toBe("ok");
+	});
+
+	test("a recovered delivery reports eventual settlement and its latency as an impact proxy", async () => {
+		const latencyMs = 1_875;
+		const state = await snapshot({
+			"monitor.inspect": {
+				monitor: MONITOR,
+				recentEvents: [
+					monitorEvent({
+						recovery: {
+							protocolFailures: [
+								{
+									reason: "protocol_response_not_array",
+									failedAt: "2026-08-27T13:02:00.000Z",
+									responseByteLength: 12,
+									responseEntryCount: null,
+								},
+							],
+							firstFailedAt: "2026-08-27T13:02:00.000Z",
+							deliveredAt: "2026-08-27T13:02:01.875Z",
+							recoveryLatencyMs: latencyMs,
+							dispatchAttempts: 2,
+						},
+					}),
+				],
+			},
+		});
+		const outcome = state.monitors.rows[0]?.fields.outcome;
+		expect(outcome).toContain("eventually delivered after protocol failure");
+		expect(outcome).toContain(`recovery latency ${latencyMs}ms (impact proxy)`);
+		expect(outcome).not.toContain("no user impact");
+		expect(outcome).not.toContain("no impact");
+		expect(state.monitors.rows[0]?.tones?.outcome).toBe("warn");
+	});
+
+	test("a recovered delivery with invalid latency says it is unavailable", async () => {
+		const state = await snapshot({
+			"monitor.inspect": {
+				monitor: MONITOR,
+				recentEvents: [
+					monitorEvent({
+						recovery: {
+							protocolFailures: [
+								{
+									reason: "protocol_response_not_array",
+									failedAt: "2026-08-27T13:02:00.000Z",
+									responseByteLength: 12,
+									responseEntryCount: null,
+								},
+							],
+							firstFailedAt: "2026-08-27T13:02:00.000Z",
+							deliveredAt: "2026-08-27T13:02:01.875Z",
+							recoveryLatencyMs: Number.NaN,
+							dispatchAttempts: 2,
+						},
+					}),
+				],
+			},
+		});
+		expect(state.monitors.rows[0]?.fields.outcome).toContain("recovery latency unavailable");
+	});
+
 	test("a disabled monitor says it will not fire instead of showing a next time", async () => {
 		const state = await snapshot({
 			"monitor.list": { monitors: [{ ...MONITOR, enabled: false }] },

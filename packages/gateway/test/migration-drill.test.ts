@@ -5,15 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayDatabase } from "../src/store/db";
 
-/** Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors. */
+/** Remove broker-authority objects before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
 	for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 		for (const action of ["update", "delete"]) database.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 	for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
 		for (const action of ["update", "delete"]) database.exec(`DROP TRIGGER ${table}_immutable_${action}`);
-	database.exec(
-		"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
-	);
 	for (const table of [
 		"broker_authority",
 		"broker_owned_bindings",
@@ -48,6 +45,14 @@ test("migrates a migration-001 database to the latest schema", async () => {
 			expect(tables).toContain(table);
 		for (const table of ["lane_jobs", "monitor_failures", "monitor_slots", "dispatch_leases"])
 			expect(tables).toContain(table);
+		const monitorFailureColumns = new Set(
+			migrated
+				.query<{ name: string }, []>("PRAGMA table_info(monitor_failures)")
+				.all()
+				.map((column) => column.name),
+		);
+		for (const column of ["protocol_reason", "response_byte_length", "response_entry_count"])
+			expect(monitorFailureColumns.has(column)).toBe(true);
 		expect(
 			migrated.query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'instance_id'").get()?.value,
 		).toBeString();

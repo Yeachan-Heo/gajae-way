@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROTOCOL_FAILURE_REASONS } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
@@ -101,6 +102,15 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 	// Dispatched is the durable monitor stage for an accepted authoring turn.
 	const accepted = seedEvent(db, monitor.monitorId, "dispatched", "old-accepted-batch");
 	const failed = seedEvent(db, monitor.monitorId, "failed", "old-failed-batch");
+	const recovered = seedEvent(db, monitor.monitorId, "failed", "recovered-batch");
+	db.monitorFailureRecord(recovered, "authoring_response_invalid", "safe protocol failure", {
+		protocolFailure: {
+			reason: "protocol_unparseable_json",
+			responseByteLength: 12,
+			responseEntryCount: null,
+		},
+	});
+	db.monitorEventUpdate(recovered, "delivered");
 	db.cutoverBrokerAuthority({
 		expectedAuthority: null,
 		targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
@@ -108,7 +118,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		disposition: "quarantine",
 	});
 	const history = db.monitorEventRows(monitor.monitorId, "newest", true);
-	expect(history).toHaveLength(2);
+	expect(history).toHaveLength(3);
 	expect(db.monitorEventRows()).toEqual([]);
 	expect(db.monitorEventRows(undefined, "oldest")).toEqual([]);
 	expect(db.monitorEventRows(monitor.monitorId, "oldest")).toEqual([]);
@@ -159,7 +169,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		};
 		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
 		const rows = await inspect("history");
-		expect(rows).toHaveLength(2);
+		expect(rows).toHaveLength(3);
 		for (const [eventId, stage] of [
 			[accepted, "dispatched"],
 			[failed, "failed"],
@@ -170,6 +180,22 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 				reason: "broker_authority_quarantined",
 			});
 		}
+		expect(rows.find((row) => row.eventId === recovered)).toMatchObject({
+			stage: "delivered",
+			recovery: {
+				protocolFailures: [
+					{
+						reason: "protocol_unparseable_json",
+						responseByteLength: 12,
+						responseEntryCount: null,
+					},
+				],
+				firstFailedAt: expect.any(String),
+				deliveredAt: expect.any(String),
+				recoveryLatencyMs: expect.any(Number),
+				dispatchAttempts: 1,
+			},
+		});
 		// Terminal current-authority events exercise the existing history bound without dispatch.
 		for (let index = 0; index < 101; index++) seedEvent(db, monitor.monitorId, "authored_no_delivery");
 		const bounded = await inspect("bounded");
@@ -187,7 +213,9 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		await propagator.reconcile();
 		expect(sends).toBe(0);
 		expect(
-			db.monitorEventRows(monitor.monitorId, "newest", true).filter((row) => [accepted, failed].includes(row.event_id)),
+			db
+				.monitorEventRows(monitor.monitorId, "newest", true)
+				.filter((row) => [accepted, failed, recovered].includes(row.event_id)),
 		).toEqual(history);
 	} finally {
 		await server.stop();
@@ -546,6 +574,111 @@ describe("monitor crash-boundary state machine", () => {
 			expect(stage(db, eventId)).toBe("failed");
 		});
 	}
+	test("protocol failure evidence persists only its allowlisted reason and response shape", async () => {
+		const { monitor, database: db } = await harness(async () => "unused");
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		db.monitorFailureRecord(
+			eventId,
+			"authoring_response_invalid",
+			"dispatch phase failed (authoring_response_invalid)",
+			{
+				protocolFailure: {
+					reason: "protocol_unknown_event",
+					responseByteLength: 57,
+					responseEntryCount: 1,
+				},
+			},
+		);
+
+		expect(db.monitorFailure(eventId)).toMatchObject({
+			protocol_reason: "protocol_unknown_event",
+			response_byte_length: 57,
+			response_entry_count: 1,
+		});
+	});
+	test("database protocol telemetry accepts every allowlisted reason including fallback", async () => {
+		const { monitor, database: db } = await harness(async () => "unused");
+		const storedReasons: string[] = [];
+		for (const reason of PROTOCOL_FAILURE_REASONS) {
+			const eventId = seedEvent(db, monitor.monitorId, "failed");
+			db.monitorFailureRecord(eventId, "authoring_response_invalid", "safe detail", {
+				protocolFailure: {
+					reason,
+					responseByteLength: 0,
+					responseEntryCount: null,
+				},
+			});
+			storedReasons.push(db.monitorFailure(eventId)?.protocol_reason ?? "missing");
+		}
+
+		expect(storedReasons).toEqual([...PROTOCOL_FAILURE_REASONS]);
+		expect(storedReasons).toContain("protocol_off_contract");
+		expect(() =>
+			db.monitorFailureRecord("invalid-reason", "authoring_response_invalid", "safe detail", {
+				protocolFailure: {
+					reason: "ghp_attacker_controlled_reason",
+					responseByteLength: 0,
+					responseEntryCount: null,
+				},
+			} as never),
+		).toThrow();
+	});
+	test("failed protocol response recovery exposes first failure latency and attempts", async () => {
+		const invalidResponse = JSON.stringify([{ eventId: "untrusted-event-id", note: "untrusted response text" }]);
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async (_id, text) => {
+				turns++;
+				if (turns === 1) return invalidResponse;
+				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" })));
+			},
+			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
+		);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && stage(db, eventId) !== "failed"; attempt++) await Bun.sleep(10);
+		expect(stage(db, eventId)).toBe("failed");
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("authored");
+		const event = db.monitorEventRows().find((row) => row.event_id === eventId);
+		const delivery = db.deliveryRows().find((row) => row.turn_id === event?.batch_id);
+		expect(delivery).toBeDefined();
+		if (!delivery) throw new Error("monitor delivery was not prepared");
+		db.deliveryConfirmWithSettle(delivery.delivery_id, "delivered");
+		expect(stage(db, eventId)).toBe("delivered");
+
+		const recovery = db.monitorEventRecovery(eventId);
+		expect(recovery).toMatchObject({
+			protocolFailures: [
+				{
+					reason: "protocol_unknown_event",
+					responseByteLength: Buffer.byteLength(invalidResponse, "utf8"),
+					responseEntryCount: 1,
+				},
+			],
+			dispatchAttempts: 2,
+		});
+		if (!recovery?.deliveredAt) throw new Error("monitor recovery telemetry was not completed");
+		expect(recovery.recoveryLatencyMs).toBe(Date.parse(recovery.deliveredAt) - Date.parse(recovery.firstFailedAt));
+		expect(recovery.recoveryLatencyMs).toBeGreaterThanOrEqual(0);
+		expect(recovery.firstFailedAt).toBe(recovery.protocolFailures[0]?.failedAt);
+	});
+	test("protocol telemetry never persists attacker-controlled response or exception text", async () => {
+		const hostileResponse = '[{"eventId":"ghp_attacker_event_id","note":"https://secret.example/token"}]';
+		const { propagator, monitor, database: db } = await harness(async () => hostileResponse);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && stage(db, eventId) !== "failed"; attempt++) await Bun.sleep(10);
+
+		const failure = db.monitorFailure(eventId);
+		const durable = `${failure?.detail ?? ""} ${JSON.stringify(db.monitorEventRecovery(eventId))}`;
+		expect(failure?.protocol_reason).toBe("protocol_unknown_event");
+		expect(durable).not.toContain("ghp_");
+		expect(durable).not.toContain("secret.example");
+		expect(durable).not.toContain("attacker_event_id");
+	});
 	test("reconcile reclaim budget: an always-failing event lands on failed_no_retry", async () => {
 		let turns = 0;
 		const {
@@ -720,11 +853,14 @@ describe("monitor crash-boundary state machine", () => {
 		});
 		const hostileId = seedEvent(db, monitor.monitorId, "admitted");
 		await propagator.reconcile();
-		const hostileDetail = db.monitorFailure(hostileId)?.detail ?? "";
+		const hostileFailure = db.monitorFailure(hostileId);
+		const hostileDetail = hostileFailure?.detail ?? "";
 		expect(hostileDetail).toContain('"class":"Error"');
 		expect(hostileDetail).toContain('"frame":"#dispatchBatch"');
 		expect(hostileDetail).not.toContain("ghp_");
 		expect(hostileDetail).not.toContain("/Users/");
+		expect(JSON.stringify(hostileFailure)).not.toContain("ghp_");
+		expect(db.monitorEventRecovery(hostileId)).toBeUndefined();
 
 		const closed = new Error("Database has closed: ghp_attacker-secret");
 		closed.stack = "Error: Database has closed\n    at withTransaction (/Users/private/gateway.db:3:4)";
