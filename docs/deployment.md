@@ -184,7 +184,7 @@ Run the Discord, Telegram, and Slack binaries as separate managed services after
 
 A gateway restart does not kill an adapter. The adapter reconnects and keeps serving the previous generation: nothing dies, nothing is lost, `delivery.pending` stays 0, and the only symptom is replies arriving a beat late. The service definitions therefore bind the stack together instead of relying on an operator following a restart order.
 
-On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=process`, because GJC daemon and session hosts share its cgroup.
+On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=mixed` and `TimeoutStopSec=30s`; see below for why that cannot reach the shared GJC broker.
 
 launchd has no `BindsTo`/`PartOf` equivalent, and `WatchPaths` does not restart an already-running job. Use the single entry point instead, on either host:
 
@@ -209,17 +209,23 @@ The gateway daemon is always started and stopped by launchd or systemd; never st
 
 Restart with the host's service manager: on the systemd deployment reached on SSH port 24, use `systemctl --user restart gajaeway-gateway`; on macOS launchd, use `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway`. These are alternatives, not consecutive steps. Give ordered shutdown at least 30 seconds with systemd `TimeoutStopSec` or launchd `ExitTimeOut`. Two gateways on one home can race over the database and delivery state even though neither owns the user broker.
 
-### systemd: preserve shared GJC hosts across gateway restarts
+### systemd: no gateway child outlives the unit
 
-Where the shared GJC daemon or SDK session hosts share the gateway's systemd cgroup, the gateway unit must use:
+The gateway unit must use:
 
 ```ini
 [Service]
-KillMode=process
+KillMode=mixed
 TimeoutStopSec=30s
 ```
 
-`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path. `KillMode=process` limits service-manager termination to the gateway main process: SDK turns must outlive the gateway. `KillMode=control-group` and `KillMode=mixed` can kill the shared user daemon and session hosts during a restart, destroying in-flight turns even though session files remain durable. Do not restore cgroup-wide killing merely because an authority cutover completed; process-only termination remains required while those hosts share the gateway cgroup.
+`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path.
+
+`KillMode=mixed` sends SIGTERM to the gateway main process for its ordered shutdown, then SIGKILLs everything still left in the unit's cgroup. Without it, every `gjc sdk serve` relay and `gjc sdk session` command the gateway spawned outlived each stop, and the next start re-adopted them (`Found left-over process ... in control group while starting unit. Ignoring.`). Those orphans held gigabytes of memory for days and kept writing into state owned by the new incarnation (#183, #227). `KillMode=process` is what caused this, and it is not supported.
+
+The shared GJC broker is not the gateway's child to kill. GJC autostarts it detached from whichever SDK command first finds it absent. When that command is the gateway's, the broker and every session host it forks would otherwise land in the gateway cgroup. The gateway therefore checks each broker generation it observes. If that broker runs inside the gateway's own unit, the gateway moves it and its descendants into a transient `gajaeway-gjc-broker-<pid>.scope` and logs `broker_scope_released`. A broker started anywhere else is never touched. SDK turns outlive gateway restarts because they run in the broker's scope, not because the unit spares its children.
+
+Upgrading a host that still has `KillMode=process` in the unit or in a drop-in: deploy this gateway first, and confirm `broker_scope_released` in its log (or `systemd-cgls --user-unit gajaeway-gateway.service` no longer listing `broker-internal`). Only then change the drop-in to `KillMode=mixed`, run `systemctl --user daemon-reload`, and restart. Changing the kill mode before the broker has been released stops the broker along with the gateway.
 
 Normal gateway stop/start closes its own SDK calls and relays and reconnects as a client. It never kills the shared user broker, reaps old hosts, deletes discovery files, copies settings, or runs global session GC. A readiness failure is not permission to repair or replace the user's daemon. If the shared broker is unavailable at boot (for example while it clears a stale lock after a host reboot), the gateway does not exit: it retries the preflight and readiness steps with exponential backoff (1s doubling to 30s) for up to 10 minutes, logging one `gateway_boot_waiting_for_broker step=… attempt=… retry_in_ms=…` line per retry, and exits 1 only after that deadline. A wrong gjc version or a rejected relay argv is still fatal immediately. For a database changing broker authority, complete the explicit cutover in the runbook before starting recovery; changing service environment alone does not migrate old work.
 

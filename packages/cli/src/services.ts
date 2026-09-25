@@ -220,11 +220,14 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		unitEnvironment("PATH", path),
 		"Restart=always",
 		"RestartSec=2",
-		// Only the gateway: GJC daemon and session hosts share the gateway cgroup,
-		// so the default control-group kill would take unrelated sessions with it.
-		// The gateway exits on its own inside 25s (SHUTDOWN_DEADLINE_MS in the
-		// gateway main); the unit's stop window is pinned so that ceiling always fits.
-		...(spec.dependsOnGateway ? [] : ["KillMode=process", "TimeoutStopSec=30s"]),
+		// Only the gateway: SIGTERM its main process for an ordered shutdown, then
+		// kill whatever is left in its cgroup so no child outlives the unit and
+		// gets re-adopted by the next start (#183). The gateway exits on its own
+		// inside 25s (SHUTDOWN_DEADLINE_MS in the gateway main); the unit's stop
+		// window is pinned so that ceiling always fits (#225). The gateway moves a GJC broker
+		// it autostarted into a scope of its own, so this never reaches the shared
+		// broker or its session hosts.
+		...(spec.dependsOnGateway ? [] : ["KillMode=mixed", "TimeoutStopSec=30s"]),
 		"",
 		"[Install]",
 		// Enabling the gateway pulls the whole stack in; a dependent is never
