@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-test-report",
+  "repository": "gajae-way",
+  "frozenSnapshot": {
+    "branch": "review/boundary-final2",
+    "head": "88d4a6fbd4e301fa59efca6ba91a8059b2bcd5e0",
+    "sourceHash": "sha256:ed96fc102d2bcc22d57d147a13ac2d286efed52b29c996a9243fbee7a4cf09ea"
+  },
+  "runtime": { "bun": "1.4.0", "gjc": "gjc/0.17.6" },
+  "commands": [
+    {
+      "command": "bun test packages/gateway/test/relay-turn.test.ts packages/gateway/test/persona-session.test.ts packages/gateway/test/reactions.test.ts packages/gateway/test/steering.test.ts packages/gateway/test/inbound-queue.test.ts packages/gateway/test/session-restart.test.ts packages/gateway/test/redteam-canonical.test.ts packages/gateway/test/redteam-generation5.test.ts packages/gateway/test/conversation-notice.test.ts packages/gateway/test/monitor-compaction.test.ts packages/gateway/test/monitor-recovery.test.ts",
+      "exitCode": 0,
+      "testsPassed": 249,
+      "testsFailed": 0,
+      "expectCalls": 1918,
+      "files": 11
+    },
+    {
+      "command": "bun test packages/gateway/test/reactions.test.ts",
+      "exitCode": 0,
+      "testsPassed": 25,
+      "testsFailed": 0,
+      "expectCalls": 94,
+      "files": 1
+    },
+    {
+      "command": "bun test packages/gateway/test/zz-qa-c7.test.ts",
+      "exitCode": 0,
+      "testsPassed": 7,
+      "testsFailed": 0,
+      "expectCalls": 30,
+      "files": 1,
+      "temporaryTestDeleted": true
+    }
+  ],
+  "adversarialCases": [
+    { "id": "C1-held-accepted", "verdict": "passed", "tests": 1, "expectCalls": 3 },
+    { "id": "C1-held-abandoned", "verdict": "passed", "tests": 1, "expectCalls": 3 },
+    { "id": "C2-not-found", "verdict": "passed", "tests": 1, "expectCalls": 2 },
+    { "id": "C7-mirror-only-end-status-reconcile", "verdict": "passed", "tests": 1, "expectCalls": 8 },
+    { "id": "C7-unknown-mirror-kind-diagnostic", "verdict": "passed", "tests": 1, "expectCalls": 1 },
+    { "id": "C7-two-turn-mirror-interleaving", "verdict": "passed", "tests": 1, "expectCalls": 9 },
+    { "id": "C7-bash-folded-stall-clock", "verdict": "passed", "tests": 1, "expectCalls": 4 }
+  ],
+  "sourceObservations": [
+    "The C7 mirror-only test emitted no top-level agent_end and verified the frame was not delivered; PersonaSessionManager.recover() then reconciled terminal status, delivered the status-backed answer once, and completed the turn without a second send.",
+    "The server's production recovery timer invokes personaSessions.recover() every 60000 ms.",
+    "C2 endpoint_stale is covered by the targeted relay-turn tests; the additional adversarial test verifies not_found maps to session_unavailable.",
+    "C1 live acknowledgement is covered by reactions.test.ts; the additional integration cases cover held acceptance and abandoned held steer behavior."
+  ],
+  "cleanup": {
+    "temporaryTestFilesDeleted": true,
+    "trackedChanges": "14 staged files only",
+    "untrackedFiles": 0
+  }
+}

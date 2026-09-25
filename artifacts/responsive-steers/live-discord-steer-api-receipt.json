@@ -1,0 +1,16 @@
+{
+  "kind": "black-box-api-receipt",
+  "surface": "discord-live-channel",
+  "build": "4daa3c9 (steer/ack path identical in 7aedc81)",
+  "host": "gaebal-gajae",
+  "channel": "1541621305302974526",
+  "triggerMessageId": "1553154231102611477",
+  "steerMessageId": "1553154296877686835",
+  "steerSentAtMs": 16048,
+  "gatewayEyesReactionAtMs": 16118,
+  "discordReactionsOnSteer": ["👀(bot)"],
+  "spokenReplyAtMs": 17816,
+  "spokenReplyDiscordTimestamp": "2026-09-25T21:20:42Z",
+  "spokenReplyText": "형님, got your message; `sleep 40; echo done` moved to background job `bg_8` and is still ru…",
+  "turnStillRunning": true
+}
