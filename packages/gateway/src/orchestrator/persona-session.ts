@@ -493,6 +493,10 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusTerminalHolds: number;
 	/** Status rechecks scheduled for a turn whose end no relay will announce (backoff ordinal). */
 	statusRechecks: number;
+	/** A stalled retired hold already attempted its one allowed host termination. */
+	retiredHostTerminationAttempted?: boolean;
+	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
+	staleOutput?: { count: number; firstAt: number; lastAt: number };
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
 	/** A tool the tail saw start and not end: the prime suspect when the turn then fails (#210). */
@@ -987,6 +991,8 @@ class OriginActor {
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
 		this.#graceTimers.clear();
 		this.#dispatchRetry = undefined;
+		if (this.#current) this.#flushStaleOutput(this.#current, "shutdown");
+		for (const retired of this.#retired.values()) this.#flushStaleOutput(retired, "shutdown");
 		await Promise.all([
 			...(this.#current?.tail ? [this.#current.tail.close()] : []),
 			...[...this.#retired.values()].flatMap((bound) => (bound.tail ? [bound.tail.close()] : [])),
@@ -1567,7 +1573,7 @@ class OriginActor {
 			onFrame: async (frame) => {
 				await this.enqueue(async () => {
 					const bound = this.#findBound(sessionId, epoch, generation);
-					if (bound && !owns(bound)) return;
+					if (bound && (!owns(bound) || bound.detached)) return;
 					await this.#onTailFrame(sessionId, epoch, generation, retired, frame);
 				});
 			},
@@ -1717,6 +1723,28 @@ class OriginActor {
 		await this.#reconcileBound(bound);
 	}
 
+	#recordStaleOutput(bound: BoundTurn): void {
+		const now = this.#manager.now();
+		if (bound.staleOutput) {
+			bound.staleOutput.count++;
+			bound.staleOutput.lastAt = now;
+			return;
+		}
+		bound.staleOutput = { count: 1, firstAt: now, lastAt: now };
+		this.#manager.log(
+			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=start count=1 first=${new Date(now).toISOString()}`,
+		);
+	}
+
+	#flushStaleOutput(bound: BoundTurn, reason: string): void {
+		const staleOutput = bound.staleOutput;
+		if (!staleOutput) return;
+		bound.staleOutput = undefined;
+		this.#manager.log(
+			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=stop count=${staleOutput.count} first=${new Date(staleOutput.firstAt).toISOString()} last=${new Date(staleOutput.lastAt).toISOString()} reason=${reason}`,
+		);
+	}
+
 	async #onTailFrame(
 		sessionId: string,
 		epoch: number,
@@ -1733,8 +1761,7 @@ class OriginActor {
 			return;
 		}
 		if ((bound.retired || retired) && !bound.answerWanted) {
-			if (frame.assistantText)
-				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
+			if (frame.assistantText) this.#recordStaleOutput(bound);
 		} else {
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			if (frame.rawKind === "tool_execution_start")
@@ -1783,13 +1810,23 @@ class OriginActor {
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`);
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
-			bound.tail?.setTurnRunning(false);
-			await bound.tail?.close();
+			this.#flushStaleOutput(bound, "stall");
+			const tail = bound.tail;
+			tail?.setTurnRunning(false);
+			await tail?.close();
+			bound.tail = undefined;
 			bound.detached = true;
+			// A reopened retired relay cannot own this turn's content. Keep the
+			// accepted turn durable and reconcile it by status without reopening
+			// the stream that produced the stale-output flood.
+			bound.tailEvidenceUnavailable = true;
+			// This discarded turn no longer needs a producer. Terminate its host,
+			// but retain the accepted row and never infer terminal status from SIGTERM.
+			if (!bound.answerWanted) await this.#terminateRetiredSession(sessionId, "stall", bound);
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 			);
-			this.#scheduleRetiredReattach(bound);
+			await this.#reconcileBound(bound);
 		}
 	}
 
@@ -2105,6 +2142,7 @@ class OriginActor {
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
 		bound.tail?.setTurnRunning(false);
+		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);
 		try {
 			await bound.tail?.close();
@@ -2115,7 +2153,7 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled");
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
 			return;
 		}
 		if (this.#current === bound) {
@@ -2135,13 +2173,14 @@ class OriginActor {
 	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
+		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
 		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
 		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded");
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded", bound);
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
@@ -2250,19 +2289,19 @@ class OriginActor {
 	}
 
 	/**
-	 * A retired turn has just been reconciled (answer delivered, failed, or
-	 * provably never landed) and dropped from `#retired`. Nothing will prompt
-	 * its session again: this origin is bound to a newer epoch. End the host so
-	 * it stops occupying the model provider. Skipped when the session is still
-	 * the live binding (same epoch reused) or some other retired turn on this
-	 * origin still needs it; best-effort, logged, never fatal.
+	 * End an obsolete session host after its final turn is settled, or after a
+	 * stalled retired turn is discarded. The latter remains in `#retired` for
+	 * status reconciliation, so callers may exclude that one hold while the
+	 * same-session guard still protects every other live or retired turn.
 	 */
-	async #terminateRetiredSession(sessionId: string, reason: string): Promise<void> {
+	async #terminateRetiredSession(sessionId: string, reason: string, except?: BoundTurn): Promise<void> {
 		const port = this.#manager.port;
 		if (!port.terminateHost) return;
+		if (except?.retiredHostTerminationAttempted) return;
 		if (this.#current?.sessionId === sessionId) return;
 		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
-		for (const other of this.#retired.values()) if (other.sessionId === sessionId) return;
+		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
+		if (except) except.retiredHostTerminationAttempted = true;
 		try {
 			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 			this.#manager.log(
