@@ -1288,11 +1288,38 @@ class OriginActor {
 				await this.#finalizeSteerAcceptance(held, epoch, opRef, undefined);
 			} catch (error) {
 				if (isDefinitiveSteerRejection(error)) this.#manager.database.inboundSteerRefused(held.message_id, opRef);
-				else
+				else if (await this.#sessionProvablyGone(sessionId, error)) {
+					// The turn is over and its session is gone: nothing will ever answer
+					// the clientRef replay. Whether the model saw the message is
+					// unknowable, so it is closed with that turn, never re-dispatched (a
+					// resend could answer it twice). Retrying it every sweep only logged
+					// `host hello did not arrive` for an hour after a broker restart.
+					this.#manager.database.inboundSteerAbandoned(held.message_id, opRef);
+					this.#manager.log(
+						`steer_abandoned origin=${this.originKey} message=${held.message_id} opRef=${opRef} reason=session_gone`,
+					);
+				} else
 					this.#manager.log(
 						`steer_hold origin=${this.originKey} message=${held.message_id} opRef=${opRef} reason=unresolved_after_terminal detail=${safeDiagnostic(error)}`,
 					);
 			}
+		}
+	}
+
+	/**
+	 * Positive evidence that a session can no longer run anything: the SDK
+	 * disowned it (`session_unavailable`, incl. `endpoint_stale`), or the relay
+	 * failed and the broker's own liveness reports it not live / disowned. An
+	 * unanswerable probe is not evidence.
+	 */
+	async #sessionProvablyGone(sessionId: string, error: unknown): Promise<boolean> {
+		if (sdkStatusErrorCode(error) === "session_unavailable") return true;
+		if (!this.#manager.port.liveness) return false;
+		try {
+			const raw = await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo });
+			return raw.live === false || raw.disowned === true;
+		} catch {
+			return false;
 		}
 	}
 
