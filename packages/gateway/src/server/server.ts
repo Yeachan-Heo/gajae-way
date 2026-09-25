@@ -1420,14 +1420,16 @@ async function sendChat(
 	// turn reads the full unread diff since the persona's last reply.
 	if (nonLoopback && inboundMessageId) {
 		const engagement = params.engagement as { authorId?: string; authorName?: unknown } | undefined;
-		options.database.contextRecord({
-			messageId: inboundMessageId,
-			originKey: key,
-			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
-			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
-			body: userText,
-			...(receivedAt ? { receivedAt } : {}),
-		});
+		ingestOrReportDrop(key, inboundMessageId, engagementDecision.engaged, () =>
+			options.database.contextRecord({
+				messageId: inboundMessageId,
+				originKey: key,
+				authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
+				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+				body: userText,
+				...(receivedAt ? { receivedAt } : {}),
+			}),
+		);
 	}
 	if (!engaged) {
 		connection.write({
@@ -1508,17 +1510,19 @@ async function sendChat(
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
 	// per-origin actor receives the notification only after this transaction wins.
-	const accepted = options.database.inboundEnqueue({
-		messageId,
-		originKey: key,
-		originRefJson: JSON.stringify(origin),
-		body: userText,
-		// The delivery-side gate needs the same bypass decision after a restart,
-		// so it travels with the durable row.
-		engagementJson: params.engagement
-			? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
-			: undefined,
-	});
+	const accepted = ingestOrReportDrop(key, messageId, true, () =>
+		options.database.inboundEnqueue({
+			messageId,
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: userText,
+			// The delivery-side gate needs the same bypass decision after a restart,
+			// so it travels with the durable row.
+			engagementJson: params.engagement
+				? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
+				: undefined,
+		}),
+	);
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
@@ -1638,14 +1642,17 @@ async function editChat(
 	}
 	const messageId = messageEditId(params.messageId, params.text);
 	const turnId = crypto.randomUUID();
-	const accepted = options.database.inboundEnqueue({
-		messageId,
-		originKey: key,
-		originRefJson: JSON.stringify(origin),
-		body: renderMessageEdit(params.messageId, params.text),
-		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
-		...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
-	});
+	const { messageId: editedId, text: edit } = params;
+	const accepted = ingestOrReportDrop(key, messageId, true, () =>
+		options.database.inboundEnqueue({
+			messageId,
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: renderMessageEdit(editedId, edit),
+			engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+			...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
+		}),
+	);
 	if (!accepted) {
 		// The same edit event delivered twice: acknowledged once, dispatched once.
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
@@ -2326,6 +2333,24 @@ export function currentConversationNotice(origin: OriginRef): string {
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
 function isSlackMessageId(value: string): boolean {
 	return /^[A-Z][A-Z0-9]+:\d+\.\d+$/.test(value);
+}
+
+/**
+ * Runs one inbound ledger write. A failure still fails the request closed (no
+ * turn is admitted without its row), but it is first logged as a drop naming
+ * the message and origin (#176): the generic request-failure line carried
+ * neither, so a mention lost to an ingest error was indistinguishable from
+ * silence.
+ */
+function ingestOrReportDrop<T>(originKey: string, messageId: string, engaged: boolean, write: () => T): T {
+	try {
+		return write();
+	} catch (error) {
+		console.error(
+			`inbound_dropped message=${messageId} origin=${originKey} engaged=${engaged} reason=ingest_error: ${diagnostic(error)}`,
+		);
+		throw error;
+	}
 }
 
 function diagnostic(error: unknown): string {
