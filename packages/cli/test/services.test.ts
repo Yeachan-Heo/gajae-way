@@ -2,14 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	GATEWAY_UNIT,
-	installServices,
-	restartStack,
-	restartStackCommands,
-	serviceSpecs,
-	systemdUnitName,
-} from "../src/services";
+import { GATEWAY_UNIT, installServices, restartStackCommands, serviceSpecs, systemdUnitName } from "../src/services";
 
 async function configuredHome(): Promise<{ home: string; cleanup: () => Promise<void> }> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-services-"));
@@ -107,26 +100,4 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 		expect(darwin).toContainEqual(["launchctl", "kickstart", "-k", `gui/501/${spec.label}`]);
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
-});
-
-test("restartStack stops at the first failing command and names it", async () => {
-	const ran: string[][] = [];
-	await expect(
-		restartStack({
-			platform: "darwin",
-			uid: 501,
-			runner: (command) => {
-				ran.push([...command]);
-				return command.includes("gui/501/dev.gajaeway.adapter-discord") ? 3 : 0;
-			},
-		}),
-	).rejects.toThrow("restart-stack failed with status 3: launchctl kickstart -k gui/501/dev.gajaeway.adapter-discord");
-	// The gateway ran, the failing adapter ran, and nothing after it did.
-	expect(ran[0]).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.gateway"]);
-	expect(ran).toHaveLength(2);
-});
-
-test("a successful restart returns every command it ran, in order", async () => {
-	const commands = await restartStack({ platform: "linux", runner: () => 0 });
-	expect(commands).toEqual([["systemctl", "--user", "restart", GATEWAY_UNIT]]);
 });

@@ -26,12 +26,15 @@ import {
 	type SessionListRow,
 } from "./list";
 import {
-	type InstallServicesOptions,
-	installServices,
-	restartStack,
-	type ServicePlatform,
-	serviceUsage,
-} from "./services";
+	effectiveRestartState,
+	type LaunchRestartOptions,
+	launchRestartStack,
+	type RunRestartOptions,
+	readRestartReceipt,
+	renderRestartReceipt,
+	runRestartStack,
+} from "./restart-stack";
+import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -57,7 +60,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -83,8 +86,11 @@ function gatewayHome(): string {
 
 export interface MainOptions {
 	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
-	/** Test seam for `ops restart-stack`; the real path spawns the service manager. */
-	readonly restartStack?: Parameters<typeof restartStack>[0];
+	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
+	readonly restartStack?: {
+		readonly launch?: Omit<LaunchRestartOptions, "home">;
+		readonly run?: Omit<RunRestartOptions, "home" | "id">;
+	};
 }
 
 export type ServicesAction = "install" | "repair";
@@ -450,9 +456,30 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				if (command === "restart-stack") {
 					// Deliberately socket-free: the reason to run this is a gateway that
 					// has to come back, so it must not need the gateway to answer first.
-					if (parsed.rest.length > 1) throw new Error("usage: gajaeway ops restart-stack");
-					const commands = await restartStack(options.restartStack ?? {});
-					for (const ran of commands) console.log(`restart-stack: ${ran.join(" ")}`);
+					// It also runs detached: restarting the gateway kills a persona turn that
+					// invoked it, which must not end the sequence half-applied (issue #54).
+					const usage = "usage: gajaeway ops restart-stack [--status]";
+					const home = gatewayHome();
+					const flag = parsed.rest[1];
+					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
+						const receipt = await runRestartStack({
+							...options.restartStack?.run,
+							home,
+							id: parsed.rest[2],
+						});
+						for (const line of renderRestartReceipt(receipt)) console.log(line);
+						if (receipt.state !== "ok") process.exitCode = 1;
+					} else if (flag === "--status" && parsed.rest.length === 2) {
+						const receipt = await readRestartReceipt(home);
+						if (receipt === undefined) throw new Error("no restart-stack receipt");
+						for (const line of renderRestartReceipt(receipt)) console.log(line);
+						// Only a completed, verified sequence exits 0; queued or running is not yet success.
+						if (effectiveRestartState(receipt) !== "ok") process.exitCode = 1;
+					} else if (parsed.rest.length === 1) {
+						const { receipt, supervisorPid } = await launchRestartStack({ ...options.restartStack?.launch, home });
+						console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
+						console.log("read the outcome with: gajaeway ops restart-stack --status");
+					} else throw new Error(usage);
 					break;
 				}
 				let redeliverParams: { deliveryId: string } | { since: string } | undefined;
@@ -482,7 +509,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						process.exitCode = cycleExitCode(cycle);
 					} else
 						throw new Error(
-							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|restart-stack",
+							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|restart-stack [--status]",
 						);
 				} finally {
 					await client.close();

@@ -190,9 +190,12 @@ launchd has no `BindsTo`/`PartOf` equivalent, and `WatchPaths` does not restart 
 
 ```sh
 gajaeway ops restart-stack
+gajaeway ops restart-stack --status
 ```
 
 On Linux that is the one `systemctl --user restart gajaeway-gateway`; on macOS it kickstarts the gateway and then every dependent job, in order. It never uses `launchctl bootout`, which removes the job and leaves it with no automatic recovery.
+
+The command returns as soon as it has queued the sequence. A detached supervisor carries it out: on macOS a process in a new session, on Linux a transient `systemd-run --user` unit outside the gateway cgroup. Restarting the gateway kills a persona turn that invoked it, but not the supervisor. After each command the supervisor checks every service against its deployed binary. The check reads the pid from the service manager and the start time from `ps`, and passes only when the process started after both the binary's modification time and the restart command. A service that fails is recorded as `stale` and the remaining labels are skipped. The receipt is `$GAJAEWAY_HOME/restart-stack.json`, and `--status` prints it. `--status` exits 0 only for a verified `ok`. A sequence whose supervisor died reports `interrupted`.
 
 To diagnose a stack that is already mismatched, read `clients` in `gajaeway status`: every connected client reports its process `startedAt` and a `staleGeneration` flag that is true when the client process predates the running gateway process. That replaces comparing `ps -o lstart` by hand.
 
