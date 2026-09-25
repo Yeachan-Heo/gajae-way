@@ -271,6 +271,26 @@ test("RT05 relay loss after interim settles original output once without replayi
 	expect(f.port.sends).toHaveLength(1);
 });
 
+test("RT05b (#228) an idle broadcast on a reopened relay never settles the turn with its mid-work line as the answer", async () => {
+	const f = await actor();
+	await f.enqueue("trigger");
+	const send = f.port.sends[0]!;
+	f.port.emitAssistant(send.sessionId, "Now canonicalizing.");
+	await until(() => f.speech.length === 1);
+	f.port.loseRelay(send.opRef);
+	await until(() => f.logs.some((line) => line.includes("reason=relay_lost_mid_turn")));
+	// The final body was streamed while the relay was down; the reopened
+	// connection is not the turn's owner and only sees the session going idle.
+	const body = "FINAL ".repeat(3000).trim();
+	f.port.seedOperation(send.opRef, send.sessionId, "terminal_ok", body);
+	for (const tail of f.port.tailsOf(send.sessionId))
+		tail.emit({ kind: "activity", rawKind: "activity", payload: { state: "idle" }, steerEcho: false, idle: true });
+	await until(() => f.terminal.length === 1);
+	expect(f.terminal).toEqual([body]);
+	expect(f.port.workerOutputReads).toHaveLength(1);
+	expect(f.logs.some((line) => line.includes("tail_evidence=unavailable"))).toBe(true);
+});
+
 test("RT04 unknown bound operation releases only after a second status sweep proves live idle", async () => {
 	const port = new ScriptedSessionPort();
 	Object.assign(port, { queueEmpty: async () => true });
