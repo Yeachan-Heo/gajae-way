@@ -213,8 +213,11 @@ export async function preflightGjcRuntime(
 			throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}`);
 		if (Number(version[i]) > Number(minimum[i])) break;
 	}
+	// A failed session list is the broker not answering yet (host reboot, stale
+	// lock being cleared), not a wrong runtime: it is classed as unavailable so
+	// boot waits it out instead of exiting into a restart loop (#182).
 	if (sdk && !isHealthySessionList(await sdk(brokerHealthArgs(), { timeoutMs: COMMAND_TIMEOUT_MS }))) {
-		throw new Error("gjc runtime preflight failed: invalid session-list envelope");
+		throw new GjcCliUnavailableError("gjc runtime preflight failed: invalid session-list envelope");
 	}
 	// The relay argv contract is boot-gated: a usage rejection (exit 2) here
 	// means EVERY tail stream would die at spawn and the gateway would silently
