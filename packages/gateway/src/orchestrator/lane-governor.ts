@@ -3,7 +3,7 @@ import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsessio
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
-import type { SessionPort } from "./session-port";
+import { isSessionUnavailable, type SessionPort } from "./session-port";
 
 export const WORK_LANE_PREFIX = "work/task/";
 
@@ -297,6 +297,12 @@ export class LaneGovernor {
 		try {
 			status = (await this.#port.status({ sessionId, repo, opRef: last.opRef })).status.status;
 		} catch (error) {
+			// The router answering session_unavailable is positive evidence the host
+			// is gone once inspect agrees; a broker outage is neither and holds.
+			if (isSessionUnavailable(error)) {
+				const liveness = await this.#liveness(sessionId, repo).catch(() => undefined);
+				if (liveness && (liveness.live === false || liveness.disowned)) return { settled: true };
+			}
 			return {
 				settled: false,
 				reason: `attempt ${last.opRef} status unavailable: ${sanitizeDiagnostic(diagnostic(error))}`,

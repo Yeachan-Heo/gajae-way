@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, ProtocolError } from "@gajae-gateway/protocol";
 import { appendAttempt, createLaneJobRecord, GjcCliError, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import { utf8Prefix, WorkLaneManager, type WorkLaneManagerOptions } from "../src/orchestrator/work-lane";
@@ -920,8 +921,12 @@ test("CAS loss does not fan out or perform a separate history/activity update", 
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "answer");
 	const history = f.db.laneJobJson(result.jobId);
-	const activity = f.db.workLaneRows()[0]!.last_activity_at;
 	await until(() => calls > 0);
+	// Streamed frames may refresh activity before settlement; a lost settlement
+	// CAS must not write it (or history) again on any later retry.
+	const activity = f.db.workLaneRows()[0]!.last_activity_at;
+	const seen = calls;
+	await until(() => calls > seen);
 	expect(f.db.laneJobJson(result.jobId)).toBe(history);
 	expect(f.db.workLaneRows()[0]!.last_activity_at).toBe(activity);
 	expect(f.notices).toHaveLength(0);
@@ -1179,4 +1184,115 @@ test("quarantined accepted work reserves its name without querying the shared br
 	expect(fresh.jobId).not.toBe(old.jobId);
 	expect(f.port.sends).toHaveLength(sends + 1);
 	expect(f.notices).toHaveLength(0);
+});
+
+function sessionUnavailable(): GjcCliError {
+	return new GjcCliError("gjc sdk request failed: session_unavailable", 1, "", { code: "session_unavailable" });
+}
+
+test("#308 host loss settles the open attempt as host_lost; resume and retire then work", async () => {
+	const f = await fixture({ hostLostGraceMs: 20 });
+	const result = await started(f, "a", origin);
+	const status = f.port.status.bind(f.port);
+	// The host process died: the router disowns the session for every read.
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	await until(() => f.db.workAttemptOpen().length === 0);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
+	expect(f.job().attempts[0]?.errorCode).toBe("host_lost");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: host_lost: output_unavailable");
+	expect(await f.manager.status({ name: "a" })).toMatchObject({
+		attempt: { opRef: result.opRef, endState: "attempt_ended" },
+		op: null,
+	});
+	expect(f.port.sends).toHaveLength(1);
+	// Retire proves the host gone from the same router verdict.
+	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true, sessionId: result.sessionId });
+	f.port.status = status;
+	const resumed = await f.manager.start({ name: "a", text: "continue", cwd: f.directory, resume: true });
+	expect(resumed).toMatchObject({ started: true });
+	expect(f.port.sends).toHaveLength(2);
+	expect(f.job().attempts).toHaveLength(2);
+});
+
+test("#308 open attempt resumes after host loss without retiring first", async () => {
+	const f = await fixture({ hostLostGraceMs: 0 });
+	const result = await started(f);
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	await until(() => f.db.workAttemptOpen().length === 0);
+	const resumed = await f.manager.start({ name: "a", text: "continue", cwd: f.directory, resume: true });
+	expect(resumed).toMatchObject({ started: true });
+});
+
+for (const [label, failure, live] of [
+	["broker_unavailable", () => new GjcCliUnavailableError("connect ECONNREFUSED"), false],
+	["an unstructured transport failure", () => new Error("gjc sdk request failed: timeout"), false],
+	["session_unavailable while inspect still reports the host live", sessionUnavailable, true],
+] as const) {
+	test(`#308 ${label} never settles an open attempt`, async () => {
+		const f = await fixture({ hostLostGraceMs: 0 });
+		const result = await started(f);
+		let reads = 0;
+		f.port.status = async () => {
+			reads++;
+			throw failure();
+		};
+		f.port.setSessionState(result.sessionId, { live });
+		await until(() => reads >= 5);
+		expect(f.db.workAttemptGet(result.opRef)?.terminal).toBeNull();
+		expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+		expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: false });
+	});
+}
+
+test("#308 host loss must persist across the grace window before settling", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 60_000 });
+	const result = await started(f);
+	let reads = 0;
+	f.port.status = async () => {
+		reads++;
+		throw sessionUnavailable();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	await until(() => reads >= 3);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	now += 60_000;
+	await until(() => f.db.workAttemptOpen().length === 0);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+});
+
+test("#308 restart recovery classifies a router-disowned open attempt as host_lost", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	await f.manager.stop();
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	await f.restart();
+	await until(() => f.db.workAttemptOpen().length === 0);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true });
+});
+
+test("#308 streamed turn frames advance lane activity past the attempt start", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	const result = await started(f);
+	const startedAt = f.db.workLaneRows()[0]!.last_activity_at!;
+	expect(startedAt).toBe(f.db.workAttemptGet(result.opRef)!.startedAt);
+	now += 5_000;
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => f.db.workLaneRows()[0]!.last_activity_at !== startedAt);
+	expect(f.db.workLaneRows()[0]!.last_activity_at).toBe(new Date(now).toISOString());
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
