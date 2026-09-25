@@ -3,10 +3,12 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	type ChannelEngagementPolicy,
+	describeChatPlatforms,
 	ENGAGEMENT_AUDIENCES,
 	ENGAGEMENT_MODES,
 	type EngagementAudience,
 	type EngagementMode,
+	isChatPlatform,
 	type OriginRef,
 	parseRuntimeConfig as parseSharedRuntimeConfig,
 	type RuntimeConfig,
@@ -95,6 +97,8 @@ export interface GatewayConfigFile {
 	readonly work?: WorkLaneConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
+	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
+	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
 }
 
 export interface BotAudienceConfig {
@@ -348,6 +352,27 @@ function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 	}
 }
 
+function parseHandoffTargets(value: unknown): Readonly<Record<string, OriginRef>> {
+	const input = requireObject(value, "handoffTargets");
+	const targets: Record<string, OriginRef> = {};
+	for (const [alias, origin] of Object.entries(input)) {
+		// An alias with `/` or `:` would be shadowed by the origin-key spellings the resolver also accepts.
+		if (!/^[A-Za-z0-9_.-]{1,64}$/.test(alias))
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be named with letters, digits, _ . or -`);
+		let parsed: OriginRef;
+		try {
+			parsed = validateOriginRef(requireObject(origin, `handoffTargets.${alias}`) as unknown as OriginRef);
+		} catch (error) {
+			if (error instanceof ConfigError) throw error;
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be a valid origin`);
+		}
+		if (!isChatPlatform(parsed.platform))
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be a ${describeChatPlatforms()} origin`);
+		targets[alias] = parsed;
+	}
+	return targets;
+}
+
 function parseStringArray(value: unknown, field: string): readonly string[] {
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item))
 		throw new ConfigError("config_invalid", `${field} must be a non-empty string array`);
@@ -462,6 +487,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
+		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
 			: {
@@ -569,7 +595,14 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
  * applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy", "botAudience"] as const;
+export const RELOADABLE_FIELDS = [
+	"mentionAllowlist",
+	"channels",
+	"stallTimeoutMs",
+	"dmPolicy",
+	"botAudience",
+	"handoffTargets",
+] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [
