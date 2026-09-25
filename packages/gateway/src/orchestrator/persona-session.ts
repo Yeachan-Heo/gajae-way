@@ -1868,7 +1868,7 @@ class OriginActor {
 			// whose answer is still wanted (session replaced under it after a steer
 			// refusal) is judged the same way: held forever, its lifecycle kept
 			// announcing a turn that never ran (live: "working… (286m)", 2026-09-05).
-			if (sdkStatusErrorCode(error) === "session_unavailable" && (!bound.retired || bound.answerWanted)) {
+			if (sdkStatusErrorCode(error) === "session_unavailable") {
 				const raw = this.#manager.port.liveness
 					? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
 					: undefined;
@@ -1878,8 +1878,21 @@ class OriginActor {
 				// (live=false or disowned); an unanswerable liveness probe holds it.
 				const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
 				const dead = raw?.live === false || raw?.disowned === true;
-				if (state === "bound" ? raw?.live !== true : dead) {
-					await this.#releaseUnlanded(bound, "router_disowned");
+				if (!bound.retired || bound.answerWanted) {
+					if (state === "bound" ? raw?.live !== true : dead) {
+						await this.#releaseUnlanded(bound, "router_disowned");
+						return;
+					}
+				} else if (dead) {
+					// A turn the owner discarded with /new on a session the broker no
+					// longer serves: nobody wants its answer and nothing can still run
+					// there. Close it instead of re-checking a dead endpoint forever
+					// (live: 285 status sweeps per retired turn after one broker restart).
+					this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+					this.#manager.log(
+						`retired_turn_closed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=session_gone`,
+					);
+					await this.#settleAfterTerminal(bound);
 					return;
 				}
 			}
@@ -2506,11 +2519,28 @@ export function isDefinitiveSteerRejection(error: unknown): boolean {
 	);
 }
 
+/**
+ * The SDK code carried by an error. gjc reports "the broker no longer serves
+ * this session id" as `endpoint_stale` (0.17.x JSON envelopes, `GjcCliError`
+ * details) or `not_found`; both mean exactly what the CLI calls
+ * `session_unavailable`, so they are classified as that one code. Missing this
+ * held every turn on a session a broker restart had dropped: status failed
+ * with endpoint_stale forever and the turn was never released.
+ */
 function sdkStatusErrorCode(error: unknown): string | undefined {
 	const code = (error as { code?: unknown } | undefined)?.code;
-	if (typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code)) return code;
+	const details = (error as { details?: unknown } | undefined)?.details;
+	const detailCode = typeof details === "object" && details !== null ? (details as { code?: unknown }).code : undefined;
+	const raw =
+		typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code)
+			? code
+			: typeof detailCode === "string" && /^[a-z0-9_.-]{1,64}$/i.test(detailCode)
+				? detailCode
+				: undefined;
+	if (raw === "endpoint_stale" || raw === "not_found") return "session_unavailable";
+	if (raw) return raw;
 	const message = error instanceof Error ? error.message : "";
-	return /session_unavailable/.test(message) ? "session_unavailable" : undefined;
+	return /session_unavailable|endpoint_stale/.test(message) ? "session_unavailable" : undefined;
 }
 
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */

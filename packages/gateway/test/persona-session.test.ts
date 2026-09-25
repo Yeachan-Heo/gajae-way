@@ -1018,6 +1018,70 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 	expect(terminal).toEqual([]);
 });
 
+/** The gjc 0.17.x envelope for a session the broker stopped serving, as the CLI parser surfaces it. */
+function endpointStale(): GjcCliError {
+	return new GjcCliError('gjc sdk session status reported failure: {"code":"endpoint_stale"}', 0, "", {
+		code: "endpoint_stale",
+		category: "unavailable",
+		message: "The SDK endpoint is stale or unavailable.",
+	});
+}
+
+/** A broker restart dropped this session: every status read fails endpoint_stale and the host is gone. */
+class DroppedSessionPort extends ScriptedSessionPort {
+	readonly dropped = new Set<string>();
+	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+		if (this.dropped.has(input.sessionId)) throw endpointStale();
+		return await super.status(input);
+	}
+	override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+		if (this.dropped.has(input.sessionId)) return { live: false, disowned: false };
+		return await super.liveness(input);
+	}
+}
+
+test("a /new-retired turn whose session a broker restart dropped is closed instead of re-checked forever", async () => {
+	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("m-1", "old turn");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const old = port.sends[0]!;
+	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	expect(database?.inboundTurnRow(old.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+
+	port.dropped.add(old.sessionId);
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(old.opRef)?.turn_state === "done", "retired turn was not closed");
+	expect(logs.some((line) => line.startsWith("retired_turn_closed") && line.includes(old.opRef))).toBe(true);
+	// Closed, never re-sent: the discarded prompt is not replayed into the new session.
+	expect(port.sends).toHaveLength(1);
+	const holdsAfter = logs.filter((line) => line.startsWith("recovery_hold") && line.includes(old.opRef)).length;
+	await manager!.tick(KEY);
+	expect(logs.filter((line) => line.startsWith("recovery_hold") && line.includes(old.opRef)).length).toBe(holdsAfter);
+});
+
+test("a live turn whose session answers endpoint_stale and is not live is released like session_unavailable", async () => {
+	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+
+	port.dropped.add(first.sessionId);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes(first.opRef) && line.includes("reason=router_disowned")),
+		`endpoint_stale was not classified as session_unavailable:\n${logs.join("\n")}`,
+	);
+	expect(logs.filter((line) => line.startsWith("recovery_hold") && line.includes("reason=status_unavailable"))).toEqual(
+		[],
+	);
+});
+
 test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,

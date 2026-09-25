@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
 const ORIGIN_KEY = "discord/channel/chan-1";
@@ -51,10 +51,12 @@ interface Harness {
 	readonly database: GatewayDatabase;
 	/** Turn texts the gateway actually dispatched to gjc: a reaction must add none. */
 	readonly turns: string[];
+	/** Messages the gateway steered into a running turn. */
+	readonly steers: readonly { readonly text: string }[];
 }
 
 /** An open channel, so every human message reaches a turn (same shape as silence.test.ts). */
-async function gateway(reply: string): Promise<Harness> {
+async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-reactions-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -72,10 +74,12 @@ async function gateway(reply: string): Promise<Harness> {
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
-	const sessionPort = sessionPortFromResponder({
+	// `hold` keeps the turn running (accepted, no terminal) so later messages are steered.
+	const sessionPort = (hold ? sessionPortFromScript : sessionPortFromResponder)({
 		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
 		respond: async (_sessionId, text) => {
 			turns.push(text);
+			if (hold) await hold;
 			return reply;
 		},
 	});
@@ -84,7 +88,7 @@ async function gateway(reply: string): Promise<Harness> {
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
-	return { client, database, turns };
+	return { client, database, turns, steers: sessionPort.steers };
 }
 
 function sendMessage(client: Client, id: string, text = "형님 이거 봐주세요", messageId = "m1"): void {
@@ -109,6 +113,32 @@ function reactionEvents(frames: any[]): any[] {
 function textEvents(frames: any[]): any[] {
 	return frames.filter((frame) => frame.type === "event" && frame.event === "chat.message" && !frame.payload.reaction);
 }
+
+test("an accepted steer is acknowledged with 👀 on the steered message at once, before the model answers", async () => {
+	let finish!: () => void;
+	const running = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const { client, database, turns, steers } = await gateway("done", running);
+	sendMessage(client, "c1", "first", "m1");
+	for (let attempt = 0; attempt < 200 && turns.length === 0; attempt++) await Bun.sleep(5);
+	sendMessage(client, "c2", "while you work: are you there?", "m2");
+	for (let attempt = 0; attempt < 200 && reactionEvents(client.frames).length === 0; attempt++) await Bun.sleep(5);
+	try {
+		expect(steers).toHaveLength(1);
+		// The model has said nothing yet: the turn is still running.
+		expect(textEvents(client.frames)).toHaveLength(0);
+		const reactions = reactionEvents(client.frames);
+		expect(reactions).toHaveLength(1);
+		expect(reactions[0].payload.reaction).toEqual({ targetMessageId: "m2", emoji: "👀", emojiName: "eyes" });
+		// A real, settleable ledger row like every other reaction.
+		expect(database.deliveryRows().some((row) => row.delivery_id === reactions[0].payload.deliveryId)).toBe(true);
+	} finally {
+		finish();
+	}
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(1);
+});
 
 test("an inbound reaction is metadata: it never creates a turn", async () => {
 	const { client, database, turns } = await gateway("should never be produced");

@@ -719,7 +719,8 @@ describe("monitor crash-boundary state machine", () => {
 		await reconcile;
 		expect(stage(db, eventId)).toBe("failed");
 		expect(db.authoredOutput(eventId)).toBeUndefined();
-		// Next boot: a fresh propagator reclaims the event as recoverable state.
+		// Next boot: a fresh propagator reclaims the event as recoverable state
+		// once its retry backoff has elapsed (#179: the second retry waits 10 minutes).
 		const next = new MonitorPropagator({
 			database: db,
 			registry,
@@ -729,6 +730,7 @@ describe("monitor crash-boundary state machine", () => {
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(db)),
 			emit: () => {},
+			now: () => Date.now() + 10 * 60_000 + 1,
 		});
 		propagators.push(next);
 		await next.reconcile();
