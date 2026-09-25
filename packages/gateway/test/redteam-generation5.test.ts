@@ -488,7 +488,7 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new Database(path);
-		// Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors.
+		// Remove v22-v24 additions before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -519,6 +519,7 @@ ALTER TABLE inbound_messages ADD COLUMN accepted_at TEXT;
 ALTER TABLE inbound_messages ADD COLUMN bound_session_id TEXT;
 ALTER TABLE inbound_messages ADD COLUMN dispatched_at TEXT;
 ALTER TABLE inbound_messages ADD COLUMN terminal_delivery_id TEXT;
+ALTER TABLE deliveries DROP COLUMN last_error;
 DELETE FROM schema_migrations WHERE version > 18;
 INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id) VALUES
  ('ride-trigger', 'migration/ride', '{}', 'first', NULL, 'pending', '2026-09-04T00:00:00.000Z', 'batch', 'trigger', 7, 'settled', 'gw-p-ride', NULL, 'session-ride', '2026-09-04T00:00:00.001Z', NULL),
@@ -527,7 +528,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(24);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],

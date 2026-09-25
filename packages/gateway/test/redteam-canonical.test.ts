@@ -1147,7 +1147,7 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
-		// Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors.
+		// Remove v22-v24 additions before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -1168,6 +1168,7 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
 CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL, batch_key TEXT, batch_role TEXT, batch_epoch INTEGER, batch_state TEXT, attributed_op_ref TEXT, accepted_at TEXT, bound_session_id TEXT, dispatched_at TEXT, terminal_delivery_id TEXT);
+ALTER TABLE deliveries DROP COLUMN last_error;
 DELETE FROM schema_migrations WHERE version > 18;
 INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id) VALUES
  ('live-trigger', 'o', '{}', 'a', NULL, 'pending', '2026-09-02T00:00:00.000Z', 'b1', 'trigger', 2, 'accepted', 'gw-p-live', NULL, 's', '2026-09-02T00:00:00.500Z', NULL),
@@ -1177,7 +1178,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(24);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;

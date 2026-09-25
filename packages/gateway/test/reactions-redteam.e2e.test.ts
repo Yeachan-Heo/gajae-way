@@ -614,6 +614,7 @@ test("RT-LEDGER-02 an ambiguous reaction failure survives and is re-emitted on r
 	await settle();
 	expect(response(client.frames, "f1").result).toEqual({ recorded: true });
 	expect(database.deliveryRows()[0]?.state).toBe("failed_ambiguous");
+	expect(database.deliveryRows()[0]?.last_error).toBe("transport_error");
 	// Ambiguous rows obey the two-second first-retry backoff, then a fresh adapter
 	// connection must be told about it again, reaction intact.
 	await Bun.sleep(2_050);

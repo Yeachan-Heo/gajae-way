@@ -405,7 +405,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 23;
+const LATEST_SCHEMA_VERSION = 24;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -2530,10 +2530,12 @@ export class GatewayDatabase {
 		);
 	}
 
-	deliveryUpdate(id: string, state: string, attempts?: number): void {
+	deliveryUpdate(id: string, state: string, attempts?: number, lastError?: string | null): void {
 		this.#database
-			.query("UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), updated_at = ? WHERE delivery_id = ?")
-			.run(state, attempts ?? null, new Date().toISOString(), id);
+			.query(
+				"UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = CASE WHEN ? THEN ? ELSE last_error END, updated_at = ? WHERE delivery_id = ?",
+			)
+			.run(state, attempts ?? null, lastError !== undefined ? 1 : 0, lastError ?? null, new Date().toISOString(), id);
 	}
 
 	deliveryExpireBefore(
@@ -2589,13 +2591,14 @@ export class GatewayDatabase {
 		origin_key: string;
 		payload_json: string;
 		state: string;
+		last_error: string | null;
 		attempts: number;
 		created_at: string;
 		updated_at: string;
 	}> {
 		return this.#database
 			.query(
-				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at FROM deliveries ORDER BY created_at",
+				"SELECT delivery_id, turn_id, origin_key, payload_json, state, last_error, attempts, created_at, updated_at FROM deliveries ORDER BY created_at",
 			)
 			.all() as Array<{
 			delivery_id: string;
@@ -2603,6 +2606,7 @@ export class GatewayDatabase {
 			origin_key: string;
 			payload_json: string;
 			state: string;
+			last_error: string | null;
 			attempts: number;
 			created_at: string;
 			updated_at: string;
@@ -3738,6 +3742,20 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(23, new Date().toISOString());
+			});
+		}
+		if (current < 24) {
+			this.withTransaction(() => {
+				// Persist only bounded delivery failure evidence. Existing rows remain NULL.
+				// Persisted delivery states are pending, inflight, confirmed, failed_ambiguous,
+				// and expired; adding a new state requires a data-preserving migration that
+				// updates the deliveries.state CHECK constraint.
+				this.#database.exec(
+					"ALTER TABLE deliveries ADD COLUMN last_error TEXT CHECK(last_error IS NULL OR last_error IN ('adapter_error','rate_limited','permission_denied','target_unavailable','transport_error'))",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(24, new Date().toISOString());
 			});
 		}
 	}

@@ -1,6 +1,14 @@
 import type { GatewayDatabase } from "./db";
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
+export const DELIVERY_FAILURE_REASONS = [
+	"adapter_error",
+	"rate_limited",
+	"permission_denied",
+	"target_unavailable",
+	"transport_error",
+] as const;
+export type DeliveryFailureReason = (typeof DELIVERY_FAILURE_REASONS)[number];
 /** Outcome of a settlement attempt against the ledger. */
 export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
 const MAX_DEFINITIVE_FAILURES = 5;
@@ -13,6 +21,7 @@ export interface DeliveryRow {
 	readonly originKey: string;
 	readonly payloadJson: string;
 	readonly state: DeliveryState;
+	readonly lastError: DeliveryFailureReason | null;
 	readonly attempts: number;
 	readonly createdAt: string;
 	readonly updatedAt: string;
@@ -76,19 +85,22 @@ export class DeliveryLedger {
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, "confirmed"));
 		return "transitioned";
 	}
-	fail(deliveryId: string, ambiguous = false): LedgerOutcome {
+	fail(deliveryId: string, ambiguous = false, reason?: unknown): LedgerOutcome {
 		const row = this.get(deliveryId);
 		if (!row) return "unknown";
 		// Terminal states never rewrite: confirmed stays delivered, expired stays
 		// expired. A late duplicate fail after confirm is recorded as a no-op.
 		if (row.state === "confirmed" || row.state === "expired") return "already_terminal";
 		const attempts = row.attempts + 1;
+		// Ambiguous failures still count as attempts but remain unsettled; ordinary
+		// sweeps apply the existing backoff and a reconnect replays them immediately.
 		const state: DeliveryState = ambiguous
 			? "failed_ambiguous"
 			: attempts >= MAX_DEFINITIVE_FAILURES
 				? "expired"
 				: "pending";
-		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, state, attempts));
+		const lastError = classifyDeliveryFailure(reason);
+		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, state, attempts, lastError));
 		return "transitioned";
 	}
 	/**
@@ -170,11 +182,38 @@ export class DeliveryLedger {
 			originKey: row.origin_key,
 			payloadJson: row.payload_json,
 			state: row.state as DeliveryState,
+			lastError: row.last_error as DeliveryFailureReason | null,
 			attempts: row.attempts,
 			createdAt: row.created_at,
 			updatedAt: row.updated_at,
 		}));
 	}
+}
+
+/** Classifies untrusted adapter text without allowing it into persistent storage. */
+export function classifyDeliveryFailure(reason: unknown): DeliveryFailureReason {
+	if (typeof reason !== "string") return "adapter_error";
+	if (/\b(rate[\s_-]?limit(?:ed|ing)?|too many requests|http\s*429|status(?:\s*code)?\s*429)\b/i.test(reason))
+		return "rate_limited";
+	if (
+		/\b(?:401|403|permission|permissions|forbidden|missing[\s_-](?:access|permissions?)|unauthori[sz]ed|not[\s_-](?:authorized|authed|allowed)|invalid[\s_-]auth|auth(?:entication|orization)?(?:[\s_-](?:failed|error|denied|invalid))?|access[\s_-]denied)\b/i.test(
+			reason,
+		)
+	)
+		return "permission_denied";
+	if (
+		/\b404\b|\b(?:unknown|missing|no[\s_-]such|not[\s_-]found|cannot[\s_-]find)[\s_-]+(?:message|channel|chat|user|target|recipient)\b|\b(?:message|channel|chat|user|target|recipient)[\s_-]+(?:not[\s_-]found|missing|unavailable)\b/i.test(
+			reason,
+		)
+	)
+		return "target_unavailable";
+	if (
+		/\b(transport|socket|econn[a-z]+|etimedout|timeout|timed out|time[\s_-]out|network|fetch failed|connection[\s_-](?:reset|closed|refused|lost))\b/i.test(
+			reason,
+		)
+	)
+		return "transport_error";
+	return "adapter_error";
 }
 
 function retryBackoffMs(attempts: number): number {
