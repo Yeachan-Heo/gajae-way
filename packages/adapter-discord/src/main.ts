@@ -730,19 +730,16 @@ export async function settleDiscordDelivery(
 		return;
 	}
 	try {
-		const channel = await discord.channels.fetch(message.origin.conversationId);
-		if (!isDiscordTextChannel(channel)) {
-			throw Object.assign(new Error(`Discord channel ${message.origin.conversationId} cannot receive messages`), {
-				code: 10003,
-			});
-		}
-		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
+		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const text = notice ? `${notice}\n${body}` : body;
 		const chunks = chunkDiscordMessage(text);
 		for (let index = 0; index < chunks.length; index++) {
 			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
 			// deleted target from failing the whole delivery.
 			const chunk = chunks[index] as string;
-			if (index === 0 && message.replyToMessageId)
+			// A reply reference points into the thread, so it is dropped on parent fallback.
+			if (index === 0 && message.replyToMessageId && !notice)
 				await channel.send({
 					content: chunk,
 					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
@@ -764,6 +761,58 @@ export async function settleDiscordDelivery(
 	} finally {
 		await status?.clear(message.origin.conversationId);
 		typing?.end(message.origin.conversationId);
+	}
+}
+
+interface ArchivableThreadLike {
+	readonly archived: boolean | null;
+	setArchived(archived: boolean): Promise<unknown>;
+}
+
+function isArchivedThread(value: unknown): value is ArchivableThreadLike {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"archived" in value &&
+		value.archived === true &&
+		"setArchived" in value &&
+		typeof value.setArchived === "function"
+	);
+}
+
+async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise<DiscordTextChannelLike> {
+	const channel = await discord.channels.fetch(id);
+	if (!isDiscordTextChannel(channel))
+		throw Object.assign(new Error(`Discord channel ${id} cannot receive messages`), { code: 10003 });
+	return channel;
+}
+
+/**
+ * Resolves where a delivery is posted. A thread archives after inactivity, and
+ * posting into it only auto-unarchives when the bot holds the right permission,
+ * so an archived thread is explicitly unarchived first. When that fails the
+ * reply goes to the parent channel with a visible notice and a log line: a
+ * monitor result that silently vanishes behind an archived thread is the worst
+ * outcome, because its schedule still looks healthy.
+ */
+async function resolveDeliveryChannel(
+	discord: DiscordClientLike,
+	origin: ChatMessagePayload["origin"],
+	deliveryId: string,
+): Promise<{ readonly channel: DiscordTextChannelLike; readonly notice?: string }> {
+	const channel = await fetchTextChannel(discord, origin.conversationId);
+	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
+	try {
+		await channel.setArchived(false);
+		return { channel };
+	} catch (error) {
+		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
+		const parent = await fetchTextChannel(discord, origin.parentId);
+		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		return {
+			channel: parent,
+			notice: `[thread <#${origin.conversationId}> is archived and could not be unarchived (${errorMessage(error)}); posting here instead]`,
+		};
 	}
 }
 

@@ -187,6 +187,90 @@ test("prefixes ambiguous redelivery and records failed settlement", async () => 
 	]);
 });
 
+const threadDelivery = (text: string): ChatMessagePayload => ({
+	...delivery(text),
+	origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+});
+
+test("an archived thread is unarchived before delivery and the reply lands in the thread", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const thread = {
+		archived: true,
+		setArchived: async (archived: boolean) => {
+			thread.archived = archived;
+		},
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) =>
+				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("monitor result"));
+	expect(thread.archived).toBe(false);
+	expect(sent).toEqual([["thread-1", "monitor result"]]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("an archived thread that cannot be unarchived falls back to its parent channel and says why", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const errors: string[] = [];
+	const thread = {
+		archived: true,
+		setArchived: async () => Promise.reject(Object.assign(new Error("Missing Permissions"), { code: 50013 })),
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) =>
+				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+		},
+	};
+	const original = console.error;
+	console.error = (line: string) => void errors.push(line);
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("monitor result"));
+	} finally {
+		console.error = original;
+	}
+	expect(sent).toEqual([
+		[
+			"channel-1",
+			"[thread <#thread-1> is archived and could not be unarchived (Missing Permissions); posting here instead]\nmonitor result",
+		],
+	]);
+	expect(errors).toEqual([
+		"Discord delivery delivery-1: thread thread-1 is archived and could not be unarchived (Missing Permissions); delivered to parent channel channel-1 instead.",
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("an active thread and a plain channel deliver exactly as before", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => ({
+				archived: false,
+				setArchived: async () => {
+					throw new Error("must not unarchive an active thread");
+				},
+				send: async (payload: unknown) => void sent.push([id, payload]),
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("in thread"));
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("in channel"));
+	expect(sent).toEqual([
+		["thread-1", "in thread"],
+		["channel-1", "in channel"],
+	]);
+	expect(requests.map((request) => request.verb)).toEqual(["delivery.confirm", "delivery.confirm"]);
+});
+
 // The merge seam between this lane's reaction wiring and the reply-metadata lane
 // lives inside settleDiscordDelivery's dispatch. Both branches are exercised here
 // because deleting either one leaves every other test in the repo green: a lost
