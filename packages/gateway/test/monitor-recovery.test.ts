@@ -36,7 +36,10 @@ function fakeSessionPort(respond: SessionPortResponder) {
 
 async function harness(
 	respond: SessionPortResponder,
-	options: { ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } } } = {},
+	options: {
+		ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } };
+		now?: () => number;
+	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -57,6 +60,7 @@ async function harness(
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
+		...(options.now ? { now: options.now } : {}),
 	});
 	propagators.push(propagator);
 	return { propagator, monitor, database, registry, sessionPort };
@@ -453,17 +457,26 @@ describe("monitor crash-boundary state machine", () => {
 	}
 	test("reconcile reclaim budget: an always-failing event lands on failed_no_retry", async () => {
 		let turns = 0;
+		let clock = Date.now();
 		const {
 			propagator,
 			monitor,
 			database: db,
-		} = await harness(async () => {
-			turns++;
-			throw new Error("turn exploded");
-		});
+		} = await harness(
+			async () => {
+				turns++;
+				throw new Error("turn exploded");
+			},
+			{ now: () => clock },
+		);
 		const eventId = seedEvent(db, monitor.monitorId, "failed");
-		for (let sweep = 0; sweep < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS + 2; sweep++) await propagator.reconcile();
+		// Sweep once per (simulated) minute for a day: the backoff schedule is exhausted well inside it.
+		for (let sweep = 0; sweep < 24 * 60 && stage(db, eventId) !== "failed_no_retry"; sweep++) {
+			await propagator.reconcile();
+			clock += 60_000;
+		}
 		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(turns).toBe(MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS);
 		// Bounded: no more dispatch attempts after the budget.
 		const attemptsAfter = turns;
 		await propagator.reconcile();
@@ -474,6 +487,41 @@ describe("monitor crash-boundary state machine", () => {
 		expect(failure?.detail).toBeDefined();
 		expect(failure?.detail).not.toContain("turn exploded");
 		expect(failure?.code.length ?? 0).toBeGreaterThan(0);
+	});
+
+	test("issue #179: a failed slot outlives a multi-hour dispatch outage and is authored after recovery", async () => {
+		let turns = 0;
+		let down = true;
+		let clock = Date.now();
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async (_id, text) => {
+				turns++;
+				if (down) throw new GjcCliError("dispatch path down", 0, "");
+				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" })));
+			},
+			{ now: () => clock },
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		// The production reconcile timer sweeps every 60s. A 15h outage (measured on the issue host)
+		// used to burn the whole budget in ~5 sweeps and drop the slot.
+		for (let sweep = 0; sweep < 15 * 60; sweep++) {
+			await propagator.reconcile();
+			clock += 60_000;
+		}
+		expect(stage(db, eventId)).toBe("failed");
+		// Backoff, not a retry storm: far fewer turns than sweeps.
+		expect(turns).toBeLessThan(MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS);
+		down = false;
+		for (let sweep = 0; sweep < 5 * 60 && stage(db, eventId) === "failed"; sweep++) {
+			await propagator.reconcile();
+			clock += 60_000;
+		}
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(db.authoredOutput(eventId)).toBe("note");
 	});
 
 	test("concurrent reconcile sweeps collapse into one", async () => {
