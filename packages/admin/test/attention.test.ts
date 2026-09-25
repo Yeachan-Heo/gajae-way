@@ -8,9 +8,10 @@ const status = (
 	oldestPendingAgeMs: number | null,
 	expired = 0,
 	recentExpired: NonNullable<GatewayStatusResult["delivery"]>["recentExpired"] = [],
+	recentPending: NonNullable<GatewayStatusResult["delivery"]>["recentPending"] = [],
 ) => ({
 	...STATUS,
-	delivery: { pending, oldestPendingAgeMs, expired, recentExpired },
+	delivery: { pending, oldestPendingAgeMs, expired, recentExpired, recentPending },
 });
 
 describe("buildAttention", () => {
@@ -39,6 +40,31 @@ describe("buildAttention", () => {
 		expect(item?.severity).toBe(2);
 	});
 
+	test("a stuck delivery names its last failure and next retry", () => {
+		const [item] = buildAttention(
+			status(
+				1,
+				PENDING_DELIVERY_MS,
+				0,
+				[],
+				[
+					{
+						deliveryId: "delivery-1",
+						originKey: "discord/channel/room",
+						state: "pending",
+						attempts: 2,
+						lastError: "network",
+						nextRetryAt: "2026-08-27T14:00:04.000Z",
+						createdAt: "2026-08-27T13:50:00.000Z",
+					},
+				],
+			),
+			[],
+			FIXED_NOW,
+		);
+		expect(item?.detail).toContain("Last failure: network after 2 attempts; next retry 2026-08-27T14:00:04.000Z.");
+	});
+
 	test("expired deliveries raise attention with identifiers and origins only", () => {
 		const [item] = buildAttention(
 			status(0, null, 2, [
@@ -47,6 +73,7 @@ describe("buildAttention", () => {
 					originKey: "discord/channel/room",
 					attempts: 5,
 					expiredAt: "2026-08-27T14:00:00.000Z",
+					lastError: "not_found",
 				},
 			]),
 			[],

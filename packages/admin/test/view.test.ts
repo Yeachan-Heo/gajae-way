@@ -72,7 +72,7 @@ describe("status bar", () => {
 		const state = await snapshot({
 			"gateway.status": {
 				...STATUS,
-				delivery: { pending: 2, oldestPendingAgeMs: 11 * 60_000, expired: 0, recentExpired: [] },
+				delivery: { pending: 2, oldestPendingAgeMs: 11 * 60_000, expired: 0, recentExpired: [], recentPending: [] },
 			},
 		});
 		expect(state.status.fields.delivery).toBe("2 deliveries pending · oldest 11m");
@@ -94,8 +94,10 @@ describe("status bar", () => {
 							originKey: "discord/channel/room",
 							attempts: 5,
 							expiredAt: "2026-08-27T14:00:00.000Z",
+							lastError: "not_found",
 						},
 					],
+					recentPending: [],
 				},
 			},
 		});

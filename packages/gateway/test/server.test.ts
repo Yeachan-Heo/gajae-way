@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -145,7 +146,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(23);
+	expect(client.frames[2].result.schemaVersion).toBe(24);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -216,7 +217,13 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
 		state: "pending",
 		attempts: 1,
+		last_error: "other",
 	});
+	client.send({ v: "0.1", type: "request", id: "status-retry", verb: "gateway.status" });
+	await waitFrame(client.frames, "status-retry");
+	const retrying = client.frames.find((frame) => frame.id === "status-retry").result.delivery.recentPending;
+	expect(retrying).toMatchObject([{ deliveryId, state: "pending", attempts: 1, lastError: "other" }]);
+	expect(Date.parse(retrying[0].nextRetryAt)).toBeGreaterThan(Date.now() - 2_000);
 	const messagesBeforeRetry = client.frames.filter(
 		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
 	).length;
@@ -387,6 +394,59 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 	await waitFrame(client.frames, "confirm");
 	expect(eventStage()).toBe("delivered");
 	client.close();
+});
+
+test("the sweep expires a stale unsettled row and alerts once even with no adapter connected", async () => {
+	const logs: string[] = [];
+	const originalError = console.error;
+	console.error = (...values: unknown[]) => logs.push(values.map(String).join(" "));
+	try {
+		directory = await mkdtemp(join(tmpdir(), "gajaeway-delivery-ttl-"));
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home: directory,
+			configPath: join(directory, "config.json"),
+			socketPath: join(directory, "gateway.sock"),
+			dbPath: join(directory, "gateway.db"),
+			logVerbosity: "info",
+			dmPolicy: "open",
+		};
+		const database = await GatewayDatabase.open(config.dbPath);
+		const sessionPort = sessionPortFromResponder({
+			bind: (key, epoch) => bindWorkFixture(key, epoch),
+			respond: async () => "unused",
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		const ledger = new DeliveryLedger(database);
+		ledger.createPending({ deliveryId: "orphan", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
+		ledger.fail("orphan", false, "socket hang up");
+		ledger.fail("orphan", false, "socket hang up");
+		const raw = new Database(config.dbPath);
+		raw
+			.query("UPDATE deliveries SET created_at = ? WHERE delivery_id = 'orphan'")
+			.run(new Date(Date.now() - 25 * 60 * 60_000).toISOString());
+		raw.close();
+		server = await startUnixServer({
+			config,
+			database,
+			sessionPort,
+			onStop: () => database.close(),
+			deliverySweepIntervalMs: 20,
+		});
+		for (let attempt = 0; attempt < 400 && ledger.get("orphan")?.state !== "expired"; attempt++) await Bun.sleep(5);
+		expect(ledger.get("orphan")).toMatchObject({
+			state: "expired",
+			attempts: 2,
+			lastError: "network",
+			nextRetryAt: null,
+		});
+		await Bun.sleep(100);
+		expect(logs.filter((line) => line.startsWith("delivery_expired deliveryId=orphan"))).toEqual([
+			"delivery_expired deliveryId=orphan origin=discord/channel/c attempts=2 reason=age",
+		]);
+	} finally {
+		console.error = originalError;
+	}
 });
 
 test("ops.redeliver requeues expired rows by id or since and immediately publishes them", async () => {
