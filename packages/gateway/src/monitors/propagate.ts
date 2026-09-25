@@ -74,9 +74,31 @@ type DispatchFailureCode =
 	// is neither the aside worker nor an orphaned external run.
 	| "executor_failed"
 	| "delivery_prepare_failed"
+	// The gateway stopped while this attempt's authoring turn was still in
+	// flight (#225). Recoverable: the lease is released at once so the next boot
+	// re-dispatches instead of waiting for the lease to expire, and the failure
+	// row names the session whose host may have outlived the gateway.
+	| "gateway_shutdown"
 	| "event_type_invalid"
 	| "monitor_invalid"
 	| "internal_error";
+
+/**
+ * How long shutdown waits for in-flight authoring turns before marking them
+ * interrupted. Together with the persona drain (5s) and connection settle (5s)
+ * this keeps an ordered stop inside a 30s `TimeoutStopSec` (#225).
+ */
+export const MONITOR_SHUTDOWN_DRAIN_MS = 10_000;
+
+/** A live dispatch claim, so a bounded shutdown can fail and release exactly what this process holds. */
+interface LiveClaim {
+	readonly leaseId: string;
+	readonly batchId: string;
+	readonly origin: string;
+	readonly attempt: number;
+	readonly phase: () => string;
+	readonly sessionId: () => string | undefined;
+}
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -167,6 +189,8 @@ export class MonitorPropagator {
 	#reconciling = false;
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
+	/** Lease/batch identity per event this process is authoring right now. */
+	#claims = new Map<string, LiveClaim>();
 	#closing = false;
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
@@ -258,14 +282,52 @@ export class MonitorPropagator {
 		for (const batch of this.#batches.values()) clearTimeout(batch.timer);
 		this.#batches.clear();
 	}
-	/** Waits for every live dispatch and reconcile writer before the database closes. */
-	async drain(): Promise<void> {
+	/**
+	 * Waits for live dispatch and reconcile writers before the database closes,
+	 * for at most `timeoutMs`. An authoring turn can legitimately run for many
+	 * minutes, and a stop that waits for it is SIGKILLed by the service manager
+	 * with nothing recorded (#225). Past the deadline every claim this process
+	 * still holds is failed as `gateway_shutdown` and its lease released, so the
+	 * event is recoverable state for the next boot's reconcile and the stale
+	 * attempt's later writes are fenced out.
+	 */
+	async drain(timeoutMs = MONITOR_SHUTDOWN_DRAIN_MS): Promise<void> {
 		this.dispose();
+		const deadline = this.#now() + Math.max(0, timeoutMs);
 		while (this.#reconciling || this.#inFlightPromises.size > 0) {
+			const remaining = deadline - this.#now();
+			if (remaining <= 0) {
+				this.#interruptClaims();
+				return;
+			}
 			const active = [...new Set(this.#inFlightPromises.values())];
-			if (active.length > 0) await Promise.all(active);
-			else await Bun.sleep(1);
+			await Promise.race([Promise.all(active), Bun.sleep(Math.min(remaining, 50))]);
 		}
+	}
+	#interruptClaims(): void {
+		const now = this.#now();
+		const stoppedAt = new Date(now).toISOString();
+		for (const [eventId, claim] of this.#claims) {
+			const sessionId = claim.sessionId();
+			const evidence = JSON.stringify({
+				phase: claim.phase(),
+				sessionId: sessionId ?? null,
+				origin: claim.origin,
+				attempt: claim.attempt,
+				stoppedAt,
+			});
+			this.#database.monitorEventFencedFail(
+				eventId,
+				claim.leaseId,
+				claim.batchId,
+				"gateway_shutdown",
+				`dispatch interrupted by gateway shutdown (gateway_shutdown): the authoring turn was still in flight when the gateway stopped at ${stoppedAt}; its session host may outlive this process ${evidence}`,
+				now,
+			);
+			this.#database.monitorEventReleaseLease(eventId, claim.leaseId);
+			console.error(`monitor dispatch interrupted by shutdown: event ${eventId} session=${sessionId ?? "unbound"}`);
+		}
+		this.#claims.clear();
 	}
 	submit(monitorId: string, eventType: string, payload: unknown): string {
 		if (this.#closing) throw new Error("monitor propagator is closing");
@@ -416,6 +478,9 @@ export class MonitorPropagator {
 			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
 			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
+				// A closing propagator starts no new dispatch: the rows stay recoverable
+				// for the next boot's sweep instead of being claimed by a dying process.
+				if (this.#closing) break;
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
 				const output = this.#database.authoredOutput(row.event_id);
 				const hasMemory = this.#database
@@ -553,15 +618,26 @@ export class MonitorPropagator {
 			leaseId,
 			leaseTtlMs,
 		);
+		// Bound outside the try so the failure handler can ask the compaction port
+		// to act on the very session that failed, and can tell whether that
+		// session is still the live one.
+		let boundSessionId: string | undefined;
+		let boundSessionEpoch: number | undefined;
+		let dispatchPhase = "bind";
+		// Registered before the per-origin queue: an event still waiting for its
+		// turn is just as interrupted by a shutdown as one mid-request.
+		for (const row of claimed)
+			this.#claims.set(row.event_id, {
+				leaseId,
+				batchId,
+				origin: sessionOriginKey,
+				attempt: row.dispatch_attempts + 1,
+				phase: () => dispatchPhase,
+				sessionId: () => boundSessionId,
+			});
 		// One generic port owns all same-origin authoring serialization; monitor
 		// leases remain active while a prior call is awaiting a terminal receipt.
 		await this.#sessionPort.runExclusive(sessionOriginKey, async () => {
-			// Bound outside the try so the failure handler can ask the compaction port
-			// to act on the very session that failed, and can tell whether that
-			// session is still the live one.
-			let boundSessionId: string | undefined;
-			let boundSessionEpoch: number | undefined;
-			let dispatchPhase = "bind";
 			// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
 			// a stranded or failed event, so a non-zero count means these events are
 			// not this session's own fresh work. Their context failure says nothing
@@ -785,6 +861,7 @@ export class MonitorPropagator {
 				});
 			} finally {
 				stopHeartbeat();
+				for (const row of claimed) this.#claims.delete(row.event_id);
 				// Release the leases this attempt holds. Lease-guarded: if this attempt
 				// expired and another process stole the claim, this release is a no-op,
 				// and a stale attempt's completion can never overwrite the newer claim.
