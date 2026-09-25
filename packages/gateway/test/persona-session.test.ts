@@ -928,24 +928,56 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 	expect(terminal).toEqual([]);
 });
 
-test("a retired stalled turn detaches into a durable hold and reconciles terminal without stale delivery", async () => {
+test("a retired stalled turn closes its tail and summarizes discarded frames", async () => {
 	const port = new ScriptedSessionPort();
 	const terminal: string[] = [];
-	await harness(port, { terminal: (text) => terminal.push(text) });
+	const logs: string[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
 	enqueue("m-1", "old turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "accepted turn did not start before retired stall");
 	const send = port.sends[0]!;
 	const opRef = latestOpRef;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	await eventually(() => port.tailsOf(send.sessionId).length === 1, "retired turn did not reattach its tail");
+	const tail = port.tailsOf(send.sessionId)[0]!;
+	for (let index = 0; index < 3; index++)
+		tail.emit({
+			kind: "message_end",
+			rawKind: "message_end",
+			eventId: `stale-${index}`,
+			commandId: `command-${opRef}`,
+			turnId: `turn-${opRef}`,
+			payload: { role: "assistant", content: [{ text: "discarded answer" }] },
+			assistantText: "discarded answer",
+			steerEcho: false,
+			idle: false,
+		});
+	await eventually(
+		() => logs.some((line) => line.startsWith(`stale_output originKey=${KEY}`) && line.includes("action=start")),
+		"discarded output start was not summarized",
+	);
+	expect(logs.filter((line) => line.startsWith(`stale_output originKey=${KEY}`))).toHaveLength(1);
 	port.emitStall(send.sessionId);
-	await manager?.recover();
+	await eventually(
+		() => logs.some((line) => line.startsWith(`stale_output originKey=${KEY}`) && line.includes("action=stop")),
+		"discarded output stop was not summarized",
+	);
+	await Bun.sleep(80);
+	expect(port.tailsOf(send.sessionId)).toHaveLength(0);
+	expect(
+		logs.filter((line) => line.includes(`retired_hold originKey=${KEY}`) && line.includes("reason=stall")),
+	).toHaveLength(1);
 	port.complete(send.opRef, "must remain fenced");
 	await manager!.tick(KEY);
 	await eventually(
 		() => database?.inboundTurnRow(opRef)?.turn_state === "done",
 		"retired hold did not reconcile terminal",
 	);
+	const staleLogs = logs.filter((line) => line.startsWith(`stale_output originKey=${KEY}`));
+	expect(staleLogs).toHaveLength(2);
+	expect(staleLogs[0]).toContain("action=start");
+	expect(staleLogs[1]).toMatch(/action=stop count=3 first=\S+ last=\S+ reason=stall/);
 	expect(terminal).toEqual([]);
 });
 

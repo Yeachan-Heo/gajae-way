@@ -487,6 +487,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusTerminalHolds: number;
 	/** Status rechecks scheduled for a turn whose end no relay will announce (backoff ordinal). */
 	statusRechecks: number;
+	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
+	staleOutput?: { count: number; firstAt: number; lastAt: number };
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
@@ -979,6 +981,8 @@ class OriginActor {
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
 		this.#graceTimers.clear();
 		this.#dispatchRetry = undefined;
+		if (this.#current) this.#flushStaleOutput(this.#current, "shutdown");
+		for (const retired of this.#retired.values()) this.#flushStaleOutput(retired, "shutdown");
 		await Promise.all([
 			...(this.#current?.tail ? [this.#current.tail.close()] : []),
 			...[...this.#retired.values()].flatMap((bound) => (bound.tail ? [bound.tail.close()] : [])),
@@ -1559,7 +1563,7 @@ class OriginActor {
 			onFrame: async (frame) => {
 				await this.enqueue(async () => {
 					const bound = this.#findBound(sessionId, epoch, generation);
-					if (bound && !owns(bound)) return;
+					if (bound && (!owns(bound) || bound.detached)) return;
 					await this.#onTailFrame(sessionId, epoch, generation, retired, frame);
 				});
 			},
@@ -1678,6 +1682,28 @@ class OriginActor {
 		await this.#reconcileBound(bound);
 	}
 
+	#recordStaleOutput(bound: BoundTurn): void {
+		const now = this.#manager.now();
+		if (bound.staleOutput) {
+			bound.staleOutput.count++;
+			bound.staleOutput.lastAt = now;
+			return;
+		}
+		bound.staleOutput = { count: 1, firstAt: now, lastAt: now };
+		this.#manager.log(
+			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=start count=1 first=${new Date(now).toISOString()}`,
+		);
+	}
+
+	#flushStaleOutput(bound: BoundTurn, reason: string): void {
+		const staleOutput = bound.staleOutput;
+		if (!staleOutput) return;
+		bound.staleOutput = undefined;
+		this.#manager.log(
+			`stale_output originKey=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} action=stop count=${staleOutput.count} first=${new Date(staleOutput.firstAt).toISOString()} last=${new Date(staleOutput.lastAt).toISOString()} reason=${reason}`,
+		);
+	}
+
 	async #onTailFrame(
 		sessionId: string,
 		epoch: number,
@@ -1694,8 +1720,7 @@ class OriginActor {
 			return;
 		}
 		if ((bound.retired || retired) && !bound.answerWanted) {
-			if (frame.assistantText)
-				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
+			if (frame.assistantText) this.#recordStaleOutput(bound);
 		} else {
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			const replyVisible = await bound.lifecycle.onFrame?.({ ...bound, frame });
@@ -1738,13 +1763,20 @@ class OriginActor {
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`);
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
-			bound.tail?.setTurnRunning(false);
-			await bound.tail?.close();
+			this.#flushStaleOutput(bound, "stall");
+			const tail = bound.tail;
+			tail?.setTurnRunning(false);
+			await tail?.close();
+			bound.tail = undefined;
 			bound.detached = true;
+			// A reopened retired relay cannot own this turn's content. Keep the
+			// accepted turn durable and reconcile it by status without reopening
+			// the stream that produced the stale-output flood.
+			bound.tailEvidenceUnavailable = true;
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 			);
-			this.#scheduleRetiredReattach(bound);
+			await this.#reconcileBound(bound);
 		}
 	}
 
@@ -2050,6 +2082,7 @@ class OriginActor {
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
 		bound.tail?.setTurnRunning(false);
+		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);
 		try {
 			await bound.tail?.close();
@@ -2080,6 +2113,7 @@ class OriginActor {
 	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
+		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
 		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
 		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
