@@ -759,9 +759,6 @@ export async function settleDiscordDelivery(
 			reason: error instanceof Error ? error.message : String(error),
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
-	} finally {
-		await status?.clear(message.origin.conversationId);
-		typing?.end(message.origin.conversationId);
 	}
 }
 
