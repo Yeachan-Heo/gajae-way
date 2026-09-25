@@ -207,6 +207,11 @@ export type WorkerOutputResult =
 export interface SessionRequestInput extends SessionSendInput {
 	/** Stable caller identity carried into tail observability. */
 	readonly originKey?: string;
+	/**
+	 * Inactivity lease, not a wall-clock cap: the wait gives up only after this
+	 * long without a frame attributed to the turn. A turn that keeps emitting
+	 * (tool calls, deltas) is observed for as long as it progresses (issue #9).
+	 */
 	readonly waitTimeoutMs?: number;
 	readonly pollMs?: number;
 }
@@ -223,7 +228,7 @@ export class SessionRequestTimeoutError extends Error {
 	readonly lastStatus: StatusReport;
 
 	constructor(sessionId: string, opRef: string, lastStatus: StatusReport) {
-		super(`session operation ${opRef} did not reach a terminal status before the bounded request wait elapsed`);
+		super(`session operation ${opRef} emitted no attributable activity within the bounded request wait`);
 		this.name = "SessionRequestTimeoutError";
 		this.sessionId = sessionId;
 		this.opRef = opRef;
@@ -1080,12 +1085,16 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		// One relay owns the whole request: the send, the terminal wait, and the
 		// final read. Monitor/batch authoring consumes no mid-turn content, so
-		// the handle's frames are only used for the stall alarm.
+		// the handle's frames only feed the stall alarm and the activity lease.
+		let lastActivityAt = this.#now();
 		const relay = await this.attachTail({
 			sessionId: input.sessionId,
 			brokerGeneration: 0,
 			repo: input.repo,
 			...(input.originKey ? { originKey: input.originKey } : {}),
+			onFrame: () => {
+				lastActivityAt = this.#now();
+			},
 			onStall: ({ elapsedMs }) =>
 				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
 		});
@@ -1126,10 +1135,14 @@ export class BrokerSessionPort implements SessionPort {
 				if (status.status.status === "unknown") throw sendError;
 				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
 			}
-			const deadline = this.#now() + (input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS);
+			// The wait leases on the turn's own activity: every frame the relay
+			// attributes to this op moves the deadline forward. A fixed 1800 s cap
+			// sat inside the ordinary duration of long monitor turns and killed the
+			// request record while the work was still landing (issue #9).
+			const leaseMs = input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS;
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
 			status ??= await readStatus();
-			while (!isTerminalStatus(status.status.status) && this.#now() < deadline) {
+			while (!isTerminalStatus(status.status.status) && this.#now() < lastActivityAt + leaseMs) {
 				this.checkStalls();
 				await this.#sleep(pollMs);
 				status = await readStatus();
