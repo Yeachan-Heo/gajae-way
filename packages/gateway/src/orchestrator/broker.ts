@@ -51,6 +51,18 @@ export interface GlobalGjcClientOptions {
 	readonly readinessDelayMs?: number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
+	/**
+	 * How long a started client may keep failing to reach a broker whose own
+	 * discovery record says it is live before `onLiveOutageExceeded` fires.
+	 */
+	readonly liveOutageLimitMs?: number;
+	/**
+	 * The broker is up but this process has not reached it for
+	 * `liveOutageLimitMs`: the fault is on the gateway side, so the owner should
+	 * exit and let the service manager restart it (#246). A dead or absent broker
+	 * never fires this; restarting the gateway would not bring it back.
+	 */
+	readonly onLiveOutageExceeded?: (detail: string) => void;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -243,6 +255,13 @@ export class GlobalGjcClient {
 	#failures = 0;
 	/** Why the most recent observation failed; logged so an outage names its cause. */
 	#unavailableReason = "not observed";
+	/** Whether the most recent failed observation saw a live broker in discovery. */
+	#observedLiveBroker = false;
+	/** Start of the current post-start outage, whatever its cause. */
+	#outageSince: number | undefined;
+	/** Start of the current run of failures against a broker discovery calls live. */
+	#liveOutageSince: number | undefined;
+	readonly #liveOutageLimit: number;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
@@ -280,6 +299,7 @@ export class GlobalGjcClient {
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
+		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) => this.#run(bindAgentDir(args, this.agentDir), commandOptions?.timeoutMs);
@@ -289,6 +309,11 @@ export class GlobalGjcClient {
 	}
 	get gjcVersion(): string | undefined {
 		return this.#gjcVersion;
+	}
+	/** The current broker outage as a log fragment, or undefined while requests can be served. */
+	outage(now = Date.now()): string | undefined {
+		if (this.#outageSince === undefined) return undefined;
+		return `broker_unavailable_for=${Math.max(0, Math.floor((now - this.#outageSince) / 1000))}s reason=${this.#unavailableReason}`;
 	}
 	/** Judges the daemon from its own discovery file, bypassing SDK transport. */
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
@@ -342,6 +367,8 @@ export class GlobalGjcClient {
 		this.#stopped = true;
 		this.#started = false;
 		this.#available = false;
+		this.#outageSince = undefined;
+		this.#liveOutageSince = undefined;
 		++this.#epoch;
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
@@ -391,14 +418,18 @@ export class GlobalGjcClient {
 		);
 	}
 	async #observe(epoch: number): Promise<boolean> {
+		this.#observedLiveBroker = false;
 		try {
 			const discovery = await this.#discovery();
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			if (!discovery) {
 				this.#available = false;
-				this.#unavailableReason = describeDiscoveryFailure(await this.judgeLiveness());
+				const verdict = await this.judgeLiveness();
+				this.#observedLiveBroker = verdict.state === "live";
+				this.#unavailableReason = describeDiscoveryFailure(verdict);
 				return false;
 			}
+			this.#observedLiveBroker = true;
 			const healthy = await bounded(
 				this.#options.healthProbe
 					? Promise.resolve(
@@ -450,16 +481,37 @@ export class GlobalGjcClient {
 		this.#timer = setTimeout(() => {
 			this.#timer = undefined;
 			void this.#observe(epoch).then((healthy) => {
-				if (healthy) this.#failures = 0;
-				else
+				if (healthy) {
+					this.#failures = 0;
+					this.#outageSince = undefined;
+					this.#liveOutageSince = undefined;
+				} else if (epoch === this.#epoch && !this.#stopped) {
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
 						),
 					);
+					this.#noteOutage(Date.now());
+				}
 				this.#schedule(epoch);
 			});
 		}, wait);
+	}
+	#noteOutage(now: number): void {
+		this.#outageSince ??= now;
+		if (!this.#observedLiveBroker) {
+			this.#liveOutageSince = undefined;
+			return;
+		}
+		this.#liveOutageSince ??= now;
+		const elapsed = now - this.#liveOutageSince;
+		if (elapsed < this.#liveOutageLimit) return;
+		// Restart the window so an owner that does not exit is told again later,
+		// not on every probe.
+		this.#liveOutageSince = now;
+		this.#options.onLiveOutageExceeded?.(
+			sanitizeDiagnostic(`live broker unreachable for ${Math.floor(elapsed / 1000)}s: ${this.#unavailableReason}`),
+		);
 	}
 	#log(error: unknown): void {
 		(this.#options.log ?? console.error)(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));

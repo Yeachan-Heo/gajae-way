@@ -32,7 +32,12 @@ export interface BootGatewayOptions {
 	readonly takeover?: TakeoverPorts;
 }
 
-export async function bootGateway(options: BootGatewayOptions = {}): Promise<GatewayServer> {
+export interface BootedGateway extends GatewayServer {
+	/** The shared-broker client, so the daemon can report its outage state. */
+	readonly broker: GlobalGjcClient;
+}
+
+export async function bootGateway(options: BootGatewayOptions = {}): Promise<BootedGateway> {
 	const config = await loadConfig({ home: options.home, overrides: options.overrides });
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);
@@ -118,7 +123,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 						overrides: options.overrides,
 					});
 			console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
-			return server;
+			return { stop: (reason) => server.stop(reason), broker: supervisor };
 		} catch (error) {
 			try {
 				await broker?.stop();
