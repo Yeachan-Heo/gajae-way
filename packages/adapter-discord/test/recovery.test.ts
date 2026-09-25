@@ -1304,6 +1304,39 @@ test("a rejected engagement.reaction is logged, never a reconnect (live: 313 rec
 	}
 });
 
+test("a live chat.send the gateway rejects is logged with its message and channel, never swallowed (#176)", async () => {
+	const cursorPath = join(home, "live-send-failure", "recovery-cursor.json");
+	const logs: string[] = [];
+	const original = console.error;
+	console.error = (line: unknown) => void logs.push(String(line));
+	const originalLog = console.log;
+	console.log = () => {};
+	try {
+		const gateway = wiredGateway(
+			fakeChannel([]),
+			{
+				request: async (verb: string) => {
+					if (verb === "chat.send") throw Object.assign(new Error("gateway request failed"), { code: "verb_failed" });
+					return {};
+				},
+			},
+			cursorPath,
+		);
+		const result = await gateway.requestInbound("1546123517383286824", channelOrigin, "<@bot-9> handoff", {
+			mentioned: true,
+			group: true,
+			authorId: "quant-gajae",
+		} as never);
+		expect(result).toBeUndefined();
+		expect(logs).toContain(
+			"Discord chat.send failed message=1546123517383286824 channel=channel-1: verb_failed: gateway request failed; left for recovery.",
+		);
+	} finally {
+		console.error = original;
+		console.log = originalLog;
+	}
+});
+
 test("typing begins only for addressed turns: an overheard public-channel turn stays invisible until it replies", async () => {
 	const cursorPath = join(home, "typing-addressed", "recovery-cursor.json");
 	const began: string[] = [];

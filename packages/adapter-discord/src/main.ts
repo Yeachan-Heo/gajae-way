@@ -1669,7 +1669,13 @@ export class ReconnectingGateway {
 					this.typing?.begin(origin.conversationId);
 				}
 				return "acked";
-			} catch {
+			} catch (error) {
+				// Never silent (#176): a live message the gateway did not accept is only
+				// recovered by the next backfill pass, so the drop must be traceable to
+				// the message and conversation it belongs to.
+				console.error(
+					`Discord chat.send failed message=${messageId} channel=${origin.conversationId}: ${summarizeRecoveryFailure(error)}; left for recovery.`,
+				);
 				this.scheduleReconnect();
 				return "unavailable";
 			}

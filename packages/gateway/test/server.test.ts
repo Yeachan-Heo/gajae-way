@@ -1013,6 +1013,66 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	client.close();
 });
 
+test("an inbound ledger write failure fails the mention closed and logs a drop naming the message (#176)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { townhall: { engagement: "mention-open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	database.inboundEnqueue = () => {
+		throw new Error("database is locked");
+	};
+	const origin = { platform: "discord", kind: "channel", conversationId: "townhall" };
+	const logs: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+		const client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "mention",
+			verb: "chat.send",
+			params: {
+				origin,
+				messageId: "1546123517383286824",
+				text: "<@bot> daily handoff",
+				engagement: { mentioned: true, group: true, authorId: "quant-gajae" },
+			},
+		});
+		await waitFrame(client.frames, "mention");
+		// Fail closed: the adapter sees an error, so the message stays eligible for recovery.
+		expect(client.frames.find((frame) => frame.id === "mention")?.type).toBe("error");
+		await Bun.sleep(50);
+		expect(turns).toEqual([]);
+		// And never silent: the drop names the message, the origin, and the reason.
+		expect(logs).toContain(
+			"inbound_dropped message=1546123517383286824 origin=discord/channel/townhall engaged=true reason=ingest_error: database is locked",
+		);
+		client.close();
+	} finally {
+		console.error = original;
+	}
+});
+
 test("a backlog left pending across an outage is answered on boot, never expired", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
