@@ -52,7 +52,7 @@ export interface SessionPort {
 		repo: string;
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
-	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
+	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
 	/**
 	 * Ends the host process of a session this gateway created and has retired.
 	 * Ownership is the point: the shared GJC daemon and broker are never touched,
@@ -70,16 +70,18 @@ export interface SessionPort {
 		sessionId: string;
 		repo: string;
 		selection: GjcModelSelection;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }>;
 	setServiceTier(input: {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }>;
 	status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport>;
 	/** Exact invocation-owned original output; never falls back to a latest-assistant heuristic. */
 	fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult>;
-	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
+	fetchLastAssistant(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<LastAssistantResult>;
 	/**
 	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the op's
 	 * reported startedAt when present, otherwise the turn's `dispatched_at`
@@ -92,6 +94,7 @@ export interface SessionPort {
 		sessionId: string;
 		repo: string;
 		notBeforeMs: number;
+		relay?: TailHandle;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
@@ -177,7 +180,21 @@ export interface WorkerOutputInput {
 	readonly signal?: AbortSignal;
 	/** Generation/attempt fence, checked before and after transport I/O. */
 	readonly isCurrent?: () => boolean;
+	/** The session's live relay; the read goes over it instead of a CLI spawn. */
+	readonly relay?: TailHandle;
 }
+
+/**
+ * One session-scoped SDK request (`raw control|query`). Answers in the CLI's
+ * printed shape so a relay answer and a CLI answer feed the same parsers.
+ * `input: undefined` keeps the CLI argv without `--json-input`.
+ */
+type SdkTransport = (
+	kind: "control" | "query",
+	name: string,
+	input: Record<string, unknown> | undefined,
+	options?: { readonly timeoutMs?: number; readonly cursor?: string },
+) => Promise<CliResult>;
 
 export type WorkerOutputResult =
 	| {
@@ -665,7 +682,7 @@ export class BrokerSessionPort implements SessionPort {
 				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
 				this.#database.assertBrokerAuthority(this.#authority);
 				if (response.ok) {
-					const result = response.result ?? {};
+					const result = recordOf(response.result) ?? {};
 					const receipt = recordOf(result.receipt) ?? result;
 					return {
 						sessionId: input.sessionId,
@@ -743,67 +760,46 @@ export class BrokerSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		selection: GjcModelSelection;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
 		this.#assertOwned(input);
-		if (typeof input.selection !== "string") {
-			const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"control",
-					input.sessionId,
-					"--op",
+		const selection = input.selection;
+		if (typeof selection !== "string") {
+			return await this.#overRelay(input, "model.profile.set", async (sdk) => {
+				const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
+					await sdk("control", "model.profile.set", { id: selection.preset }),
 					"model.profile.set",
-					"--json-input",
-					JSON.stringify({ id: input.selection.preset }),
-				]),
-				"model.profile.set",
-			);
-			const changed = typeof activation === "boolean" ? activation : activation.changed;
-			if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
-			return { changed };
+				);
+				const changed = typeof activation === "boolean" ? activation : activation?.changed;
+				if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
+				return { changed };
+			});
 		}
-		const result = parseEnvelope<{ changed?: unknown }>(
-			await this.#cli([
-				"sdk",
-				"session",
-				"raw",
-				"control",
-				input.sessionId,
-				"--op",
+		return await this.#overRelay(input, "model.set", async (sdk) => {
+			const result = parseEnvelope<{ changed?: unknown } | undefined>(
+				await sdk("control", "model.set", { id: selection }),
 				"model.set",
-				"--json-input",
-				JSON.stringify({ id: input.selection }),
-			]),
-			"model.set",
-		);
-		if (typeof result.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
-		return { changed: result.changed };
+			);
+			if (typeof result?.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
+			return { changed: result.changed };
+		});
 	}
 
 	async setServiceTier(input: {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
+		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
 		this.#assertOwned(input);
-		const result = parseEnvelope<{ changed?: unknown }>(
-			await this.#cli([
-				"sdk",
-				"session",
-				"raw",
-				"control",
-				input.sessionId,
-				"--op",
+		return await this.#overRelay(input, "service_tier.set", async (sdk) => {
+			const result = parseEnvelope<{ changed?: unknown } | undefined>(
+				await sdk("control", "service_tier.set", { tier: input.tier }),
 				"service_tier.set",
-				"--json-input",
-				JSON.stringify({ tier: input.tier }),
-			]),
-			"service_tier.set",
-		);
-		if (typeof result.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
-		return { changed: result.changed };
+			);
+			if (typeof result?.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
+			return { changed: result.changed };
+		});
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport> {
@@ -816,7 +812,7 @@ export class BrokerSessionPort implements SessionPort {
 		const response = await input.relay.query("turn.result", { kind: "prompt", clientRef: input.opRef });
 		this.#database.assertBrokerAuthority(this.#authority);
 		if (!response.ok) throw relayFailure("turn.result", response);
-		const status = response.result ?? {};
+		const status = recordOf(response.result) ?? {};
 		const raw = typeof status.status === "string" ? status.status : "unknown";
 		return parseStatusReport({
 			exitCode: 0,
@@ -843,19 +839,11 @@ export class BrokerSessionPort implements SessionPort {
 		const read = async (): Promise<WorkerOutputResult> => {
 			if (workerOutputCancelled(input)) return { status: "unavailable", code: "cancelled" };
 			try {
-				const raw = await this.#cli(
-					[
-						"sdk",
-						"session",
-						"raw",
-						"query",
-						input.sessionId,
-						"--query",
-						"turn.result",
-						"--json-input",
-						JSON.stringify({ kind: "prompt", clientRef: input.opRef }),
-					],
-					{ timeoutMs: 15_000 },
+				const raw = await this.#overRelay(
+					input,
+					"turn.result",
+					async (sdk) =>
+						await sdk("query", "turn.result", { kind: "prompt", clientRef: input.opRef }, { timeoutMs: 15_000 }),
 				);
 				return parseWorkerOutputResponse(input, raw, this.#now());
 			} catch (error) {
@@ -882,11 +870,12 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
+	async queueEmpty(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean> {
 		this.#assertOwned(input);
-		const result = await this.#cli(
-			["sdk", "session", "raw", "query", input.sessionId, "--query", "queue.messages.list", "--json-input", "{}"],
-			{ timeoutMs: 10_000 },
+		const result = await this.#overRelay(
+			input,
+			"queue.messages.list",
+			async (sdk) => await sdk("query", "queue.messages.list", {}, { timeoutMs: 10_000 }),
 		);
 		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
@@ -922,29 +911,23 @@ export class BrokerSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		notBeforeMs: number;
+		relay?: TailHandle;
 	}): Promise<LastAssistantResult | undefined> {
 		this.#assertOwned(input);
+		return await this.#overRelay(input, "transcript.list", async (sdk) => await this.#assistantSince(input, sdk));
+	}
+
+	async #assistantSince(input: { notBeforeMs: number }, sdk: SdkTransport): Promise<LastAssistantResult | undefined> {
 		let cursor: string | undefined;
 		let latest: { role?: string; ts?: string; textSummary?: string; body?: string } | undefined;
 		const seenCursors = new Set<string>();
 		for (let pages = 1; pages <= 1_000; pages++) {
-			const result = await this.#cli(
-				[
-					"sdk",
-					"session",
-					"raw",
-					"query",
-					input.sessionId,
-					"--query",
-					"transcript.list",
-					"--json-input",
-					"{}",
-					...(cursor ? ["--cursor", cursor] : []),
-				],
-				{ timeoutMs: 15_000 },
-			);
+			const result = await sdk("query", "transcript.list", {}, { timeoutMs: 15_000, ...(cursor ? { cursor } : {}) });
+			const envelope = JSON.parse(result.stdout) as { ok?: unknown };
+			// A refusal is the host's answer: surface its code, not a missing page.
+			if (envelope.ok === false) parseEnvelope(result, "transcript.list");
 			const page = (
-				JSON.parse(result.stdout) as {
+				envelope as {
 					page?: {
 						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }>;
 						complete?: unknown;
@@ -977,34 +960,13 @@ export class BrokerSessionPort implements SessionPort {
 		throw new TranscriptIncompleteError("transcript.list exceeded 1000 recovery pages", 1_000);
 	}
 
-	async fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult> {
+	async fetchLastAssistant(input: {
+		sessionId: string;
+		repo: string;
+		relay?: TailHandle;
+	}): Promise<LastAssistantResult> {
 		this.#assertOwned(input);
-		const maxPages = 50;
-		const chunks: string[] = [];
-		let cursor: string | undefined;
-		for (let pages = 1; pages <= maxPages; pages++) {
-			const page = parseLastAssistantPage(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"query",
-					input.sessionId,
-					"--query",
-					"session.last_assistant",
-					...(cursor ? ["--cursor", cursor] : []),
-				]),
-			);
-			chunks.push(page.text);
-			if (page.complete) return { text: chunks.join(""), pages, complete: true };
-			if (!page.cursor)
-				throw new TranscriptIncompleteError(
-					`session.last_assistant page ${pages} is incomplete but returned no continuation cursor`,
-					pages,
-				);
-			cursor = page.cursor;
-		}
-		throw new TranscriptIncompleteError(`session.last_assistant did not complete within ${maxPages} pages`, maxPages);
+		return await this.#overRelay(input, "session.last_assistant", async (sdk) => await lastAssistant(sdk));
 	}
 
 	async attachTail(input: TailAttachInput): Promise<TailHandle> {
@@ -1153,7 +1115,7 @@ export class BrokerSessionPort implements SessionPort {
 			return {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }),
+				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }),
 			};
 		} finally {
 			relay.setTurnRunning(false);
@@ -1165,9 +1127,104 @@ export class BrokerSessionPort implements SessionPort {
 		this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
 	}
 
+	/**
+	 * Runs one session-scoped read or control on the caller's live relay, and on
+	 * the CLI only when the relay transport failed (closed, timed out) - the same
+	 * rule as `status()`. A relay refusal (`ok: false`) is the host's answer and
+	 * surfaces exactly as the CLI's envelope would; it is never retried there.
+	 * Without a relay the CLI is the transport: opening a relay (itself a
+	 * `serve --stdio` spawn) for one request would buy nothing. A paged read that
+	 * tears mid-way restarts on the CLI: relay cursors are grants of the relay
+	 * connection and do not carry over.
+	 */
+	async #overRelay<T>(
+		input: { readonly sessionId: string; readonly relay?: TailHandle },
+		operation: string,
+		work: (sdk: SdkTransport) => Promise<T>,
+	): Promise<T> {
+		const cli = this.#cliTransport(input.sessionId);
+		if (!input.relay) return await work(cli);
+		try {
+			return await work(this.#relayTransport(input.relay));
+		} catch (error) {
+			if (!isRelayTransportFailure(error)) throw error;
+			console.error(
+				`relay_request_unavailable session=${input.sessionId} op=${operation} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+			);
+			return await work(cli);
+		}
+	}
+
+	#cliTransport(sessionId: string): SdkTransport {
+		return async (kind, name, input, options) =>
+			await this.#cli(
+				[
+					"sdk",
+					"session",
+					"raw",
+					kind,
+					sessionId,
+					kind === "control" ? "--op" : "--query",
+					name,
+					...(input === undefined ? [] : ["--json-input", JSON.stringify(input)]),
+					...(options?.cursor ? ["--cursor", options.cursor] : []),
+				],
+				options?.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs },
+			);
+	}
+
+	/**
+	 * The relay answer printed in the CLI's shape (`{ ok, result | page | error }`, exit 0).
+	 * The CLI timeouts budget a process spawn plus broker attach; a request on an
+	 * open connection keeps the runner's own request timeout.
+	 */
+	#relayTransport(relay: TailHandle): SdkTransport {
+		return async (kind, name, input, options) => {
+			const requestOptions = options?.cursor ? { cursor: options.cursor } : {};
+			this.#database.assertBrokerAuthority(this.#authority);
+			const response =
+				kind === "control"
+					? await relay.control(name, input ?? {}, requestOptions)
+					: await relay.query(name, input ?? {}, requestOptions);
+			this.#database.assertBrokerAuthority(this.#authority);
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					...(kind === "query" ? { type: "query_response" } : {}),
+					ok: response.ok,
+					...(response.result === undefined ? {} : { result: response.result }),
+					...(response.page === undefined ? {} : { page: response.page }),
+					...(response.ok ? {} : { error: response.error ?? {} }),
+				}),
+				stderr: "",
+			};
+		};
+	}
+
 	#controller(repo: string): ControllerOptions {
 		return { run: this.#cli, repo };
 	}
+}
+
+/** `session.last_assistant`, paged by the host's continuation cursor until complete. */
+async function lastAssistant(sdk: SdkTransport): Promise<LastAssistantResult> {
+	const maxPages = 50;
+	const chunks: string[] = [];
+	let cursor: string | undefined;
+	for (let pages = 1; pages <= maxPages; pages++) {
+		const page = parseLastAssistantPage(
+			await sdk("query", "session.last_assistant", undefined, cursor ? { cursor } : undefined),
+		);
+		chunks.push(page.text);
+		if (page.complete) return { text: chunks.join(""), pages, complete: true };
+		if (!page.cursor)
+			throw new TranscriptIncompleteError(
+				`session.last_assistant page ${pages} is incomplete but returned no continuation cursor`,
+				pages,
+			);
+		cursor = page.cursor;
+	}
+	throw new TranscriptIncompleteError(`session.last_assistant did not complete within ${maxPages} pages`, maxPages);
 }
 
 /**
@@ -1351,7 +1408,9 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 	const items = (page as Record<string, unknown>).items;
 	if (!Array.isArray(items) || items.some((item) => typeof item !== "string"))
 		throw new Error("session.last_assistant query page contained non-text items");
-	const cursor = (page as Record<string, unknown>).cursor;
+	// gjc hosts grant `continuationCursor`; older CLI prints carried `cursor`.
+	const record = page as Record<string, unknown>;
+	const cursor = typeof record.continuationCursor === "string" ? record.continuationCursor : record.cursor;
 	return {
 		text: items.join(""),
 		complete: (page as Record<string, unknown>).complete === true,
