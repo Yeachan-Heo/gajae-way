@@ -419,6 +419,13 @@ export interface MonitorSpec {
 	 * response contract is unaffected.
 	 */
 	readonly instruction?: string;
+	/**
+	 * Procedure/doctrine files this monitor follows, relative to the session
+	 * workspace (`memory/...` reaches the memory corpus). They are re-read on
+	 * EVERY firing and their current content is handed to the authoring turn, so
+	 * an edit reaches a long-lived event-type session on the very next firing.
+	 */
+	readonly procedureFiles?: readonly string[];
 	/** Absent means inherit the gateway default; present overrides this monitor's authoring session. */
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
@@ -456,6 +463,17 @@ export interface MonitorEventRecord {
 	/** Historical authority hold; stage remains the recorded historical stage. */
 	readonly quarantined?: boolean;
 	readonly reason?: string;
+	/** Procedure file versions the authoring turn was given; present once authored with declared procedure files. */
+	readonly procedure?: readonly MonitorProcedureVersion[];
+}
+
+/** Version of one declared procedure file as read for one firing. */
+export interface MonitorProcedureVersion {
+	readonly path: string;
+	readonly status: "ok" | "truncated" | "missing" | "unreadable" | "too_large" | "outside_root";
+	/** sha256 of the full file bytes, when the file was read. */
+	readonly sha256?: string;
+	readonly mtime?: string;
 }
 
 /** A worker gjc session run: an isolated coding-register session doing delegated work. */

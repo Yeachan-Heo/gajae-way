@@ -1105,6 +1105,7 @@ async function handleRequest(
 					eventType: row.event_type,
 					firedAt: row.fired_at,
 					stage: row.stage,
+					...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
 					...(options.database.isBrokerQuarantined("monitor", row.event_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
