@@ -1345,6 +1345,37 @@ export class GatewayDatabase {
 		}>;
 	}
 
+	/**
+	 * Cycle projection source: per event type, the run of most recent terminal
+	 * events (fired at or after `sinceIso`) that exhausted retries with no stored
+	 * authored output. Any other terminal outcome ends the run; in-flight events
+	 * are not evidence either way. Types whose latest terminal event is not such a
+	 * loss are omitted.
+	 */
+	monitorAuthoringLossStreaks(
+		sinceIso: string,
+	): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
+		const rows = this.#database
+			.query<{ event_type: string; fired_at: string; lost: number }, [string]>(
+				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+			)
+			.all(sinceIso);
+		const streaks = new Map<string, { consecutive: number; lastFiredAt: string; open: boolean }>();
+		for (const row of rows) {
+			const streak = streaks.get(row.event_type);
+			if (!streak) {
+				streaks.set(row.event_type, { consecutive: row.lost ? 1 : 0, lastFiredAt: row.fired_at, open: !!row.lost });
+			} else if (streak.open) {
+				if (row.lost) streak.consecutive++;
+				else streak.open = false;
+			}
+		}
+		return [...streaks]
+			.filter(([, streak]) => streak.consecutive > 0)
+			.map(([eventType, { consecutive, lastFiredAt }]) => ({ eventType, consecutive, lastFiredAt }))
+			.sort((a, b) => a.eventType.localeCompare(b.eventType));
+	}
+
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")

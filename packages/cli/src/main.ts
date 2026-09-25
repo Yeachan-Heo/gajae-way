@@ -160,6 +160,10 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(
 		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,
 	);
+	if (cycle.monitorAuthoringLost.length > 0)
+		lines.push(
+			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
+		);
 	if (cycle.sessions.length > 0) {
 		lines.push("sessions:");
 		lines.push("INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST");
