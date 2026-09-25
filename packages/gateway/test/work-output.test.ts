@@ -212,7 +212,12 @@ test("absence is retryable, affirmative missing authority is unavailable, and tr
 		status: "absent",
 		code: "output_pending",
 	});
+	// A missing receipt can still be enriched by a late agent_end (#248).
 	expect(parse(terminal("", { content: undefined, receiptState: "missing" }))).toEqual({
+		status: "absent",
+		code: "output_pending",
+	});
+	expect(parse(terminal("", { content: undefined, receiptState: "absent" }))).toEqual({
 		status: "unavailable",
 		code: "output_unavailable",
 	});

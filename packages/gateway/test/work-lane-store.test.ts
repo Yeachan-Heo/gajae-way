@@ -332,6 +332,54 @@ describe("work attempt durable transactions", () => {
 		).toThrow();
 	});
 
+	test("terminal evidence is write-once except a proven missing-to-present receipt (#248)", async () => {
+		const f = await fixture();
+		f.database.workAttemptPrepare(f.runtime, f.record);
+		const missing = {
+			kind: "broker" as const,
+			observedAt: END,
+			reasonCode: "terminal_missing_receipt",
+			status: { status: "terminal_ok" as const, receiptState: "missing" as const, outcome: { reason: "end_turn" } },
+		};
+		const present = {
+			...missing,
+			reasonCode: "end_turn",
+			status: { ...missing.status, receiptState: "present" as const },
+		};
+		const runtime = f.database.workAttemptUpdate(f.runtime.opRef, 0, { terminal: missing })!;
+		const proof = {
+			opRef: f.runtime.opRef,
+			sessionId: SESSION,
+			epoch: 0,
+			observedAtMs: Date.parse(END),
+			source: "turn.result" as const,
+			attribution: "operation_ref" as const,
+			fullness: "original" as const,
+			clientRef: f.runtime.opRef,
+			repo: "/work",
+			terminalAt: Date.parse(END),
+			contentVersion: 1 as const,
+			byteLength: 8,
+		};
+		const available = { ...runtime.output, disposition: "available" as const, excerpt: "PR ready", proof };
+		// No proven body: the receipt cannot be upgraded.
+		expect(() => f.database.workAttemptUpdate(runtime.opRef, runtime.version, { terminal: present })).toThrow();
+		// Any other terminal rewrite remains forbidden, even with a proven body.
+		expect(() =>
+			f.database.workAttemptUpdate(runtime.opRef, runtime.version, {
+				terminal: { ...present, status: { ...present.status, outcome: { reason: "refusal" } } },
+				output: available,
+			}),
+		).toThrow();
+		const upgraded = f.database.workAttemptUpdate(runtime.opRef, runtime.version, {
+			terminal: present,
+			output: available,
+		})!;
+		expect(upgraded.terminal).toEqual(present);
+		// present never regresses to missing.
+		expect(() => f.database.workAttemptUpdate(upgraded.opRef, upgraded.version, { terminal: missing })).toThrow();
+	});
+
 	test("corrupt runtime projection or history throws rather than returning empty", async () => {
 		const f = await fixture();
 		f.database.workAttemptPrepare(f.runtime, f.record);
