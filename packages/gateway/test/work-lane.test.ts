@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -477,6 +477,78 @@ for (const [reason, state] of [
 		expect(Buffer.byteLength(suffix)).toBeLessThanOrEqual(2048);
 	});
 }
+
+test("failing status reads back off and log one diagnostic per distinct reason (#262)", async () => {
+	const f = await fixture();
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const result = await started(f);
+	let queries = 0;
+	let message = "reconciliation unavailable token=sk-secret-value";
+	f.port.status = async () => {
+		queries++;
+		throw new Error(message);
+	};
+	await Bun.sleep(300);
+	// Fixed 5ms polling would have issued ~60 reads; backoff bounds it.
+	expect(queries).toBeGreaterThan(0);
+	expect(queries).toBeLessThan(12);
+	const lines = () =>
+		errors.mock.calls
+			.map((call) => String(call[0]))
+			.filter((line) => line.startsWith("work_reconciliation_unavailable"));
+	expect(lines()).toHaveLength(1);
+	expect(lines()[0]).toContain(`opRef=${result.opRef}`);
+	expect(lines()[0]).toContain("reason=Error: reconciliation unavailable");
+	expect(lines()[0]).not.toContain("sk-secret-value");
+	message = "offline";
+	await until(() => lines().length === 2);
+	expect(lines()[1]).toContain("reason=Error: offline");
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+});
+
+test("a rebound lane stops the observer and settles the attempt as session_disowned (#262)", async () => {
+	const f = await fixture({ pollMs: 1 });
+	const result = await started(f, "a", origin);
+	let queries = 0;
+	f.port.status = async () => {
+		queries++;
+		throw new Error("invalid status identity");
+	};
+	await until(() => queries > 0);
+	f.db.rebindEpoch(result.sessionKey);
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_disowned");
+	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
+	expect(f.job().state).toBe("awaiting_operator");
+	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: session_disowned: output_unavailable");
+	const settledQueries = queries;
+	await Bun.sleep(50);
+	expect(queries).toBe(settledQueries);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+});
+
+test("persistently failing status without liveness proof settles instead of polling forever (#262)", async () => {
+	const f = await fixture({ pollMs: 1 });
+	const result = await started(f, "a", origin);
+	let queries = 0;
+	f.port.status = async () => {
+		queries++;
+		throw new Error("offline");
+	};
+	f.port.liveness = async () => {
+		throw new Error("offline");
+	};
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(queries).toBeLessThanOrEqual(10);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("recovery_indeterminate");
+	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
+	const settledQueries = queries;
+	await Bun.sleep(50);
+	expect(queries).toBe(settledQueries);
+	expect(f.port.sends).toHaveLength(1);
+});
 
 test("live restart reattaches exact session/op without bind, resume or replay", async () => {
 	const f = await fixture();
