@@ -362,6 +362,60 @@ test("each unavailable observation names why the broker was rejected", async () 
 	await eventually(() => logs.some((line) => line.endsWith("observing without repair: discovery absent)")));
 });
 
+test("a live broker the gateway cannot reach past the bound asks the owner to exit (#246)", async () => {
+	// 2026-09-21: a current, healthy broker, yet every request failed
+	// broker_unavailable for 37 minutes while service_alive kept ticking; only a
+	// gateway restart recovered it.
+	let probeOk = true;
+	const exceeded: string[] = [];
+	const value = client({
+		healthProbe: async () => probeOk,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		liveOutageLimitMs: 40,
+		onLiveOutageExceeded: (detail) => exceeded.push(detail),
+	});
+	await value.start();
+	expect(value.outage()).toBeUndefined();
+	probeOk = false;
+	await eventually(() => exceeded.length > 0);
+	expect(exceeded[0]).toMatch(/^live broker unreachable for \d+s: endpoint probe failed for live discovery pid 12345$/);
+	expect(value.outage()).toMatch(
+		/^broker_unavailable_for=\d+s reason=endpoint probe failed for live discovery pid 12345$/,
+	);
+	probeOk = true;
+	await eventually(() => value.outage() === undefined);
+});
+
+test("a dead or absent broker never asks the gateway to exit (#246)", async () => {
+	// 2026-09-23: the broker itself was being killed; restarting the gateway on
+	// top of it would only stack restarts.
+	const agentDir = await directory();
+	await mkdir(join(agentDir, "sdk"));
+	await writeFile(
+		join(agentDir, "sdk", "broker.json"),
+		JSON.stringify({ ...discovery(), protocolVersion: 3, host: "127.0.0.1" }),
+	);
+	let alive = true;
+	const exceeded: string[] = [];
+	const value = client({
+		agentDir,
+		discovery: undefined,
+		isPidAlive: () => alive,
+		healthProbe: async () => alive,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		liveOutageLimitMs: 20,
+		onLiveOutageExceeded: (detail) => exceeded.push(detail),
+	});
+	await value.start();
+	alive = false;
+	await eventually(() => value.outage()?.endsWith("reason=discovery pid 12345 is dead") === true);
+	await Bun.sleep(80);
+	expect(value.outage()).toContain("reason=discovery pid 12345 is dead");
+	expect(exceeded).toEqual([]);
+});
+
 test("rejects retarget arguments before executing commands", async () => {
 	let calls = 0;
 	const value = client({

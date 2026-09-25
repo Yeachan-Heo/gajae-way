@@ -6,7 +6,13 @@ import { sanitizeDiagnostic } from "./orchestrator/rebind";
  * line has to be greppable from a journal that is read after the fact, and the
  * operator has to be able to count restarts per class (#182).
  */
-export type ExitCause = "boot_failure" | "uncaught_exception" | "unhandled_rejection" | "signal" | "unexpected_exit";
+export type ExitCause =
+	| "boot_failure"
+	| "broker_unreachable"
+	| "uncaught_exception"
+	| "unhandled_rejection"
+	| "signal"
+	| "unexpected_exit";
 
 export type ExitWriter = (line: string) => void;
 
