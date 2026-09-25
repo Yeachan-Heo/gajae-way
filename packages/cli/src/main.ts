@@ -27,6 +27,7 @@ import {
 	SESSION_COLUMNS,
 	type SessionListRow,
 } from "./list";
+import { migrate, parseMigrateArgs } from "./migrate";
 import {
 	effectiveRestartState,
 	type LaunchRestartOptions,
@@ -37,7 +38,6 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
-import { migrate, parseMigrateArgs } from "./migrate";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
