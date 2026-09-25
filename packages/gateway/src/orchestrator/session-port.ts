@@ -24,7 +24,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
 import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
-import { sanitizeDiagnostic } from "./rebind";
+import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
 	type RelayResponse,
@@ -379,7 +379,7 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			if (input.epochRecovery === false) throw error;
+			if (input.epochRecovery === false || !isRebindableCode(sdkErrorCode(error))) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
 				console.error(

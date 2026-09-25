@@ -277,7 +277,7 @@ test("no discovery launches only a read-only explicit all-scope readiness reques
 		},
 	});
 	await value.start();
-	expect(calls).toEqual([["sdk", "session", "list", "--scope", "all", "--agent-dir", value.agentDir]]);
+	expect(calls).toEqual([["sdk", "session", "list", "--scope", "all", "--json", "--agent-dir", value.agentDir]]);
 	expect(value.generation).toBe(1);
 });
 
@@ -665,7 +665,7 @@ test("the gjc 0.17.4 structured usage envelope is a usage rejection; runtime env
 	expect(isUsageRejection({ exitCode: 2, stdout: "", stderr: 'ERROR {"code":"broker_unavailable"}\n' })).toBe(false);
 });
 
-test("every sdk session call binds --agent-dir at the leaf, never between `session` and the leaf", async () => {
+test("every sdk session call adds JSON output and binds --agent-dir at the leaf", async () => {
 	const calls: string[][] = [];
 	const value = client({
 		command: async (args) => {
@@ -675,18 +675,45 @@ test("every sdk session call binds --agent-dir at the leaf, never between `sessi
 	});
 	await value.start();
 	for (const leaf of [
+		["list", "--scope", "all"],
 		["inspect", "s-1"],
 		["status", "s-1", "op-1"],
+		["send", "s-1", "--text", "hello", "--op-ref", "op-1", "--wait", "--json"],
+		["tail", "s-1", "--strict", "--all-events", "--json"],
+		["close", "s-1"],
+		["retire", "s-1"],
+		["raw", "control", "s-1", "--op", "model.set", "--json-input", '{"id":"test-model"}'],
 		["raw", "query", "s-1", "--query", "transcript.list"],
 		["raw", "global", "--op", "session.close"],
+		["raw", "global", "--op", "session.create", "--idempotency-key", "create-1", "--json-input", '{"cwd":"/work"}'],
 	]) {
 		await value.cli(["sdk", "session", ...leaf]);
 	}
 	for (const args of calls) {
 		expect(args[2]).not.toBe("--agent-dir");
+		expect(args.filter((arg) => arg === "--json")).toHaveLength(1);
 		expect(args.slice(-2)).toEqual(["--agent-dir", value.agentDir]);
 	}
-	expect(calls.length).toBe(4);
+	expect(calls).toHaveLength(11);
+	expect(calls[10]).toContain('{"cwd":"/work"}');
+});
+
+test("session payload values equal to --json are preserved while output mode is added", async () => {
+	let invocation: readonly string[] | undefined;
+	const value = client({
+		command: async (args) => {
+			invocation = [...args];
+			return healthy;
+		},
+	});
+	const args = ["sdk", "session", "send", "s-1", "--text", "--json"];
+	await value.cli(args);
+	expect(invocation).toEqual([...args, "--json", "--agent-dir", value.agentDir]);
+	expect(args).toEqual(["sdk", "session", "send", "s-1", "--text", "--json"]);
+	await value.cli([...args, "--json"]);
+	expect(invocation).toEqual([...args, "--json", "--agent-dir", value.agentDir]);
+	expect(() => value.cli(["sdk", "session", "list", "--json", "--json"])).toThrow("duplicate --json flags");
+	expect(() => value.cli(["sdk", "session", "list", "--", "--json"])).toThrow("option delimiters");
 });
 
 test("relay stdout and stderr are decoded independently: a multibyte character split across stdout chunks survives interleaved stderr and stderr EOF", async () => {
