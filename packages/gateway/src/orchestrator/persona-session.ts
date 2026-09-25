@@ -1773,6 +1773,9 @@ class OriginActor {
 			// accepted turn durable and reconcile it by status without reopening
 			// the stream that produced the stale-output flood.
 			bound.tailEvidenceUnavailable = true;
+			// This discarded turn no longer needs a producer. Terminate its host,
+			// but retain the accepted row and never infer terminal status from SIGTERM.
+			if (!bound.answerWanted) await this.#terminateRetiredSession(sessionId, "stall", bound);
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 			);
@@ -2229,19 +2232,17 @@ class OriginActor {
 	}
 
 	/**
-	 * A retired turn has just been reconciled (answer delivered, failed, or
-	 * provably never landed) and dropped from `#retired`. Nothing will prompt
-	 * its session again: this origin is bound to a newer epoch. End the host so
-	 * it stops occupying the model provider. Skipped when the session is still
-	 * the live binding (same epoch reused) or some other retired turn on this
-	 * origin still needs it; best-effort, logged, never fatal.
+	 * End an obsolete session host after its final turn is settled, or after a
+	 * stalled retired turn is discarded. The latter remains in `#retired` for
+	 * status reconciliation, so callers may exclude that one hold while the
+	 * same-session guard still protects every other live or retired turn.
 	 */
-	async #terminateRetiredSession(sessionId: string, reason: string): Promise<void> {
+	async #terminateRetiredSession(sessionId: string, reason: string, except?: BoundTurn): Promise<void> {
 		const port = this.#manager.port;
 		if (!port.terminateHost) return;
 		if (this.#current?.sessionId === sessionId) return;
 		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
-		for (const other of this.#retired.values()) if (other.sessionId === sessionId) return;
+		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
 		try {
 			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
 			this.#manager.log(

@@ -929,7 +929,12 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 });
 
 test("a retired stalled turn closes its tail and summarizes discarded frames", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) => {
+			if (input.text === "new turn") scripted.complete(input.opRef, "replacement reply");
+		},
+	});
 	const terminal: string[] = [];
 	const logs: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
@@ -939,6 +944,12 @@ test("a retired stalled turn closes its tail and summarizes discarded frames", a
 	const send = port.sends[0]!;
 	const opRef = latestOpRef;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	enqueue("m-2", "new turn");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2 && terminal.length === 1, "replacement turn did not settle");
+	const replacement = port.sends[1]!;
+	expect(replacement.sessionId).not.toBe(send.sessionId);
+	expect(database!.getSessionRecord(KEY)?.sessionId).toBe(replacement.sessionId);
 	await eventually(() => port.tailsOf(send.sessionId).length === 1, "retired turn did not reattach its tail");
 	const tail = port.tailsOf(send.sessionId)[0]!;
 	for (let index = 0; index < 3; index++)
@@ -958,13 +969,28 @@ test("a retired stalled turn closes its tail and summarizes discarded frames", a
 		"discarded output start was not summarized",
 	);
 	expect(logs.filter((line) => line.startsWith(`stale_output originKey=${KEY}`))).toHaveLength(1);
+	await Bun.sleep(10);
 	port.emitStall(send.sessionId);
 	await eventually(
 		() => logs.some((line) => line.startsWith(`stale_output originKey=${KEY}`) && line.includes("action=stop")),
 		"discarded output stop was not summarized",
 	);
+	await eventually(
+		() =>
+			logs.some((line) => line.includes("retired_session_host") && line.includes("reason=stall outcome=terminated")),
+		"stalled retired host was not terminated",
+	);
 	await Bun.sleep(80);
 	expect(port.tailsOf(send.sessionId)).toHaveLength(0);
+	expect(port.closes.map((close) => close.sessionId)).toEqual([send.sessionId]);
+	expect(await port.inspect({ sessionId: send.sessionId, repo: join(home, "workspace") })).toMatchObject({
+		live: false,
+	});
+	expect(await port.inspect({ sessionId: replacement.sessionId, repo: join(home, "workspace") })).toMatchObject({
+		live: true,
+	});
+	expect(database!.inboundTurnRow(opRef)?.turn_state).toBe("accepted");
+	expect(port.sends).toHaveLength(2);
 	expect(
 		logs.filter((line) => line.includes(`retired_hold originKey=${KEY}`) && line.includes("reason=stall")),
 	).toHaveLength(1);
@@ -978,7 +1004,7 @@ test("a retired stalled turn closes its tail and summarizes discarded frames", a
 	expect(staleLogs).toHaveLength(2);
 	expect(staleLogs[0]).toContain("action=start");
 	expect(staleLogs[1]).toMatch(/action=stop count=3 first=\S+ last=\S+ reason=stall/);
-	expect(terminal).toEqual([]);
+	expect(terminal).toEqual(["replacement reply"]);
 });
 
 /** A torn initial send used to exercise recovery of persisted unaccepted turns. */
