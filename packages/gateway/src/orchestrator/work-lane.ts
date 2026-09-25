@@ -487,7 +487,9 @@ export class WorkLaneManager {
 			if (!this.#current(observer)) return;
 			observer.task = this.#tick(observer)
 				.then(
-					() => this.#failures.delete(opRef),
+					() => {
+						this.#failures.delete(opRef);
+					},
 					(error: unknown) => this.#failed(observer, error),
 				)
 				.finally(() => {
