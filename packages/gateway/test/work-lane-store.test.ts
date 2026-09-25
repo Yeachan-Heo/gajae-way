@@ -367,7 +367,7 @@ describe("work attempt durable transactions", () => {
 	test("v21 migration preserves historical open history and adopts without target", async () => {
 		const f = await fixture();
 		f.database.putLaneJob({ ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) });
-		// Preserve the fixture's explicit provenance while replaying v21 and v22.
+		// Preserve the fixture's explicit provenance while replaying v21 through v23.
 		// Restoring a snapshot is not initialization/adoption of a populated database.
 		f.raw.exec(`CREATE TEMP TABLE saved_authority AS SELECT * FROM broker_authority;
 			CREATE TEMP TABLE saved_bindings AS SELECT * FROM broker_owned_bindings;`);
@@ -384,7 +384,12 @@ describe("work attempt durable transactions", () => {
 			"broker_retired_sessions",
 		])
 			f.raw.exec(`DROP TABLE ${table}`);
-		f.raw.exec("DROP TABLE work_attempt_runtime; DELETE FROM schema_migrations WHERE version >= 21");
+		f.raw.exec(`
+ALTER TABLE memory_intents DROP COLUMN quarantine_reason;
+ALTER TABLE memory_intents DROP COLUMN attempts;
+DROP TABLE work_attempt_runtime;
+DELETE FROM schema_migrations WHERE version >= 21;
+`);
 		const migrated = await GatewayDatabase.open(f.path);
 		handles.push(migrated);
 		f.raw.exec(`INSERT INTO broker_authority SELECT * FROM saved_authority;
@@ -396,7 +401,7 @@ describe("work attempt durable transactions", () => {
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(22);
+		expect(migrated.schemaVersion).toBe(23);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, target: null };
 		migrated.workAttemptPrepare(historical, f.record);

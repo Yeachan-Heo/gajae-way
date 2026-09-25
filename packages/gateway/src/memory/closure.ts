@@ -1,5 +1,6 @@
 import { appendFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "../store/db";
 import { appendDaily, initializeMemory, memoryGit } from "./doctrine";
 
@@ -15,6 +16,8 @@ type Intent = {
 	kind: string;
 	payload_json: string;
 	state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+	attempts: number;
+	quarantine_reason: string | null;
 };
 export type RecoveryReport = {
 	queued: number;
@@ -58,12 +61,23 @@ export class MemoryClosureQueue {
 	async #initialize(): Promise<RecoveryReport> {
 		await initializeMemory(this.#home);
 		for (const intent of this.#database.memoryIntentRows()) {
-			if (intent.state === "receipted" || intent.state === "quarantined") continue;
+			if (intent.state === "receipted") continue;
+			if (intent.state === "quarantined") {
+				const reason = intent.quarantine_reason ?? "reason unavailable (legacy quarantined intent)";
+				if (!intent.quarantine_reason) this.#database.memoryIntentQuarantine(intent.id, reason);
+				await this.#ensureQuarantineReceipt(intent.id, reason);
+				continue;
+			}
 			try {
 				await this.#recover(intent);
-			} catch {
-				this.#database.memoryIntentUpdate(intent.id, "quarantined");
+			} catch (error) {
+				const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				this.#database.memoryIntentQuarantine(intent.id, reason);
 				this.recovery.quarantined++;
+				console.warn(
+					`memory_intent_quarantined id=${this.#logField(intent.id)} kind=${this.#logField(intent.kind)} origin=${this.#originKey(intent)} reason=${this.#logField(reason)}`,
+				);
+				await this.#ensureQuarantineReceipt(intent.id, reason);
 			}
 		}
 		return this.recovery;
@@ -128,6 +142,7 @@ export class MemoryClosureQueue {
 	}
 
 	async #process(intent: Intent): Promise<void> {
+		this.#database.memoryIntentBeginAttempt(intent.id);
 		const root = await initializeMemory(this.#home);
 		const mutation = this.#parse(intent);
 		let state = intent.state;
@@ -199,6 +214,42 @@ export class MemoryClosureQueue {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw error;
 		}
+	}
+
+	async #ensureQuarantineReceipt(id: string, reason: string): Promise<void> {
+		if (await this.#hasQuarantineReceipt(id)) return;
+		await appendFile(
+			join(this.#home, "memory-receipts.jsonl"),
+			`${JSON.stringify({ id, state: "quarantined", reason, at: new Date().toISOString() })}\n`,
+			"utf8",
+		);
+	}
+
+	async #hasQuarantineReceipt(id: string): Promise<boolean> {
+		try {
+			return (await readFile(join(this.#home, "memory-receipts.jsonl"), "utf8")).split("\n").some((line) => {
+				if (!line) return false;
+				const receipt = JSON.parse(line) as { id?: string; state?: string };
+				return receipt.id === id && receipt.state === "quarantined";
+			});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+	}
+
+	#originKey(intent: Intent): string {
+		try {
+			const payload = JSON.parse(intent.payload_json) as { originRefJson?: unknown };
+			if (typeof payload.originRefJson !== "string") return "unknown";
+			return originKey(validateOriginRef(JSON.parse(payload.originRefJson) as never));
+		} catch {
+			return "unknown";
+		}
+	}
+
+	#logField(value: string): string {
+		return JSON.stringify(value).slice(1, -1);
 	}
 
 	#kill(point: string): void {

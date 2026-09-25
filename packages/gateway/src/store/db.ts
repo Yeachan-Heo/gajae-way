@@ -363,7 +363,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 22;
+const LATEST_SCHEMA_VERSION = 23;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -1347,13 +1347,42 @@ export class GatewayDatabase {
 	}
 
 	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
-	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
+	memoryIntentRowsByRowid(): Array<{
+		id: string;
+		kind: string;
+		payload_json: string;
+		state: string;
+		attempts: number;
+		quarantine_reason: string | null;
+	}> {
 		return this.#database
-			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid")
-			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
+			.query("SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY rowid")
+			.all() as Array<{
+			id: string;
+			kind: string;
+			payload_json: string;
+			state: string;
+			attempts: number;
+			quarantine_reason: string | null;
+		}>;
 	}
 
-	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
+	memoryIntentBeginAttempt(id: string): void {
+		this.#database
+			.query("UPDATE memory_intents SET attempts = attempts + 1, updated_at = ? WHERE id = ?")
+			.run(new Date().toISOString(), id);
+	}
+
+	memoryIntentQuarantine(id: string, reason: string): void {
+		if (!reason.trim()) throw new Error("memory intent quarantine reason is required");
+		this.#database
+			.query(
+				"UPDATE memory_intents SET state = 'quarantined', quarantine_reason = COALESCE(quarantine_reason, ?), updated_at = ? WHERE id = ?",
+			)
+			.run(reason, new Date().toISOString(), id);
+	}
+
+	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted"): void {
 		this.#database
 			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
 			.run(state, new Date().toISOString(), id);
@@ -1364,14 +1393,20 @@ export class GatewayDatabase {
 		kind: string;
 		payload_json: string;
 		state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+		attempts: number;
+		quarantine_reason: string | null;
 	}> {
 		return this.#database
-			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY created_at, id")
+			.query(
+				"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY created_at, id",
+			)
 			.all() as Array<{
 			id: string;
 			kind: string;
 			payload_json: string;
 			state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+			attempts: number;
+			quarantine_reason: string | null;
 		}>;
 	}
 
@@ -3498,6 +3533,16 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(22, new Date().toISOString());
+			});
+		}
+		if (current < 23) {
+			this.withTransaction(() => {
+				this.#database.exec(
+					"ALTER TABLE memory_intents ADD COLUMN quarantine_reason TEXT; ALTER TABLE memory_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND typeof(attempts) = 'integer')",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(23, new Date().toISOString());
 			});
 		}
 	}
