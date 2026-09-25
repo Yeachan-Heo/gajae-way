@@ -1812,3 +1812,106 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 		}
 	});
 });
+
+describe("monitor overlap policy (issue #83)", () => {
+	async function overlapHarness(overlap: "queue" | "skip" | undefined) {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-overlap-"));
+		const db = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = db;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "backlog-watch",
+			trigger: { kind: "cron", schedule: "*/30 * * * *" },
+			eventTypes: ["backlog.watch"],
+			burstPolicy: "serialize",
+			...(overlap ? { overlap } : {}),
+		});
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
+		let release!: () => void;
+		let gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const prompts: string[] = [];
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async (_id, text) => {
+				prompts.push(text);
+				await gate;
+				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "no-op" })));
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		const openGate = () => {
+			release();
+			gate = Promise.resolve();
+		};
+		return { db, monitor, propagator, prompts, openGate, registry };
+	}
+	const slot = (minute: number) => new Date(2026, 7, 27, 10, minute);
+	async function settle(db: GatewayDatabase, eventId: string) {
+		for (let attempt = 0; attempt < 400 && stage(db, eventId) !== "authored_no_delivery"; attempt++) await Bun.sleep(5);
+		return stage(db, eventId);
+	}
+
+	test("skip: a slot that fires while its predecessor is still authoring is recorded skipped, never authored", async () => {
+		const { db, monitor, propagator, prompts, openGate, registry } = await overlapHarness("skip");
+		expect(registry.get(monitor.monitorId)?.overlap).toBe("skip");
+		const first = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(0)) as string;
+		for (let attempt = 0; attempt < 400 && prompts.length === 0; attempt++) await Bun.sleep(5);
+		expect(prompts).toHaveLength(1);
+		// The 10:30 slot fires while the 10:00 authoring turn is still running.
+		const second = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30)) as string;
+		expect(second).not.toBeNull();
+		const row = db.monitorEventRows(monitor.monitorId).find((candidate) => candidate.event_id === second);
+		expect(row?.stage).toBe("skipped");
+		expect(row?.skipped_by).toBe(first);
+		// A scheduling outcome, not an error: no failure evidence, and recovery
+		// never revives it into a late (stale) authoring turn.
+		expect(db.monitorFailure(second)).toBeUndefined();
+		await propagator.reconcile();
+		expect(stage(db, second)).toBe("skipped");
+		// Webhook/script admission honors the same policy.
+		const manual = propagator.submit(monitor.monitorId, "backlog.watch", {});
+		expect(stage(db, manual)).toBe("skipped");
+		openGate();
+		expect(await settle(db, first)).toBe("authored_no_delivery");
+		// Once the predecessor is done the next slot is admitted and authored normally.
+		const third = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(60)) as string;
+		expect(await settle(db, third)).toBe("authored_no_delivery");
+		expect(prompts).toHaveLength(2);
+		expect(prompts.some((text) => text.includes(second) || text.includes(manual))).toBe(false);
+		// The skipped slot stays claimed: a restart catch-up cannot refire it.
+		expect(propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30))).toBeNull();
+	});
+
+	test("queue (default): an overlapping slot is admitted behind its predecessor", async () => {
+		const { db, monitor, propagator, prompts, openGate, registry } = await overlapHarness(undefined);
+		expect(registry.get(monitor.monitorId)?.overlap).toBe("queue");
+		const first = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(0)) as string;
+		for (let attempt = 0; attempt < 400 && prompts.length === 0; attempt++) await Bun.sleep(5);
+		const second = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30)) as string;
+		expect(stage(db, second)).not.toBe("skipped");
+		openGate();
+		expect(await settle(db, first)).toBe("authored_no_delivery");
+		expect(await settle(db, second)).toBe("authored_no_delivery");
+		expect(prompts).toHaveLength(2);
+	});
+
+	test("an invalid overlap policy is rejected at registration", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-overlap-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		expect(() =>
+			registry.add({
+				name: "bad",
+				trigger: { kind: "cron", schedule: "*/30 * * * *" },
+				eventTypes: ["backlog.watch"],
+				overlap: "replace" as never,
+			}),
+		).toThrow('monitor overlap must be "queue" or "skip"');
+	});
+});

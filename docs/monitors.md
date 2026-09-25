@@ -25,6 +25,13 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
 
 Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
 
+`overlap` decides what a new fire does while an earlier event of the same monitor still owes an authoring turn (stage `admitted`, `batched`, `dispatched`, or `failed` awaiting retry):
+
+- `queue` (default) admits it behind the predecessor. A monitor slower than its cadence then stacks up and its later reports describe old state.
+- `skip` records the fire as the terminal stage `skipped`, naming the in-flight predecessor (`skippedBy` in `monitors inspect`). It never authors, never retries, and writes no `monitor_failures` row: losing the slot is a scheduling outcome, not an error. A skipped cron slot stays claimed, so restart catch-up does not replay it. Use `skip` for watchdogs whose report is only worth reading while it is current.
+
+`burstPolicy` is separate: it only merges fires that arrive within the same 250 ms admission window. It has no effect on a fire that lands while a previous turn is still running.
+
 The four trigger kinds are:
 
 ```json
@@ -63,7 +70,7 @@ The durable propagation path is:
 
 A gateway stop waits a bounded 10 seconds for in-flight authoring turns. A turn still running past that is failed as `gateway_shutdown` with the bound session id and stop time in `monitor_failures.detail`, its lease is released, and the event is re-dispatched by the next boot's reconcile rather than retried against a session whose host the stop orphaned.
 
-The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, and `failed`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
+The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, `failed`, and the terminal `skipped`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
 
 ## Session context: native compaction and the safety net
 

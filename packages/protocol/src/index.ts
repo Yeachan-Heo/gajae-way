@@ -30,6 +30,7 @@ export {
 	type MemorySearchResult,
 	type MonitorChannelTarget,
 	type MonitorEventRecord,
+	type MonitorOverlapPolicy,
 	type MonitorRecord,
 	type MonitorSpec,
 	type MonitorTestParams,

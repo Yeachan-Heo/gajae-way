@@ -245,6 +245,8 @@ function lastOutcome(events: readonly MonitorEventRecord[] | null): { label: str
 			return { label: "✕ failed, retries exhausted", tone: "danger", at: latest.firedAt };
 		case "failed":
 			return { label: "✕ failed", tone: "danger", at: latest.firedAt };
+		case "skipped":
+			return { label: "○ skipped, previous fire still in flight", tone: "muted", at: latest.firedAt };
 		default:
 			return { label: `◐ ${latest.stage}`, tone: "warn", at: latest.firedAt };
 	}
