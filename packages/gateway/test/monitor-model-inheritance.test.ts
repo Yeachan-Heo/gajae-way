@@ -53,12 +53,12 @@ test("monitors inherit gateway model/tier by default and may override both per m
 		await pipeline.submitAwaitable(overridden.monitorId, "override.tick", {});
 
 		expect(port.binds.map((bind) => [bind.originKey, bind.model])).toEqual([
-			["monitor/eventtype/inherit.tick", { preset: "gpt-heavy" }],
-			["monitor/eventtype/override.tick", "z-ai/glm-5.3"],
+			[`monitor/eventtype/inherit.tick/parent=${inherited.monitorId}`, { preset: "gpt-heavy" }],
+			[`monitor/eventtype/override.tick/parent=${overridden.monitorId}`, "z-ai/glm-5.3"],
 		]);
 		expect(port.serviceTiers.map((entry) => [entry.sessionId, entry.tier])).toEqual([
-			["monitor/eventtype/inherit.tick", "priority"],
-			["monitor/eventtype/override.tick", "none"],
+			[`monitor/eventtype/inherit.tick/parent=${inherited.monitorId}`, "priority"],
+			[`monitor/eventtype/override.tick/parent=${overridden.monitorId}`, "none"],
 		]);
 		expect(registry.get(inherited.monitorId)).toMatchObject({ model: undefined, serviceTier: undefined });
 		expect(registry.get(overridden.monitorId)).toMatchObject({ model: "z-ai/glm-5.3", serviceTier: "none" });

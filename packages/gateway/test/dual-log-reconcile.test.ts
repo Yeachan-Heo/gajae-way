@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eventTypeOrigin, originKey } from "@gajae-gateway/protocol";
+import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
@@ -77,7 +77,7 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 		const replyTexts = intents.map((row) => (JSON.parse(row.payload_json) as { replyText: string }).replyText);
 		expect(replyTexts.some((text) => text.includes("retained authored knowledge"))).toBe(true);
 		expect(replyTexts.some((text) => text.includes("authored by model"))).toBe(true);
-		expect(dispatches).toContain(originKey(eventTypeOrigin("changed")));
+		expect(dispatches).toContain(originKey(monitorSessionOrigin(monitor.monitorId, "changed")));
 		expect(database.authoredOutput(missing)).toBe("authored by model");
 		database.close();
 	} finally {
