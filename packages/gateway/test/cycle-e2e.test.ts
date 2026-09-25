@@ -145,6 +145,57 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 	}
 });
 
+test("monitor authoring loss gates ops.cycle while delivery stays healthy, and clears on recovery (#160)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-monitor-loss-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	try {
+		const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+		const seed = (eventType: string, stage: string, minutesAgo: number, authored = false) => {
+			const eventId = crypto.randomUUID();
+			database.monitorEventCreate({
+				eventId,
+				monitorId: "m1",
+				eventType,
+				payloadJson: "{}",
+				firedAt: at(minutesAgo),
+			});
+			database.monitorEventUpdate(eventId, stage as never, null);
+			if (authored) database.authoredOutputCreate(eventId, "note");
+			return eventId;
+		};
+		const project = () => new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		// One lost slot of one type after a delivered one is not yet an outage.
+		seed("backlog.watch", "delivered", 120, true);
+		seed("backlog.watch", "failed_no_retry", 60);
+		expect(project().gates).toEqual([]);
+		// Two monitor types whose latest slot was lost pre-author: a cross-type outage.
+		seed("memory.canonicalize", "failed_no_retry", 50);
+		const crossType = project();
+		expect(crossType.gates).toEqual(["monitor_authoring_lost"]);
+		expect(crossType.phase).toBe("degraded");
+		expect(crossType.monitorAuthoringLost).toEqual([
+			{ eventType: "backlog.watch", consecutive: 1, lastFiredAt: expect.any(String) },
+			{ eventType: "memory.canonicalize", consecutive: 1, lastFiredAt: expect.any(String) },
+		]);
+		// The canonicalize type recovers; backlog.watch then loses a second consecutive slot.
+		seed("memory.canonicalize", "delivered", 40, true);
+		expect(project().gates).toEqual([]);
+		seed("backlog.watch", "failed_no_retry", 30);
+		const streak = project();
+		expect(streak.gates).toEqual(["monitor_authoring_lost"]);
+		expect(streak.monitorAuthoringLost).toMatchObject([{ eventType: "backlog.watch", consecutive: 2 }]);
+		// A delivered slot of the lost type clears the gate again.
+		seed("backlog.watch", "delivered", 10, true);
+		expect(project().gates).toEqual([]);
+		// Losses older than the observation window age out instead of gating forever.
+		seed("retired.a", "failed_no_retry", 25 * 60);
+		seed("retired.b", "failed_no_retry", 25 * 60);
+		expect(project().gates).toEqual([]);
+	} finally {
+		database.close();
+	}
+});
+
 test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-e2e-"));
 	const config = testConfig(directory);

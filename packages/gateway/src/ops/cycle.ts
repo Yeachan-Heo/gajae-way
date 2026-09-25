@@ -40,6 +40,17 @@ const SETTLED_JOB_STATES = new Set(["attempt_ended", "done", "aborted"]);
  * moving has only ever meant a stuck actor.
  */
 export const INBOUND_STARVATION_MS = 10 * 60_000;
+/**
+ * Monitor authoring loss (#160): scheduled events exhausting retries with no
+ * authored output while chat delivery stays healthy. Only the latest window
+ * counts, so a loss that has since aged out stops gating without operator
+ * action. One lost slot of one type is noise; this many distinct types whose
+ * latest slot was lost, or this many consecutive lost slots of one type, is an
+ * authoring-lane outage (observed: 19h of 100% loss with every other gate green).
+ */
+export const MONITOR_AUTHORING_LOSS_WINDOW_MS = 24 * 60 * 60_000;
+export const MONITOR_AUTHORING_LOSS_TYPES = 2;
+export const MONITOR_AUTHORING_LOSS_CONSECUTIVE = 2;
 
 export interface RuntimeCycleSources {
 	readonly sessionRows: Array<{
@@ -70,6 +81,8 @@ export interface RuntimeCycleSources {
 	readonly unsettledByOrigin: ReadonlyMap<string, { n: number; oldestMs: number }>;
 	readonly memoryIntents: ReadonlyMap<string, number>;
 	readonly monitorStages: ReadonlyMap<string, number>;
+	/** Event types whose latest terminal slots in the loss window were lost before authoring. */
+	readonly monitorAuthoringLost: ReturnType<GatewayDatabase["monitorAuthoringLossStreaks"]>;
 	readonly memoryClosing: boolean;
 	readonly instanceId: string;
 	/** Bound `work.run` lanes and the configured admission cap. */
@@ -141,6 +154,9 @@ export class RuntimeCycleProjector {
 			unsettledByOrigin: unsettled,
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
+			monitorAuthoringLost: this.#database.monitorAuthoringLossStreaks(
+				new Date(nowMs - MONITOR_AUTHORING_LOSS_WINDOW_MS).toISOString(),
+			),
 			inboundPendingByOrigin: pendingByOrigin,
 			oldestStarvedPendingMs,
 			contextByOrigin,
@@ -220,6 +236,13 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// `batched` rows used to strand forever while the projection stayed green).
 	if (sources.monitorStages.get("batched") || sources.monitorStages.get("dispatched"))
 		gates.add("monitor_settlement_stuck");
+	// Terminal pre-author loss is invisible to the stage census gates above
+	// (`failed_no_retry` is terminal), so a dead authoring lane read as healthy.
+	if (
+		sources.monitorAuthoringLost.length >= MONITOR_AUTHORING_LOSS_TYPES ||
+		sources.monitorAuthoringLost.some((lost) => lost.consecutive >= MONITOR_AUTHORING_LOSS_CONSECUTIVE)
+	)
+		gates.add("monitor_authoring_lost");
 	// Lane saturation is an operator condition: every further work.run is
 	// refused until a lane is retired, so it must not read as a healthy idle.
 	if (sources.activeLanes >= sources.maxLanes) gates.add("lane_capacity_exhausted");
@@ -259,6 +282,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		monitorEvents: [...sources.monitorStages.entries()]
 			.map(([stage, count]) => ({ stage, count }))
 			.sort((a, b) => a.stage.localeCompare(b.stage)),
+		monitorAuthoringLost: sources.monitorAuthoringLost,
 		deliveries: {
 			pending: sources.deliveryCounts.get("pending") ?? 0,
 			inflight: sources.deliveryCounts.get("inflight") ?? 0,

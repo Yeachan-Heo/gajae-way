@@ -649,6 +649,7 @@ export type CycleGateReason =
 	| "memory_closure_blocked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
+	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
 	| "inbound_starved";
 
@@ -702,6 +703,15 @@ export interface OpsCycleResult {
 	};
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
+	/**
+	 * Event types whose most recent terminal events (last 24h) exhausted retries
+	 * with no authored output: `consecutive` lost slots, newest at `lastFiredAt`.
+	 */
+	readonly monitorAuthoringLost: readonly {
+		readonly eventType: string;
+		readonly consecutive: number;
+		readonly lastFiredAt: string;
+	}[];
 	/** Delivery ledger census across all states. */
 	readonly deliveries: {
 		readonly pending: number;

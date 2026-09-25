@@ -539,6 +539,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		sessions: [],
 		memoryIntents: { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 },
 		monitorEvents: [],
+		monitorAuthoringLost: [],
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
 		inFlightInbound: 0,
 		pendingInbound: 0,
@@ -618,6 +619,24 @@ describe("cycle rendering", () => {
 		expect(lines).toContain("deliveries: pending=0 inflight=0 confirmed=0 failed_ambiguous=0 expired=0");
 		expect(lines).toContain("memory: queued=0 written=0 committed=0 receipted=0 quarantined=0");
 		expect(lines).toContain("monitors: none");
+		expect(lines).not.toContain("monitor authoring lost");
+	});
+
+	test("lost monitor authoring renders each event type with its streak", () => {
+		const lines = renderCycle(
+			cycleResult({
+				phase: "degraded",
+				gates: ["monitor_authoring_lost"],
+				monitorAuthoringLost: [
+					{ eventType: "backlog.watch", consecutive: 3, lastFiredAt: "2026-09-04T07:00:00.000Z" },
+					{ eventType: "memory.audit", consecutive: 1, lastFiredAt: "2026-09-04T06:00:00.000Z" },
+				],
+			}),
+		).join("\n");
+		expect(lines).toContain("gates: monitor_authoring_lost");
+		expect(lines).toContain(
+			"monitor authoring lost: backlog.watch=3 (last 2026-09-04T07:00:00.000Z) memory.audit=1 (last 2026-09-04T06:00:00.000Z)",
+		);
 	});
 
 	test("exit-code contract: gates force exit 1, healthy is exit 0", () => {
@@ -627,6 +646,7 @@ describe("cycle rendering", () => {
 			"delivery_settlement_unknown",
 			"memory_closure_blocked",
 			"monitor_settlement_failed",
+			"monitor_authoring_lost",
 		])
 			expect(cycleExitCode(cycleResult({ gates: [gate as OpsCycleResult["gates"][number]] }))).toBe(1);
 	});

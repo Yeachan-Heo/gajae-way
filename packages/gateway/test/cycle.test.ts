@@ -26,6 +26,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		unsettledByOrigin: new Map(),
 		memoryIntents: new Map(),
 		monitorStages: new Map(),
+		monitorAuthoringLost: [],
 		memoryClosing: false,
 		instanceId: "test-instance",
 		activeLanes: 0,
