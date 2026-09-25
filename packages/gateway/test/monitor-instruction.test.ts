@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors/registry";
@@ -161,6 +162,98 @@ test("monitor.add refuses an event type that cannot be an executing-session orig
 		expect(registry.add({ name: "ok", eventTypes: ["townhall.report.8h+mention-1"], ...base }).eventTypes).toEqual([
 			"townhall.report.8h+mention-1",
 		]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("#180: channel and mention targets are typed fields that survive a restart and reach the delivery", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-typed-target-"));
+	try {
+		const instruction =
+			"Review the last 24 hours of runtime operation. Report actual friction, failures and latency with public-safe evidence only. Check existing issues before proposing a new one.";
+		const channelTarget = {
+			origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
+			mentionUserIds: ["1468532331001413743"],
+		} as const;
+		let monitorId: string;
+		{
+			const { database, registry } = await harness(directory);
+			monitorId = registry.add({
+				name: "runtime-feedback",
+				trigger: { kind: "cron", schedule: "0 11 * * *" },
+				eventTypes: ["gajaeway.runtime-feedback.daily"],
+				instruction,
+				channelTarget,
+			}).monitorId;
+			database.close();
+		}
+		// Gateway restart: a fresh database handle and registry over the same file.
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const restored = registry.get(monitorId)!;
+		expect(restored.instruction).toBe(instruction);
+		expect(restored.eventTypes).toEqual(["gajaeway.runtime-feedback.daily"]);
+		expect(restored.channelTarget).toEqual(channelTarget);
+
+		const prompts: string[] = [];
+		const delivered: ChatMessagePayload[] = [];
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: new ScriptedSessionPort({
+				onSend: (input, scripted) => {
+					prompts.push(input.text);
+					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "No new friction." }]));
+				},
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(database)),
+			emit: () => {},
+			deliver: (payload) => delivered.push(payload),
+		});
+		pipeline.submit(monitorId, "gajaeway.runtime-feedback.daily", { at: "2026-09-07T11:00:00.000Z" });
+		await Bun.sleep(250);
+		expect(prompts[0]!.startsWith(`Author monitor events. ${instruction} Respond ONLY`)).toBe(true);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
+		// The mention comes from the typed field, not from the author remembering it.
+		expect(delivered[0]!.text).toBe("<@1468532331001413743> No new friction.");
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("#180: mention targets are validated as platform ids", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-mention-invalid-"));
+	try {
+		const { database, registry } = await harness(directory);
+		const base = {
+			name: "bad",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["changed"],
+		} as const;
+		const origin = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
+		for (const mentionUserIds of [["way-gajae>@everyone"], [""], "u1", [42]])
+			expect(() =>
+				registry.add({ ...base, channelTarget: { origin, mentionUserIds: mentionUserIds as never } }),
+			).toThrow("monitor channelTarget.mentionUserIds");
+		// A Slack id on a Discord target, and mentions on a platform without `<@id>`.
+		expect(() => registry.add({ ...base, channelTarget: { origin, mentionUserIds: ["U0C2GSKTA6M"] } })).toThrow(
+			"monitor channelTarget.mentionUserIds",
+		);
+		const telegram = { platform: "telegram", kind: "channel", conversationId: "-100" } as const;
+		expect(() => registry.add({ ...base, channelTarget: { origin: telegram, mentionUserIds: ["1"] } })).toThrow(
+			"not supported for telegram",
+		);
+		const slack = {
+			origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+			mentionUserIds: ["U0C2GSKTA6M"],
+		} as const;
+		expect(registry.add({ ...base, channelTarget: slack }).channelTarget).toEqual(slack);
+		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
