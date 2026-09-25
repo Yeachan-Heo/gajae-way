@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { bootGateway } from "../src/boot";
-import { MIN_GJC_VERSION } from "../src/orchestrator/broker";
 import {
 	acquireGatewayHome,
 	claimGatewayHome,
@@ -131,7 +130,7 @@ test("boot settles home ownership before the socket or database exist, and relea
 	const command: CliRunner = async (args) => {
 		expect((await lstat(join(home, "workspace"))).isDirectory()).toBe(true);
 		return args[0] === "--version"
-			? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" }
+			? { exitCode: 0, stdout: "gjc/0.17.5\n", stderr: "" }
 			: { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessions: [] } }), stderr: "" };
 	};
 	const broker = {

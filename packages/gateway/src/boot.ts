@@ -113,10 +113,10 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			broker = new GlobalGjcClient({
 				...options.broker,
 				cwd: join(config.home, "workspace"),
-				agentDir: join(config.home, "gjc-agent"),
+				agentDir: options.broker?.agentDir ?? join(config.home, "gjc-agent"),
 				pinnedVersion,
 			});
-			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` };
+			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
 			database.assertBrokerAuthority(authority, { initializeEmpty: true });
 			// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 			const client = broker;

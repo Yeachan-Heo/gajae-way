@@ -24,6 +24,8 @@ export interface UpgradeOptions {
 	readonly gjcVersion?: string;
 	/** Test seam: function to check CI status */
 	readonly checkCiStatus?: (repo: string) => Promise<boolean>;
+	/** Test seam: function to read gateway pinned gjc version */
+	readonly readPinnedVersion?: (home: string) => Promise<string>;
 }
 
 /** Read the pinned gjc version from the gateway's package.json */
@@ -107,7 +109,8 @@ async function checkLatestCiStatus(repo: string): Promise<boolean> {
 }
 
 export async function performUpgrade(options: UpgradeOptions): Promise<UpgradeResult> {
-	const targetVersion = options.gjcVersion ?? (await readGatewayPinnedGjcVersion(options.home));
+	const readVersion = options.readPinnedVersion || readGatewayPinnedGjcVersion;
+	const targetVersion = options.gjcVersion ?? (await readVersion(options.home));
 
 	try {
 		// 1. Check CI status (deploy gate)

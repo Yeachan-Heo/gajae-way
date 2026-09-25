@@ -3,11 +3,12 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
+	"description": "Gajaeway Gateway (requires gjc >= 0.17.5; handles 0.17.5+ mirrored lifecycle frames per #324)",
 	"bin": {
 		"gajaeway-gateway": "./src/main.ts"
 	},
 	"gjc": {
-		"version": "0.16.3"
+		"version": "0.17.5"
 	},
 	"dependencies": {
 		"@gajae-gateway/log": "workspace:*",
