@@ -21,7 +21,24 @@ export {
 	readBrokerDiscovery,
 } from "./broker-liveness";
 
-export const MIN_GJC_VERSION = "0.16.0";
+/**
+ * Read the pinned GJC version from the gateway package.json.
+ * Throws if the file cannot be read or is malformed.
+ */
+export function readPinnedGjcVersion(): string {
+	try {
+		const pkg = JSON.parse(readFileSync(join(dirname(dirname(dirname(__filename))), "package.json"), "utf-8"));
+		const version = pkg.gjc?.version;
+		if (!version || typeof version !== "string") {
+			throw new Error("gjc.version not found in gateway package.json");
+		}
+		return version;
+	} catch (error) {
+		throw new Error(`Failed to read pinned GJC version: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+export const MIN_GJC_VERSION = "0.16.0"; // Minimum acceptable version; pinned version is read at boot
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
 // GJC's authoritative shared session flags are in packages/coding-agent/src/commands/sdk.ts;
@@ -66,6 +83,12 @@ export interface GlobalGjcClientOptions {
 	readonly readinessDelayMs?: number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
+	/**
+	 * Exact GJC version required; if set, preflight refuses to start the broker
+	 * if the running version does not match exactly. Used by the gateway to
+	 * enforce version pinning across releases.
+	 */
+	readonly pinnedVersion?: string;
 	/**
 	 * How long a started client may keep failing to reach a broker whose own
 	 * discovery record says it is live before `onLiveOutageExceeded` fires.
@@ -202,16 +225,30 @@ export async function preflightGjcRuntime(
 	run: GjcCommandRunner,
 	minimumVersion = MIN_GJC_VERSION,
 	sdk?: GjcCommandRunner,
+	options?: { readonly pinnedVersion?: string },
 ): Promise<{ readonly version: string }> {
 	const result = await run(["--version"], { timeoutMs: COMMAND_TIMEOUT_MS });
 	const version = (result.stdout || result.stderr).match(/(?:gjc\/)?(\d+)\.(\d+)\.(\d+)/);
-	const minimum = minimumVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
-	if (result.exitCode !== 0 || !version || !minimum)
-		throw new Error("gjc runtime preflight failed: invalid version response");
-	for (let i = 1; i <= 3; i++) {
-		if (Number(version[i]) < Number(minimum[i]))
-			throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}`);
-		if (Number(version[i]) > Number(minimum[i])) break;
+	if (result.exitCode !== 0 || !version) throw new Error("gjc runtime preflight failed: invalid version response");
+
+	const detectedVersion = version.slice(1, 4).join(".");
+
+	// If a pinned version is required, check for exact match
+	if (options?.pinnedVersion) {
+		if (detectedVersion !== options.pinnedVersion) {
+			throw new Error(
+				`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
+			);
+		}
+	} else {
+		// Otherwise check minimum version
+		const minimum = minimumVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+		if (!minimum) throw new Error("gjc runtime preflight failed: invalid minimum version spec");
+		for (let i = 1; i <= 3; i++) {
+			if (Number(version[i]) < Number(minimum[i]))
+				throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}`);
+			if (Number(version[i]) > Number(minimum[i])) break;
+		}
 	}
 	// A failed session list is the broker not answering yet (host reboot, stale
 	// lock being cleared), not a wrong runtime: it is classed as unavailable so
@@ -346,6 +383,7 @@ export class GlobalGjcClient {
 			(args, options) => this.#run(args, options?.timeoutMs),
 			MIN_GJC_VERSION,
 			this.cli,
+			{ pinnedVersion: this.#options.pinnedVersion },
 		);
 		this.#gjcVersion = result.version;
 	}

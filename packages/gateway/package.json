@@ -6,6 +6,9 @@
 	"bin": {
 		"gajaeway-gateway": "./src/main.ts"
 	},
+	"gjc": {
+		"version": "0.16.3"
+	},
 	"dependencies": {
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
