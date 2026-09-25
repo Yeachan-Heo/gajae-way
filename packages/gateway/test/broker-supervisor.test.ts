@@ -562,7 +562,12 @@ test("discovery refuses stale, future, foreign endpoints and dead PIDs without d
 test("runtime capability requires a real session envelope and explicit all scope", async () => {
 	expect(brokerHealthArgs()).toEqual(["sdk", "session", "list", "--scope", "all"]);
 	expect(isHealthySessionList({ ...healthy, stdout: "USAGE gjc sdk" })).toBe(false);
-	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.14.0" }))).rejects.toThrow("requires");
+	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.15.6" }))).rejects.toThrow(
+		"requires gjc >= 0.16.0",
+	);
+	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.16.0" }))).resolves.toEqual({
+		version: "0.16.0",
+	});
 	await expect(
 		preflightGjcRuntime(
 			async () => ({ ...healthy, stdout: "gjc/0.16.3" }),
@@ -680,6 +685,7 @@ test("every sdk session call adds JSON output and binds --agent-dir at the leaf"
 		["status", "s-1", "op-1"],
 		["send", "s-1", "--text", "hello", "--op-ref", "op-1", "--wait", "--json"],
 		["tail", "s-1", "--strict", "--all-events", "--json"],
+		["tail", "s-1", "--cursor", "cursor-1"],
 		["close", "s-1"],
 		["retire", "s-1"],
 		["raw", "control", "s-1", "--op", "model.set", "--json-input", '{"id":"test-model"}'],
@@ -694,8 +700,8 @@ test("every sdk session call adds JSON output and binds --agent-dir at the leaf"
 		expect(args.filter((arg) => arg === "--json")).toHaveLength(1);
 		expect(args.slice(-2)).toEqual(["--agent-dir", value.agentDir]);
 	}
-	expect(calls).toHaveLength(11);
-	expect(calls[10]).toContain('{"cwd":"/work"}');
+	expect(calls).toHaveLength(12);
+	expect(calls[11]).toContain('{"cwd":"/work"}');
 });
 
 test("session payload values equal to --json are preserved while output mode is added", async () => {
@@ -712,6 +718,9 @@ test("session payload values equal to --json are preserved while output mode is 
 	expect(args).toEqual(["sdk", "session", "send", "s-1", "--text", "--json"]);
 	await value.cli([...args, "--json"]);
 	expect(invocation).toEqual([...args, "--json", "--agent-dir", value.agentDir]);
+	const cursorArgs = ["sdk", "session", "tail", "s-1", "--cursor", "--json"];
+	await value.cli(cursorArgs);
+	expect(invocation).toEqual([...cursorArgs, "--json", "--agent-dir", value.agentDir]);
 	expect(() => value.cli(["sdk", "session", "list", "--json", "--json"])).toThrow("duplicate --json flags");
 	expect(() => value.cli(["sdk", "session", "list", "--", "--json"])).toThrow("option delimiters");
 });

@@ -21,9 +21,11 @@ export {
 	readBrokerDiscovery,
 } from "./broker-liveness";
 
-export const MIN_GJC_VERSION = "0.15.6";
+export const MIN_GJC_VERSION = "0.16.0";
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
+// GJC's authoritative shared session flags are in packages/coding-agent/src/commands/sdk.ts;
+// value-taking options here keep literal --json payloads from becoming output flags.
 const SESSION_VALUE_OPTIONS = new Set([
 	"--cursor",
 	"--idempotency-key",

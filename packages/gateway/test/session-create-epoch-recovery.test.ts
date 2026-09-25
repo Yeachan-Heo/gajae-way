@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
+import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
@@ -179,6 +181,61 @@ test("generic and malformed create failures do not mint a new idempotency key or
 			expect(database.getSessionRecord(failure.originKey)).toBeUndefined();
 			expect(database.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
 			if (failure.code) expect(lastError).toMatchObject({ name: "GjcCliError", details: { code: failure.code } });
+		}
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("direct thrown create transport failures preserve the error, epoch, and idempotency key", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-thrown-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	const failures = [
+		{
+			originKey: "create-thrown-timeout",
+			error: new GjcCliUnavailableError("request timed out after 10ms"),
+		},
+		{
+			originKey: "create-thrown-transport",
+			error: new Error("transport disconnected before response"),
+		},
+	];
+	const epoch = 7;
+	const instanceId = "create-thrown";
+	const repo = join(home, "workspace");
+	let activeError: Error = failures[0]!.error;
+	const idempotencyKeys: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		idempotencyKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
+		throw activeError;
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	try {
+		for (const failure of failures) {
+			activeError = failure.error;
+			idempotencyKeys.length = 0;
+			const expectedKey = `gw-bind-${createHash("sha256")
+				.update(`${instanceId}|${failure.originKey}|${epoch}|${repo}`)
+				.digest("hex")
+				.slice(0, 32)}`;
+			for (let attempt = 0; attempt < 2; attempt++) {
+				const error = await port.bind({ originKey: failure.originKey, epoch, repo }).catch((caught: unknown) => caught);
+				expect(error).toBeInstanceOf(Error);
+				expect(error).toMatchObject({ name: "Error", message: failure.error.message });
+			}
+			expect(idempotencyKeys).toEqual([expectedKey, expectedKey]);
+			expect(database.getSessionRecord(failure.originKey)).toBeUndefined();
+			expect(database.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
 		}
 	} finally {
 		database.close();
