@@ -234,7 +234,7 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
-	console.error(
+	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
 	return result;
@@ -503,7 +503,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			if (origin.platform === "loopback") {
-				console.error(notice);
+				console.warn(notice);
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
@@ -1384,7 +1384,7 @@ async function sendChat(
 						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
 			}
 		}
-		console.error(`gateway restart requested by owner via ${key}`);
+		console.info(`gateway restart requested by owner via ${key}`);
 		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
 		setTimeout(() => {
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
@@ -1471,7 +1471,7 @@ async function sendChat(
 		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
-			console.error(
+			console.warn(
 				`gateway bot audience admission declined origin=${key} message=${typeof params.messageId === "string" ? params.messageId : "unidentified"} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
 			);
 	}
@@ -1695,7 +1695,7 @@ async function editChat(
 		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
-			console.error(
+			console.warn(
 				`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
 			);
 	}
@@ -1887,7 +1887,7 @@ async function createInboundTurnLifecycle(
 			reactionTokensSeen = true;
 			for (const wanted of reactionReply.reactions) {
 				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-					console.error(
+					console.warn(
 						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
 					);
 					continue;

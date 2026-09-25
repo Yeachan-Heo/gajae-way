@@ -76,7 +76,7 @@ export function speechGateApplies(subject: SpeechGateSubject): boolean {
 export async function preTurnSkip(input: KevShadowInput): Promise<boolean> {
 	const verdict = await judgeKevShadow(input);
 	if (verdict?.verdict !== "would-skip") return false;
-	console.error(`speech-gate skip origin=${input.originKey} score=${verdict.score.toFixed(4)}`);
+	console.info(`speech-gate skip origin=${input.originKey} score=${verdict.score.toFixed(4)}`);
 	return true;
 }
 
@@ -100,6 +100,6 @@ export async function isAbstentionNarration(originKey: string, message: string, 
 	if (!probs) return false;
 	const score = draftScore(probs);
 	if (score >= ABSTAIN_UNDER) return false;
-	console.error(`speech-gate drop origin=${originKey} score=${score.toFixed(4)} text=${JSON.stringify(draft)}`);
+	console.info(`speech-gate drop origin=${originKey} score=${score.toFixed(4)} text=${JSON.stringify(draft)}`);
 	return true;
 }

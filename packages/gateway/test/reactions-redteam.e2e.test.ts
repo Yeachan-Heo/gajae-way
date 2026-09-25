@@ -230,14 +230,18 @@ function errorFrame(frames: any[], id: string): any {
 /** Captures the daemon log, which is where a token-path rejection must show up. */
 async function withCapturedLog<T>(body: (lines: string[]) => Promise<T>): Promise<T> {
 	const lines: string[] = [];
-	const original = console.error;
-	console.error = (...args: unknown[]) => {
+	const originalError = console.error;
+	const originalWarn = console.warn;
+	const capture = (...args: unknown[]) => {
 		lines.push(args.map((value) => String(value)).join(" "));
 	};
+	console.error = capture;
+	console.warn = capture;
 	try {
 		return await body(lines);
 	} finally {
-		console.error = original;
+		console.error = originalError;
+		console.warn = originalWarn;
 	}
 }
 

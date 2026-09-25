@@ -219,8 +219,8 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	let server: GatewayServer | undefined;
 	let client: Awaited<ReturnType<typeof connect>> | undefined;
 	const logs: string[] = [];
-	const previousError = console.error;
-	console.error = (...values: unknown[]) => logs.push(values.map((value) => String(value)).join(" "));
+	const previousInfo = console.info;
+	console.info = (...values: unknown[]) => logs.push(values.map((value) => String(value)).join(" "));
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 		client = await connect(config.socketPath);
@@ -324,7 +324,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		try {
 			await server?.stop();
 		} finally {
-			console.error = previousError;
+			console.info = previousInfo;
 			if (!server) database.close();
 			await rm(home, { recursive: true, force: true });
 		}

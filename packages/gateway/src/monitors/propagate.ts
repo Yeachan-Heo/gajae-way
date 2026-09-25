@@ -1047,7 +1047,7 @@ export class MonitorPropagator {
 			// jip-gajae `sns-threads`, 19/19 ticks in one day).
 			if (liveBinding && state.protocolFailures >= this.#protocolFailureRollThreshold) {
 				state.pendingRoll = "protocol_failures_off_contract";
-				console.error(
+				console.warn(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=protocol_failures_off_contract protocol_failures=${state.protocolFailures}/${this.#protocolFailureRollThreshold} last_reason=${protocolReason} turns=${state.turns}`,
 				);
 			}
@@ -1055,7 +1055,7 @@ export class MonitorPropagator {
 		}
 		if (!liveBinding) {
 			state.staleContextFailures += 1;
-			console.error(
+			console.info(
 				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} current_epoch=${currentEpoch}`,
 			);
 			return;
@@ -1072,7 +1072,7 @@ export class MonitorPropagator {
 		// Arm, do not roll here: the roll must happen at the dispatch boundary
 		// where no batch is in flight.
 		state.pendingRoll = reason;
-		console.error(
+		console.warn(
 			`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} context_failures=${state.contextFailures}/${this.#contextFailureRollThreshold} native_compaction=${status} turns=${state.turns}`,
 		);
 	}
@@ -1139,7 +1139,7 @@ export class MonitorPropagator {
 		state.protocolFailures = 0;
 		state.busyFailures = 0;
 		state.turns = 0;
-		console.error(
+		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
 		);
 		return digest;

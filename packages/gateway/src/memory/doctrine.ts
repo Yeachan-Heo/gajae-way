@@ -98,7 +98,7 @@ async function memoryGitUnserialized(root: string, args: readonly string[]): Pro
 				const age = Date.now() - (await stat(lockPath)).mtimeMs;
 				if (age >= ORPHANED_LOCK_GRACE_MS) {
 					await unlink(lockPath);
-					console.error(`memory git: removed orphaned ${lockPath} (age ${Math.round(age / 1000)}s)`);
+					console.info(`memory git: removed orphaned ${lockPath} (age ${Math.round(age / 1000)}s)`);
 					continue;
 				}
 			} catch {
