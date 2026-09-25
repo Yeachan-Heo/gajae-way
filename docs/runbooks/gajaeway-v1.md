@@ -107,10 +107,10 @@ gajaeway monitors update <monitor-id> --schedule '<cron>'
 gajaeway monitors update <monitor-id> --enabled false
 gajaeway monitors list
 gajaeway monitors inspect <monitor-id>
-gajaeway monitors test <monitor-id> --type changed --payload '{"source":"manual"}'
+gajaeway monitors test <monitor-id> --type changed --payload '{"source":"manual"}' --wait=60
 ```
 
-Declare event types with `add`; use a partial JSON update to change them later. `update` changes a monitor in place, preserving its ID and event history; its `--enabled` option requires an explicit `true` or `false`. Use `inspect` to review recent event stages before retrying a trigger. Webhooks are dangerous when exposed beyond loopback: set an explicit non-loopback bind only when required, put it behind authenticated ingress, and require authentication at that ingress. Do not expose an unauthenticated webhook directly to the Internet.
+Declare event types with `add`; use a partial JSON update to change them later. `update` changes a monitor in place, preserving its ID and event history; its `--enabled` option requires an explicit `true` or `false`. Use `test --wait[=SECONDS]` to observe a submitted event’s stage transitions over the event stream without repeatedly inspecting the database; use `inspect` for recent history before retrying a trigger. Webhooks are dangerous when exposed beyond loopback: set an explicit non-loopback bind only when required, put it behind authenticated ingress, and require authentication at that ingress. Do not expose an unauthenticated webhook directly to the Internet.
 
 ## Memory
 

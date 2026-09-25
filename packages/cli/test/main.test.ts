@@ -99,6 +99,111 @@ describe("cli arguments", () => {
 			await rm(home, { recursive: true, force: true });
 		}
 	});
+
+	test("monitors test --wait returns streamed terminal and timeout stages without polling", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-monitor-wait-"));
+		const path = join(home, "fake.sock");
+		const received: string[] = [];
+		const output: string[] = [];
+		const originalLog = console.log;
+		console.log = (line: unknown) => output.push(String(line));
+		const listener = Bun.listen<{ buffer: string }>({
+			unix: path,
+			socket: {
+				open(socket) {
+					socket.data = { buffer: "" };
+				},
+				data(socket, data) {
+					socket.data.buffer += Buffer.from(data).toString("utf8");
+					let newline = socket.data.buffer.indexOf("\n");
+					while (newline >= 0) {
+						const line = socket.data.buffer.slice(0, newline);
+						socket.data.buffer = socket.data.buffer.slice(newline + 1);
+						const frame = JSON.parse(line) as { type: string; id?: string; verb?: string };
+						if (frame.type === "hello")
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`,
+							);
+						else if (frame.type === "request") {
+							received.push(frame.verb as string);
+							const eventId = `event-${41 + received.length}`;
+							const stage = received.length === 1 ? "delivered" : "authored";
+							const event = {
+								v: "0.1",
+								type: "event",
+								event: "monitor.event",
+								payload: {
+									eventId,
+									monitorId: "monitor-1",
+									eventType: "test.event",
+									firedAt: "2026-09-25T10:00:00.000Z",
+									stage,
+								},
+							};
+							const response = {
+								v: "0.1",
+								type: "response",
+								id: frame.id,
+								result: { eventId },
+							};
+							// Exercise the event-before-response race: delivery may settle before
+							// the caller has learned the event id from monitor.test.
+							socket.write(`${JSON.stringify(event)}\n${JSON.stringify(response)}\n`);
+						}
+						newline = socket.data.buffer.indexOf("\n");
+					}
+				},
+			},
+		});
+		try {
+			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=1"]);
+			await main(["--socket", path, "monitors", "test", "monitor-1", "--wait=0"]);
+			expect(received).toEqual(["monitor.test", "monitor.test"]);
+			expect(output).toEqual([
+				'{"eventId":"event-42","stage":"delivered"}',
+				'{"eventId":"event-43","stage":"authored"}',
+			]);
+		} finally {
+			console.log = originalLog;
+			listener.stop(true);
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("monitors test rejects invalid wait options before connecting", async () => {
+		const errors: string[] = [];
+		const originalError = console.error;
+		const previousExitCode = process.exitCode ?? 0;
+		console.error = (line: unknown) => errors.push(String(line));
+		try {
+			const cases = [
+				["--wait=-1"],
+				["--wait=1.5"],
+				["--wait=86401"],
+				["--wait=invalid"],
+				["--wait="],
+				["--wait=1", "--wait=2"],
+			];
+			for (const options of cases) {
+				await main([
+					"--socket",
+					"/nonexistent/gajaeway-monitor-wait.sock",
+					"monitors",
+					"test",
+					"monitor-1",
+					...options,
+				]);
+			}
+			expect(errors).toHaveLength(6);
+			expect(errors.slice(0, 5).every((error) => error.includes("--wait expects a finite non-negative integer"))).toBe(
+				true,
+			);
+			expect(errors[5]).toContain("duplicate --wait");
+		} finally {
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+		}
+	});
 });
 
 describe("service installation", () => {

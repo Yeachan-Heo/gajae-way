@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
+	MonitorEventRecord,
 	MonitorRecord,
 	MonitorSpec,
 	OpsCycleResult,
@@ -61,7 +62,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -189,6 +190,84 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 	};
 }
 
+interface ParsedMonitorTestArgs {
+	readonly monitorId: string;
+	readonly eventType?: string;
+	readonly payload: unknown;
+	readonly waitSeconds?: number;
+}
+
+const MONITOR_TEST_USAGE = "usage: gajaeway monitors test <id> [--type T] [--payload J] [--wait[=SECONDS]]";
+const MONITOR_WAIT_ERROR = `${MONITOR_TEST_USAGE}\n--wait expects a finite non-negative integer up to 86400`;
+
+function parseMonitorTestArgs(args: readonly string[]): ParsedMonitorTestArgs {
+	const [monitorId, ...flags] = args;
+	if (!monitorId || monitorId.startsWith("--")) throw new Error(MONITOR_TEST_USAGE);
+	let eventType: string | undefined;
+	let payload: unknown = {};
+	let waitSeconds: number | undefined;
+	const seen = new Set<string>();
+	for (let i = 0; i < flags.length; i++) {
+		const flag = flags[i];
+		if (flag === "--type" || flag === "--payload") {
+			if (seen.has(flag)) throw new Error(`${MONITOR_TEST_USAGE}\nduplicate ${flag}`);
+			seen.add(flag);
+			const value = flags[++i];
+			if (value === undefined || value.length === 0 || value.startsWith("--"))
+				throw new Error(`${MONITOR_TEST_USAGE}\n${flag} requires a value`);
+			if (flag === "--type") eventType = value;
+			else payload = JSON.parse(value);
+		} else if (flag === "--wait" || flag.startsWith("--wait=")) {
+			if (seen.has("--wait")) throw new Error(`${MONITOR_TEST_USAGE}\nduplicate --wait`);
+			seen.add("--wait");
+			const value = flag === "--wait" ? undefined : flag.slice("--wait=".length);
+			if (value === undefined) waitSeconds = 30;
+			else {
+				if (!/^\d+$/.test(value)) throw new Error(MONITOR_WAIT_ERROR);
+				const seconds = Number(value);
+				if (!Number.isFinite(seconds) || !Number.isInteger(seconds) || seconds > 86_400)
+					throw new Error(MONITOR_WAIT_ERROR);
+				waitSeconds = seconds;
+			}
+		} else throw new Error(`${MONITOR_TEST_USAGE}\nunknown argument: ${flag}`);
+	}
+	return {
+		monitorId,
+		...(eventType === undefined ? {} : { eventType }),
+		payload,
+		...(waitSeconds === undefined ? {} : { waitSeconds }),
+	};
+}
+
+const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry"]);
+
+function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSeconds: number): Promise<string> {
+	return new Promise((resolve) => {
+		let stage = "admitted";
+		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let unsubscribe: (() => void) | undefined;
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			if (timer !== undefined) clearTimeout(timer);
+			unsubscribe?.();
+			resolve(stage);
+		};
+		unsubscribe = client.on("monitor.event", (payload) => {
+			if (typeof payload !== "object" || payload === null) return;
+			const event = payload as Partial<MonitorEventRecord>;
+			if (event.eventId !== eventId || typeof event.stage !== "string") return;
+			stage = event.stage;
+			if (TERMINAL_MONITOR_STAGES.has(stage)) finish();
+		});
+		// GajaewayClient.on may synchronously replay an event held before the
+		// monitor.test response; if that event was terminal, clean up the now
+		// installed listener rather than starting the timeout.
+		if (settled) unsubscribe();
+		else timer = setTimeout(finish, timeoutSeconds * 1000);
+	});
+}
 /**
  * Operator runtime-cycle view (`gajaeway ops cycle`).
  *
@@ -596,10 +675,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "monitors": {
-				const listOptions =
-					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), MONITOR_COLUMNS) : undefined;
 				const [command, ...args] = parsed.rest;
+				const listOptions = command === "list" ? parseListOptions(args, MONITOR_COLUMNS) : undefined;
 				const update = command === "update" ? parseMonitorUpdateArgs(args) : undefined;
+				const monitorTest = command === "test" ? parseMonitorTestArgs(args) : undefined;
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (command === "add" && args[0] === "--json" && args[1])
@@ -618,25 +697,20 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(JSON.stringify(await client.request("monitor.inspect", { monitorId: args[0] })));
 					else if (command === "remove" && args[0])
 						console.log(JSON.stringify(await client.request("monitor.remove", { monitorId: args[0] })));
-					else if (command === "test" && args[0]) {
-						let eventType: string | undefined;
-						let payload: unknown = {};
-						for (let i = 1; i < args.length; i++) {
-							if (args[i] === "--type") eventType = args[++i];
-							else if (args[i] === "--payload") payload = JSON.parse(args[++i] ?? "");
+					else if (command === "test" && monitorTest) {
+						const result = await client.request<{ eventId: string }>("monitor.test", {
+							monitorId: monitorTest.monitorId,
+							...(monitorTest.eventType === undefined ? {} : { eventType: monitorTest.eventType }),
+							payload: monitorTest.payload,
+						});
+						if (monitorTest.waitSeconds === undefined) console.log(JSON.stringify(result));
+						else {
+							const stage = await waitForMonitorStage(client, result.eventId, monitorTest.waitSeconds);
+							console.log(JSON.stringify({ eventId: result.eventId, stage }));
 						}
-						console.log(
-							JSON.stringify(
-								await client.request("monitor.test", {
-									monitorId: args[0],
-									...(eventType ? { eventType } : {}),
-									payload,
-								}),
-							),
-						);
 					} else
 						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]`,
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]`,
 						);
 				} finally {
 					await client.close();

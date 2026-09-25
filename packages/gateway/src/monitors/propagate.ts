@@ -514,9 +514,15 @@ export class MonitorPropagator {
 					// are reclaimed here (the dispatcher acquires its own lease).
 					if (this.#database.monitorEventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
-						this.#database.withTransaction(() =>
-							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null),
-						);
+						const failedRow = this.#database.withTransaction(() => {
+							const current = this.#database
+								.monitorEventRows(undefined, "newest", true)
+								.find((candidate) => candidate.event_id === row.event_id);
+							if (!current) return undefined;
+							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null);
+							return current.stage === "failed_no_retry" ? undefined : current;
+						});
+						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
 						continue;
 					}
 					this.#database.monitorEventIncrementAttempts(row.event_id);
@@ -561,12 +567,16 @@ export class MonitorPropagator {
 		if (!rows.length) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
-			for (const row of rows)
-				this.#database.monitorEventTerminalFail(
-					row.event_id,
-					"monitor_invalid",
-					"dispatch setup failed (monitor_invalid)",
-				);
+			for (const row of rows) {
+				if (
+					this.#database.monitorEventTerminalFail(
+						row.event_id,
+						"monitor_invalid",
+						"dispatch setup failed (monitor_invalid)",
+					)
+				)
+					this.#emitStage(row, "failed_no_retry");
+			}
 			console.error(
 				`monitor dispatch rejected missing or invalid monitor: events ${rows.map((row) => row.event_id).join(",")}`,
 			);
@@ -602,6 +612,7 @@ export class MonitorPropagator {
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			return;
 		}
+		for (const row of claimed) this.#emitStage(row, "batched");
 		const declared = new Set(monitor.eventTypes);
 		const claimedEventType = claimed[0]?.event_type;
 		let sessionOrigin: OriginRef;
@@ -613,7 +624,7 @@ export class MonitorPropagator {
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
 			for (const row of claimed) {
-				this.#database.monitorEventFencedFail(
+				const failed = this.#database.monitorEventFencedFail(
 					row.event_id,
 					leaseId,
 					batchId,
@@ -622,6 +633,7 @@ export class MonitorPropagator {
 					now(),
 					true,
 				);
+				if (failed) this.#emitStage(row, "failed_no_retry");
 			}
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			console.error(
@@ -747,6 +759,7 @@ export class MonitorPropagator {
 					this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 				);
 				if (!fenced.length) return;
+				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
 				if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
 				// Strict response contract: exactly one valid entry per claimed event —
@@ -810,7 +823,8 @@ export class MonitorPropagator {
 				if (!target) {
 					for (const row of fenced) {
 						if (this.#database.authoredOutput(row.event_id) === undefined) continue;
-						this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
+						if (this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId))
+							this.#emitStage(row, "authored_no_delivery");
 					}
 					return;
 				}
@@ -869,7 +883,7 @@ export class MonitorPropagator {
 				const failureClass = classifyAuthoringFailure(error);
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
 				for (const row of leased) {
-					this.#database.monitorEventFencedFail(
+					const failed = this.#database.monitorEventFencedFail(
 						row.event_id,
 						leaseId,
 						batchId,
@@ -877,6 +891,7 @@ export class MonitorPropagator {
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
 						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 					);
+					if (failed) this.#emitStage(row, "failed");
 				}
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
@@ -1146,14 +1161,14 @@ export class MonitorPropagator {
 		eventId: string,
 		note: string,
 		noDelivery = false,
-		row?: { monitor_id: string; event_type: string; fired_at: string },
+		row?: { event_id: string; monitor_id: string; event_type: string; fired_at: string },
 	): void {
 		const eventRow = row ?? this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 		if (!eventRow) return;
 		// Atomic output+intent with a DETERMINISTIC intent id: reconcile and a
 		// concurrent dispatch can never create two intents for one event.
 		const intentId = `monitor-event-intent:${eventId}`;
-		this.#database.monitorEventFencedAuthorWithIntent(
+		const authored = this.#database.monitorEventFencedAuthorWithIntent(
 			eventId,
 			"",
 			note,
@@ -1162,14 +1177,18 @@ export class MonitorPropagator {
 			intentId,
 			JSON.stringify(eventTypeOrigin(eventRow.event_type)),
 		);
+		if (!authored) return;
 		// Wake the closure queue for the intent admitted above.
 		this.#memory.enqueueExistingId(intentId);
+		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+	}
+	#emitStage(row: { event_id: string; monitor_id: string; event_type: string; fired_at: string }, stage: string): void {
 		this.#emit({
-			eventId,
-			monitorId: eventRow.monitor_id,
-			eventType: eventRow.event_type,
-			firedAt: eventRow.fired_at,
-			stage: noDelivery ? "authored_no_delivery" : "authored",
+			eventId: row.event_id,
+			monitorId: row.monitor_id,
+			eventType: row.event_type,
+			firedAt: row.fired_at,
+			stage,
 		});
 	}
 }
