@@ -25,7 +25,12 @@ export const STATUS: GatewayStatusResult = {
 export const MONITOR: MonitorRecord = {
 	monitorId: "mon-weekday-review-0001",
 	name: "weekday-review",
-	trigger: { kind: "cron", schedule: "30 8 * * 1-5" },
+	trigger: { kind: "cron", schedule: "30 8 * * 1-5", timezone: "Asia/Seoul" },
+	nextFireAt: {
+		timezone: "Asia/Seoul",
+		local: "2026-08-28 08:30:00",
+		utc: "2026-08-27T23:30:00.000Z",
+	},
 	eventTypes: ["review.due"],
 	burstPolicy: "coalesce",
 	channelTarget: { origin: { platform: "discord", kind: "channel", conversationId: "1493635653441945762" } },

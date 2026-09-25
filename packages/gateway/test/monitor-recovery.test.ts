@@ -132,7 +132,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 	try {
 		const frames: Array<Record<string, unknown>> = [];
 		let buffered = "";
-		socket = await Bun.connect({
+		const connected = await Bun.connect({
 			unix: socketPath,
 			socket: {
 				data(_socket, data) {
@@ -143,22 +143,43 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 				},
 			},
 		});
-		const inspect = async (id: string) => {
-			socket!.write(
-				`${JSON.stringify({ v: "0.1", type: "request", id, verb: "monitor.inspect", params: { monitorId: monitor.monitorId } })}\n`,
+		socket = connected;
+		const request = async (id: string, verb: "monitor.inspect" | "monitor.list") => {
+			connected.write(
+				`${JSON.stringify({
+					v: "0.1",
+					type: "request",
+					id,
+					verb,
+					...(verb === "monitor.inspect" ? { params: { monitorId: monitor.monitorId } } : {}),
+				})}\n`,
 			);
 			for (let attempt = 0; attempt < 400; attempt++) {
 				const frame = frames.find((entry) => entry.id === id);
 				if (frame) {
 					expect(frame.type).toBe("response");
-					return (frame.result as { recentEvents: Array<Record<string, unknown>> }).recentEvents;
+					return frame.result as Record<string, unknown>;
 				}
 				await Bun.sleep(5);
 			}
-			throw new Error(`no monitor.inspect response for ${id}`);
+			throw new Error(`no ${verb} response for ${id}`);
 		};
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
-		const rows = await inspect("history");
+		connected.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		const list = (await request("list", "monitor.list")).monitors as Array<Record<string, unknown>>;
+		expect(list[0]?.nextFireAt).toMatchObject({
+			timezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : undefined,
+			utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+		});
+		const inspected = await request("history", "monitor.inspect");
+		const inspectedMonitor = inspected.monitor as Record<string, unknown>;
+		const rows = inspected.recentEvents as Array<Record<string, unknown>>;
+		expect(inspectedMonitor).toMatchObject({
+			nextFireAt: {
+				timezone: monitor.trigger.kind === "cron" ? monitor.trigger.timezone : undefined,
+				local: expect.stringMatching(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/),
+				utc: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+			},
+		});
 		expect(rows).toHaveLength(2);
 		for (const [eventId, stage] of [
 			[accepted, "dispatched"],
@@ -172,7 +193,8 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		}
 		// Terminal current-authority events exercise the existing history bound without dispatch.
 		for (let index = 0; index < 101; index++) seedEvent(db, monitor.monitorId, "authored_no_delivery");
-		const bounded = await inspect("bounded");
+		const boundedResponse = await request("bounded", "monitor.inspect");
+		const bounded = boundedResponse.recentEvents as Array<Record<string, unknown>>;
 		expect(bounded).toHaveLength(100);
 		expect(bounded.map((row) => row.eventId)).toEqual(
 			db
@@ -1582,7 +1604,8 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				{ platform: "loopback", kind: "loopback", conversationId: "loopback" },
 				"note",
 			);
-			const deliveryId = payload!.deliveryId as string;
+			if (!payload) throw new Error("outbound delivery was not prepared");
+			const deliveryId = payload.deliveryId as string;
 			delivery.markInflight(deliveryId);
 			// Atomic path: one call transitions ledger AND settles events.
 			const outcome = db.deliveryConfirmWithSettle(deliveryId, "delivered");

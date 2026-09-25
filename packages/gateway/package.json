@@ -9,6 +9,7 @@
 	"dependencies": {
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
-		"@gajae-gateway/subsession": "workspace:*"
+		"@gajae-gateway/subsession": "workspace:*",
+		"cron-parser": "5.10.1"
 	}
 }

@@ -225,6 +225,8 @@ describe("monitor rows", () => {
 		const row = state.monitors.rows[0];
 		expect(row?.fields.trigger).toBe("weekdays 08:30");
 		expect(row?.fields.next).toMatch(/^in \d/);
+		expect(row?.fields.next).toContain("2026-08-28 08:30:00 Asia/Seoul");
+		expect(row?.fields.next).toContain("2026-08-27T23:30:00.000Z");
 		expect(row?.fields.emits).toBe("review.due");
 		expect(row?.fields.target).toBe("discord channel · 1493…5762");
 		expect(row?.fields.outcome).toBe("✓ delivered");

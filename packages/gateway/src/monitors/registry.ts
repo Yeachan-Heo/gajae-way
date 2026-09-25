@@ -33,7 +33,12 @@ export class MonitorRegistry {
 	}
 	add(spec: MonitorSpec): MonitorRecord {
 		validateSpec(spec);
-		const trigger = spec.trigger.kind === "webhook" ? { ...spec.trigger, route: crypto.randomUUID() } : spec.trigger;
+		const trigger: TriggerSpec =
+			spec.trigger.kind === "webhook"
+				? { ...spec.trigger, route: crypto.randomUUID() }
+				: spec.trigger.kind === "cron"
+					? { ...spec.trigger, timezone: spec.trigger.timezone ?? localTimezone() }
+					: spec.trigger;
 		const instruction = spec.instruction?.trim() || undefined;
 		const record: MonitorRecord = {
 			...spec,
@@ -131,10 +136,12 @@ export class MonitorRegistry {
 }
 
 function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): MonitorRecord {
+	const trigger = JSON.parse(row.trigger_json) as TriggerSpec;
 	const record: MonitorRecord = {
 		monitorId: row.monitor_id,
 		name: row.name,
-		trigger: JSON.parse(row.trigger_json),
+		trigger:
+			trigger.kind === "cron" && trigger.timezone === undefined ? { ...trigger, timezone: localTimezone() } : trigger,
 		eventTypes: JSON.parse(row.event_types_json),
 		burstPolicy: row.burst_policy as MonitorRecord["burstPolicy"],
 		channelTarget: row.channel_target_json ? JSON.parse(row.channel_target_json) : null,
@@ -211,7 +218,18 @@ function validateMentionUserIds(target: MonitorChannelTarget): void {
 }
 function validateTrigger(trigger: TriggerSpec): void {
 	if (!trigger || typeof trigger !== "object") throw new Error("monitor trigger is required");
-	if (trigger.kind === "cron" && typeof trigger.schedule === "string") return;
+	if (trigger.kind === "cron" && typeof trigger.schedule === "string") {
+		if (trigger.timezone !== undefined) {
+			if (typeof trigger.timezone !== "string" || !trigger.timezone.trim())
+				throw new Error("monitor cron timezone must be a non-empty IANA timezone");
+			try {
+				new Intl.DateTimeFormat("en-US", { timeZone: trigger.timezone }).format();
+			} catch {
+				throw new Error(`monitor cron timezone ${JSON.stringify(trigger.timezone)} is not a valid IANA timezone`);
+			}
+		}
+		return;
+	}
 	if (trigger.kind === "webhook" && typeof trigger.route === "string") return;
 	if (trigger.kind === "watcher" && typeof trigger.root === "string") return;
 	if (
@@ -224,4 +242,10 @@ function validateTrigger(trigger: TriggerSpec): void {
 	)
 		return;
 	throw new Error("invalid monitor trigger");
+}
+
+function localTimezone(): string {
+	const timezone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!timezone) throw new Error("gateway local IANA timezone is unavailable");
+	return timezone;
 }

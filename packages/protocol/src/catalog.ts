@@ -372,7 +372,7 @@ export interface MemorySearchResult {
  * at creation, never inferred; unknown types route to the catch-all session.
  */
 export type TriggerSpec =
-	| { readonly kind: "cron"; readonly schedule: string }
+	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
 	| { readonly kind: "webhook"; readonly route: string }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
@@ -431,6 +431,8 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly createdAt: string;
 	readonly burstPolicy: BurstPolicyKind;
 	readonly enabled: boolean;
+	/** Computed on list/inspect responses; absent on registry records. */
+	readonly nextFireAt?: { readonly timezone: string; readonly local: string; readonly utc: string } | null;
 }
 
 export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {

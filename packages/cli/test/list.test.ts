@@ -13,7 +13,12 @@ function monitor(overrides: Partial<MonitorRecord> = {}): MonitorRecord {
 	return {
 		monitorId: "mon-1234-abcd",
 		name: "nightly-audit",
-		trigger: { kind: "cron", schedule: "0 3 * * *" },
+		trigger: { kind: "cron", schedule: "0 3 * * *", timezone: "Asia/Seoul" },
+		nextFireAt: {
+			timezone: "Asia/Seoul",
+			local: "2026-08-30 03:00:00",
+			utc: "2026-08-29T18:00:00.000Z",
+		},
 		eventTypes: ["cron.tick"],
 		burstPolicy: "coalesce",
 		createdAt: "2026-08-29T00:00:00.000Z",
@@ -79,6 +84,7 @@ describe("monitors list rendering", () => {
 				monitorId: "mon-5678-efgh",
 				name: "webhook-relay",
 				trigger: { kind: "webhook", route: "r-1" },
+				nextFireAt: null,
 				eventTypes: ["push", "issue"],
 				channelTarget: null,
 				enabled: false,
@@ -86,9 +92,13 @@ describe("monitors list rendering", () => {
 		];
 		const lines = renderList(MONITOR_COLUMNS, rows, parseListOptions([], MONITOR_COLUMNS), monitorEnvelope(rows));
 		expect(lines).toHaveLength(3);
-		expect(lines[0]).toBe("ID        NAME           SCHEDULE     EVENTS      TARGET               ENABLED");
+		expect(lines[0]).toBe(
+			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               ENABLED",
+		);
 		expect(lines[1]).toContain("mon-1234");
 		expect(lines[1]).toContain("0 3 * * *");
+		expect(lines[1]).toContain("Asia/Seoul");
+		expect(lines[1]).toContain("2026-08-30 03:00:00 / 2026-08-29T18:00Z");
 		expect(lines[1]).toContain("cron.tick");
 		expect(lines[1]).toEndWith("true");
 		expect(lines[2]).toContain("webhook:r-1");
@@ -102,7 +112,7 @@ describe("monitors list rendering", () => {
 
 	test("empty list renders a header plus an explicit (none) marker", () => {
 		expect(renderList(MONITOR_COLUMNS, [], parseListOptions([], MONITOR_COLUMNS), monitorEnvelope([]))).toEqual([
-			"ID  NAME  SCHEDULE  EVENTS  TARGET  ENABLED",
+			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  ENABLED",
 			"(none)",
 		]);
 	});

@@ -4,7 +4,6 @@ import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
 	MonitorRecord,
-	MonitorSpec,
 	OpsCycleResult,
 	OriginRef,
 	WorkJobsResult,
@@ -27,15 +26,12 @@ import {
 	type SessionListRow,
 } from "./list";
 import {
-	effectiveRestartState,
-	type LaunchRestartOptions,
-	launchRestartStack,
-	type RunRestartOptions,
-	readRestartReceipt,
-	renderRestartReceipt,
-	runRestartStack,
-} from "./restart-stack";
-import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+	type InstallServicesOptions,
+	installServices,
+	restartStack,
+	type ServicePlatform,
+	serviceUsage,
+} from "./services";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -61,7 +57,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -87,11 +83,8 @@ function gatewayHome(): string {
 
 export interface MainOptions {
 	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
-	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
-	readonly restartStack?: {
-		readonly launch?: Omit<LaunchRestartOptions, "home">;
-		readonly run?: Omit<RunRestartOptions, "home" | "id">;
-	};
+	/** Test seam for `ops restart-stack`; the real path spawns the service manager. */
+	readonly restartStack?: Parameters<typeof restartStack>[0];
 }
 
 export type ServicesAction = "install" | "repair";
@@ -136,59 +129,6 @@ export function parseServicesArgs(args: readonly string[]): ParsedServicesArgs {
 	};
 }
 
-interface ParsedMonitorUpdateArgs {
-	readonly monitorId: string;
-	readonly params: Record<string, unknown>;
-}
-
-const MONITOR_UPDATE_USAGE =
-	"usage: gajaeway monitors update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])";
-
-function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArgs {
-	const [monitorId, ...options] = args;
-	if (!monitorId || monitorId.startsWith("--") || options.length === 0) throw new Error(MONITOR_UPDATE_USAGE);
-
-	let jsonPatch: Partial<MonitorSpec> | undefined;
-	let schedule: string | undefined;
-	let enabled: boolean | undefined;
-	for (let i = 0; i < options.length; i++) {
-		const option = options[i];
-		if (option === "--json") {
-			const value = options[++i];
-			if (jsonPatch !== undefined || value === undefined || value.startsWith("--"))
-				throw new Error(MONITOR_UPDATE_USAGE);
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(value);
-			} catch {
-				throw new Error(MONITOR_UPDATE_USAGE);
-			}
-			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(MONITOR_UPDATE_USAGE);
-			jsonPatch = parsed as Partial<MonitorSpec>;
-		} else if (option === "--schedule") {
-			const value = options[++i];
-			if (schedule !== undefined || !value || value.startsWith("--")) throw new Error(MONITOR_UPDATE_USAGE);
-			schedule = value;
-		} else if (option === "--enabled") {
-			const value = options[++i];
-			if (enabled !== undefined || (value !== "true" && value !== "false")) throw new Error(MONITOR_UPDATE_USAGE);
-			enabled = value === "true";
-		} else throw new Error(MONITOR_UPDATE_USAGE);
-	}
-
-	if (jsonPatch !== undefined && (schedule !== undefined || enabled !== undefined))
-		throw new Error(MONITOR_UPDATE_USAGE);
-	if (jsonPatch !== undefined) return { monitorId, params: { ...jsonPatch, monitorId } };
-	return {
-		monitorId,
-		params: {
-			monitorId,
-			...(schedule === undefined ? {} : { schedule }),
-			...(enabled === undefined ? {} : { enabled }),
-		},
-	};
-}
-
 /**
  * Operator runtime-cycle view (`gajaeway ops cycle`).
  *
@@ -220,10 +160,6 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(
 		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,
 	);
-	if (cycle.monitorAuthoringLost.length > 0)
-		lines.push(
-			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
-		);
 	if (cycle.sessions.length > 0) {
 		lines.push("sessions:");
 		lines.push("INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST");
@@ -510,30 +446,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				if (command === "restart-stack") {
 					// Deliberately socket-free: the reason to run this is a gateway that
 					// has to come back, so it must not need the gateway to answer first.
-					// It also runs detached: restarting the gateway kills a persona turn that
-					// invoked it, which must not end the sequence half-applied (issue #54).
-					const usage = "usage: gajaeway ops restart-stack [--status]";
-					const home = gatewayHome();
-					const flag = parsed.rest[1];
-					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
-						const receipt = await runRestartStack({
-							...options.restartStack?.run,
-							home,
-							id: parsed.rest[2],
-						});
-						for (const line of renderRestartReceipt(receipt)) console.log(line);
-						if (receipt.state !== "ok") process.exitCode = 1;
-					} else if (flag === "--status" && parsed.rest.length === 2) {
-						const receipt = await readRestartReceipt(home);
-						if (receipt === undefined) throw new Error("no restart-stack receipt");
-						for (const line of renderRestartReceipt(receipt)) console.log(line);
-						// Only a completed, verified sequence exits 0; queued or running is not yet success.
-						if (effectiveRestartState(receipt) !== "ok") process.exitCode = 1;
-					} else if (parsed.rest.length === 1) {
-						const { receipt, supervisorPid } = await launchRestartStack({ ...options.restartStack?.launch, home });
-						console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
-						console.log("read the outcome with: gajaeway ops restart-stack --status");
-					} else throw new Error(usage);
+					if (parsed.rest.length > 1) throw new Error("usage: gajaeway ops restart-stack");
+					const commands = await restartStack(options.restartStack ?? {});
+					for (const ran of commands) console.log(`restart-stack: ${ran.join(" ")}`);
 					break;
 				}
 				let redeliverParams: { deliveryId: string } | { since: string } | undefined;
@@ -563,7 +478,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						process.exitCode = cycleExitCode(cycle);
 					} else
 						throw new Error(
-							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|restart-stack [--status]",
+							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|restart-stack",
 						);
 				} finally {
 					await client.close();
@@ -598,14 +513,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "monitors": {
 				const listOptions =
 					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), MONITOR_COLUMNS) : undefined;
-				const [command, ...args] = parsed.rest;
-				const update = command === "update" ? parseMonitorUpdateArgs(args) : undefined;
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
+					const [command, ...args] = parsed.rest;
 					if (command === "add" && args[0] === "--json" && args[1])
 						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
-					else if (command === "update" && update)
-						console.log(JSON.stringify(await client.request<{ monitorId: string }>("monitor.update", update.params)));
 					else if (command === "list") {
 						const options = listOptions as ListOptions;
 						const result = await client.request<{ monitors: MonitorRecord[] }>("monitor.list");
@@ -636,7 +548,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						);
 					} else
 						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]`,
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]; cron timezone is an IANA zone and defaults to the gateway host's local timezone`,
 						);
 				} finally {
 					await client.close();
@@ -690,12 +602,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								const state = job.quarantined
 									? `HELD: quarantined reason=${job.reason} historical_state=${job.state}`
 									: job.state;
-								// HEAD is the progress signal that survives a dead op (issue #67).
-								const head = job.last_commit
-									? `${job.last_commit.sha.slice(0, 7)}@${job.last_commit.committed_at} ${JSON.stringify(job.last_commit.subject)}`
-									: "-";
 								console.log(
-									`${name} ${state} session=${job.session_id || "-"} accepted=${job.accepted_at || "-"} op=${job.attempt?.op_ref || "-"} last=${job.last_activity_at || "-"} head=${head} ${job.worktree_path}`,
+									`${name} ${state} session=${job.session_id || "-"} last=${job.last_activity_at || "-"} ${job.worktree_path}`,
 								);
 							}
 						}

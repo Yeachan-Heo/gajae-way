@@ -139,6 +139,17 @@ export const MONITOR_COLUMNS: readonly Column<MonitorRecord>[] = [
 	{ name: "id", value: (monitor) => monitor.monitorId.slice(0, 8) },
 	{ name: "name", value: (monitor) => monitor.name },
 	{ name: "schedule", value: triggerSummary },
+	{ name: "timezone", value: (monitor) => (monitor.trigger.kind === "cron" ? monitor.trigger.timezone : null) },
+	{
+		name: "nextFire",
+		value: (monitor) => {
+			if (monitor.trigger.kind !== "cron") return null;
+			if (!monitor.enabled) return "paused";
+			if (!monitor.nextFireAt) return "never";
+			const utc = monitor.nextFireAt.utc.replace(/:\d{2}\.\d{3}Z$/, "Z");
+			return `${monitor.nextFireAt.local} / ${utc}`;
+		},
+	},
 	{ name: "events", value: (monitor) => [...monitor.eventTypes] },
 	{ name: "target", value: (monitor) => (monitor.channelTarget ? originKey(monitor.channelTarget.origin) : null) },
 	{ name: "enabled", value: (monitor) => monitor.enabled },

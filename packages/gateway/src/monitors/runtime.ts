@@ -13,6 +13,13 @@ type WebhookTrigger = { kind: "webhook"; route: string; auth?: { kind: "hmac" | 
 export class MonitorRuntimeError extends Error {
 	readonly code = "monitor_runtime_invalid";
 }
+
+function firstEventType(monitor: ReturnType<MonitorRegistry["list"]>[number]): string {
+	const eventType = monitor.eventTypes[0];
+	if (!eventType) throw new MonitorRuntimeError(`monitor ${monitor.monitorId} has no event type`);
+	return eventType;
+}
+
 export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
@@ -36,6 +43,7 @@ export class MonitorRuntime {
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
 		if (webhooks.length) await this.#startWebhook(webhooks);
 		for (const monitor of monitors) {
+			const eventType = firstEventType(monitor);
 			if (monitor.trigger.kind === "cron")
 				this.#stops.push(
 					startCron(
@@ -43,16 +51,10 @@ export class MonitorRuntime {
 						// Atomic slot-claim + event admission inside the propagator.
 						// Returns whether the slot was NEWLY admitted (false for
 						// restart-overlap duplicates) so the catch-up budget counts
-						// only real admissions. A startup catch-up event carries its
-						// missed window in the payload.
-						(slotAt, catchUp) =>
-							this.#propagator.submitSlot(
-								monitor.monitorId,
-								monitor.eventTypes[0]!,
-								{ at: slotAt.toISOString(), ...(catchUp ? { catchUp } : {}) },
-								slotAt,
-							) !== null,
-						{ now: this.#clock, since: this.#propagator.slotBoundary(monitor) },
+						// only real admissions.
+						(slotAt) =>
+							this.#propagator.submitSlot(monitor.monitorId, eventType, { at: slotAt.toISOString() }, slotAt) !== null,
+						{ now: this.#clock, timezone: monitor.trigger.timezone },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {
@@ -61,7 +63,7 @@ export class MonitorRuntime {
 					await startWatcher(
 						monitor.trigger.root,
 						this.#config.watcherRoots,
-						(path) => this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { path }),
+						(path) => this.#propagator.submit(monitor.monitorId, eventType, { path }),
 						monitor.trigger.debounceMs,
 					),
 				);
@@ -70,7 +72,7 @@ export class MonitorRuntime {
 				if (!this.#config.scriptRoot) throw new MonitorRuntimeError("scriptRoot must be configured");
 				this.#stops.push(
 					await startScript(monitor.trigger.command, monitor.trigger.intervalMs, this.#config.scriptRoot, (stdout) =>
-						this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { stdout }),
+						this.#propagator.submit(monitor.monitorId, eventType, { stdout }),
 					),
 				);
 			}
@@ -89,6 +91,7 @@ export class MonitorRuntime {
 		const nonLoopback = bind !== "127.0.0.1" && bind !== "::1";
 		const records: WebhookMonitor[] = [];
 		for (const monitor of monitors) {
+			const eventType = firstEventType(monitor);
 			const trigger = monitor.trigger as WebhookTrigger;
 			if (nonLoopback && (!config.exposeNonLoopback || !trigger.auth))
 				throw new MonitorRuntimeError(
@@ -98,7 +101,7 @@ export class MonitorRuntime {
 			records.push({
 				monitorId: monitor.monitorId,
 				route: trigger.route,
-				eventType: monitor.eventTypes[0]!,
+				eventType,
 				...(trigger.auth && secret ? { auth: { kind: trigger.auth.kind, secret } } : {}),
 			});
 		}
