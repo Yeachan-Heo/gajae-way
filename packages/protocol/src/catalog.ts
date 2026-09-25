@@ -10,6 +10,19 @@ import type { ReactionAction, ReactionRef } from "./reactions";
  * delivery settlement verbs, and redelivery labeling on chat.message.
  */
 
+/**
+ * Allowlisted classification of a failed delivery attempt. Adapter failure
+ * reasons are free text (platform bodies, credentials); only this code is kept.
+ */
+export type DeliveryErrorCode =
+	| "rate_limited"
+	| "timeout"
+	| "network"
+	| "not_found"
+	| "forbidden"
+	| "invalid_request"
+	| "other";
+
 export interface GatewayStatusResult {
 	readonly profileVersion: string;
 	readonly capabilities: readonly string[];
@@ -28,6 +41,17 @@ export interface GatewayStatusResult {
 			readonly originKey: string;
 			readonly attempts: number;
 			readonly expiredAt: string;
+			readonly lastError: DeliveryErrorCode | null;
+		}[];
+		/** The five oldest unsettled rows with their retry diagnostics (metadata only). */
+		readonly recentPending: readonly {
+			readonly deliveryId: string;
+			readonly originKey: string;
+			readonly state: "pending" | "inflight" | "failed_ambiguous";
+			readonly attempts: number;
+			readonly lastError: DeliveryErrorCode | null;
+			readonly nextRetryAt: string | null;
+			readonly createdAt: string;
 		}[];
 	};
 	/** Aggregate-only conversation diff health; never includes message bodies. */

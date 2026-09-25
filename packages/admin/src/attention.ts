@@ -83,12 +83,16 @@ export function buildAttention(
 	const delivery = status?.delivery;
 	if (delivery && delivery.pending > 0 && (delivery.oldestPendingAgeMs ?? 0) >= PENDING_DELIVERY_MS) {
 		const age = formatDuration(delivery.oldestPendingAgeMs ?? 0);
+		const oldest = delivery.recentPending[0];
+		const lastFailure = oldest?.lastError
+			? ` Last failure: ${oldest.lastError} after ${oldest.attempts} attempts; next retry ${oldest.nextRetryAt ?? "none"}.`
+			: "";
 		items.push({
 			key: "delivery:pending",
 			severity: delivery.pending > 1 ? 1 : 2,
 			tone: "danger",
 			title: `${pluralise(delivery.pending, "reply", "replies")} never reached their platform`,
-			detail: `The oldest has been waiting ${age}. Either the adapter is down or it is not settling the ledger.`,
+			detail: `The oldest has been waiting ${age}. Either the adapter is down or it is not settling the ledger.${lastFailure}`,
 			meta: "gateway.status · delivery",
 			at: null,
 		});

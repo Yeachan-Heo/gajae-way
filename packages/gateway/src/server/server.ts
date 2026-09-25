@@ -588,9 +588,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	const deliverySweepTimer = setInterval(() => {
-		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {
-			const sweep = delivery.sweep();
+			// The age TTL runs with or without an adapter: an unsettled row must reach
+			// a terminal state even while nothing is connected to retry it (#171).
+			const connected = [...connections].some((connection) => connection.negotiated);
+			const sweep = delivery.sweep(Date.now(), false, connected);
 			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
@@ -835,7 +837,7 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
 			// adapter may be retrying a stale outcome).
-			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
+			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous, params.reason);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);

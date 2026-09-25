@@ -15,6 +15,7 @@ export {
 	type CycleSessionView,
 	containsSilenceToken,
 	type DeliveryConfirmParams,
+	type DeliveryErrorCode,
 	type DeliveryFailParams,
 	type EngagementContext,
 	type EngagementReactionParams,

@@ -11,7 +11,7 @@ export const STATUS: GatewayStatusResult = {
 	startedAt: new Date(FIXED_NOW.getTime() - 4 * 86_400_000 - 6 * 3_600_000).toISOString(),
 	schemaVersion: 8,
 	sessions: { active: 2 },
-	delivery: { pending: 0, oldestPendingAgeMs: null, expired: 0, recentExpired: [] },
+	delivery: { pending: 0, oldestPendingAgeMs: null, expired: 0, recentExpired: [], recentPending: [] },
 	contextDiff: {
 		unread: 3,
 		expired: 287,

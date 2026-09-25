@@ -1,3 +1,4 @@
+import type { DeliveryErrorCode } from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "./db";
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
@@ -6,6 +7,21 @@ export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
 const MAX_DEFINITIVE_FAILURES = 5;
 const RETRY_BACKOFF_BASE_MS = 2_000;
 const RETRY_BACKOFF_CAP_MS = 5 * 60_000;
+
+const DELIVERY_ERROR_PATTERNS: readonly (readonly [DeliveryErrorCode, RegExp])[] = [
+	["rate_limited", /rate.?limit|\b429\b|too many requests/i],
+	["timeout", /time.?out|deadline/i],
+	["network", /network|socket|econn|enotfound|eai_again|hang up|fetch failed|connection/i],
+	["not_found", /unknown (message|channel|guild|user)|not.?found|\b404\b/i],
+	["forbidden", /forbidden|missing (access|permissions)|not.?allowed|disabled|blocked|cannot|\b403\b/i],
+	["invalid_request", /invalid|bad request|malformed|\b400\b/i],
+];
+
+/** Maps an adapter's free-text failure reason onto the allowlisted code; the raw text is never stored. */
+export function classifyDeliveryError(reason: string | undefined): DeliveryErrorCode {
+	if (reason) for (const [code, pattern] of DELIVERY_ERROR_PATTERNS) if (pattern.test(reason)) return code;
+	return "other";
+}
 
 export interface DeliveryRow {
 	readonly deliveryId: string;
@@ -16,6 +32,10 @@ export interface DeliveryRow {
 	readonly attempts: number;
 	readonly createdAt: string;
 	readonly updatedAt: string;
+	/** Classification of the most recent failed attempt; kept across redrive and confirm. */
+	readonly lastError: DeliveryErrorCode | null;
+	/** When the sweep next retries this row; null once the row is terminal. */
+	readonly nextRetryAt: string | null;
 }
 
 export interface ExpiredDeliveryRow {
@@ -23,6 +43,17 @@ export interface ExpiredDeliveryRow {
 	readonly originKey: string;
 	readonly attempts: number;
 	readonly expiredAt: string;
+	readonly lastError: DeliveryErrorCode | null;
+}
+
+export interface UnsettledDeliveryRow {
+	readonly deliveryId: string;
+	readonly originKey: string;
+	readonly state: Exclude<DeliveryState, "confirmed" | "expired">;
+	readonly attempts: number;
+	readonly lastError: DeliveryErrorCode | null;
+	readonly nextRetryAt: string | null;
+	readonly createdAt: string;
 }
 
 export class DeliveryLedger {
@@ -76,7 +107,7 @@ export class DeliveryLedger {
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, "confirmed"));
 		return "transitioned";
 	}
-	fail(deliveryId: string, ambiguous = false): LedgerOutcome {
+	fail(deliveryId: string, ambiguous = false, reason?: string): LedgerOutcome {
 		const row = this.get(deliveryId);
 		if (!row) return "unknown";
 		// Terminal states never rewrite: confirmed stays delivered, expired stays
@@ -88,7 +119,9 @@ export class DeliveryLedger {
 			: attempts >= MAX_DEFINITIVE_FAILURES
 				? "expired"
 				: "pending";
-		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, state, attempts));
+		this.#database.withTransaction(() =>
+			this.#database.deliveryUpdate(deliveryId, state, attempts, classifyDeliveryError(reason)),
+		);
 		return "transitioned";
 	}
 	/**
@@ -101,7 +134,7 @@ export class DeliveryLedger {
 			(row) =>
 				!["confirmed", "expired"].includes(row.state) &&
 				now - Date.parse(row.createdAt) <= freshnessMs &&
-				(ignoreBackoff || row.attempts === 0 || now - Date.parse(row.updatedAt) >= retryBackoffMs(row.attempts)),
+				(ignoreBackoff || now >= Date.parse(row.nextRetryAt as string)),
 		);
 	}
 	expireStale(freshnessMs: number, now = Date.now()): ExpiredDeliveryRow[] {
@@ -114,6 +147,7 @@ export class DeliveryLedger {
 				originKey: row.origin_key,
 				attempts: row.attempts,
 				expiredAt: row.updated_at,
+				lastError: row.last_error as DeliveryErrorCode | null,
 			}));
 	}
 	requeue(deliveryId: string): string[] {
@@ -139,6 +173,7 @@ export class DeliveryLedger {
 		oldestPendingAgeMs: number | null;
 		expired: number;
 		recentExpired: readonly ExpiredDeliveryRow[];
+		recentPending: readonly UnsettledDeliveryRow[];
 	} {
 		const allRows = this.rows();
 		const rows = allRows.filter((row) => !["confirmed", "expired"].includes(row.state));
@@ -157,6 +192,16 @@ export class DeliveryLedger {
 				originKey: row.originKey,
 				attempts: row.attempts,
 				expiredAt: row.updatedAt,
+				lastError: row.lastError,
+			})),
+			recentPending: rows.slice(0, 5).map((row) => ({
+				deliveryId: row.deliveryId,
+				originKey: row.originKey,
+				state: row.state as UnsettledDeliveryRow["state"],
+				attempts: row.attempts,
+				lastError: row.lastError,
+				nextRetryAt: row.nextRetryAt,
+				createdAt: row.createdAt,
 			})),
 		};
 	}
@@ -164,19 +209,29 @@ export class DeliveryLedger {
 		return this.rows().find((row) => row.deliveryId === deliveryId);
 	}
 	private rows(): DeliveryRow[] {
-		return this.#database.deliveryRows().map((row) => ({
-			deliveryId: row.delivery_id,
-			turnId: row.turn_id,
-			originKey: row.origin_key,
-			payloadJson: row.payload_json,
-			state: row.state as DeliveryState,
-			attempts: row.attempts,
-			createdAt: row.created_at,
-			updatedAt: row.updated_at,
-		}));
+		return this.#database.deliveryRows().map((row) => {
+			const state = row.state as DeliveryState;
+			return {
+				deliveryId: row.delivery_id,
+				turnId: row.turn_id,
+				originKey: row.origin_key,
+				payloadJson: row.payload_json,
+				state,
+				attempts: row.attempts,
+				createdAt: row.created_at,
+				updatedAt: row.updated_at,
+				lastError: row.last_error as DeliveryErrorCode | null,
+				nextRetryAt:
+					state === "confirmed" || state === "expired"
+						? null
+						: new Date(Date.parse(row.updated_at) + retryBackoffMs(row.attempts)).toISOString(),
+			};
+		});
 	}
 }
 
+/** Delay after the last ledger transition before the sweep retries; a never-failed row is due at once. */
 function retryBackoffMs(attempts: number): number {
+	if (attempts === 0) return 0;
 	return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), RETRY_BACKOFF_CAP_MS);
 }

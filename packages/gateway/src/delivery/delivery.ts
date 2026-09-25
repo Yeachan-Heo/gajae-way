@@ -123,14 +123,18 @@ export class DeliveryService {
 	confirm(deliveryId: string): LedgerOutcome {
 		return this.#ledger.confirm(deliveryId);
 	}
-	fail(deliveryId: string, ambiguous?: boolean): LedgerOutcome {
-		return this.#ledger.fail(deliveryId, ambiguous);
+	fail(deliveryId: string, ambiguous?: boolean, reason?: string): LedgerOutcome {
+		return this.#ledger.fail(deliveryId, ambiguous, reason);
 	}
-	/** `onConnect`: replay every unsettled row to a newly negotiated adapter, ignoring retry backoff. */
-	sweep(now = Date.now(), onConnect = false): DeliverySweep {
+	/**
+	 * Always applies the age TTL. `onConnect`: replay every unsettled row to a
+	 * newly negotiated adapter, ignoring retry backoff. `redeliver = false`
+	 * (no adapter connected) only expires.
+	 */
+	sweep(now = Date.now(), onConnect = false, redeliver = true): DeliverySweep {
 		const expired = this.#ledger.expireStale(DELIVERY_FRESHNESS_MS, now);
 		return {
-			payloads: this.#redeliveries(now, onConnect),
+			payloads: redeliver ? this.#redeliveries(now, onConnect) : [],
 			expired,
 		};
 	}
