@@ -106,8 +106,23 @@ async function memoryGitUnserialized(root: string, args: readonly string[]): Pro
 				continue;
 			}
 		}
-		throw new Error(`memory git ${args[0]} failed: ${stderr.trim()}`);
+		throw new Error(gitFailureMessage(args, code, stdout, stderr));
 	}
+}
+
+/**
+ * A git failure must carry its reason. `commit` with nothing staged, for one,
+ * explains itself on stdout with an empty stderr, so a stderr-only message was
+ * the bare `memory git commit failed:` a live gateway died on (#192); the exit
+ * status and argv separate that from an index lock, a hook rejection or a
+ * detached worktree.
+ */
+function gitFailureMessage(args: readonly string[], code: number, stdout: string, stderr: string): string {
+	const argv = ["git", ...args]
+		.map((arg) => (/^[\w./=:@-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`))
+		.join(" ");
+	const reason = [stderr.trim(), stdout.trim()].filter(Boolean).join(" | ") || "(no output)";
+	return `memory git ${args[0]} failed (exit ${code}, argv: ${argv}): ${reason}`;
 }
 
 /** Longer than any git op on a memory corpus should take; shorter than a monitor tick. */
