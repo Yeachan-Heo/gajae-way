@@ -447,12 +447,43 @@ export interface MonitorTestParams {
 	readonly payload?: unknown;
 }
 
+export const PROTOCOL_FAILURE_REASONS = [
+	"protocol_response_not_array",
+	"protocol_entry_missing_field",
+	"protocol_unknown_event",
+	"protocol_duplicate_event",
+	"protocol_omitted_event",
+	"protocol_unparseable_json",
+	"protocol_off_contract",
+] as const;
+export type ProtocolFailureReason = (typeof PROTOCOL_FAILURE_REASONS)[number];
+
+export interface MonitorProtocolFailureRecord {
+	readonly reason: ProtocolFailureReason;
+	readonly failedAt: string;
+	readonly responseByteLength: number;
+	/** Null when the invalid response could not be parsed as an array. */
+	readonly responseEntryCount: number | null;
+}
+
+export interface MonitorEventRecovery {
+	readonly protocolFailures: readonly MonitorProtocolFailureRecord[];
+	readonly firstFailedAt: string;
+	/** Set only after adapter-confirmed delivery. */
+	readonly deliveredAt: string | null;
+	/** Null until delivery is confirmed. */
+	readonly recoveryLatencyMs: number | null;
+	readonly dispatchAttempts: number;
+}
+
 export interface MonitorEventRecord {
 	readonly eventId: string;
 	readonly monitorId: string;
 	readonly eventType: string;
 	readonly firedAt: string;
 	readonly stage: string;
+	/** Public-safe protocol failure/recovery telemetry; raw response text is never included. */
+	readonly recovery?: MonitorEventRecovery;
 	/** Historical authority hold; stage remains the recorded historical stage. */
 	readonly quarantined?: boolean;
 	readonly reason?: string;

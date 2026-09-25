@@ -235,8 +235,21 @@ function lastOutcome(events: readonly MonitorEventRecord[] | null): { label: str
 	const [latest] = events;
 	if (!latest) return { label: "◌ never fired", tone: "muted", at: null };
 	switch (latest.stage) {
-		case "delivered":
+		case "delivered": {
+			if (latest.recovery) {
+				const latencyMs = latest.recovery.recoveryLatencyMs;
+				const latency =
+					typeof latencyMs === "number" && Number.isFinite(latencyMs) && latencyMs >= 0
+						? `${latencyMs}ms (impact proxy)`
+						: "unavailable";
+				return {
+					label: `✓ eventually delivered after protocol failure · recovery latency ${latency}`,
+					tone: "warn",
+					at: latest.firedAt,
+				};
+			}
 			return { label: "✓ delivered", tone: "ok", at: latest.firedAt };
+		}
 		case "authored":
 			return { label: "◐ authored, delivery pending", tone: "warn", at: latest.firedAt };
 		case "authored_no_delivery":

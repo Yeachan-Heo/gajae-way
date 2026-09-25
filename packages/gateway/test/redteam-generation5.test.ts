@@ -488,14 +488,11 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new Database(path);
-		// Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors.
+		// Remove broker-authority objects before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
-		raw.exec(
-			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
-		);
 		for (const table of [
 			"broker_authority",
 			"broker_owned_bindings",

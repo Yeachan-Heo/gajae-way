@@ -367,7 +367,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		await lease.release();
 	});
 
-	test("legacy schema is backed up before migration 22 and authority adoption", async () => {
+	test("legacy schema is backed up before migrations 22–23 and authority adoption", async () => {
 		const f = await fixture();
 		const legacy = new Database(f.path);
 		for (const table of [
@@ -389,11 +389,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		]) {
 			legacy.exec(`DROP TABLE ${table}`);
 		}
-		legacy.exec(
-			"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
-		);
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 23");
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 22");
+		legacy.exec("DELETE FROM schema_migrations WHERE version >= 22");
 		legacy.close();
 		const report = await main(f.apply);
 		expect(report.mode).toBe("apply");

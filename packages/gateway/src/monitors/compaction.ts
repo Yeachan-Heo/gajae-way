@@ -1,3 +1,5 @@
+import type { ProtocolFailureReason } from "@gajae-gateway/protocol";
+
 /**
  * Monitor session safety net (issue #68).
  *
@@ -239,18 +241,11 @@ export function classifyExecutorFailure(error: unknown): ExecutorFailureReason {
  * These reasons are derived from the classifier's own markers, so they name the
  * violated rule without ever emitting the offending text.
  */
-export type ProtocolFailureReason =
-	| "protocol_response_not_array"
-	| "protocol_entry_missing_field"
-	| "protocol_unknown_event"
-	| "protocol_duplicate_event"
-	| "protocol_omitted_event"
-	| "protocol_unparseable_json"
-	| "protocol_off_contract";
-
 /** Marker -> reason, in check order. First match wins. */
 const PROTOCOL_REASON_MARKERS: ReadonlyArray<readonly [string, ProtocolFailureReason]> = [
 	["authoring response is not an array", "protocol_response_not_array"],
+	["authoring response is not a json array", "protocol_response_not_array"],
+	["authoring response json is unparseable", "protocol_unparseable_json"],
 	["authoring response entry missing", "protocol_entry_missing_field"],
 	["authoring response contains unknown event", "protocol_unknown_event"],
 	["authoring response duplicates event", "protocol_duplicate_event"],

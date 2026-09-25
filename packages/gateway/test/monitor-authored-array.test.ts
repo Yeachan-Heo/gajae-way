@@ -11,6 +11,6 @@ test("authoring answers are accepted as bare JSON, fenced JSON, or prose around 
 	expect(parseAuthoredArray('note with [brackets] inside: [{"eventId":"e1","note":"see [ref] here"}]')).toEqual([
 		{ eventId: "e1", note: "see [ref] here" },
 	]);
-	expect(() => parseAuthoredArray("no array here")).toThrow(/not a JSON array/);
+	expect(() => parseAuthoredArray("no array here")).toThrow(/JSON is unparseable/);
 	expect(() => parseAuthoredArray('{"eventId":"e1","note":"object not array"}')).toThrow(/not a JSON array/);
 });

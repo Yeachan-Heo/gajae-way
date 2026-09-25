@@ -5,8 +5,12 @@ import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilenceToken,
+	type MonitorEventRecovery,
+	type MonitorProtocolFailureRecord,
 	type OriginRef,
 	originKey,
+	PROTOCOL_FAILURE_REASONS,
+	type ProtocolFailureReason,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import {
@@ -154,27 +158,6 @@ export class WorkAttemptStateError extends Error {
 		super("work lane state unavailable");
 		this.name = "WorkAttemptStateError";
 	}
-}
-
-/**
- * The only permitted terminal rewrite (#248): broker evidence observed with
- * receiptState=missing is upgraded to present, in the same write that stores
- * this op's proven final body. The SDK receipt state is monotonic, so the
- * rest of the terminal status must be unchanged.
- */
-function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRuntime): boolean {
-	const before = current.terminal;
-	const after = next.terminal;
-	return (
-		before?.kind === "broker" &&
-		after?.kind === "broker" &&
-		before.observedAt === after.observedAt &&
-		before.status?.receiptState === "missing" &&
-		JSON.stringify({ ...before.status, receiptState: "present" }) === JSON.stringify(after.status) &&
-		current.output.proof === null &&
-		next.output.proof !== null &&
-		(next.output.disposition === "available" || next.output.disposition === "silent")
-	);
 }
 
 /** Length-delimited identity hashing; independent of target, output and recovery time. */
@@ -452,6 +435,13 @@ export interface MonitorFailureRow {
 	readonly code: string;
 	readonly detail: string;
 	readonly failed_at: string;
+	readonly protocol_reason: ProtocolFailureReason | null;
+	readonly response_byte_length: number | null;
+	readonly response_entry_count: number | null;
+}
+
+interface MonitorFailureOptions {
+	readonly protocolFailure?: Pick<MonitorProtocolFailureRecord, "reason" | "responseByteLength" | "responseEntryCount">;
 }
 
 export class DatabaseStartupError extends Error {
@@ -474,12 +464,9 @@ export class DatabaseStartupError extends Error {
  * - dispatched: authoring turn sent, output not yet parsed.
  * - authored: note authored; delivery to the target is pending or settled.
  * - delivered: the batch's ledger delivery was confirmed by the adapter.
- * - authored_no_delivery: terminal — nothing will ever be delivered: the
- *   monitor has no channel target and no owner target is configured, or the
- *   authored note is a silence token. Explicit instead of `authored`-forever
- *   so the operator sees a finished state.
- * - failed_no_retry also covers an authored note whose delivery expired
- *   (`monitor_failures` code `delivery_expired`).
+ * - authored_no_delivery: terminal — the monitor has no channel target and no
+ *   owner target is configured, so nothing will ever be delivered. Explicit
+ *   instead of `authored`-forever so the operator sees a finished state.
  * - failed: the last dispatch attempt failed; reconcile redispatches.
  * - failed_no_retry: dispatch failed and reconcile will not retry it again
  *   (reclaim budget exhausted); operator-visible terminal state.
@@ -918,11 +905,7 @@ export class GatewayDatabase {
 		validateWorkRuntime(next, this.instanceId);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
-		workAssert(
-			current.terminal === null ||
-				JSON.stringify(current.terminal) === JSON.stringify(next.terminal) ||
-				lateReceiptReconciled(current, next),
-		);
+		workAssert(current.terminal === null || JSON.stringify(current.terminal) === JSON.stringify(next.terminal));
 		workAssert(
 			current.output.knownSilence === null ||
 				JSON.stringify(current.output.knownSilence) === JSON.stringify(next.output.knownSilence),
@@ -1348,37 +1331,6 @@ export class GatewayDatabase {
 		}>;
 	}
 
-	/**
-	 * Cycle projection source: per event type, the run of most recent terminal
-	 * events (fired at or after `sinceIso`) that exhausted retries with no stored
-	 * authored output. Any other terminal outcome ends the run; in-flight events
-	 * are not evidence either way. Types whose latest terminal event is not such a
-	 * loss are omitted.
-	 */
-	monitorAuthoringLossStreaks(
-		sinceIso: string,
-	): Array<{ eventType: string; consecutive: number; lastFiredAt: string }> {
-		const rows = this.#database
-			.query<{ event_type: string; fired_at: string; lost: number }, [string]>(
-				`SELECT event_type, fired_at, (stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id)) AS lost FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND fired_at >= ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
-			)
-			.all(sinceIso);
-		const streaks = new Map<string, { consecutive: number; lastFiredAt: string; open: boolean }>();
-		for (const row of rows) {
-			const streak = streaks.get(row.event_type);
-			if (!streak) {
-				streaks.set(row.event_type, { consecutive: row.lost ? 1 : 0, lastFiredAt: row.fired_at, open: !!row.lost });
-			} else if (streak.open) {
-				if (row.lost) streak.consecutive++;
-				else streak.open = false;
-			}
-		}
-		return [...streaks]
-			.filter(([, streak]) => streak.consecutive > 0)
-			.map(([eventType, { consecutive, lastFiredAt }]) => ({ eventType, consecutive, lastFiredAt }))
-			.sort((a, b) => a.eventType.localeCompare(b.eventType));
-	}
-
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")
@@ -1406,42 +1358,13 @@ export class GatewayDatabase {
 	}
 
 	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
-	memoryIntentRowsByRowid(): Array<{
-		id: string;
-		kind: string;
-		payload_json: string;
-		state: string;
-		attempts: number;
-		quarantine_reason: string | null;
-	}> {
+	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
 		return this.#database
-			.query("SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY rowid")
-			.all() as Array<{
-			id: string;
-			kind: string;
-			payload_json: string;
-			state: string;
-			attempts: number;
-			quarantine_reason: string | null;
-		}>;
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid")
+			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
 	}
 
-	memoryIntentBeginAttempt(id: string): void {
-		this.#database
-			.query("UPDATE memory_intents SET attempts = attempts + 1, updated_at = ? WHERE id = ?")
-			.run(new Date().toISOString(), id);
-	}
-
-	memoryIntentQuarantine(id: string, reason: string): void {
-		if (!reason.trim()) throw new Error("memory intent quarantine reason is required");
-		this.#database
-			.query(
-				"UPDATE memory_intents SET state = 'quarantined', quarantine_reason = COALESCE(quarantine_reason, ?), updated_at = ? WHERE id = ?",
-			)
-			.run(reason, new Date().toISOString(), id);
-	}
-
-	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted"): void {
+	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
 		this.#database
 			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
 			.run(state, new Date().toISOString(), id);
@@ -1452,20 +1375,14 @@ export class GatewayDatabase {
 		kind: string;
 		payload_json: string;
 		state: "queued" | "written" | "committed" | "receipted" | "quarantined";
-		attempts: number;
-		quarantine_reason: string | null;
 	}> {
 		return this.#database
-			.query(
-				"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY created_at, id",
-			)
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY created_at, id")
 			.all() as Array<{
 			id: string;
 			kind: string;
 			payload_json: string;
 			state: "queued" | "written" | "committed" | "receipted" | "quarantined";
-			attempts: number;
-			quarantine_reason: string | null;
 		}>;
 	}
 
@@ -2609,37 +2526,6 @@ export class GatewayDatabase {
 			service_tier: string | null;
 		}>;
 	}
-	monitorUpdate(row: {
-		id: string;
-		name: string;
-		triggerJson: string;
-		eventTypesJson: string;
-		burstPolicy: string;
-		channelTargetJson: string | null;
-		enabled: boolean;
-		instruction: string | null;
-		modelJson: string | null;
-		serviceTier: string | null;
-	}): boolean {
-		return (
-			this.#database
-				.query(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ? WHERE monitor_id = ?",
-				)
-				.run(
-					row.name,
-					row.triggerJson,
-					row.eventTypesJson,
-					row.burstPolicy,
-					row.channelTargetJson,
-					row.enabled ? 1 : 0,
-					row.instruction,
-					row.modelJson,
-					row.serviceTier,
-					row.id,
-				).changes > 0
-		);
-	}
 	monitorDelete(id: string): boolean {
 		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
 	}
@@ -2883,6 +2769,7 @@ WHERE event_id = ? AND ${leasePredicate}`,
 		detail: string,
 		now = Date.now(),
 		terminal = false,
+		options?: MonitorFailureOptions,
 	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
@@ -2901,7 +2788,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					new Date(now).toISOString(),
 				).changes;
 			if (changes === 0) return false;
-			this.monitorFailureRecord(eventId, code, detail);
+			this.monitorFailureRecord(eventId, code, detail, options);
 			return true;
 		});
 	}
@@ -2994,12 +2881,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// delivered may ONLY be reached from authored: an omitted event still in
 		// dispatched/batched can never be promoted by a batch-wide settlement
 		// (terminal-critic blocker 3).
-		// An expired delivery fails its events terminally (#94); an operator redrive
-		// that the adapter then confirms proves the note did land.
-		if (
-			stage === "delivered" &&
-			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
-		) {
+		if (stage === "delivered" && row.stage === "authored") {
 			this.monitorEventUpdate(eventId, "delivered");
 			return true;
 		}
@@ -3016,35 +2898,6 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			return true;
 		}
 		return false;
-	}
-	/**
-	 * An expired delivery is terminal, so the monitor events it carried can never
-	 * reach `delivered` (#94). Moves the batch's still-`authored` events to
-	 * `failed_no_retry` with evidence naming the delivery, its attempt count and
-	 * the last transport error. Runs inside the caller's transaction; returns the
-	 * failed event ids.
-	 */
-	monitorEventsFailExpiredDelivery(deliveryId: string, reason: string): string[] {
-		const delivery = this.#database
-			.query<{ turn_id: string; attempts: number; state: string }, [string]>(
-				"SELECT turn_id, attempts, state FROM deliveries WHERE delivery_id = ?",
-			)
-			.get(deliveryId);
-		if (delivery?.state !== "expired") return [];
-		const events = this.#database
-			.query<{ event_id: string }, [string]>(
-				`SELECT event_id FROM monitor_events WHERE batch_id = ? AND stage = 'authored' AND ${REPLAYABLE_MONITOR}`,
-			)
-			.all(delivery.turn_id);
-		for (const { event_id } of events) {
-			this.monitorEventUpdate(event_id, "failed_no_retry");
-			this.monitorFailureRecord(
-				event_id,
-				"delivery_expired",
-				`delivery ${deliveryId} expired after ${delivery.attempts} attempts: ${reason}`,
-			);
-		}
-		return events.map((row) => row.event_id);
 	}
 	/**
 	 * Bumps the reclaim counter; returns the new count. Reconcile stops
@@ -3125,7 +2978,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			this.#database
 				.query<MonitorFailureRow, [string]>(
-					"SELECT event_id, code, detail, failed_at FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) ?? undefined
 		);
@@ -3136,17 +2989,99 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * Keeps the newest 20 rows per event and deletes stale rows so the table
 	 * cannot grow without bound across retries.
 	 */
-	monitorFailureRecord(eventId: string, code: string, detail: string): void {
+	monitorFailureRecord(eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
 		// Runs inside the caller's transaction when one is open (dispatch failure
 		// bookkeeping must be atomic with the stage transition); standalone otherwise.
+		const protocolFailure = options?.protocolFailure;
+		if (protocolFailure) {
+			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
+				throw new Error("invalid monitor protocol failure reason");
+			if (!Number.isSafeInteger(protocolFailure.responseByteLength) || protocolFailure.responseByteLength < 0)
+				throw new Error("invalid monitor protocol response byte length");
+			if (
+				protocolFailure.responseEntryCount !== null &&
+				(!Number.isSafeInteger(protocolFailure.responseEntryCount) ||
+					protocolFailure.responseEntryCount < 0 ||
+					protocolFailure.responseEntryCount > protocolFailure.responseByteLength)
+			)
+				throw new Error("invalid monitor protocol response entry count");
+		}
+		const failedAt = new Date().toISOString();
 		this.#database
-			.query("INSERT INTO monitor_failures (event_id, code, detail, failed_at) VALUES (?, ?, ?, ?)")
-			.run(eventId, code, detail.slice(0, 500), new Date().toISOString());
+			.query(
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				eventId,
+				code,
+				detail.slice(0, 500),
+				failedAt,
+				protocolFailure?.reason ?? null,
+				protocolFailure?.responseByteLength ?? null,
+				protocolFailure?.responseEntryCount ?? null,
+			);
 		this.#database
 			.query(
 				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
 			)
 			.run(eventId, eventId);
+	}
+	/** Public-safe protocol failure history and delivery recovery timing for an event. */
+	monitorEventRecovery(eventId: string): MonitorEventRecovery | undefined {
+		const event = this.#database
+			.query<{ stage: string; updated_at: string; dispatch_attempts: number }, [string]>(
+				"SELECT stage, updated_at, dispatch_attempts FROM monitor_events WHERE event_id = ?",
+			)
+			.get(eventId);
+		if (!event) return undefined;
+		const rows = this.#database
+			.query<
+				{
+					protocol_reason: string | null;
+					failed_at: string;
+					response_byte_length: number | null;
+					response_entry_count: number | null;
+				},
+				[string]
+			>(
+				"SELECT protocol_reason, failed_at, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? AND protocol_reason IS NOT NULL ORDER BY rowid ASC",
+			)
+			.all(eventId);
+		const protocolFailures: MonitorProtocolFailureRecord[] = [];
+		for (const row of rows) {
+			if (
+				!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(row.protocol_reason ?? "") ||
+				!Number.isSafeInteger(row.response_byte_length) ||
+				(row.response_byte_length ?? -1) < 0 ||
+				(row.response_entry_count !== null &&
+					(!Number.isSafeInteger(row.response_entry_count) ||
+						row.response_entry_count < 0 ||
+						row.response_entry_count > (row.response_byte_length ?? -1)))
+			)
+				continue;
+			protocolFailures.push({
+				reason: row.protocol_reason as ProtocolFailureReason,
+				failedAt: row.failed_at,
+				responseByteLength: row.response_byte_length as number,
+				responseEntryCount: row.response_entry_count,
+			});
+		}
+		const first = protocolFailures[0];
+		if (!first) return undefined;
+		const deliveredAt = event.stage === "delivered" ? event.updated_at : null;
+		const failedAtMs = Date.parse(first.failedAt);
+		const deliveredAtMs = deliveredAt === null ? Number.NaN : Date.parse(deliveredAt);
+		const latency = deliveredAtMs - failedAtMs;
+		return {
+			protocolFailures,
+			firstFailedAt: first.failedAt,
+			deliveredAt,
+			recoveryLatencyMs:
+				Number.isFinite(failedAtMs) && Number.isFinite(deliveredAtMs) && Number.isSafeInteger(latency) && latency >= 0
+					? latency
+					: null,
+			dispatchAttempts: event.dispatch_attempts + 1,
+		};
 	}
 	monitorFailures(eventIds: readonly string[]): Map<string, MonitorFailureRow> {
 		const rows = new Map<string, MonitorFailureRow>();
@@ -3199,16 +3134,6 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			)
 			.get(monitorId, slotAt);
 		return (row?.n ?? 0) > 0;
-	}
-	/** The monitor's persisted schedule boundary: its newest claimed slot. */
-	monitorLastSlotAt(monitorId: string): string | undefined {
-		return (
-			this.#database
-				.query<{ slot_at: string | null }, [string]>(
-					"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
-				)
-				.get(monitorId)?.slot_at ?? undefined
-		);
 	}
 	/** Drops slot ledger entries older than the retention window (bounded table). */
 	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
@@ -3671,11 +3596,30 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		}
 		if (current < 23) {
 			this.withTransaction(() => {
-				this.#database.exec(
-					"ALTER TABLE memory_intents ADD COLUMN quarantine_reason TEXT; ALTER TABLE memory_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND typeof(attempts) = 'integer')",
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitor_failures)")
+						.all()
+						.map((row) => row.name),
 				);
+				const additions = [
+					[
+						"protocol_reason",
+						"TEXT CHECK(protocol_reason IS NULL OR protocol_reason IN ('protocol_response_not_array', 'protocol_entry_missing_field', 'protocol_unknown_event', 'protocol_duplicate_event', 'protocol_omitted_event', 'protocol_unparseable_json', 'protocol_off_contract'))",
+					],
+					[
+						"response_byte_length",
+						"INTEGER CHECK(response_byte_length IS NULL OR (typeof(response_byte_length) = 'integer' AND response_byte_length BETWEEN 0 AND 9007199254740991))",
+					],
+					[
+						"response_entry_count",
+						"INTEGER CHECK(response_entry_count IS NULL OR (typeof(response_entry_count) = 'integer' AND response_entry_count BETWEEN 0 AND 9007199254740991))",
+					],
+				] as const;
+				for (const [name, declaration] of additions)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE monitor_failures ADD COLUMN ${name} ${declaration}`);
 				this.#database
-					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(23, new Date().toISOString());
 			});
 		}
