@@ -525,8 +525,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			(JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
 				? undefined
 				: (editedMessageId(row.message_id) ?? row.message_id),
-		onHeldSteerAccepted: ({ row }) => {
+		onHeldSteerAccepted: ({ row, abandoned }) => {
+			const turnId = runtime.inbound.get(row.message_id)?.turnId;
 			runtime.inbound.delete(row.message_id);
+			// A steer the runtime recorded after its turn ended still gets its 👀;
+			// one closed because its session is gone was never seen, so it gets none.
+			if (!abandoned) acknowledgeSteer(runtime, row, turnId);
 		},
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
@@ -2115,36 +2119,9 @@ async function createInboundTurnLifecycle(
 	// transaction as the acceptance; only transient ownership is released here.
 	const steerContextMessageId = (steered: InboundMessageRow): string | undefined =>
 		nonLoopback ? (editedMessageId(steered.message_id) ?? steered.message_id) : undefined;
-	// A steer lands inside a running turn whose model may take minutes to say
-	// anything (a folded foreground wait, a long tool). The owner must see at once
-	// that the message arrived, independent of the model: the gateway acknowledges
-	// the accepted steer with 👀 on the steered message itself. Same ledger and
-	// budget as every reaction; a cap or duplicate is logged, never thrown.
-	const acknowledgeSteer = (steered: InboundMessageRow) => {
-		if (!nonLoopback) return;
-		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
-		if (!isPlatformMessageId(targetMessageId)) return;
-		const eyes = resolveReactionEmoji("👀");
-		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
-		const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: eyes.unicode });
-		if (rejection) {
-			console.error(
-				`gateway steer acknowledgement skipped (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
-			);
-			return;
-		}
-		broadcastDelivery(
-			runtime,
-			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-				targetMessageId,
-				emoji: eyes.unicode,
-				emojiName: eyes.name,
-			}),
-		);
-	};
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		runtime.inbound.delete(steered.message_id);
-		acknowledgeSteer(steered);
+		acknowledgeSteer(runtime, steered, turnId);
 	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
 		let threw = false;
@@ -2391,6 +2368,49 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+}
+
+/**
+ * A steer lands inside a running turn whose model may take minutes to say
+ * anything (a folded foreground wait, a long tool). The owner must see at once
+ * that the message arrived, independent of the model: the gateway acknowledges
+ * an accepted steer with 👀 on the steered message itself, through the same
+ * ledger and budget as every reaction. It runs AFTER the steer is durably
+ * accepted, so it must never throw: a cap, a duplicate (the model reacting 👀
+ * too) or a storage error is logged and the acceptance stands.
+ */
+function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: string | undefined): void {
+	try {
+		const origin = validateOriginRef(JSON.parse(steered.origin_ref_json) as OriginRef);
+		if (!isChatPlatform(origin.platform)) return;
+		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
+		if (!isPlatformMessageId(targetMessageId)) return;
+		const eyes = resolveReactionEmoji("👀");
+		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
+		const key = originKey(origin);
+		const rejection = runtime.reactions.claim({
+			...(turnId ? { turnId } : {}),
+			originKey: key,
+			targetMessageId,
+			emoji: eyes.unicode,
+		});
+		if (rejection) {
+			console.error(
+				`gateway steer acknowledgement skipped (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+			);
+			return;
+		}
+		broadcastDelivery(
+			runtime,
+			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+				targetMessageId,
+				emoji: eyes.unicode,
+				emojiName: eyes.name,
+			}),
+		);
+	} catch (error) {
+		console.error(`gateway steer acknowledgement failed for message ${steered.message_id}: ${diagnostic(error)}`);
+	}
 }
 
 /** Fans a committed monitor-event stage transition out to every negotiated adapter. */

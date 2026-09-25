@@ -140,6 +140,27 @@ test("an accepted steer is acknowledged with 👀 on the steered message at once
 	expect(reactionEvents(client.frames)).toHaveLength(1);
 });
 
+test("the model's own [REACT:👀] on a steered message the gateway already acknowledged is not delivered twice", async () => {
+	let finish!: () => void;
+	const running = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const { client, turns, steers } = await gateway("[REACT:👀@m2] on it", running);
+	sendMessage(client, "c1", "first", "m1");
+	for (let attempt = 0; attempt < 200 && turns.length === 0; attempt++) await Bun.sleep(5);
+	sendMessage(client, "c2", "while you work: are you there?", "m2");
+	for (let attempt = 0; attempt < 200 && reactionEvents(client.frames).length === 0; attempt++) await Bun.sleep(5);
+	expect(steers).toHaveLength(1);
+	finish();
+	for (let attempt = 0; attempt < 200 && textEvents(client.frames).length === 0; attempt++) await Bun.sleep(5);
+	await settle();
+	const eyes = reactionEvents(client.frames).filter(
+		(frame) => frame.payload.reaction.emoji === "👀" && frame.payload.reaction.targetMessageId === "m2",
+	);
+	expect(eyes).toHaveLength(1);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["on it"]);
+});
+
 test("an inbound reaction is metadata: it never creates a turn", async () => {
 	const { client, database, turns } = await gateway("should never be produced");
 	client.send({
