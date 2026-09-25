@@ -27,6 +27,7 @@ export {
 	type MemoryAuditResult,
 	type MemorySearchParams,
 	type MemorySearchResult,
+	type MonitorChannelTarget,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type MonitorSpec,

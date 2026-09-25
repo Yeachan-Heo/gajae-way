@@ -14,13 +14,16 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
   "burstPolicy": "dedupe",
   "instruction": "Read the open review queue, pick the oldest item, and post a one-paragraph verdict.",
   "channelTarget": {
-    "origin": { "platform": "discord", "kind": "dm", "conversationId": "owner", "peerId": "owner" }
+    "origin": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
+    "mentionUserIds": ["1468532331001413743"]
   },
   "enabled": true
 }
 ```
 
-`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note.
+`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note. Write it as prose sentences, not a tag bundle: it reaches the authoring session verbatim.
+
+Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
 
 The four trigger kinds are:
 

@@ -718,11 +718,15 @@ export class MonitorPropagator {
 					.join("\n");
 				if (!isSilenceToken(deliveryText)) {
 					const origin = target.origin;
+					// Typed mentions (issue #180) are added here, in code: the author is
+					// never asked to remember who to ping, and the recipient list never
+					// has to be recovered from the event type or the instruction prose.
+					const mentions = (monitor.channelTarget?.mentionUserIds ?? []).map((id) => `<@${id}>`).join(" ");
 					const payload: ChatMessagePayload = {
 						turnId: batchId,
 						origin,
 						role: "assistant",
-						text: deliveryText,
+						text: mentions ? `${mentions} ${deliveryText}` : deliveryText,
 						final: true,
 						deliveryId,
 					};

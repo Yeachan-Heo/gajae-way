@@ -380,6 +380,20 @@ export type MonitorServiceTier =
 	| "openai-only"
 	| "claude-only";
 
+/**
+ * Where a monitor's authored output goes. Destination and mentions are typed
+ * fields so they are never encoded into an event type or recovered from
+ * instruction prose (issue #180).
+ */
+export interface MonitorChannelTarget {
+	readonly origin: OriginRef;
+	/**
+	 * Platform user ids pinged at the start of every delivered note, as `<@id>`.
+	 * Discord and Slack targets only.
+	 */
+	readonly mentionUserIds?: readonly string[];
+}
+
 export interface MonitorSpec {
 	readonly name: string;
 	readonly trigger: TriggerSpec;
@@ -388,7 +402,7 @@ export interface MonitorSpec {
 	/** Burst policy; coalesce when unspecified (spec fact 12). */
 	readonly burstPolicy?: BurstPolicyKind;
 	/** Channel target for authored output: at most one (spec fact 7). */
-	readonly channelTarget?: { readonly origin: OriginRef } | null;
+	readonly channelTarget?: MonitorChannelTarget | null;
 	/**
 	 * Per-monitor execution instruction handed to the authoring turn. Without it
 	 * a monitor's session only learns that an event fired, so it can do nothing

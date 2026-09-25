@@ -1,5 +1,6 @@
 import {
 	eventTypeOrigin,
+	type MonitorChannelTarget,
 	type MonitorRecord,
 	type MonitorSpec,
 	OriginRefError,
@@ -109,7 +110,10 @@ export function validateSpec(spec: MonitorSpec): void {
 	}
 	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
 	validateTrigger(spec.trigger);
-	if (spec.channelTarget) validateOriginRef(spec.channelTarget.origin);
+	if (spec.channelTarget) {
+		validateOriginRef(spec.channelTarget.origin);
+		validateMentionUserIds(spec.channelTarget);
+	}
 	if (spec.model !== undefined) {
 		const valid =
 			(typeof spec.model === "string" && spec.model.trim() !== "") ||
@@ -128,6 +132,19 @@ export function validateSpec(spec: MonitorSpec): void {
 		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)
 			throw new Error(`monitor instruction must be at most ${MONITOR_INSTRUCTION_MAX_LENGTH} characters`);
 	}
+}
+/** `<@id>` renders as a ping on Discord (numeric snowflake) and Slack (`U…`/`W…`). */
+const MENTION_ID_BY_PLATFORM: Partial<Record<string, RegExp>> = {
+	discord: /^\d{1,32}$/,
+	slack: /^[UW][A-Z0-9]{1,31}$/,
+};
+function validateMentionUserIds(target: MonitorChannelTarget): void {
+	const ids: unknown = target.mentionUserIds;
+	if (ids === undefined) return;
+	const pattern = MENTION_ID_BY_PLATFORM[target.origin.platform];
+	if (!pattern) throw new Error(`monitor channelTarget.mentionUserIds is not supported for ${target.origin.platform}`);
+	if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || !pattern.test(id)))
+		throw new Error(`monitor channelTarget.mentionUserIds must be a list of ${target.origin.platform} user ids`);
 }
 function validateTrigger(trigger: TriggerSpec): void {
 	if (!trigger || typeof trigger !== "object") throw new Error("monitor trigger is required");
