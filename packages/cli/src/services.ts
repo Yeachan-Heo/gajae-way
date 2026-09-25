@@ -251,34 +251,17 @@ export function restartStackCommands(platform: ServicePlatform, uid?: number): r
 	if (platform === "linux") return [["systemctl", "--user", "restart", GATEWAY_UNIT]];
 	if (platform === "darwin") {
 		const target = uid ?? process.getuid?.() ?? 0;
-		const ordered = [
-			...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
-			...SERVICE_SPECS.filter((spec) => spec.dependsOnGateway),
-		];
-		return ordered.map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
+		return restartOrder().map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
 	}
 	throw new Error(`unsupported service platform: ${platform}`);
 }
 
-export type CommandRunner = (command: readonly string[]) => number | PromiseLike<number>;
-
-async function defaultCommandRunner(command: readonly string[]): Promise<number> {
-	const child = Bun.spawn([...command], { stdout: "inherit", stderr: "inherit" });
-	return await child.exited;
-}
-
-/** Runs {@link restartStackCommands} in order, stopping at the first failure. */
-export async function restartStack(
-	options: { readonly platform?: ServicePlatform; readonly uid?: number; readonly runner?: CommandRunner } = {},
-): Promise<readonly (readonly string[])[]> {
-	const platform = options.platform === undefined ? currentPlatform() : requirePlatform(options.platform);
-	const runner = options.runner ?? defaultCommandRunner;
-	const commands = restartStackCommands(platform, options.uid);
-	for (const command of commands) {
-		const status = await runner(command);
-		if (status !== 0) throw new Error(`restart-stack failed with status ${status}: ${command.join(" ")}`);
-	}
-	return commands;
+/** The gateway first, then every job that holds a connection to it. */
+export function restartOrder(): readonly ServiceSpec[] {
+	return [
+		...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
+		...SERVICE_SPECS.filter((spec) => spec.dependsOnGateway),
+	];
 }
 
 function requirePlatform(platform: string): ServicePlatform {
@@ -286,7 +269,7 @@ function requirePlatform(platform: string): ServicePlatform {
 	return platform;
 }
 
-function currentPlatform(): ServicePlatform {
+export function currentPlatform(): ServicePlatform {
 	if (process.platform === "darwin" || process.platform === "linux") return process.platform;
 	throw new Error(`unsupported service platform: ${process.platform}`);
 }
