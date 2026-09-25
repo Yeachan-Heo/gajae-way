@@ -72,7 +72,13 @@ import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from 
 import { laneLastCommit, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
-import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
+import {
+	type GatewayDatabase,
+	type InboundMessageRow,
+	type MonitorEventStage,
+	type TerminalUnlinkedReason,
+	terminalDeliveryIds,
+} from "../store/db";
 import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
@@ -605,6 +611,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		}
 	}, options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS);
 	options.database.contextMaintain();
+	reportTerminalLinkAudit(options.database);
 	const contextMaintenanceTimer = setInterval(
 		() => {
 			try {
@@ -612,6 +619,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			} catch (error) {
 				console.error(`gateway context maintenance failed: ${diagnostic(error)}`);
 			}
+			reportTerminalLinkAudit(options.database);
 		},
 		60 * 60 * 1000,
 	);
@@ -1807,6 +1815,22 @@ async function createInboundTurnLifecycle(
 	const effectiveModel = modelOverride ?? runtime.config.model;
 
 	const deliveredParts: string[] = [];
+	/** Ledger ids of every text part and reaction this turn put on the wire, in order. */
+	const deliveredIds: string[] = [];
+	/**
+	 * Closes the trigger's terminal link. Terminal parts claim their own slots as
+	 * they ship; a turn whose visible output was interim text or a reaction (then
+	 * a silent or failed terminal) is linked to the last delivery it made, and a
+	 * turn that delivered nothing records why, so `done` never leaves it NULL (#247).
+	 */
+	const closeTerminalLink = (reason: TerminalUnlinkedReason) => {
+		const last = deliveredIds.at(-1);
+		if (last === undefined) options.database.inboundTurnMarkUnlinked(input.turn.opRef, reason);
+		else if (
+			terminalDeliveryIds(options.database.inboundTurnRow(input.turn.opRef)?.terminal_delivery_id ?? null).length === 0
+		)
+			options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, last);
+	};
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
@@ -1861,6 +1885,7 @@ async function createInboundTurnLifecycle(
 					emojiName: wanted.emojiName,
 				});
 				assistantDeliveryStarted = true;
+				deliveredIds.push(payload.deliveryId as string);
 				broadcastDelivery(runtime, payload);
 			}
 			message = reactionReply.body;
@@ -1951,6 +1976,7 @@ async function createInboundTurnLifecycle(
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
+			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
 			const isLast = index === planned.length - 1;
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
@@ -2072,6 +2098,7 @@ async function createInboundTurnLifecycle(
 		runtime.inbound.delete(steered.message_id);
 	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+		let threw = false;
 		try {
 			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (bootstrap)
@@ -2133,8 +2160,15 @@ async function createInboundTurnLifecycle(
 				userText: capturedUser,
 				replyText,
 			});
+		} catch (error) {
+			threw = true;
+			throw error;
 		} finally {
-			endProgress();
+			try {
+				if (!threw) closeTerminalLink(nonLoopback ? "silent" : "loopback");
+			} finally {
+				endProgress();
+			}
 		}
 	};
 
@@ -2165,6 +2199,9 @@ async function createInboundTurnLifecycle(
 					broadcastDelivery(runtime, notice);
 				}
 			}
+			// The `[turn failed]` notice is a diagnostic, not an answer: it never
+			// claims the slot, but visible interim output before the failure does.
+			closeTerminalLink(nonLoopback ? "turn_failed" : "loopback");
 		} finally {
 			endProgress();
 		}
@@ -2199,6 +2236,25 @@ async function createInboundTurnLifecycle(
 		onStall: ({ elapsedMs }) =>
 			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
 	};
+}
+
+/**
+ * #247 invariant: every `done` trigger names the delivery that closed it or
+ * the reason none did. Reports the last 24 h at startup and hourly, so a
+ * dispatch path that drops the link is visible without a manual ledger audit.
+ */
+function reportTerminalLinkAudit(database: GatewayDatabase): void {
+	try {
+		const { done, unlinked } = database.inboundTerminalLinkAudit(
+			new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+		);
+		if (unlinked > 0)
+			console.error(
+				`gateway terminal link audit: ${unlinked}/${done} done turns in the last 24h have no terminal_delivery_id`,
+			);
+	} catch (error) {
+		console.error(`gateway terminal link audit failed: ${diagnostic(error)}`);
+	}
 }
 
 function parseReceivedAt(value: unknown): string | undefined {
