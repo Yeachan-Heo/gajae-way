@@ -1,4 +1,5 @@
 export {
+	type AgentDiskView,
 	type BurstPolicyKind,
 	type ChatMessagePayload,
 	type ChatProgressActivity,

@@ -688,7 +688,19 @@ export type CycleGateReason =
 	| "monitor_settlement_stuck"
 	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
-	| "inbound_starved";
+	| "inbound_starved"
+	| "agent_disk_headroom";
+
+/**
+ * Free space on the filesystem holding the broker-bound GJC agent directory.
+ * GJC owns and never reaps that directory (sessions, recovery snapshots), so
+ * the gateway only observes headroom; null bytes mean the probe failed.
+ */
+export interface AgentDiskView {
+	readonly path: string;
+	readonly freeBytes: number | null;
+	readonly totalBytes: number | null;
+}
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */
@@ -765,6 +777,8 @@ export interface OpsCycleResult {
 	readonly contextDiff: ConversationContextDiagnostics;
 	/** Worker-lane census against the configured admission cap. */
 	readonly lanes: { readonly active: number; readonly max: number };
+	/** Agent-directory disk headroom; null when no broker agent directory is bound. */
+	readonly agentDisk: AgentDiskView | null;
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */

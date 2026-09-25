@@ -627,6 +627,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 			floorAt: null,
 		},
 		lanes: { active: 0, max: 8 },
+		agentDisk: null,
 		...overrides,
 	};
 }
@@ -712,6 +713,24 @@ describe("cycle rendering", () => {
 		expect(lines).toContain(
 			"monitor authoring lost: backlog.watch=3 (last 2026-09-04T07:00:00.000Z) memory.audit=1 (last 2026-09-04T06:00:00.000Z)",
 		);
+	});
+
+	test("agent-directory headroom renders free/total, or unobservable when the probe failed", () => {
+		const path = "/home/operator/.gjc/agent";
+		const low = renderCycle(
+			cycleResult({
+				phase: "degraded",
+				gates: ["agent_disk_headroom"],
+				agentDisk: { path, freeBytes: 3 * 1024 ** 3, totalBytes: 456 * 1024 ** 3 },
+			}),
+		);
+		expect(low).toContain("gates: agent_disk_headroom");
+		expect(low).toContain(`agent_disk: ${path} free=3.0GiB total=456.0GiB`);
+		expect(renderCycle(cycleResult({ agentDisk: { path, freeBytes: null, totalBytes: null } }))).toContain(
+			`agent_disk: ${path} unobservable`,
+		);
+		expect(renderCycle(cycleResult()).join("\n")).not.toContain("agent_disk:");
+		expect(cycleExitCode(cycleResult({ gates: ["agent_disk_headroom"] }))).toBe(1);
 	});
 
 	test("exit-code contract: gates force exit 1, healthy is exit 0", () => {

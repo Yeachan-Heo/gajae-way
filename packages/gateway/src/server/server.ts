@@ -657,7 +657,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
 		botAudienceTurns,
-		cycle: new RuntimeCycleProjector(options.database, memory, { maxLanes: lanes.maxLanes }),
+		cycle: new RuntimeCycleProjector(options.database, memory, {
+			maxLanes: lanes.maxLanes,
+			agentDir: options.broker?.agentDir,
+		}),
 		lanes,
 		work,
 		inbound,
