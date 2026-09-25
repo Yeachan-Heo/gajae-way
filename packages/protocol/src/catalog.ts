@@ -561,6 +561,12 @@ export interface WorkJobsResult {
 		readonly session_id: string;
 		readonly last_activity_at: string | null;
 		readonly updated_at: string;
+		/** Worktree HEAD (issue #67): progress evidence that survives an op dying; null when unreadable. */
+		readonly last_commit: { readonly sha: string; readonly subject: string; readonly committed_at: string } | null;
+		/** When the job was accepted; absent on a corrupt record. */
+		readonly accepted_at?: string;
+		/** The current attempt, a detail of the job; absent on a corrupt record. */
+		readonly attempt?: { readonly op_ref: string; readonly started_at: string; readonly ended_at?: string } | null;
 	}>;
 }
 
