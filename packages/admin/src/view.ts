@@ -17,8 +17,8 @@ import type {
 	GatewayStatusResult,
 	MonitorEventRecord,
 	MonitorRecord,
+	MonitorScheduleProjection,
 	SessionListResult,
-	TriggerSpec,
 } from "@gajae-gateway/protocol";
 import {
 	ATTENTION_GAPS,
@@ -27,7 +27,6 @@ import {
 	type CoverageGap,
 	type MonitorSnapshot,
 } from "./attention";
-import { nextCronFire } from "./cron";
 import {
 	formatClock,
 	formatClockSeconds,
@@ -250,16 +249,21 @@ function lastOutcome(events: readonly MonitorEventRecord[] | null): { label: str
 	}
 }
 
-function nextFireLabel(trigger: TriggerSpec, now: Date): string {
-	if (trigger.kind !== "cron") return "on demand";
-	const next = nextCronFire(trigger.schedule, now);
+function nextFireLabel(monitor: MonitorRecord, schedule: MonitorScheduleProjection | undefined, now: Date): string {
+	if (monitor.trigger.kind !== "cron") return "on demand";
+	if (!schedule) return "schedule unavailable";
+	const next = schedule.nextFireAt;
 	if (!next) return "schedule never matches";
-	const weekday = next.toLocaleDateString("en-US", { weekday: "short" });
-	const clock = `${String(next.getHours()).padStart(2, "0")}:${String(next.getMinutes()).padStart(2, "0")}`;
-	return `in ${formatDuration(next.getTime() - now.getTime())} · ${weekday} ${clock}`;
+	const timezone = schedule?.effectiveTimezone ? ` ${schedule.effectiveTimezone}` : "";
+	return `in ${formatDuration(Date.parse(next.utc) - now.getTime())} · ${next.local}${timezone} / ${next.utc}`;
 }
 
-function monitorRow(monitor: MonitorRecord, events: readonly MonitorEventRecord[] | null, now: Date): RowView {
+function monitorRow(
+	monitor: MonitorRecord,
+	schedule: MonitorScheduleProjection | undefined,
+	events: readonly MonitorEventRecord[] | null,
+	now: Date,
+): RowView {
 	const outcome = lastOutcome(events);
 	return {
 		key: monitor.monitorId,
@@ -268,7 +272,7 @@ function monitorRow(monitor: MonitorRecord, events: readonly MonitorEventRecord[
 		fields: {
 			name: monitor.name,
 			trigger: triggerSummary(monitor.trigger),
-			next: monitor.enabled ? nextFireLabel(monitor.trigger, now) : "paused — will not fire",
+			next: monitor.enabled ? nextFireLabel(monitor, schedule, now) : "paused — will not fire",
 			emits: monitor.eventTypes.join(", ") || "no declared types",
 			target: monitor.channelTarget ? originLabel(monitor.channelTarget.origin) : "no channel target",
 			outcome: outcome.label,
@@ -400,7 +404,10 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 	const [status, sessions, monitors] = await Promise.all([
 		read<GatewayStatusResult>(deps.request, "gateway.status"),
 		read<SessionListResult>(deps.request, "session.list"),
-		read<{ monitors: readonly MonitorRecord[] }>(deps.request, "monitor.list"),
+		read<{
+			monitors: readonly MonitorRecord[];
+			schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+		}>(deps.request, "monitor.list"),
 	]);
 
 	const monitorList = asList<MonitorRecord>(monitors.value?.monitors).filter(
@@ -408,9 +415,11 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 	);
 	const inspected = await Promise.all(
 		monitorList.slice(0, MONITOR_INSPECT_LIMIT).map((monitor) =>
-			read<{ monitor: MonitorRecord; recentEvents: readonly MonitorEventRecord[] }>(deps.request, "monitor.inspect", {
-				monitorId: monitor.monitorId,
-			}),
+			read<{
+				monitor: MonitorRecord;
+				schedule: MonitorScheduleProjection;
+				recentEvents: readonly MonitorEventRecord[];
+			}>(deps.request, "monitor.inspect", { monitorId: monitor.monitorId }),
 		),
 	);
 	const eventsById = new Map<string, readonly MonitorEventRecord[]>();
@@ -432,7 +441,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 	);
 	const projectedSessions = project(sessionList, sessionRow);
 	const projectedMonitors = project(monitorList, (monitor) =>
-		monitorRow(monitor, eventsById.get(monitor.monitorId) ?? null, now),
+		monitorRow(monitor, monitors.value?.schedules?.[monitor.monitorId], eventsById.get(monitor.monitorId) ?? null, now),
 	);
 
 	const reachable = status.value !== null;
@@ -514,6 +523,7 @@ export async function buildMonitorConsequence(
 ): Promise<MutationConsequence> {
 	const inspected = (await request("monitor.inspect", { monitorId })) as {
 		monitor: MonitorRecord;
+		schedule: MonitorScheduleProjection;
 		recentEvents: readonly MonitorEventRecord[];
 	};
 	const monitor = inspected.monitor;

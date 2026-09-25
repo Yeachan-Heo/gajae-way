@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { nextCronFire, parseCron } from "../src/cron";
-
-/** Local time throughout: a cron the gateway scheduled fires on the host clock. */
-function local(text: string): Date {
-	return new Date(text);
-}
+import { parseCron } from "../src/cron";
 
 describe("parseCron", () => {
 	test("rejects anything that is not five fields", () => {
@@ -39,48 +34,5 @@ describe("parseCron", () => {
 		expect(parseCron("0 9 1 * 1")?.dayUnion).toBe(true);
 		expect(parseCron("0 9 1 * *")?.dayUnion).toBe(false);
 		expect(parseCron("0 9 * * 1")?.dayUnion).toBe(false);
-	});
-});
-
-describe("nextCronFire", () => {
-	test("finds the next matching minute, strictly after the given instant", () => {
-		// 2026-08-27 is a Thursday.
-		const next = nextCronFire("30 8 * * 1-5", local("2026-08-27T08:00:00"));
-		expect(next?.toISOString()).toBe(local("2026-08-27T08:30:00").toISOString());
-	});
-
-	test("never returns the instant it was given", () => {
-		const at = local("2026-08-27T08:30:00");
-		expect(nextCronFire("30 8 * * *", at)?.toISOString()).toBe(local("2026-08-28T08:30:00").toISOString());
-	});
-
-	test("rolls to the next weekday across a weekend", () => {
-		// 2026-08-28 is a Friday, so the next weekday fire after it is Monday.
-		const next = nextCronFire("30 8 * * 1-5", local("2026-08-28T09:00:00"));
-		expect(next?.toISOString()).toBe(local("2026-08-31T08:30:00").toISOString());
-	});
-
-	test("rolls across a month and a year boundary", () => {
-		expect(nextCronFire("0 0 1 * *", local("2026-08-27T12:00:00"))?.toISOString()).toBe(
-			local("2026-09-01T00:00:00").toISOString(),
-		);
-		expect(nextCronFire("0 0 1 1 *", local("2026-08-27T12:00:00"))?.toISOString()).toBe(
-			local("2027-01-01T00:00:00").toISOString(),
-		);
-	});
-
-	test("treats a restricted day-of-month and day-of-week as a union, as cron does", () => {
-		// The 1st, or any Monday, whichever comes first.
-		expect(nextCronFire("0 0 1 * 1", local("2026-08-27T12:00:00"))?.toISOString()).toBe(
-			local("2026-08-31T00:00:00").toISOString(),
-		);
-	});
-
-	test("returns null for an unparseable schedule instead of a plausible lie", () => {
-		expect(nextCronFire("not a cron", local("2026-08-27T12:00:00"))).toBeNull();
-	});
-
-	test("returns null rather than spinning on a schedule that can never fire", () => {
-		expect(nextCronFire("0 0 30 2 *", local("2026-08-27T12:00:00"))).toBeNull();
 	});
 });

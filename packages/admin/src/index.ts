@@ -6,7 +6,7 @@ export {
 	type MonitorSnapshot,
 } from "./attention";
 export { type AuditLog, jsonlAuditLog, memoryAuditLog } from "./audit";
-export { type CronSchedule, nextCronFire, parseCron } from "./cron";
+export { type CronSchedule, parseCron } from "./cron";
 export {
 	type AuditEntry,
 	type AuditSink,

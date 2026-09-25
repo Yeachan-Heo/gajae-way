@@ -320,15 +320,6 @@ export interface SessionListResult {
 	}[];
 }
 
-/**
- * `/model set` choices (session.modelChoices): preset names from the gjc
- * profile's `models.yml` `profiles:` map plus the configured gateway selector.
- * Fails soft: an unreadable catalog yields an empty list, never an error.
- */
-export interface SessionModelChoicesResult {
-	readonly choices: readonly string[];
-}
-
 export interface SessionBootstrapProjection {
 	readonly epoch: number;
 	readonly pending: boolean;
@@ -372,7 +363,7 @@ export interface MemorySearchResult {
  * at creation, never inferred; unknown types route to the catch-all session.
  */
 export type TriggerSpec =
-	| { readonly kind: "cron"; readonly schedule: string }
+	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
 	| { readonly kind: "webhook"; readonly route: string }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
@@ -389,20 +380,6 @@ export type MonitorServiceTier =
 	| "openai-only"
 	| "claude-only";
 
-/**
- * Where a monitor's authored output goes. Destination and mentions are typed
- * fields so they are never encoded into an event type or recovered from
- * instruction prose (issue #180).
- */
-export interface MonitorChannelTarget {
-	readonly origin: OriginRef;
-	/**
-	 * Platform user ids pinged at the start of every delivered note, as `<@id>`.
-	 * Discord and Slack targets only.
-	 */
-	readonly mentionUserIds?: readonly string[];
-}
-
 export interface MonitorSpec {
 	readonly name: string;
 	readonly trigger: TriggerSpec;
@@ -411,7 +388,7 @@ export interface MonitorSpec {
 	/** Burst policy; coalesce when unspecified (spec fact 12). */
 	readonly burstPolicy?: BurstPolicyKind;
 	/** Channel target for authored output: at most one (spec fact 7). */
-	readonly channelTarget?: MonitorChannelTarget | null;
+	readonly channelTarget?: { readonly origin: OriginRef } | null;
 	/**
 	 * Per-monitor execution instruction handed to the authoring turn. Without it
 	 * a monitor's session only learns that an event fired, so it can do nothing
@@ -433,12 +410,9 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
-export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
-	readonly monitorId: string;
-	/** Replace the trigger spec; use schedule to change only a cron schedule. */
-	readonly trigger?: TriggerSpec;
-	/** Change the schedule while retaining the monitor's existing cron trigger. */
-	readonly schedule?: string;
+export interface MonitorScheduleProjection {
+	readonly effectiveTimezone: string | null;
+	readonly nextFireAt: { readonly local: string; readonly utc: string } | null;
 }
 
 export interface MonitorTestParams {
@@ -592,12 +566,6 @@ export interface WorkJobsResult {
 		readonly session_id: string;
 		readonly last_activity_at: string | null;
 		readonly updated_at: string;
-		/** Worktree HEAD (issue #67): progress evidence that survives an op dying; null when unreadable. */
-		readonly last_commit: { readonly sha: string; readonly subject: string; readonly committed_at: string } | null;
-		/** When the job was accepted; absent on a corrupt record. */
-		readonly accepted_at?: string;
-		/** The current attempt, a detail of the job; absent on a corrupt record. */
-		readonly attempt?: { readonly op_ref: string; readonly started_at: string; readonly ended_at?: string } | null;
 	}>;
 }
 
@@ -686,7 +654,6 @@ export type CycleGateReason =
 	| "memory_closure_blocked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
-	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
 	| "inbound_starved";
 
@@ -740,15 +707,6 @@ export interface OpsCycleResult {
 	};
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
-	/**
-	 * Event types whose most recent terminal events (last 24h) exhausted retries
-	 * with no authored output: `consecutive` lost slots, newest at `lastFiredAt`.
-	 */
-	readonly monitorAuthoringLost: readonly {
-		readonly eventType: string;
-		readonly consecutive: number;
-		readonly lastFiredAt: string;
-	}[];
 	/** Delivery ledger census across all states. */
 	readonly deliveries: {
 		readonly pending: number;
@@ -778,7 +736,6 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
-	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
 	"memory.autolink": {
 		params: undefined;
@@ -786,11 +743,20 @@ export interface VerbCatalogV01 {
 	};
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
-	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
-	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
+	"monitor.list": {
+		params: undefined;
+		result: {
+			readonly monitors: readonly MonitorRecord[];
+			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+		};
+	};
 	"monitor.inspect": {
 		params: { readonly monitorId: string };
-		result: { readonly monitor: MonitorRecord; readonly recentEvents: readonly MonitorEventRecord[] };
+		result: {
+			readonly monitor: MonitorRecord;
+			readonly schedule: MonitorScheduleProjection;
+			readonly recentEvents: readonly MonitorEventRecord[];
+		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
@@ -828,12 +794,10 @@ export const VERBS_V01 = [
 	"delivery.fail",
 	"session.recall",
 	"session.list",
-	"session.modelChoices",
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",
 	"monitor.add",
-	"monitor.update",
 	"monitor.list",
 	"monitor.inspect",
 	"monitor.test",

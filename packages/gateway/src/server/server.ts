@@ -15,6 +15,8 @@ import {
 	isPlatformMessageId,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
+	type MonitorRecord,
+	type MonitorScheduleProjection,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -51,6 +53,7 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
+import { nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
@@ -69,7 +72,7 @@ import {
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
-import { laneLastCommit, WorkLaneManager } from "../orchestrator/work-lane";
+import { WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -77,7 +80,7 @@ import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
-import { applyModelCommand, listModelChoices } from "./model-command";
+import { applyModelCommand } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -471,6 +474,7 @@ async function settleMemory(runtime: Runtime): Promise<void> {
 
 function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
+	const broker = options.broker;
 	const connections = new Set<Connection>();
 	const inbound = new Map<string, InboundContext>();
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
@@ -485,8 +489,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		repo: join(options.config.home, "workspace"),
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
-		brokerGeneration: () => options.broker?.generation ?? 0,
-		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
+		brokerGeneration: () => broker?.generation ?? 0,
+		brokerLiveness: broker ? () => broker.judgeLiveness() : undefined,
 		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {
@@ -588,7 +592,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {
 			const sweep = delivery.sweep();
-			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
@@ -712,7 +716,7 @@ async function handleFrame(
 			};
 			connection.write({ v: PROFILE_VERSION, type: "negotiated", payload: result.negotiated });
 			const sweep = runtime.delivery.sweep(Date.now(), true);
-			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
 			for (const payload of sweep.payloads)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 			return;
@@ -731,6 +735,36 @@ async function handleFrame(
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
+function localCronFireTime(at: Date, timezone: string): string {
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: timezone,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		hourCycle: "h23",
+	}).formatToParts(at);
+	const part = (type: Intl.DateTimeFormatPartTypes): string => {
+		const value = parts.find((entry) => entry.type === type)?.value;
+		if (!value) throw new Error(`missing ${type} in cron timestamp`);
+		return value;
+	};
+	return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function scheduleProjection(monitor: MonitorRecord, now: Date): MonitorScheduleProjection {
+	if (monitor.trigger.kind !== "cron") return { effectiveTimezone: null, nextFireAt: null };
+	const timezone = monitor.trigger.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!monitor.enabled) return { effectiveTimezone: timezone, nextFireAt: null };
+	const next = nextCronFire(monitor.trigger.schedule, now, timezone);
+	return {
+		effectiveTimezone: timezone,
+		nextFireAt: next ? { local: localCronFireTime(next, timezone), utc: next.toISOString() } : null,
+	};
+}
+
 async function handleRequest(
 	connection: Connection,
 	request: RequestFrame,
@@ -811,7 +845,7 @@ async function handleRequest(
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				if (failedRow?.state === "expired")
-					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason));
+					reportDeliveryExpired(runtime, failedRow, safeDiagnosticField(params.reason));
 			}
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
@@ -890,27 +924,14 @@ async function handleRequest(
 					...row,
 					session_id: lane?.gjc_session_id ?? "",
 					last_activity_at: lane?.last_activity_at ?? null,
-					// Repository evidence (issue #67): a lane whose op died but whose HEAD
-					// moved is progressing; it is read from the worktree, not the record.
-					last_commit: laneLastCommit(row.worktree_path),
 					...(options.database.isBrokerQuarantined("work", row.job_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				};
 				try {
 					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
-					const attempt = record.attempts.at(-1);
 					return {
 						...bound,
-						// The job is the primary object; the current attempt is a detail.
-						accepted_at: record.createdAt,
-						attempt: attempt
-							? {
-									op_ref: attempt.opRef,
-									started_at: attempt.startedAt,
-									...(attempt.endedAt ? { ended_at: attempt.endedAt } : {}),
-								}
-							: null,
 						attempts: record.attempts.length,
 						checkpoints: record.checkpoints.length,
 						escalations: record.escalations.length,
@@ -966,11 +987,6 @@ async function handleRequest(
 				bootstrap: bootstrapProjection(row),
 			}));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
-			return;
-		}
-		case "session.modelChoices": {
-			const choices = await listModelChoices(options.broker?.agentDir, runtime.config.model);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices } });
 			return;
 		}
 		case "session.recall": {
@@ -1038,30 +1054,20 @@ async function handleRequest(
 			}
 			return;
 		}
-		case "monitor.update": {
-			try {
-				const monitor = runtime.registry.update(request.params as never);
-				if (!monitor) throw new Error("unknown monitorId");
-				connection.write({
-					v: PROFILE_VERSION,
-					type: "response",
-					id: request.id,
-					result: { monitorId: monitor.monitorId },
-				});
-				void runtime.monitorRuntime.refresh();
-			} catch (error) {
-				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid monitor update");
-			}
-			return;
-		}
-		case "monitor.list":
+		case "monitor.list": {
+			const now = new Date();
+			const monitors = runtime.registry.list();
+			const schedules = Object.fromEntries(
+				monitors.map((monitor) => [monitor.monitorId, scheduleProjection(monitor, now)] as const),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitors: runtime.registry.list() },
+				result: { monitors, schedules },
 			});
 			return;
+		}
 		case "monitor.inspect": {
 			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
 			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
@@ -1080,7 +1086,12 @@ async function handleRequest(
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				}));
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor, recentEvents } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { monitor, schedule: scheduleProjection(monitor, new Date()), recentEvents },
+			});
 			return;
 		}
 		case "monitor.test": {
@@ -1089,11 +1100,9 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "monitor.test requires monitorId");
 			const monitor = runtime.registry.get(params.monitorId);
 			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
-			const eventId = runtime.monitors.submit(
-				params.monitorId,
-				typeof params.eventType === "string" ? params.eventType : monitor.eventTypes[0]!,
-				params.payload ?? {},
-			);
+			const eventType = typeof params.eventType === "string" ? params.eventType : monitor.eventTypes[0];
+			if (!eventType) throw new ProtocolError("invalid_params", "monitor has no event types");
+			const eventId = runtime.monitors.submit(params.monitorId, eventType, params.payload ?? {});
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { eventId } });
 			return;
 		}
@@ -1454,16 +1463,14 @@ async function sendChat(
 	// turn reads the full unread diff since the persona's last reply.
 	if (nonLoopback && inboundMessageId) {
 		const engagement = params.engagement as { authorId?: string; authorName?: unknown } | undefined;
-		ingestOrReportDrop(key, inboundMessageId, engagementDecision.engaged, () =>
-			options.database.contextRecord({
-				messageId: inboundMessageId,
-				originKey: key,
-				authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
-				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
-				body: userText,
-				...(receivedAt ? { receivedAt } : {}),
-			}),
-		);
+		options.database.contextRecord({
+			messageId: inboundMessageId,
+			originKey: key,
+			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
+			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+			body: userText,
+			...(receivedAt ? { receivedAt } : {}),
+		});
 	}
 	if (!engaged) {
 		connection.write({
@@ -1544,19 +1551,17 @@ async function sendChat(
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
 	// per-origin actor receives the notification only after this transaction wins.
-	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.inboundEnqueue({
-			messageId,
-			originKey: key,
-			originRefJson: JSON.stringify(origin),
-			body: userText,
-			// The delivery-side gate needs the same bypass decision after a restart,
-			// so it travels with the durable row.
-			engagementJson: params.engagement
-				? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
-				: undefined,
-		}),
-	);
+	const accepted = options.database.inboundEnqueue({
+		messageId,
+		originKey: key,
+		originRefJson: JSON.stringify(origin),
+		body: userText,
+		// The delivery-side gate needs the same bypass decision after a restart,
+		// so it travels with the durable row.
+		engagementJson: params.engagement
+			? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
+			: undefined,
+	});
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
@@ -1676,17 +1681,14 @@ async function editChat(
 	}
 	const messageId = messageEditId(params.messageId, params.text);
 	const turnId = crypto.randomUUID();
-	const { messageId: editedId, text: edit } = params;
-	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.inboundEnqueue({
-			messageId,
-			originKey: key,
-			originRefJson: JSON.stringify(origin),
-			body: renderMessageEdit(editedId, edit),
-			engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
-			...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
-		}),
-	);
+	const accepted = options.database.inboundEnqueue({
+		messageId,
+		originKey: key,
+		originRefJson: JSON.stringify(origin),
+		body: renderMessageEdit(params.messageId, params.text),
+		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+		...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
+	});
 	if (!accepted) {
 		// The same edit event delivered twice: acknowledged once, dispatched once.
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
@@ -2009,7 +2011,7 @@ async function createInboundTurnLifecycle(
 		emitProgress(lastKnown, true);
 	};
 
-	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
+	const onFrame = async ({ frame }: PersonaTailFrameInput) => {
 		if (ended) return false;
 		tailActivitySeen = true;
 		// Every assistant message the owned relay delivers before the final answer
@@ -2138,15 +2140,10 @@ async function createInboundTurnLifecycle(
 		}
 	};
 
-	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
+	const onFailure = async ({ error }: PersonaFailureInput) => {
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);
-			// The turn wrote its answer before it failed (#210): deliver it through
-			// the ordinary terminal slot. It then counts as a visible reply, and the
-			// failure stays in the operator log instead of replacing the answer.
-			if (nonLoopback && recoveredText && !assistantDeliveryStarted)
-				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
 				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (nonLoopback && !assistantDeliveryStarted) {
@@ -2290,7 +2287,6 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 
 function reportDeliveryExpired(
 	runtime: Runtime,
-	database: GatewayDatabase,
 	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
 	reason: string,
 ): void {
@@ -2299,12 +2295,6 @@ function reportDeliveryExpired(
 	const attempts = Number.isSafeInteger(expired.attempts) && expired.attempts >= 0 ? expired.attempts : 0;
 	console.error(
 		`delivery_expired deliveryId=${deliveryId} origin=${origin} attempts=${attempts} reason=${safeDiagnosticField(reason)}`,
-	);
-	// A monitor batch riding on this delivery can never be confirmed now: fail its
-	// events terminally with the delivery evidence instead of leaving them
-	// `authored` forever (#94).
-	database.withTransaction(() =>
-		database.monitorEventsFailExpiredDelivery(expired.deliveryId, safeDiagnosticField(reason)),
 	);
 	if (expired.deliveryId.startsWith("gw-x-")) return;
 	const ownerTarget = runtime.config.ownerTarget?.origin;
@@ -2374,24 +2364,6 @@ export function currentConversationNotice(origin: OriginRef): string {
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
 function isSlackMessageId(value: string): boolean {
 	return /^[A-Z][A-Z0-9]+:\d+\.\d+$/.test(value);
-}
-
-/**
- * Runs one inbound ledger write. A failure still fails the request closed (no
- * turn is admitted without its row), but it is first logged as a drop naming
- * the message and origin (#176): the generic request-failure line carried
- * neither, so a mention lost to an ingest error was indistinguishable from
- * silence.
- */
-function ingestOrReportDrop<T>(originKey: string, messageId: string, engaged: boolean, write: () => T): T {
-	try {
-		return write();
-	} catch (error) {
-		console.error(
-			`inbound_dropped message=${messageId} origin=${originKey} engaged=${engaged} reason=ingest_error: ${diagnostic(error)}`,
-		);
-		throw error;
-	}
 }
 
 function diagnostic(error: unknown): string {

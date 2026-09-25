@@ -9,27 +9,28 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
 ```json
 {
   "name": "weekday-review",
-  "trigger": { "kind": "cron", "schedule": "30 8 * * 1-5" },
+  "trigger": { "kind": "cron", "schedule": "30 8 * * 1-5", "timezone": "Asia/Seoul" },
   "eventTypes": ["review.due"],
   "burstPolicy": "dedupe",
   "instruction": "Read the open review queue, pick the oldest item, and post a one-paragraph verdict.",
   "channelTarget": {
-    "origin": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
-    "mentionUserIds": ["1468532331001413743"]
+    "origin": { "platform": "discord", "kind": "dm", "conversationId": "owner", "peerId": "owner" }
   },
   "enabled": true
 }
 ```
 
-`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note. Write it as prose sentences, not a tag bundle: it reaches the authoring session verbatim.
-
-Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
+`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note.
 
 The four trigger kinds are:
 
 ```json
-{ "kind": "cron", "schedule": "30 5 * * *" }
+{ "kind": "cron", "schedule": "30 5 * * *", "timezone": "Asia/Seoul" }
 ```
+
+Cron schedules use five fields (`minute hour day-of-month month day-of-week`) in the trigger's IANA `timezone`. If omitted, the gateway resolves its host-local timezone when the monitor is added and records that effective zone in the trigger. Set `timezone` explicitly when a schedule must keep the same wall-clock meaning across hosts. Schedule data is a separate RPC projection, not a `MonitorRecord` field. `monitor.list` returns `{ "monitors": [...], "schedules": { "<monitorId>": { "effectiveTimezone": "Asia/Seoul", "nextFireAt": { "local": "2026-08-28 08:30:00", "utc": "2026-08-27T23:30:00.000Z" } } }`; `monitor.inspect` returns `{ "monitor": ..., "schedule": { "effectiveTimezone": "Asia/Seoul", "nextFireAt": { "local": "2026-08-28 08:30:00", "utc": "2026-08-27T23:30:00.000Z" } }, "recentEvents": [...] }`. A schedule with no upcoming cron fire has `nextFireAt: null`; non-cron schedules have `effectiveTimezone: null` and `nextFireAt: null`.
+
+The scheduler evaluates absolute UTC minute slots against local wall-clock fields. A nonexistent spring-forward minute is skipped; a repeated fall-back minute fires once for each distinct UTC instant.
 
 ```json
 { "kind": "webhook", "route": "incoming" }
@@ -42,8 +43,6 @@ The four trigger kinds are:
 ```json
 { "kind": "script", "command": ["/absolute/path/to/check"], "intervalMs": 60000 }
 ```
-
-Cron slots are claimed durably, once per scheduled minute. On startup the gateway resumes from each cron monitor's newest claimed slot (or its creation instant). Slots missed while the gateway was down coalesce into one event for the newest missed slot. Only slots from the last 24 hours count. The event's payload carries `catchUp: { cause: "startup", missedFrom, missedTo, missedSlots }`. Older slots are never replayed, and a restart that owes no slot creates nothing.
 
 For webhook monitors, the registry replaces the supplied route with a generated route token. The runtime receives it at `/hook/<token>`. Watcher roots must fall under configured `watcherRoots`; script commands must be inside configured `scriptRoot` and are checked by ActionGuard.
 
@@ -60,8 +59,6 @@ The durable propagation path is:
 5. **Memory queued** — create a durable `monitor-event` memory intent for the authored note.
 6. **Delivered** — when a `channelTarget` exists, prepare and mark an outbound ledger delivery.
 7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent.
-
-A gateway stop waits a bounded 10 seconds for in-flight authoring turns. A turn still running past that is failed as `gateway_shutdown` with the bound session id and stop time in `monitor_failures.detail`, its lease is released, and the event is re-dispatched by the next boot's reconcile rather than retried against a session whose host the stop orphaned.
 
 The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, and `failed`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
 
@@ -119,11 +116,7 @@ Webhook binding defaults to loopback. A non-loopback bind requires both `webhook
 ## CLI
 
 ```sh
-gajaeway monitors add --json '{"name":"weekday-review","trigger":{"kind":"cron","schedule":"30 8 * * 1-5"},"eventTypes":["review.due"],"burstPolicy":"dedupe","enabled":true}'
-gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5'
-gajaeway monitors update <monitor-id> --enabled false
-gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5' --enabled true
-gajaeway monitors update <monitor-id> --json '{"instruction":"Review the open queue."}'
+gajaeway monitors add --json '{"name":"weekday-review","trigger":{"kind":"cron","schedule":"30 8 * * 1-5","timezone":"Asia/Seoul"},"eventTypes":["review.due"],"burstPolicy":"dedupe","enabled":true}'
 gajaeway monitors list
 gajaeway monitors list --json
 gajaeway monitors list --fields id,name,schedule --limit 20 --offset 20
@@ -131,4 +124,4 @@ gajaeway monitors inspect <monitor-id>
 gajaeway monitors test <monitor-id> --type review.due --payload '{"source":"manual"}'
 ```
 
-`update` changes the existing monitor in place, preserving its identity and event history. Its `--json` value is a partial `MonitorSpec`: only supplied fields are merged into the current spec. Use either `--json` or the shorthand flags; `--schedule '<cron>'` and `--enabled true|false` may be used together. The enabled flag requires an explicit `true` or `false`. The command prints the resulting monitor ID as JSON. `list` prints a one-line-per-monitor table (`id`, `name`, `schedule`, `events`, `target`, `enabled`); `--json` emits the raw monitor records. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns the selected monitor and its recent event records. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.
+`list` prints a one-line-per-monitor table including `timezone` and `nextFire`; `--json` emits `{ monitors, schedules }`, with `schedules` keyed by monitor ID. Each schedule projection contains `effectiveTimezone` and nullable `nextFireAt.local` / `nextFireAt.utc`; those fields are not added to the monitor record. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns `{ monitor, schedule, recentEvents }`, with the effective zone in `schedule.effectiveTimezone` and the next local/UTC times in `schedule.nextFireAt.local` and `schedule.nextFireAt.utc`. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.

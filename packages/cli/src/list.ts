@@ -1,4 +1,4 @@
-import type { MonitorRecord } from "@gajae-gateway/protocol";
+import type { MonitorRecord, MonitorScheduleProjection } from "@gajae-gateway/protocol";
 import { originKey } from "@gajae-gateway/protocol";
 
 /**
@@ -135,13 +135,31 @@ function triggerSummary(monitor: MonitorRecord): string {
 	}
 }
 
-export const MONITOR_COLUMNS: readonly Column<MonitorRecord>[] = [
-	{ name: "id", value: (monitor) => monitor.monitorId.slice(0, 8) },
-	{ name: "name", value: (monitor) => monitor.name },
-	{ name: "schedule", value: triggerSummary },
-	{ name: "events", value: (monitor) => [...monitor.eventTypes] },
-	{ name: "target", value: (monitor) => (monitor.channelTarget ? originKey(monitor.channelTarget.origin) : null) },
-	{ name: "enabled", value: (monitor) => monitor.enabled },
+export interface MonitorListRow {
+	readonly monitor: MonitorRecord;
+	readonly schedule: MonitorScheduleProjection | null;
+}
+
+export const MONITOR_COLUMNS: readonly Column<MonitorListRow>[] = [
+	{ name: "id", value: (row) => row.monitor.monitorId.slice(0, 8) },
+	{ name: "name", value: (row) => row.monitor.name },
+	{ name: "schedule", value: (row) => triggerSummary(row.monitor) },
+	{ name: "timezone", value: (row) => row.schedule?.effectiveTimezone ?? null },
+	{
+		name: "nextFire",
+		value: (row) => {
+			const { monitor, schedule } = row;
+			if (monitor.trigger.kind !== "cron") return null;
+			if (!monitor.enabled) return "paused";
+			if (!schedule) return null;
+			if (!schedule.nextFireAt) return "never";
+			const utc = schedule.nextFireAt.utc.replace(/:\d{2}\.\d{3}Z$/, "Z");
+			return `${schedule.nextFireAt.local} / ${utc}`;
+		},
+	},
+	{ name: "events", value: (row) => [...row.monitor.eventTypes] },
+	{ name: "target", value: (row) => (row.monitor.channelTarget ? originKey(row.monitor.channelTarget.origin) : null) },
+	{ name: "enabled", value: (row) => row.monitor.enabled },
 ];
 
 export interface SessionListRow {
@@ -176,12 +194,19 @@ export function renderList<T>(
 	columns: readonly Column<T>[],
 	rows: readonly T[],
 	options: ListOptions,
-	envelope: { readonly key: string; readonly result: unknown },
+	envelope: {
+		readonly key: string;
+		readonly result: unknown;
+		/** Restore the gateway array-item shape when display rows are wrapped. */
+		readonly serializeRow?: (row: T) => unknown;
+	},
 ): string[] {
 	const entries = pageRows(rows, options);
 	const selected = selectColumns(columns, options.fields);
 	if (!options.json) return renderTable(selected, entries);
 	if (!options.fields && options.limit === undefined && options.offset === 0) return [JSON.stringify(envelope.result)];
-	const projected = options.fields ? projectRows(selected, entries) : entries.map((entry) => entry.row);
+	const projected = options.fields
+		? projectRows(selected, entries)
+		: entries.map((entry) => (envelope.serializeRow ? envelope.serializeRow(entry.row) : entry.row));
 	return [JSON.stringify({ ...(envelope.result as object), [envelope.key]: projected })];
 }
