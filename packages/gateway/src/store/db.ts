@@ -1834,16 +1834,24 @@ export class GatewayDatabase {
 	 * A held steer whose turn is over and whose session is gone: whether the model
 	 * saw it is unknowable and nothing will ever answer the clientRef replay. It is
 	 * closed as done input of that turn - never re-dispatched, which could deliver
-	 * a message the model already answered a second time.
+	 * a message the model already answered a second time - and, in the SAME
+	 * transaction, its platform message leaves the unread context window, exactly
+	 * like an accepted steer, so the next turn does not present it as unread.
 	 */
-	inboundSteerAbandoned(messageId: string, opRef: string): boolean {
-		return (
-			this.#database
-				.query(
-					"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE message_id = ? AND state = 'pending' AND turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?",
-				)
-				.run(messageId, opRef).changes === 1
-		);
+	inboundSteerAbandoned(messageId: string, opRef: string, contextMessageId?: string): boolean {
+		return this.withTransaction(() => {
+			const closed =
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE message_id = ? AND state = 'pending' AND turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?",
+					)
+					.run(messageId, opRef).changes === 1;
+			if (closed && contextMessageId)
+				this.#database
+					.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ? AND consumed_at IS NULL")
+					.run(new Date().toISOString(), contextMessageId);
+			return closed;
+		});
 	}
 
 	/** Held steers of this origin whose turn is already terminal: unresolvable by the turn, only by a clientRef replay. */

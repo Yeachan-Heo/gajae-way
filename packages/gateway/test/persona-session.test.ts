@@ -1055,6 +1055,8 @@ test("a /new-retired turn whose session a broker restart dropped is closed inste
 	await manager!.tick(KEY);
 	await eventually(() => database?.inboundTurnRow(old.opRef)?.turn_state === "done", "retired turn was not closed");
 	expect(logs.some((line) => line.startsWith("retired_turn_closed") && line.includes(old.opRef))).toBe(true);
+	// Recorded as a discarded turn, not as an answered-without-delivery one.
+	expect(database?.inboundTurnRow(old.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "retired" }));
 	// Closed, never re-sent: the discarded prompt is not replayed into the new session.
 	expect(port.sends).toHaveLength(1);
 	const holdsAfter = logs.filter((line) => line.startsWith("recovery_hold") && line.includes(old.opRef)).length;
@@ -1062,24 +1064,100 @@ test("a /new-retired turn whose session a broker restart dropped is closed inste
 	expect(logs.filter((line) => line.startsWith("recovery_hold") && line.includes(old.opRef)).length).toBe(holdsAfter);
 });
 
-test("a live turn whose session answers endpoint_stale and is not live is released like session_unavailable", async () => {
+test("an ACCEPTED live turn whose session answers endpoint_stale and is not live is closed with a notice, never re-sent", async () => {
 	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const failures: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) }, (line) => logs.push(line));
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	expect(database?.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
+
+	port.dropped.add(first.sessionId);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef)),
+		`endpoint_stale was not classified as session_unavailable:\n${logs.join("\n")}`,
+	);
+	// The model may already have run and acted: the trigger is closed, never re-sent.
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(port.sends).toHaveLength(1);
+	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+	// The owner is told the turn was cut off instead of waiting on silence.
+	expect(failures).toHaveLength(1);
+	expect(failures[0]).toContain("session_unavailable");
+	// The next message gets a fresh session instead of the dead one.
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	enqueue("m-2", "next question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2, "next message was not dispatched");
+	expect(port.sends[1]!.text).toBe("next question");
+	expect(port.sends[1]!.sessionId).not.toBe(first.sessionId);
+});
+
+test("an ACCEPTED turn whose status is endpoint_stale but whose liveness is unanswerable is held, never closed or re-sent", async () => {
+	class UnknownLivenessPort extends DroppedSessionPort {
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			if (this.dropped.has(input.sessionId)) return { live: undefined, disowned: false };
+			return await super.liveness(input);
+		}
+	}
+	const port = new UnknownLivenessPort({ onBind: (input) => `session-e${input.epoch}` });
 	const logs: string[] = [];
 	await harness(port, {}, (line) => logs.push(line));
 	enqueue("m-1", "question");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
 	const first = port.sends[0]!;
-
 	port.dropped.add(first.sessionId);
 	await manager!.tick(KEY);
 	await eventually(
-		() => logs.some((line) => line.includes(first.opRef) && line.includes("reason=router_disowned")),
-		`endpoint_stale was not classified as session_unavailable:\n${logs.join("\n")}`,
+		() => logs.some((line) => line.startsWith("recovery_hold") && line.includes(first.opRef)),
+		"unanswerable liveness did not hold the turn",
 	);
-	expect(logs.filter((line) => line.startsWith("recovery_hold") && line.includes("reason=status_unavailable"))).toEqual(
-		[],
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(port.sends).toHaveLength(1);
+	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
+});
+
+test("a dead-session close whose notice fails to persist leaves the turn open and retries the notice; it is never lost or duplicated", async () => {
+	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	let failNotice = true;
+	const notices: string[] = [];
+	await harness(
+		port,
+		{
+			failure: (message) => {
+				if (failNotice) throw new Error("ledger write failed");
+				notices.push(message);
+			},
+		},
+		(line) => logs.push(line),
 	);
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	port.dropped.add(first.sessionId);
+
+	await manager!.tick(KEY).catch(() => {});
+	// Persisting the notice failed: the trigger is NOT closed and the binding is kept.
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
+
+	failNotice = false;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "retry did not close the turn");
+	expect(notices).toHaveLength(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	// A further sweep finds it closed: no second notice, no resend.
+	await manager!.tick(KEY);
+	expect(notices).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
 });
 
 test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {

@@ -244,6 +244,33 @@ test("discarding at /new touches only unbound pending rows and terminal completi
 	expect(db.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+test("an abandoned held steer is closed as done input and its message leaves the unread window in the same write", async () => {
+	const db = await open();
+	const now = Date.now();
+	const opRef = "gw-p-abandoned";
+	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: timestamp(now, 0) });
+	db.inboundBindTurn({ messageId: "trigger", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" });
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
+	db.inboundEnqueue({ ...message("held", "while you work"), receivedAt: timestamp(now, 1) });
+	db.contextRecord({ messageId: "held", originKey: ORIGIN_KEY, body: "while you work", receivedAt: timestamp(now, 1) });
+	expect(db.inboundSteerIssued({ messageId: "held", epoch: 0, opRef })).toBe(true);
+	expect(db.inboundTurnComplete(opRef)).toBe(1);
+	expect(db.inboundSteersHeld(opRef).map((row) => row.message_id)).toEqual(["held"]);
+	expect(db.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).toContain("held");
+
+	expect(db.inboundSteerAbandoned("held", opRef, "held")).toBe(true);
+	expect(db.inboundSteersHeld(opRef)).toEqual([]);
+	expect(db.inboundTurnRows(opRef).find((row) => row.message_id === "held")).toMatchObject({
+		state: "done",
+		turn_state: "done",
+	});
+	// Never presented to the next turn as unread, and never pending for re-dispatch.
+	expect(db.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).not.toContain("held");
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	// Idempotent: a second close is a no-op.
+	expect(db.inboundSteerAbandoned("held", opRef, "held")).toBe(false);
+});
+
 test("one nonterminal trigger per epoch permits steers and retired epochs", async () => {
 	const db = await open();
 	const now = Date.now();

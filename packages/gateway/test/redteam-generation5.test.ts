@@ -390,7 +390,7 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 	}
 });
 
-test("G5: accepted turns need positive death evidence, while bound turns release on an unknown liveness result", async () => {
+test("G5: accepted turns are closed (never re-sent) on positive death evidence, while bound turns release on an unknown liveness result", async () => {
 	const acceptedPort = new AcceptedLivenessPort();
 	const accepted = await directFixture({ port: acceptedPort });
 	try {
@@ -407,11 +407,17 @@ test("G5: accepted turns need positive death evidence, while bound turns release
 
 		acceptedPort.live = false;
 		await accepted.manager.tick(ORIGIN_KEY);
-		await eventually(() => acceptedPort.sends.length === 2, "positive dead evidence did not release the accepted turn");
-		const released = required(acceptedPort.sends[1], "released replacement missing");
-		expect(released.opRef).not.toBe(first.opRef);
+		// The model may already have run and acted: positive death evidence closes
+		// the accepted turn with a notice instead of re-sending it under a new opRef.
+		await eventually(
+			() => accepted.database.inboundTurnRow(first.opRef)?.turn_state === "done",
+			"positive dead evidence did not close the accepted turn",
+		);
+		expect(accepted.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
+			true,
+		);
 		await accepted.manager.tick(ORIGIN_KEY);
-		expect(acceptedPort.sends).toHaveLength(2);
+		expect(acceptedPort.sends).toHaveLength(1);
 	} finally {
 		await accepted.close();
 	}

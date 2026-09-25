@@ -954,7 +954,7 @@ test("C6a: terminal recovery after a stop invokes the reconstructed lifecycle on
 	}
 });
 
-test("C6b: an unknown operation on a broker-disowned session is re-sent once with a new opRef", async () => {
+test("C6b: an accepted operation on a broker-disowned dead session is closed at recovery, never re-sent under a new opRef", async () => {
 	const port = new DisownedStatusPort();
 	const fixture = await directFixture({ port, instanceId: "canonical-recover-requeue" });
 	let recovered: PersonaSessionManager | undefined;
@@ -978,15 +978,23 @@ test("C6b: an unknown operation on a broker-disowned session is re-sent once wit
 			log: (line) => fixture.logs.push(line),
 		});
 		await recovered.recover();
-		await eventually(() => port.sends.length === 2, "disowned operation was not sent on a new session");
-		const replacement = required(port.sends[1], "replacement send missing");
-		expect(replacement.opRef).not.toBe(first.opRef);
-		expect(replacement.sessionId).not.toBe(first.sessionId);
-		expect(port.sendAttempts).toHaveLength(2);
-		port.complete(replacement.opRef, "replacement answer");
-		await eventually(() => fixture.terminals.length === 1, "replacement turn did not complete");
-		expect(fixture.terminals).toEqual([{ trigger: "recover-requeue", text: "replacement answer" }]);
-		expect(port.sends).toHaveLength(2);
+		// The model may already have run and acted: the accepted trigger is closed,
+		// not replayed into a fresh session.
+		await eventually(
+			() => fixture.database.inboundTurnRow(first.opRef)?.turn_state === "done",
+			"disowned accepted operation was not closed",
+		);
+		expect(fixture.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
+			true,
+		);
+		expect(fixture.logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+		expect(port.sendAttempts).toHaveLength(1);
+		expect(port.sends).toHaveLength(1);
+		// A genuinely new message after the close is sent on a fresh session.
+		enqueue(fixture, "after-close", "a new question");
+		await recovered.notifyInbound(DIRECT_ORIGIN_KEY);
+		await eventually(() => port.sends.length === 2, "new message was not sent after the close");
+		expect(port.sends[1]!.sessionId).not.toBe(first.sessionId);
 	} finally {
 		await recovered?.stop();
 		await fixture.close();
