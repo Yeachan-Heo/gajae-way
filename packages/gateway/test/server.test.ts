@@ -6,6 +6,7 @@ import { originKey } from "@gajae-gateway/protocol";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
+import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -324,6 +325,68 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 	} finally {
 		console.error = originalError;
 	}
+});
+
+test("an expired monitor delivery fails its authored events with evidence; a confirmed redrive delivers them (#94)", async () => {
+	const { client, database } = await startDeliveryServer();
+	const monitor = new MonitorRegistry(database).add({
+		name: "watch",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["memory.canonicalize"],
+		burstPolicy: "dedupe",
+		enabled: false,
+	});
+	const batchId = crypto.randomUUID();
+	const eventId = crypto.randomUUID();
+	database.monitorEventCreate({
+		eventId,
+		monitorId: monitor.monitorId,
+		eventType: "memory.canonicalize",
+		payloadJson: "{}",
+		firedAt: new Date().toISOString(),
+	});
+	database.monitorEventUpdate(eventId, "authored", batchId);
+	database.authoredOutputCreate(eventId, "report");
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const deliveryId = "monitor-delivery";
+	new DeliveryLedger(database).createPending({
+		deliveryId,
+		turnId: batchId,
+		originKey: originKey(origin),
+		payloadJson: JSON.stringify({
+			turnId: batchId,
+			origin,
+			role: "assistant",
+			text: "report",
+			final: true,
+			deliveryId,
+		}),
+	});
+	for (let attempt = 1; attempt <= 5; attempt++) {
+		const id = `monitor-fail-${attempt}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "discord 503", ambiguous: false },
+		});
+		await waitFrame(client.frames, id);
+	}
+	const eventStage = () => database.monitorEventRows().find((row) => row.event_id === eventId)?.stage;
+	expect(eventStage()).toBe("failed_no_retry");
+	expect(database.monitorFailure(eventId)).toMatchObject({
+		code: "delivery_expired",
+		detail: `delivery ${deliveryId} expired after 5 attempts: discord_503`,
+	});
+	expect(database.authoredOutput(eventId)).toBe("report");
+
+	client.send({ v: "0.1", type: "request", id: "redrive", verb: "ops.redeliver", params: { deliveryId } });
+	await waitFrame(client.frames, "redrive");
+	client.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
+	await waitFrame(client.frames, "confirm");
+	expect(eventStage()).toBe("delivered");
+	client.close();
 });
 
 test("ops.redeliver requeues expired rows by id or since and immediately publishes them", async () => {

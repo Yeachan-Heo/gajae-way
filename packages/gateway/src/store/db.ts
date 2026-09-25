@@ -474,9 +474,12 @@ export class DatabaseStartupError extends Error {
  * - dispatched: authoring turn sent, output not yet parsed.
  * - authored: note authored; delivery to the target is pending or settled.
  * - delivered: the batch's ledger delivery was confirmed by the adapter.
- * - authored_no_delivery: terminal — the monitor has no channel target and no
- *   owner target is configured, so nothing will ever be delivered. Explicit
- *   instead of `authored`-forever so the operator sees a finished state.
+ * - authored_no_delivery: terminal — nothing will ever be delivered: the
+ *   monitor has no channel target and no owner target is configured, or the
+ *   authored note is a silence token. Explicit instead of `authored`-forever
+ *   so the operator sees a finished state.
+ * - failed_no_retry also covers an authored note whose delivery expired
+ *   (`monitor_failures` code `delivery_expired`).
  * - failed: the last dispatch attempt failed; reconcile redispatches.
  * - failed_no_retry: dispatch failed and reconcile will not retry it again
  *   (reclaim budget exhausted); operator-visible terminal state.
@@ -2960,7 +2963,12 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// delivered may ONLY be reached from authored: an omitted event still in
 		// dispatched/batched can never be promoted by a batch-wide settlement
 		// (terminal-critic blocker 3).
-		if (stage === "delivered" && row.stage === "authored") {
+		// An expired delivery fails its events terminally (#94); an operator redrive
+		// that the adapter then confirms proves the note did land.
+		if (
+			stage === "delivered" &&
+			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
+		) {
 			this.monitorEventUpdate(eventId, "delivered");
 			return true;
 		}
@@ -2977,6 +2985,35 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			return true;
 		}
 		return false;
+	}
+	/**
+	 * An expired delivery is terminal, so the monitor events it carried can never
+	 * reach `delivered` (#94). Moves the batch's still-`authored` events to
+	 * `failed_no_retry` with evidence naming the delivery, its attempt count and
+	 * the last transport error. Runs inside the caller's transaction; returns the
+	 * failed event ids.
+	 */
+	monitorEventsFailExpiredDelivery(deliveryId: string, reason: string): string[] {
+		const delivery = this.#database
+			.query<{ turn_id: string; attempts: number; state: string }, [string]>(
+				"SELECT turn_id, attempts, state FROM deliveries WHERE delivery_id = ?",
+			)
+			.get(deliveryId);
+		if (delivery?.state !== "expired") return [];
+		const events = this.#database
+			.query<{ event_id: string }, [string]>(
+				`SELECT event_id FROM monitor_events WHERE batch_id = ? AND stage = 'authored' AND ${REPLAYABLE_MONITOR}`,
+			)
+			.all(delivery.turn_id);
+		for (const { event_id } of events) {
+			this.monitorEventUpdate(event_id, "failed_no_retry");
+			this.monitorFailureRecord(
+				event_id,
+				"delivery_expired",
+				`delivery ${deliveryId} expired after ${delivery.attempts} attempts: ${reason}`,
+			);
+		}
+		return events.map((row) => row.event_id);
 	}
 	/**
 	 * Bumps the reclaim counter; returns the new count. Reconcile stops
