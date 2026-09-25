@@ -120,6 +120,10 @@ Webhook binding defaults to loopback. A non-loopback bind requires both `webhook
 
 ```sh
 gajaeway monitors add --json '{"name":"weekday-review","trigger":{"kind":"cron","schedule":"30 8 * * 1-5"},"eventTypes":["review.due"],"burstPolicy":"dedupe","enabled":true}'
+gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5'
+gajaeway monitors update <monitor-id> --enabled false
+gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5' --enabled true
+gajaeway monitors update <monitor-id> --json '{"instruction":"Review the open queue."}'
 gajaeway monitors list
 gajaeway monitors list --json
 gajaeway monitors list --fields id,name,schedule --limit 20 --offset 20
@@ -127,4 +131,4 @@ gajaeway monitors inspect <monitor-id>
 gajaeway monitors test <monitor-id> --type review.due --payload '{"source":"manual"}'
 ```
 
-`list` prints a one-line-per-monitor table (`id`, `name`, `schedule`, `events`, `target`, `enabled`); `--json` emits the raw monitor records. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns the selected monitor and its recent event records. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.
+`update` changes the existing monitor in place, preserving its identity and event history. Its `--json` value is a partial `MonitorSpec`: only supplied fields are merged into the current spec. Use either `--json` or the shorthand flags; `--schedule '<cron>'` and `--enabled true|false` may be used together. The enabled flag requires an explicit `true` or `false`. The command prints the resulting monitor ID as JSON. `list` prints a one-line-per-monitor table (`id`, `name`, `schedule`, `events`, `target`, `enabled`); `--json` emits the raw monitor records. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns the selected monitor and its recent event records. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.

@@ -433,6 +433,14 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
+export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
+	readonly monitorId: string;
+	/** Replace the trigger spec; use schedule to change only a cron schedule. */
+	readonly trigger?: TriggerSpec;
+	/** Change the schedule while retaining the monitor's existing cron trigger. */
+	readonly schedule?: string;
+}
+
 export interface MonitorTestParams {
 	readonly monitorId: string;
 	readonly eventType?: string;
@@ -778,6 +786,7 @@ export interface VerbCatalogV01 {
 	};
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
+	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
 	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
 	"monitor.inspect": {
 		params: { readonly monitorId: string };
@@ -824,6 +833,7 @@ export const VERBS_V01 = [
 	"memory.autolink",
 	"memory.search",
 	"monitor.add",
+	"monitor.update",
 	"monitor.list",
 	"monitor.inspect",
 	"monitor.test",

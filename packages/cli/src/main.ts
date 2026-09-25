@@ -4,6 +4,7 @@ import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
 	MonitorRecord,
+	MonitorSpec,
 	OpsCycleResult,
 	OriginRef,
 	WorkJobsResult,
@@ -132,6 +133,59 @@ export function parseServicesArgs(args: readonly string[]): ParsedServicesArgs {
 		...(launchAgentsDir === undefined ? {} : { launchAgentsDir }),
 		...(unitDir === undefined ? {} : { unitDir }),
 		...(platform === undefined ? {} : { platform }),
+	};
+}
+
+interface ParsedMonitorUpdateArgs {
+	readonly monitorId: string;
+	readonly params: Record<string, unknown>;
+}
+
+const MONITOR_UPDATE_USAGE =
+	"usage: gajaeway monitors update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])";
+
+function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArgs {
+	const [monitorId, ...options] = args;
+	if (!monitorId || monitorId.startsWith("--") || options.length === 0) throw new Error(MONITOR_UPDATE_USAGE);
+
+	let jsonPatch: Partial<MonitorSpec> | undefined;
+	let schedule: string | undefined;
+	let enabled: boolean | undefined;
+	for (let i = 0; i < options.length; i++) {
+		const option = options[i];
+		if (option === "--json") {
+			const value = options[++i];
+			if (jsonPatch !== undefined || value === undefined || value.startsWith("--"))
+				throw new Error(MONITOR_UPDATE_USAGE);
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(value);
+			} catch {
+				throw new Error(MONITOR_UPDATE_USAGE);
+			}
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(MONITOR_UPDATE_USAGE);
+			jsonPatch = parsed as Partial<MonitorSpec>;
+		} else if (option === "--schedule") {
+			const value = options[++i];
+			if (schedule !== undefined || !value || value.startsWith("--")) throw new Error(MONITOR_UPDATE_USAGE);
+			schedule = value;
+		} else if (option === "--enabled") {
+			const value = options[++i];
+			if (enabled !== undefined || (value !== "true" && value !== "false")) throw new Error(MONITOR_UPDATE_USAGE);
+			enabled = value === "true";
+		} else throw new Error(MONITOR_UPDATE_USAGE);
+	}
+
+	if (jsonPatch !== undefined && (schedule !== undefined || enabled !== undefined))
+		throw new Error(MONITOR_UPDATE_USAGE);
+	if (jsonPatch !== undefined) return { monitorId, params: { ...jsonPatch, monitorId } };
+	return {
+		monitorId,
+		params: {
+			monitorId,
+			...(schedule === undefined ? {} : { schedule }),
+			...(enabled === undefined ? {} : { enabled }),
+		},
 	};
 }
 
@@ -544,11 +598,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "monitors": {
 				const listOptions =
 					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), MONITOR_COLUMNS) : undefined;
+				const [command, ...args] = parsed.rest;
+				const update = command === "update" ? parseMonitorUpdateArgs(args) : undefined;
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
-					const [command, ...args] = parsed.rest;
 					if (command === "add" && args[0] === "--json" && args[1])
 						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
+					else if (command === "update" && update)
+						console.log(JSON.stringify(await client.request<{ monitorId: string }>("monitor.update", update.params)));
 					else if (command === "list") {
 						const options = listOptions as ListOptions;
 						const result = await client.request<{ monitors: MonitorRecord[] }>("monitor.list");
@@ -579,7 +636,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						);
 					} else
 						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]`,
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]`,
 						);
 				} finally {
 					await client.close();

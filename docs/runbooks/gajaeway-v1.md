@@ -103,12 +103,14 @@ Operator prerequisites, per platform:
 
 ```sh
 gajaeway monitors add --json '<MonitorSpec JSON>'
+gajaeway monitors update <monitor-id> --schedule '<cron>'
+gajaeway monitors update <monitor-id> --enabled false
 gajaeway monitors list
 gajaeway monitors inspect <monitor-id>
 gajaeway monitors test <monitor-id> --type changed --payload '{"source":"manual"}'
 ```
 
-Declare event types at creation time. Use `inspect` to review recent event stages before retrying a trigger. Webhooks are dangerous when exposed beyond loopback: set an explicit non-loopback bind only when required, put it behind authenticated ingress, and require authentication at that ingress. Do not expose an unauthenticated webhook directly to the Internet.
+Declare event types with `add`; use a partial JSON update to change them later. `update` changes a monitor in place, preserving its ID and event history; its `--enabled` option requires an explicit `true` or `false`. Use `inspect` to review recent event stages before retrying a trigger. Webhooks are dangerous when exposed beyond loopback: set an explicit non-loopback bind only when required, put it behind authenticated ingress, and require authentication at that ingress. Do not expose an unauthenticated webhook directly to the Internet.
 
 ## Memory
 
