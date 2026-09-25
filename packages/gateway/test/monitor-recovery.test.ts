@@ -11,7 +11,7 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { MonitorRuntime } from "../src/monitors/runtime";
 import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
-import { SessionTerminalError } from "../src/orchestrator/session-port";
+import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
@@ -418,6 +418,55 @@ describe("monitor crash-boundary state machine", () => {
 			} as never),
 			'"terminal":"failed"',
 		],
+		// #178: a relay refusal is a structured envelope, not a process exit. It
+		// must carry the envelope code and never a misleading `exitCode: 0`.
+		[
+			"envelope refusal",
+			new GjcCliError("SECRET_RAW", 0, "", { code: "prompt_failed", message: "SECRET_ENVELOPE" }),
+			'"code":"prompt_failed","transport":"envelope"',
+		],
+		// #178: the SDK terminal code and outcome classifiers were flattened away,
+		// so a deadline kill and a provider overload read identically.
+		[
+			"terminal deadline",
+			new SessionTerminalError({
+				operationRef: "SECRET_OP",
+				status: {
+					status: "failed",
+					error: { code: "prompt_deadline_exceeded", message: "SECRET_TERMINAL" },
+					outcome: { kind: "failed", provenance: "deadline" },
+				},
+			} as never),
+			'"code":"prompt_deadline_exceeded","terminal":"failed","outcome":{"kind":"failed","provenance":"deadline"}',
+		],
+		[
+			"terminal provider overload",
+			new SessionTerminalError({
+				operationRef: "SECRET_OP",
+				status: {
+					status: "failed",
+					outcome: {
+						kind: "failed",
+						code: "prompt_failed",
+						providerCode: "overloaded_error",
+						phase: "post_start",
+						category: "agent_runtime",
+						provenance: "agent_failed",
+						message: "SECRET_OUTCOME",
+						reason: "SECRET REASON with spaces",
+					},
+				},
+			} as never),
+			'"code":"prompt_failed","terminal":"failed","outcome":{"kind":"failed","providerCode":"overloaded_error","phase":"post_start","category":"agent_runtime","provenance":"agent_failed"}',
+		],
+		[
+			"request wait timeout",
+			new SessionRequestTimeoutError("s1", "SECRET_OP", {
+				operationRef: "SECRET_OP",
+				status: { status: "in_flight" },
+			} as never),
+			'"class":"SessionRequestTimeoutError","lastStatus":"in_flight"',
+		],
 		[
 			"untrusted fields",
 			Object.assign(new Error("SECRET_RAW"), {
@@ -444,7 +493,7 @@ describe("monitor crash-boundary state machine", () => {
 			expect(detail).toContain('"origin":"monitor/eventtype/memory.canonicalize"');
 			expect(detail).toContain('"attempt":2');
 			expect(detail).not.toContain("SECRET");
-			if (label === "untrusted fields" || label === "missing fields") {
+			if (label === "untrusted fields" || label === "missing fields" || label === "envelope refusal") {
 				expect(detail).not.toContain('"exitCode"');
 				expect(detail).not.toContain('"signal"');
 			}
