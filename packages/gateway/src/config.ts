@@ -87,6 +87,13 @@ export interface GatewayConfigFile {
 	 * MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD.
 	 */
 	readonly monitorContextFailureRollThreshold?: number;
+	/**
+	 * Cron catch-up ceiling (issue #157). After downtime every slot since a
+	 * monitor's durable cursor is replayed, except slots older than `maxAgeMs`
+	 * and the oldest overflow beyond `maxSlots`; those are recorded as skipped.
+	 * Default DEFAULT_CRON_CATCH_UP (24 slots, 24 hours).
+	 */
+	readonly monitorCatchUp?: MonitorCatchUpConfig;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -96,6 +103,15 @@ export interface GatewayConfigFile {
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
 }
+
+export interface MonitorCatchUpConfig {
+	readonly maxSlots?: number;
+	readonly maxAgeMs?: number;
+}
+
+/** Bounds for `monitorCatchUp`: at least one slot, at most a week of lookback. */
+export const MONITOR_CATCH_UP_MAX_SLOTS = 1000;
+export const MONITOR_CATCH_UP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface BotAudienceConfig {
 	/**
@@ -384,6 +400,36 @@ function parseMonitorContextFailureRollThreshold(value: unknown): number {
 	return value as number;
 }
 
+function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
+	const input = requireObject(value, "monitorCatchUp");
+	if (Object.keys(input).some((key) => key !== "maxSlots" && key !== "maxAgeMs"))
+		throw new ConfigError("config_invalid", "monitorCatchUp may only contain maxSlots and maxAgeMs");
+	if (
+		input.maxSlots !== undefined &&
+		(!Number.isInteger(input.maxSlots) ||
+			(input.maxSlots as number) < 1 ||
+			(input.maxSlots as number) > MONITOR_CATCH_UP_MAX_SLOTS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`monitorCatchUp.maxSlots must be an integer between 1 and ${MONITOR_CATCH_UP_MAX_SLOTS}`,
+		);
+	if (
+		input.maxAgeMs !== undefined &&
+		(!Number.isInteger(input.maxAgeMs) ||
+			(input.maxAgeMs as number) < 60_000 ||
+			(input.maxAgeMs as number) > MONITOR_CATCH_UP_MAX_AGE_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`monitorCatchUp.maxAgeMs must be an integer between 60000 and ${MONITOR_CATCH_UP_MAX_AGE_MS}`,
+		);
+	return {
+		...(input.maxSlots === undefined ? {} : { maxSlots: input.maxSlots as number }),
+		...(input.maxAgeMs === undefined ? {} : { maxAgeMs: input.maxAgeMs as number }),
+	};
+}
+
 function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
 	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs"))
@@ -461,6 +507,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
+		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
@@ -584,6 +631,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"runtime",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
+	"monitorCatchUp",
 	"work",
 ] as const;
 

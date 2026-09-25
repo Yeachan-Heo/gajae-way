@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
 import type { GatewayConfig } from "../config";
+import type { GatewayDatabase } from "../store/db";
 import type { MonitorPropagator } from "./propagate";
 import type { MonitorRegistry } from "./registry";
-import { startCron } from "./triggers/cron";
+import { type CronCatchUpPolicy, startCron } from "./triggers/cron";
 import { startScript } from "./triggers/script";
 import { startWatcher } from "./triggers/watcher";
 import { startWebhook, type WebhookMonitor } from "./triggers/webhook";
@@ -17,18 +18,23 @@ export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
 	readonly #propagator: MonitorPropagator;
+	readonly #database: GatewayDatabase;
 	#stops: Stop[] = [];
 	readonly #clock?: () => Date;
+	readonly #catchUp?: CronCatchUpPolicy;
 	constructor(
 		config: GatewayConfig,
 		registry: MonitorRegistry,
 		propagator: MonitorPropagator,
-		options: { now?: () => Date } = {},
+		database: GatewayDatabase,
+		options: { now?: () => Date; catchUp?: CronCatchUpPolicy } = {},
 	) {
 		this.#config = config;
 		this.#registry = registry;
 		this.#propagator = propagator;
+		this.#database = database;
 		this.#clock = options.now;
+		this.#catchUp = options.catchUp;
 	}
 	async start(): Promise<void> {
 		await this.stop();
@@ -40,19 +46,37 @@ export class MonitorRuntime {
 				this.#stops.push(
 					startCron(
 						monitor.trigger.schedule,
-						// Atomic slot-claim + event admission inside the propagator.
-						// Returns whether the slot was NEWLY admitted (false for
-						// restart-overlap duplicates) so the catch-up budget counts
-						// only real admissions. A startup catch-up event carries its
-						// missed window in the payload.
-						(slotAt, catchUp) =>
-							this.#propagator.submitSlot(
-								monitor.monitorId,
-								monitor.eventTypes[0]!,
-								{ at: slotAt.toISOString(), ...(catchUp ? { catchUp } : {}) },
-								slotAt,
-							) !== null,
-						{ now: this.#clock, since: this.#propagator.slotBoundary(monitor) },
+						{
+							// Durable per-monitor progress (issue #157): the newest claimed or
+							// policy-skipped slot, never earlier than the monitor's creation.
+							cursor: () => {
+								const created = Date.parse(monitor.createdAt);
+								const stored = this.#database.monitorCronCursor(monitor.monitorId);
+								return new Date(stored === undefined ? created : Math.max(created, Date.parse(stored)));
+							},
+							// Atomic slot-claim + event admission inside the propagator;
+							// false for a slot another sweep already claimed.
+							fire: (slotAt) =>
+								this.#propagator.submitSlot(
+									monitor.monitorId,
+									monitor.eventTypes[0]!,
+									{ at: slotAt.toISOString() },
+									slotAt,
+								) !== null,
+							skipped: (skip) => {
+								const oldest = skip.oldest.toISOString();
+								const newest = skip.newest.toISOString();
+								this.#database.monitorCronRecordSkip(
+									monitor.monitorId,
+									{ count: skip.count, oldest, newest },
+									(this.#clock?.() ?? new Date()).toISOString(),
+								);
+								console.error(
+									`monitor_slots_skipped monitor=${monitor.monitorId} count=${skip.count} oldest=${oldest} newest=${newest}`,
+								);
+							},
+						},
+						{ now: this.#clock, policy: this.#catchUp },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {

@@ -95,6 +95,27 @@ test("invalid runtime PATH settings fail the offline config check", async () => 
 	}
 });
 
+test("monitorCatchUp is a bounded, restart-required cron catch-up ceiling", () => {
+	const config = parseConfigFile({
+		schemaVersion: CONFIG_SCHEMA_VERSION,
+		monitorCatchUp: { maxSlots: 48, maxAgeMs: 172_800_000 },
+	});
+	expect(config.monitorCatchUp).toEqual({ maxSlots: 48, maxAgeMs: 172_800_000 });
+	expect(RESTART_REQUIRED_FIELDS).toContain("monitorCatchUp");
+	for (const monitorCatchUp of [
+		{ maxSlots: 0 },
+		{ maxSlots: 1.5 },
+		{ maxSlots: 1001 },
+		{ maxAgeMs: 59_999 },
+		{ maxAgeMs: 7 * 24 * 60 * 60 * 1000 + 1 },
+		{ windowMs: 3_600_000 },
+	])
+		expect(
+			() => parseConfigFile({ schemaVersion: CONFIG_SCHEMA_VERSION, monitorCatchUp }),
+			JSON.stringify(monitorCatchUp),
+		).toThrow(/monitorCatchUp/);
+});
+
 test("malformed JSON is reported as not_json rather than crashing", async () => {
 	const result = await checkConfigFile(await configFile('{"schemaVersion": 1,}'));
 	expect(result.ok).toBe(false);
