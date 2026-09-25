@@ -59,7 +59,7 @@ The durable propagation path is:
 4. **Authored** — ask Gajae for exactly one note per event, then persist each authored output.
 5. **Memory queued** — create a durable `monitor-event` memory intent for the authored note.
 6. **Delivered** — when a `channelTarget` exists, prepare and mark an outbound ledger delivery.
-7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent.
+7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent. A `failed` event is reclaimed on a backoff measured from its last failure — immediately, then after 10 minutes, 1 hour, 4 hours and 12 hours — so the five-attempt budget spans ~17 hours and a slot survives a multi-hour dispatch outage. Only after that does it land on the terminal `failed_no_retry`.
 
 A gateway stop waits a bounded 10 seconds for in-flight authoring turns. A turn still running past that is failed as `gateway_shutdown` with the bound session id and stop time in `monitor_failures.detail`, its lease is released, and the event is re-dispatched by the next boot's reconcile rather than retried against a session whose host the stop orphaned.
 

@@ -14,7 +14,12 @@ import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
 import type { GatewayDatabase } from "../store/db";
-import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
+import {
+	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
+	MONITOR_EVENT_RETRY_BACKOFF_MS,
+	RECONCILABLE_STAGES,
+	TERMINAL_STAGES,
+} from "../store/db";
 import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
@@ -459,7 +464,9 @@ export class MonitorPropagator {
 	 * - terminal rows are skipped.
 	 * The reclaim budget (MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) bounds retries:
 	 * an event that keeps failing lands on `failed_no_retry` — operator-visible,
-	 * never an infinite dispatch loop.
+	 * never an infinite dispatch loop. `failed` rows are reclaimed on the
+	 * MONITOR_EVENT_RETRY_BACKOFF_MS schedule, so the budget spans hours rather
+	 * than five consecutive sweeps (#179).
 	 */
 	async reconcile(): Promise<void> {
 		if (this.#reconciling) {
@@ -519,6 +526,11 @@ export class MonitorPropagator {
 						);
 						continue;
 					}
+					if (
+						row.stage === "failed" &&
+						this.#now() - Date.parse(row.updated_at) < (MONITOR_EVENT_RETRY_BACKOFF_MS[row.dispatch_attempts] ?? 0)
+					)
+						continue;
 					this.#database.monitorEventIncrementAttempts(row.event_id);
 					await this.#dispatch([row.event_id]);
 				}
@@ -876,6 +888,7 @@ export class MonitorPropagator {
 						code,
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
 						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
+						now(),
 					);
 				}
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);

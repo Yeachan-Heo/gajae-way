@@ -500,8 +500,20 @@ export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "b
 /** Terminal stages: no further transition will ever happen without operator action. */
 export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
 
+/**
+ * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
+ * `failed` event for its (index+1)-th time. The schedule spans ~17h so a slot survives a
+ * multi-hour dispatch outage instead of burning its budget on consecutive 60s sweeps (#179).
+ */
+export const MONITOR_EVENT_RETRY_BACKOFF_MS: readonly number[] = [
+	0,
+	10 * 60_000,
+	60 * 60_000,
+	4 * 60 * 60_000,
+	12 * 60 * 60_000,
+];
 /** Upper bound on how often a single event may be reclaimed by reconcile. */
-export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = 5;
+export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = MONITOR_EVENT_RETRY_BACKOFF_MS.length;
 
 export class GatewayDatabase {
 	readonly #database: Database;
