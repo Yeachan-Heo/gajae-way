@@ -527,6 +527,7 @@ export class MonitorPropagator {
 								.find((candidate) => candidate.event_id === row.event_id);
 							if (!current) return undefined;
 							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null);
+							this.#database.metaDelete(authoringTurnKey(row.event_id));
 							return current.stage === "failed_no_retry" ? undefined : current;
 						});
 						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
@@ -735,7 +736,19 @@ export class MonitorPropagator {
 					.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
-				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
+				// #187: a request-phase failure does not mean the prompt was refused —
+				// the turn it started may still be running. A retry of the same events
+				// on the same session reuses that op-ref, so the port observes the
+				// original turn instead of injecting a second prompt for the event.
+				const opRef =
+					(await this.#reusableAuthoringTurn(
+						claimed.map((row) => row.event_id),
+						sessionId,
+					)) ?? `gw-m-${batchId.replaceAll("-", "")}`;
+				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: claimed.map((row) => row.event_id) });
+				this.#database.withTransaction(() => {
+					for (const row of claimed) this.#database.metaSet(authoringTurnKey(row.event_id), pendingTurn);
+				});
 				dispatchPhase = "request";
 				const response = (
 					await this.#sessionPort.request({
@@ -746,6 +759,10 @@ export class MonitorPropagator {
 						opRef,
 					})
 				).assistant.text;
+				// The turn settled: a later retry must author afresh, never re-read it.
+				this.#database.withTransaction(() => {
+					for (const row of claimed) this.#database.metaDelete(authoringTurnKey(row.event_id));
+				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
@@ -927,6 +944,45 @@ export class MonitorPropagator {
 				for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			}
 		});
+	}
+	/**
+	 * The op-ref of a previous attempt's authoring turn for exactly these events
+	 * on this session, when that turn is still running or finished successfully.
+	 * A failed, unknown or unreadable prior turn is forgotten so the retry sends
+	 * a fresh prompt.
+	 */
+	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
+		const raw = this.#database.metaGet(authoringTurnKey(eventIds[0] ?? ""));
+		if (raw === undefined) return undefined;
+		let prior: { sessionId?: unknown; opRef?: unknown; eventIds?: unknown };
+		try {
+			prior = JSON.parse(raw) as typeof prior;
+		} catch {
+			prior = {};
+		}
+		const priorIds = Array.isArray(prior.eventIds) ? prior.eventIds : [];
+		const forget = () => {
+			for (const id of new Set([...eventIds, ...priorIds.filter((id): id is string => typeof id === "string")]))
+				this.#database.metaDelete(authoringTurnKey(id));
+		};
+		if (
+			prior.sessionId !== sessionId ||
+			typeof prior.opRef !== "string" ||
+			priorIds.length !== eventIds.length ||
+			!eventIds.every((id) => priorIds.includes(id))
+		) {
+			forget();
+			return undefined;
+		}
+		try {
+			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
+			const state = report.status.status;
+			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+		} catch {
+			// Unreadable status is not evidence of a live turn.
+		}
+		forget();
+		return undefined;
 	}
 	/** Read-only safety-net evidence for one session origin (ops/tests). */
 	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {
@@ -1287,6 +1343,11 @@ export function parseAuthoredArray(response: string): unknown {
 	throw new Error(
 		`authoring response is not a JSON array (${lastError instanceof Error ? lastError.message : "no array found"})`,
 	);
+}
+
+/** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
+function authoringTurnKey(eventId: string): string {
+	return `monitor_authoring_turn:${eventId}`;
 }
 
 /** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */

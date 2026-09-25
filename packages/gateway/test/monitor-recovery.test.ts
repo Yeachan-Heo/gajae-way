@@ -13,7 +13,7 @@ import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
 import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
+import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_RETRY_BACKOFF_MS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
@@ -617,6 +617,74 @@ describe("monitor crash-boundary state machine", () => {
 		}
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 		expect(db.authoredOutput(eventId)).toBe("note");
+	});
+
+	test("#187 a retry attaches to the still-running authoring turn instead of re-prompting the session", async () => {
+		let skew = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+			sessionPort,
+		} = await harness(() => new Promise<string>(() => {}), { now: () => Date.now() + skew });
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		const request = sessionPort.request.bind(sessionPort);
+		// Attempt 1: the prompt is accepted, but the bounded request wait elapses
+		// while the authoring turn keeps running.
+		sessionPort.request = async (input) => {
+			await sessionPort.send(input);
+			throw new SessionRequestTimeoutError(
+				input.sessionId,
+				input.opRef,
+				await sessionPort.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef }),
+			);
+		};
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(sessionPort.sends).toHaveLength(1);
+		const firstOpRef = sessionPort.sends[0]?.opRef;
+		// Attempt 2 runs once the #179 retry backoff elapses, while that turn is still alive.
+		skew += (MONITOR_EVENT_RETRY_BACKOFF_MS[1] ?? 0) + 60_000;
+		sessionPort.request = request;
+		const retry = propagator.reconcile();
+		await Bun.sleep(50);
+		// The live turn finishes its work; whichever op is newest gets the answer.
+		sessionPort.complete(sessionPort.sends.at(-1)?.opRef ?? "", JSON.stringify([{ eventId, note: "slot done" }]));
+		await retry;
+		// One prompt for one event: the retry observed the original turn.
+		expect(sessionPort.sends).toHaveLength(1);
+		expect(sessionPort.sendAttempts.map((input) => input.opRef)).toEqual([firstOpRef, firstOpRef]);
+		expect(db.authoredOutput(eventId)).toBe("slot done");
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+	});
+
+	test("#187 a retry after the prior turn settled failed sends a fresh prompt", async () => {
+		let skew = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+			sessionPort,
+		} = await harness(
+			async (_session, text) =>
+				JSON.stringify(eventsFromPrompt(text).map((entry) => ({ eventId: entry.eventId, note: "ok" }))),
+			{ now: () => Date.now() + skew },
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			sessionPort.seedAcceptedSend(input, "failed");
+			throw new SessionTerminalError(
+				await sessionPort.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef }),
+			);
+		};
+		await propagator.reconcile();
+		skew += (MONITOR_EVENT_RETRY_BACKOFF_MS[1] ?? 0) + 60_000;
+		sessionPort.request = request;
+		await propagator.reconcile();
+		expect(sessionPort.sends).toHaveLength(2);
+		expect(new Set(sessionPort.sends.map((input) => input.opRef)).size).toBe(2);
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
 	});
 
 	test("concurrent reconcile sweeps collapse into one", async () => {
