@@ -66,8 +66,9 @@ export async function readOpenClaw(tree: SourceTree, _home: string): Promise<Sou
 	// Extract persona
 	if (config.persona?.name) {
 		extract.files.push({
-			path: "persona.json",
 			category: "persona",
+			sources: ["config.persona.name"],
+			target: "persona.json",
 			content: JSON.stringify({ name: config.persona.name }),
 		});
 		consumedConfig.add("persona");
@@ -88,7 +89,7 @@ export async function readOpenClaw(tree: SourceTree, _home: string): Promise<Sou
 					extract.monitors.push({ source: `config.monitors.${name}`, spec: monitorResult });
 				} else {
 					extract.unmapped.push({
-						path: `config.monitors.${name}`,
+						source: `config.monitors.${name}`,
 						reason: monitorResult,
 						category: "monitors",
 					});
@@ -114,7 +115,7 @@ export async function readOpenClaw(tree: SourceTree, _home: string): Promise<Sou
 	for (const [key] of Object.entries(config)) {
 		if (!consumedConfig.has(key)) {
 			extract.unmapped.push({
-				path: `config.${key}`,
+				source: `config.${key}`,
 				reason: "not mapped by migration",
 				category: "other",
 			});
@@ -124,7 +125,7 @@ export async function readOpenClaw(tree: SourceTree, _home: string): Promise<Sou
 	for (const [key] of env.entries()) {
 		if (!consumedEnv.has(key)) {
 			extract.unmapped.push({
-				path: `.env.${key}`,
+				source: `.env.${key}`,
 				reason: "not mapped by migration",
 				category: "credentials",
 			});
@@ -151,8 +152,8 @@ function readOpenClawChannels(
 			if (token) {
 				consumedEnv.add(credKey);
 				channels.credentials[platform === "slack" ? "slack-bot" : platform] = {
-					name: `${platform}-bot`,
-					secret: token,
+					value: token,
+					source: `.env ${credKey}`,
 				};
 			}
 
@@ -160,14 +161,10 @@ function readOpenClawChannels(
 			if (isRecord(platformConfig.channels)) {
 				for (const [channelId, channelPolicy] of Object.entries(platformConfig.channels)) {
 					if (isRecord(channelPolicy)) {
-						const engagement = typeof channelPolicy.engagement === "string" ? channelPolicy.engagement : "closed";
-						const audience = typeof channelPolicy.audience === "string" ? channelPolicy.audience : "human-only";
-						const owner = typeof channelPolicy.owner === "string" ? channelPolicy.owner : undefined;
+						const engagement = typeof channelPolicy.engagement === "string" ? channelPolicy.engagement : "open";
 
 						channels.channels[`${platform}:${channelId}`] = {
-							engagement: engagement as "open" | "mention-open" | "closed",
-							audience: audience as "all" | "human-only" | "bot-only",
-							owner,
+							engagement: engagement as "open" | "mention-open",
 						};
 					}
 				}
@@ -218,12 +215,15 @@ function buildOpenClawMonitor(name: string, spec: Record<string, unknown>): Moni
 		}
 	}
 
+	const taken = new Set<string>();
 	return cronMonitor({
+		source: "openclaw",
 		name: slug(name),
 		instruction,
 		schedule: cronExpr,
 		enabled,
 		target: deliveryTarget,
+		taken,
 	});
 }
 
@@ -243,8 +243,9 @@ async function readOpenClawSkills(
 
 		if (skillContent) {
 			extract.files.push({
-				path: join(".gjc", "skills", `${slug(skillName)}.md`),
 				category: "skills",
+				sources: [skillPath],
+				target: join(".gjc", "skills", `${slug(skillName)}.md`),
 				content: skillContent,
 			});
 		}
@@ -272,8 +273,9 @@ async function readOpenClawMemory(
 
 			if (content) {
 				extract.files.push({
-					path: join("memory", "imported.md"),
 					category: "memory",
+					sources: [fullPath],
+					target: join("memory", "imported.md"),
 					content,
 				});
 			}

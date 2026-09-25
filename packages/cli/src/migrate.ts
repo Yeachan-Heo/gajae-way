@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { detectHermes, readHermes } from "./migrate/hermes";
 import { detectOpenClaw, readOpenClaw } from "./migrate/openclaw";
@@ -73,25 +73,25 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 		for (const [category, entries] of byCategory) {
 			console.log(`  ${category}:`);
 			for (const entry of entries) {
-				console.log(`    - ${entry.path}: ${entry.reason}`);
+				console.log(`    - ${entry.source}: ${entry.reason}`);
 			}
 		}
 	}
 
 	// Report inventory
-	if (extract.inventory.personas > 0 || extract.inventory.monitors > 0) {
+	if (extract.inventory.persona.length > 0 || extract.inventory.schedules.length > 0) {
 		console.log("\nMigration summary:");
-		console.log(`  Personas: ${extract.inventory.personas}`);
-		console.log(`  Monitors: ${extract.inventory.monitors}`);
-		console.log(`  Memory entries: ${extract.inventory.memory}`);
-		console.log(`  Skills: ${extract.inventory.skills}`);
-		console.log(`  Channels: ${extract.inventory.channels}`);
+		console.log(`  Personas: ${extract.inventory.persona.length}`);
+		console.log(`  Schedules: ${extract.inventory.schedules.length}`);
+		console.log(`  Memory entries: ${extract.inventory.memory.length}`);
+		console.log(`  Skills: ${extract.inventory.skills.length}`);
+		console.log(`  Channels: ${extract.inventory.channels.length}`);
 	}
 
 	if (options.dryRun) {
 		console.log("\n[DRY RUN] Output would be written to:");
 		for (const file of extract.files) {
-			console.log(`  ${file.path} (${file.category})`);
+			console.log(`  ${file.target} (${file.category})`);
 		}
 		return;
 	}
@@ -107,16 +107,24 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 
 	// Write source files
 	for (const file of extract.files) {
-		const filePath = join(targetHome, file.path);
+		const filePath = join(targetHome, file.target);
 		await mkdir(join(filePath, ".."), { recursive: true });
 		await writeFile(filePath, file.content);
 	}
 
 	// Write merged JSON files
 	for (const merge of extract.merges) {
-		const filePath = join(targetHome, merge.path);
+		const filePath = join(targetHome, merge.target);
 		await mkdir(join(filePath, ".."), { recursive: true });
-		await writeFile(filePath, JSON.stringify(merge.content, null, 2));
+		let existing: Record<string, unknown> | undefined;
+		try {
+			const text = await readFile(filePath, "utf-8");
+			existing = JSON.parse(text) as Record<string, unknown>;
+		} catch {
+			// File doesn't exist or is not valid JSON, start fresh
+		}
+		const merged = merge.merge(existing);
+		await writeFile(filePath, JSON.stringify(merged, null, 2));
 	}
 
 	console.log(`\nMigration complete. Output written to ${targetHome}`);
