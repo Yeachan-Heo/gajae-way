@@ -33,10 +33,15 @@ import {
 	workAttemptDeliveryId,
 } from "../store/db";
 import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
 
 const owners = new WeakSet<GatewayDatabase>();
+/** Consecutive failed reconciliations between authority re-checks through recovery. */
+const FAILURES_PER_READOPTION = 8;
+/** Ceiling for the failure backoff between reconciliation polls. */
+const MAX_FAILURE_BACKOFF_MS = 30_000;
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -112,6 +117,8 @@ export class WorkLaneManager {
 	readonly #db: GatewayDatabase;
 	readonly #port: SessionPort;
 	readonly #observers = new Map<string, Observer>();
+	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
+	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	readonly #detachedOwners = new WeakSet<object>();
 	#generationRecovery?: Promise<void>;
@@ -474,21 +481,69 @@ export class WorkLaneManager {
 	}
 	#schedule(observer: Observer, delay: number): void {
 		if (!this.#current(observer) || observer.timer || observer.task) return;
+		const opRef = observer.runtime.opRef;
 		observer.timer = setTimeout(() => {
 			observer.timer = undefined;
 			if (!this.#current(observer)) return;
 			observer.task = this.#tick(observer)
-				.catch(() => {
-					if (this.#current(observer)) console.error(`work reconciliation unavailable opRef=${observer.runtime.opRef}`);
-				})
+				.then(
+					() => this.#failures.delete(opRef),
+					(error: unknown) => this.#failed(observer, error),
+				)
 				.finally(() => {
 					observer.task = undefined;
 					if (!this.#current(observer)) return;
-					if (this.#db.workAttemptGet(observer.runtime.opRef)?.settledAt === null)
-						this.#schedule(observer, this.#options.pollMs ?? 250);
-					else this.#observers.delete(observer.runtime.opRef);
+					if (this.#db.workAttemptGet(opRef)?.settledAt !== null) {
+						this.#observers.delete(opRef);
+						this.#failures.delete(opRef);
+						return;
+					}
+					// The lane was rebound under this observer: it can never write again,
+					// so polling is pure waste. Recovery re-proves authority and settles.
+					if (!this.#writeCurrent(observer)) return this.#readopt(observer, "binding_changed");
+					const failures = this.#failures.get(opRef)?.failures ?? 0;
+					if (failures > 0 && failures % FAILURES_PER_READOPTION === 0)
+						return this.#readopt(observer, "reconciliation_unavailable");
+					const pollMs = this.#options.pollMs ?? 250;
+					this.#schedule(observer, failures ? Math.min(pollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : pollMs);
 				});
 		}, delay);
+	}
+	/** Counts the failure and reports it once per distinct reason instead of on every poll. */
+	#failed(observer: Observer, error: unknown): void {
+		const opRef = observer.runtime.opRef;
+		const prior = this.#failures.get(opRef);
+		const reason = failureReason(error);
+		const failures = (prior?.failures ?? 0) + 1;
+		this.#failures.set(opRef, { failures, reason });
+		if (this.#current(observer) && prior?.reason !== reason)
+			console.error(`work_reconciliation_unavailable opRef=${opRef} failures=${failures} reason=${reason}`);
+	}
+	/**
+	 * Retires this observer and hands the open attempt back to recovery, which
+	 * re-reads status and broker liveness and either resumes observation on a
+	 * live, still-bound session or records a local terminal reason.
+	 */
+	#readopt(observer: Observer, cause: "binding_changed" | "reconciliation_unavailable"): void {
+		const opRef = observer.runtime.opRef;
+		console.error(
+			`work_observer_readopted opRef=${opRef} cause=${cause} failures=${this.#failures.get(opRef)?.failures ?? 0}`,
+		);
+		observer.abort.abort();
+		void (async () => {
+			await this.recover();
+			// A recovery pass already past this attempt when it was retired cannot
+			// have readopted it; a pass started after retirement always does.
+			const current = this.#observers.get(opRef);
+			if (
+				!this.#stopped &&
+				(!current || current.abort.signal.aborted) &&
+				this.#db.workAttemptGet(opRef)?.settledAt === null
+			)
+				await this.recover();
+		})().catch(() => {
+			/* Recovery reports its own failures; the attempt stays open and observable. */
+		});
 	}
 	#attach(observer: Observer): void {
 		if (observer.tail || observer.attaching || !this.#writeCurrent(observer) || !this.#binding(observer.runtime))
@@ -777,11 +832,12 @@ export class WorkLaneManager {
 						terminal: {
 							kind: "local",
 							observedAt: this.#at(),
-							reasonCode: live.disowned
-								? "session_disowned"
-								: live.live === false
-									? "session_dead"
-									: "recovery_indeterminate",
+							reasonCode:
+								live.disowned || !this.#binding(runtime)
+									? "session_disowned"
+									: live.live === false
+										? "session_dead"
+										: "recovery_indeterminate",
 						},
 					});
 					this.#schedule(observer, 0);
@@ -983,6 +1039,11 @@ function workError(
 		sessionId: runtime.sessionId,
 		...(clientRef ? { clientRef } : {}),
 	});
+}
+/** Bounded, secret-free error class and message for a log line. */
+function failureReason(error: unknown): string {
+	const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+	return sanitizeDiagnostic(text).slice(0, 200) || "unknown";
 }
 function safeRefusal(error: unknown): string {
 	const code =
