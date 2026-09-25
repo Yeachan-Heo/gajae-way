@@ -456,7 +456,7 @@ export class WorkLaneManager {
 	}
 	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
 		this.#assertNotQuarantined(runtime.jobId);
-		const report = await this.#port.status({ sessionId: runtime.sessionId, repo: runtime.cwd, opRef: runtime.opRef });
+		const report = await this.#port.status({ sessionId: runtime.sessionId, repo: runtime.cwd, opRef: runtime.opRef, priority: "background" });
 		if (
 			report.operationRef !== runtime.opRef ||
 			!report.status ||
@@ -507,7 +507,10 @@ export class WorkLaneManager {
 					if (failures > 0 && failures % FAILURES_PER_READOPTION === 0)
 						return this.#readopt(observer, "reconciliation_unavailable");
 					const pollMs = this.#options.pollMs ?? 250;
-					this.#schedule(observer, failures ? Math.min(pollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : pollMs);
+					// When a tail is attached, frames already wake the observer (#schedule(observer, 0) in onFrame),
+					// so use a slow fallback cadence (5s) instead of the fast 250ms poll.
+					const basePollMs = observer.tail && !this.#options.pollMs ? 5_000 : pollMs;
+					this.#schedule(observer, failures ? Math.min(basePollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : basePollMs);
 				});
 		}, delay);
 	}

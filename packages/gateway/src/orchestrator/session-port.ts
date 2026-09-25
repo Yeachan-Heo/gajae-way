@@ -76,7 +76,7 @@ export interface SessionPort {
 		repo: string;
 		tier: GjcServiceTier;
 	}): Promise<{ readonly changed: boolean }>;
-	status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport>;
+	status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle; priority?: "interactive" | "background" }): Promise<StatusReport>;
 	/** Exact invocation-owned original output; never falls back to a latest-assistant heuristic. */
 	fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
@@ -806,12 +806,12 @@ export class BrokerSessionPort implements SessionPort {
 		return { changed: result.changed };
 	}
 
-	async status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<StatusReport> {
+	async status(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle; priority?: "interactive" | "background" }): Promise<StatusReport> {
 		this.#assertOwned(input);
 		// With a live relay the read is one round-trip on the owned connection;
 		// without one (retired holds, work lanes, terminal recovery) the CLI's
 		// `session status` performs the identical `turn.result` query.
-		if (!input.relay) return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
+		if (!input.relay) return await fetchOpState(this.#controller(input.repo, input.priority), input.sessionId, input.opRef);
 		this.#database.assertBrokerAuthority(this.#authority);
 		const response = await input.relay.query("turn.result", { kind: "prompt", clientRef: input.opRef });
 		this.#database.assertBrokerAuthority(this.#authority);
@@ -1165,8 +1165,11 @@ export class BrokerSessionPort implements SessionPort {
 		this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
 	}
 
-	#controller(repo: string): ControllerOptions {
-		return { run: this.#cli, repo };
+	#controller(repo: string, priority?: "interactive" | "background"): ControllerOptions {
+		const run: CliRunner = priority
+			? (args, opts) => this.#cli(args, { ...opts, priority })
+			: this.#cli;
+		return { run, repo };
 	}
 }
 
