@@ -606,8 +606,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								const state = job.quarantined
 									? `HELD: quarantined reason=${job.reason} historical_state=${job.state}`
 									: job.state;
+								// HEAD is the progress signal that survives a dead op (issue #67).
+								const head = job.last_commit
+									? `${job.last_commit.sha.slice(0, 7)}@${job.last_commit.committed_at} ${JSON.stringify(job.last_commit.subject)}`
+									: "-";
 								console.log(
-									`${name} ${state} session=${job.session_id || "-"} last=${job.last_activity_at || "-"} ${job.worktree_path}`,
+									`${name} ${state} session=${job.session_id || "-"} accepted=${job.accepted_at || "-"} op=${job.attempt?.op_ref || "-"} last=${job.last_activity_at || "-"} head=${head} ${job.worktree_path}`,
 								);
 							}
 						}

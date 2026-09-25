@@ -1436,6 +1436,95 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	client.close();
 });
 
+test("work.jobs projects each lane's last commit, accept time and current attempt (issue #67)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const repo = join(directory, "lane-repo");
+	await mkdir(repo);
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "lane",
+				GIT_AUTHOR_EMAIL: "lane@example.invalid",
+				GIT_COMMITTER_NAME: "lane",
+				GIT_COMMITTER_EMAIL: "lane@example.invalid",
+				GIT_COMMITTER_DATE: "2026-09-01T00:00:00Z",
+			},
+		});
+		expect(result.exitCode).toBe(0);
+		return result.stdout.toString().trim();
+	};
+	git("init", "--quiet");
+	git("commit", "--allow-empty", "--quiet", "-m", "baseline");
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	let committed = false;
+	const sessionPort = sessionPortFromResponder({
+		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch) }),
+		respond: async () => {
+			// The first worker commits; that HEAD move is the progress signal the row must show.
+			if (!committed) git("commit", "--allow-empty", "--quiet", "-m", "lane: land the fix");
+			committed = true;
+			return "worker result";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { name: "row", text: "fix it", cwd: repo },
+	});
+	await waitFrame(client.frames, "w");
+	const run = client.frames.find((frame) => frame.id === "w");
+	expect(run.type).toBe("response");
+	// A second lane whose worktree has since been removed (Q5: manual cleanup).
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "gone",
+		verb: "work.run",
+		params: { name: "gone", text: "x", cwd: join(directory, "missing-worktree") },
+	});
+	await waitFrame(client.frames, "gone");
+
+	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
+	await waitFrame(client.frames, "jobs");
+	const jobs = client.frames.find((frame) => frame.id === "jobs").result.jobs;
+	const row = jobs.find((job: { lane_key: string }) => job.lane_key === "work-row");
+	const record = parseLaneJobRecord(database.laneJobJson(row.job_id) as string);
+	expect(row.accepted_at).toBe(record.createdAt);
+	expect(row.attempt).toEqual({
+		op_ref: run.result.opRef,
+		started_at: record.attempts[0].startedAt,
+		ended_at: record.attempts[0].endedAt,
+	});
+	expect(row.last_commit).toEqual({
+		sha: git("rev-parse", "HEAD"),
+		subject: "lane: land the fix",
+		committed_at: "2026-09-01T00:00:00.000Z",
+	});
+	// No repository evidence is reported as absent, never invented.
+	const gone = jobs.find((job: { lane_key: string }) => job.lane_key === "work-gone");
+	expect(gone.last_commit).toBeNull();
+	client.close();
+});
+
 test("a stalled durable job holds the next work.run until resume (production path)", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

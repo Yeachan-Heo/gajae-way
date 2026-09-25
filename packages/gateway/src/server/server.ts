@@ -69,7 +69,7 @@ import {
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
-import { WorkLaneManager } from "../orchestrator/work-lane";
+import { laneLastCommit, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -890,14 +890,27 @@ async function handleRequest(
 					...row,
 					session_id: lane?.gjc_session_id ?? "",
 					last_activity_at: lane?.last_activity_at ?? null,
+					// Repository evidence (issue #67): a lane whose op died but whose HEAD
+					// moved is progressing; it is read from the worktree, not the record.
+					last_commit: laneLastCommit(row.worktree_path),
 					...(options.database.isBrokerQuarantined("work", row.job_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				};
 				try {
 					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
+					const attempt = record.attempts.at(-1);
 					return {
 						...bound,
+						// The job is the primary object; the current attempt is a detail.
+						accepted_at: record.createdAt,
+						attempt: attempt
+							? {
+									op_ref: attempt.opRef,
+									started_at: attempt.startedAt,
+									...(attempt.endedAt ? { ended_at: attempt.endedAt } : {}),
+								}
+							: null,
 						attempts: record.attempts.length,
 						checkpoints: record.checkpoints.length,
 						escalations: record.escalations.length,

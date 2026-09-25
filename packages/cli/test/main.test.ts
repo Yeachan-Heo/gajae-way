@@ -946,8 +946,33 @@ describe("work operator commands", () => {
 		});
 		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
 		expect(output.lines).toEqual([
-			"fix running session=session-1 last=2026-09-07T00:00:00Z /repo/fix",
-			"done done session=- last=- /repo/done",
+			"fix running session=session-1 accepted=- op=- last=2026-09-07T00:00:00Z head=- /repo/fix",
+			"done done session=- accepted=- op=- last=- head=- /repo/done",
+		]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work jobs shows the job first, its current attempt, and the lane's last commit (issue #67)", async () => {
+		const output = await run(["jobs"], {
+			jobs: [
+				{
+					lane_key: "work-fix",
+					state: "attempt_ended",
+					session_id: "session-1",
+					last_activity_at: "2026-09-07T00:10:00Z",
+					worktree_path: "/repo/fix",
+					accepted_at: "2026-09-07T00:00:00.000Z",
+					attempt: { op_ref: "op-2", started_at: "2026-09-07T00:05:00.000Z", ended_at: "2026-09-07T00:10:00.000Z" },
+					last_commit: {
+						sha: "0123456789abcdef0123456789abcdef01234567",
+						subject: "fix: land it",
+						committed_at: "2026-09-07T00:09:20.000Z",
+					},
+				},
+			],
+		});
+		expect(output.lines).toEqual([
+			'fix attempt_ended session=session-1 accepted=2026-09-07T00:00:00.000Z op=op-2 last=2026-09-07T00:10:00Z head=0123456@2026-09-07T00:09:20.000Z "fix: land it" /repo/fix',
 		]);
 		expect(output.closed).toBe(true);
 	});
@@ -975,8 +1000,8 @@ describe("work operator commands", () => {
 		});
 		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
 		expect(output.lines).toEqual([
-			"current running session=global-session last=2026-09-09T00:00:00Z /repo/current",
-			"legacy HELD: quarantined reason=broker_authority_quarantined historical_state=running session=private-session last=2026-09-07T00:00:00Z /repo/legacy",
+			"current running session=global-session accepted=- op=- last=2026-09-09T00:00:00Z head=- /repo/current",
+			"legacy HELD: quarantined reason=broker_authority_quarantined historical_state=running session=private-session accepted=- op=- last=2026-09-07T00:00:00Z head=- /repo/legacy",
 		]);
 		expect(output.errors).toEqual([]);
 		expect(output.closed).toBe(true);

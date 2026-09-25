@@ -1164,6 +1164,27 @@ export function utf8Prefix(text: string, maxBytes = 2048): string {
 	}
 	return text.slice(0, end);
 }
+/**
+ * The lane's HEAD commit (issue #67): the only progress signal that survives an
+ * op dying. Null when the worktree yields no commit; never invented.
+ */
+export function laneLastCommit(
+	worktreePath: string,
+): { readonly sha: string; readonly subject: string; readonly committed_at: string } | null {
+	try {
+		const log = Bun.spawnSync(["git", "-C", worktreePath, "log", "-1", "--format=%H%x00%cI%x00%s"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (log.exitCode !== 0) return null;
+		const [sha, at, subject] = log.stdout.toString().replace(/\n$/, "").split("\0");
+		const committed = Date.parse(at ?? "");
+		if (!sha || !/^[0-9a-f]{40}$/.test(sha) || subject === undefined || Number.isNaN(committed)) return null;
+		return { sha, subject: utf8Prefix(subject, 256), committed_at: new Date(committed).toISOString() };
+	} catch {
+		return null;
+	}
+}
 async function collectRepoFacts(
 	worktreePath: string,
 ): Promise<{ headSha?: string; dirtyFiles: number; branch?: string } | undefined> {
