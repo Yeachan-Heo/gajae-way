@@ -219,6 +219,122 @@ test("the turn's own content is delivered once, in order, and foreign correlatio
 	await handle.close();
 });
 
+/**
+ * Frame sequence captured from gjc 0.17.6 (`sdk serve --stdio`, 2026-09-25): a
+ * turn running `sleep 45` in the foreground is steered. The host folds the bash
+ * command into the background, echoes the steer as a user message, and answers
+ * it ("Four.") under the SAME turn correlation. Every lifecycle frame arrives
+ * twice: top-level and as a ring-sequenced `{type:"event"}` mirror.
+ */
+function captured0176SteerTurn(sessionId: string): Record<string, unknown>[] {
+	const correlation = {
+		commandId: "80ae507d-ac3a-49e6-ae8e-9489e551dfc8",
+		turnId: "7d150346-7eaa-4ae1-b4bc-9b9e054f6527",
+	};
+	const mirror = (kind: string, payload: Record<string, unknown>, seq: number) => ({
+		kind,
+		payload: { type: kind, sessionId, ...payload },
+		type: "event",
+		generation: 1,
+		seq,
+	});
+	const message = (role: string, content: unknown[], id: string) => ({
+		type: "event",
+		kind: "message_end",
+		payload: { event_type: "message_end", event: { type: "message_end", message: { role, id, content } } },
+		...correlation,
+	});
+	return [
+		message(
+			"user",
+			[{ type: "text", text: "Run exactly this bash command in the foreground: sleep 45; echo done." }],
+			"u-1",
+		),
+		mirror("agent_start", correlation, 3),
+		{ type: "activity", sessionId, state: "busy" },
+		{ type: "agent_start", sessionId, ...correlation },
+		mirror("activity", { state: "busy" }, 4),
+		message("assistant", [{ type: "thinking", thinking: "run it" }], "a-1"),
+		{
+			type: "event",
+			kind: "tool_execution_start",
+			payload: {
+				event_type: "tool_execution_start",
+				event: { toolCallId: "tc-1", toolName: "bash", args: { command: "sleep 45; echo done" } },
+			},
+			...correlation,
+		},
+		mirror("bash_folded", { jobId: "bg_1" }, 5),
+		{
+			type: "event",
+			kind: "tool_execution_end",
+			payload: {
+				event_type: "tool_execution_end",
+				event: { toolCallId: "tc-1", toolName: "bash", result: "Background job bg_1 started" },
+			},
+			...correlation,
+		},
+		message("toolResult", [{ type: "text", text: "Background job bg_1 started: sleep 45; echo done" }], "t-1"),
+		message(
+			"user",
+			[{ type: "text", text: "Quick question while you wait: what is 2+2? Answer in words now." }],
+			"u-2",
+		),
+		message(
+			"assistant",
+			[
+				{ type: "thinking", thinking: "four" },
+				{ type: "text", text: "Four." },
+			],
+			"a-2",
+		),
+		mirror("agent_end", { ...correlation, finalText: "Four.", outcome: { kind: "stopped", reason: "end_turn" } }, 6),
+		{
+			type: "agent_end",
+			sessionId,
+			...correlation,
+			finalText: "Four.",
+			outcome: { kind: "stopped", reason: "end_turn" },
+		},
+		mirror("activity", { state: "idle" }, 7),
+		{ type: "activity", sessionId, state: "idle" },
+	];
+}
+
+test("a captured gjc 0.17.6 steered turn: the steer answer reaches the turn once, lifecycle mirrors are not double-applied or reported unknown", async () => {
+	const relay = new FakeRelay();
+	const frames: TailFrame[] = [];
+	const diagnostics: string[] = [];
+	const handle = await runner(() => relay).attach({
+		sessionId: "898ea744",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onFrame: (frame) => {
+			frames.push(frame);
+		},
+		onDiagnostic: (line) => diagnostics.push(line),
+	});
+	handle.beginTurn("steer-probe");
+	handle.setTurnRunning(true);
+	for (const frame of captured0176SteerTurn("898ea744")) relay.host(frame);
+	await Bun.sleep(10);
+
+	// The answer to the steer is delivered to the owning turn, exactly once.
+	expect(frames.filter((frame) => frame.assistantText).map((frame) => frame.assistantText)).toEqual(["Four."]);
+	// The steer is attributed to the turn as an echo, never as speech.
+	expect(frames.filter((frame) => frame.steerEcho && frame.payload.role === "user")).toHaveLength(2);
+	// Each lifecycle transition is applied once, from the top-level frame only.
+	expect(frames.filter((frame) => frame.rawKind === "agent_start")).toHaveLength(1);
+	expect(frames.filter((frame) => frame.rawKind === "agent_end")).toHaveLength(1);
+	expect(frames.find((frame) => frame.rawKind === "agent_end")).toMatchObject({ idle: true });
+	// The top-level idle marker still reaches the actor exactly once.
+	expect(frames.filter((frame) => frame.rawKind === "activity" && frame.idle)).toHaveLength(1);
+	// No mirror or host notice is reported as an unrecognised protocol frame.
+	expect(diagnostics.filter((line) => line.startsWith("unknown_runtime_event"))).toEqual([]);
+	expect(diagnostics.filter((line) => line.startsWith("tail_frame_foreign"))).toEqual([]);
+	await handle.close();
+});
+
 test("the first correlated frame after beginTurn adopts the turn when the accept receipt has not landed yet", async () => {
 	const relay = new FakeRelay();
 	const frames: TailFrame[] = [];
