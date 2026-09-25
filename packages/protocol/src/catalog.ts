@@ -689,7 +689,9 @@ export type CycleGateReason =
 	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
 	| "inbound_starved"
-	| "agent_disk_headroom";
+	| "agent_disk_headroom"
+	| "monitor_dispatch_failing"
+	| "broker_respawn_churn";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.

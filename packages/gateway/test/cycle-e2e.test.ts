@@ -207,6 +207,46 @@ test("monitor authoring loss gates ops.cycle while delivery stays healthy, and c
 	}
 });
 
+test("issue #189: consecutive failed_no_retry monitor events degrade the projection; one delivery clears it", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-monitor-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	try {
+		const fire = (id: string) =>
+			database.monitorEventCreate({
+				eventId: id,
+				monitorId: "m1",
+				eventType: "digest",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+		fire("ok-0");
+		database.monitorEventUpdate("ok-0", "delivered");
+		for (const id of ["lost-1", "lost-2"]) {
+			fire(id);
+			expect(database.monitorEventTerminalFail(id, "internal_error", "authoring turn failed")).toBe(true);
+		}
+		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
+		expect(database.monitorConsecutiveTerminalFailures()).toBe(2);
+		// Two same-type pre-author losses already trip the #160 authoring gate;
+		// the #189 dispatch streak stays below its threshold.
+		expect(projector.project().gates).toEqual(["monitor_authoring_lost"]);
+		fire("lost-3");
+		database.monitorEventTerminalFail("lost-3", "internal_error", "authoring turn failed");
+		const outage = projector.project();
+		expect(outage.gates).toEqual(["monitor_authoring_lost", "monitor_dispatch_failing"]);
+		expect(outage.phase).toBe("degraded");
+		await Bun.sleep(2);
+		fire("ok-4");
+		database.monitorEventUpdate("ok-4", "delivered");
+		expect(database.monitorConsecutiveTerminalFailures()).toBe(0);
+		expect(projector.project().gates).toEqual([]);
+		const churning = new RuntimeCycleProjector(database, { queueDepth: 0 }, { brokerRespawnChurn: () => true });
+		expect(churning.project().gates).toEqual(["broker_respawn_churn"]);
+	} finally {
+		database.close();
+	}
+});
+
 test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-e2e-"));
 	const config = testConfig(directory);

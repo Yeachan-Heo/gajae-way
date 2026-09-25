@@ -39,6 +39,10 @@ const SESSION_VALUE_OPTIONS = new Set([
 	"--text",
 	"--timeout-ms",
 ]);
+/** Window over which observed broker incarnation changes count as churn. */
+export const BROKER_RESPAWN_WINDOW_MS = 30 * 60_000;
+/** Respawns inside the window that turn silent recovery into one operator alert. */
+export const BROKER_RESPAWN_CHURN_THRESHOLD = 3;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
 export type BrokerGenerationListener = (generation: number) => void;
@@ -283,6 +287,9 @@ export class GlobalGjcClient {
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
+	/** Observation times of incarnation changes after the first; bounded by the churn window. */
+	#respawns: number[] = [];
+	#churnAlerted = false;
 
 	constructor(options: GlobalGjcClientOptions = {}) {
 		this.#options = options;
@@ -332,6 +339,21 @@ export class GlobalGjcClient {
 	outage(now = Date.now()): string | undefined {
 		if (this.#outageSince === undefined) return undefined;
 		return `broker_unavailable_for=${Math.max(0, Math.floor((now - this.#outageSince) / 1000))}s reason=${this.#unavailableReason}`;
+	}
+	/**
+	 * Broker incarnation changes observed inside the churn window. A daemon that
+	 * keeps dying and being respawned by its own lifecycle passes every
+	 * liveness probe between deaths; only the repetition names the outage.
+	 */
+	recentRespawns(now = Date.now()): number {
+		const floor = now - BROKER_RESPAWN_WINDOW_MS;
+		const live = this.#respawns.findIndex((at) => at > floor);
+		this.#respawns.splice(0, live < 0 ? this.#respawns.length : live);
+		return this.#respawns.length;
+	}
+	/** True while respawns inside the window reach the churn threshold. */
+	respawnChurn(now = Date.now()): boolean {
+		return this.recentRespawns(now) >= BROKER_RESPAWN_CHURN_THRESHOLD;
 	}
 	/** Judges the daemon from its own discovery file, bypassing SDK transport. */
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
@@ -471,6 +493,7 @@ export class GlobalGjcClient {
 			}
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
+				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
 				this.#generation++;
 				for (const listener of this.#listeners) {
@@ -490,6 +513,21 @@ export class GlobalGjcClient {
 			}
 			return false;
 		}
+	}
+	#noteRespawn(pid: number): void {
+		const now = Date.now();
+		this.#respawns.push(now);
+		if (!this.respawnChurn(now)) {
+			this.#churnAlerted = false;
+			return;
+		}
+		// One loud line per churn episode, not one per respawn: the episode ends
+		// only when the window drains below the threshold.
+		if (this.#churnAlerted) return;
+		this.#churnAlerted = true;
+		this.#log(
+			`broker_respawn_churn respawns=${this.recentRespawns(now)} windowMs=${BROKER_RESPAWN_WINDOW_MS} pid=${pid} generation=${this.#generation + 1}`,
+		);
 	}
 	#schedule(epoch: number): void {
 		if (this.#stopped || epoch !== this.#epoch) return;
