@@ -136,6 +136,12 @@ export interface PersonaTerminalInput extends PersonaTurnIdentity {
 export interface PersonaFailureInput extends PersonaTurnIdentity {
 	readonly error: Error;
 	readonly status?: StatusReport;
+	/**
+	 * The answer this turn wrote before it failed, read from the transcript
+	 * because no relay showed it (#210). A written reply must not die with the
+	 * turn that produced it.
+	 */
+	readonly recoveredText?: string;
 }
 
 export interface PersonaTurnSettledInput extends PersonaTurnIdentity {
@@ -489,6 +495,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusRechecks: number;
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
+	/** A tool the tail saw start and not end: the prime suspect when the turn then fails (#210). */
+	openTool?: { readonly name: string; readonly startedAtMs: number };
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
 };
@@ -1644,6 +1652,37 @@ class OriginActor {
 	}
 
 	/**
+	 * A turn can fail AFTER it wrote its answer: a tool call that times out
+	 * ends the whole run (#210), and a relay that went dark mid-turn never
+	 * showed the reply. When no assistant text reached the consumer, read the
+	 * transcript for a row written since this turn dispatched. A reply already
+	 * shown on the tail is not re-read: it was delivered (or deliberately not).
+	 */
+	async #recoverFailedTurnAnswer(bound: BoundTurn): Promise<string | undefined> {
+		const port = this.#manager.port;
+		if (bound.replyVisible || bound.lastAssistantText !== undefined) return undefined;
+		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return undefined;
+		try {
+			const found = await port.fetchAssistantSince({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				notBeforeMs: bound.dispatchedAtMs,
+			});
+			const text = found?.text?.trim();
+			if (!text) return undefined;
+			this.#manager.log(
+				`failed_turn_answer_recovered origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} chars=${text.length}`,
+			);
+			return text;
+		} catch (error) {
+			this.#manager.log(
+				`failed_turn_answer_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return undefined;
+		}
+	}
+
+	/**
 	 * The relay that owned the running turn died. Whatever the host streamed
 	 * while it was down is gone (content is best-effort by host contract), so
 	 * the turn settles from status and the original result; the handle itself
@@ -1698,6 +1737,12 @@ class OriginActor {
 				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
+			if (frame.rawKind === "tool_execution_start")
+				bound.openTool = {
+					name: typeof frame.payload.toolName === "string" ? frame.payload.toolName : "tool",
+					startedAtMs: this.#manager.now(),
+				};
+			else if (frame.rawKind === "tool_execution_end") bound.openTool = undefined;
 			const replyVisible = await bound.lifecycle.onFrame?.({ ...bound, frame });
 			if (replyVisible === true) bound.replyVisible = true;
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
@@ -1952,10 +1997,20 @@ class OriginActor {
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
+				const openTool = bound.openTool && {
+					name: toolLabel(bound.openTool.name),
+					elapsedMs: Math.max(0, this.#manager.now() - bound.openTool.startedAtMs),
+				};
 				this.#manager.log(
-					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}`,
+					`terminal_failure origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} status=${report.status.status} ${terminalFailureDiagnosis(report)}${openTool ? ` open_tool=${openTool.name} open_tool_elapsed_ms=${openTool.elapsedMs}` : ""}`,
 				);
-				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
+				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
+				await bound.lifecycle.onFailure?.({
+					...bound,
+					error: terminalError(report, openTool),
+					status: report,
+					...(recoveredText ? { recoveredText } : {}),
+				});
 			}
 		} catch (error) {
 			this.#manager.log(
@@ -2319,16 +2374,24 @@ class OriginActor {
  * the ENTIRE diagnosis — dropping it here made six distinct lost turns deliver
  * six identical, untriageable lines (#244).
  */
-function terminalError(status: StatusReport): GjcRuntimeError {
+function terminalError(
+	status: StatusReport,
+	openTool?: { readonly name: string; readonly elapsedMs: number },
+): GjcRuntimeError {
 	const failure = status.status.error;
 	const outcome = status.status.outcome;
 	const code = sanitizeDiagnostic(failure?.code ?? outcome?.code ?? "") || undefined;
-	const message =
+	const reported =
 		sanitizeDiagnostic(failure?.message ?? outcome?.message ?? "") ||
 		// Never empty: a code-only failure still reports the code as its diagnosis,
 		// and a failure with neither keeps the gateway's own framing (#14).
 		code ||
 		sanitizeDiagnostic(`session status ${status.status.status}`);
+	// The redacted post-start sentence names no cause. A tool that started and
+	// never finished is the one the reader needs (#210: a 300s `op whoami`).
+	const message = openTool
+		? `${reported} (a ${openTool.name} call had been running for ${Math.round(openTool.elapsedMs / 1000)}s without finishing)`
+		: reported;
 	return new GjcRuntimeError(`${code ? `${code}: ` : ""}${message}`, {
 		...(code ? { code } : {}),
 		message,
@@ -2348,6 +2411,12 @@ function terminalFailureDiagnosis(status: StatusReport): string {
 	return fields
 		.map(([name, value]) => `${name}=${(value === undefined ? "" : sanitizeDiagnostic(value)) || "unknown"}`)
 		.join(" ");
+}
+
+/** A tool name bound for a log field and a chat notice: one token, bounded. */
+function toolLabel(name: string): string {
+	const label = name.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 48);
+	return label || "tool";
 }
 
 function safeDiagnostic(error: unknown): string {

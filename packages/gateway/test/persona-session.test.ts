@@ -355,6 +355,95 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 	);
 });
 
+// #210: a bash call blocked on an interactive auth prompt (`op whoami`) timed
+// out and took the whole turn with it. The notice said only the redacted
+// sentence, and the reply the persona had already written was discarded.
+test("a turn that fails with a tool still running names the tool and hands over the answer it already wrote", async () => {
+	let now = 1_000_000;
+	const port = new ScriptedSessionPort();
+	const failures: { notice: string; recovered?: string }[] = [];
+	const logs: string[] = [];
+	const frames: string[] = [];
+	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		now: () => now,
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFrame: ({ frame }) => {
+				frames.push(frame.rawKind);
+			},
+			onFailure: ({ error, recoveredText }) => {
+				failures.push({ notice: formatFailureNotice(error), ...(recoveredText ? { recovered: recoveredText } : {}) });
+			},
+		}),
+	});
+	const probes: number[] = [];
+	port.fetchAssistantSince = async (input) => {
+		probes.push(input.notBeforeMs);
+		return { text: "the answer written before the tool hung", pages: 1, complete: true };
+	};
+	enqueue("tool-timeout", "check the 1password session");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	port.emitTool(first.sessionId, { toolName: "bash", args: { command: "op whoami" } });
+	await eventually(() => frames.includes("tool_execution_start"), "tool start did not reach the actor");
+	now += 300_000;
+	port.fail(first.opRef, "Agent run failed after execution started.", { code: "prompt_failed" });
+	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
+
+	expect(failures[0]!.notice).toBe(
+		"[turn failed] prompt_failed: Agent run failed after execution started. (a bash call had been running for 300s without finishing)",
+	);
+	expect(failures[0]!.recovered).toBe("the answer written before the tool hung");
+	expect(probes).toHaveLength(1);
+	expect(logs.find((line) => line.startsWith("terminal_failure "))).toContain(
+		"code=prompt_failed provider_code=unknown phase=unknown category=unknown provenance=unknown open_tool=bash open_tool_elapsed_ms=300000",
+	);
+	expect(logs.some((line) => line.startsWith("failed_turn_answer_recovered "))).toBe(true);
+});
+
+test("a failed turn whose answer already reached the tail neither re-reads the transcript nor blames a finished tool", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: { notice: string; recovered?: string }[] = [];
+	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error, recoveredText }) => {
+				failures.push({ notice: formatFailureNotice(error), ...(recoveredText ? { recovered: recoveredText } : {}) });
+			},
+		}),
+	});
+	let probes = 0;
+	port.fetchAssistantSince = async () => {
+		probes++;
+		return { text: "must not be re-delivered", pages: 1, complete: true };
+	};
+	enqueue("visible-then-fail", "work");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	port.emitTool(first.sessionId, { toolName: "bash" });
+	port.emitToolEnd(first.sessionId, "bash");
+	port.emitAssistant(first.sessionId, "already shown", "shown", first.opRef);
+	port.fail(first.opRef, "Agent run failed after execution started.", { code: "prompt_failed" });
+	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
+	expect(failures[0]).toEqual({ notice: "[turn failed] prompt_failed: Agent run failed after execution started." });
+	expect(probes).toBe(0);
+});
+
 test("a rebindable post-start code keeps its /new hint, and a codeless failure still has a diagnosis", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const notices: string[] = [];
@@ -436,6 +525,7 @@ for (const reason of ["unsupported_input_status", "context_exhausted"] as const)
 		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.emitTool(first.sessionId);
+		port.emitToolEnd(first.sessionId, "tool");
 		port.emitAssistant(first.sessionId, "partial answer", "partial", first.opRef);
 		port.setFailedTurnEvidence(first.sessionId, reason);
 		port.fail(first.opRef, "failed once");

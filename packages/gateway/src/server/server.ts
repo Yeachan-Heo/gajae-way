@@ -2097,10 +2097,15 @@ async function createInboundTurnLifecycle(
 		}
 	};
 
-	const onFailure = async ({ error }: PersonaFailureInput) => {
+	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);
+			// The turn wrote its answer before it failed (#210): deliver it through
+			// the ordinary terminal slot. It then counts as a visible reply, and the
+			// failure stays in the operator log instead of replacing the answer.
+			if (nonLoopback && recoveredText && !assistantDeliveryStarted)
+				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
 				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (nonLoopback && !assistantDeliveryStarted) {
