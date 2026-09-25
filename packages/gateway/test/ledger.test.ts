@@ -3,7 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { classifyDeliveryFailure, DeliveryLedger } from "../src/store/ledger";
+
+test("delivery failure classifier keeps common causes inside the allowlist", () => {
+	expect(classifyDeliveryFailure("HTTP 429 Too Many Requests")).toBe("rate_limited");
+	expect(classifyDeliveryFailure("DiscordAPIError[50013]: Missing Permissions")).toBe("permission_denied");
+	expect(classifyDeliveryFailure("Unknown Message")).toBe("target_unavailable");
+	expect(classifyDeliveryFailure("socket hang up")).toBe("transport_error");
+	expect(classifyDeliveryFailure("request failed with credential=secret")).toBe("adapter_error");
+});
 
 test("delivery ledger expires only after the fifth definitive failure", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));

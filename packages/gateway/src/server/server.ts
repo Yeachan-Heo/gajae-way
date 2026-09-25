@@ -835,7 +835,7 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
 			// adapter may be retrying a stale outcome).
-			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
+			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous, params.reason);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);

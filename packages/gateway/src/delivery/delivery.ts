@@ -123,8 +123,8 @@ export class DeliveryService {
 	confirm(deliveryId: string): LedgerOutcome {
 		return this.#ledger.confirm(deliveryId);
 	}
-	fail(deliveryId: string, ambiguous?: boolean): LedgerOutcome {
-		return this.#ledger.fail(deliveryId, ambiguous);
+	fail(deliveryId: string, ambiguous?: boolean, reason?: unknown): LedgerOutcome {
+		return this.#ledger.fail(deliveryId, ambiguous, reason);
 	}
 	/** `onConnect`: replay every unsettled row to a newly negotiated adapter, ignoring retry backoff. */
 	sweep(now = Date.now(), onConnect = false): DeliverySweep {
