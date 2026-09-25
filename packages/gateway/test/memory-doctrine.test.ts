@@ -211,3 +211,22 @@ test("an orphaned index.lock older than the grace is removed once and the operat
 	expect(await memoryGit(root, ["log", "--format=%s", "-1"])).toBe("after orphaned lock");
 	await expect(stat(lock)).rejects.toThrow();
 }, 20_000);
+
+test("a failed git operation reports argv, exit status and stdout, never a bare `failed:` (#192)", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-reason-"));
+	await initializeMemory(home);
+	const root = join(home, "memory");
+	// The live crash: `git commit` with nothing staged exits 1 and explains itself
+	// on STDOUT, so a stderr-only message was literally `memory git commit failed:`.
+	let error: Error | undefined;
+	try {
+		await memoryGit(root, ["commit", "-m", "nothing staged"]);
+	} catch (caught) {
+		error = caught as Error;
+	}
+	expect(error).toBeInstanceOf(Error);
+	expect(error?.message).not.toMatch(/failed:\s*$/);
+	expect(error?.message).toContain("git commit -m 'nothing staged'");
+	expect(error?.message).toContain("exit 1");
+	expect(error?.message).toMatch(/nothing (added )?to commit/);
+});
