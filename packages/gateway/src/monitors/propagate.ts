@@ -1132,11 +1132,38 @@ function failureDetail(error: unknown): string {
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
-	// A GjcCliError carries the SDK envelope code in `details`, which is the
-	// only part of the refusal that tells an operator what the runtime said.
+	// Codes and classifiers the SDK itself produced (envelope error code, terminal
+	// error code, outcome classifiers) are bounded machine tokens: a lowercase
+	// token crosses the boundary, free text never does. Arbitrary `code` fields on
+	// foreign errors stay on the explicit allowlist.
+	const sdkToken = (value: unknown): string | undefined =>
+		typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : undefined;
+	const outcomeBody = object(terminal.outcome);
+	// #178: a GjcCliError carries the SDK envelope code in `details`, and a
+	// terminal status carries it in `error.code` or `outcome.code`. Those are the
+	// only facts that tell a deadline kill from a provider refusal.
 	const code =
-		fields.code ?? terminalError.code ?? (error instanceof GjcCliError ? envelopeErrorCode(error.details) : undefined);
-	const exitCode = fields.exitCode;
+		(typeof fields.code === "string" && allowedCodes.has(fields.code) ? fields.code : undefined) ??
+		sdkToken(terminalError.code) ??
+		sdkToken(outcomeBody.code) ??
+		(error instanceof GjcCliError ? sdkToken(envelopeErrorCode(error.details)) : undefined);
+	// A GjcCliError with exit status 0 is a structured `{ok:false}` envelope
+	// refusal (or an unparseable success print), not a process failure; recording
+	// `exitCode: 0` on a failure row reads as "the CLI succeeded" (#178).
+	const transport =
+		error instanceof GjcCliError && error.exitCode === 0
+			? error.details !== null && typeof error.details === "object"
+				? "envelope"
+				: "malformed_envelope"
+			: undefined;
+	const exitCode = transport ? undefined : fields.exitCode;
+	const outcome: Record<string, string> = {};
+	for (const key of ["kind", "reason", "providerCode", "phase", "category", "provenance"]) {
+		const value = sdkToken(outcomeBody[key]);
+		if (value) outcome[key] = value;
+	}
+	// A request-wait timeout says where the operation was when the wait gave up.
+	const lastStatus = sdkToken(object(object(fields.lastStatus).status).status);
 	const signal = fields.signal;
 	const status = terminal.status;
 	const message = error instanceof Error ? error.message : "";
@@ -1154,7 +1181,8 @@ function failureDetail(error: unknown): string {
 			: undefined;
 	return JSON.stringify({
 		class: name,
-		...(typeof code === "string" && allowedCodes.has(code) ? { code } : {}),
+		...(code ? { code } : {}),
+		...(transport ? { transport } : {}),
 		...(typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
 			? { exitCode }
 			: {}),
@@ -1164,6 +1192,8 @@ function failureDetail(error: unknown): string {
 		...(typeof status === "string" && ["failed", "cancelled", "completed", "aborted"].includes(status)
 			? { terminal: status }
 			: {}),
+		...(Object.keys(outcome).length ? { outcome } : {}),
+		...(lastStatus ? { lastStatus } : {}),
 		...(cause ? { cause } : {}),
 		...(frame ? { frame } : {}),
 	});
