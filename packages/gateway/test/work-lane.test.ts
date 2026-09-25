@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, ProtocolError } from "@gajae-gateway/protocol";
 import { appendAttempt, createLaneJobRecord, GjcCliError, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
-import type { WorkerOutputResult } from "../src/orchestrator/session-port";
+import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import { utf8Prefix, WorkLaneManager, type WorkLaneManagerOptions } from "../src/orchestrator/work-lane";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -732,10 +732,9 @@ test("invalid shared parameters have no bind/send effects and manager registrati
 	expect(f.port.sends).toHaveLength(0);
 	expect(() => new WorkLaneManager({ database: f.db, port: f.port, lanes: f.lanes })).toThrow("already registered");
 });
-for (const [receiptState, reasonCode, endState] of [
-	["missing", "terminal_missing_receipt", "terminal_missing_receipt"],
-	["unknown", "terminal_uncertain", "terminal_uncertain"],
-] as const) {
+// receiptState=missing is covered by the #248 late-receipt/held tests below:
+// a proven same-op final body reconciles it instead of holding.
+for (const [receiptState, reasonCode, endState] of [["unknown", "terminal_uncertain", "terminal_uncertain"]] as const) {
 	test(`terminal receipt ${receiptState} is a held non-success with a safe notice`, async () => {
 		const f = await fixture();
 		const result = await started(f, "a", origin);
@@ -751,6 +750,111 @@ for (const [receiptState, reasonCode, endState] of [
 		expect(f.notices[0]?.text).toBe(`[lane a] attempt_ended: ${reasonCode}: partial answer`);
 	});
 }
+
+test("late receipt after a missing-receipt terminal is reconciled once, without resend (#248)", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	const original = f.port.fetchWorkerOutput.bind(f.port);
+	let reads = 0;
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "PR opened");
+	const status = f.port.status.bind(f.port);
+	// The terminal is observed before the final body lands: the SDK reports
+	// receiptState=missing, then enriches the same op to present.
+	f.port.status = async (input) => {
+		const report = await status(input);
+		return { ...report, status: { ...report.status, receiptState: "missing" } };
+	};
+	f.port.fetchWorkerOutput = async (input) => {
+		reads++;
+		if (reads === 1) {
+			const early = await original(input);
+			expect(early.status).toBe("proven");
+			return parseWorkerOutputResponse(
+				input,
+				{
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: input.opRef,
+							...input.terminalIdentity,
+							status: "terminal_ok",
+							terminalAt: input.notBeforeMs + 1,
+							receiptState: "missing",
+						},
+					}),
+					stderr: "",
+				},
+				Date.now(),
+			);
+		}
+		return original(input);
+	};
+	await until(() => reads === 1);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("terminal_missing_receipt");
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	now += 1000;
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(reads).toBe(2);
+	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("end_turn");
+	expect(f.job().attempts[0]?.endState).toBe("completed");
+	expect(f.job().state).not.toBe("awaiting_operator");
+	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] completed: PR opened"]);
+	// Reprocessing the same terminal neither re-notifies nor re-runs the work.
+	await f.restart();
+	await Bun.sleep(20);
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+});
+
+test("a receipt still missing after the output budget stays held with a non-loss diagnostic (#248)", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	let reads = 0;
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "unused");
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "terminal_ok", receiptState: "missing", outcome: { reason: "end_turn", kind: "stopped" } },
+		summaryCompleted: true,
+	});
+	f.port.fetchWorkerOutput = async (input) => {
+		reads++;
+		return parseWorkerOutputResponse(
+			input,
+			{
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: input.opRef,
+						status: "terminal_ok",
+						terminalAt: input.notBeforeMs + 1,
+						receiptState: "missing",
+					},
+				}),
+				stderr: "",
+			},
+			Date.now(),
+		);
+	};
+	await until(() => reads === 1);
+	now += 1000;
+	await until(() => reads === 2);
+	now += 5000;
+	await until(() => f.db.workAttemptOpen().length === 0);
+	expect(reads).toBe(3);
+	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
+	expect(f.job().state).toBe("awaiting_operator");
+	expect(f.notices.map((notice) => notice.text)).toEqual([
+		`[lane a] attempt_ended: terminal_missing_receipt: final_response_missing opRef=${result.opRef}`,
+	]);
+	expect(f.port.sends).toHaveLength(1);
+});
 
 test("broker deadline ends the attempt but caller timeout never does", async () => {
 	const f = await fixture();

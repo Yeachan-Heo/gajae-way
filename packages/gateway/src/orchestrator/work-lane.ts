@@ -648,7 +648,16 @@ export class WorkLaneManager {
 						attribution: "operation_ref" as const,
 					};
 					const silent = isSilenceToken(result.text) || containsSilenceToken(result.text);
+					const terminal = runtime.terminal!;
+					// A terminal first observed with receiptState=missing whose same-op
+					// final body then proves present is a late receipt, not a missing one
+					// (#248): re-derive the end state from the reconciled receipt.
+					const reconciled =
+						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
+							? terminalEvidence({ ...terminal.status, receiptState: "present" }, terminal.observedAt)
+							: undefined;
 					const updated = this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+						...(reconciled ? { terminal: reconciled } : {}),
 						output: {
 							...runtime.output,
 							disposition: silent ? "silent" : "available",
@@ -713,7 +722,14 @@ export class WorkLaneManager {
 			const decision = runtime.output.knownSilence ? "suppressed" : runtime.target === null ? "no_target" : "enqueued";
 			const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 			const lead = reason === "end_turn" ? "" : `${reason}: `;
-			const body = runtime.output.disposition === "unavailable" ? "output_unavailable" : (runtime.output.excerpt ?? "");
+			// A missing receipt means the SDK recorded no final response text, not
+			// that commits or PRs were lost; carry the opRef for correlation.
+			const body =
+				runtime.output.disposition !== "unavailable"
+					? (runtime.output.excerpt ?? "")
+					: reason === "terminal_missing_receipt"
+						? `final_response_missing opRef=${runtime.opRef}`
+						: "output_unavailable";
 			const content = `${lead}${utf8Prefix(body, 2048 - Buffer.byteLength(lead, "utf8"))}`;
 			const payload =
 				decision === "enqueued"

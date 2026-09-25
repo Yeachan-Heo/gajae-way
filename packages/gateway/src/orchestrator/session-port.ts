@@ -1246,7 +1246,11 @@ export function parseWorkerOutputResponse(
 	if (!content) {
 		if (result.content !== undefined || result.textSummary !== undefined)
 			return { status: "unavailable", code: "invalid_evidence" };
-		return result.receiptState === "missing" || result.receiptState === "absent"
+		// The SDK's receipt state is monotonic missing -> present: a late agent_end
+		// can still attach the final body to this terminal op (#248), so `missing`
+		// is retryable within the bounded read budget. A terminal op whose receipt
+		// is `absent` contradicts the SDK contract and is not.
+		return result.receiptState === "absent"
 			? { status: "unavailable", code: "output_unavailable" }
 			: { status: "absent", code: "output_pending" };
 	}

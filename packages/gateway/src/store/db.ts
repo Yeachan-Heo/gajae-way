@@ -156,6 +156,27 @@ export class WorkAttemptStateError extends Error {
 	}
 }
 
+/**
+ * The only permitted terminal rewrite (#248): broker evidence observed with
+ * receiptState=missing is upgraded to present, in the same write that stores
+ * this op's proven final body. The SDK receipt state is monotonic, so the
+ * rest of the terminal status must be unchanged.
+ */
+function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRuntime): boolean {
+	const before = current.terminal;
+	const after = next.terminal;
+	return (
+		before?.kind === "broker" &&
+		after?.kind === "broker" &&
+		before.observedAt === after.observedAt &&
+		before.status?.receiptState === "missing" &&
+		JSON.stringify({ ...before.status, receiptState: "present" }) === JSON.stringify(after.status) &&
+		current.output.proof === null &&
+		next.output.proof !== null &&
+		(next.output.disposition === "available" || next.output.disposition === "silent")
+	);
+}
+
 /** Length-delimited identity hashing; independent of target, output and recovery time. */
 export function workAttemptDeliveryId(instanceId: string, jobId: string, opRef: string): string {
 	return `work-${createHash("sha256")
@@ -894,7 +915,11 @@ export class GatewayDatabase {
 		validateWorkRuntime(next, this.instanceId);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
-		workAssert(current.terminal === null || JSON.stringify(current.terminal) === JSON.stringify(next.terminal));
+		workAssert(
+			current.terminal === null ||
+				JSON.stringify(current.terminal) === JSON.stringify(next.terminal) ||
+				lateReceiptReconciled(current, next),
+		);
 		workAssert(
 			current.output.knownSilence === null ||
 				JSON.stringify(current.output.knownSilence) === JSON.stringify(next.output.knownSilence),
