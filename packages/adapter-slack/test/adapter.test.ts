@@ -1,4 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
@@ -25,7 +27,7 @@ import type { WebSocketLike } from "../src/socket";
 
 // The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
 // be able to reach a real operator home, whatever a fixture forgets to pass.
-process.env.GAJAEWAY_HOME = `/tmp/slack-test-home-${crypto.randomUUID()}`;
+process.env.GAJAEWAY_HOME = join(tmpdir(), `slack-test-home-${crypto.randomUUID()}`);
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const engagement: EngagementContext = { mentioned: false, group: true, authorId: "U1" };
@@ -138,7 +140,11 @@ async function fixture(
 ) {
 	const api = new Api();
 	const gateway = new Gateway();
-	const recoveryCursorPath = `/tmp/slack-recovery-${crypto.randomUUID()}/adapters/slack/recovery-cursor.json`;
+	const recoveryCursorPath = join(
+		tmpdir(),
+		`slack-recovery-${crypto.randomUUID()}`,
+		"adapters/slack/recovery-cursor.json",
+	);
 	const adapter = await startSlackAdapter(
 		{
 			botToken: "xoxb-test",
@@ -797,7 +803,7 @@ test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder
 		{
 			api,
 			// Never the ambient $GAJAEWAY_HOME store: this process may be a real host.
-			recoveryCursorPath: `/tmp/slack-recovery-${crypto.randomUUID()}.json`,
+			recoveryCursorPath: join(tmpdir(), `slack-recovery-${crypto.randomUUID()}.json`),
 			log: { log() {}, error() {} },
 			socketFactory: () => {
 				const socket = new Socket();
@@ -1091,7 +1097,7 @@ test("Slack recovery keeps retrying until its cursor state is actually on disk",
 		const { mkdir, rm, writeFile } = await import("node:fs/promises");
 		const { dirname } = await import("node:path");
 		const storeDir = dirname(path);
-		expect(storeDir.startsWith("/tmp/slack-recovery-")).toBe(true);
+		expect(storeDir.startsWith(join(tmpdir(), "slack-recovery-"))).toBe(true);
 		await mkdir(dirname(storeDir), { recursive: true });
 		await writeFile(storeDir, "not a directory");
 		expect(await f.recoverMissedMessages()).toBe(false);
@@ -1221,7 +1227,11 @@ test("Slack recovery gate times socket and gateway outages independently", async
 		},
 		{
 			api,
-			recoveryCursorPath: `/tmp/slack-recovery-${crypto.randomUUID()}/adapters/slack/recovery-cursor.json`,
+			recoveryCursorPath: join(
+				tmpdir(),
+				`slack-recovery-${crypto.randomUUID()}`,
+				"adapters/slack/recovery-cursor.json",
+			),
 			now: () => clock,
 			log: { log() {}, error() {} },
 			socketFactory: () => {
