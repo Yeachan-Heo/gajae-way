@@ -41,6 +41,24 @@ export type TailEventKind =
  */
 const PROGRESS_EVENT_KINDS: ReadonlySet<string> = new Set(["message_update"]);
 
+/**
+ * gjc >= 0.17.5 relays every lifecycle frame twice: the top-level form
+ * (`{type:"agent_start", commandId, turnId}`) that this gateway decodes, and a
+ * ring-sequenced mirror (`{type:"event", kind:"agent_start", payload:{...},
+ * generation, seq}`) carrying the same fields inside `payload`. Decoding both
+ * would apply every start/end/activity twice, so the mirror is recognised and
+ * dropped. `bash_folded` is a host notice that a running foreground command was
+ * moved to the background (a steer interrupted it); the turn's own frames carry
+ * everything the gateway delivers.
+ */
+const MIRRORED_EVENT_KINDS: ReadonlySet<string> = new Set([
+	"agent_start",
+	"agent_end",
+	"agent_failed",
+	"activity",
+	"bash_folded",
+]);
+
 export interface TailFrame {
 	readonly kind: TailEventKind;
 	readonly rawKind: string;
@@ -714,6 +732,7 @@ export function decodeStreamFrame(frame: Record<string, unknown>): readonly Tail
 		...(typeof frame.turnId === "string" ? { turnId: frame.turnId } : {}),
 	};
 	if (type === "event" && typeof frame.kind === "string") {
+		if (MIRRORED_EVENT_KINDS.has(frame.kind)) return [];
 		const wrapper = recordOf(frame.payload) ?? {};
 		const event = recordOf(wrapper.event) ?? wrapper;
 		return [decodeEvent(frame.kind, event, correlation)];
