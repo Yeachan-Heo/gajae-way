@@ -145,7 +145,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(23);
+	expect(client.frames[2].result.schemaVersion).toBe(24);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -1451,6 +1451,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(jobs.result.jobs).toHaveLength(1);
 	expect(jobs.result.jobs[0].job_id).toBe(jobId);
 	expect(jobs.result.jobs[0].lane_key).toBe("work-Repo.Fix-2");
+	expect(jobs.result.jobs[0].reports).toEqual({ pending: 0, claimed: 0, held: 0, undeliverable: 0 });
 	// The completed ATTEMPT closed; the JOB stays continuable (attempt_ended),
 	// never a terminal work-failure.
 	expect(jobs.result.jobs[0].state).toBe("attempt_ended");
@@ -2090,6 +2091,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 });
 async function workSocketFixture() {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-async-socket-"));
+	const target = { platform: "discord" as const, kind: "channel" as const, conversationId: "results" };
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -2098,6 +2100,7 @@ async function workSocketFixture() {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		work: { maxLanes: 2 },
+		ownerTarget: { origin: target },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
@@ -2128,13 +2131,12 @@ async function workSocketFixture() {
 
 test("socket work.start accepts before terminal, status/steer stay available, one completion notice", async () => {
 	const f = await workSocketFixture();
-	const target = { platform: "discord", kind: "channel", conversationId: "results" };
 	f.client.send({
 		v: "0.1",
 		type: "request",
 		id: "start",
 		verb: "work.start",
-		params: { name: "a", text: "work", cwd: directory, notify: target },
+		params: { name: "a", text: "work", cwd: directory },
 	});
 	await waitFrame(f.client.frames, "start");
 	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
@@ -2167,7 +2169,7 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 	expect(notices).toHaveLength(1);
 	expect(notices[0].payload).toMatchObject({
 		turnId: receipt.opRef,
-		origin: target,
+		origin: { platform: "discord", kind: "channel", conversationId: "results" },
 		text: "[lane a] completed: socket result",
 	});
 	expect(f.port.sends).toHaveLength(1);

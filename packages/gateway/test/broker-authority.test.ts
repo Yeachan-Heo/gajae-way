@@ -4,7 +4,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
-import { type BrokerAuthority, GatewayDatabase, type WorkAttemptRuntime, workAttemptDeliveryId } from "../src/store/db";
+import {
+	type BrokerAuthority,
+	GatewayDatabase,
+	type WorkAttemptRuntime,
+	workAttemptDeliveryId,
+	workAttemptReportId,
+} from "../src/store/db";
 
 const GLOBAL: BrokerAuthority = { canonicalAgentDir: "/home/operator/.gjc/agent", identity: "global-user" };
 const PRIVATE: BrokerAuthority = { canonicalAgentDir: "/srv/gateway/agent", identity: "retired-private" };
@@ -307,7 +313,10 @@ describe("durable single broker authority", () => {
 			sendEvidence: null,
 			terminal: null,
 			output: { disposition: "pending", reads: 0, nextReadAt: null, excerpt: null, proof: null, knownSilence: null },
-			target: null,
+			parent: null,
+			reportId: workAttemptReportId(database.instanceId, record.jobId, "gw-authority-work"),
+			wakeReportId: null,
+			noticeHash: null,
 			deliveryId: workAttemptDeliveryId(database.instanceId, record.jobId, "gw-authority-work"),
 			decision: "undecided",
 			settledAt: null,

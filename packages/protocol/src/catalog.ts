@@ -472,12 +472,12 @@ export interface WorkRunParams {
 	readonly resume?: boolean;
 	/** Startup model: an explicit model id or a model profile preset; applied at session create and on every send. */
 	readonly model?: string | { readonly preset: string };
+	/** Untrusted routing hint linking this request to the calling GJC session. */
+	readonly callerSessionId?: string;
 }
 
-/** Only asynchronous starts snapshot a completion notification target. */
-export interface WorkStartParams extends WorkRunParams {
-	readonly notify?: OriginRef;
-}
+/** Asynchronous starts and synchronous runs share the same caller metadata. */
+export type WorkStartParams = WorkRunParams;
 
 export type WorkStartResult =
 	| {
@@ -598,6 +598,12 @@ export interface WorkJobsResult {
 		readonly accepted_at?: string;
 		/** The current attempt, a detail of the job; absent on a corrupt record. */
 		readonly attempt?: { readonly op_ref: string; readonly started_at: string; readonly ended_at?: string } | null;
+		readonly reports?: {
+			readonly pending: number;
+			readonly claimed: number;
+			readonly held: number;
+			readonly undeliverable: number;
+		};
 	}>;
 }
 

@@ -264,6 +264,11 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).admit());
 	}
 
+	/** Current durable/in-memory admission hold for lane-report decisions. */
+	admissionHold(originKey: string): string | undefined {
+		return this.#actor(originKey).admissionHold();
+	}
+
 	/** Running-server stall heartbeat: threshold check only, never an abort. */
 	checkStalls(): void {
 		if (this.#stopped) return;
@@ -530,6 +535,13 @@ class OriginActor {
 	constructor(manager: PersonaSessionManager, originKey: string) {
 		this.#manager = manager;
 		this.originKey = originKey;
+	}
+
+	admissionHold(): string | undefined {
+		if (this.#bindWedged) return "broker_wedged";
+		if (this.#lastBindHoldReason) return this.#lastBindHoldReason;
+		if (this.#manager.database.inboundHasQuarantinedNonterminalTurn(this.originKey)) return "quarantined_turn";
+		return undefined;
 	}
 
 	get state(): PersonaActorState {
@@ -1308,7 +1320,7 @@ class OriginActor {
 				await this.#manager.port.steer({
 					sessionId,
 					repo: this.#manager.repo,
-					text: renderSteer(held.body),
+					text: laneSteerText(held),
 					clientRef,
 				});
 				await this.#finalizeSteerAcceptance(held, epoch, opRef, undefined);
@@ -1508,7 +1520,7 @@ class OriginActor {
 			const steer = {
 				sessionId: current.sessionId,
 				repo: this.#manager.repo,
-				text: renderSteer(current.lifecycle.renderSteer?.(row) ?? row.body),
+				text: laneSteerText(row, current.lifecycle),
 				clientRef,
 				...(current.tail ? { relay: current.tail } : {}),
 			};
@@ -2164,7 +2176,7 @@ class OriginActor {
 				await this.#manager.port.steer({
 					sessionId: bound.sessionId,
 					repo: this.#manager.repo,
-					text: renderSteer(bound.lifecycle.renderSteer?.(held) ?? held.body),
+					text: laneSteerText(held, bound.lifecycle),
 					clientRef,
 				});
 				await this.#finalizeSteerAcceptance(held, bound.epoch, bound.turn.opRef, bound);
@@ -2608,6 +2620,12 @@ function safeDiagnostic(error: unknown): string {
  */
 export function renderSteer(body: string): string {
 	return `[Additional message from the user, received while you were still working on their previous request. Finish that request, then also address this. Do not restart or repeat what you already said.]\n${body}`;
+}
+
+function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {
+	if (row.source === "lane_report")
+		return `[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n${row.body}`;
+	return renderSteer(lifecycle?.renderSteer?.(row) ?? row.body);
 }
 
 /**

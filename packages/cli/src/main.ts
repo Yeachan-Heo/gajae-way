@@ -7,7 +7,6 @@ import type {
 	MonitorRecord,
 	MonitorSpec,
 	OpsCycleResult,
-	OriginRef,
 	WorkJobsResult,
 	WorkRetireResult,
 	WorkRunResult,
@@ -16,7 +15,7 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, originKey, parseOriginKey } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	columnNames,
@@ -62,7 +61,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -729,7 +728,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
@@ -778,7 +777,17 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 									? `${job.last_commit.sha.slice(0, 7)}@${job.last_commit.committed_at} ${JSON.stringify(job.last_commit.subject)}`
 									: "-";
 								console.log(
-									`${name} ${state} session=${job.session_id || "-"} accepted=${job.accepted_at || "-"} op=${job.attempt?.op_ref || "-"} last=${job.last_activity_at || "-"} head=${head} ${job.worktree_path}`,
+									`${name} ${state} session=${job.session_id || "-"} accepted=${job.accepted_at || "-"} op=${job.attempt?.op_ref || "-"} last=${job.last_activity_at || "-"} head=${head} ${job.worktree_path}${
+										job.reports &&
+										(
+											job.reports.pending !== 0 ||
+												job.reports.claimed !== 0 ||
+												job.reports.held !== 0 ||
+												job.reports.undeliverable !== 0
+										)
+											? ` reports=p:${job.reports.pending} c:${job.reports.claimed} h:${job.reports.held} u:${job.reports.undeliverable}`
+											: ""
+									}`,
 								);
 							}
 						}
@@ -792,23 +801,15 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				let cwd: string | undefined;
 				let resume = false;
 				let model: string | { preset: string } | undefined;
-				let notify: OriginRef | undefined;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
-					if (arg === "--cwd" || arg === "--model" || arg === "--preset" || arg === "--notify") {
+					if (arg === "--cwd" || arg === "--model" || arg === "--preset") {
 						const value = args[++i];
 						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
 						if (arg === "--cwd") {
 							if (cwd !== undefined || !isAbsolute(value)) throw new Error(usage);
 							cwd = value;
-						} else if (arg === "--notify") {
-							if (command !== "start" || notify !== undefined) throw new Error(usage);
-							try {
-								notify = parseOriginKey(value);
-							} catch {
-								throw new Error(`${usage}\ninvalid --notify originKey`);
-							}
 						} else {
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
@@ -825,13 +826,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					requestTimeoutMs: command === "run" ? 3_600_000 : 120_000,
 				});
 				try {
+					const callerSessionId = process.env.GJC_SESSION_ID?.trim();
 					const params: WorkStartParams = {
 						name,
 						text,
 						...(cwd ? { cwd } : {}),
 						...(resume ? { resume: true } : {}),
 						...(model === undefined ? {} : { model }),
-						...(notify === undefined ? {} : { notify }),
+						...(callerSessionId ? { callerSessionId } : {}),
 					};
 					if (command === "start") {
 						const result = await client.request<WorkStartResult>("work.start", params);
