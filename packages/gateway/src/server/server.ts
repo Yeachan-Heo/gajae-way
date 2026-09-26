@@ -522,9 +522,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		// (resolved at terminal or after a restart) is finalized exactly like a
 		// live one: read context, ownership released.
 		heldSteerContextMessageId: (row) =>
-			(JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
+			row.source === "lane_report"
 				? undefined
-				: (editedMessageId(row.message_id) ?? row.message_id),
+				: (JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
+					? undefined
+					: (editedMessageId(row.message_id) ?? row.message_id),
 		onHeldSteerAccepted: ({ row, abandoned }) => {
 			const turnId = runtime.inbound.get(row.message_id)?.turnId;
 			runtime.inbound.delete(row.message_id);
@@ -579,7 +581,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		lanes,
 		ownerTarget: () => runtime.config.ownerTarget?.origin,
 		brokerGeneration: () => options.broker?.generation ?? 0,
-		deliver: (payload) => broadcastDelivery(runtime, payload),
+		allowNested: () => runtime.config.work?.allowNested === true,
+		personaHold: (originKey) => personaSessions.admissionHold(originKey),
+		notifyPersona: (originKey) => {
+			void personaSessions.notifyInbound(originKey);
+		},
+		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 	});
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
@@ -926,6 +933,9 @@ async function handleRequest(
 					// Repository evidence (issue #67): a lane whose op died but whose HEAD
 					// moved is progressing; it is read from the worktree, not the record.
 					last_commit: laneLastCommit(row.worktree_path),
+					reports: row.lane_key.startsWith("work-")
+						? options.database.laneReportCounts(row.lane_key.slice("work-".length))
+						: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },
 					...(options.database.isBrokerQuarantined("work", row.job_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
@@ -1291,6 +1301,8 @@ async function sendChat(
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
+	if (typeof params.messageId === "string" && params.messageId.startsWith("lane-report-"))
+		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be sent to chat");
 	const userText: string = params.text;
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
@@ -1653,6 +1665,8 @@ async function editChat(
 		throw new ProtocolError("invalid_params", "chat.edit requires non-empty text");
 	if (typeof params.messageId !== "string" || !params.messageId)
 		throw new ProtocolError("invalid_params", "chat.edit requires the edited messageId");
+	if (params.messageId.startsWith("lane-report-"))
+		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be edited");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -1738,6 +1752,7 @@ async function createInboundTurnLifecycle(
 ): Promise<PersonaTurnLifecycle> {
 	// One inbound message is one turn; it carries the live requester/voice context.
 	const row = input.trigger;
+	const laneReport = row.source === "lane_report";
 	const context = runtime.inbound.get(row.message_id);
 	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? [...runtime.connections][0];
@@ -1768,14 +1783,16 @@ async function createInboundTurnLifecycle(
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	const bootstrapState = options.database.getSessionBootstrap(key);
-	let turnText = userText;
+	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
 	if (nonLoopback) {
 		const prepared = options.database.contextWindow(key, row.message_id);
 		// A pointer-update turn reads its ORIGINAL message's row (the edited body
 		// lives there); commit that id, not the synthetic edit row.
-		contextMessageIds = [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
+		contextMessageIds = laneReport
+			? [...prepared.selectedMessageIds]
+			: [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
@@ -1816,7 +1833,7 @@ async function createInboundTurnLifecycle(
 					? `${droppedNote}\n`
 					: ""
 		}`;
-		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
+		turnText = `${header}${laneReport ? laneReportTriggerText(userText) : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
 	}
 
 	const bootstrap =
@@ -1896,6 +1913,10 @@ async function createInboundTurnLifecycle(
 					);
 					continue;
 				}
+				if (laneReport && wanted.targetMessageId === undefined) {
+					console.error(`gateway reaction skipped for internal lane report origin=${key} reason=no_trigger_message`);
+					continue;
+				}
 				const targetMessageId = wanted.targetMessageId ?? row.message_id;
 				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
 				if (rejection) {
@@ -1944,8 +1965,9 @@ async function createInboundTurnLifecycle(
 		// Thread origins already carry their root; explicit [REPLY:…] always wins.
 		// Slack only: a Discord DM's reply metadata is an ordinary "replied to X"
 		// note whose delivery would otherwise turn into a quoted reply nobody asked for.
-		const inboundThreadRoot =
-			origin.platform !== "slack"
+		const inboundThreadRoot = laneReport
+			? undefined
+			: origin.platform !== "slack"
 				? undefined
 				: origin.kind === "channel" &&
 						nonLoopback &&
@@ -2105,6 +2127,7 @@ async function createInboundTurnLifecycle(
 	};
 
 	const renderSteer = (steered: InboundMessageRow): string => {
+		if (steered.source === "lane_report") return steered.body;
 		const steerEngagement = steered.engagement_json
 			? (JSON.parse(steered.engagement_json) as NonNullable<typeof engagement>)
 			: undefined;
@@ -2118,7 +2141,11 @@ async function createInboundTurnLifecycle(
 	// message (that is where the edited body now lives). Consumed in the same
 	// transaction as the acceptance; only transient ownership is released here.
 	const steerContextMessageId = (steered: InboundMessageRow): string | undefined =>
-		nonLoopback ? (editedMessageId(steered.message_id) ?? steered.message_id) : undefined;
+		steered.source === "lane_report"
+			? undefined
+			: nonLoopback
+				? (editedMessageId(steered.message_id) ?? steered.message_id)
+				: undefined;
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		runtime.inbound.delete(steered.message_id);
 		acknowledgeSteer(runtime, steered, turnId);
@@ -2283,6 +2310,9 @@ function reportTerminalLinkAudit(database: GatewayDatabase): void {
 	}
 }
 
+function laneReportTriggerText(body: string): string {
+	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
+}
 function parseReceivedAt(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || !value)
@@ -2504,11 +2534,9 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// foreground `gh run watch`, and answered 22 owner steers with a bare
 		// [REACT:👀] while it kept polling lanes with `sleep N; gajaeway work jobs`.
 		// A conversation turn is the owner's line to the persona; it must not be
-		// spent waiting. Waits are backgrounded or handed to a notifying lane.
+		// spent waiting. Waits are backgrounded or handed to a lane that reports to its parent.
 		"## Staying responsive while you work",
-		"Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or hand the work to a lane started with `gajaeway work start <name> --notify " +
-			originKey(origin) +
-			" …` so its completion arrives here as a new message. Say what you started and end the turn.",
+		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> "<task>"`; its result returns here as an internal report, not a chat post. Say what you started and end the turn.',
 		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
 }

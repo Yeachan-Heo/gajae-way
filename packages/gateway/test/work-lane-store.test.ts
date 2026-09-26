@@ -3,15 +3,18 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LOOPBACK_ORIGIN } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
 import {
+	DatabaseStartupError,
 	GatewayDatabase,
+	type WorkAttemptAdmission,
 	type WorkAttemptRuntime,
 	type WorkAttemptSettlement,
 	WorkAttemptStateError,
 	workAttemptDeliveryId,
+	workAttemptReportId,
 } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 
@@ -63,7 +66,10 @@ async function fixture() {
 		sendEvidence: null,
 		terminal: null,
 		output: { disposition: "pending", reads: 0, nextReadAt: null, excerpt: null, proof: null, knownSilence: null },
-		target: LOOPBACK_ORIGIN,
+		parent: { kind: "persona", originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN },
+		reportId: workAttemptReportId(database.instanceId, record.jobId, "gw-work-store-a"),
+		wakeReportId: null,
+		noticeHash: null,
 		deliveryId: workAttemptDeliveryId(database.instanceId, record.jobId, "gw-work-store-a"),
 		decision: "undecided",
 		settledAt: null,
@@ -78,7 +84,7 @@ async function fixture() {
 			status: { status: "terminal_ok", receiptState: "present", outcome: { reason: "end_turn" } },
 		},
 		output: { ...runtime.output, disposition: "unavailable" },
-		decision: "enqueued",
+		decision: "report",
 		settledAt: END,
 	};
 	const payload = buildDeliveryPayload(
@@ -87,19 +93,53 @@ async function fixture() {
 		"[lane a] completed: output_unavailable",
 		runtime.deliveryId,
 	)!;
-	return { path, database, raw, authority, record, runtime, closed, settlement, payload };
+	const admission: WorkAttemptAdmission = {
+		kind: "persona",
+		row: {
+			messageId: runtime.reportId,
+			originKey: originKey(LOOPBACK_ORIGIN),
+			originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+			body: payload.text,
+			receivedAt: END,
+		},
+		fallbackPayload: payload,
+	};
+	return { path, database, raw, authority, record, runtime, closed, settlement, payload, admission };
+}
+
+function seedLinkedWakeReport(
+	f: Awaited<ReturnType<typeof fixture>>,
+	root: { readonly originKey: string; readonly origin: OriginRef } | null,
+): string {
+	const childName = "child";
+	const childOpRef = "gw-child-op";
+	const childJobId = `lanejob-${Buffer.from(childName, "utf8").toString("hex")}`;
+	const reportId = workAttemptReportId(f.database.instanceId, childJobId, childOpRef);
+	f.raw
+		.query(
+			"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, 'a', ?, ?, ?, ?, 'claimed', 'wake', ?, NULL, 1, NULL, NULL, ?, ?)",
+		)
+		.run(
+			reportId,
+			childName,
+			childOpRef,
+			"[lane child] completed: child output",
+			root === null ? null : JSON.stringify(root),
+			f.runtime.opRef,
+			START,
+			START,
+		);
+	return reportId;
 }
 
 describe("work attempt durable transactions", () => {
 	for (const mode of ["start", "run"] as const) {
 		test(`${mode} publishes worker metadata and activity atomically at prepare and settlement`, async () => {
 			const f = await fixture();
-			const runtime = { ...f.runtime, mode, target: mode === "start" ? f.runtime.target : null };
-			const settlement = {
-				...f.settlement,
-				decision: mode === "start" ? ("enqueued" as const) : ("no_target" as const),
-			};
-			const payload = mode === "start" ? f.payload : undefined;
+			const runtime = { ...f.runtime, mode, parent: mode === "start" ? f.runtime.parent : null };
+			const settlement = { ...f.settlement, decision: mode === "start" ? ("report" as const) : ("no_target" as const) };
+			const admission = mode === "start" ? f.admission : undefined;
+			const expectedDecision = mode === "start" ? "fallback" : "no_target";
 			const identity = () => f.database.sessionIdentityRows().find((row) => row.origin_key === runtime.sessionKey);
 			const workerOrigin = JSON.stringify({ platform: "work", kind: "task", conversationId: "a" });
 			// An AFTER fault proves both assignments roll back even after the UPDATE executes.
@@ -114,20 +154,20 @@ describe("work attempt durable transactions", () => {
 			// Simulate missing legacy metadata to prove settlement restores it too.
 			f.raw.query("UPDATE sessions SET origin_ref_json = NULL WHERE origin_key = ?").run(runtime.sessionKey);
 			f.raw.exec("CREATE TRIGGER fault AFTER UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'fault'); END");
-			expect(() => f.database.workAttemptSettle(runtime.opRef, 0, f.closed, settlement, payload)).toThrow();
+			expect(() => f.database.workAttemptSettle(runtime.opRef, 0, f.closed, settlement, admission)).toThrow();
 			expect(identity()).toMatchObject({ origin_ref_json: null, last_activity_at: START });
 			expect(f.database.workAttemptGet(runtime.opRef)?.decision).toBe("undecided");
 			expect(f.database.deliveryRows()).toHaveLength(0);
 			f.raw.exec("DROP TRIGGER fault");
-			expect(f.database.workAttemptSettle(runtime.opRef, 0, f.closed, settlement, payload)?.decision).toBe(
-				settlement.decision,
+			expect(f.database.workAttemptSettle(runtime.opRef, 0, f.closed, settlement, admission)?.runtime.decision).toBe(
+				expectedDecision,
 			);
 			expect(identity()).toMatchObject({ origin_ref_json: workerOrigin, last_activity_at: END });
 		});
 
 		test(`${mode} stale epoch settlement cannot retag or refresh a successor binding`, async () => {
 			const f = await fixture();
-			const runtime = { ...f.runtime, mode, target: mode === "start" ? f.runtime.target : null };
+			const runtime = { ...f.runtime, mode, parent: mode === "start" ? f.runtime.parent : null };
 			f.database.workAttemptPrepare(runtime, f.record);
 			const successorOrigin = JSON.stringify(LOOPBACK_ORIGIN);
 			// Keep sessionId identical: the epoch predicate must independently fence the write.
@@ -136,16 +176,17 @@ describe("work attempt durable transactions", () => {
 				.run(successorOrigin, START, runtime.sessionKey);
 			const before = f.database.sessionIdentityRows();
 			expect(() => f.database.workAttemptPrepare(runtime, f.record)).toThrow();
-			const decision = mode === "start" ? ("enqueued" as const) : ("no_target" as const);
+			const requested = mode === "start" ? ("report" as const) : ("no_target" as const);
+			const expected = mode === "start" ? "fallback" : "no_target";
 			expect(
 				f.database.workAttemptSettle(
 					runtime.opRef,
 					0,
 					f.closed,
-					{ ...f.settlement, decision },
-					mode === "start" ? f.payload : undefined,
-				)?.decision,
-			).toBe(decision);
+					{ ...f.settlement, decision: requested },
+					mode === "start" ? f.admission : undefined,
+				)?.runtime.decision,
+			).toBe(expected);
 			expect(f.database.sessionIdentityRows()).toEqual(before);
 		});
 	}
@@ -171,15 +212,15 @@ describe("work attempt durable transactions", () => {
 			f.database.workAttemptPrepare(f.runtime, f.record);
 			const action = table === "deliveries" ? "INSERT" : "UPDATE";
 			f.raw.exec(`CREATE TRIGGER fault BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'fault'); END`);
-			expect(() => f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.payload)).toThrow();
+			expect(() => f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)).toThrow();
 			expect(f.database.workAttemptGet(f.runtime.opRef)).toEqual(f.runtime);
 			expect(parseLaneJobRecord(f.database.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 			expect(f.database.workLaneRows()[0]?.last_activity_at).toBe(START);
 			expect(f.database.deliveryRows()).toHaveLength(0);
 			f.raw.exec("DROP TRIGGER fault");
-			expect(f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.payload)?.decision).toBe(
-				"enqueued",
-			);
+			expect(
+				f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)?.runtime.decision,
+			).toBe("fallback");
 			expect(f.database.deliveryRows()).toHaveLength(1);
 			expect(f.database.workLaneRows()[0]?.last_activity_at).toBe(END);
 		});
@@ -193,17 +234,19 @@ describe("work attempt durable transactions", () => {
 			sendEvidence: { source: "receipt", observedAt: START },
 		});
 		expect(accepted?.version).toBe(1);
-		expect(f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.payload)).toBeUndefined();
+		expect(f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)).toBeUndefined();
 		expect(f.database.deliveryRows()).toHaveLength(0);
-		expect(f.database.workAttemptSettle(f.runtime.opRef, 1, f.closed, f.settlement, f.payload)?.version).toBe(2);
+		expect(f.database.workAttemptSettle(f.runtime.opRef, 1, f.closed, f.settlement, f.admission)?.runtime.version).toBe(
+			2,
+		);
 		const ledger = new DeliveryLedger(f.database);
 		expect(ledger.confirm(f.runtime.deliveryId)).toBe("transitioned");
 		expect(ledger.prune(0, Date.now() + 1000)).toBe(1);
 		const reopened = await GatewayDatabase.open(f.path);
 		handles.push(reopened);
-		expect(reopened.workAttemptSettle(f.runtime.opRef, 2, f.closed, f.settlement, f.payload)).toBeUndefined();
+		expect(reopened.workAttemptSettle(f.runtime.opRef, 2, f.closed, f.settlement, f.admission)).toBeUndefined();
 		expect(reopened.workAttemptUpdate(f.runtime.opRef, 2, {})).toBeUndefined();
-		expect(reopened.workAttemptGet(f.runtime.opRef)?.decision).toBe("enqueued");
+		expect(reopened.workAttemptGet(f.runtime.opRef)?.decision).toBe("fallback");
 		expect(reopened.deliveryRows()).toHaveLength(0);
 	});
 
@@ -242,7 +285,7 @@ describe("work attempt durable transactions", () => {
 			undefined,
 			f.runtime.deliveryId,
 		);
-		expect(() => f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.payload)).toThrow();
+		expect(() => f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)).toThrow();
 		expect(f.database.workAttemptGet(f.runtime.opRef)?.decision).toBe("undecided");
 		expect(f.database.deliveryRows()[0]?.turn_id).toBe("other-turn");
 	});
@@ -284,7 +327,7 @@ describe("work attempt durable transactions", () => {
 		expect(reopened.workAttemptGet(f.runtime.opRef)?.output.knownSilence).toEqual(proof);
 		expect(() => reopened.workAttemptUpdate(f.runtime.opRef, 1, { output: f.runtime.output })).toThrow();
 		const suppressed = { ...f.settlement, output, decision: "suppressed" as const };
-		expect(reopened.workAttemptSettle(f.runtime.opRef, 1, f.closed, suppressed)?.decision).toBe("suppressed");
+		expect(reopened.workAttemptSettle(f.runtime.opRef, 1, f.closed, suppressed)?.runtime.decision).toBe("suppressed");
 		expect(reopened.workAttemptSettle(f.runtime.opRef, 2, f.closed, suppressed)).toBeUndefined();
 		expect(reopened.deliveryRows()).toHaveLength(0);
 	});
@@ -393,16 +436,192 @@ describe("work attempt durable transactions", () => {
 	test("run is response-only and final decisions cannot bypass settlement", async () => {
 		const f = await fixture();
 		expect(() => f.database.workAttemptPrepare({ ...f.runtime, mode: "run" }, f.record)).toThrow();
-		const runtime = { ...f.runtime, mode: "run" as const, target: null };
+		const runtime = { ...f.runtime, mode: "run" as const, parent: null };
 		f.database.workAttemptPrepare(runtime, f.record);
 		expect(() => f.database.workAttemptUpdate(runtime.opRef, 0, f.settlement)).toThrow();
-		expect(() => f.database.workAttemptSettle(runtime.opRef, 0, f.closed, f.settlement, f.payload)).toThrow();
+		expect(() => f.database.workAttemptSettle(runtime.opRef, 0, f.closed, f.settlement, f.admission)).toThrow();
 		const patch = { ...f.settlement, decision: "no_target" as const };
-		expect(() => f.database.workAttemptSettle(runtime.opRef, 0, f.closed, patch, f.payload)).toThrow();
-		expect(f.database.workAttemptSettle(runtime.opRef, 0, f.closed, patch)?.decision).toBe("no_target");
+		expect(() => f.database.workAttemptSettle(runtime.opRef, 0, f.closed, patch, f.admission)).toThrow();
+		expect(f.database.workAttemptSettle(runtime.opRef, 0, f.closed, patch)?.runtime.decision).toBe("no_target");
 		expect(f.database.deliveryRows()).toHaveLength(0);
 	});
 
+	test("wake_unaccepted validator rejects fabricated upstream decisions", async () => {
+		for (const decision of ["reported", "fallback", "no_target", "suppressed"] as const) {
+			const f = await fixture();
+			const linkedId = seedLinkedWakeReport(f, {
+				originKey: originKey(LOOPBACK_ORIGIN),
+				origin: LOOPBACK_ORIGIN,
+			});
+			const runtime = { ...f.runtime, wakeReportId: linkedId };
+			f.database.workAttemptPrepare(runtime, f.record);
+			const terminal = { kind: "local" as const, observedAt: END, reasonCode: "session_dead" };
+			const invalid = {
+				...runtime,
+				parent: decision === "no_target" ? null : runtime.parent,
+				version: 1,
+				terminal,
+				output: { ...runtime.output, disposition: "unavailable" as const },
+				decision,
+				settledAt: END,
+			};
+			f.raw
+				.query("UPDATE work_attempt_runtime SET record_json = ?, version = 1, settled_at = ? WHERE op_ref = ?")
+				.run(JSON.stringify(invalid), END, runtime.opRef);
+			expect(() => f.database.workAttemptGet(runtime.opRef)).toThrow(WorkAttemptStateError);
+		}
+
+		const noLink = await fixture();
+		noLink.database.workAttemptPrepare(noLink.runtime, noLink.record);
+		const noLinkInvalid = {
+			...noLink.runtime,
+			version: 1,
+			terminal: { kind: "local" as const, observedAt: END, reasonCode: "session_dead" },
+			output: { ...noLink.runtime.output, disposition: "unavailable" as const },
+			decision: "wake_unaccepted" as const,
+			settledAt: END,
+		};
+		noLink.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ?, version = 1, settled_at = ? WHERE op_ref = ?")
+			.run(JSON.stringify(noLinkInvalid), END, noLink.runtime.opRef);
+		expect(() => noLink.database.workAttemptGet(noLink.runtime.opRef)).toThrow(WorkAttemptStateError);
+	});
+
+	test("wake_unaccepted settles only the linked child transition", async () => {
+		for (const [root, reasonCode, expectedState] of [
+			[{ originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN }, "send_rejected", "fallback"],
+			[null, "send_rejected", "undeliverable"],
+			[{ originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN }, "session_dead", "held"],
+		] as const) {
+			const f = await fixture();
+			const linkedId = seedLinkedWakeReport(f, root);
+			const runtime = { ...f.runtime, parent: null, wakeReportId: linkedId };
+			f.database.workAttemptPrepare(runtime, f.record);
+			const terminal = { kind: "local" as const, observedAt: END, reasonCode };
+			const staged = f.database.workAttemptUpdate(runtime.opRef, 0, {
+				terminal,
+				output: { ...runtime.output, disposition: "unavailable" },
+			})!;
+			const closed = closeAttempt({
+				record: f.record,
+				opRef: runtime.opRef,
+				endState: reasonCode === "send_rejected" ? "failed" : "terminal_uncertain",
+				errorCode: reasonCode,
+				endedAt: END,
+			});
+			const result = f.database.workAttemptSettle(staged.opRef, staged.version, closed, {
+				terminal,
+				output: staged.output,
+				decision: "wake_unaccepted",
+				settledAt: END,
+			});
+			expect(result?.runtime.decision).toBe("wake_unaccepted");
+			expect(f.database.workAttemptGet(runtime.opRef)?.decision).toBe("wake_unaccepted");
+			expect(f.database.inboundTurnRow(runtime.opRef)).toBeUndefined();
+			expect(f.raw.query("SELECT 1 FROM lane_reports WHERE child_op_ref = ?").get(runtime.opRef)).toBeNull();
+			expect(f.database.deliveryRows().some((row) => row.delivery_id === runtime.deliveryId)).toBe(false);
+			const child = f.database.laneReportGet(linkedId)!;
+			expect(child.state).toBe(expectedState);
+			if (expectedState === "fallback") {
+				const childDeliveryId = workAttemptDeliveryId(
+					f.database.instanceId,
+					`lanejob-${Buffer.from("child", "utf8").toString("hex")}`,
+					"gw-child-op",
+				);
+				expect(result?.childFallback?.deliveryId).toBe(childDeliveryId);
+				expect(f.database.deliveryRows()).toMatchObject([
+					{ delivery_id: childDeliveryId, turn_id: "gw-child-op", origin_key: originKey(LOOPBACK_ORIGIN) },
+				]);
+			} else {
+				expect(result?.childFallback).toBeUndefined();
+				expect(f.database.deliveryRows()).toHaveLength(0);
+			}
+			if (expectedState === "held") expect(child.hold_reason).toBe("wake_acceptance_uncertain");
+		}
+	});
+
+	test("accepted wake consumes its child and reports normally to its inherited persona", async () => {
+		const f = await fixture();
+		const root = { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN };
+		const linkedId = seedLinkedWakeReport(f, root);
+		const personaSessionId = crypto.randomUUID();
+		expect(
+			f.database.recordOwnedBinding({
+				authority: f.authority,
+				sessionId: personaSessionId,
+				originKey: root.originKey,
+				epoch: 0,
+				repo: "/work",
+			}),
+		).toBe(true);
+		const runtime = { ...f.runtime, wakeReportId: linkedId };
+		f.database.workAttemptPrepare(runtime, f.record);
+		const accepted = f.database.workAttemptUpdate(runtime.opRef, 0, {
+			sendPhase: "accepted",
+			sendEvidence: { source: "receipt", observedAt: START },
+		})!;
+		expect(f.database.laneReportGet(linkedId)?.state).toBe("consumed");
+		const result = f.database.workAttemptSettle(accepted.opRef, accepted.version, f.closed, f.settlement, f.admission)!;
+		expect(result.runtime.decision).toBe("reported");
+		expect(f.database.laneReportGet(linkedId)?.consumed_op_ref).toBe(runtime.opRef);
+		expect(f.database.inboundPendingOldest(root.originKey)).toMatchObject({
+			message_id: runtime.reportId,
+			source: "lane_report",
+		});
+		expect(result.childFallback).toBeUndefined();
+		expect(f.database.deliveryRows()).toHaveLength(0);
+	});
+	test("wake with proven output and missing receipt is accepted and reports normally", async () => {
+		const f = await fixture();
+		const root = { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN };
+		const linkedId = seedLinkedWakeReport(f, root);
+		const personaSessionId = crypto.randomUUID();
+		f.database.recordOwnedBinding({
+			authority: f.authority,
+			sessionId: personaSessionId,
+			originKey: root.originKey,
+			epoch: 0,
+			repo: "/work",
+		});
+		const runtime = { ...f.runtime, wakeReportId: linkedId };
+		f.database.workAttemptPrepare(runtime, f.record);
+		const proof = {
+			opRef: runtime.opRef,
+			sessionId: runtime.sessionId,
+			epoch: runtime.epoch,
+			observedAtMs: Date.parse(END),
+			source: "turn.result" as const,
+			attribution: "operation_ref" as const,
+			fullness: "original" as const,
+			clientRef: runtime.opRef,
+			repo: runtime.cwd,
+			terminalAt: Date.parse(END),
+			contentVersion: 1 as const,
+			byteLength: Buffer.byteLength("proven wake output"),
+		};
+		const provenOutput = {
+			...runtime.output,
+			disposition: "available" as const,
+			excerpt: "proven wake output",
+			proof,
+		};
+		const accepted = f.database.workAttemptUpdate(runtime.opRef, 0, { output: provenOutput })!;
+		expect(accepted.sendPhase).toBe("prepared");
+		expect(f.database.laneReportGet(linkedId)?.state).toBe("consumed");
+		const patch = {
+			...f.settlement,
+			output: { ...provenOutput, disposition: "unavailable" as const, excerpt: null },
+			decision: "report" as const,
+		};
+		const result = f.database.workAttemptSettle(accepted.opRef, accepted.version, f.closed, patch, f.admission)!;
+		expect(result.runtime.decision).toBe("reported");
+		expect(result.runtime.output.proof).toEqual(proof);
+		expect(f.database.laneReportGet(linkedId)?.consumed_op_ref).toBe(runtime.opRef);
+		expect(f.database.inboundPendingOldest(root.originKey)).toMatchObject({
+			message_id: runtime.reportId,
+			source: "lane_report",
+		});
+	});
 	test("wrong bound identity and history cannot be prepared", async () => {
 		const f = await fixture();
 		expect(() => f.database.workAttemptPrepare({ ...f.runtime, epoch: 1 }, f.record)).toThrow();
@@ -412,10 +631,93 @@ describe("work attempt durable transactions", () => {
 		expect(f.database.laneJobJson(f.runtime.jobId)).toBeUndefined();
 	});
 
-	test("v21 migration preserves historical open history and adopts without target", async () => {
+	test("v24 migration rewrites a quarantined v23 runtime and restores quarantine triggers", async () => {
+		const f = await fixture();
+		f.database.workAttemptPrepare(f.runtime, f.record);
+		const settled = f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)!;
+		expect(settled.runtime.decision).toBe("fallback");
+		const targetAuthority = {
+			canonicalAgentDir: join(f.path, "..", "target-agent"),
+			identity: "target-broker",
+		};
+		f.database.cutoverBrokerAuthority({
+			expectedAuthority: f.authority,
+			targetAuthority,
+			evidence: "test v23 quarantine migration",
+			disposition: "quarantine",
+		});
+		const current = f.database.workAttemptGet(f.runtime.opRef)!;
+		const legacy: Record<string, unknown> = {
+			...current,
+			target: current.parent?.kind === "persona" ? current.parent.origin : null,
+			decision: "enqueued",
+		};
+		delete legacy.parent;
+		delete legacy.reportId;
+		delete legacy.wakeReportId;
+		delete legacy.noticeHash;
+		f.raw.exec(
+			"DROP TRIGGER work_attempt_runtime_quarantine_update; DROP TRIGGER work_attempt_runtime_quarantine_delete;",
+		);
+		f.raw
+			.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+			.run(JSON.stringify(legacy), f.runtime.opRef);
+		f.raw.exec(`
+			CREATE TRIGGER work_attempt_runtime_quarantine_update BEFORE UPDATE ON work_attempt_runtime
+			WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+			BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+			CREATE TRIGGER work_attempt_runtime_quarantine_delete BEFORE DELETE ON work_attempt_runtime
+			WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+			BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+		`);
+		f.raw.exec(
+			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version = 24",
+		);
+
+		const migrated = await GatewayDatabase.open(f.path);
+		handles.push(migrated);
+		expect(migrated.schemaVersion).toBe(24);
+		expect(migrated.workAttemptGet(f.runtime.opRef)).toMatchObject({
+			decision: "fallback",
+			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
+			reportId: workAttemptReportId(migrated.instanceId, f.runtime.jobId, f.runtime.opRef),
+			wakeReportId: null,
+			noticeHash: null,
+		});
+		const triggers = new Set(
+			f.raw
+				.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+				.all()
+				.map((row) => row.name),
+		);
+		expect(triggers.has("work_attempt_runtime_quarantine_update")).toBe(true);
+		expect(triggers.has("work_attempt_runtime_quarantine_delete")).toBe(true);
+		expect(() =>
+			f.raw.query("UPDATE work_attempt_runtime SET version = version + 1 WHERE op_ref = ?").run(f.runtime.opRef),
+		).toThrow();
+	});
+
+	test("v24 corrupt runtime migration rolls schema changes back", async () => {
+		const f = await fixture();
+		f.database.workAttemptPrepare(f.runtime, f.record);
+		f.raw.exec(
+			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version = 24",
+		);
+		f.raw.query("UPDATE work_attempt_runtime SET record_json = '{' WHERE op_ref = ?").run(f.runtime.opRef);
+		await expect(GatewayDatabase.open(f.path)).rejects.toBeInstanceOf(DatabaseStartupError);
+		expect(f.database.schemaVersion).toBe(23);
+		expect(f.raw.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lane_reports'").get()).toBeNull();
+		expect(
+			f.raw
+				.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+				.all()
+				.some((row) => row.name === "source"),
+		).toBe(false);
+	});
+	test("v21 migration preserves historical open history and adopts without parent", async () => {
 		const f = await fixture();
 		f.database.putLaneJob({ ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) });
-		// Preserve the fixture's explicit provenance while replaying v21 through v23.
+		// Preserve the fixture's explicit provenance while replaying v21 through v24.
 		// Restoring a snapshot is not initialization/adoption of a populated database.
 		f.raw.exec(`CREATE TEMP TABLE saved_authority AS SELECT * FROM broker_authority;
 			CREATE TEMP TABLE saved_bindings AS SELECT * FROM broker_owned_bindings;`);
@@ -436,6 +738,8 @@ describe("work attempt durable transactions", () => {
 ALTER TABLE memory_intents DROP COLUMN quarantine_reason;
 ALTER TABLE memory_intents DROP COLUMN attempts;
 DROP TABLE work_attempt_runtime;
+ALTER TABLE inbound_messages DROP COLUMN source;
+DROP TABLE lane_reports;
 DELETE FROM schema_migrations WHERE version >= 21;
 `);
 		const migrated = await GatewayDatabase.open(f.path);
@@ -449,13 +753,14 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(23);
+		expect(migrated.schemaVersion).toBe(24);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
-		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, target: null };
+		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.workAttemptPrepare(historical, f.record);
-		expect(migrated.workAttemptGet(f.runtime.opRef)?.target).toBeNull();
+		expect(migrated.workAttemptGet(f.runtime.opRef)?.parent).toBeNull();
 		expect(
-			migrated.workAttemptSettle(f.runtime.opRef, 0, f.closed, { ...f.settlement, decision: "no_target" })?.decision,
+			migrated.workAttemptSettle(f.runtime.opRef, 0, f.closed, { ...f.settlement, decision: "no_target" })?.runtime
+				.decision,
 		).toBe("no_target");
 		expect(migrated.deliveryRows()).toHaveLength(0);
 	});

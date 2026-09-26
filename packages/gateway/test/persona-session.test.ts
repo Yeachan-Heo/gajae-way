@@ -36,12 +36,13 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 	expect(predicate(), message).toBe(true);
 }
 
-function enqueue(messageId: string, body: string): void {
+function enqueue(messageId: string, body: string, source: "platform" | "lane_report" = "platform"): void {
 	const accepted = database?.inboundEnqueue({
 		messageId,
 		originKey: KEY,
 		originRefJson: JSON.stringify(ORIGIN),
 		body,
+		source,
 	});
 	expect(accepted).toBe(true);
 }
@@ -1514,6 +1515,57 @@ test("notifyInbound immediately starts a turn while idle", async () => {
 	expect(port.sends).toEqual([expect.objectContaining({ text: "live policy", opRef: latestOpRef })]);
 });
 
+test("lane_report steer uses lane framing, not user framing", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("human-trigger", "first");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "initial persona turn did not start");
+	enqueue("lane-report-steer", "[lane child] completed: result", "lane_report");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.steers.length === 1, "lane report was not steered into the running turn");
+	expect(port.steers[0]?.text).toBe(
+		"[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[lane child] completed: result",
+	);
+	expect(port.steers[0]?.text).not.toContain("Additional message from the user");
+	expect(database!.inboundTurnRows(latestOpRef)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ message_id: "lane-report-steer", source: "lane_report", turn_role: "steer" }),
+		]),
+	);
+});
+
+test("/new keeps pending lane_report rows while discarding platform rows", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("platform-before-new", "old human", "platform");
+	enqueue("internal-before-new", "[lane child] attempt_ended", "lane_report");
+	await manager!.reset(KEY, JSON.stringify(ORIGIN), "2030-09-01T00:00:00.000Z");
+	await eventually(() => port.sends.length === 1, "pending lane report was not admitted after /new");
+	expect(database!.inboundTurnRow(latestOpRef)).toMatchObject({
+		message_id: "internal-before-new",
+		source: "lane_report",
+		state: "pending",
+	});
+	expect(port.sends[0]?.text).toBe("[lane child] attempt_ended");
+});
+
+test("admissionHold reports a quarantined nonterminal persona turn", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("quarantined-trigger", "original request");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const authority = database!.inspectBrokerAuthority().authority;
+	if (!authority) throw new Error("fixture broker authority missing");
+	database!.cutoverBrokerAuthority({
+		expectedAuthority: authority,
+		targetAuthority: { canonicalAgentDir: join(home, "next-agent"), identity: "next-owner" },
+		evidence: "test quarantine for admission hold",
+		disposition: "quarantine",
+	});
+	expect(manager!.admissionHold(KEY)).toBe("quarantined_turn");
+});
 test("two messages 50ms apart start one turn and steer the second", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);

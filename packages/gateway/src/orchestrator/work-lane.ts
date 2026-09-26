@@ -1,10 +1,13 @@
+import { createHash } from "node:crypto";
 import {
 	type ChatMessagePayload,
 	containsSilenceToken,
 	isSilenceToken,
 	type OriginRef,
+	originKey,
 	type PromptStatusBody,
 	ProtocolError,
+	parseOriginKey,
 	validateOriginRef,
 	type WorkStartResult,
 	type WorkStatusResult,
@@ -28,9 +31,14 @@ import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
 import {
 	type GatewayDatabase,
+	type LaneReportRow,
+	type WorkAttemptAdmission,
 	type WorkAttemptRuntime,
 	type WorkAttemptTerminalEvidence,
+	type WorkParent,
+	type WorkReportRoot,
 	workAttemptDeliveryId,
+	workAttemptReportId,
 } from "../store/db";
 import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
@@ -76,6 +84,9 @@ const pendingOutput = () => ({
 	proof: null,
 	knownSilence: null,
 });
+function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
+	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
+}
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
 	readonly generation: number;
@@ -96,8 +107,11 @@ export interface WorkLaneManagerOptions {
 	readonly port: SessionPort;
 	readonly lanes: LaneGovernor;
 	readonly ownerTarget?: () => OriginRef | undefined;
+	readonly allowNested?: () => boolean;
+	readonly personaHold?: (originKey: string) => string | undefined;
+	readonly notifyPersona?: (originKey: string) => void;
+	readonly deliverFallback?: (payload: ChatMessagePayload) => void;
 	readonly brokerGeneration?: () => number;
-	readonly deliver?: (payload: ChatMessagePayload) => void;
 	readonly pollMs?: number;
 	readonly waitTimeoutMs?: number;
 	readonly now?: () => number;
@@ -108,7 +122,12 @@ interface WorkInput {
 	cwd: string;
 	resume: boolean;
 	model?: GjcModelSelection;
-	target: OriginRef | null;
+	callerSessionId?: string;
+}
+interface StartContext {
+	readonly parent: WorkParent | null;
+	readonly opRef?: string;
+	readonly wakeReportId?: string;
 }
 
 /** Attempt ownership is independent of sockets, response deadlines and broker generations. */
@@ -209,11 +228,117 @@ export class WorkLaneManager {
 				...(name === undefined ? {} : { name }),
 			});
 	}
+	#latestRuntime(name: string): WorkAttemptRuntime | undefined {
+		const opRef = this.#job(name)?.attempts.at(-1)?.opRef;
+		return opRef ? this.#db.workAttemptGet(opRef) : undefined;
+	}
+	#rootForLane(name: string): WorkReportRoot | null {
+		const parent = this.#latestRuntime(name)?.parent;
+		if (parent?.kind === "persona") return { originKey: parent.originKey, origin: parent.origin };
+		if (parent?.kind === "lane") return parent.root;
+		return null;
+	}
+	#assertNoNestedCycle(childName: string, parentName: string): void {
+		const visited = new Set<string>();
+		let name = parentName;
+		for (let hop = 0; hop < 16; hop++) {
+			if (name === childName || visited.has(name))
+				throw new ProtocolError("invalid_params", "nested work lane would create a parent cycle", {
+					reasonCode: "nested_lane_cycle",
+					name: childName,
+					parent: name,
+				});
+			visited.add(name);
+			const parent = this.#latestRuntime(name)?.parent;
+			if (parent?.kind !== "lane") return;
+			name = parent.name;
+		}
+		throw new ProtocolError("invalid_params", "nested work lane parent chain exceeds 16 hops", {
+			reasonCode: "nested_lane_cycle",
+			name: childName,
+			parent: name,
+		});
+	}
+	#resolveCaller(input: WorkInput, mode: "start" | "run"): WorkParent | null {
+		let callerOrigin: string | undefined;
+		if (input.callerSessionId) callerOrigin = this.#db.originForSessionId(input.callerSessionId);
+		const lanePrefix = "work/task/";
+		const callerLane = callerOrigin?.startsWith(lanePrefix) ? callerOrigin.slice(lanePrefix.length) : undefined;
+		let callerPersona: OriginRef | undefined;
+		if (callerOrigin && callerLane === undefined) {
+			try {
+				const origin = parseOriginKey(callerOrigin);
+				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) callerPersona = origin;
+			} catch {
+				/* Unknown and non-persona origins fall back to ownerTarget for starts. */
+			}
+		}
+		if (callerLane !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(callerLane)) {
+			if (this.#options.allowNested?.() !== true) {
+				console.error(`work_nested_refused verb=${mode} name=${input.name} parent=${callerLane}`);
+				throw new ProtocolError(
+					"unauthorized",
+					`work.${mode} from a work lane is disabled (work.allowNested=false); finish your task and report back to your parent instead`,
+					{ reasonCode: "nested_lane_forbidden", verb: mode, parent: callerLane },
+				);
+			}
+			if (mode === "start") this.#assertNoNestedCycle(input.name, callerLane);
+			const parent: WorkParent = { kind: "lane", name: callerLane, root: this.#rootForLane(callerLane) };
+			const resolved = mode === "start" ? parent : null;
+			console.error(
+				`work_parent_resolved verb=${mode} name=${input.name} source=session kind=${mode === "start" ? "lane" : "none"}`,
+			);
+			return resolved;
+		}
+		if (mode === "run") {
+			console.error(`work_parent_resolved verb=run name=${input.name} source=none kind=none`);
+			return null;
+		}
+		if (callerPersona) {
+			const parent: WorkParent = { kind: "persona", originKey: originKey(callerPersona), origin: callerPersona };
+			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
+			return parent;
+		}
+		const owner = this.#options.ownerTarget?.();
+		if (owner) {
+			try {
+				validateOriginRef(owner);
+				if (["discord", "slack", "telegram", "loopback"].includes(owner.platform)) {
+					const parent: WorkParent = { kind: "persona", originKey: originKey(owner), origin: structuredClone(owner) };
+					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona`);
+					return parent;
+				}
+			} catch {
+				/* Invalid owner origins cannot become report targets. */
+			}
+		}
+		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none`);
+		return null;
+	}
+	#laneNotice(
+		name: string,
+		parent: WorkParent | null,
+		epoch: number,
+	): { readonly text: string; readonly hash: string } | undefined {
+		const allowNested = this.#options.allowNested?.() === true;
+		const text = laneSystemNotice({ name, parent, allowNested });
+		const hash = createHash("sha256").update(text).digest("hex");
+		const stored = this.#db.metaGet(`lane-notice:${workSessionKey(name)}`);
+		if (stored) {
+			try {
+				const previous = JSON.parse(stored) as { epoch?: unknown; hash?: unknown };
+				if (previous.epoch === epoch && previous.hash === hash) return undefined;
+			} catch {
+				/* Corrupt notice metadata fails closed by re-sending the notice. */
+			}
+		}
+		return { text, hash };
+	}
 	async start(params: unknown): Promise<WorkStartResult> {
-		return this.#start(parseInput(params, "start", this.#options.ownerTarget?.()), "start");
+		return this.#start(parseInput(params), "start");
 	}
 	async run(params: unknown, owner: object, signal?: AbortSignal) {
-		const started = await this.#start(parseInput(params, "run"), "run");
+		const started = await this.#start(parseInput(params), "run");
 		if (!started.started) {
 			const { started: _, ...held } = started;
 			return held;
@@ -228,153 +353,157 @@ export class WorkLaneManager {
 	}
 	async #start(input: WorkInput, mode: "start" | "run"): Promise<WorkStartResult> {
 		this.#live();
+		const parent = this.#resolveCaller(input, mode);
 		this.#job(input.name);
 		await this.recover();
 		this.#live();
 		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, async (): Promise<WorkStartResult> => {
+		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent }));
+	}
+	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
+		this.#live();
+		const sessionKey = workSessionKey(input.name);
+		let job = this.#job(input.name);
+		const { jobId } = laneJobIdentity(input.name);
+		if (job && job.lane.worktreePath !== input.cwd)
+			throw new ProtocolError("invalid_params", "work lane cwd mismatch", {
+				reasonCode: "lane_cwd_mismatch",
+				name: input.name,
+			});
+		const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
+		if (open)
+			throw new ProtocolError("invalid_params", "attempt already open; use work.steer or wait", {
+				reasonCode: "attempt_open",
+				jobId,
+				opRef: open.opRef,
+				sessionId: open.sessionId,
+			});
+		if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
+			if (!input.resume)
+				return {
+					started: false,
+					held: true,
+					jobId,
+					state: job.state,
+					reason: `the job is ${job.state}; reconcile, then resume explicitly`,
+				};
+			job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
+		}
+		if (!job) {
+			const facts = await collectRepoFacts(input.cwd);
+			job = createLaneJobRecord({
+				jobId,
+				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
+				worktreePath: input.cwd,
+				baselineSha: facts?.headSha,
+			});
+		}
+		const binding = await this.#port.runExclusive("work/admission", async () => {
 			this.#live();
-			let job = this.#job(input.name);
-			const { jobId } = laneJobIdentity(input.name);
-			if (job && job.lane.worktreePath !== input.cwd)
-				throw new ProtocolError("invalid_params", "work lane cwd mismatch", {
-					reasonCode: "lane_cwd_mismatch",
+			this.#options.lanes.assertAdmission(input.name);
+			try {
+				return await this.#port.bind({
+					originKey: sessionKey,
+					epoch: this.#db.getSessionRecord(sessionKey)?.epoch ?? 0,
+					repo: input.cwd,
+					codingRegister: true,
+					...(input.model ? { model: input.model } : {}),
+				});
+			} catch {
+				throw new ProtocolError("verb_failed", "work lane bind failed", {
+					reasonCode: "bind_failed",
 					name: input.name,
 				});
-			const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
-			if (open)
-				throw new ProtocolError("invalid_params", "attempt already open; use work.steer or wait", {
-					reasonCode: "attempt_open",
-					jobId,
-					opRef: open.opRef,
-					sessionId: open.sessionId,
-				});
-			if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
-				if (!input.resume)
-					return {
-						started: false,
-						held: true,
-						jobId,
-						state: job.state,
-						reason: `the job is ${job.state}; reconcile, then resume explicitly`,
-					};
-				job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
 			}
-			if (!job) {
-				const facts = await collectRepoFacts(input.cwd);
-				job = createLaneJobRecord({
-					jobId,
-					branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
-					worktreePath: input.cwd,
-					baselineSha: facts?.headSha,
-				});
-			}
-			const binding = await this.#port.runExclusive("work/admission", async () => {
-				this.#live();
-				this.#options.lanes.assertAdmission(input.name);
-				try {
-					return await this.#port.bind({
-						originKey: sessionKey,
-						epoch: this.#db.getSessionRecord(sessionKey)?.epoch ?? 0,
-						repo: input.cwd,
-						codingRegister: true,
-						...(input.model ? { model: input.model } : {}),
-					});
-				} catch {
-					throw new ProtocolError("verb_failed", "work lane bind failed", {
-						reasonCode: "bind_failed",
-						name: input.name,
-					});
-				}
-			});
-			this.#live();
-			const opRef = newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-			const runtime = makeRuntime(
-				this.#db,
-				input.name,
-				binding.sessionId,
-				binding.epoch,
-				input.cwd,
-				this.#at(),
-				opRef,
-				mode,
-				input.target,
-			);
-			job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
-			this.#db.workAttemptPrepare(runtime, job);
-			const observer = this.#register(runtime);
-			// Submit on the observer's own relay so the host streams this turn's
-			// lifecycle to it; the frame callback then wakes reconciliation as the
-			// turn progresses instead of on the poll interval alone.
-			this.#attach(observer);
-			await observer.attaching;
-			let accepted = false;
-			let rejected = false;
-			let source: "receipt" | "status" = "receipt";
-			try {
-				const receipt = await this.#port.send({
-					sessionId: runtime.sessionId,
-					repo: runtime.cwd,
-					opRef,
-					text: input.text,
-					codingRegister: true,
-					...(observer.tail ? { relay: observer.tail } : {}),
-					// Only this bind receipt can prove the requested model was applied at startup.
-					...(input.model && binding.startupModelApplied !== true ? { model: input.model } : {}),
-				});
-				observer.tail?.correlate(opRef, receipt);
-				accepted = receipt.operationRef === opRef && receipt.sessionId === runtime.sessionId;
-			} catch (error) {
-				rejected = definitiveRefusal(error);
-				const code =
-					typeof error === "object" && error !== null && "details" in error
-						? (error.details as { code?: unknown } | undefined)?.code
-						: undefined;
-				console.error(
-					`work_send_error opRef=${opRef} code=${typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "transport_unavailable"}`,
-				);
-			}
-			if (!this.#writeCurrent(observer)) {
-				console.error(
-					`work_send_fenced opRef=${opRef} generation=${observer.generation} currentGeneration=${this.#options.brokerGeneration?.() ?? 0} binding=${this.#binding(runtime)}`,
-				);
-				this.#live();
-				throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
-			}
-			let latest = this.#db.workAttemptGet(opRef)!;
-			if (!accepted && !rejected) {
-				try {
-					accepted = provesAcceptance(await this.#query(latest));
-					source = "status";
-				} catch {
-					/* Observation owns recovery; never replay. */
-				}
-			}
-			if (!this.#writeCurrent(observer)) {
-				console.error(
-					`work_send_reconcile_fenced opRef=${opRef} generation=${observer.generation} currentGeneration=${this.#options.brokerGeneration?.() ?? 0} binding=${this.#binding(runtime)}`,
-				);
-				this.#live();
-				throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
-			}
-			latest =
-				this.#db.workAttemptUpdate(
-					opRef,
-					latest.version,
-					accepted
-						? { sendPhase: "accepted", sendEvidence: { source, observedAt: this.#at() } }
-						: {
-								sendPhase: "uncertain",
-								...(rejected
-									? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" } as const }
-									: {}),
-							},
-				) ?? latest;
-			this.#schedule(observer, 0);
-			if (rejected) throw workError("work send rejected", "send_rejected", latest);
-			if (!accepted) throw workError("work send acceptance uncertain", "send_acceptance_uncertain", latest);
-			return { started: true, jobId, opRef, sessionKey, sessionId: runtime.sessionId };
 		});
+		this.#live();
+		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+		const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
+		const runtime = makeRuntime(
+			this.#db,
+			input.name,
+			binding.sessionId,
+			binding.epoch,
+			input.cwd,
+			this.#at(),
+			opRef,
+			mode,
+			mode === "start" ? context.parent : null,
+			context.wakeReportId ?? null,
+			notice?.hash ?? null,
+		);
+		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
+		this.#db.workAttemptPrepare(runtime, job);
+		const observer = this.#register(runtime);
+		this.#attach(observer);
+		await observer.attaching;
+		let accepted = false;
+		let rejected = false;
+		let source: "receipt" | "status" = "receipt";
+		try {
+			const receipt = await this.#port.send({
+				sessionId: runtime.sessionId,
+				repo: runtime.cwd,
+				opRef,
+				text: input.text,
+				...(observer.tail ? { relay: observer.tail } : {}),
+				...(notice ? { systemPreamble: notice.text } : {}),
+				codingRegister: true,
+				// Only this bind receipt can prove the requested model was applied at startup.
+				...(input.model && binding.startupModelApplied !== true ? { model: input.model } : {}),
+			});
+			observer.tail?.correlate(opRef, receipt);
+			accepted = receipt.operationRef === opRef && receipt.sessionId === runtime.sessionId;
+		} catch (error) {
+			rejected = definitiveRefusal(error);
+			const code =
+				typeof error === "object" && error !== null && "details" in error
+					? (error.details as { code?: unknown } | undefined)?.code
+					: undefined;
+			console.error(
+				`work_send_error opRef=${opRef} code=${typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "transport_unavailable"}`,
+			);
+		}
+		if (!this.#writeCurrent(observer)) {
+			console.error(
+				`work_send_fenced opRef=${opRef} generation=${observer.generation} currentGeneration=${this.#options.brokerGeneration?.() ?? 0} binding=${this.#binding(runtime)}`,
+			);
+			this.#live();
+			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
+		}
+		let latest = this.#db.workAttemptGet(opRef)!;
+		if (!accepted && !rejected) {
+			try {
+				accepted = provesAcceptance(await this.#query(latest));
+				source = "status";
+			} catch {
+				/* Observation owns recovery; never replay. */
+			}
+		}
+		if (!this.#writeCurrent(observer)) {
+			console.error(
+				`work_send_reconcile_fenced opRef=${opRef} generation=${observer.generation} currentGeneration=${this.#options.brokerGeneration?.() ?? 0} binding=${this.#binding(runtime)}`,
+			);
+			this.#live();
+			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
+		}
+		latest =
+			this.#db.workAttemptUpdate(
+				opRef,
+				latest.version,
+				accepted
+					? { sendPhase: "accepted", sendEvidence: { source, observedAt: this.#at() } }
+					: {
+							sendPhase: "uncertain",
+							...(rejected
+								? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" } as const }
+								: {}),
+						},
+			) ?? latest;
+		this.#schedule(observer, 0);
+		if (rejected) throw workError("work send rejected", "send_rejected", latest);
+		if (!accepted) throw workError("work send acceptance uncertain", "send_acceptance_uncertain", latest);
+		return { started: true, jobId, opRef, sessionKey, sessionId: runtime.sessionId };
 	}
 	async status(params: unknown): Promise<WorkStatusResult> {
 		const name = parseName(params);
@@ -682,7 +811,7 @@ export class WorkLaneManager {
 	}
 	async #settle(observer: Observer, runtime: WorkAttemptRuntime): Promise<void> {
 		const facts = await collectRepoFacts(runtime.cwd);
-		await this.#port.runExclusive(runtime.sessionKey, async () => {
+		const result = await this.#port.runExclusive(runtime.sessionKey, async () => {
 			if (!this.#writeCurrent(observer)) return;
 			const current = this.#db.workAttemptGet(runtime.opRef);
 			if (!current || current.version !== runtime.version || current.settledAt) return;
@@ -719,44 +848,352 @@ export class WorkLaneManager {
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
 			}
-			const decision = runtime.output.knownSilence ? "suppressed" : runtime.target === null ? "no_target" : "enqueued";
-			const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
-			const lead = reason === "end_turn" ? "" : `${reason}: `;
-			// A missing receipt means the SDK recorded no final response text, not
-			// that commits or PRs were lost; carry the opRef for correlation.
-			const body =
-				runtime.output.disposition !== "unavailable"
-					? (runtime.output.excerpt ?? "")
-					: reason === "terminal_missing_receipt"
-						? `final_response_missing opRef=${runtime.opRef}`
-						: "output_unavailable";
-			const content = `${lead}${utf8Prefix(body, 2048 - Buffer.byteLength(lead, "utf8"))}`;
-			const payload =
-				decision === "enqueued"
-					? buildDeliveryPayload(
-							runtime.opRef,
-							runtime.target!,
-							`[lane ${name}] ${label}: ${content}`,
-							runtime.deliveryId,
-						)
-					: undefined;
+
+			const text = reportText(name, endState, reason, runtime.opRef, runtime.output);
+			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
+			let admission: WorkAttemptAdmission | undefined;
+			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
+				decision = "wake_unaccepted";
+			} else if (runtime.output.knownSilence !== null) {
+				decision = "suppressed";
+			} else if (runtime.parent === null) {
+				decision = "no_target";
+			} else {
+				decision = "report";
+				if (runtime.parent.kind === "persona") {
+					const fallbackPayload = buildDeliveryPayload(runtime.opRef, runtime.parent.origin, text, runtime.deliveryId)!;
+					const holdReason = this.#options.personaHold?.(runtime.parent.originKey);
+					admission = {
+						kind: "persona",
+						row: {
+							messageId: runtime.reportId,
+							originKey: runtime.parent.originKey,
+							originRefJson: JSON.stringify(runtime.parent.origin),
+							body: text,
+							receivedAt: at,
+						},
+						fallbackPayload,
+						...(holdReason ? { holdReason } : {}),
+					};
+				} else {
+					const root = runtime.parent.root;
+					admission = {
+						kind: "lane",
+						report: {
+							reportId: runtime.reportId,
+							parentName: runtime.parent.name,
+							childName: name,
+							childOpRef: runtime.opRef,
+							body: text,
+							root,
+						},
+						fallbackPayload: root
+							? (buildDeliveryPayload(runtime.opRef, root.origin, text, runtime.deliveryId) ?? null)
+							: null,
+					};
+				}
+			}
 			const settled = this.#db.workAttemptSettle(
 				runtime.opRef,
 				runtime.version,
 				job,
 				{ decision, settledAt: at },
-				payload,
+				admission,
 			);
-			if (!settled) return;
+			if (!settled) return undefined;
 			for (const waiter of [...(this.#waiters.get(runtime.opRef) ?? [])]) waiter.finish();
-			if (payload) this.#options.deliver?.(payload);
+			return settled;
 		});
+
+		if (result) {
+			const settled = result.runtime;
+			const parentLabel =
+				settled.parent?.kind === "persona"
+					? settled.parent.originKey
+					: settled.parent?.kind === "lane"
+						? `lane:${settled.parent.name}`
+						: "none";
+			console.error(`work_report decision=${settled.decision} parent=${parentLabel} reportId=${settled.reportId}`);
+			if (settled.parent?.kind === "lane" && settled.decision === "reported")
+				console.error(
+					`lane_report_transition id=${settled.reportId} parent=${settled.parent.name} from=none to=pending reason=admitted`,
+				);
+			if (settled.parent?.kind === "lane" && settled.decision === "fallback")
+				console.error(`lane_report_fallback id=${settled.reportId} parent=${settled.parent.name}`);
+			if (settled.parent?.kind === "lane" && settled.decision === "no_target")
+				console.error(`lane_report_undeliverable id=${settled.reportId} parent=${settled.parent.name}`);
+			if (settled.decision === "wake_unaccepted") {
+				const child = this.#db.laneReportGet(settled.wakeReportId!)!;
+				const outcome = ["fallback", "undeliverable", "pending"].includes(child.state) ? "refused" : "ambiguous";
+				console.error(
+					`work_report decision=wake_unaccepted reportId=${settled.wakeReportId} childReportId=${child.report_id} outcome=${outcome}`,
+				);
+			}
+			for (const payload of [result.fallbackPayload, result.childFallback]) {
+				if (!payload) continue;
+				try {
+					this.#options.deliverFallback?.(payload);
+				} catch {
+					console.error(`work_fallback_delivery_failed deliveryId=${payload.deliveryId}`);
+				}
+			}
+			if (settled.decision === "reported" && settled.parent?.kind === "persona") {
+				try {
+					this.#options.notifyPersona?.(settled.parent.originKey);
+				} catch {
+					console.error(`work_persona_nudge_failed origin=${settled.parent.originKey}`);
+				}
+			}
+			const drain = async (parentName: string) => {
+				try {
+					await this.#drainLaneReports(parentName);
+				} catch {
+					console.error(`lane_report_drain_failed parent=${parentName}`);
+				}
+			};
+			if (settled.parent?.kind === "lane") await drain(settled.parent.name);
+			await drain(settled.sessionKey.slice("work/task/".length));
+			if (result.requeuedParent) await drain(result.requeuedParent);
+		}
 		if (this.#current(observer) && this.#db.workAttemptGet(runtime.opRef)?.settledAt) {
 			observer.tail?.setTurnRunning(false);
 			await observer.tail?.close();
 			observer.tail = undefined;
 		}
 	}
+	async #drainLaneReports(parentName: string): Promise<void> {
+		if (this.#stopped) return;
+		await this.#port.runExclusive(workSessionKey(parentName), async () => {
+			if (this.#stopped) return;
+			let job: LaneJobRecord | undefined;
+			let unavailable = this.#db.isBrokerQuarantined("work", laneJobIdentity(parentName).jobId);
+			if (!unavailable) {
+				try {
+					job = this.#job(parentName, true);
+				} catch {
+					unavailable = true;
+				}
+			}
+			for (let row of this.#db.laneReportsByParent(parentName)) {
+				if (this.#stopped) return;
+				if (["consumed", "fallback", "undeliverable"].includes(row.state)) continue;
+				if (unavailable || !job) {
+					await this.#resolveUnavailableLaneReport(row);
+					continue;
+				}
+				if (row.state === "held") {
+					if (row.claim_kind === "wake") {
+						const runtime = this.#attemptByOpRef(row.claim_ref);
+						if (runtime && hasAcceptanceEvidence(runtime) && this.#db.laneReportConsume(row.report_id, row.claim_ref!))
+							this.#logLaneReportTransition(row, "held", "consumed", "wake_acceptance_proven");
+					} else if (row.claim_kind === "steer") {
+						await this.#replayLaneSteer(row, job);
+					}
+					continue;
+				}
+				if (row.state === "claimed" && row.claim_kind === "wake") {
+					if (this.#attemptByOpRef(row.claim_ref)) continue;
+					const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
+					if (open) {
+						if (!this.#db.laneReportRequeue(row.report_id, row.claim_ref!)) continue;
+						this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_open");
+						row = this.#db.laneReportGet(row.report_id)!;
+					} else {
+						await this.#wakeLaneReport(row, job);
+						try {
+							job = this.#job(parentName, true);
+						} catch {
+							unavailable = true;
+							job = undefined;
+						}
+						continue;
+					}
+				}
+				if (row.state === "claimed" && row.claim_kind === "steer") {
+					await this.#replayLaneSteer(row, job);
+					continue;
+				}
+				if (row.state !== "pending") continue;
+				const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
+				if (open) {
+					const runtime = this.#attemptByOpRef(open.opRef);
+					if (runtime && !runtime.terminal && this.#binding(runtime))
+						await this.#claimAndSteerLaneReport(row, job, runtime);
+					continue;
+				}
+				if (job.state === "awaiting_operator" || job.state === "stalled") {
+					this.#fallbackLaneReport(row, "parent_held");
+					continue;
+				}
+				await this.#wakeLaneReport(row, job);
+				try {
+					job = this.#job(parentName, true);
+				} catch {
+					unavailable = true;
+					job = undefined;
+				}
+			}
+		});
+	}
+
+	#attemptByOpRef(opRef: string | null): WorkAttemptRuntime | undefined {
+		if (opRef === null) return undefined;
+		try {
+			return this.#db.workAttemptGet(opRef);
+		} catch {
+			return undefined;
+		}
+	}
+
+	#reportRoot(row: LaneReportRow): WorkReportRoot | null {
+		return row.root_json === null ? null : (JSON.parse(row.root_json) as WorkReportRoot);
+	}
+
+	#laneReportText(row: LaneReportRow): string {
+		return `[Report from child work lane ${row.child_name}; not from a human. Integrate it into your task; your own final answer still goes to your parent.]\n\n${row.body}`;
+	}
+
+	#laneFallbackPayload(row: LaneReportRow): ChatMessagePayload | undefined {
+		const root = this.#reportRoot(row);
+		if (root === null) return undefined;
+		const { jobId } = laneJobIdentity(row.child_name);
+		return buildDeliveryPayload(
+			row.child_op_ref,
+			root.origin,
+			row.body,
+			workAttemptDeliveryId(this.#db.instanceId, jobId, row.child_op_ref),
+		);
+	}
+
+	#logLaneReportTransition(row: LaneReportRow, from: string, to: string, reason: string): void {
+		console.error(
+			`lane_report_transition id=${row.report_id} parent=${row.parent_name} from=${from} to=${to} reason=${reason}`,
+		);
+	}
+
+	#fallbackLaneReport(row: LaneReportRow, reason: string): void {
+		const payload = this.#laneFallbackPayload(row);
+		if (payload === undefined) {
+			if (this.#db.laneReportUndeliverable(row.report_id))
+				this.#logLaneReportTransition(row, row.state, "undeliverable", reason);
+			return;
+		}
+		if (!this.#db.laneReportFallback(row.report_id, payload)) return;
+		this.#logLaneReportTransition(row, row.state, "fallback", reason);
+		try {
+			this.#options.deliverFallback?.(payload);
+		} catch {
+			console.error(`work_fallback_delivery_failed deliveryId=${payload.deliveryId}`);
+		}
+	}
+
+	#resolveUnavailableLaneReport(row: LaneReportRow): void {
+		if (row.state === "pending") {
+			this.#fallbackLaneReport(row, "parent_quarantined");
+			return;
+		}
+		if (row.state === "held") {
+			if (row.claim_kind === "wake") {
+				const runtime = this.#attemptByOpRef(row.claim_ref);
+				if (runtime && hasAcceptanceEvidence(runtime) && this.#db.laneReportConsume(row.report_id, row.claim_ref!))
+					this.#logLaneReportTransition(row, "held", "consumed", "wake_acceptance_proven");
+			}
+			return;
+		}
+		if (row.state !== "claimed") return;
+		if (row.claim_kind === "wake" && !this.#attemptByOpRef(row.claim_ref)) {
+			if (!this.#db.laneReportRequeue(row.report_id, row.claim_ref!)) return;
+			this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_quarantined");
+			this.#fallbackLaneReport(this.#db.laneReportGet(row.report_id)!, "parent_quarantined");
+			return;
+		}
+		if (this.#db.laneReportHold(row.report_id, "parent_quarantined_ambiguous"))
+			this.#logLaneReportTransition(row, "claimed", "held", "parent_quarantined_ambiguous");
+	}
+
+	async #claimAndSteerLaneReport(row: LaneReportRow, job: LaneJobRecord, runtime: WorkAttemptRuntime): Promise<void> {
+		const claimSeq = row.claim_seq + 1;
+		const clientRef = laneSteerClientRef(row.report_id, claimSeq);
+		const claimed = this.#db.laneReportClaim(row.report_id, "steer", clientRef, runtime.opRef);
+		if (!claimed) return;
+		this.#logLaneReportTransition(row, "pending", "claimed", "steer_claimed");
+		await this.#sendLaneSteer(claimed, job, runtime);
+	}
+
+	async #replayLaneSteer(row: LaneReportRow, job: LaneJobRecord): Promise<void> {
+		const runtime = this.#attemptByOpRef(row.claim_target_op_ref);
+		if (!runtime) {
+			if (this.#db.laneReportHold(row.report_id, "steer_acceptance_uncertain"))
+				this.#logLaneReportTransition(row, row.state, "held", "steer_acceptance_uncertain");
+			return;
+		}
+		await this.#sendLaneSteer(row, job, runtime);
+	}
+
+	async #sendLaneSteer(row: LaneReportRow, job: LaneJobRecord, runtime: WorkAttemptRuntime): Promise<void> {
+		const clientRef = row.claim_ref!;
+		try {
+			await this.#port.steer({
+				sessionId: runtime.sessionId,
+				repo: job.lane.worktreePath,
+				text: this.#laneReportText(row),
+				clientRef,
+			});
+			if (this.#db.laneReportConsume(row.report_id, clientRef))
+				this.#logLaneReportTransition(row, row.state, "consumed", "steer_accepted");
+		} catch (error) {
+			if (definitiveSteerRefusal(error)) {
+				if (safeRefusal(error) === "session_not_found") {
+					if (this.#db.laneReportHold(row.report_id, "steer_acceptance_uncertain"))
+						this.#logLaneReportTransition(row, row.state, "held", "steer_acceptance_uncertain");
+					return;
+				}
+				if (this.#db.laneReportRequeue(row.report_id, clientRef))
+					this.#logLaneReportTransition(row, row.state, "pending", "steer_refused");
+				return;
+			}
+			console.error(`lane_report_steer_hold id=${row.report_id} parent=${row.parent_name} clientRef=${clientRef}`);
+		}
+	}
+
+	async #wakeLaneReport(row: LaneReportRow, job: LaneJobRecord): Promise<void> {
+		let claimed = row;
+		let opRef = row.claim_ref;
+		if (row.state === "pending") {
+			opRef = laneWakeOpRef(row.parent_name, row.report_id, row.claim_seq + 1);
+			const result = this.#db.laneReportClaim(row.report_id, "wake", opRef, null);
+			if (!result) return;
+			claimed = result;
+			this.#logLaneReportTransition(row, "pending", "claimed", "wake_claimed");
+		}
+		if (!opRef || claimed.claim_kind !== "wake" || claimed.claim_ref !== opRef) return;
+		const last = job.attempts.at(-1);
+		const inheritedParent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		try {
+			const outcome = await this.#startLocked(
+				{
+					name: row.parent_name,
+					text: this.#laneReportText(row),
+					cwd: job.lane.worktreePath,
+					resume: false,
+				},
+				"start",
+				{ parent: inheritedParent, opRef, wakeReportId: row.report_id },
+			);
+			if (outcome.started) return;
+		} catch {
+			if (this.#attemptByOpRef(opRef)) return;
+		}
+		if (this.#attemptByOpRef(opRef)) return;
+		const fresh = this.#db.laneReportGet(row.report_id);
+		if (!fresh || fresh.state !== "claimed") return;
+		if (!this.#db.laneReportRequeue(row.report_id, opRef)) return;
+		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
+		const parentJob = this.#job(row.parent_name);
+		if (parentJob && (parentJob.state === "awaiting_operator" || parentJob.state === "stalled"))
+			this.#fallbackLaneReport(this.#db.laneReportGet(row.report_id)!, "parent_held");
+	}
+
 	/** Registers recovery work, never waits for a worker's terminal transition. */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
@@ -794,6 +1231,7 @@ export class WorkLaneManager {
 						open.opRef,
 						"historical",
 						null,
+						null,
 					),
 					job,
 				);
@@ -829,7 +1267,15 @@ export class WorkLaneManager {
 				if (!this.#current(observer)) continue;
 				const terminal = status && terminalEvidence(status, this.#at());
 				if (terminal && this.#writeCurrent(observer)) {
-					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, { terminal });
+					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+						...(provesAcceptance(status!)
+							? {
+									sendPhase: "accepted" as const,
+									sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
+								}
+							: {}),
+						terminal,
+					});
 					this.#schedule(observer, 0);
 					continue;
 				}
@@ -861,6 +1307,18 @@ export class WorkLaneManager {
 					this.#schedule(observer, 0);
 				}
 			}
+		}
+		if (this.#stopped) return;
+		const parents = new Set([
+			...this.#db.laneReportParentNames(),
+			...this.#db
+				.laneJobRows(true)
+				.filter((row) => row.lane_key.startsWith("work-"))
+				.map((row) => row.lane_key.slice("work-".length)),
+		]);
+		for (const parentName of parents) {
+			if (this.#stopped) return;
+			await this.#drainLaneReports(parentName);
 		}
 	}
 	onBrokerGeneration(): Promise<void> {
@@ -960,6 +1418,26 @@ export class WorkLaneManager {
 	}
 }
 
+export function laneSystemNotice(input: {
+	readonly name: string;
+	readonly parent: WorkParent | null;
+	readonly allowNested: boolean;
+}): string {
+	const parent =
+		input.parent?.kind === "persona"
+			? `persona conversation ${input.parent.originKey}`
+			: input.parent?.kind === "lane"
+				? `work lane ${input.parent.name}`
+				: "none (status-only)";
+	const nested = input.allowNested ? "allowed" : "refused";
+	return [
+		`You are work lane ${input.name}.`,
+		`Parent: ${parent}.`,
+		"Your final answer goes to your parent as an internal report, never to a human.",
+		"Never post to chat or use gajaeway chat.",
+		`Nested work.start and work.run are ${nested} (work.allowNested=${input.allowNested}).`,
+	].join("\n");
+}
 function makeRuntime(
 	db: GatewayDatabase,
 	name: string,
@@ -969,7 +1447,9 @@ function makeRuntime(
 	startedAt: string,
 	opRef: string,
 	mode: WorkAttemptRuntime["mode"],
-	target: OriginRef | null,
+	parent: WorkParent | null,
+	wakeReportId: string | null,
+	noticeHash: string | null = null,
 ): WorkAttemptRuntime {
 	const { jobId, laneKey } = laneJobIdentity(name);
 	return {
@@ -982,7 +1462,10 @@ function makeRuntime(
 		startedAt,
 		opRef,
 		mode,
-		target: target ? structuredClone(target) : null,
+		parent: parent ? structuredClone(parent) : null,
+		reportId: workAttemptReportId(db.instanceId, jobId, opRef),
+		wakeReportId,
+		noticeHash,
 		sendPhase: mode === "historical" ? "uncertain" : "prepared",
 		sendEvidence: null,
 		terminal: null,
@@ -1001,9 +1484,25 @@ function parseName(params: unknown): string {
 	if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) invalid("name");
 	return name;
 }
-function parseInput(params: unknown, mode: "start" | "run", owner?: OriginRef): WorkInput {
-	const name = parseName(params);
+
+function laneReportClaimHash(reportId: string, claimSeq: number): string {
+	return createHash("sha256").update(`${reportId}|${claimSeq}`).digest("hex");
+}
+
+function laneSteerClientRef(reportId: string, claimSeq: number): string {
+	return `gw-lr-${laneReportClaimHash(reportId, claimSeq).slice(0, 32)}`;
+}
+
+function laneWakeOpRef(parentName: string, reportId: string, claimSeq: number): string {
+	const slug = parentName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+	return `gw-work-${slug}-lr-${laneReportClaimHash(reportId, claimSeq).slice(0, 24)}`;
+}
+function parseInput(params: unknown): WorkInput {
+	const inputFields = ["name", "text", "cwd", "resume", "model", "callerSessionId"];
 	const input = params as Record<string, unknown>;
+	if (input && typeof input === "object" && !Array.isArray(input))
+		for (const field of Object.keys(input)) if (!inputFields.includes(field)) invalid(field);
+	const name = parseName(params);
 	if (typeof input.text !== "string" || !input.text) invalid("text");
 	if (input.cwd !== undefined) {
 		if (typeof input.cwd !== "string" || !input.cwd.startsWith("/") || input.cwd.length > 4096) invalid("cwd");
@@ -1026,14 +1525,11 @@ function parseInput(params: unknown, mode: "start" | "run", owner?: OriginRef): 
 			model = { preset: (input.model as { preset: string }).preset };
 		else invalid("model");
 	}
-	if (mode === "run" && Object.hasOwn(input, "notify")) invalid("notify");
-	let target: OriginRef | null = null;
-	if (mode === "start" && (input.notify !== undefined || owner !== undefined)) {
-		try {
-			target = validateOriginRef((input.notify !== undefined ? input.notify : owner) as OriginRef);
-		} catch {
-			invalid("notify");
-		}
+	let callerSessionId: string | undefined;
+	if (input.callerSessionId !== undefined) {
+		if (typeof input.callerSessionId !== "string" || !/^[A-Za-z0-9-]{1,128}$/.test(input.callerSessionId))
+			invalid("callerSessionId");
+		callerSessionId = input.callerSessionId;
 	}
 	return {
 		name,
@@ -1041,7 +1537,7 @@ function parseInput(params: unknown, mode: "start" | "run", owner?: OriginRef): 
 		cwd: (input.cwd as string) ?? process.cwd(),
 		resume: input.resume === true,
 		model,
-		target,
+		...(callerSessionId === undefined ? {} : { callerSessionId }),
 	};
 }
 function workError(
@@ -1184,6 +1680,29 @@ export function laneLastCommit(
 	} catch {
 		return null;
 	}
+}
+
+/** Shapes the complete lane report under the 2048-byte UTF-8 storage budget. */
+export function reportText(
+	name: string,
+	endState: string,
+	reason: string,
+	opRef: string,
+	output: WorkAttemptRuntime["output"],
+): string {
+	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
+	const lead = reason === "end_turn" ? "" : `${reason}: `;
+	const head = `[lane ${name}] ${label}: ${lead}`;
+	const body =
+		output.disposition === "unavailable"
+			? reason === "terminal_missing_receipt"
+				? `final_response_missing opRef=${opRef}`
+				: "output_unavailable"
+			: (output.excerpt ?? "");
+	const content = utf8Prefix(body, 2048 - Buffer.byteLength(head, "utf8"));
+	const text = head + content;
+	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");
+	return text;
 }
 async function collectRepoFacts(
 	worktreePath: string,

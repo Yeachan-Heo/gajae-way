@@ -123,6 +123,22 @@ test("work lane limits parse without materializing omitted configuration", () =>
 	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("work");
 });
 
+test("work.allowNested is a boolean restart-required policy and defaults disabled", async () => {
+	const path = await home();
+	const defaults = await loadConfig({ home: path });
+	expect(defaults.work?.allowNested).toBeUndefined();
+	expect(parseConfigFile({ schemaVersion: 1, work: { allowNested: true } }).work).toEqual({ allowNested: true });
+	expect(parseConfigFile({ schemaVersion: 1, work: { allowNested: false } }).work).toEqual({ allowNested: false });
+	for (const invalid of ["true", 1, null])
+		expect(() => parseConfigFile({ schemaVersion: 1, work: { allowNested: invalid } })).toThrow("work.allowNested");
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { allowNested: false } }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { allowNested: true } }));
+	const result = await reloadConfig(current);
+	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["work"] });
+	if (result.ok) expect(result.config.work).toEqual({ allowNested: false });
+});
+
 for (const [work, field] of [
 	[{ maxLanes: 0 }, "work.maxLanes"],
 	[{ maxLanes: 257 }, "work.maxLanes"],

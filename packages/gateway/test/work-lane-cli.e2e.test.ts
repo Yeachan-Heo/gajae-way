@@ -52,18 +52,10 @@ async function status(f: WorkFixture, name: string) {
 	return JSON.parse(output.stdout);
 }
 
-test("live CLI start/status/steer/jobs/retire: early receipt, open refusal, exact correlation and start-only target", async () => {
+test("live CLI start/status/steer/jobs/retire: early receipt, open refusal, exact correlation and parent fallback", async () => {
 	const f = await fixture();
 	const observer = await f.connect();
-	const started = await cli(f, [
-		"start",
-		"cli",
-		"--cwd",
-		f.home,
-		"--notify",
-		"discord/channel/explicit",
-		"fixture work",
-	]);
+	const started = await cli(f, ["start", "cli", "--cwd", f.home, "fixture work"]);
 	expect(started.code).toBe(0);
 	expect(started.stderr).toBe("");
 	expect(started.stdout).toMatch(/^started: work\/task\/cli session=\S+ job=\S+ op=\S+\n$/);
@@ -111,14 +103,22 @@ test("live CLI start/status/steer/jobs/retire: early receipt, open refusal, exac
 	);
 	expect(event.payload).toMatchObject({
 		text: "[lane cli] completed: CLI final answer",
-		origin: { platform: "discord", kind: "channel", conversationId: "explicit" },
+		origin: { platform: "discord", kind: "channel", conversationId: "fixture" },
 	});
 	expect(f.calls("send")).toHaveLength(1);
 	expect(f.calls("bind")).toHaveLength(1);
 	expect(f.calls("resume")).toHaveLength(0);
 }, 40_000);
 
-test("actual CLI run waits independently while status/steer work, returns original output without owner notification", async () => {
+test("run --notify is a usage error", async () => {
+	const f = await fixture();
+	const invalid = await cli(f, ["run", "invalid", "--notify", "discord/channel/fixture", "forbidden"]);
+	expect(invalid.code).toBe(1);
+	expect(invalid.stderr).toContain("usage: gajaeway work");
+	expect(f.calls("send")).toHaveLength(0);
+});
+
+test("actual CLI run waits independently while status/steer work and returns original output", async () => {
 	const f = await fixture();
 	const observer = await f.connect();
 	const run = launch(f, ["run", "waiting", "--cwd", f.home, "long fixture work"]);
@@ -134,15 +134,12 @@ test("actual CLI run waits independently while status/steer work, returns origin
 	expect(steer.code).toBe(0);
 	expect(steer.stdout).toContain("steered:");
 	expect(run.done()).toBe(false);
-	const invalid = await cli(f, ["run", "invalid", "--notify", "discord/channel/fixture", "forbidden"]);
-	expect(invalid.code).toBe(1);
-	expect(invalid.stderr).toContain("usage: gajaeway work");
 	expect(f.calls("send")).toHaveLength(1);
 	await f.control(pending.attempt.opRef, { terminal: true, text: "original CLI run answer" });
 	const answer = await run.result;
 	expect(answer).toEqual({ code: 0, stdout: "original CLI run answer\n", stderr: "" });
 	expect((await status(f, "waiting")).attempt.endState).toBe("completed");
-	expect(f.snapshot().runtimes[0]).toMatchObject({ mode: "run", target: null, decision: "no_target" });
+	expect(f.snapshot().runtimes[0]).toMatchObject({ mode: "run", parent: null, decision: "no_target" });
 	expect(f.snapshot().deliveries).toHaveLength(0);
 	expect(observer.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
 }, 40_000);

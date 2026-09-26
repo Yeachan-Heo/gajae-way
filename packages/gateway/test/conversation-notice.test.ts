@@ -40,10 +40,11 @@ test("every conversation is told to stay responsive: no foreground waits, answer
 		expect(notice).toContain("`gh run watch`");
 		expect(notice).toContain("Always answer it in words, right away");
 	}
-	// The notifying lane names THIS conversation, so completion comes back here.
-	expect(currentConversationNotice(channel)).toContain(
-		"gajaeway work start <name> --notify discord/channel/1480171104348930221",
-	);
+	// Starting a lane from this session routes its completion back as an internal report.
+	const notice = currentConversationNotice(channel);
+	expect(notice).toContain('gajaeway work start <name> "<task>"');
+	expect(notice).toContain("internal report, not a chat post");
+	expect(notice).not.toContain("--notify");
 	// Only chat platforms get the gateway's 👀 acknowledgement, so only they are told about it.
 	expect(currentConversationNotice(channel)).toContain("The gateway already marks the message 👀");
 	expect(currentConversationNotice(loopback)).not.toContain("👀");

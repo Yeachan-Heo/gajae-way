@@ -5,14 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayDatabase } from "../src/store/db";
 
-/** Remove v22/v23 completely before replaying historical DDL; missing objects are fixture errors. */
+/** Remove v22-v24 completely before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
 	for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 		for (const action of ["update", "delete"]) database.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 	for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
 		for (const action of ["update", "delete"]) database.exec(`DROP TRIGGER ${table}_immutable_${action}`);
 	database.exec(
-		"ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts",
+		`DROP TABLE IF EXISTS lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts;`,
 	);
 	for (const table of [
 		"broker_authority",
@@ -36,7 +36,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(23);
+		expect(database.schemaVersion).toBe(24);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -46,7 +46,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 			.map((row) => row.name);
 		for (const table of ["deliveries", "recall_snippets", "meta", "monitors", "monitor_events", "authored_outputs"])
 			expect(tables).toContain(table);
-		for (const table of ["lane_jobs", "monitor_failures", "monitor_slots", "dispatch_leases"])
+		for (const table of ["lane_jobs", "lane_reports", "monitor_failures", "monitor_slots", "dispatch_leases"])
 			expect(tables).toContain(table);
 		expect(
 			migrated.query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'instance_id'").get()?.value,
@@ -91,7 +91,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(24);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -99,7 +99,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 				.all()
 				.map((row) => row.name),
 		);
-		for (const table of ["lane_jobs", "monitor_failures", "monitor_slots", "dispatch_leases"])
+		for (const table of ["lane_jobs", "lane_reports", "monitor_failures", "monitor_slots", "dispatch_leases"])
 			expect(tables.has(table)).toBe(true);
 		upgraded.close();
 	} finally {
@@ -138,7 +138,7 @@ DELETE FROM schema_migrations WHERE version > 12;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(24);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -184,7 +184,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(24);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -237,7 +237,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(23);
+	expect(upgraded.schemaVersion).toBe(24);
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
@@ -248,7 +248,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await GatewayDatabase.open(path);
-		expect(latest.schemaVersion).toBe(23);
+		expect(latest.schemaVersion).toBe(24);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
 		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
@@ -287,7 +287,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(23);
+		expect(upgraded.schemaVersion).toBe(24);
 		const after = new Database(path, { readonly: true });
 		const columns = after
 			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
@@ -305,6 +305,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 			"bound_session_id",
 			"dispatched_at",
 			"terminal_delivery_id",
+			"source",
 		])
 			expect(columns).toContain(kept);
 		expect(total).toBe(9);

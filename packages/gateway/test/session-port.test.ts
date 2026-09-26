@@ -119,7 +119,7 @@ test("failed-turn evidence comes from the owned shared session file without expo
 	);
 });
 
-test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt, terminal status, and transcript body", async () => {
+test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort preserves op-ref, model, terminal status, and transcript", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
