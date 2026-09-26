@@ -459,6 +459,13 @@ export class BrokerSessionPort implements SessionPort {
 		if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
 			throw new Error("session.create succeeded without a sessionId");
 		}
+		// The host is live right after create: this is the one moment a control op
+		// cannot hit endpoint_stale, so the thinking level from a `model:level`
+		// selector is applied here rather than deferred to the first turn.
+		if (typeof input.model === "string") {
+			const { thinking } = splitThinkingSuffix(input.model);
+			if (thinking) await this.#setThinking(this.#cliTransport(created.sessionId), thinking);
+		}
 		const persistedEpoch = this.#database.getSessionRecord(input.originKey)?.epoch;
 		if (persistedEpoch !== undefined && persistedEpoch > input.epoch) {
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
@@ -575,7 +582,13 @@ export class BrokerSessionPort implements SessionPort {
 						JSON.stringify({
 							cwd: repo,
 							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
-							...(typeof model === "string" ? { modelId: model } : model ? { modelPreset: model.preset } : {}),
+							// session.create takes a bare model id; a `:level` suffix is applied
+							// with thinking.set once the host is up (see bind()).
+							...(typeof model === "string"
+								? { modelId: splitThinkingSuffix(model).model }
+								: model
+									? { modelPreset: model.preset }
+									: {}),
 						}),
 					]),
 					"session.create",
@@ -825,18 +838,18 @@ export class BrokerSessionPort implements SessionPort {
 				"model.set",
 			);
 			if (typeof result?.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
-			let thinkingChanged = false;
-			if (thinking) {
-				const applied = parseEnvelope<{ changed?: unknown } | undefined>(
-					await sdk("control", "thinking.set", { level: thinking }),
-					"thinking.set",
-				);
-				if (typeof applied?.changed !== "boolean")
-					throw new Error("thinking.set succeeded without a changed receipt");
-				thinkingChanged = applied.changed;
-			}
+			const thinkingChanged = thinking ? await this.#setThinking(sdk, thinking) : false;
 			return { changed: result.changed || thinkingChanged };
 		});
+	}
+
+	async #setThinking(sdk: SdkTransport, level: string): Promise<boolean> {
+		const applied = parseEnvelope<{ changed?: unknown } | undefined>(
+			await sdk("control", "thinking.set", { level }),
+			"thinking.set",
+		);
+		if (typeof applied?.changed !== "boolean") throw new Error("thinking.set succeeded without a changed receipt");
+		return applied.changed;
 	}
 
 	async setServiceTier(input: {
