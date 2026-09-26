@@ -10,7 +10,7 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { ACK_TIMEOUT_MS, DeliveryLedger } from "../src/store/ledger";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -237,6 +237,57 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(
 		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId),
 	).toHaveLength(2);
+	client.close();
+});
+
+test("inflight rows are not re-broadcast by the timed sweep within ack timeout", async () => {
+	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 50 });
+	const origin = { platform: "discord", kind: "dm", conversationId: "inflight-test", peerId: "owner" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "create-inflight",
+		verb: "chat.send",
+		params: { origin, text: "test inflight", engagement: { mentioned: false, group: false, authorId: "owner" } },
+	});
+	await waitFrame(client.frames, "create-inflight");
+	// Wait for the delivery to arrive
+	for (let attempt = 0; attempt < 400 && !client.frames.some((frame) => frame.event === "chat.message"); attempt++)
+		await Bun.sleep(5);
+	const initial = client.frames.find(
+		(frame) => frame.event === "chat.message" && frame.payload?.text === "the single reply body",
+	);
+	expect(initial).toBeDefined();
+	const deliveryId = initial.payload.deliveryId as string;
+
+	// Manually mark the delivery as inflight (simulating an in-flight state)
+	const ledger = new DeliveryLedger(database);
+	ledger.markInflight(deliveryId);
+	const row = ledger.get(deliveryId);
+	const updatedAt = Date.parse(row!.updatedAt);
+
+	// Count chat.message frames with this deliveryId before the sweep
+	const messagesBeforeSweep = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+
+	// Wait for multiple sweep cycles (timed sweep runs every 50ms)
+	await Bun.sleep(250);
+
+	// Verify no duplicate was broadcast during the ack timeout window
+	const messagesAfterWait = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+	expect(messagesAfterWait).toBe(messagesBeforeSweep);
+
+	// Manually advance time to after the ack timeout in the ledger
+	const nowAfterTimeout = updatedAt + ACK_TIMEOUT_MS + 100;
+	const undelivered = ledger.listUndelivered(24 * 60 * 60_000, nowAfterTimeout, false);
+
+	// After ack timeout, the inflight row should be returned
+	expect(undelivered).toHaveLength(1);
+	expect(undelivered[0]).toMatchObject({ deliveryId, state: "inflight" });
+
 	client.close();
 });
 

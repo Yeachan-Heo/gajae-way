@@ -177,17 +177,25 @@ test("a monitor without its own channel target reports authored notes to the own
 		},
 	});
 	pipeline.submit(monitor.monitorId, "memory.canonicalize", { source: "test" });
-	let undelivered: ReturnType<typeof delivery.redeliveries> = [];
+	// Wait for the note to be pushed to live adapters immediately.
 	for (let attempt = 0; attempt < 400; attempt++) {
-		undelivered = delivery.redeliveries();
-		if (undelivered.length > 0) break;
+		if (pushed.length > 0) break;
 		await Bun.sleep(5);
 	}
-	expect(undelivered).toHaveLength(1);
-	expect(undelivered[0]?.origin).toMatchObject({ platform: "discord", kind: "dm", conversationId: "owner-dm" });
-	expect(undelivered[0]?.text).toBe("owner-target note");
-	// The note is pushed to live adapters immediately, not just parked in the ledger.
 	expect(pushed).toHaveLength(1);
 	expect((pushed[0] as { text: string }).text).toBe("owner-target note");
+
+	// Verify the note is persisted in the ledger as inflight (awaiting confirmation).
+	const rows = database.deliveryRows();
+	expect(rows).toHaveLength(1);
+	expect(rows[0]).toMatchObject({
+		state: "inflight",
+		origin_key: "discord/dm/owner-dm/peer=owner",
+	});
+	const payload = JSON.parse(rows[0]!.payload_json);
+	expect(payload).toMatchObject({
+		origin: { platform: "discord", kind: "dm", conversationId: "owner-dm" },
+		text: "owner-target note",
+	});
 	database.close();
 });

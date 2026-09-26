@@ -6,6 +6,7 @@ export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
 const MAX_DEFINITIVE_FAILURES = 5;
 const RETRY_BACKOFF_BASE_MS = 2_000;
 const RETRY_BACKOFF_CAP_MS = 5 * 60_000;
+export const ACK_TIMEOUT_MS = 60 * 1_000;
 
 export interface DeliveryRow {
 	readonly deliveryId: string;
@@ -95,13 +96,19 @@ export class DeliveryLedger {
 	 * Unsettled, fresh rows. `ignoreBackoff` is for a newly negotiated adapter:
 	 * the backoff paces retries over a transport that already failed them, and a
 	 * new connection is a new transport.
+	 *
+	 * Inflight rows are only returned if:
+	 * - ignoreBackoff is true (onConnect: replay everything immediately), OR
+	 * - ACK_TIMEOUT has elapsed since updatedAt (acknowledgement timeout expired).
+	 * This prevents re-broadcasting inflight rows that are still pending confirmation.
 	 */
 	listUndelivered(freshnessMs: number, now = Date.now(), ignoreBackoff = false): DeliveryRow[] {
 		return this.rows().filter(
 			(row) =>
 				!["confirmed", "expired"].includes(row.state) &&
 				now - Date.parse(row.createdAt) <= freshnessMs &&
-				(ignoreBackoff || row.attempts === 0 || now - Date.parse(row.updatedAt) >= retryBackoffMs(row.attempts)),
+				(ignoreBackoff || row.attempts === 0 || now - Date.parse(row.updatedAt) >= retryBackoffMs(row.attempts)) &&
+				(row.state !== "inflight" || ignoreBackoff || now - Date.parse(row.updatedAt) >= ACK_TIMEOUT_MS),
 		);
 	}
 	expireStale(freshnessMs: number, now = Date.now()): ExpiredDeliveryRow[] {
