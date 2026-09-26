@@ -1296,3 +1296,16 @@ for (const progressing of [true, false]) {
 		}
 	});
 }
+
+test("splitThinkingSuffix separates a trailing thinking level and leaves other colons alone", async () => {
+	const { splitThinkingSuffix } = await import("../src/orchestrator/session-port");
+	expect(splitThinkingSuffix("anthropic/claude-opus-5-5:xhigh")).toEqual({
+		model: "anthropic/claude-opus-5-5",
+		thinking: "xhigh",
+	});
+	expect(splitThinkingSuffix("anthropic/claude-opus-5-5")).toEqual({ model: "anthropic/claude-opus-5-5" });
+	expect(splitThinkingSuffix("openai-codex/gpt-5.5:high")).toEqual({ model: "openai-codex/gpt-5.5", thinking: "high" });
+	// An unknown suffix is not a level: keep the whole selector so the SDK reports it.
+	expect(splitThinkingSuffix("anthropic/claude-opus-5-5:turbo")).toEqual({ model: "anthropic/claude-opus-5-5:turbo" });
+	expect(splitThinkingSuffix(":xhigh")).toEqual({ model: ":xhigh" });
+});
