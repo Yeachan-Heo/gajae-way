@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { ACK_TIMEOUT_MS, DeliveryLedger } from "../src/store/ledger";
 
 test("delivery ledger expires only after the fifth definitive failure", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
@@ -178,6 +178,75 @@ test("a deterministic tail delivery id is admitted once across replay", async ()
 		expect(ledger.createPending(row)).toBe(true);
 		expect(ledger.createPending(row)).toBe(false);
 		expect(ledger.counts().pending).toBe(1);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("timed sweep does not re-broadcast fresh inflight rows until ack timeout expires", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryLedger(database);
+		ledger.createPending({ deliveryId: "inflight", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
+		ledger.markInflight("inflight");
+		const createdAt = Date.parse(ledger.get("inflight")!.createdAt);
+		const updatedAt = Date.parse(ledger.get("inflight")!.updatedAt);
+
+		// Fresh inflight row should not be returned by the timed sweep (ignoreBackoff=false)
+		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt, false)).toHaveLength(0);
+
+		// After ack timeout, it should be returned with duplicateWarning
+		const afterTimeout = updatedAt + ACK_TIMEOUT_MS;
+		const undelivered = ledger.listUndelivered(24 * 60 * 60_000, afterTimeout, false);
+		expect(undelivered).toHaveLength(1);
+		expect(undelivered[0]).toMatchObject({ deliveryId: "inflight", state: "inflight" });
+
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("onConnect sweep replays inflight rows immediately without waiting for ack timeout", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryLedger(database);
+		ledger.createPending({ deliveryId: "inflight", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
+		ledger.markInflight("inflight");
+		const updatedAt = Date.parse(ledger.get("inflight")!.updatedAt);
+
+		// Immediately after marking inflight, with ignoreBackoff=true (onConnect case)
+		const undelivered = ledger.listUndelivered(24 * 60 * 60_000, updatedAt, true);
+		expect(undelivered).toHaveLength(1);
+		expect(undelivered[0]).toMatchObject({ deliveryId: "inflight", state: "inflight" });
+
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("timed sweep re-broadcasts inflight rows after ack timeout for crash/lost-ack recovery", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryLedger(database);
+		ledger.createPending({ deliveryId: "lost-ack", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
+		ledger.markInflight("lost-ack");
+		const updatedAt = Date.parse(ledger.get("lost-ack")!.updatedAt);
+
+		// Within ack timeout, not returned by timed sweep (ignoreBackoff=false)
+		let undelivered = ledger.listUndelivered(24 * 60 * 60_000, updatedAt + ACK_TIMEOUT_MS - 1, false);
+		expect(undelivered).toHaveLength(0);
+
+		// After ack timeout, returned by timed sweep for recovery
+		undelivered = ledger.listUndelivered(24 * 60 * 60_000, updatedAt + ACK_TIMEOUT_MS, false);
+		expect(undelivered).toHaveLength(1);
+		expect(undelivered[0]).toMatchObject({ deliveryId: "lost-ack", state: "inflight" });
+
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
