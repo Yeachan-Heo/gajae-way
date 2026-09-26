@@ -136,16 +136,6 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 			};
 		if (args.includes("model.set"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
-		if (args.includes("session.last_assistant"))
-			return {
-				exitCode: 0,
-				stdout: JSON.stringify({
-					type: "query_response",
-					ok: true,
-					page: { items: ["finished body"], complete: true },
-				}),
-				stderr: "",
-			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	// The turn is submitted and observed on the session's own relay: the prompt
@@ -158,6 +148,8 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 			};
 		if (request.operation === "turn.result")
 			return { ok: true, result: { kind: "prompt", status: "terminal_ok", clientRef: request.input.clientRef } };
+		if (request.operation === "session.last_assistant")
+			return { ok: true, page: { items: ["finished body"], complete: true } };
 		return { ok: false, error: { code: "unsupported_operation" } };
 	});
 	const tailRunner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
@@ -217,9 +209,9 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 	expect(calls.find((args) => args.includes("model.profile.set"))).toEqual(
 		expect.arrayContaining(["raw", "control", "sdk-1", "--op", "model.profile.set"]),
 	);
-	expect(calls.find((args) => args.includes("session.last_assistant"))).toEqual(
-		expect.arrayContaining(["raw", "query", "sdk-1", "--query", "session.last_assistant"]),
-	);
+	// The final read rides the request's own relay; no CLI query is spawned for it.
+	expect(relay.requests[2]).toEqual({ type: "query_request", operation: "session.last_assistant", input: {} });
+	expect(calls.some((args) => args.includes("session.last_assistant"))).toBe(false);
 	// The relay is closed once the request settles.
 	expect(relay.streams).toHaveLength(1);
 	expect(relay.streams[0]!.closed).toBe(true);
@@ -1220,12 +1212,6 @@ for (const progressing of [true, false]) {
 		const repo = join(home, "workspace");
 		await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "lease", epoch: 0 });
 		const run: CliRunner = async (args) => {
-			if (args.includes("session.last_assistant"))
-				return {
-					exitCode: 0,
-					stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: ["landed"], complete: true } }),
-					stderr: "",
-				};
 			throw new Error(`unexpected command ${args.join(" ")}`);
 		};
 		let clock = 0;
@@ -1234,6 +1220,8 @@ for (const progressing of [true, false]) {
 		const relay = scriptedRelay((request) => {
 			if (request.operation === "turn.prompt")
 				return { ok: true, result: { ...ids, accepted: true, clientRef: request.input.clientRef } };
+			if (request.operation === "session.last_assistant")
+				return { ok: true, page: { items: ["landed"], complete: true } };
 			polls += 1;
 			// Terminal only on the 6th poll (clock 5000 ms); the lease is 2500 ms.
 			return {

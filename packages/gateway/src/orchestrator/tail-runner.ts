@@ -99,11 +99,16 @@ export interface TailAttachInput {
 
 export interface RelayRequestOptions {
 	readonly timeoutMs?: number;
+	/** Continuation cursor of a paged query, sent as the top-level `cursor` of `query_request` (as gjc's CLI does). */
+	readonly cursor?: string;
 }
 
 export type RelayResponse = {
 	readonly ok: boolean;
-	readonly result?: Record<string, unknown>;
+	/** The host's `result` as sent: controls answer records or bare values (`model.profile.set` answers a boolean). */
+	readonly result?: unknown;
+	/** Paged queries answer `page: { items, complete, continuationCursor | cursor }` instead of `result`. */
+	readonly page?: Record<string, unknown>;
 	readonly error?: { readonly code?: string; readonly message?: string };
 };
 
@@ -431,7 +436,12 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	query(name: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse> {
-		return this.#request("query_request", "query_response", { query: name, input }, options);
+		return this.#request(
+			"query_request",
+			"query_response",
+			{ query: name, input, ...(options?.cursor ? { cursor: options.cursor } : {}) },
+			options,
+		);
 	}
 
 	async #request(
@@ -708,7 +718,8 @@ function decodeResponse(frame: Record<string, unknown>): RelayResponse {
 	const error = recordOf(frame.error);
 	return {
 		ok: frame.ok === true,
-		...(recordOf(frame.result) ? { result: recordOf(frame.result) } : {}),
+		...(frame.result !== undefined ? { result: frame.result } : {}),
+		...(recordOf(frame.page) ? { page: recordOf(frame.page) } : {}),
 		...(error
 			? {
 					error: {

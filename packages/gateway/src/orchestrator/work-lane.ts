@@ -766,6 +766,7 @@ export class WorkLaneManager {
 						terminalIdentity: runtime.terminal?.status,
 						signal: observer.abort.signal,
 						isCurrent: () => this.#writeCurrent(observer),
+						...(observer.tail ? { relay: observer.tail } : {}),
 					})
 					.catch(() => ({ status: "absent" as const, code: "transport_error" as const }));
 				if (!this.#writeCurrent(observer)) return;
