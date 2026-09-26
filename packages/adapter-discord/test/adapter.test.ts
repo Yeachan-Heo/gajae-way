@@ -341,7 +341,7 @@ test("delivery subscription filters non-Discord and missing delivery ids", async
 	off();
 });
 
-test("typing indicator pulses while a turn runs and stops when the delivery settles", async () => {
+test("typing indicator keeps pulsing during interim delivery and stops on final progress", async () => {
 	let typingCount = 0;
 	const discord: DiscordClientLike = {
 		channels: {
@@ -352,14 +352,50 @@ test("typing indicator pulses while a turn runs and stops when the delivery sett
 		},
 	};
 	const typing = new TypingIndicator(discord, 5, 10_000, { error: () => {} });
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	const gateway: GatewayClientLike = {
+		request: async <T>() => ({}) as T,
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	subscribeDiscordProgress(gateway, { update: async () => {}, clear: async () => {} }, { error: () => {} }, typing);
 	typing.begin("channel-1");
 	await Bun.sleep(20);
 	expect(typingCount).toBeGreaterThanOrEqual(2);
-	const requests: Array<{ verb: string; params: unknown }> = [];
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("reply"), typing);
-	const settled = typingCount;
+	const beforeDeliver = typingCount;
+	// Interim delivery arrives while turn is still working
+	await settleDiscordDelivery(gateway, discord, delivery("reply"), typing);
+	await Bun.sleep(20);
+	// Typing should continue pulsing after interim delivery
+	expect(typingCount).toBeGreaterThan(beforeDeliver);
+	const beforeFinal = typingCount;
+	// Final progress arrives, which should end typing
+	emit?.({
+		turnId: "turn-1",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
 	await Bun.sleep(25);
-	expect(typingCount).toBe(settled);
+	// Typing should stop after final progress
+	expect(typingCount).toBe(beforeFinal);
+});
+
+test("interim delivery with no active typing run stays harmless", async () => {
+	// Redelivery after restart, monitor delivery, etc.
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {} }) },
+	};
+	const typing = new TypingIndicator(discord, 5, 10_000, { error: () => {} });
+	// No typing started, then delivery arrives
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	// Should not throw or fail
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("reply"), typing);
 });
 
 test("a final progress event ends the typing hint even when the turn delivered nothing", async () => {
@@ -462,7 +498,7 @@ function presenceDiscord() {
 	return { discord, reacted, removed };
 }
 
-test("working status is a reaction gradient on the triggering message and clears on delivery", async () => {
+test("working status is a reaction gradient on the triggering message and clears on final progress", async () => {
 	const { discord, reacted, removed } = presenceDiscord();
 	let clock = 0;
 	const status = new WorkingStatus(
@@ -472,6 +508,16 @@ test("working status is a reaction gradient on the triggering message and clears
 		() => clock,
 	);
 	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	const gateway: GatewayClientLike = {
+		request: async <T>() => ({}) as T,
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	subscribeDiscordProgress(gateway, status, { error: () => {} });
 	status.arm("channel-1", "m-1");
 	await Bun.sleep(1);
 	expect(reacted).toEqual(["⏳"]);
@@ -491,11 +537,24 @@ test("working status is a reaction gradient on the triggering message and clears
 	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
 	expect(reacted).toHaveLength(4);
 	const requests: Array<{ verb: string; params: unknown }> = [];
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("real reply"), undefined, status);
+	const beforeDeliver = removed.length;
+	await settleDiscordDelivery(gateway, discord, delivery("real reply"), undefined, status);
+	// Interim delivery should NOT clear the reactions
+	expect(removed).toHaveLength(beforeDeliver);
+	// Final progress should clear them
+	emit?.({
+		turnId: "turn-1",
+		origin,
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
+	await Bun.sleep(1);
 	expect(new Set(removed)).toEqual(new Set(["⏳:bot-1", "🔧:bot-1", "🕐:bot-1", "1️⃣:bot-1"]));
 	// A later delivery with no live gradient is a no-op.
 	const before = removed.length;
-	await settleDiscordDelivery(mockGateway(requests), discord, delivery("again"), undefined, status);
+	await settleDiscordDelivery(gateway, discord, delivery("again"), undefined, status);
 	expect(removed).toHaveLength(before);
 });
 
