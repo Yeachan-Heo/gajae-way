@@ -161,7 +161,7 @@ export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
 	const command: CliRunner = async (rawArgs) => {
 		if (violatesSessionArgvContract(rawArgs)) return usage();
 		const args = withoutAgentDir(rawArgs);
-			if (args[0] === "--version") return { exitCode: 0, stdout: "gjc/0.17.5\n", stderr: ""};
+		if (args[0] === "--version") return { exitCode: 0, stdout: "gjc/0.17.5\n", stderr: "" };
 		if (args[0] !== "sdk") return failure("stub_unsupported");
 		if (args[1] === "serve") return { exitCode: 1, stdout: "", stderr: "" };
 		if (args[1] !== "session") return failure("stub_unsupported");

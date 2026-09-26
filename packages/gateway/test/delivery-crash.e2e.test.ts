@@ -97,7 +97,7 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	// path. Reopening here only inspects; it never initializes or adopts authority.
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	try {
-			const authority = database.inspectBrokerAuthority().authority;
+		const authority = database.inspectBrokerAuthority().authority;
 		// Boot respects broker.agentDir from test dependencies (testOnlyBrokerDependencies.agentDir)
 		expect(authority?.canonicalAgentDir).toBe("/test-only/gjc-agent");
 		if (!authority) throw new Error("child did not initialize broker authority");
