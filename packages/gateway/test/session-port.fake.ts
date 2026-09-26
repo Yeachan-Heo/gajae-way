@@ -466,7 +466,19 @@ export class ScriptedSessionPort implements SessionPort {
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
 		const relay = await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo });
 		relay.beginTurn(input.opRef);
-		const receipt = await this.send({ ...input, relay });
+		let receipt: SendReceipt;
+		try {
+			receipt = await this.send({ ...input, relay });
+		} catch (error) {
+			// Same contract as BrokerSessionPort.request: an op-ref the runtime already
+			// accepted is observed under that clientRef, never re-prompted.
+			const known = this.#operations.get(input.opRef);
+			if (!(error instanceof OpRefRejectedError) || known?.sessionId !== input.sessionId) {
+				await relay.close();
+				throw error;
+			}
+			receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
+		}
 		for (let attempts = 0; attempts < 10_000; attempts++) {
 			const status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			if (status.status.status === "terminal_ok") {
