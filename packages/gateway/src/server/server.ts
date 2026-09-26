@@ -84,6 +84,19 @@ import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
+import {
+	buildHandoffDigest,
+	extendHandoffChain,
+	type HandoffProvenance,
+	type HandoffReply,
+	handoffMessageId,
+	parseHandoffReply,
+	readHandoffProvenance,
+	renderHandoffFailure,
+	renderHandoffPointer,
+	renderHandoffTurn,
+	resolveHandoffTarget,
+} from "./handoff";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -1776,8 +1789,11 @@ async function createInboundTurnLifecycle(
 				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };
 				/** Set at intake by the speech gate (#260); absent means the reply is never judged. */
 				speechGated?: boolean;
+				/** Present when this row is a relayed handoff from another conversation (#72). */
+				handoff?: unknown;
 			})
 		: undefined;
+	const incomingHandoff = readHandoffProvenance(engagement?.handoff);
 	const speaker = composeSpeakerLabel(engagement);
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
@@ -1896,8 +1912,85 @@ async function createInboundTurnLifecycle(
 		}
 		return verdict;
 	};
+	/**
+	 * Delivers one line into THIS conversation under the trigger's terminal slot,
+	 * so a replayed or reconciled answer can never post it twice.
+	 */
+	const deliverTerminalLine = (text: string) => {
+		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
+		if (options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, deliveryId) !== deliveryId) return;
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
+		if (!payload) return;
+		deliveredParts.push(text);
+		assistantDeliveryStarted = true;
+		broadcastDelivery(runtime, payload);
+	};
+	/**
+	 * A `[HANDOFF:<target>]` answer (#72): the target conversation's session gets
+	 * one durable, relayed inbound row and answers there; this conversation gets
+	 * a pointer. Anything that cannot be handed off is said here, and nothing runs.
+	 */
+	const handOff = async (handoff: HandoffReply) => {
+		const resolved = resolveHandoffTarget(handoff.target, runtime.config);
+		const hop = resolved.ok
+			? extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey)
+			: { ok: false as const, reason: resolved.reason };
+		if (!hop.ok || !resolved.ok) {
+			const reason = hop.ok ? "unresolvable target" : hop.reason;
+			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
+			deliverTerminalLine(renderHandoffFailure(handoff.target, reason));
+			return;
+		}
+		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+		const provenance: HandoffProvenance = {
+			chain: hop.chain,
+			sourceOriginKey: key,
+			sourceMessageId,
+			...(incomingHandoff
+				? {
+						...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
+						...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
+					}
+				: {
+						...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+						...(speaker ? { requesterName: speaker } : {}),
+					}),
+			at: row.received_at,
+		};
+		const digest = buildHandoffDigest(
+			options.database.recentConversation(
+				key,
+				origin.conversationId,
+				RECENT_HISTORY_MAX,
+				new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+			),
+		);
+		// No author identity on the relayed row: nobody in the target conversation
+		// sent it, so it must not read (or authorise) as the requester speaking there.
+		const accepted = options.database.inboundEnqueue({
+			messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
+			originKey: resolved.originKey,
+			originRefJson: JSON.stringify(resolved.origin),
+			body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
+			engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
+		});
+		if (accepted) {
+			console.error(`gateway handoff enqueued origin=${key} target=${resolved.originKey} chain=${hop.chain.length}`);
+			// Not awaited: the target actor runs its own turn under its own serialization.
+			void runtime.personaSessions
+				.notifyInbound(resolved.originKey)
+				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
+		}
+		deliverTerminalLine(renderHandoffPointer(handoff.target));
+	};
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
+		const handoff = parseHandoffReply(rawMessage);
+		if (handoff) {
+			// The work itself never posts here; only the final answer hands off.
+			if (source === "terminal") await handOff(handoff);
+			return;
+		}
 		let message = rawMessage;
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
@@ -2521,6 +2614,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
+				]
+			: []),
+		...(isChatPlatform(origin.platform)
+			? [
+					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence
