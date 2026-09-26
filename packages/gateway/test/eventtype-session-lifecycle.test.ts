@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eventTypeOrigin, originKey } from "@gajae-gateway/protocol";
+import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
@@ -44,12 +44,15 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 		pipeline.submit(monitor.monitorId, "build", {});
 		await Bun.sleep(20);
 		expect(calls.map((call) => call.origin)).toEqual([
-			originKey(eventTypeOrigin("build")),
-			originKey(eventTypeOrigin("build")),
+			originKey(monitorSessionOrigin(monitor.monitorId, "build")),
+			originKey(monitorSessionOrigin(monitor.monitorId, "build")),
 		]);
 		expect(calls.map((call) => call.epoch)).toEqual([0, 0]);
 		database.withTransaction(() =>
-			database.bumpEpoch(originKey(eventTypeOrigin("build")), JSON.stringify(eventTypeOrigin("build"))),
+			database.bumpEpoch(
+				originKey(monitorSessionOrigin(monitor.monitorId, "build")),
+				JSON.stringify(monitorSessionOrigin(monitor.monitorId, "build")),
+			),
 		);
 		pipeline.submit(monitor.monitorId, "build", {});
 		await Bun.sleep(20);

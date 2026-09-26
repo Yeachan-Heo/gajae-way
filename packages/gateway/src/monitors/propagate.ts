@@ -5,6 +5,7 @@ import {
 	isSilenceToken,
 	type MonitorEventRecord,
 	type MonitorRecord,
+	monitorSessionOrigin,
 	type OriginRef,
 	originKey,
 } from "@gajae-gateway/protocol";
@@ -632,7 +633,12 @@ export class MonitorPropagator {
 		try {
 			if (!claimedEventType) throw new Error("missing event type");
 			originKey(eventTypeOrigin(claimedEventType));
-			sessionOrigin = declared.has(claimedEventType) ? eventTypeOrigin(claimedEventType) : CATCH_ALL_EVENT_ORIGIN;
+			// The session is owned by THIS monitor (#177): monitors that declare the
+			// same event type must not share history, instruction, or failure domain.
+			sessionOrigin = monitorSessionOrigin(
+				monitor.monitorId,
+				declared.has(claimedEventType) ? claimedEventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
+			);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
 			for (const row of claimed) {

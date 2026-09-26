@@ -100,6 +100,7 @@ export {
 	eventTypeOrigin,
 	isChatPlatform,
 	LOOPBACK_ORIGIN,
+	monitorSessionOrigin,
 	ORIGIN_KINDS,
 	ORIGIN_PLATFORMS,
 	type OriginKind,

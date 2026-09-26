@@ -540,7 +540,7 @@ describe("monitor crash-boundary state machine", () => {
 			expect(detail).toContain(expected);
 			expect(detail).toContain('"phase":"request"');
 			expect(detail).toContain('"sessionId":"s1"');
-			expect(detail).toContain('"origin":"monitor/eventtype/memory.canonicalize"');
+			expect(detail).toContain(`"origin":"monitor/eventtype/memory.canonicalize/parent=${monitor.monitorId}"`);
 			expect(detail).toContain('"attempt":2');
 			expect(detail).not.toContain("SECRET");
 			if (label === "untrusted fields" || label === "missing fields" || label === "envelope refusal") {

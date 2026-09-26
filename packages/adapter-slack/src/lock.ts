@@ -154,7 +154,15 @@ export class AdapterLock {
 					.then((info) => info.ino)
 					.catch(() => undefined);
 				if (expectedInode !== undefined) {
-					await rename(path, previous);
+					try {
+						await rename(path, previous);
+					} catch (error) {
+						// The pidfile we just stat'ed vanished: a contender that displaced
+						// our election moved it first. Fail closed instead of surfacing ENOENT.
+						if ((error as NodeJS.ErrnoException).code === "ENOENT")
+							throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+						throw error;
+					}
 					previousMoved = true;
 					const movedInode = (await stat(previous)).ino;
 					if (movedInode !== expectedInode || (await readHolder(previous)) !== holder) {

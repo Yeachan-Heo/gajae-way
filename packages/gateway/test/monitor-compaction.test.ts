@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eventTypeOrigin, originKey } from "@gajae-gateway/protocol";
+import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import {
@@ -268,7 +268,7 @@ test("a healthy 10-minute monitor is never rolled, however far past any turn thr
 			burstPolicy: "serialize",
 			instruction: "Report the oldest unacknowledged alert.",
 		});
-		const sessionKey = originKey(eventTypeOrigin("heartbeat.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "heartbeat.tick"));
 		// 25 hours at one tick per 10 minutes — far past the 24 the old
 		// implementation rolled on, and past the chat path's 50.
 		const ticks = 150;
@@ -316,7 +316,7 @@ test("consecutive context failures with native compaction unavailable roll, and 
 			burstPolicy: "serialize",
 			instruction,
 		});
-		const sessionKey = originKey(eventTypeOrigin("digest.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "digest.tick"));
 		const healthyIds: string[] = [];
 		for (let tick = 0; tick < 3; tick += 1)
 			healthyIds.push(await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick }));
@@ -385,7 +385,7 @@ test("a compaction port that reports success keeps the session, however long the
 			eventTypes: ["native.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("native.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "native.tick"));
 		for (let tick = 0; tick < 6; tick += 1) await pipeline.submitAwaitable(monitor.monitorId, "native.tick", { tick });
 		// Native compaction was asked every time and said it handled it, so the
 		// safety net stays holstered.
@@ -418,7 +418,7 @@ test("a native compaction that fails outright rolls with its own structured reas
 			eventTypes: ["nf.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("nf.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "nf.tick"));
 		await pipeline.submitAwaitable(monitor.monitorId, "nf.tick", { tick: 0 });
 		expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_failures_native_compaction_failed");
 		empty = false;
@@ -454,7 +454,7 @@ test("a protocol-class failure names the violated rule and rolls only after its 
 			eventTypes: ["bad.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("bad.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "bad.tick"));
 		const eventIds: string[] = [];
 		for (let tick = 0; tick < 2; tick += 1)
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "bad.tick", { tick }));
@@ -505,7 +505,7 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 			eventTypes: ["boundary.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("boundary.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "boundary.tick"));
 		const healthy: string[] = [];
 		for (let tick = 0; tick < 3; tick += 1)
 			healthy.push(await pipeline.submitAwaitable(monitor.monitorId, "boundary.tick", { tick }));
@@ -590,7 +590,7 @@ test("a healthy answer resets the streak, so isolated context failures never rol
 			eventTypes: ["flaky.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("flaky.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "flaky.tick"));
 		// A single context_too_large, then a healthy turn — twice. The failures are
 		// never consecutive, so nothing may arm.
 		for (const tick of [0, 1, 2, 3]) {
@@ -639,7 +639,7 @@ test("a context failure on a replayed stale event does not feed the current sess
 			eventTypes: ["stale.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("stale.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "stale.tick"));
 		// Park an event at `failed` with an executor failure: retryable, and no
 		// context evidence on the books.
 		const staleId = await pipeline.submitAwaitable(monitor.monitorId, "stale.tick", { tick: 0 });
@@ -694,7 +694,7 @@ test("an aside-worker timeout streak never rolls: an executor failure is not con
 			eventTypes: ["aside.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("aside.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "aside.tick"));
 		const eventIds: string[] = [];
 		for (let tick = 0; tick < 5; tick += 1)
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "aside.tick", { tick }));
@@ -737,7 +737,7 @@ test("an orphaned-executor streak never rolls and never touches the context stre
 			eventTypes: ["orphan.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("orphan.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "orphan.tick"));
 		const eventIds: string[] = [];
 		for (let tick = 0; tick < 5; tick += 1)
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "orphan.tick", { tick }));
@@ -782,7 +782,7 @@ test("interleaved orphaned-executor and context failures advance only the contex
 			eventTypes: ["mixed.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("mixed.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "mixed.tick"));
 		// orphaned, context, orphaned, context: the orphans neither advance nor
 		// reset the streak, so the two context failures still reach the threshold.
 		const expectedContextStreak = [0, 1, 1, 2];
@@ -827,7 +827,7 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 			eventTypes: ["threads.tick"],
 			burstPolicy: "serialize",
 		});
-		const sessionKey = originKey(eventTypeOrigin("threads.tick"));
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "threads.tick"));
 		expect(MONITOR_BUSY_FAILURE_ROLL_THRESHOLD).toBe(2);
 		const first = await pipeline.submitAwaitable(monitor.monitorId, "threads.tick", { tick: 0 });
 		expect(database.monitorFailure(first)?.code).toBe("session_busy");
