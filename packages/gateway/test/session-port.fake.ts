@@ -9,6 +9,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type { SessionRelayStream } from "../src/orchestrator/broker";
 import type {
+	RunningHostJob,
 	SessionBindInput,
 	SessionBinding,
 	SessionPort,
@@ -208,6 +209,15 @@ export class ScriptedSessionPort implements SessionPort {
 		this.closes.push(input);
 		const state = this.#sessionStates.get(input.sessionId);
 		if (state) this.#sessionStates.set(input.sessionId, { ...state, live: false });
+	}
+
+	/** Background jobs each scripted host reports as running; an Error makes the read fail. */
+	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
+
+	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
+		const jobs = this.hostJobs.get(input.sessionId) ?? [];
+		if (jobs instanceof Error) throw jobs;
+		return jobs;
 	}
 
 	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */

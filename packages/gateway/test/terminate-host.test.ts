@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, parseRunningJobs } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
 import { noRelay } from "./session-port.fake";
@@ -138,4 +138,24 @@ test("a pid that already exited is already gone, not an error", async () => {
 	} finally {
 		await h.close();
 	}
+});
+
+// #41: the host's running background jobs are read before it is ended. Shape
+// captured from a live gjc 0.17.2 `runtime.jobs.list` query response.
+test("runtime.jobs.list: running jobs are parsed; an unreadable answer throws instead of reading as none", () => {
+	const page = (running: unknown[]) =>
+		JSON.stringify({
+			type: "query_response",
+			ok: true,
+			page: {
+				items: [{ running, recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } }],
+				complete: true,
+			},
+		});
+	expect(parseRunningJobs(page([]))).toEqual([]);
+	expect(
+		parseRunningJobs(page([{ id: "0-Review", type: "task", status: "running", label: "review", startTime: 1 }])),
+	).toEqual([{ id: "0-Review", type: "task", label: "review" }]);
+	expect(() => parseRunningJobs(JSON.stringify({ ok: false, error: { code: "resource_gone" } }))).toThrow();
+	expect(() => parseRunningJobs(JSON.stringify({ ok: true, page: { items: [null], complete: true } }))).toThrow();
 });
