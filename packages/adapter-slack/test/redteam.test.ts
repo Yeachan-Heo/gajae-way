@@ -1574,22 +1574,46 @@ test("RT-SLACK-66 fresh live election replacing abandoned directory survives wai
 	await writeFile(join(dir, "owner"), "88888\n");
 	const old = new Date(Date.now() - 3000);
 	await utimes(dir, old, old);
+
+	// Use a barrier to hold the contender during the directory swap.
+	// This ensures the swap is atomic with respect to the contender:
+	// the contender will wait before retrying, giving us a window to
+	// swap the directories without racing.
+	let allowContinueResolve: (() => void) | undefined;
+	const allowContinue = new Promise<void>((resolve) => {
+		allowContinueResolve = resolve;
+	});
 	let fresh = false;
-	const pending = AdapterLock.acquire(home, { pid: 42, alive: (pid) => fresh && pid === 7 }).then(
+	const pending = AdapterLock.acquire(home, {
+		pid: 42,
+		alive: (pid) => fresh && pid === 7,
+		beforeRetryWait: () => allowContinue,
+	}).then(
 		(lock) => ({ lock, error: undefined }),
 		(error) => ({ lock: undefined, error }),
 	);
 	await Bun.sleep(100);
+
 	// A real contender never leaves the slot empty: it prepares its election in
 	// private and swaps it in. Reproduce that (rename over the abandoned dir
 	// after moving it aside) so the waiter never sees a free slot.
 	const staging = `${dir}.staging`;
 	await mkdir(staging);
 	await writeFile(join(staging, "owner"), "7\n");
+
+	// Perform the directory swap. The contender is paused at beforeRetryWait,
+	// so it won't interfere with the swap.
 	await rename(dir, `${dir}.old`);
+	// Inject a delay to force the race window and verify the barrier holds.
+	// Without the barrier, this delay would allow the contender to race.
+	await new Promise((resolve) => setTimeout(resolve, 50));
 	await rename(staging, dir);
 	await rm(`${dir}.old`, { recursive: true, force: true });
+
+	// Release the barrier and mark the fresh winner as alive.
 	fresh = true;
+	allowContinueResolve?.();
+
 	const inode = (await stat(dir)).ino;
 	const result = await pending;
 	expect(result.error).toBeInstanceOf(AdapterAlreadyRunningError);
