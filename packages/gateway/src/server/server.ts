@@ -668,6 +668,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		cycle: new RuntimeCycleProjector(options.database, memory, {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.broker?.agentDir,
+			brokerRespawnChurn: () =>
+				typeof options.broker?.respawnChurn === "function" ? options.broker.respawnChurn() : false,
 		}),
 		lanes,
 		work,

@@ -1983,6 +1983,21 @@ export class GatewayDatabase {
 			.sort((a, b) => a.eventType.localeCompare(b.eventType));
 	}
 
+	/**
+	 * Cycle projection source: how many of the most recently settled monitor
+	 * events, newest first, ended `failed_no_retry` before the first success.
+	 * Dispatch outcome, not process liveness, is what a monitor outage looks like.
+	 */
+	monitorConsecutiveTerminalFailures(limit = 100): number {
+		const rows = this.#database
+			.query<{ stage: string }, [number]>(
+				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+			)
+			.all(limit);
+		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry");
+		return streak < 0 ? rows.length : streak;
+	}
+
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")

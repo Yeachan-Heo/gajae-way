@@ -333,6 +333,38 @@ test("reconnection is read-only and only a changed incarnation advances generati
 	expect(commands).toBe(0);
 });
 
+test("issue #189: a broker killed in a loop raises one churn alert and a state change, not N healthy verdicts", async () => {
+	let current = discovery();
+	let available = true;
+	const logs: string[] = [];
+	const value = client({
+		discovery: async () => current,
+		healthProbe: async () => available,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		log: (line) => logs.push(line),
+	});
+	await value.start();
+	expect(value.respawnChurn()).toBe(false);
+	for (let cycle = 1; cycle <= 6; cycle++) {
+		available = false;
+		await eventually(() => logs.some((line) => line.includes("observing without repair")));
+		logs.splice(0, logs.length, ...logs.filter((line) => !line.includes("observing without repair")));
+		current = { ...current, pid: 20_000 + cycle };
+		available = true;
+		await eventually(() => value.generation === cycle + 1);
+		if (cycle < 3) expect(value.respawnChurn()).toBe(false);
+	}
+	expect(value.recentRespawns()).toBe(6);
+	expect(value.respawnChurn()).toBe(true);
+	const alerts = logs.filter((line) => line.startsWith("broker_respawn_churn "));
+	expect(alerts).toEqual([
+		expect.stringContaining("broker_respawn_churn respawns=3 windowMs=1800000 pid=20003 generation=4"),
+	]);
+	// The window drains: churn is an episode, not a permanent verdict.
+	expect(value.respawnChurn(Date.now() + 31 * 60_000)).toBe(false);
+});
+
 test("each unavailable observation names why the broker was rejected", async () => {
 	// 2026-09-23: 484 identical "observing without repair" lines over 81 minutes
 	// could not tell a dead discovery pid from a live broker that refused the
