@@ -20,6 +20,8 @@ export interface AdapterLockPorts {
 	readonly alive: (pid: number) => boolean;
 	/** Test-only seam for a slow critical section after election and before the pidfile write. */
 	readonly beforePidfileWrite?: () => void | Promise<void>;
+	/** Test-only seam to hold the contender before the retry wait, allowing the test to perform atomic operations. */
+	readonly beforeRetryWait?: () => void | Promise<void>;
 }
 
 export function defaultLockPorts(): AdapterLockPorts {
@@ -113,6 +115,7 @@ export class AdapterLock {
 					if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
 				}
 				if (attempt < RECLAIM_WAIT_ATTEMPTS) {
+					await ports.beforeRetryWait?.();
 					await new Promise((resolve) => setTimeout(resolve, RECLAIM_WAIT_STEP_MS));
 					continue;
 				}
