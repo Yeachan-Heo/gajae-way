@@ -3,7 +3,12 @@ import { join } from "node:path";
 import { type ConfigOverrides, loadConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
-import { GjcCliUnavailableError, GlobalGjcClient, type GlobalGjcClientDependencies } from "./orchestrator/broker";
+import {
+	GjcCliUnavailableError,
+	GlobalGjcClient,
+	type GlobalGjcClientDependencies,
+	readPinnedGjcVersion,
+} from "./orchestrator/broker";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
@@ -104,11 +109,14 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		let broker: GlobalGjcClient | undefined;
 		try {
 			await mkdir(join(config.home, "workspace"), { recursive: true, mode: 0o700 });
+			const pinnedVersion = readPinnedGjcVersion();
 			broker = new GlobalGjcClient({
 				...options.broker,
 				cwd: join(config.home, "workspace"),
+				agentDir: options.broker?.agentDir ?? join(config.home, "gjc-agent"),
+				pinnedVersion,
 			});
-			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` };
+			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
 			database.assertBrokerAuthority(authority, { initializeEmpty: true });
 			// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 			const client = broker;

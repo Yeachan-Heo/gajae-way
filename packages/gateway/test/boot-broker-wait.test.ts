@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { bootGateway, waitForBroker } from "../src/boot";
-import { GjcCliUnavailableError, MIN_GJC_VERSION } from "../src/orchestrator/broker";
+import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -16,7 +16,7 @@ const SESSIONS = JSON.stringify({ ok: true, result: { sessions: [] } });
 function brokerRecoveringAfter(failures: number, home: string) {
 	let listCalls = 0;
 	const command: CliRunner = async (args) => {
-		if (args[0] === "--version") return { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" };
+		if (args[0] === "--version") return { exitCode: 0, stdout: "gjc/0.17.5\n", stderr: "" };
 		if (args[1] === "session" && args[2] === "list" && ++listCalls <= failures) {
 			// What `gjc sdk session list` does while the shared broker clears a stale lock.
 			return { exitCode: 1, stdout: "", stderr: "broker lock held by dead pid\n" };

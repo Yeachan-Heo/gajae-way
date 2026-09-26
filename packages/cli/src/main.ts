@@ -37,6 +37,7 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import { performUpgrade } from "./upgrade";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -590,7 +591,28 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "ops": {
-				const [command, path] = parsed.rest;
+				const [command, path, ...extraArgs] = parsed.rest;
+				if (command === "upgrade") {
+					// gajaeway ops upgrade [--gjc X.Y.Z]
+					const home = gatewayHome();
+					let gjcVersion: string | undefined;
+					if (path === "--gjc" && extraArgs[0]) {
+						gjcVersion = extraArgs[0];
+					} else if (path && path !== "--gjc") {
+						throw new Error("usage: gajaeway ops upgrade [--gjc X.Y.Z]");
+					}
+					const result = await performUpgrade({ home, gjcVersion });
+					console.log(result.detail);
+					if (result.status !== "ok") {
+						process.exitCode = 1;
+						break;
+					}
+					// After upgrade, trigger restart-stack
+					const { receipt, supervisorPid } = await launchRestartStack({ home });
+					console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
+					console.log("read the outcome with: gajaeway ops restart-stack --status");
+					break;
+				}
 				if (command === "restore" && path) {
 					await restoreDatabase(parsed.socket, path);
 					break;
@@ -651,7 +673,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						process.exitCode = cycleExitCode(cycle);
 					} else
 						throw new Error(
-							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|restart-stack [--status]",
+							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|upgrade [--gjc X.Y.Z]|restart-stack [--status]",
 						);
 				} finally {
 					await client.close();
