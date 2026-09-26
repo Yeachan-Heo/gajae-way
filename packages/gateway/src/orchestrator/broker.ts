@@ -9,6 +9,7 @@ import {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 } from "./broker-liveness";
+import { type BrokerRelease, type BrokerReleaser, createBrokerReleaser } from "./broker-scope";
 import { sanitizeDiagnostic } from "./rebind";
 
 export {
@@ -78,6 +79,8 @@ export interface GlobalGjcClientOptions {
 	 * never fires this; restarting the gateway would not bring it back.
 	 */
 	readonly onLiveOutageExceeded?: (detail: string) => void;
+	/** Moves a broker found in the gateway's own systemd unit into its own scope; `null` disables. */
+	readonly releaseBrokerScope?: BrokerReleaser | null;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -252,6 +255,7 @@ export class GlobalGjcClient {
 	readonly cli: CliRunner;
 	readonly #options: GlobalGjcClientOptions;
 	readonly #spawn: SpawnFn;
+	readonly #releaseBrokerScope: BrokerReleaser | undefined;
 	readonly #cwd: string;
 	readonly #env: Record<string, string>;
 	readonly #timeout: number;
@@ -313,6 +317,10 @@ export class GlobalGjcClient {
 			GJC_AGENT_DIR: this.agentDir,
 		};
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
+		this.#releaseBrokerScope =
+			options.releaseBrokerScope === null
+				? undefined
+				: (options.releaseBrokerScope ?? (process.platform === "linux" ? createBrokerReleaser() : undefined));
 		this.#timeout = integer(options.healthProbeTimeoutMs, COMMAND_TIMEOUT_MS, 1);
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
@@ -472,6 +480,7 @@ export class GlobalGjcClient {
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
 				this.#identity = identity;
+				await this.#releaseBroker(discovery.pid);
 				this.#generation++;
 				for (const listener of this.#listeners) {
 					try {
@@ -490,6 +499,23 @@ export class GlobalGjcClient {
 			}
 			return false;
 		}
+	}
+	/** A broker our own SDK command autostarted must not share the gateway unit's stop (#183). */
+	async #releaseBroker(pid: number): Promise<void> {
+		if (!this.#releaseBrokerScope) return;
+		let result: BrokerRelease;
+		try {
+			result = await this.#releaseBrokerScope(pid);
+		} catch (error) {
+			result = {
+				outcome: "skipped",
+				reason: `scope_failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+		if (result.outcome === "released")
+			this.#log(`broker_scope_released pid=${pid} scope=${result.scope} processes=${result.pids.length}`);
+		else if (result.reason.startsWith("scope_failed"))
+			this.#log(`broker_scope_release_failed pid=${pid} reason=${result.reason}`);
 	}
 	#schedule(epoch: number): void {
 		if (this.#stopped || epoch !== this.#epoch) return;
