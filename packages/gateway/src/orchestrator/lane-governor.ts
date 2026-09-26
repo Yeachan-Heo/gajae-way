@@ -1,3 +1,4 @@
+import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
@@ -69,7 +70,7 @@ export interface LaneGovernorOptions {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
 	readonly now?: () => number;
-	readonly log?: (line: string) => void;
+	readonly log?: (line: string, level?: LogLevel) => void;
 }
 
 /**
@@ -87,7 +88,7 @@ export class LaneGovernor {
 	readonly maxLanes: number;
 	readonly idleRetireMs: number;
 	readonly #now: () => number;
-	readonly #log: (line: string) => void;
+	readonly #log: (line: string, level?: LogLevel) => void;
 	#recoveryGate?: () => Promise<void>;
 	#stopped = false;
 	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
@@ -98,7 +99,7 @@ export class LaneGovernor {
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
 		this.#now = options.now ?? (() => Date.now());
-		this.#log = options.log ?? ((line) => console.error(line));
+		this.#log = options.log ?? ((line, level) => console[level ?? "info"](line));
 	}
 
 	/** Installed by the sole attempt owner; recovery registration precedes retirement. */
@@ -239,17 +240,23 @@ export class LaneGovernor {
 				const detail = sanitizeDiagnostic(diagnostic(error));
 				const liveness = await this.#liveness(lane.sessionId, repo);
 				if (liveness.live !== false && !liveness.disowned) {
-					this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=retained`);
+					this.#log(
+						`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=retained`,
+						"error",
+					);
 					return {
 						retired: false,
 						sessionKey,
 						reason: `session.close failed and the session is not proven gone: ${detail}`,
 					};
 				}
-				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=session_gone`);
+				this.#log(
+					`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=session_gone`,
+					"error",
+				);
 			}
 			this.#database.rebindEpoch(sessionKey);
-			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${reason} closed=${closed}`);
+			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${reason} closed=${closed}`, "info");
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed };
 		});
 	}

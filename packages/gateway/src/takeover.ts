@@ -274,7 +274,7 @@ async function waitForExit(pid: number, timeoutMs: number, ports: TakeoverPorts)
 	return !ports.isPidAlive(pid);
 }
 
-export function defaultTakeoverPorts(log: (line: string) => void = (line) => console.error(line)): TakeoverPorts {
+export function defaultTakeoverPorts(log: (line: string) => void = (line) => console.info(line)): TakeoverPorts {
 	return {
 		isPidAlive: (pid) => {
 			try {

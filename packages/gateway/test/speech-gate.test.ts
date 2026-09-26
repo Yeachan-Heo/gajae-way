@@ -26,7 +26,7 @@ const ENV = ["KEV_SHADOW_URL", "KEV_SHADOW_TOKEN", "KEV_GATE_MODE"] as const;
 let directory = "";
 let server: GatewayServer | undefined;
 const logs: string[] = [];
-const consoleError = console.error;
+const consoleInfo = console.info;
 
 beforeEach(() => {
 	for (const name of ENV) saved[name] = process.env[name];
@@ -56,13 +56,13 @@ beforeEach(() => {
 	});
 	process.env.KEV_SHADOW_URL = `http://127.0.0.1:${gate.port}`;
 	process.env.KEV_GATE_MODE = "enforce";
-	console.error = (...args: unknown[]) => {
+	console.info = (...args: unknown[]) => {
 		logs.push(args.map(String).join(" "));
 	};
 });
 
 afterEach(async () => {
-	console.error = consoleError;
+	console.info = consoleInfo;
 	await server?.stop();
 	server = undefined;
 	gate?.stop(true);

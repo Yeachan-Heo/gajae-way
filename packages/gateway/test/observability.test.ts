@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { LogLevel } from "@gajae-gateway/log";
 import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
@@ -19,8 +20,19 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 test("persistent-session control-plane logs use grep-stable fields", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-observability-"));
 	const lines: string[] = [];
-	const original = console.error;
-	console.error = (...parts: unknown[]) => lines.push(parts.map(String).join(" "));
+	const records: Array<{ level: LogLevel; line: string }> = [];
+	const original = { error: console.error, warn: console.warn, info: console.info, log: console.log };
+	const capture =
+		(level: LogLevel) =>
+		(...parts: unknown[]) => {
+			const line = parts.map(String).join(" ");
+			lines.push(line);
+			records.push({ level, line });
+		};
+	console.error = capture("error");
+	console.warn = capture("warn");
+	console.info = capture("info");
+	console.log = capture("info");
 	let database: GatewayDatabase | undefined;
 	let manager: PersonaSessionManager | undefined;
 	let broker: GlobalGjcClient | undefined;
@@ -87,6 +99,13 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 				line.startsWith(`steer_delivered originKey=${originKey} opRef=${first.opRef} messageId=m-2`),
 			),
 		).toBe(true);
+		expect(
+			records.some(
+				({ level, line }) =>
+					level === "info" &&
+					line.startsWith(`steer_delivered originKey=${originKey} opRef=${first.opRef} messageId=m-2`),
+			),
+		).toBe(true);
 
 		const runner = new TailRunner({
 			stream: noRelay,
@@ -98,6 +117,14 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 				(line) =>
 					line ===
 					`compaction_event sessionId=${first.sessionId} originKey=${originKey} source=control_receipt result=started`,
+			),
+		).toBe(true);
+		expect(
+			records.some(
+				({ level, line }) =>
+					level === "info" &&
+					line ===
+						`compaction_event sessionId=${first.sessionId} originKey=${originKey} source=control_receipt result=started`,
 			),
 		).toBe(true);
 
@@ -128,6 +155,11 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 			() => lines.some((line) => line.includes("global broker unavailable; observing without repair")),
 			"read-only global broker outage observation was not logged",
 		);
+		expect(
+			records.some(
+				({ level, line }) => level === "error" && line.includes("global broker unavailable; observing without repair"),
+			),
+		).toBe(true);
 		const outageProbes = probes;
 		healthy = true;
 		await eventually(() => probes > outageProbes, "same-incarnation recovery was not observed");
@@ -141,7 +173,10 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		await manager?.stop();
 		await broker?.stop();
 		database?.close();
-		console.error = original;
+		console.error = original.error;
+		console.warn = original.warn;
+		console.info = original.info;
+		console.log = original.log;
 		await rm(home, { recursive: true, force: true });
 	}
 });

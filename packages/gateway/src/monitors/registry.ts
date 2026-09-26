@@ -66,7 +66,7 @@ export class MonitorRegistry {
 			try {
 				records.push(rowToRecord(row));
 			} catch {
-				console.error(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
+				console.warn(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
 			}
 		}
 		return records;

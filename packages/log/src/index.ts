@@ -6,7 +6,8 @@ export const DEFAULT_LOG_ROTATION_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_LOG_RETAINED_FILES = 5;
 export const DEFAULT_LOG_HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000;
 
-type LogLevel = "error" | "log";
+export type LogLevel = "error" | "warn" | "info";
+type ConsoleMethod = LogLevel | "log";
 
 /** Synchronous filesystem seam; tests substitute an in-memory one. */
 export interface StructuredLogFileSystem {
@@ -32,13 +33,14 @@ export interface StructuredLoggingOptions {
 	readonly now?: () => number;
 	readonly filesystem?: StructuredLogFileSystem;
 	/** Console this wraps; production uses the global one. */
-	readonly console?: Pick<Console, "error" | "log">;
+	readonly console?: Pick<Console, ConsoleMethod>;
 	readonly setInterval?: (handler: () => void, delayMs: number) => unknown;
 	readonly clearInterval?: (timer: unknown) => void;
 }
 
 interface PendingRun {
 	readonly level: LogLevel;
+	readonly method: ConsoleMethod;
 	readonly message: string;
 	count: number;
 	readonly firstAt: string;
@@ -60,7 +62,7 @@ function renderedMessage(args: readonly unknown[]): string {
 
 function messageLines(message: string): string[] {
 	const lines = message.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
-	// `console.error`/`console.log` append their own final newline. Avoid
+	// Console methods append their own final newline. Avoid
 	// manufacturing a second blank record when the caller's string ends in one.
 	if (lines.length > 1 && lines.at(-1) === "") lines.pop();
 	return lines.length > 0 ? lines : [""];
@@ -77,9 +79,10 @@ function optionalInterval(value: number | undefined): number {
 }
 
 /**
- * Install a timestamping, rotating, heartbeat-producing sink around the two
- * console methods used by the gateway and adapters. The returned disposer is
- * idempotent and restores the exact functions that were present at install.
+ * Install a timestamping, rotating, heartbeat-producing sink around console
+ * severity methods used by the gateway and adapters. `console.log` is recorded
+ * at the informational level. The returned disposer is idempotent and
+ * restores the exact functions that were present at install.
  */
 export function installStructuredLogging(options: StructuredLoggingOptions): () => void {
 	const path = options.path;
@@ -108,7 +111,10 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 	}
 
 	const originalError = target.error;
+	const originalWarn = target.warn;
+	const originalInfo = target.info;
 	const originalLog = target.log;
+	const originalMethods = { error: originalError, warn: originalWarn, info: originalInfo, log: originalLog };
 
 	const append = (data: string): void => {
 		try {
@@ -167,32 +173,37 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 		}
 	};
 
-	const echo = (level: LogLevel, message: string, timestamp: string): void => {
+	const echo = (method: ConsoleMethod, message: string, timestamp: string): void => {
 		try {
 			const prefixed = messageLines(message)
-				.map((line) => `${timestamp} ${level} ${line}`)
+				.map((line) => `${timestamp} ${method === "log" ? "info" : method} ${line}`)
 				.join("\n");
-			(level === "error" ? originalError : originalLog).call(target, prefixed);
+			originalMethods[method].call(target, prefixed);
 		} catch {
 			// A hostile test double must not disable the owned sink.
 		}
 	};
 
-	const emit = (level: LogLevel, message: string, timestamp: string, echoOriginal = true): void => {
+	const emit = (level: LogLevel, message: string, timestamp: string, method: ConsoleMethod = level): void => {
 		writeLine(level, message, timestamp);
-		if (echoOriginal) echo(level, message, timestamp);
+		echo(method, message, timestamp);
 	};
 
 	const flushPending = (timestamp: string): void => {
 		const run = pending;
 		pending = undefined;
 		if (!run || run.count <= 1) return;
-		emit(run.level, `${run.message} x${run.count - 1} (identical, first=${run.firstAt} last=${run.lastAt})`, timestamp);
+		emit(
+			run.level,
+			`${run.message} x${run.count - 1} (identical, first=${run.firstAt} last=${run.lastAt})`,
+			timestamp,
+			run.method,
+		);
 	};
 
-	const receive = (level: LogLevel, args: readonly unknown[]): void => {
+	const receive = (level: LogLevel, method: ConsoleMethod, args: readonly unknown[]): void => {
 		if (disposed) {
-			(level === "error" ? originalError : originalLog).apply(target, args as never);
+			originalMethods[method].apply(target, args as never);
 			return;
 		}
 		const message = renderedMessage(args);
@@ -204,13 +215,17 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 			return;
 		}
 		flushPending(timestamp);
-		emit(level, message, timestamp);
-		pending = { level, message, count: 1, firstAt: timestamp, lastAt: timestamp };
+		emit(level, message, timestamp, method);
+		pending = { level, method, message, count: 1, firstAt: timestamp, lastAt: timestamp };
 	};
 
-	const wrappedError = (...args: unknown[]): void => receive("error", args);
-	const wrappedLog = (...args: unknown[]): void => receive("log", args);
+	const wrappedError = (...args: unknown[]): void => receive("error", "error", args);
+	const wrappedWarn = (...args: unknown[]): void => receive("warn", "warn", args);
+	const wrappedInfo = (...args: unknown[]): void => receive("info", "info", args);
+	const wrappedLog = (...args: unknown[]): void => receive("info", "log", args);
 	target.error = wrappedError as Console["error"];
+	target.warn = wrappedWarn as Console["warn"];
+	target.info = wrappedInfo as Console["info"];
 	target.log = wrappedLog as Console["log"];
 
 	let heartbeatTimer: unknown;
@@ -228,7 +243,7 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 				detail = "";
 			}
 			const uptime = Math.max(0, Math.floor((atMs - startedAtMs) / 1000));
-			emit("log", `service_alive uptime=${uptime}${detail ? ` ${detail}` : ""}`, timestamp);
+			emit("info", `service_alive uptime=${uptime}${detail ? ` ${detail}` : ""}`, timestamp);
 		}, heartbeatIntervalMs);
 		if (typeof heartbeatTimer === "object" && heartbeatTimer !== null && "unref" in heartbeatTimer) {
 			(heartbeatTimer as { unref?: () => void }).unref?.();
@@ -248,6 +263,8 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 		}
 		flushPending(new Date(now()).toISOString());
 		if (target.error === wrappedError) target.error = originalError;
+		if (target.warn === wrappedWarn) target.warn = originalWarn;
+		if (target.info === wrappedInfo) target.info = originalInfo;
 		if (target.log === wrappedLog) target.log = originalLog;
 	};
 }

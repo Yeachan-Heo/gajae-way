@@ -4,16 +4,18 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { installStructuredLogging } from "../src/index";
 
-const ISO_LINE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z (?:error|log) /;
+const ISO_LINE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z (?:error|warn|info) /;
 
 function target() {
-	const echoed: Array<{ level: "error" | "log"; args: unknown[] }> = [];
+	const echoed: Array<{ level: "error" | "warn" | "info"; args: unknown[] }> = [];
 	return {
 		echoed,
 		console: {
 			error: (...args: unknown[]) => echoed.push({ level: "error", args }),
-			log: (...args: unknown[]) => echoed.push({ level: "log", args }),
-		} as Pick<Console, "error" | "log">,
+			warn: (...args: unknown[]) => echoed.push({ level: "warn", args }),
+			info: (...args: unknown[]) => echoed.push({ level: "info", args }),
+			log: (...args: unknown[]) => echoed.push({ level: "info", args }),
+		} as Pick<Console, "error" | "warn" | "info" | "log">,
 	};
 }
 
@@ -41,6 +43,39 @@ test("prefixes every line, including multiline messages, with an ISO-8601 UTC ti
 		expect(lines.every((line) => ISO_LINE.test(line))).toBe(true);
 		expect(lines.map((line) => line.replace(ISO_LINE, ""))).toEqual(["first line", "second line", "third line"]);
 		expect(lines.filter((line) => ISO_LINE.test(line)).length / lines.length).toBe(1);
+	} finally {
+		await rm(sink.directory, { recursive: true, force: true });
+	}
+});
+
+test("records informational, warning, and error diagnostics at their emitted severity", async () => {
+	const sink = await temporarySink();
+	try {
+		const { console: output, echoed } = target();
+		const dispose = installStructuredLogging({
+			path: sink.path,
+			console: output,
+			heartbeatIntervalMs: 0,
+			now: () => Date.parse("2026-09-18T00:00:00.000Z"),
+		});
+		output.info("steer_delivered opRef=op-1");
+		output.warn("recovery_hold opRef=op-2");
+		output.error("transport failure opRef=op-3");
+		dispose();
+
+		const lines = (await readFile(sink.path, "utf8")).trimEnd().split("\n");
+		expect(lines.map((line) => line.replace(/^\S+ /, ""))).toEqual([
+			"info steer_delivered opRef=op-1",
+			"warn recovery_hold opRef=op-2",
+			"error transport failure opRef=op-3",
+		]);
+		expect(lines.every((line) => ISO_LINE.test(line))).toBe(true);
+		expect(echoed.map(({ level }) => level)).toEqual(["info", "warn", "error"]);
+		expect(echoed.map(({ args }) => args[0])).toEqual([
+			"2026-09-18T00:00:00.000Z info steer_delivered opRef=op-1",
+			"2026-09-18T00:00:00.000Z warn recovery_hold opRef=op-2",
+			"2026-09-18T00:00:00.000Z error transport failure opRef=op-3",
+		]);
 	} finally {
 		await rm(sink.directory, { recursive: true, force: true });
 	}
@@ -127,20 +162,26 @@ test("emits exactly one heartbeat line during an otherwise idle interval", async
 
 		const lines = (await readFile(sink.path, "utf8")).trimEnd().split("\n");
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("log service_alive uptime=60");
+		expect(lines[0]).toContain("info service_alive uptime=60");
 	} finally {
 		await rm(sink.directory, { recursive: true, force: true });
 	}
 });
 
-test("disposer restores console.error and an uninstalled console spy sees raw text", async () => {
+test("disposer restores every console method and an uninstalled console spy sees raw text", async () => {
 	const sink = await temporarySink();
-	const originalError = console.error;
+	const original = { error: console.error, warn: console.warn, info: console.info, log: console.log };
 	try {
 		const dispose = installStructuredLogging({ path: sink.path, heartbeatIntervalMs: 0 });
-		expect(console.error).not.toBe(originalError);
+		expect(console.error).not.toBe(original.error);
+		expect(console.warn).not.toBe(original.warn);
+		expect(console.info).not.toBe(original.info);
+		expect(console.log).not.toBe(original.log);
 		dispose();
-		expect(console.error).toBe(originalError);
+		expect(console.error).toBe(original.error);
+		expect(console.warn).toBe(original.warn);
+		expect(console.info).toBe(original.info);
+		expect(console.log).toBe(original.log);
 
 		const spy = spyOn(console, "error").mockImplementation(() => {});
 		try {
@@ -150,7 +191,10 @@ test("disposer restores console.error and an uninstalled console spy sees raw te
 			spy.mockRestore();
 		}
 	} finally {
-		if (console.error !== originalError) console.error = originalError;
+		if (console.error !== original.error) console.error = original.error;
+		if (console.warn !== original.warn) console.warn = original.warn;
+		if (console.info !== original.info) console.info = original.info;
+		if (console.log !== original.log) console.log = original.log;
 		await rm(sink.directory, { recursive: true, force: true });
 	}
 });

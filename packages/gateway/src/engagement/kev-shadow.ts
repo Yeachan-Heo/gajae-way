@@ -247,7 +247,7 @@ export async function judgeKevShadow(input: KevShadowInput): Promise<ShadowVerdi
 	if (!probs) return null;
 	const s = shadowScore(probs);
 	const f = (n: number) => n.toFixed(4);
-	console.error(
+	console.info(
 		`kev-shadow origin=${input.originKey} help=${f(s.help)} directed=${f(s.directed)} ack=${f(s.ack)} ` +
 			`isAnswer=${f(s.isAnswer)} chatter=${f(s.chatter)} score=${f(s.score)} verdict=${s.verdict} ` +
 			`addressed=${input.addressed ? (input.addressedBy ?? "1") : "0"} ctx=${input.earlier?.length ?? 0} ` +

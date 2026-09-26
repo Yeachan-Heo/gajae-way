@@ -171,7 +171,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						onStop: close,
 						overrides: options.overrides,
 					});
-			console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
+			console.info(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 			return { stop: (reason) => server.stop(reason), broker: supervisor };
 		} catch (error) {
 			try {

@@ -373,7 +373,7 @@ export class BrokerSessionPort implements SessionPort {
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 			}
 			const rebound = this.#database.rebindEpoch(input.originKey);
-			console.error(
+			console.info(
 				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
 			);
 			return await this.bind({ ...input, epoch: rebound });
@@ -394,7 +394,7 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
-			console.error(
+			console.info(
 				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
 			);
 			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
@@ -686,7 +686,7 @@ export class BrokerSessionPort implements SessionPort {
 				if (this.#now() >= deadline) throw error;
 				if (!waited) {
 					waited = true;
-					console.error(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
+					console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
 				}
 				await this.#sleep(BUSY_POLL_MS);
 			}
@@ -1096,7 +1096,7 @@ export class BrokerSessionPort implements SessionPort {
 				lastActivityAt = this.#now();
 			},
 			onStall: ({ elapsedMs }) =>
-				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+				console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
 		});
 		relay.beginTurn(input.opRef);
 		relay.setTurnRunning(true);
