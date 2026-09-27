@@ -7,6 +7,7 @@ import {
 	type ChatProgressActivity,
 	containsSilenceToken,
 	describeChatPlatforms,
+	type EngagementContext,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
@@ -2401,6 +2402,19 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 }
 
 /**
+ * The 👀 acknowledgement tells a human their message to the persona landed. In
+ * a group room most steers are ambient chatter the persona merely reads, so only
+ * a message that explicitly addressed it (a mention, or any DM) gets one; bot
+ * authors never do. A row without engagement metadata (non-chat) gets none.
+ */
+function steerAddressedPersona(steered: InboundMessageRow): boolean {
+	if (!steered.engagement_json) return false;
+	const engagement = JSON.parse(steered.engagement_json) as Partial<EngagementContext>;
+	if (engagement.authorIsBot === true) return false;
+	return engagement.mentioned === true || engagement.group === false;
+}
+
+/**
  * A steer lands inside a running turn whose model may take minutes to say
  * anything (a folded foreground wait, a long tool). The owner must see at once
  * that the message arrived, independent of the model: the gateway acknowledges
@@ -2413,6 +2427,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 	try {
 		const origin = validateOriginRef(JSON.parse(steered.origin_ref_json) as OriginRef);
 		if (!isChatPlatform(origin.platform)) return;
+		if (!steerAddressedPersona(steered)) return;
 		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");

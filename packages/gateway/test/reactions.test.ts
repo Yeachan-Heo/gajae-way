@@ -91,7 +91,13 @@ async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 	return { client, database, turns, steers: sessionPort.steers };
 }
 
-function sendMessage(client: Client, id: string, text = "형님 이거 봐주세요", messageId = "m1"): void {
+function sendMessage(
+	client: Client,
+	id: string,
+	text = "형님 이거 봐주세요",
+	messageId = "m1",
+	engagement: Record<string, unknown> = { mentioned: true, group: true, authorId: "human-1", authorName: "형님" },
+): void {
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -101,7 +107,7 @@ function sendMessage(client: Client, id: string, text = "형님 이거 봐주세
 			origin: ORIGIN,
 			text,
 			messageId,
-			engagement: { mentioned: true, group: true, authorId: "human-1", authorName: "형님" },
+			engagement,
 		},
 	});
 }
@@ -139,6 +145,31 @@ test("an accepted steer is acknowledged with 👀 on the steered message at once
 	await settle();
 	expect(reactionEvents(client.frames)).toHaveLength(1);
 });
+
+// Live 2026-09-27: every ambient (untagged) steer in an open room got 👀, so the
+// persona looked like it was reacting to chatter it was only reading.
+for (const [label, engagement] of [
+	["untagged human", { mentioned: false, group: true, authorId: "human-2", authorName: "누군가" }],
+] as const) {
+	test(`a steer from an ${label} is steered but not acknowledged with 👀`, async () => {
+		let finish!: () => void;
+		const running = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		const { client, turns, steers } = await gateway("done", running);
+		sendMessage(client, "c1", "first", "m1");
+		for (let attempt = 0; attempt < 200 && turns.length === 0; attempt++) await Bun.sleep(5);
+		sendMessage(client, "c2", "ambient chatter", "m2", engagement);
+		for (let attempt = 0; attempt < 200 && steers.length === 0; attempt++) await Bun.sleep(5);
+		await settle();
+		try {
+			expect(steers).toHaveLength(1);
+			expect(reactionEvents(client.frames)).toHaveLength(0);
+		} finally {
+			finish();
+		}
+	});
+}
 
 test("the model's own [REACT:👀] on a steered message the gateway already acknowledged is not delivered twice", async () => {
 	let finish!: () => void;
