@@ -668,6 +668,8 @@ export class MonitorPropagator {
 		let boundSessionId: string | undefined;
 		let boundSessionEpoch: number | undefined;
 		let dispatchPhase = "bind";
+		let dispatchOperation: string | undefined;
+		let dispatchOperationArgs: Record<string, unknown> | undefined;
 		// Registered before the per-origin queue: an event still waiting for its
 		// turn is just as interrupted by a shutdown as one mid-request.
 		for (const row of claimed)
@@ -701,6 +703,11 @@ export class MonitorPropagator {
 				const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
 				const effectiveModel = (monitor.model as GjcModelSelection | undefined) ?? this.#model;
 				const effectiveServiceTier = (monitor.serviceTier as GjcServiceTier | undefined) ?? this.#serviceTier;
+				dispatchOperation = "bind";
+				dispatchOperationArgs = {
+					epoch: boundEpoch,
+					hasModel: effectiveModel !== undefined,
+				};
 				const binding = await this.#sessionPort.bind({
 					originKey: sessionOriginKey,
 					epoch: boundEpoch,
@@ -717,12 +724,20 @@ export class MonitorPropagator {
 						: `preset:${effectiveModel.preset}`
 					: undefined;
 				if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+					dispatchOperation = "setModel";
+					dispatchOperationArgs = {
+						model: modelKey,
+					};
 					await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
 					this.#appliedModels.set(sessionId, modelKey!);
 				} else if (effectiveModel && binding.startupModelApplied) {
 					this.#appliedModels.set(sessionId, modelKey!);
 				}
 				if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
+					dispatchOperation = "setServiceTier";
+					dispatchOperationArgs = {
+						tier: effectiveServiceTier,
+					};
 					await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
 					this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
 				}
@@ -737,6 +752,10 @@ export class MonitorPropagator {
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
 				dispatchPhase = "request";
+				dispatchOperation = "request";
+				dispatchOperationArgs = {
+					opRef,
+				};
 				const response = (
 					await this.#sessionPort.request({
 						sessionId,
@@ -901,7 +920,7 @@ export class MonitorPropagator {
 						batchId,
 						code,
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
-						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
+						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 						now(),
 					);
 					if (failed) this.#emitStage(row, "failed");
