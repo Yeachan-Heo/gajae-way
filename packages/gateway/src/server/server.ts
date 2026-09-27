@@ -1049,8 +1049,9 @@ async function handleRequest(
 		case "memory.autolink": {
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
+			// Runs through shared lock to serialize with intent commits (#341).
 			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root);
+			const report = await autolinkCorpus(root, runtime.memory);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
 			return;
 		}

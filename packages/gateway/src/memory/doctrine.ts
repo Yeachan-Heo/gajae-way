@@ -35,6 +35,33 @@ function gitEnv(): Record<string, string> {
  */
 const gitChains = new Map<string, Promise<void>>();
 
+export class CorpusWriter {
+	readonly #root: string;
+	constructor(root: string) { this.#root = root; }
+	async stageFiles(...paths: string[]): Promise<void> {
+		for (const path of paths) await memoryGit(this.#root, ["add", path]);
+	}
+	async commit(message: string, trailer?: string): Promise<string | undefined> {
+		const msg = trailer ? `${message}\n\n${trailer}` : message;
+		try {
+			await memoryGit(this.#root, ["commit", "-m", msg]);
+			return (await memoryGit(this.#root, ["rev-parse", "HEAD"])).trim();
+		} catch (error) {
+			if (error instanceof Error && error.message.includes("nothing to commit")) return undefined;
+			throw error;
+		}
+	}
+	async findCommitByTrailer(trailer: string): Promise<string | undefined> {
+		try {
+			const output = await memoryGit(this.#root, ["log", "--format=%H", "--grep", trailer]);
+			return output.split("\n").find(Boolean);
+		} catch (error) {
+			if (error instanceof Error && error.message.includes("does not have any commits")) return undefined;
+			throw error;
+		}
+	}
+}
+
 /** Runs `work` after every earlier call on the same `root` in `chains` has settled. */
 async function serializedOnRoot<T>(
 	chains: Map<string, Promise<void>>,
@@ -433,6 +460,7 @@ export async function appendDaily(
 	originRefJson: string,
 	userText: string,
 	replyText: string,
+	intentId?: string,
 ): Promise<string> {
 	const date = new Date().toISOString().slice(0, 10);
 	// Resolved, never hardcoded: a deployment that re-roots the capture axis in
@@ -447,7 +475,8 @@ export async function appendDaily(
 			.slice(0, 500)
 			.replaceAll("\u0000", "")
 			.replaceAll(/\r\n|\r|\n/g, "\\n");
-	const entry = `\n## ${new Date().toISOString()}\n\n- origin: ${bounded(originRefJson)}\n- user: ${bounded(userText)}\n- reply: ${bounded(replyText)}\n`;
+	const intentMarker = intentId ? `- intent-id: ${intentId}\n` : "";
+	const entry = `\n## ${new Date().toISOString()}\n\n- origin: ${bounded(originRefJson)}\n${intentMarker}- user: ${bounded(userText)}\n- reply: ${bounded(replyText)}\n`;
 	await appendFile(path, entry, { encoding: "utf8" });
 	await regenerateMap(root, registry);
 	return relative(root, path).replaceAll("\\", "/");

@@ -2,7 +2,7 @@ import { appendFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "../store/db";
-import { appendDaily, initializeMemory, memoryGit } from "./doctrine";
+import { appendDaily, CorpusWriter, initializeMemory, memoryGit } from "./doctrine";
 
 export interface DailyCaptureMutation {
 	readonly kind: "daily_capture" | "monitor-event";
@@ -36,6 +36,8 @@ export class MemoryClosureQueue {
 	failures = 0;
 	#initializing: Promise<RecoveryReport> | undefined;
 	readonly recovery: RecoveryReport = { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 };
+	/** Corpus commit lock: serializes all writes through one queue (#341). */
+	readonly #corpusLocks: Map<string, Promise<void>> = new Map();
 
 	constructor(database: GatewayDatabase, home: string) {
 		this.#database = database;
@@ -133,6 +135,31 @@ export class MemoryClosureQueue {
 		await this.#tail;
 	}
 
+	/**
+	 * Serialize work through the corpus lock. Intent processing and autolink
+	 * coordinate commits to prevent races (#341).
+	 */
+	async coordinateCommit<T>(root: string, work: () => Promise<T>): Promise<T> {
+		const previous = this.#corpusLocks.get(root) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const current = previous.then(() => gate);
+		this.#corpusLocks.set(root, current);
+		await previous;
+		try {
+			return await work();
+		} finally {
+			release();
+			if (this.#corpusLocks.get(root) === current) this.#corpusLocks.delete(root);
+		}
+	}
+
+	getWriter(root: string): CorpusWriter {
+		return new CorpusWriter(root);
+	}
+
 	async #recover(intent: Intent): Promise<void> {
 		if (intent.state === "queued") this.recovery.queued++;
 		if (intent.state === "written") this.recovery.written++;
@@ -146,29 +173,53 @@ export class MemoryClosureQueue {
 		const root = await initializeMemory(this.#home);
 		const mutation = this.#parse(intent);
 		let state = intent.state;
+		let writtenPath: string | undefined;
+
+		// Before lock: appendDaily if needed (pass intent ID as unique marker)
 		if (state === "queued") {
-			await appendDaily(root, mutation.originRefJson, mutation.userText, mutation.replyText);
+			writtenPath = await appendDaily(
+				root,
+				mutation.originRefJson,
+				mutation.userText,
+				mutation.replyText,
+				intent.id,
+			);
 			this.#database.memoryIntentUpdate(intent.id, "written");
 			state = "written";
 			this.#kill("after-write");
 		}
+
 		const existing = await this.#commitFor(root, intent.id);
 		let commit = existing;
 		if (!commit) {
 			if (state !== "written") throw new Error(`memory intent ${intent.id} lacks recoverable written evidence`);
-			// Stage the whole corpus, not just the capture axis. Every registered axis —
-			// built-in, custom, or an axis a human curated by hand — is memory, so a
-			// reflection or an ops rule written between two captures would otherwise stay
-			// permanently untracked and drop out of the Git history the doctrine promises
-			// to review. Naming axes here would also silently miss any axis added later.
-			await memoryGit(root, ["add", "--all", "."]);
-			await memoryGit(root, ["commit", "-m", `Memory mutation\n\nGajaeway-Mutation-Id: ${intent.id}`]);
-			commit = await this.#commitFor(root, intent.id);
-			if (!commit) throw new Error(`memory intent ${intent.id} commit trailer missing`);
+
+			// Inside lock: serialize to prevent #341 (autolink + intent races)
+			commit = await this.coordinateCommit(root, async () => {
+				const writer = this.getWriter(root);
+				const trailer = `Gajaeway-Mutation-Id: ${intent.id}`;
+
+				// Stage everything (intent paths + any concurrent changes) and commit atomically
+				// The lock ensures autolink + intent don't race (#341)
+				await memoryGit(root, ["add", "--all", "."]);
+				const intentCommit = await writer.commit(`Memory mutation`, trailer);
+
+				// If nothing to commit, content already in HEAD (recovery case):
+				// find by intent ID marker in the entry
+				if (!intentCommit) {
+					const found = await writer.findCommitByTrailer(`intent-id: ${intent.id}`);
+					if (!found) throw new Error(`memory intent ${intent.id} content not found`);
+					return found;
+				}
+
+				return intentCommit;
+			});
+
 			this.#database.memoryIntentUpdate(intent.id, "committed");
 			state = "committed";
 			this.#kill("after-commit");
 		}
+
 		if (state !== "receipted") {
 			if (!(await this.#hasReceipt(intent.id))) {
 				await appendFile(
