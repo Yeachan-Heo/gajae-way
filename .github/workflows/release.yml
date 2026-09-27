@@ -53,15 +53,20 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
+      # npm >= 11.5.1 authenticates to the registry with this job's GitHub
+      # OIDC token (trusted publishing, configured per package on npmjs.com)
+      # and attaches provenance. No NPM_TOKEN or .npmrc is involved; do not
+      # set setup-node's registry-url, which writes a token-based .npmrc.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
       # Publishes @gajae-gateway/protocol, @gajae-gateway/sdk, and @gajae-gateway/cli in
       # dependency order via scripts/release-packages.ts --publish. The
       # script never touches the registry unless --publish is explicit.
       - name: Publish protocol, sdk, cli (dependency order)
-        env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NPM_CONFIG_TOKEN}" > ~/.npmrc
           TAG="${{ github.event.inputs.npm_tag }}"
           if [ -z "$TAG" ]; then TAG="latest"; fi
           bun run release:publish -- --tag "$TAG"
