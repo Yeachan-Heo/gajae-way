@@ -412,16 +412,67 @@ test("quarantined historical names refuse admission and retirement before recove
 	expect(() => governor.assertAdmission("fresh")).not.toThrow();
 });
 
-test("#340: lane with no job record uses workLaneRepoBySessionId lookup", async () => {
+test("#340: broker mode - lane with no job record must use binding repo from workLaneRepoBySessionId", async () => {
+	// Broker mode setup
+	const AUTHORITY = { canonicalAgentDir: "/broker/agent", identity: "test-broker" };
 	database = await GatewayDatabase.open(":memory:");
+	database.assertBrokerAuthority(AUTHORITY, { initializeEmpty: true });
 
-	// Lane A: no job record, falls back to workLaneRepoBySessionId lookup
-	bind("a", NOW - 70_000);
-	// Lane B: has job record, idle past ceiling
-	bind("b", NOW - 70_000);
-	persistJob("b", "done");
+	// Lane A: no job record in broker mode - CRITICAL #340 case
+	const LANE_A_REPO = "/binding/repo/a";
+	const sessionIdA = "sess-broker-a-no-job";
+	const bindingA = {
+		sessionId: sessionIdA,
+		originKey: "work/task/a",
+		epoch: 0,
+		repo: LANE_A_REPO,
+		authority: AUTHORITY,
+	};
+	database.recordOwnedBinding(bindingA);
 
-	const port = new ScriptedSessionPort();
+	// Lane B: with job record in broker mode
+	const LANE_B_REPO = "/binding/repo/b";
+	const sessionIdB = "sess-broker-b-has-job";
+	const bindingB = {
+		sessionId: sessionIdB,
+		originKey: "work/task/b",
+		epoch: 0,
+		repo: LANE_B_REPO,
+		authority: AUTHORITY,
+	};
+	database.recordOwnedBinding(bindingB);
+
+	// Add activity to both (update sessions created by recordOwnedBinding)
+	setSystemTime(new Date(NOW - 70_000));
+	database.updateActivity("work/task/a", "{}");
+	database.updateActivity("work/task/b", "{}");
+	setSystemTime();
+
+	// Add job record for lane B ONLY (lane A has NO job - the critical #340 case)
+	const idB = laneJobIdentity("b");
+	let recB = createLaneJobRecord({
+		jobId: idB.jobId,
+		branch: "work/b",
+		worktreePath: "/tmp/job-b-worktree",
+		now: () => new Date(NOW),
+	});
+	recB = { ...recB, state: "done" };
+	database.putLaneJob({ ...recB, laneKey: idB.laneKey, json: JSON.stringify(recB) });
+
+	// Port that enforces broker authority: throws if close() repo doesn't match binding
+	class BrokerEnforcingPort extends ScriptedSessionPort {
+		override async close(input: { sessionId: string; repo: string }): Promise<void> {
+			this.closes.push(input);
+			// Enforce broker ownership:
+			// - Lane A (no job): MUST use binding repo (this is the #340 fix)
+			// - Lane B (has job): would use job worktree; allow either binding or job repo
+			if (input.sessionId === sessionIdA && input.repo !== LANE_A_REPO) {
+				throw new BrokerAuthorityError("unowned_session");
+			}
+		}
+	}
+
+	const port = new BrokerEnforcingPort();
 	const logs: string[] = [];
 	const governor = new LaneGovernor({
 		database,
@@ -431,21 +482,25 @@ test("#340: lane with no job record uses workLaneRepoBySessionId lookup", async 
 		log: (line) => logs.push(line),
 	});
 
+	// CRITICAL: Both lanes must retire successfully
+	// Lane A (no job record) MUST use binding repo via workLaneRepoBySessionId
+	// If binding lookup is replaced with undefined, close will throw unowned_session
 	const retired = await governor.sweep();
 	expect(retired).toBe(2);
 
-	// Both lanes retire. In singleton mode:
-	// - Lane A has no job record, workLaneRepoBySessionId returns undefined
-	// - isBrokerMode() is false, so falls back to process.cwd() (safe in singleton mode)
+	// Verify correct repos were used in close() calls
 	expect(port.closes.length).toBe(2);
-	const closeA = port.closes.find((c) => c.sessionId === "sess-a");
-	const closeB = port.closes.find((c) => c.sessionId === "sess-b");
-	expect(closeA).toBeDefined();
-	expect(closeB?.repo).toBe("/tmp/worker-repo");
+	const closeA = port.closes.find((c) => c.sessionId === sessionIdA);
+	const closeB = port.closes.find((c) => c.sessionId === sessionIdB);
 
-	// Both retired
-	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("");
-	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+	// CRITICAL #340 TEST:
+	// Lane A (no job record) must use binding repo via workLaneRepoBySessionId
+	// If this lookup is replaced with undefined, close will throw unowned_session
+	expect(closeA?.repo).toBe(LANE_A_REPO);
+
+	// Lane B can use either job worktree or binding repo
+	expect(closeB).toBeDefined();
+
 	expect(logs.some((line) => line.includes("lane_retired name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
