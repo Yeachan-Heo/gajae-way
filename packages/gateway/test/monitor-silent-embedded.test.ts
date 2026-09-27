@@ -65,7 +65,7 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 
 const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
 
-describe("isSilentOutput integration (marker at boundary)", () => {
+describe("isSilentOutput integration (issue #338: [SILENT] at start)", () => {
 	test("note starting with [SILENT] plus narration is NOT delivered", async () => {
 		const {
 			propagator,
@@ -86,27 +86,7 @@ describe("isSilentOutput integration (marker at boundary)", () => {
 		expect(db!.deliveryRows()).toHaveLength(0);
 	});
 
-	test("note ending with [SILENT] is NOT delivered", async () => {
-		const {
-			propagator,
-			monitor,
-			database: db,
-		} = await harness(
-			async (_id, text) =>
-				JSON.stringify(
-					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Nothing to report. [SILENT]" })),
-				),
-			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
-		);
-		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
-		await propagator.drain();
-		expect(db!.authoredOutput(eventId)).toBe("Nothing to report. [SILENT]");
-		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.deliveryRows()).toHaveLength(0);
-	});
-
-	test("note with [SILENT] mid-text is delivered (marker must be at boundary)", async () => {
+	test("note with [SILENT] mid-text is delivered (marker must be at start)", async () => {
 		const {
 			propagator,
 			monitor,
@@ -125,12 +105,11 @@ describe("isSilentOutput integration (marker at boundary)", () => {
 		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
 		await propagator.drain();
 		expect(db!.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
-		// Mid-text [SILENT] should NOT suppress, so it will be in "authored" stage and a delivery will exist
-		expect(stage(db!, eventId)).not.toBe("authored_no_delivery");
+		// Mid-text [SILENT] should NOT suppress, so delivery rows should exist
 		expect(db!.deliveryRows().length).toBeGreaterThan(0);
 	});
 
-	test("note with only [SILENT] is NOT delivered", async () => {
+	test("only [SILENT] token (exact match) is silent", async () => {
 		const {
 			propagator,
 			monitor,

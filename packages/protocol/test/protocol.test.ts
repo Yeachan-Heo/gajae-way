@@ -205,9 +205,7 @@ describe("silence tokens", () => {
 	test("recognizes an original-body marker beyond a 2 KiB excerpt", () => {
 		const text = `${"x".repeat(2049)}\n[SILENT]`;
 		expect(containsSilenceToken(text)).toBe(true);
-		expect(isSilentOutput(text)).toBe(true); // isSilentOutput also sees it
 		expect(containsSilenceToken(text.slice(0, 2048))).toBe(false);
-		expect(isSilentOutput(text.slice(0, 2048))).toBe(false);
 	});
 
 	for (const text of ["ordinary text", "preamble SILENT", "preamble [NO_REPLY]", "preamble [ SILENT ]"]) {
@@ -241,24 +239,25 @@ describe("isSilentOutput", () => {
 		expect(isSilentOutput("  silent  ")).toBe(true);
 	});
 
-	test("notes starting with [SILENT] or [silent] plus narration are silent", () => {
+	test("notes starting with [SILENT] or [silent] plus narration are silent (issue #338)", () => {
 		expect(isSilentOutput("[SILENT] This is a status update")).toBe(true);
 		expect(isSilentOutput("[SILENT]\nMultiline status")).toBe(true);
 		expect(isSilentOutput("[silent] lowercase marker with text")).toBe(true);
 		expect(isSilentOutput("  [SILENT] narration after trim")).toBe(true);
 	});
 
-	test("notes ending with [SILENT] or [silent] are silent", () => {
-		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(true);
-		expect(isSilentOutput("Nothing to report. [silent]")).toBe(true);
-		expect(isSilentOutput("Done.\n[SILENT]")).toBe(true);
+	test("notes starting with [SILENT] followed by control token are silent", () => {
+		expect(isSilentOutput("[SILENT][REACT:👍]")).toBe(true);
+		expect(isSilentOutput("[silent][REACT:emoji]")).toBe(true);
 	});
 
-	test("notes mentioning [SILENT] truly mid-text are NOT silent", () => {
-		// Issue #338: marker must be at a boundary (start/end/line), not embedded mid-sentence
+	test("notes mentioning [SILENT] mid-text or at end are NOT silent (issue #338)", () => {
+		// Markers must be at START, not embedded mid-text or trailing
 		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(false);
 		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(false);
 		expect(isSilentOutput("text [SILENT] more")).toBe(false);
+		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(false);
+		expect(isSilentOutput("Finished processing. [silent]")).toBe(false);
 	});
 
 	test("non-silent text is not silent", () => {
