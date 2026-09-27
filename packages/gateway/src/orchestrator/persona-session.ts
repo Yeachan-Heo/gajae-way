@@ -80,6 +80,11 @@ export interface PersonaTurnLifecycle {
 	/** Legacy/send-time fallback only; persistent persona turns leave this unset. */
 	readonly sendModelFallback?: GjcModelSelection;
 	/**
+	 * Message IDs that are included in this turn's unread context.
+	 * Used to prevent double-delivery when a message in context is also steered.
+	 */
+	readonly contextMessageIds?: ReadonlySet<string>;
+	/**
 	 * Renders a message that arrives while this turn runs into the steer text.
 	 * Owns the same speaker/place/reply header as the trigger so the model can
 	 * tell who spoke; the actor wraps the result with the steer framing.
@@ -1493,6 +1498,14 @@ class OriginActor {
 			this.#quarantinedTurn(current.turn.opRef)
 		)
 			return false;
+		// If this message is already in the turn's unread context, skip steering it to
+		// prevent the model from seeing it twice (once in context, once as a steer).
+		if (current.lifecycle.contextMessageIds?.has(row.message_id)) {
+			this.#manager.log(
+				`steer_skip origin=${this.originKey} message=${row.message_id} reason=already_in_context`,
+			);
+			return true; // Continue to next message
+		}
 		{
 			assertControlAllowed("turn.steer", { operatorApproval: true });
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, current.epoch, row.message_id);
