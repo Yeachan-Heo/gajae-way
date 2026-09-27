@@ -92,6 +92,63 @@ test("bind failure includes operation details in error report", async () => {
 	}
 });
 
+test("bind failure events are marked as failed (not failed_no_retry) for re-dispatch", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-refirer-"));
+	try {
+		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "refirer-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.refirer"],
+			burstPolicy: "serialize",
+		});
+
+		const failingPort: Partial<SessionPort> = {
+			bind: async () => {
+				throw new GjcCliError("session bind failed", 0, "", { code: "operation_failed" });
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: failingPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(database)),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.refirer", {});
+
+		// Wait for first dispatch attempt to fail
+		for (let i = 0; i < 100; i++) {
+			const row = database.monitorEventRows().find((r) => r.event_id === eventId);
+			if (row?.stage === "failed") break;
+			await Bun.sleep(10);
+		}
+
+		const failedRow = database.monitorEventRows().find((r) => r.event_id === eventId);
+		// The critical check: dispatch-phase failures mark event as "failed", not "failed_no_retry"
+		// This means reconcile WILL re-fire the event
+		expect(failedRow?.stage).toBe("failed");
+		// dispatch_attempts starts at 0, incremented when dispatch is retried
+		expect((failedRow?.dispatch_attempts ?? -1) >= 0).toBe(true);
+		// Verify failure is recorded with operation details
+		const failure = database.monitorFailure(eventId);
+		expect(failure?.code).toBe("session_bind_failed");
+		expect(failure?.detail).toContain("operation");
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("setModel failure includes operation details in error report", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-setmodel-fail-"));
 	try {

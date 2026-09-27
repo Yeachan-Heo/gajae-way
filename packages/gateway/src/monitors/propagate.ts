@@ -1398,6 +1398,9 @@ function failureDetail(error: unknown): string {
 		error instanceof Error && error.stack
 			? frameNames.find((candidate) => error.stack?.split("\n").some((line) => line.includes(candidate)))
 			: undefined;
+	// Note: error messages contain secrets and cannot be safely persisted; use failureDetail
+	// diagnostics (code, cause, frame) instead. Child error messages would require aggressive
+	// redaction; existing tests verify raw messages are never persisted (see monitor-recovery.test.ts).
 	return JSON.stringify({
 		class: name,
 		...(code ? { code } : {}),
