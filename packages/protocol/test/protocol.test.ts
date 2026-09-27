@@ -8,6 +8,7 @@ import {
 	FrameDecoder,
 	isChatPlatform,
 	isSilenceToken,
+	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	MAX_FRAME_BYTES,
 	negotiate,
@@ -204,20 +205,20 @@ describe("silence tokens", () => {
 	test("recognizes an original-body marker beyond a 2 KiB excerpt", () => {
 		const text = `${"x".repeat(2049)}\n[SILENT]`;
 		expect(containsSilenceToken(text)).toBe(true);
+		expect(isSilentOutput(text)).toBe(true); // isSilentOutput also sees it
 		expect(containsSilenceToken(text.slice(0, 2048))).toBe(false);
+		expect(isSilentOutput(text.slice(0, 2048))).toBe(false);
 	});
 
-	for (const text of [
-		"ordinary text",
-		"preamble SILENT",
-		"preamble [Silent]",
-		"preamble [NO_REPLY]",
-		"preamble [ SILENT ]",
-	]) {
+	for (const text of ["ordinary text", "preamble SILENT", "preamble [NO_REPLY]", "preamble [ SILENT ]"]) {
 		test(`does not broaden embedded grammar for ${JSON.stringify(text)}`, () => {
 			expect(containsSilenceToken(text)).toBe(false);
 		});
 	}
+
+	test(`embedded [Silent] is not recognized (case-sensitive)`, () => {
+		expect(containsSilenceToken("preamble [Silent]")).toBe(false);
+	});
 
 	for (const text of ["SILENT", "[SILENT]", "silent", "NO_REPLY", "NO REPLY", "[NO_REPLY]", "[NO REPLY]"]) {
 		test(`preserves exact-body alias ${text}`, () => {
@@ -225,4 +226,50 @@ describe("silence tokens", () => {
 			expect(isSilenceToken(`  ${text}\n`)).toBe(true);
 		});
 	}
+});
+
+describe("isSilentOutput", () => {
+	test("unifies exact-match tokens and embedded markers", () => {
+		// Exact-match: [SILENT], SILENT, NO_REPLY, NO REPLY (case-insensitive, with brackets optional)
+		expect(isSilentOutput("[SILENT]")).toBe(true);
+		expect(isSilentOutput("[Silent]")).toBe(true); // Case-insensitive when bracketed
+		expect(isSilentOutput("SILENT")).toBe(true);
+		expect(isSilentOutput("silent")).toBe(true);
+		expect(isSilentOutput("NO_REPLY")).toBe(true);
+		expect(isSilentOutput("NO REPLY")).toBe(true);
+		expect(isSilentOutput("[NO_REPLY]")).toBe(true);
+		expect(isSilentOutput("[NO REPLY]")).toBe(true);
+		// Whitespace and case variants
+		expect(isSilentOutput("  [SILENT]\n")).toBe(true);
+		expect(isSilentOutput("  silent  ")).toBe(true);
+		expect(isSilentOutput("\tNO REPLY\t")).toBe(true);
+	});
+
+	test("recognizes embedded [SILENT] or [silent] markers with narration", () => {
+		// Embedded markers in the middle of text are recognized
+		expect(isSilentOutput("preamble [SILENT]")).toBe(true);
+		expect(isSilentOutput("preamble\n[SILENT]\npostscript")).toBe(true);
+		expect(isSilentOutput("[SILENT] postscript")).toBe(true);
+		expect(isSilentOutput("preamble [silent] postscript")).toBe(true);
+		// Exact case for embedded markers
+		expect(isSilentOutput("[silent]")).toBe(true);
+		expect(isSilentOutput("text [SILENT] more text")).toBe(true);
+	});
+
+	test("rejects non-silent text containing [SILENT] mid-string", () => {
+		// These should NOT match
+		expect(isSilentOutput("preamble [NO_REPLY]")).toBe(false); // Only [SILENT] or [silent] is recognized as embedded
+		expect(isSilentOutput("preamble SILENT")).toBe(false); // Not bracketed and contains other text
+		expect(isSilentOutput("preamble [ SILENT ]")).toBe(false); // Extra spaces inside brackets
+	});
+
+	test("distinguishes silent from non-silent output", () => {
+		expect(isSilentOutput("ordinary text")).toBe(false);
+		expect(isSilentOutput("hello world")).toBe(false);
+		expect(isSilentOutput("")).toBe(false);
+		expect(isSilentOutput("This is a real response")).toBe(false);
+		expect(isSilentOutput("silent")).toBe(true); // Exact-match token (case-insensitive)
+		expect(isSilentOutput("[SILENT]")).toBe(true); // Exact-match token
+		expect(isSilentOutput("text [silent] more")).toBe(true); // Embedded marker
+	});
 });
