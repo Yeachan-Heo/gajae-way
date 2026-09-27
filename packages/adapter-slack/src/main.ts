@@ -397,6 +397,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	#monitorTimer: ReturnType<typeof setTimeout> | undefined;
 	#connectionGeneration = 0;
+	#stopped = false;
 
 	/** Runs after every successful (re)connect: recovery re-walks the gap the outage left. */
 	onConnected: (() => void) | undefined;
@@ -409,6 +410,8 @@ export class ReconnectingGateway implements GatewayClientLike {
 		initialClient?: GatewayClientLike,
 		readonly status?: WorkingStatus,
 		readonly mentions?: MentionDirectory,
+		private readonly monitorIntervals = { healthy: 30_000, degraded: 5_000 },
+		private readonly reconnectDelayMs = 500,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
 	}
@@ -463,17 +466,18 @@ export class ReconnectingGateway implements GatewayClientLike {
 	}
 
 	async connect(): Promise<void> {
+		if (this.#stopped) return;
 		const generation = ++this.#connectionGeneration;
 		try {
 			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-slack" });
-			if (generation !== this.#connectionGeneration) {
+			if (generation !== this.#connectionGeneration || this.#stopped) {
 				await client.close();
 				return;
 			}
 			this.adoptClient(client);
 			console.log("Slack adapter connected to gateway.");
 		} catch {
-			if (generation === this.#connectionGeneration) this.scheduleReconnect();
+			if (generation === this.#connectionGeneration && !this.#stopped) this.scheduleReconnect();
 		}
 	}
 
@@ -631,20 +635,20 @@ export class ReconnectingGateway implements GatewayClientLike {
 	private monitor(client: GatewayClientLike, strikes = 0): void {
 		this.#monitorTimer = setTimeout(
 			() => {
-				if (this.#client !== client) return;
+				if (this.#client !== client || this.#stopped) return;
 				void client.request("gateway.status").then(
 					() => {
-						if (this.#client === client) this.monitor(client);
+						if (this.#client === client && !this.#stopped) this.monitor(client);
 					},
 					() => {
-						if (this.#client !== client) return;
+						if (this.#client !== client || this.#stopped) return;
 						const next = monitorFailureDecision(strikes);
 						if (next.action === "reconnect") this.scheduleReconnect();
 						else this.monitor(client, next.strikes);
 					},
 				);
 			},
-			strikes === 0 ? 30_000 : 5_000,
+			strikes === 0 ? this.monitorIntervals.healthy : this.monitorIntervals.degraded,
 		);
 		this.#monitorTimer.unref?.();
 	}
@@ -656,7 +660,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#client = undefined;
 		this.#deliveryOff?.();
 		clearTimeout(this.#monitorTimer);
-		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
+		const delay = Math.min(30_000, this.reconnectDelayMs * 2 ** Math.min(this.#attempt++, 6));
 		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
 		console.log(`Slack adapter gateway reconnecting in ${delay + jitter}ms.`);
 		this.#reconnectTimer = setTimeout(() => {
@@ -664,6 +668,12 @@ export class ReconnectingGateway implements GatewayClientLike {
 			void this.connect();
 		}, delay + jitter);
 		this.#reconnectTimer.unref?.();
+	}
+
+	stop(): void {
+		this.#stopped = true;
+		clearTimeout(this.#monitorTimer);
+		clearTimeout(this.#reconnectTimer);
 	}
 }
 

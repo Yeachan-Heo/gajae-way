@@ -171,11 +171,12 @@ async function fixture(
 	// so the fixture's own adoptClient cannot race their counts.
 	if (options.autoRecover === false) adapter.gateway.onConnected = undefined;
 	adapter.gateway.adoptClient(gateway);
-	// One stop covers both background loops so no test can leak a scheduler.
+	// One stop covers all background loops and timers so no test can leak a scheduler.
 	const socket = { ...adapter.socket, stop: () => {} };
 	const stopAll = () => {
 		adapter.socket.stop();
 		adapter.recovery.stop();
+		adapter.gateway.stop();
 	};
 	return {
 		...adapter,
@@ -697,6 +698,50 @@ test("Slack monitor tolerates two strikes and reconnects on the third", () => {
 	expect(monitorFailureDecision(0)).toEqual({ action: "retry", strikes: 1 });
 	expect(monitorFailureDecision(1)).toEqual({ action: "retry", strikes: 2 });
 	expect(monitorFailureDecision(2)).toEqual({ action: "reconnect" });
+});
+
+test("Slack adapter stop clears monitor and reconnect timers", async () => {
+	const logs: string[] = [];
+	const originalLog = console.log;
+	console.log = (message: unknown) => {
+		logs.push(String(message));
+		originalLog.call(console, message);
+	};
+	try {
+		// Create a gateway with short monitor intervals and reconnect delay for testing
+		const api = new Api();
+		const gateway = new ReconnectingGateway(
+			"/tmp/unused.sock",
+			api,
+			undefined,
+			undefined,
+			undefined,
+			{ healthy: 10, degraded: 5 }, // Short monitor intervals for testing
+			10, // 10ms base reconnect delay (fast enough to fire during test)
+		);
+		const testClient = new Gateway();
+		// Make status requests fail to trigger reconnect after 3 strikes
+		testClient.failure = new Error("status failed");
+		// Adopt client to start monitor
+		gateway.adoptClient(testClient);
+		// Wait long enough for monitor to fire multiple times and trigger first reconnect
+		// (10ms interval * 3 strikes = 30ms, plus time for reconnect to trigger)
+		await Bun.sleep(40);
+		// Verify timer is actually running by confirming at least one reconnect message
+		const beforeStop = logs.filter((line) => line.includes("reconnecting")).length;
+		expect(beforeStop).toBeGreaterThan(0);
+		// Now stop the gateway (should clear timers)
+		gateway.stop();
+		// Wait long enough for timers to have fired multiple times if not stopped
+		// (10ms reconnect delay, so 50ms gives time for ~5+ reconnect cycles if timer continues)
+		await Bun.sleep(50);
+		// Verify no additional reconnecting messages after stop
+		const afterStop = logs.filter((line) => line.includes("reconnecting")).length;
+		// Confirm no new reconnecting messages appeared after stop
+		expect(afterStop).toBe(beforeStop);
+	} finally {
+		console.log = originalLog;
+	}
 });
 
 for (const command of ["/new", "/reset", "/restart", "/model", "/unknown"])
