@@ -221,7 +221,25 @@ export class LaneGovernor {
 				return { retired: false, sessionKey, reason: `lane no longer qualifies for ${expected.reason} retirement` };
 			const job = this.#job(name);
 			const record = job === "corrupt" ? undefined : job;
-			const repo = record?.lane.worktreePath ?? process.cwd();
+			// Try job record repo first, then owned binding repo, then process.cwd() fallback.
+			// In broker mode: if there's no job record and no owned binding, the lane is an orphan.
+			// In singleton mode: process.cwd() is safe (no broker enforcing repo matching).
+			let repo = record?.lane.worktreePath;
+			if (!repo) {
+				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+			}
+			if (!repo) {
+				// No job record and no owned binding repo.
+				// Check if we're in broker mode: if so, this is an orphan.
+				// If not, fall back to process.cwd() (safe in singleton mode).
+				if (this.#database.isBrokerMode()) {
+					// Broker mode: cannot close safely without knowing the repo.
+					this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
+					return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
+				}
+				// Singleton mode: safe to use process.cwd().
+				repo = process.cwd();
+			}
 			// The ledger's last attempt ended, but only the broker knows whether
 			// its operation actually reached a terminal state: a timed-out wait
 			// or a crash-left attempt may still be running.
@@ -237,7 +255,7 @@ export class LaneGovernor {
 				// this governor exists to prevent. Only broker liveness proving the
 				// session gone lets the binding clear.
 				const detail = sanitizeDiagnostic(diagnostic(error));
-				const liveness = await this.#liveness(lane.sessionId, repo);
+				const liveness = await this.#safeLiveness(lane.sessionId, repo);
 				if (liveness.live !== false && !liveness.disowned) {
 					this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=retained`);
 					return {
@@ -258,6 +276,7 @@ export class LaneGovernor {
 	 * Retires lanes whose job is terminal or that have been quiet past the idle
 	 * ceiling. The snapshot only nominates; `retire` re-proves the binding
 	 * identity and eligibility under the lane lock before closing anything.
+	 * Per-lane errors are caught and logged; one lane's failure does not abort the sweep.
 	 */
 	async sweep(now = this.#now()): Promise<number> {
 		if (this.#stopped) return 0;
@@ -265,8 +284,13 @@ export class LaneGovernor {
 		for (const lane of this.activeLanes(now)) {
 			const reason = this.#sweepReason(lane);
 			if (!reason) continue;
-			const outcome = await this.retire(lane.name, reason, { sessionId: lane.sessionId, reason, now });
-			if (outcome.retired) retired++;
+			try {
+				const outcome = await this.retire(lane.name, reason, { sessionId: lane.sessionId, reason, now });
+				if (outcome.retired) retired++;
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_retire_failed name=${lane.name} session=${lane.sessionId} reason=${detail}`);
+			}
 		}
 		return retired;
 	}
@@ -316,6 +340,21 @@ export class LaneGovernor {
 	async #liveness(sessionId: string, repo: string): Promise<{ live: boolean | undefined; disowned: boolean }> {
 		if (!this.#port.liveness) return { live: undefined, disowned: false };
 		return await this.#port.liveness({ sessionId, repo });
+	}
+
+	/**
+	 * Safe liveness probe: catches errors and logs them instead of throwing.
+	 * Errors are conservative: assume session is still alive (live: undefined).
+	 */
+	async #safeLiveness(sessionId: string, repo: string): Promise<{ live: boolean | undefined; disowned: boolean }> {
+		try {
+			return await this.#liveness(sessionId, repo);
+		} catch (error) {
+			const detail = sanitizeDiagnostic(diagnostic(error));
+			this.#log(`liveness_probe_failed session=${sessionId} repo=${repo} reason=${detail}`);
+			// Conservative: assume session still alive if we can't probe.
+			return { live: undefined, disowned: false };
+		}
 	}
 
 	/** `undefined` when no job row exists; `"corrupt"` when one exists but cannot be trusted. */

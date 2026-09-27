@@ -3117,6 +3117,23 @@ export class GatewayDatabase {
 			.all();
 	}
 
+	/** Check if this gateway is in broker mode (has an active broker authority). */
+	isBrokerMode(): boolean {
+		return this.#brokerAuthority() !== null;
+	}
+
+	/** Get the repo for a work lane by session ID from the owned binding, or undefined if not found. */
+	workLaneRepoBySessionId(sessionId: string): string | undefined {
+		const authority = this.#brokerAuthority();
+		if (!authority) return undefined;
+		const row = this.#database
+			.query<{ repo: string }, [string, string]>(
+				"SELECT repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
+			)
+			.get(brokerAuthorityKey(authority), sessionId);
+		return row?.repo;
+	}
+
 	putSession(originKey: string, sessionId: string): void {
 		if (this.#database.query("SELECT 1 FROM broker_authority").get()) throw new BrokerAuthorityError("unowned_session");
 		this.#database
