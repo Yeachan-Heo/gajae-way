@@ -38,10 +38,13 @@ export class MemoryClosureQueue {
 	readonly recovery: RecoveryReport = { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 };
 	/** Corpus commit lock: serializes all writes through one queue (#341). */
 	readonly #corpusLocks: Map<string, Promise<void>> = new Map();
+	/** Test hook: invoked after appendDaily, before commit (for #341 regression test). */
+	readonly #afterWrite?: () => Promise<void>;
 
-	constructor(database: GatewayDatabase, home: string) {
+	constructor(database: GatewayDatabase, home: string, options?: { afterWrite?: () => Promise<void> }) {
 		this.#database = database;
 		this.#home = home;
+		this.#afterWrite = options?.afterWrite;
 	}
 
 	get queueDepth(): number {
@@ -187,6 +190,8 @@ export class MemoryClosureQueue {
 			this.#database.memoryIntentUpdate(intent.id, "written");
 			state = "written";
 			this.#kill("after-write");
+			// Test hook: allow concurrent operations (e.g., autolink) to start between appendDaily and commit (#341)
+			if (this.#afterWrite) await this.#afterWrite();
 		}
 
 		const existing = await this.#commitFor(root, intent.id);
