@@ -8,7 +8,7 @@ import {
 	newOpRef,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
-import { GatewayDatabase } from "../src/store/db";
+import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
@@ -412,10 +412,10 @@ test("quarantined historical names refuse admission and retirement before recove
 	expect(() => governor.assertAdmission("fresh")).not.toThrow();
 });
 
-test("#340: lane with no job record retires with owned binding repo in singleton mode", async () => {
+test("#340: lane with no job record uses workLaneRepoBySessionId lookup", async () => {
 	database = await GatewayDatabase.open(":memory:");
 
-	// Lane A: no job record, falls back to owned binding lookup (which returns undefined in singleton mode)
+	// Lane A: no job record, falls back to workLaneRepoBySessionId lookup
 	bind("a", NOW - 70_000);
 	// Lane B: has job record, idle past ceiling
 	bind("b", NOW - 70_000);
@@ -434,20 +434,61 @@ test("#340: lane with no job record retires with owned binding repo in singleton
 	const retired = await governor.sweep();
 	expect(retired).toBe(2);
 
-	// Both lanes retire. In singleton mode (no broker authority):
-	// - Lane A has no job record, workLaneRepoBySessionId returns undefined,
-	//   isBrokerMode() is false, so falls back to process.cwd() (safe)
-	// - Lane B uses job record's repo
+	// Both lanes retire. In singleton mode:
+	// - Lane A has no job record, workLaneRepoBySessionId returns undefined
+	// - isBrokerMode() is false, so falls back to process.cwd() (safe in singleton mode)
 	expect(port.closes.length).toBe(2);
 	const closeA = port.closes.find((c) => c.sessionId === "sess-a");
 	const closeB = port.closes.find((c) => c.sessionId === "sess-b");
 	expect(closeA).toBeDefined();
-	expect(closeB?.repo).toBe("/tmp/worker-repo"); // From job record
+	expect(closeB?.repo).toBe("/tmp/worker-repo");
 
 	// Both retired
 	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("");
 	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
 	expect(logs.some((line) => line.includes("lane_retired name=a"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
+});
+
+test("#340: per-lane error handling continues sweep for remaining lanes", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane A: will fail during lock
+	bind("a", NOW - 70_000);
+	// Lane B: should retire despite A's error
+	bind("b", NOW - 70_000);
+	persistJob("b", "done");
+
+	class FailingLockPort extends ScriptedSessionPort {
+		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
+			if (key === "work/task/a") {
+				throw new Error("lock acquisition failed");
+			}
+			return await super.runExclusive(key, work);
+		}
+	}
+
+	const port = new FailingLockPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	const retired = await governor.sweep();
+	// Only B retired; A's error is caught and logged
+	expect(retired).toBe(1);
+
+	expect(port.closes.length).toBe(1);
+	expect(port.closes[0].sessionId).toBe("sess-b");
+
+	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+
+	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
 
