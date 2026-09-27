@@ -239,25 +239,17 @@ describe("isSilentOutput", () => {
 		expect(isSilentOutput("  silent  ")).toBe(true);
 	});
 
-	test("notes starting with [SILENT] or [silent] plus narration are silent (issue #338)", () => {
+	test("embedded [SILENT] or [silent] markers anywhere silence (issue #338: propagate.ts must use this)", () => {
+		// Leading markers
 		expect(isSilentOutput("[SILENT] This is a status update")).toBe(true);
 		expect(isSilentOutput("[SILENT]\nMultiline status")).toBe(true);
 		expect(isSilentOutput("[silent] lowercase marker with text")).toBe(true);
-		expect(isSilentOutput("  [SILENT] narration after trim")).toBe(true);
-	});
-
-	test("notes starting with [SILENT] followed by control token are silent", () => {
-		expect(isSilentOutput("[SILENT][REACT:👍]")).toBe(true);
-		expect(isSilentOutput("[silent][REACT:emoji]")).toBe(true);
-	});
-
-	test("notes mentioning [SILENT] mid-text or at end are NOT silent (issue #338)", () => {
-		// Markers must be at START, not embedded mid-text or trailing
-		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(false);
-		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(false);
-		expect(isSilentOutput("text [SILENT] more")).toBe(false);
-		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(false);
-		expect(isSilentOutput("Finished processing. [silent]")).toBe(false);
+		// Trailing markers
+		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(true);
+		expect(isSilentOutput("Finished processing. [silent]")).toBe(true);
+		// Mid-text markers
+		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(true);
+		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(true);
 	});
 
 	test("non-silent text is not silent", () => {
@@ -265,5 +257,7 @@ describe("isSilentOutput", () => {
 		expect(isSilentOutput("hello world")).toBe(false);
 		expect(isSilentOutput("")).toBe(false);
 		expect(isSilentOutput("This is a real response")).toBe(false);
+		// Case-sensitive embedded markers: [Silent], [silent] only, not mixed case
+		expect(isSilentOutput("preamble [Silent]")).toBe(false);
 	});
 });

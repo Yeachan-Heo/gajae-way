@@ -65,7 +65,7 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 
 const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
 
-describe("isSilentOutput integration (issue #338: [SILENT] at start)", () => {
+describe("isSilentOutput integration (issue #338: propagate.ts must use embedded marker grammar)", () => {
 	test("note starting with [SILENT] plus narration is NOT delivered", async () => {
 		const {
 			propagator,
@@ -86,7 +86,7 @@ describe("isSilentOutput integration (issue #338: [SILENT] at start)", () => {
 		expect(db!.deliveryRows()).toHaveLength(0);
 	});
 
-	test("note with [SILENT] mid-text is delivered (marker must be at start)", async () => {
+	test("note with [SILENT] mid-text is also NOT delivered (grammar: anywhere silences)", async () => {
 		const {
 			propagator,
 			monitor,
@@ -105,11 +105,12 @@ describe("isSilentOutput integration (issue #338: [SILENT] at start)", () => {
 		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
 		await propagator.drain();
 		expect(db!.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
-		// Mid-text [SILENT] should NOT suppress, so delivery rows should exist
-		expect(db!.deliveryRows().length).toBeGreaterThan(0);
+		// [SILENT] anywhere silences (per containsSilenceToken grammar)
+		expect(stage(db!, eventId)).toBe("authored_no_delivery");
+		expect(db!.deliveryRows()).toHaveLength(0);
 	});
 
-	test("only [SILENT] token (exact match) is silent", async () => {
+	test("only [SILENT] token (exact match) is also silent", async () => {
 		const {
 			propagator,
 			monitor,

@@ -901,30 +901,13 @@ export function containsSilenceToken(text: string): boolean {
 }
 
 /**
- * Check if text starts with a silence marker (issue #338).
- * Matches [SILENT] or [silent] at the start (after trim), but NOT when
- * embedded mid-sentence or in quoted context.
- * Examples:
- *   "[SILENT] narration" → true (starts with marker + space)
- *   "[SILENT][REACT:emoji]" → true (starts with marker, followed by control token)
- *   "[SILENT]" → true (only the marker)
- *   "See [SILENT] in docs" → false (marker is mid-text, not at start)
- */
-export function startsWithSilenceMarker(text: string): boolean {
-	const trimmed = text.trim();
-	// Match [SILENT] or [silent] at the start, followed by:
-	// whitespace, another control token [, or end of string
-	return /^\[(SILENT|silent)\](\s|\[|$)/.test(trimmed);
-}
-
-/**
  * Unified silence check: a note is silent if it is EITHER an exact match to
- * a silence token OR starts with an embedded [SILENT] marker (issue #338).
+ * a silence token OR contains an embedded [SILENT] marker (issue #338).
  * Use this in all delivery and recovery paths to prevent silent content from
  * leaking into deliveries while preserving authored notes in records.
  */
 export function isSilentOutput(text: string): boolean {
-	return isSilenceToken(text) || startsWithSilenceMarker(text);
+	return isSilenceToken(text) || containsSilenceToken(text);
 }
 
 function unbracket(text: string): string {
