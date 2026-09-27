@@ -180,13 +180,7 @@ export class MemoryClosureQueue {
 
 		// Before lock: appendDaily if needed (pass intent ID as unique marker)
 		if (state === "queued") {
-			writtenPath = await appendDaily(
-				root,
-				mutation.originRefJson,
-				mutation.userText,
-				mutation.replyText,
-				intent.id,
-			);
+			writtenPath = await appendDaily(root, mutation.originRefJson, mutation.userText, mutation.replyText, intent.id);
 			this.#database.memoryIntentUpdate(intent.id, "written");
 			state = "written";
 			this.#kill("after-write");

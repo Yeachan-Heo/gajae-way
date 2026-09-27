@@ -37,7 +37,9 @@ const gitChains = new Map<string, Promise<void>>();
 
 export class CorpusWriter {
 	readonly #root: string;
-	constructor(root: string) { this.#root = root; }
+	constructor(root: string) {
+		this.#root = root;
+	}
 	async stageFiles(...paths: string[]): Promise<void> {
 		for (const path of paths) await memoryGit(this.#root, ["add", path]);
 	}

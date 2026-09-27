@@ -1,8 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
-import { corpusEntries, type CorpusWriter, regenerateMap } from "./doctrine";
-import { loadRegistry } from "./registry";
 import type { MemoryClosureQueue } from "./closure";
+import { type CorpusWriter, corpusEntries, regenerateMap } from "./doctrine";
+import { loadRegistry } from "./registry";
 
 /**
  * Deterministic crosslinker for the canonical memory corpus.
@@ -234,7 +234,7 @@ export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue)
 	});
 	const index = await buildAliasIndex(root, writableFiles, texts);
 	let filesChanged = 0;
-		let linksAdded = 0;
+	let linksAdded = 0;
 	const modifiedFiles: { path: string; rewritten: string; added: number }[] = [];
 
 	// Detect changes (fast path, outside lock)
