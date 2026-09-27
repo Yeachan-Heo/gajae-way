@@ -1612,6 +1612,125 @@ test("a pending message already rendered into the turn's unread context is close
 	port.complete(latestOpRef, "done");
 });
 
+test("PR #337: an edit row for a message in unread context IS still steered despite the original being in context", async () => {
+	// Regression: edits carry new text and must be steered even when the original message is in the prompt.
+	const port = new ScriptedSessionPort();
+	const lines: string[] = [];
+	await harness(port, { contextMessageIds: ["original-msg"] }, (line) => lines.push(line));
+	const now = Date.now();
+	expect(
+		database?.inboundEnqueue({
+			messageId: "trigger-msg",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "Start working",
+			receivedAt: new Date(now).toISOString(),
+		}),
+	).toBe(true);
+	expect(
+		database?.inboundEnqueue({
+			messageId: "edit-msg",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "Actually, do this instead",
+			receivedAt: new Date(now + 50).toISOString(),
+		}),
+	).toBe(true);
+
+	await manager?.notifyInbound(KEY);
+
+	expect(manager?.state(KEY)).toBe("turn-running");
+	expect(port.sends).toEqual([expect.objectContaining({ text: "Start working", opRef: latestOpRef })]);
+	// The edit is steered despite the original message being in context.
+	const sendSession = port.sends[0]?.sessionId;
+	expect(sendSession).toBeDefined();
+	expect(port.steers).toEqual([
+		expect.objectContaining({
+			sessionId: sendSession,
+			text: expect.stringMatching(/\nActually, do this instead$/),
+		}),
+	]);
+	expect(
+		database?.inboundTurnRows(latestOpRef).find((row) => row.message_id === "edit-msg"),
+	).toMatchObject({
+		state: "done",
+		turn_role: "steer",
+		turn_state: "done",
+	});
+	expect(lines.filter((line) => line.startsWith("steer_skip "))).toHaveLength(0);
+	port.complete(latestOpRef, "done");
+});
+
+test("PR #337: after turn terminal and restart, an in-context message is never sent as trigger nor steered", async () => {
+	// Regression: in-context messages closed as steers during the turn should not be re-sent as triggers after restart.
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	await harness(port, { contextMessageIds: ["in-context-msg"] }, (line) => logs.push(line));
+	const now = Date.now();
+	expect(
+		database?.inboundEnqueue({
+			messageId: "trigger",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "Trigger",
+			receivedAt: new Date(now).toISOString(),
+		}),
+	).toBe(true);
+	expect(
+		database?.inboundEnqueue({
+			messageId: "in-context-msg",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "In context",
+			receivedAt: new Date(now + 50).toISOString(),
+		}),
+	).toBe(true);
+
+	await manager?.notifyInbound(KEY);
+	const triggerOpRef = latestOpRef;
+	const sendCount = port.sends.length;
+	const steerCount = port.steers.length;
+
+	// The in-context message is closed as a steer of this turn.
+	expect(database?.inboundTurnRows(triggerOpRef).find((row) => row.message_id === "in-context-msg")).toMatchObject({
+		state: "done",
+		turn_role: "steer",
+		turn_state: "done",
+	});
+
+	// Complete the turn.
+	port.complete(triggerOpRef, "reply");
+	await eventually(
+		() => database?.inboundTurnRow(triggerOpRef)?.turn_state === "done",
+		"turn did not terminal",
+	);
+
+	// Stop the manager.
+	await manager?.stop();
+
+	// Restart: fresh manager on the same database.
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+		}),
+	});
+
+	await manager.recover();
+	await manager.tick(KEY);
+
+	// After restart: no new sends or steers for the closed message.
+	expect(port.sends).toHaveLength(sendCount);
+	expect(port.steers).toHaveLength(steerCount);
+	// The inbound row is still done.
+	expect(database?.inboundTurnRow(triggerOpRef)).toMatchObject({ state: "done", turn_state: "done" });
+	const contextRow = database?.inboundTurnRows(triggerOpRef).find((row) => row.message_id === "in-context-msg");
+	expect(contextRow).toMatchObject({ state: "done", turn_role: "steer", turn_state: "done" });
+});
+
 test("recovery and stop never scan or delete unrelated shared broker sessions", async () => {
 	class SharedPort extends ScriptedSessionPort {
 		readonly index = [
