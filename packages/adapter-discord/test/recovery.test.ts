@@ -40,6 +40,7 @@ function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorSt
 		attempts: {},
 		deadLetters: [],
 		deadLetterDigest: {},
+		ackedMessageIds: {},
 		sequence: 0,
 	};
 }
@@ -1370,4 +1371,130 @@ test("typing begins only for addressed turns: an overheard public-channel turn s
 	} as never);
 	await gateway.requestInbound("m-3", dmOrigin, "hi", { group: false, mentioned: false, authorId: "u" } as never);
 	expect(began).toEqual(["channel-1", "dm-1"]);
+});
+
+test("RecoveryGate: deduplicates within session", async () => {
+	const gate = new RecoveryGate();
+	let deliveryCount = 0;
+	const attempt = () => {
+		deliveryCount++;
+		return Promise.resolve("acked" as const);
+	};
+
+	// First delivery succeeds and is marked as acked
+	const result1 = await gate.join("msg-1", attempt);
+	expect(result1).toBe("acked");
+	expect(deliveryCount).toBe(1);
+
+	// Second delivery with same ID returns duplicate without calling attempt
+	const result2 = await gate.join("msg-1", attempt);
+	expect(result2).toBe("duplicate");
+	expect(deliveryCount).toBe(1); // Still 1, not 2
+
+	// Different ID goes through normally
+	const result3 = await gate.join("msg-2", attempt);
+	expect(result3).toBe("acked");
+	expect(deliveryCount).toBe(2);
+});
+
+test("RecoveryGate: seeds from persisted state", async () => {
+	const gate = new RecoveryGate();
+	let deliveryCount = 0;
+	const attempt = () => {
+		deliveryCount++;
+		return Promise.resolve("acked" as const);
+	};
+
+	// Seed gate with previously acked IDs
+	gate.seedAcked(["previously-acked-1", "previously-acked-2"]);
+
+	// Seeded IDs should be treated as duplicates
+	const result1 = await gate.join("previously-acked-1", attempt);
+	expect(result1).toBe("duplicate");
+	expect(deliveryCount).toBe(0); // Never called
+
+	// Non-seeded ID should go through
+	const result2 = await gate.join("new-msg", attempt);
+	expect(result2).toBe("acked");
+	expect(deliveryCount).toBe(1);
+});
+
+test("RecoveryGate: persists acked IDs via callback", async () => {
+	const gate = new RecoveryGate();
+	const ackedIds: string[] = [];
+
+	// Set up callback to track acked IDs
+	gate.setOnAcked((messageId) => ackedIds.push(messageId));
+
+	let deliveryCount = 0;
+	const attempt = () => {
+		deliveryCount++;
+		return Promise.resolve("acked" as const);
+	};
+
+	// Deliver messages
+	await gate.join("msg-1", attempt);
+	await gate.join("msg-2", attempt);
+
+	// Callback should have been called for each acked message
+	expect(ackedIds).toEqual(["msg-1", "msg-2"]);
+});
+
+test("RecoveryGate: survives bounded history pruning", async () => {
+	// Small limit to test pruning
+	const gate = new RecoveryGate(2);
+	let deliveryCount = 0;
+	const attempt = () => {
+		deliveryCount++;
+		return Promise.resolve("acked" as const);
+	};
+
+	// Deliver 3 messages (exceeds limit of 2)
+	for (let i = 1; i <= 3; i++) {
+		await gate.join(`msg-${i}`, attempt);
+	}
+
+	// First message should have been pruned from gate's memory
+	const result1 = await gate.join("msg-1", attempt);
+	expect(result1).toBe("acked"); // Attempt is called again, not detected as duplicate
+	expect(deliveryCount).toBe(4); // 3 original + 1 retry
+
+	// But recent ones should still be cached
+	const result2 = await gate.join("msg-3", attempt);
+	expect(result2).toBe("duplicate"); // msg-3 is still in bounded cache
+	expect(deliveryCount).toBe(4); // Not called again
+});
+
+test("cursor state: persists and restores acked message IDs", async () => {
+	const tmp = await mkdtemp(join(tmpdir(), "recovery-dedup-"));
+	try {
+		const path = join(tmp, "cursor.json");
+
+		// Save state with acked message IDs
+		const initialState: RecoveryCursorState = {
+			recoveredThrough: { "c-1": "1000" },
+			quarantined: {},
+			knownDms: {},
+			attempts: {},
+			deadLetters: [],
+			deadLetterDigest: {},
+			ackedMessageIds: {
+				"msg-acked-1": { seq: 1 },
+				"msg-acked-2": { seq: 2 },
+			},
+			sequence: 2,
+		};
+
+		await saveRecoveryCursors(path, initialState);
+
+		// Load and verify acked IDs are restored
+		const loaded = await loadRecoveryCursors(path);
+		expect(loaded.ackedMessageIds).toEqual({
+			"msg-acked-1": { seq: 1 },
+			"msg-acked-2": { seq: 2 },
+		});
+		expect(loaded.sequence).toBe(2);
+	} finally {
+		await rm(tmp, { recursive: true });
+	}
 });

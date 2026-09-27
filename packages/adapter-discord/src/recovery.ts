@@ -96,6 +96,13 @@ export interface RecoveryCursorState {
 	readonly deadLetters: readonly RecoveryDeadLetter[];
 	/** Per-conversation discard aggregates; never evicted. */
 	readonly deadLetterDigest: Readonly<Record<string, RecoveryDeadLetterDigest>>;
+	/**
+	 * Message IDs that have been successfully delivered via live or recovery paths,
+	 * bounded to RECOVERY_ACKED_MESSAGE_CAP entries. Survives adapter restarts so the
+	 * RecoveryGate can deduplicate against platform messages seen before restart.
+	 * Ordered by insertion sequence for LRU eviction.
+	 */
+	readonly ackedMessageIds: Readonly<Record<string, { readonly seq: number }>>;
 	/** Monotonic allocator for the `seq` fields above. */
 	readonly sequence: number;
 }
@@ -109,6 +116,7 @@ const EMPTY_STATE: RecoveryCursorState = {
 	attempts: {},
 	deadLetters: [],
 	deadLetterDigest: {},
+	ackedMessageIds: {},
 	sequence: 0,
 };
 
@@ -116,13 +124,29 @@ export function recoveryCursorPath(home: string = adapterHome()): string {
 	return join(home, "adapters", "discord", "recovery-cursor.json");
 }
 
-/** Snowflake-keyed in-flight/acked gate shared by the live and recovery send paths. */
+/**
+ * Snowflake-keyed in-flight/acked gate shared by the live and recovery send paths.
+ * Deduplicates within a process session via #acked Set, plus persisted acked IDs from
+ * RecoveryCursorState to survive adapter restarts.
+ */
 export class RecoveryGate {
 	readonly #pending = new Map<string, Promise<RecoveryGateResult>>();
 	readonly #acked = new Set<string>();
+	readonly #onAcked?: (messageId: string) => void;
 
-	constructor(readonly limit = 10_000) {
+	constructor(
+		readonly limit = 10_000,
+		initialAcked?: Iterable<string>,
+	) {
 		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("recovery gate limit must be a positive integer");
+		if (initialAcked) {
+			for (const id of initialAcked) this.#acked.add(id);
+		}
+	}
+
+	/** Sets the callback invoked when a message is successfully acked. */
+	setOnAcked(onAcked: (messageId: string) => void): void {
+		this.#onAcked = onAcked;
 	}
 
 	/**
@@ -142,6 +166,7 @@ export class RecoveryGate {
 					this.#pending.delete(messageId);
 					if (verdict === "acked") {
 						this.#acked.add(messageId);
+						this.#onAcked?.(messageId);
 						this.forgetBeyond(this.limit);
 					}
 					return verdict;
@@ -164,6 +189,14 @@ export class RecoveryGate {
 	forgetBeyond(limit: number): void {
 		while (this.#acked.size > limit) this.#acked.delete(this.#acked.values().next().value as string);
 	}
+
+	/** Seeds the gate with previously persisted acked IDs (used after adapter restart). */
+	seedAcked(messageIds: Iterable<string>): void {
+		for (const id of messageIds) {
+			this.#acked.add(id);
+		}
+		this.forgetBeyond(this.limit);
+	}
 }
 
 export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorState> {
@@ -183,10 +216,12 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 	const quarantined = readQuarantined(record.quarantined);
 	const knownDms = readKnownDms(record.knownDms);
 	const attempts = readAttempts(record.attempts);
+	const ackedMessageIds = readAckedMessageIds(record.ackedMessageIds);
 	const seqs = [
 		...Object.values(quarantined).map((entry) => entry.seq),
 		...Object.values(knownDms).map((entry) => entry.seq),
 		...Object.values(attempts).map((entry) => entry.seq),
+		...Object.values(ackedMessageIds).map((entry) => entry.seq),
 	];
 	const stored = typeof record.sequence === "number" && Number.isSafeInteger(record.sequence) ? record.sequence : 0;
 	return {
@@ -196,6 +231,7 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 		attempts,
 		deadLetters: readDeadLetters(record.deadLetters),
 		deadLetterDigest: readDigest(record.deadLetterDigest),
+		ackedMessageIds,
 		// Never hand back a sequence below anything already stored, or fresh entries would
 		// collide with old ones and the retention order would be wrong after a restart.
 		sequence: Math.max(stored, ...seqs, 0),
@@ -285,6 +321,28 @@ export function rememberKnownDm(
 	);
 }
 
+/** Records a successfully delivered message id and prunes oldest entries to stay bounded. */
+export function recordAckedMessageId(
+	state: RecoveryCursorState,
+	messageId: string,
+	cap = RECOVERY_ACKED_MESSAGE_CAP,
+): RecoveryCursorState {
+	const sequence = state.sequence + 1;
+	const ackedMessageIds = {
+		...state.ackedMessageIds,
+		[messageId]: { seq: sequence },
+	};
+	const entries = Object.entries(ackedMessageIds).sort((a, b) => b[1].seq - a[1].seq);
+	if (entries.length <= cap) return { ...state, ackedMessageIds, sequence };
+	const pruned = Object.fromEntries(entries.slice(0, cap));
+	return { ...state, ackedMessageIds: pruned, sequence };
+}
+
+/** Returns true when this message id has been successfully delivered before (survives restarts). */
+export function isAckedMessageId(state: RecoveryCursorState, messageId: string): boolean {
+	return messageId in state.ackedMessageIds;
+}
+
 function readAttempts(entries: unknown): Record<string, RecoveryAttemptRecord> {
 	const ledger: Record<string, RecoveryAttemptRecord> = {};
 	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
@@ -302,6 +360,20 @@ function readAttempts(entries: unknown): Record<string, RecoveryAttemptRecord> {
 		}
 	}
 	return ledger;
+}
+
+function readAckedMessageIds(entries: unknown): Record<string, { readonly seq: number }> {
+	const acked: Record<string, { readonly seq: number }> = {};
+	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
+		for (const [id, value] of Object.entries(entries)) {
+			if (typeof value !== "object" || value === null) continue;
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.seq === "number" && Number.isSafeInteger(entry.seq)) {
+				acked[id] = { seq: entry.seq };
+			}
+		}
+	}
+	return acked;
 }
 
 function readDeadLetters(entries: unknown): RecoveryDeadLetter[] {
@@ -608,6 +680,8 @@ export const RECOVERY_ATTEMPT_LEDGER_CAP = 200;
  * discarding anything and without advancing the cursor.
  */
 export const RECOVERY_UNIFORM_FAILURE_LIMIT = 3;
+/** Retention bound for acked message IDs (survives adapter restarts for deduplication). */
+export const RECOVERY_ACKED_MESSAGE_CAP = 1_000;
 
 /** The slice of a discord.js text-based channel recovery needs: forward paged history. */
 /** Maximum non-enumerable DM conversations retained for restart recovery. */

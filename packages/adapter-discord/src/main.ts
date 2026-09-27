@@ -42,6 +42,7 @@ import {
 	recoveryCursorPath as defaultRecoveryCursorPath,
 	loadRecoveryCursors,
 	pruneKnownDms,
+	recordAckedMessageId,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
 	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_MAX_PAGES,
@@ -1619,6 +1620,8 @@ export class ReconnectingGateway {
 			.then((state) => {
 				this.#cursors = state;
 				this.#cursorFault = undefined;
+				// Seed RecoveryGate with previously acked message IDs so deduplication survives restarts.
+				this.#seedRecoveryGate(state);
 			})
 			.catch((error: unknown) => {
 				// Observable and retryable: drop the memoized load so the next recovery pass
@@ -1628,6 +1631,18 @@ export class ReconnectingGateway {
 				console.error(`Discord recovery cursor load failed: ${this.#cursorFault}`);
 			});
 		return this.#cursorLoads;
+	}
+
+	/** Seeds the RecoveryGate with acked message IDs from persisted cursor state. */
+	private #seedRecoveryGate(state: RecoveryCursorState): void {
+		// Initialize the gate with all previously acked IDs so it can deduplicate
+		// against messages that were delivered before an adapter restart.
+		this.#inbound.seedAcked(Object.keys(state.ackedMessageIds));
+		// Set up callback to persist new acked IDs as they succeed.
+		this.#inbound.setOnAcked((messageId) => {
+			if (!this.#cursors) return;
+			this.persist(recordAckedMessageId(this.#cursors, messageId));
+		});
 	}
 
 	/**
