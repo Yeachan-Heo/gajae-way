@@ -9,6 +9,7 @@ import {
 	originKey,
 } from "@gajae-gateway/protocol";
 import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
+import { sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
