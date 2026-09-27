@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import {
 	type ChatMessagePayload,
-	containsSilenceToken,
-	isSilenceToken,
+	isSilentOutput,
 	type OriginRef,
 	originKey,
 	type PromptStatusBody,
@@ -776,7 +775,7 @@ export class WorkLaneManager {
 						observedAtMs: result.observedAtMs,
 						attribution: "operation_ref" as const,
 					};
-					const silent = isSilenceToken(result.text) || containsSilenceToken(result.text);
+					const silent = isSilentOutput(result.text);
 					const terminal = runtime.terminal!;
 					// A terminal first observed with receiptState=missing whose same-op
 					// final body then proves present is a late receipt, not a missing one

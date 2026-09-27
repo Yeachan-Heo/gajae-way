@@ -15,6 +15,7 @@ import {
 	isChatPlatform,
 	isPlatformMessageId,
 	isSilenceToken,
+	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventRecord,
 	negotiate,
@@ -1946,7 +1947,7 @@ async function createInboundTurnLifecycle(
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
+			.filter((part) => part.length > 0 && !isSilentOutput(part))
 			.slice(0, 5);
 		// A persona that decided not to speak often says so instead of emitting
 		// the token (#260). On gated traffic, such a part is dropped like one.
@@ -2171,7 +2172,7 @@ async function createInboundTurnLifecycle(
 					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
 				);
 			});
-			if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
 			if (!nonLoopback) {
 				if (connection)
 					connection.write({

@@ -900,6 +900,16 @@ export function containsSilenceToken(text: string): boolean {
 	return /\[(SILENT|silent)\]/.test(text);
 }
 
+/**
+ * Unified silence check: a note is silent if it is EITHER an exact match to
+ * a silence token OR contains an embedded [SILENT] marker. Use this in all
+ * delivery and recovery paths to prevent silent content from leaking into
+ * deliveries while preserving authored notes in records.
+ */
+export function isSilentOutput(text: string): boolean {
+	return isSilenceToken(text) || containsSilenceToken(text);
+}
+
 function unbracket(text: string): string {
 	return text.startsWith("[") && text.endsWith("]") && text.length > 2 ? text.slice(1, -1).trim() : text;
 }

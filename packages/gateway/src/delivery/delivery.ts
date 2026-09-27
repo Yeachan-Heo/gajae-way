@@ -1,6 +1,6 @@
 import {
 	type ChatMessagePayload,
-	isSilenceToken,
+	isSilentOutput,
 	type OriginRef,
 	originKey,
 	type ReactionRef,
@@ -27,7 +27,7 @@ export function buildDeliveryPayload(
 	deliveryId: string,
 	replyToMessageId?: string,
 ): ChatMessagePayload | undefined {
-	if (isSilenceToken(text)) return undefined;
+	if (isSilentOutput(text)) return undefined;
 	originKey(origin);
 	return {
 		turnId,
@@ -67,7 +67,7 @@ export class DeliveryService {
 	}
 	/** Caller owns the transaction; never opens a nested createPending transaction. */
 	persistInTransaction(payload: ChatMessagePayload): boolean {
-		if (isSilenceToken(payload.text)) throw new Error("silent payload cannot be persisted");
+		if (isSilentOutput(payload.text)) throw new Error("silent payload cannot be persisted");
 		if (!payload.deliveryId) throw new Error("delivery id is required");
 		return this.#ledger.createPendingInTransaction({
 			deliveryId: payload.deliveryId,

@@ -24,6 +24,7 @@ export {
 	type EventName,
 	type GatewayStatusResult,
 	isSilenceToken,
+	isSilentOutput,
 	type LaneCapacityDetail,
 	type MemoryAuditResult,
 	type MemorySearchParams,

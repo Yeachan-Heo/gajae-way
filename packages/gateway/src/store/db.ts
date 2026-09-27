@@ -4,7 +4,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
-	isSilenceToken,
+	isSilentOutput,
 	type OriginRef,
 	originKey,
 	parseOriginKey,
@@ -1171,7 +1171,7 @@ export class GatewayDatabase {
 					payload.role === "assistant" &&
 					payload.final === true &&
 					!payload.reaction &&
-					!isSilenceToken(payload.text),
+					!isSilentOutput(payload.text),
 			);
 			const changed = this.#database
 				.query(
@@ -1414,7 +1414,7 @@ export class GatewayDatabase {
 						fallbackPayload.role === "assistant" &&
 						fallbackPayload.final === true &&
 						!fallbackPayload.reaction &&
-						!isSilenceToken(fallbackPayload.text),
+						!isSilentOutput(fallbackPayload.text),
 				);
 				this.deliveryCreateInTransaction({
 					id: next.deliveryId,

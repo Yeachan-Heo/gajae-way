@@ -2,7 +2,7 @@ import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
 	eventTypeOrigin,
-	isSilenceToken,
+	isSilentOutput,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type OriginRef,
@@ -511,8 +511,8 @@ export class MonitorPropagator {
 				// A silent note is never delivered, so `authored` would wait forever for a
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
 				if (output && !hasMemory)
-					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilenceToken(output), row);
-				else if (output && row.stage === "authored" && isSilenceToken(output))
+					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
+				else if (output && row.stage === "authored" && isSilentOutput(output))
 					this.#database.withTransaction(() => this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery"));
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
@@ -853,7 +853,7 @@ export class MonitorPropagator {
 					)
 					.map((entry) => entry.note)
 					.join("\n");
-				if (!isSilenceToken(deliveryText)) {
+				if (!isSilentOutput(deliveryText)) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
 					// never asked to remember who to ping, and the recipient list never
