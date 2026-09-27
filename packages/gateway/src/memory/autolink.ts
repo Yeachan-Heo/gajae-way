@@ -234,10 +234,10 @@ export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue)
 	});
 	const index = await buildAliasIndex(root, writableFiles, texts);
 	let filesChanged = 0;
-	let linksAdded = 0;
-	const modifiedFiles: string[] = [];
+		let linksAdded = 0;
+	const modifiedFiles: { path: string; rewritten: string; added: number }[] = [];
 
-	// Read + detect changes outside lock (fast path)
+	// Detect changes (fast path, outside lock)
 	for (let position = 0; position < writableFiles.length; position++) {
 		const path = writableFiles[position] as string;
 		const text = texts.get(path);
@@ -251,24 +251,24 @@ export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue)
 	}
 
 	if (modifiedFiles.length === 0) return { filesChanged: 0, linksAdded: 0, aliases: index.length };
-
 	filesChanged = modifiedFiles.length;
 
-	// Write + stage + commit inside lock to prevent #341
-	if (closure) {
-		await closure.coordinateCommit(root, async () => {
-			for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
-			await regenerateMap(root, registry);
-			const writer = closure.getWriter(root);
-			for (const { path } of modifiedFiles) await writer.stageFiles(path);
-			await writer.stageFiles("MEMORY.md");
-			await writer.commit(`Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`);
-		});
-	} else {
-		// Without closure (test mode): just write locally, no commit
+	// If no closure, just write locally (test mode, no commit)
+	if (!closure) {
 		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
 		await regenerateMap(root, registry);
+		return { filesChanged, linksAdded, aliases: index.length };
 	}
+
+	// With closure: write + stage + commit inside lock (#341 fix)
+	await closure.coordinateCommit(root, async () => {
+		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
+		await regenerateMap(root, registry);
+		const writer = closure.getWriter(root);
+		for (const { path } of modifiedFiles) await writer.stageFiles(path);
+		await writer.stageFiles("MEMORY.md");
+		await writer.commit(`Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`);
+	});
 
 	return { filesChanged, linksAdded, aliases: index.length };
 }
