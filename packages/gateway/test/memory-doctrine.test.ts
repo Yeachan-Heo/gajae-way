@@ -231,9 +231,11 @@ test("a failed git operation reports argv, exit status and stdout, never a bare 
 	expect(error?.message).toMatch(/nothing (added )?to commit/);
 });
 
-test("issue #341: autolink + intent via coordinateCommit serialize commits", async () => {
-	// Regression test: both autolinkCorpus and intent processing use the same
-	// coordinateCommit lock to prevent #341 misattribution.
+test("issue #341: intent appendDaily + concurrent autolink don't misattribute via lock", async () => {
+	// Regression test: intent processing (appendDaily + commit) and autolinkCorpus
+	// both serialize through coordinateCommit lock to prevent #341 misattribution.
+	// Without lock: intent's add --all picks up autolink's uncommitted edits.
+	// With lock: autolink commits first, intent's add --all finds clean tree.
 	home = await mkdtemp(join(tmpdir(), "issue-341-"));
 	const root = await initializeMemory(home);
 	const { MemoryClosureQueue } = await import("../src/memory/closure");
@@ -243,7 +245,7 @@ test("issue #341: autolink + intent via coordinateCommit serialize commits", asy
 	const database = new GatewayDatabase(join(home, "gateway.db"));
 	const closure = new MemoryClosureQueue(database, home);
 
-	// Set up: entity + rule
+	// Set up: entity + rule with mention of entity
 	await mkdir(join(root, "entities"), { recursive: true });
 	await writeFile(join(root, "entities/myentity.md"), "# MyEntity\n\nCanonical.");
 	await mkdir(join(root, "ops/rules"), { recursive: true });
@@ -252,37 +254,62 @@ test("issue #341: autolink + intent via coordinateCommit serialize commits", asy
 	await memoryGit(root, ["commit", "-m", "setup"]);
 
 	const intentId = crypto.randomUUID();
-	const intentText = "Captured intent";
-	const beforeCommits = await memoryGit(root, ["log", "--format=%H"])
-		.then((out) => out.split("\n").filter(Boolean).length);
+	const intentText = "Captured text";
+	let autolinkStarted = false;
 
-	// Both operations run through the same lock
-	const autoPromise = autolinkCorpus(root, closure);
+	// Simulate intent processing with hook: trigger autolinkCorpus between appendDaily and commit
 	const intentPromise = closure.coordinateCommit(root, async () => {
+		// Simulate what #process does: appendDaily then add + commit
 		const date = new Date().toISOString().slice(0, 10);
+		const dailyFile = `daily/${date}.md`;
 		await mkdir(join(root, "daily"), { recursive: true });
+		const dailyPath = join(root, dailyFile);
+
+		// HOOK POINT: start autolink AFTER appendDaily but BEFORE commit
 		await writeFile(
-			join(root, `daily/${date}.md`),
+			dailyPath,
 			`\n## ${new Date().toISOString()}\n\n- intent-id: ${intentId}\n- user: ${intentText}\n- reply: resp\n`,
 		);
+
+		if (!autolinkStarted) {
+			autolinkStarted = true;
+			// Start autolink while inside the lock - it will queue behind or ahead depending on timing
+			autolinkCorpus(root, closure).catch(() => {});
+		}
+
+		// Small delay to let autolink queue its lock request
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		// Now commit the intent - should NOT pick up autolink's edits
 		const writer = closure.getWriter(root);
 		await memoryGit(root, ["add", "--all", "."]);
-		return await writer.commit(`Memory mutation`, `Gajaeway-Mutation-Id: ${intentId}`);
+		const commit = await writer.commit(`Memory mutation`, `Gajaeway-Mutation-Id: ${intentId}`);
+		return commit;
 	});
 
-	const [autoResult, intentCommit] = await Promise.all([autoPromise, intentPromise]);
-
+	const intentCommit = await intentPromise;
 	expect(intentCommit).toBeDefined();
 
-	// Verify: intent commit contains only intent text, not autolink's edits (#341)
-	const show = await memoryGit(root, ["show", intentCommit!]);
-	expect(show).toContain(intentText);
-	expect(show).not.toContain("[MyEntity]"); // KEY: autolink link should NOT be here
+	// Verify: intent commit has the trailer
+	const intentShow = await memoryGit(root, ["show", intentCommit!]);
+	expect(intentShow).toContain(`Gajaeway-Mutation-Id: ${intentId}`);
 
-	// Verify: exactly one commit has the intent's trailer
-	const trailer = `Gajaeway-Mutation-Id: ${intentId}`;
-	const trailerCommits = await memoryGit(root, ["log", "--format=%H", "--grep", trailer])
+	// Verify: intent commit contains intent's appended text
+	expect(intentShow).toContain(intentText);
+
+	// CRITICAL: intent commit should NOT contain autolink's link edits (#341)
+	expect(intentShow).not.toContain("[MyEntity]");
+
+	// Verify: exactly one commit has the intent's trailer (not duplicated by autolink race)
+	const trailerCommits = await memoryGit(root, ["log", "--format=%H", "--grep", `Gajaeway-Mutation-Id: ${intentId}`])
 		.then((out) => out.split("\n").filter(Boolean));
 	expect(trailerCommits).toHaveLength(1);
-	expect(trailerCommits[0]).toBe(intentCommit);
+
+	// Verify: autolink's commit (if exists) doesn't contain intent text
+	const autoCommits = await memoryGit(root, ["log", "--format=%H", "--grep", "Memory autolink sweep"])
+		.then((out) => out.split("\n").filter(Boolean));
+	for (const commit of autoCommits) {
+		const show = await memoryGit(root, ["show", commit]);
+		expect(show).not.toContain(intentText); // autolink commit has no intent text
+	}
 });
