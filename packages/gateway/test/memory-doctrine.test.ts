@@ -244,7 +244,7 @@ test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommi
 	const { GatewayDatabase } = await import("../src/store/db");
 
 	const intentText = "Captured text";
-	let autoPromise: Promise<any>;
+	let autoPromise: Promise<unknown> | undefined;
 
 	// Create closure with afterWrite hook that triggers autolinkCorpus
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -297,8 +297,9 @@ test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommi
 	expect(show).not.toContain("[MyEntity]");
 
 	// Verify: autolink's commit (if exists) contains no intent text
-	const autoCommits = await memoryGit(root, ["log", "--format=%H", "--grep", "Memory autolink sweep"])
-		.then((out) => out.split("\n").filter(Boolean));
+	const autoCommits = await memoryGit(root, ["log", "--format=%H", "--grep", "Memory autolink sweep"]).then((out) =>
+		out.split("\n").filter(Boolean),
+	);
 	for (const commit of autoCommits) {
 		const c = await memoryGit(root, ["show", commit]);
 		expect(c).not.toContain(intentText);
