@@ -231,21 +231,30 @@ test("a failed git operation reports argv, exit status and stdout, never a bare 
 	expect(error?.message).toMatch(/nothing (added )?to commit/);
 });
 
-test("issue #341: coordinateCommit lock serializes autolink + intent commits", async () => {
-	// Regression test: both autolinkCorpus and intent processing use coordinateCommit
-	// lock to serialize corpus writes and prevent #341 misattribution.
-	// Key scenario: intent appends daily file + autolink modifies rules file,
-	// both attempt to commit. Without lock, intent's add --all picks up autolink's
-	// uncommitted changes. With lock, they serialize.
+test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommit lock", async () => {
+	// Regression test: intent enqueued via closure.enqueue() triggers #process,
+	// which calls appendDaily then coordinateCommit. Meanwhile, afterWrite hook
+	// starts autolinkCorpus. Both must serialize through coordinateCommit lock.
+	// Without lock: intent's add --all picks up autolink's uncommitted changes (#341).
+	// With lock: each owns its changes, separate commits.
 	home = await mkdtemp(join(tmpdir(), "issue-341-"));
 	const root = await initializeMemory(home);
 	const { MemoryClosureQueue } = await import("../src/memory/closure");
 	const { autolinkCorpus } = await import("../src/memory/autolink");
+	const { GatewayDatabase } = await import("../src/store/db");
 
-	const intentId = crypto.randomUUID();
 	const intentText = "Captured text";
+	let autoPromise: Promise<any>;
 
-	const closure = new MemoryClosureQueue({} as never, home);
+	// Create closure with afterWrite hook that triggers autolinkCorpus
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const closure = new MemoryClosureQueue(database, home, {
+		afterWrite: async () => {
+			// Start autolink after appendDaily, before intent's commit (potential #341 race)
+			autoPromise = autolinkCorpus(root, closure);
+		},
+	});
+	await closure.initialize();
 
 	// Set up: entity + rule
 	await mkdir(join(root, "entities"), { recursive: true });
@@ -255,25 +264,33 @@ test("issue #341: coordinateCommit lock serializes autolink + intent commits", a
 	await memoryGit(root, ["add", "-A"]);
 	await memoryGit(root, ["commit", "-m", "setup"]);
 
-	// Simulate concurrent execution through the lock
-	const autoPromise = autolinkCorpus(root, closure);
-	const intentPromise = closure.coordinateCommit(root, async () => {
-		const date = new Date().toISOString().slice(0, 10);
-		await mkdir(join(root, "daily"), { recursive: true });
-		await writeFile(
-			join(root, `daily/${date}.md`),
-			`\n## ${new Date().toISOString()}\n\n- intent-id: ${intentId}\n- user: ${intentText}\n- reply: resp\n`,
-		);
-		const writer = closure.getWriter(root);
-		await memoryGit(root, ["add", "--all", "."]);
-		return await writer.commit(`Memory mutation`, `Gajaeway-Mutation-Id: ${intentId}`);
+	// Enqueue real daily_capture intent through the actual API
+	closure.enqueue({
+		kind: "daily_capture",
+		originRefJson: JSON.stringify({ platform: "test", kind: "test" }),
+		userText: intentText,
+		replyText: "response",
 	});
 
-	const [_autoResult, intentCommit] = await Promise.all([autoPromise, intentPromise]);
-	expect(intentCommit).toBeDefined();
+	// Process queue and wait for autolink
+	await closure.drain();
+	if (autoPromise) await autoPromise;
+	database.close();
 
-	// Verify: intent commit contains the appended text
-	const show = await memoryGit(root, ["show", intentCommit!]);
+	// Read receipts to find the intent's commit
+	const receiptsFile = join(home, "memory-receipts.jsonl");
+	const receiptsContent = await readFile(receiptsFile, "utf8");
+	const receipts = receiptsContent
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as { id: string; commit: string; state: string });
+
+	expect(receipts.length).toBeGreaterThan(0);
+	const intentReceipt = receipts[receipts.length - 1];
+	expect(intentReceipt.commit).toBeDefined();
+
+	// Verify: intent's commit contains the appended text
+	const show = await memoryGit(root, ["show", intentReceipt.commit]);
 	expect(show).toContain(intentText);
 
 	// CRITICAL #341 FIX: intent commit must NOT contain autolink's link edits
