@@ -65,6 +65,7 @@ async function harness(
 		released?: (opRef: string) => void;
 		failure?: (message: string) => void;
 		failureError?: (error: Error) => void;
+		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
 	extra: { brokerGeneration?: () => number } = {},
@@ -83,6 +84,7 @@ async function harness(
 			latestOpRef = turn.opRef;
 			return {
 				text: trigger.body,
+				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				onTerminal: ({ text }) => hooks.terminal?.(text),
 				onFailure: ({ error }) => {
 					hooks.failure?.(error.message);
@@ -1569,6 +1571,45 @@ test("two messages 50ms apart start one turn and steer the second", async () => 
 			database?.inboundTurnRows(latestOpRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"turn rows did not complete after terminal tail evidence",
 	);
+});
+
+test("a pending message already rendered into the turn's unread context is closed, not steered twice", async () => {
+	// Live 2026-09-27: rows requeued by recovery were both listed as unread in the
+	// next turn's prompt AND steered into that turn, so every message was answered twice.
+	const port = new ScriptedSessionPort();
+	const lines: string[] = [];
+	await harness(port, { contextMessageIds: ["m-1", "m-2", "m-3"] }, (line) => lines.push(line));
+	const now = Date.now();
+	for (const [index, id] of ["m-1", "m-2", "m-3", "m-4"].entries())
+		expect(
+			database?.inboundEnqueue({
+				messageId: id,
+				originKey: KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body: `body ${id}`,
+				receivedAt: new Date(now + index * 10).toISOString(),
+			}),
+		).toBe(true);
+
+	await manager?.notifyInbound(KEY);
+
+	expect(manager?.state(KEY)).toBe("turn-running");
+	expect(port.sends).toEqual([expect.objectContaining({ text: "body m-1", opRef: latestOpRef })]);
+	// Only the message that was NOT in the prompt's unread context is steered.
+	expect(port.steers).toEqual([expect.objectContaining({ text: expect.stringMatching(/\nbody m-4$/) })]);
+	expect(database?.inboundPendingOldest(KEY)).toBeUndefined();
+	for (const id of ["m-2", "m-3"])
+		expect(database?.inboundTurnRows(latestOpRef).find((row) => row.message_id === id)).toMatchObject({
+			state: "done",
+			turn_role: "steer",
+			turn_state: "done",
+		});
+	expect(lines.filter((line) => line.startsWith("steer_skip "))).toHaveLength(2);
+
+	// A later tick must not re-offer the closed rows.
+	await manager?.notifyInbound(KEY);
+	expect(port.steers).toHaveLength(1);
+	port.complete(latestOpRef, "done");
 });
 
 test("recovery and stop never scan or delete unrelated shared broker sessions", async () => {
