@@ -1096,6 +1096,8 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 	const fixture = await serverFixture({ port, dmPolicy: "open", channels: { "d7-chan": { engagement: "open" } } });
 	try {
 		const channel = { platform: "discord", kind: "channel", conversationId: "d7-chan" } as const;
+		// Follow-ups arrive only after every turn has started: a follow-up that is
+		// already in the trigger prompt's unread context is closed, not steered.
 		fixture.client.sendMany([
 			request("dm-trigger", "chat.send", {
 				origin: DM_ORIGIN,
@@ -1103,17 +1105,21 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 				text: "dm start",
 				engagement: DM_ENGAGEMENT,
 			}),
-			request("dm-steer", "chat.send", {
-				origin: DM_ORIGIN,
-				messageId: "dm-steer",
-				text: "dm follow-up",
-				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
-			}),
 			request("ch-trigger", "chat.send", {
 				origin: channel,
 				messageId: "ch-trigger",
 				text: "channel start",
 				engagement: { mentioned: true, group: true, authorId: "u1", authorName: "alice" },
+			}),
+			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
+		]);
+		await eventually(() => port.sends.length === 3, "not every trigger started a turn");
+		fixture.client.sendMany([
+			request("dm-steer", "chat.send", {
+				origin: DM_ORIGIN,
+				messageId: "dm-steer",
+				text: "dm follow-up",
+				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
 			}),
 			request("ch-steer", "chat.send", {
 				origin: channel,
@@ -1127,7 +1133,6 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 					replyTo: { messageId: "ch-trigger", authorName: "alice", fromSelf: false, excerpt: "channel start" },
 				},
 			}),
-			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
 			request("lb-steer", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback follow-up" }),
 		]);
 		await eventually(() => port.steers.length === 3, "not every follow-up was steered");
