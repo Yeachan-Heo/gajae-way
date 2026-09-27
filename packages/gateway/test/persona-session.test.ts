@@ -1650,9 +1650,7 @@ test("PR #337: an edit row for a message in unread context IS still steered desp
 			text: expect.stringMatching(/\nActually, do this instead$/),
 		}),
 	]);
-	expect(
-		database?.inboundTurnRows(latestOpRef).find((row) => row.message_id === "edit-msg"),
-	).toMatchObject({
+	expect(database?.inboundTurnRows(latestOpRef).find((row) => row.message_id === "edit-msg")).toMatchObject({
 		state: "done",
 		turn_role: "steer",
 		turn_state: "done",
@@ -1700,10 +1698,7 @@ test("PR #337: after turn terminal and restart, an in-context message is never s
 
 	// Complete the turn.
 	port.complete(triggerOpRef, "reply");
-	await eventually(
-		() => database?.inboundTurnRow(triggerOpRef)?.turn_state === "done",
-		"turn did not terminal",
-	);
+	await eventually(() => database?.inboundTurnRow(triggerOpRef)?.turn_state === "done", "turn did not terminal");
 
 	// Stop the manager.
 	await manager?.stop();
