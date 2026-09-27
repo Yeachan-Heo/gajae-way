@@ -268,6 +268,7 @@ export class GlobalGjcClient {
 	#identity: string | undefined;
 	#available = false;
 	#stopped = false;
+	#stoppedAtEpoch: number | undefined;
 	#started = false;
 	#epoch = 0;
 	#failures = 0;
@@ -354,6 +355,7 @@ export class GlobalGjcClient {
 		if (this.#started) return;
 		if (this.#children.size > 0) throw new GjcCliUnavailableError("owned child exit remains unconfirmed");
 		this.#stopped = false;
+		this.#stoppedAtEpoch = undefined;  // Clear involuntary stop state on explicit recovery
 		const epoch = ++this.#epoch;
 		this.#starting = this.#start(epoch);
 		try {
@@ -383,6 +385,7 @@ export class GlobalGjcClient {
 	}
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		this.#stoppedAtEpoch = undefined;  // Intentional stop, not an involuntary termination failure
 		this.#started = false;
 		this.#available = false;
 		this.#outageSince = undefined;
@@ -412,12 +415,20 @@ export class GlobalGjcClient {
 		const termination = terminateChild(child)
 			.catch((error: unknown) => {
 				// Unconfirmed children must not overlap a replacement client generation.
+				// Set #stopped to prevent new requests, but keep the observation loop running
+				// so the #246 guard (onLiveOutageExceeded) can trigger and exit the process when
+				// the broker is live but unreachable. Store the epoch to distinguish voluntary
+				// stop from involuntary termination failure.
 				this.#stopped = true;
+				this.#stoppedAtEpoch = this.#epoch;
 				this.#started = false;
 				this.#available = false;
 				++this.#epoch;
 				if (this.#timer) clearTimeout(this.#timer);
+				// Do NOT clear #timer: let the observation loop continue so the live outage
+				// handler can trigger. Schedule observation immediately to detect liveness.
 				this.#timer = undefined;
+				this.#schedule(this.#epoch);
 				throw error;
 			})
 			.finally(() => {
@@ -492,7 +503,10 @@ export class GlobalGjcClient {
 		}
 	}
 	#schedule(epoch: number): void {
-		if (this.#stopped || epoch !== this.#epoch) return;
+		// Allow observation loop to continue after involuntary stops (termination failures)
+		// so the #246 guard (live outage exceeded) can trigger and exit the process.
+		const voluntarilyStop = this.#stopped && this.#stoppedAtEpoch === undefined;
+		if (voluntarilyStop || epoch !== this.#epoch) return;
 		const wait = this.#available
 			? this.#interval
 			: Math.min(this.#initialBackoff * 2 ** Math.min(this.#failures++, 20), this.#maxBackoff);
@@ -509,6 +523,12 @@ export class GlobalGjcClient {
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
 						),
 					);
+					this.#noteOutage(Date.now());
+				} else if (epoch === this.#epoch && this.#stoppedAtEpoch !== undefined && this.#stoppedAtEpoch < epoch) {
+					// Call #noteOutage even when stopped, if the stop was due to a termination
+					// failure. This allows the #246 guard (live outage exceeded) to trigger and
+					// exit the process, satisfying the requirement that a stuck-stopped client
+					// with unconfirmed children eventually exits instead of hanging forever.
 					this.#noteOutage(Date.now());
 				}
 				this.#schedule(epoch);

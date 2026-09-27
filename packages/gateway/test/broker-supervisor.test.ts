@@ -115,6 +115,40 @@ test("CLI timeout with unconfirmed termination fences client generation until ob
 	}
 }, 10_000);
 
+test("unconfirmed child termination keeps child tracked and doesn't bypass #246 guard", async () => {
+	// Issue #330: when a child fails to terminate, it remains unconfirmed and tracked.
+	// The observation loop continues so the #246 guard (live outage exceeded) can
+	// trigger and exit the process instead of hanging forever. The child must stay
+	// tracked to prevent overlapping broker generations (a safety invariant).
+	let finish = (_code: number) => {};
+	const exited = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	const spawn = (() => ({
+		exited,
+		stdout: new Blob([]).stream(),
+		stderr: new Blob([]).stream(),
+		kill() {},
+	})) as unknown as SpawnFn;
+	const value = client({ spawn, command: undefined });
+	await value.start();
+	const gen1 = value.generation;
+	try {
+		// Spawn a child that will fail to terminate when killed
+		await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toThrow("termination failed");
+		// Client is now stopped due to unconfirmed child
+		await expect(value.cli(["sdk", "session", "list"])).rejects.toThrow("stopped");
+		// Calling start() again fails because child is still tracked
+		await expect(value.start()).rejects.toThrow("exit remains unconfirmed");
+		// Verify generation hasn't changed (no new broker generation started while child is unconfirmed)
+		expect(value.generation).toBe(gen1);
+	} finally {
+		finish(0);
+		await exited;
+		await value.stop();
+	}
+}, 10_000);
+
 test("normal owned relay exit is observed and allows clean idempotent stop", async () => {
 	let finish = (_code: number) => {};
 	const exited = new Promise<number>((resolve) => {
