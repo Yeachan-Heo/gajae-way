@@ -901,13 +901,36 @@ export function containsSilenceToken(text: string): boolean {
 }
 
 /**
+ * Check if text has a silence marker at a boundary (issue #338).
+ * Matches [SILENT] or [silent] at the start or end (after trim),
+ * but NOT when embedded mid-sentence within a word.
+ * Examples:
+ *   "[SILENT] narration" → true (starts with marker + space)
+ *   "[SILENT][REACT:emoji]" → true (starts with marker, followed by control token)
+ *   "narration [SILENT]" → true (ends with marker)
+ *   "HEAD:" + unicode*1000 + "[SILENT]" → true (ends with marker)
+ *   "See [SILENT] in docs" → false (marker is mid-text, not at boundary)
+ */
+export function startsOrEndsWithSilenceMarker(text: string): boolean {
+	const trimmed = text.trim();
+	// Match [SILENT] or [silent] at the start, followed by:
+	// whitespace, another control token [, or end of string
+	if (/^\[(SILENT|silent)\](\s|\[|$)/.test(trimmed)) return true;
+	// Match [SILENT] or [silent] at the end (any content before is ok, as long as
+	// [SILENT] is at the very end). This covers cases like "narrative [SILENT]" and
+	// "HEAD:" + large_text + "[SILENT]" where marker truly ends the output.
+	if (/\[(SILENT|silent)\]$/.test(trimmed)) return true;
+	return false;
+}
+
+/**
  * Unified silence check: a note is silent if it is EITHER an exact match to
- * a silence token OR contains an embedded [SILENT] marker. Use this in all
- * delivery and recovery paths to prevent silent content from leaking into
- * deliveries while preserving authored notes in records.
+ * a silence token OR has an embedded [SILENT] marker at a word boundary.
+ * Use this in all delivery and recovery paths to prevent silent content from
+ * leaking into deliveries while preserving authored notes in records.
  */
 export function isSilentOutput(text: string): boolean {
-	return isSilenceToken(text) || containsSilenceToken(text);
+	return isSilenceToken(text) || startsOrEndsWithSilenceMarker(text);
 }
 
 function unbracket(text: string): string {

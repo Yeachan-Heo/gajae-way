@@ -65,8 +65,8 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 
 const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
 
-describe("isSilentOutput integration (embedded [SILENT] markers)", () => {
-	test("a note with [SILENT] prefix plus narration is NOT delivered", async () => {
+describe("isSilentOutput integration (marker at boundary)", () => {
+	test("note starting with [SILENT] plus narration is NOT delivered", async () => {
 		const {
 			propagator,
 			monitor,
@@ -83,11 +83,10 @@ describe("isSilentOutput integration (embedded [SILENT] markers)", () => {
 		await propagator.drain();
 		expect(db!.authoredOutput(eventId)).toBe("[SILENT] This is a status update");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		// No delivery was created
 		expect(db!.deliveryRows()).toHaveLength(0);
 	});
 
-	test("a note with narration followed by [SILENT] is NOT delivered", async () => {
+	test("note ending with [SILENT] is NOT delivered", async () => {
 		const {
 			propagator,
 			monitor,
@@ -95,19 +94,19 @@ describe("isSilentOutput integration (embedded [SILENT] markers)", () => {
 		} = await harness(
 			async (_id, text) =>
 				JSON.stringify(
-					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Finished processing. [SILENT]" })),
+					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Nothing to report. [SILENT]" })),
 				),
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
 		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.authoredOutput(eventId)).toBe("Finished processing. [SILENT]");
+		expect(db!.authoredOutput(eventId)).toBe("Nothing to report. [SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
 		expect(db!.deliveryRows()).toHaveLength(0);
 	});
 
-	test("a note with narration and [silent] (lowercase) in the middle is NOT delivered", async () => {
+	test("note with [SILENT] mid-text is delivered (marker must be at boundary)", async () => {
 		const {
 			propagator,
 			monitor,
@@ -117,7 +116,7 @@ describe("isSilentOutput integration (embedded [SILENT] markers)", () => {
 				JSON.stringify(
 					eventsFromPrompt(text).map(({ eventId }) => ({
 						eventId,
-						note: "Start of note\n[silent]\nEnd of note",
+						note: "Please see [SILENT] in docs for details",
 					})),
 				),
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
@@ -125,12 +124,13 @@ describe("isSilentOutput integration (embedded [SILENT] markers)", () => {
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
 		for (let attempt = 0; attempt < 100 && db!.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.authoredOutput(eventId)).toBe("Start of note\n[silent]\nEnd of note");
-		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.deliveryRows()).toHaveLength(0);
+		expect(db!.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
+		// Mid-text [SILENT] should NOT suppress, so it will be in "authored" stage and a delivery will exist
+		expect(stage(db!, eventId)).not.toBe("authored_no_delivery");
+		expect(db!.deliveryRows().length).toBeGreaterThan(0);
 	});
 
-	test("a note with only [SILENT] is still NOT delivered", async () => {
+	test("note with only [SILENT] is NOT delivered", async () => {
 		const {
 			propagator,
 			monitor,

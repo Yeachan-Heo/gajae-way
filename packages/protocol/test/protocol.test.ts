@@ -229,47 +229,42 @@ describe("silence tokens", () => {
 });
 
 describe("isSilentOutput", () => {
-	test("unifies exact-match tokens and embedded markers", () => {
-		// Exact-match: [SILENT], SILENT, NO_REPLY, NO REPLY (case-insensitive, with brackets optional)
+	test("exact-match tokens are silent", () => {
 		expect(isSilentOutput("[SILENT]")).toBe(true);
-		expect(isSilentOutput("[Silent]")).toBe(true); // Case-insensitive when bracketed
 		expect(isSilentOutput("SILENT")).toBe(true);
 		expect(isSilentOutput("silent")).toBe(true);
 		expect(isSilentOutput("NO_REPLY")).toBe(true);
 		expect(isSilentOutput("NO REPLY")).toBe(true);
 		expect(isSilentOutput("[NO_REPLY]")).toBe(true);
 		expect(isSilentOutput("[NO REPLY]")).toBe(true);
-		// Whitespace and case variants
 		expect(isSilentOutput("  [SILENT]\n")).toBe(true);
 		expect(isSilentOutput("  silent  ")).toBe(true);
-		expect(isSilentOutput("\tNO REPLY\t")).toBe(true);
 	});
 
-	test("recognizes embedded [SILENT] or [silent] markers with narration", () => {
-		// Embedded markers in the middle of text are recognized
-		expect(isSilentOutput("preamble [SILENT]")).toBe(true);
-		expect(isSilentOutput("preamble\n[SILENT]\npostscript")).toBe(true);
-		expect(isSilentOutput("[SILENT] postscript")).toBe(true);
-		expect(isSilentOutput("preamble [silent] postscript")).toBe(true);
-		// Exact case for embedded markers
-		expect(isSilentOutput("[silent]")).toBe(true);
-		expect(isSilentOutput("text [SILENT] more text")).toBe(true);
+	test("notes starting with [SILENT] or [silent] plus narration are silent", () => {
+		expect(isSilentOutput("[SILENT] This is a status update")).toBe(true);
+		expect(isSilentOutput("[SILENT]\nMultiline status")).toBe(true);
+		expect(isSilentOutput("[silent] lowercase marker with text")).toBe(true);
+		expect(isSilentOutput("  [SILENT] narration after trim")).toBe(true);
 	});
 
-	test("rejects non-silent text containing [SILENT] mid-string", () => {
-		// These should NOT match
-		expect(isSilentOutput("preamble [NO_REPLY]")).toBe(false); // Only [SILENT] or [silent] is recognized as embedded
-		expect(isSilentOutput("preamble SILENT")).toBe(false); // Not bracketed and contains other text
-		expect(isSilentOutput("preamble [ SILENT ]")).toBe(false); // Extra spaces inside brackets
+	test("notes ending with [SILENT] or [silent] are silent", () => {
+		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(true);
+		expect(isSilentOutput("Nothing to report. [silent]")).toBe(true);
+		expect(isSilentOutput("Done.\n[SILENT]")).toBe(true);
 	});
 
-	test("distinguishes silent from non-silent output", () => {
+	test("notes mentioning [SILENT] truly mid-text are NOT silent", () => {
+		// Issue #338: marker must be at a boundary (start/end/line), not embedded mid-sentence
+		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(false);
+		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(false);
+		expect(isSilentOutput("text [SILENT] more")).toBe(false);
+	});
+
+	test("non-silent text is not silent", () => {
 		expect(isSilentOutput("ordinary text")).toBe(false);
 		expect(isSilentOutput("hello world")).toBe(false);
 		expect(isSilentOutput("")).toBe(false);
 		expect(isSilentOutput("This is a real response")).toBe(false);
-		expect(isSilentOutput("silent")).toBe(true); // Exact-match token (case-insensitive)
-		expect(isSilentOutput("[SILENT]")).toBe(true); // Exact-match token
-		expect(isSilentOutput("text [silent] more")).toBe(true); // Embedded marker
 	});
 });

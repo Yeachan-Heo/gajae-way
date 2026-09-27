@@ -867,6 +867,7 @@ export class MonitorPropagator {
 					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
 					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
 				}
+				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
 				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
@@ -896,13 +897,7 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				} else if (silentEntries.length > 0 && nonSilentEntries.length === 0) {
-					// All notes in the batch were silent: nothing would ever confirm it,
-					// so settle terminally instead of stranding at `authored` (#94).
-					// Silent notes already marked above; nothing more to do.
 				}
-				// If there were non-silent entries, they've been delivered.
-				// If there were silent entries, they've been marked as authored_no_delivery.
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
