@@ -412,11 +412,12 @@ test("quarantined historical names refuse admission and retirement before recove
 	expect(() => governor.assertAdmission("fresh")).not.toThrow();
 });
 
-test("#340: lane with no job record uses process.cwd() fallback in singleton mode", async () => {
+test("#340: lane with no job record retires with owned binding repo in singleton mode", async () => {
 	database = await GatewayDatabase.open(":memory:");
-	// Lane A: no job record, not in broker mode, falls back to process.cwd().
+
+	// Lane A: no job record, falls back to owned binding lookup (which returns undefined in singleton mode)
 	bind("a", NOW - 70_000);
-	// Lane B: has job record, idle past ceiling.
+	// Lane B: has job record, idle past ceiling
 	bind("b", NOW - 70_000);
 	persistJob("b", "done");
 
@@ -433,36 +434,36 @@ test("#340: lane with no job record uses process.cwd() fallback in singleton mod
 	const retired = await governor.sweep();
 	expect(retired).toBe(2);
 
-	// In singleton mode (no broker authority), lane A falls back to process.cwd().
-	// This is safe because there's no broker enforcing repo matching.
+	// Both lanes retire. In singleton mode (no broker authority):
+	// - Lane A has no job record, workLaneRepoBySessionId returns undefined,
+	//   isBrokerMode() is false, so falls back to process.cwd() (safe)
+	// - Lane B uses job record's repo
 	expect(port.closes.length).toBe(2);
-	const closeForA = port.closes.find((c) => c.sessionId === "sess-a");
-	const closeForB = port.closes.find((c) => c.sessionId === "sess-b");
-	// Lane A uses job record worktree if available, else process.cwd().
-	expect(closeForA).toBeDefined();
-	expect(closeForB?.repo).toBe("/tmp/worker-repo"); // From job record.
+	const closeA = port.closes.find((c) => c.sessionId === "sess-a");
+	const closeB = port.closes.find((c) => c.sessionId === "sess-b");
+	expect(closeA).toBeDefined();
+	expect(closeB?.repo).toBe("/tmp/worker-repo"); // From job record
 
-	// Both lanes retired.
+	// Both retired
 	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("");
 	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
 	expect(logs.some((line) => line.includes("lane_retired name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
 
-test("#340: sweep continues when retire() throws, per-lane error handling", async () => {
+test("#340: per-lane error handling continues sweep when retire() throws", async () => {
 	database = await GatewayDatabase.open(":memory:");
 
-	// Lane A: will fail its lock acquisition.
+	// Lane A: will fail during lock acquisition
 	bind("a", NOW - 70_000);
-	// Lane B: should be retired despite lane A's error.
+	// Lane B: should retire despite A's error
 	bind("b", NOW - 70_000);
 	persistJob("b", "done");
 
-	// Port that throws when trying to lock lane A.
 	class FailingLockPort extends ScriptedSessionPort {
 		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
 			if (key === "work/task/a") {
-				throw new Error("simulated lock failure");
+				throw new Error("lock acquisition failed");
 			}
 			return await super.runExclusive(key, work);
 		}
@@ -478,16 +479,15 @@ test("#340: sweep continues when retire() throws, per-lane error handling", asyn
 		log: (line) => logs.push(line),
 	});
 
-	// Without per-lane error handling, the lock failure would abort the sweep.
-	// With the fix, error is caught and sweep continues.
 	const retired = await governor.sweep();
-	expect(retired).toBe(1); // Only lane B retired.
+	expect(retired).toBe(1); // Only B retired
 
-	// Lane B should be retired despite lane A's error.
-	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe(""); // A not retired.
-	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe(""); // B retired.
+	expect(port.closes.length).toBe(1);
+	expect(port.closes[0].sessionId).toBe("sess-b");
 
-	// Verify error was logged.
+	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+
 	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
