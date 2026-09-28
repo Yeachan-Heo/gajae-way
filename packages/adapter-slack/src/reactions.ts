@@ -2,6 +2,11 @@ import { type EngagementContext, type OriginRef, REACTION_ALLOWLIST, type Reacti
 import { SlackApiError } from "./api";
 import { slackMessageId, slackMessageOrigin } from "./origin";
 
+/**
+ * Slack's own short names, exactly as `reactions.add` accepts and `reaction_added`
+ * reports them. Aliases other chat apps use (`rofl`) are not Slack names and are
+ * refused with `invalid_name`.
+ */
 export const SLACK_REACTION_NAMES: Readonly<Record<string, string>> = {
 	thumbsup: "+1",
 	thumbsdown: "-1",
@@ -11,7 +16,7 @@ export const SLACK_REACTION_NAMES: Readonly<Record<string, string>> = {
 	pray: "pray",
 	fire: "fire",
 	tada: "tada",
-	laugh: "rofl",
+	laugh: "rolling_on_the_floor_laughing",
 	heart: "heart",
 	thinking: "thinking_face",
 	salute: "saluting_face",

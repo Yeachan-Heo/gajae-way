@@ -20,6 +20,28 @@ test("Every protocol reaction has a Slack mapping and round trips", () => {
 		expect(() => slackReactionFor({ emojiName: name })).toThrow(`Slack has no reaction name for ${name}`);
 });
 
+test("Slack reaction names are Slack's own short names", () => {
+	// Pinned to names `reactions.add` accepts. `rofl` is a Discord/GitHub alias
+	// Slack refuses with invalid_name, which lost every laugh reaction live.
+	expect(SLACK_REACTION_NAMES).toEqual({
+		thumbsup: "+1",
+		thumbsdown: "-1",
+		check: "white_check_mark",
+		cross: "x",
+		eyes: "eyes",
+		pray: "pray",
+		fire: "fire",
+		tada: "tada",
+		laugh: "rolling_on_the_floor_laughing",
+		heart: "heart",
+		thinking: "thinking_face",
+		salute: "saluting_face",
+		lobster: "lobster",
+	});
+	expect(reactionFromSlackName("rolling_on_the_floor_laughing")).toEqual({ emoji: "🤣", emojiName: "laugh" });
+	expect(reactionFromSlackName("rofl")).toBeUndefined();
+});
+
 const event: SlackReactionEvent = {
 	type: "reaction_added",
 	user: "U1",

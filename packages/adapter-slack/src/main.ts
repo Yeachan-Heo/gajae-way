@@ -245,6 +245,8 @@ export class OrderedIngress {
 	}
 }
 
+const SLACK_BARE_TS = /^\d+\.\d+$/;
+
 /** The Slack channel a delivery for this origin is posted in. */
 export function deliveryChannel(origin: OriginRef): string {
 	return origin.kind === "thread" ? (origin.parentId ?? origin.conversationId) : origin.conversationId;
@@ -253,10 +255,16 @@ export function deliveryChannel(origin: OriginRef): string {
 /**
  * Resolves where a reply is posted: inside its thread, or at the top level.
  *
- * Throws a definitive `SlackApiError` when the routing intent cannot be honoured
- * - a thread origin whose id is not a `channel:ts` pair, or an explicit reply
- * target that is malformed or lives in another channel. Posting at the top level
- * instead would silently answer in the wrong place and confirm success for it.
+ * A bare Slack `ts` reply target (`1790575366.547779`, the model dropping the
+ * `channel:` prefix of a header id) names a message in the origin channel, so it
+ * is read as one. A target that is still not a `channel:ts` pair carries no
+ * routing intent at all: the reply goes to the top level of the origin channel,
+ * the conversation it was written for, instead of being dropped whole.
+ *
+ * Throws a definitive `SlackApiError` when a real routing intent cannot be
+ * honoured - a thread origin whose id is not a `channel:ts` pair, or a reply
+ * target in another channel. Posting at the top level instead would silently
+ * answer in a place the target explicitly did not name.
  */
 export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "replyToMessageId">): string | undefined {
 	const channel = deliveryChannel(message.origin);
@@ -267,8 +275,10 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 		return root.ts;
 	}
 	if (message.replyToMessageId === undefined) return undefined;
-	const target = parseSlackMessageId(message.replyToMessageId);
-	if (!target) throw new SlackApiError(0, "invalid_target", "Slack reply target has a malformed message id");
+	const target = parseSlackMessageId(
+		SLACK_BARE_TS.test(message.replyToMessageId) ? `${channel}:${message.replyToMessageId}` : message.replyToMessageId,
+	);
+	if (!target) return undefined;
 	if (target.channel !== channel)
 		throw new SlackApiError(0, "invalid_target", "Slack reply target belongs to a foreign channel");
 	return target.ts;

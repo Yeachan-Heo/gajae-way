@@ -519,22 +519,23 @@ test("Slack threaded delivery keeps every chunk in the thread; explicit same-cha
 		expect(api.posts.map((p) => p[2])).toEqual(["1.000", "1.000", "1.000"]);
 		expect(api.posts.map((p) => p[1]).join("")).toBe("a".repeat(8001));
 	}
-	// A reply target the adapter cannot honour is a definitive failure with no
-	// post at all: answering at the top level would confirm a reply nobody saw.
-	for (const replyToMessageId of ["C2:1.000", "bad", "C1:", ":1.0"]) {
+	// A reply target in another channel is a definitive failure with no post at
+	// all: answering here would confirm a reply to a message nobody here saw.
+	{
 		const api = new Api();
 		const gateway = new Gateway();
-		await settleSlackDelivery(gateway, api, delivery({ replyToMessageId }));
+		await settleSlackDelivery(gateway, api, delivery({ replyToMessageId: "C2:1.000" }));
 		expect(api.posts).toEqual([]);
 		expect(gateway.requests).toEqual([
 			{
 				verb: "delivery.fail",
-				params: { deliveryId: "delivery", reason: expect.stringMatching(/malformed|foreign/), ambiguous: false },
+				params: { deliveryId: "delivery", reason: expect.stringMatching(/foreign/), ambiguous: false },
 			},
 		]);
-		expect(() => replyThreadTs(delivery({ replyToMessageId }))).toThrow(SlackApiError);
+		expect(() => replyThreadTs(delivery({ replyToMessageId: "C2:1.000" }))).toThrow(SlackApiError);
 	}
-	// A thread origin whose id is not channel:ts is refused the same way.
+	// A thread origin whose id is not channel:ts is refused the same way: the
+	// thread is the conversation itself, so the top level is the wrong place.
 	const api = new Api();
 	const gateway = new Gateway();
 	await settleSlackDelivery(
@@ -544,6 +545,36 @@ test("Slack threaded delivery keeps every chunk in the thread; explicit same-cha
 	);
 	expect(api.posts).toEqual([]);
 	expect(gateway.requests[0]?.verb).toBe("delivery.fail");
+});
+
+test("Slack bare-ts reply targets thread in the origin channel; malformed targets post unthreaded", async () => {
+	// Observed live: models drop the `channel:` prefix of a header id, and a
+	// numeric round trip trims the ts. Both name a message in the origin channel.
+	const dm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" };
+	for (const [extra, channel, ts] of [
+		[{ replyToMessageId: "1790575366.547779" }, "C1", "1790575366.547779"],
+		[{ replyToMessageId: "1790575366.547000" }, "C1", "1790575366.547000"],
+		[{ origin: dm, replyToMessageId: "1790575366.547779" }, "D1", "1790575366.547779"],
+	] as const) {
+		const api = new Api();
+		const gateway = new Gateway();
+		await settleSlackDelivery(gateway, api, delivery(extra));
+		expect(api.posts).toEqual([[channel, "hello", ts]]);
+		expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
+	}
+	// A target that is not a message id at all carries no routing intent: the
+	// answer lands at the top level of its own conversation instead of vanishing.
+	for (const replyToMessageId of ["bad", "C1:", ":1.0", "1790575366"]) {
+		const api = new Api();
+		const gateway = new Gateway();
+		await settleSlackDelivery(gateway, api, delivery({ replyToMessageId }));
+		expect(api.posts).toEqual([["C1", "hello", undefined]]);
+		expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
+		expect(replyThreadTs(delivery({ replyToMessageId }))).toBeUndefined();
+	}
+	// A thread origin ignores the reply target: the bare ts cannot move it.
+	const thread: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	expect(replyThreadTs(delivery({ origin: thread, replyToMessageId: "9.999" }))).toBe("1.000");
 });
 
 for (const error of [new TypeError("Slack network lost"), new SlackApiError(403, "not_allowed")])
