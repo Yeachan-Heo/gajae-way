@@ -545,16 +545,28 @@ export type WorkSteerResult =
 	| { readonly steered: false; readonly reason: string };
 
 export interface WorkRetireParams {
-	readonly name: string;
+	readonly name?: string;
+	readonly force?: boolean;
+	readonly allDead?: boolean;
 }
 
 /**
  * Retirement closes the worker's gjc session and clears the gateway binding,
  * so the next `work.run` for that name creates a fresh session. A lane with an
  * open attempt is never retired from under its turn.
+ *
+ * When `force` is true, skip attempt-state checks and require broker liveness
+ * proving the session dead or disowned; if found dead, close as `host_lost` and
+ * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
  */
 export type WorkRetireResult =
-	| { readonly retired: true; readonly sessionKey: string; readonly sessionId: string; readonly closed: boolean }
+	| {
+			readonly retired: true;
+			readonly sessionKey: string;
+			readonly sessionId: string;
+			readonly closed: boolean;
+			readonly forced?: boolean;
+	  }
 	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
 
 /** Structured detail carried by a `lane_capacity` error. */

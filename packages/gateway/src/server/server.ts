@@ -32,6 +32,7 @@ import {
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
 	validateOriginRef,
+	type WorkRetireResult,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
@@ -597,7 +598,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 		void work
 			.recover()
-			.then(() => lanes.sweep())
+			.then(async () => {
+				await lanes.sweep();
+				// Also release dead/disowned lanes via reconciliation
+				await lanes.retireAllDead();
+			})
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	const deliverySweepTimer = setInterval(() => {
@@ -978,7 +983,42 @@ async function handleRequest(
 			return;
 		}
 		case "work.retire": {
-			const params = request.params as { name?: unknown } | undefined;
+			const params = request.params as { name?: unknown; force?: unknown; allDead?: unknown } | undefined;
+			const force = params?.force === true;
+			const allDead = params?.allDead === true;
+			if (force && allDead) throw new ProtocolError("invalid_params", "force and allDead are mutually exclusive");
+			if (allDead) {
+				// Retire all dead lanes
+				await runtime.work.recover();
+				const { count, names } = await runtime.lanes.retireAllDead();
+				// Return result with count and names of retired lanes
+				const result: Record<string, unknown> = {
+					retired: count > 0,
+					count,
+					names,
+					sessionKey: "work/*",
+					sessionId: "",
+					closed: true,
+				};
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result,
+				});
+				return;
+			}
+			if (force) {
+				if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
+					throw new ProtocolError(
+						"invalid_params",
+						"work.retire --force requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+					);
+				await runtime.work.recover();
+				const outcome = await runtime.lanes.forceRetire(params.name);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
+				return;
+			}
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.retire requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 			await runtime.work.recover();

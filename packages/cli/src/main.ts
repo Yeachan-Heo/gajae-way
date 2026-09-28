@@ -61,7 +61,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -753,17 +753,46 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					break;
 				}
 				if (command === "retire" || command === "jobs") {
-					if (command === "retire" ? args.length !== 1 || !args[0] || args[0].startsWith("--") : args.length !== 0)
+					let force = false;
+					let allDead = false;
+					let name: string | undefined;
+					if (command === "retire") {
+						for (let i = 0; i < args.length; i++) {
+							const arg = args[i];
+							if (arg === "--force") {
+								if (force) throw new Error(usage);
+								force = true;
+							} else if (arg === "--all-dead") {
+								if (allDead) throw new Error(usage);
+								allDead = true;
+							} else if (!arg.startsWith("--")) {
+								if (name) throw new Error(usage); // Already have a name, reject duplicate
+								name = arg;
+							} else throw new Error(usage);
+						}
+						if (!allDead && !name) throw new Error(usage);
+						if (allDead && name) throw new Error(usage);
+					} else if (args.length !== 0) {
 						throw new Error(usage);
+					}
 					const client = await GajaewayClient.connectSocket(parsed.socket);
 					try {
 						if (command === "retire") {
-							const result = await client.request<WorkRetireResult>("work.retire", { name: args[0] });
-							console.log(
-								result.retired
-									? `retired: ${result.sessionKey} session=${result.sessionId} closed=${result.closed}`
-									: `not retired: ${result.reason}`,
-							);
+							const result = await client.request<WorkRetireResult>("work.retire", {
+								...(name !== undefined ? { name } : {}),
+								...(force ? { force } : {}),
+								...(allDead ? { allDead } : {}),
+							});
+							if (allDead) {
+								console.log(`Retired all dead lanes`);
+							} else {
+								const forced = result.retired && result.forced ? " (forced)" : "";
+								console.log(
+									result.retired
+										? `retired: ${result.sessionKey} session=${result.sessionId} closed=${result.closed}${forced}`
+										: `not retired: ${result.reason}`,
+								);
+							}
 						} else {
 							const result = await client.request<WorkJobsResult>("work.jobs");
 							for (const job of result.jobs) {

@@ -191,6 +191,8 @@ test("a corrupt lane-job record fails closed: counted, never retired", async () 
 		json: "{not json",
 	});
 	const port = new ScriptedSessionPort();
+	// Set session as live to prevent sweep second pass from releasing it
+	port.setSessionState("sess-a", { live: true });
 	const governor = new LaneGovernor({ database, sessionPort: port, maxLanes: 1, idleRetireMs: 60_000, now: () => NOW });
 	const lane = governor.activeLanes()[0];
 	expect(lane).toMatchObject({ name: "a", state: "corrupt", attemptOpen: true });
@@ -262,7 +264,7 @@ test("sweep retires idle and terminal jobs but preserves fresh lanes and open at
 	persistJob("aborted", "aborted");
 	persistJob("busy", "running", true);
 	const port = new ScriptedSessionPort();
-	const logs: string[] = [];
+	const logs: string[]= [];
 	const governor = new LaneGovernor({
 		database,
 		sessionPort: port,
@@ -333,6 +335,8 @@ test("an existing lane-job row with an empty body is corrupt, not absent", async
 		json: "",
 	});
 	const port = new ScriptedSessionPort();
+	// Set session as live to prevent sweep second pass from releasing it
+	port.setSessionState("sess-a", { live: true });
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => NOW });
 	expect(governor.activeLanes()[0]).toMatchObject({ state: "corrupt", attemptOpen: true });
 	expect((await governor.retire("a", "operator")).retired).toBe(false);
@@ -344,6 +348,8 @@ test("sweep leaves a lane alone when it was reused on the same session between n
 	database = await GatewayDatabase.open(":memory:");
 	bind("a", NOW - 10 * 60_000, "sess-a");
 	const port = new ScriptedSessionPort();
+	// Set session as live to prevent sweep second pass from releasing it
+	port.setSessionState("sess-a", { live: true });
 	let clock = NOW;
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => clock });
 	// Hold the lane lock while the sweep nominates `a` as idle, then make the
@@ -524,6 +530,9 @@ test("#340: per-lane error handling continues sweep for remaining lanes", async 
 	}
 
 	const port = new FailingLockPort();
+	// Set session state: A is live (lock fails, doesn't get retired in first pass)
+	// B's state defaults to live=false (will be retired)
+	port.setSessionState("sess-a", { live: true });
 	const logs: string[] = [];
 	const governor = new LaneGovernor({
 		database,
@@ -534,13 +543,15 @@ test("#340: per-lane error handling continues sweep for remaining lanes", async 
 	});
 
 	const retired = await governor.sweep();
-	// Only B retired; A's error is caught and logged
+	// B retired by first pass (done job), A retained by lock failure and live session
 	expect(retired).toBe(1);
 
 	expect(port.closes.length).toBe(1);
 	expect(port.closes[0].sessionId).toBe("sess-b");
 
+	// A stays bound because lock failed and session is live
 	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	// B is retired
 	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
 
 	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
@@ -566,6 +577,8 @@ test("#340: per-lane error handling continues sweep when retire() throws", async
 	}
 
 	const port = new FailingLockPort();
+	// A is live (lock fails, doesn't get retired); B defaults to dead
+	port.setSessionState("sess-a", { live: true });
 	const logs: string[] = [];
 	const governor = new LaneGovernor({
 		database,
@@ -581,33 +594,43 @@ test("#340: per-lane error handling continues sweep when retire() throws", async
 	expect(port.closes.length).toBe(1);
 	expect(port.closes[0].sessionId).toBe("sess-b");
 
+	// A stays bound (lock failed, live session)
 	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	// B is retired
 	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
 
 	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
 
-test("#340: per-lane error handling continues sweep when retire() throws", async () => {
+test("#360: session_unavailable status error is treated like unknown: settled when session dead/disowned", async () => {
 	database = await GatewayDatabase.open(":memory:");
+	bind("a", NOW - 10 * 60_000, SESSION_ID);
+	const identity = laneJobIdentity("a");
+	const opRef = newOpRef("governor-session-unavail");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/a",
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW - 300_000),
+	});
+	record = appendAttempt(record, { opRef, sessionId: SESSION_ID, startedAt: new Date(NOW - 240_000).toISOString() });
+	record = closeAttempt({
+		record,
+		opRef,
+		endState: "attempt_ended",
+		errorCode: "gateway_turn_reaped",
+		endedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
 
-	// Lane A: will fail during lock acquisition.
-	bind("a", NOW - 70_000);
-	// Lane B: should be retired despite lane A's error.
-	bind("b", NOW - 70_000);
-	persistJob("b", "done");
-
-	// Port that throws when locking lane A.
-	class FailingLockPort extends ScriptedSessionPort {
-		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
-			if (key === "work/task/a") {
-				throw new Error("lock acquisition failed");
-			}
-			return await super.runExclusive(key, work);
+	class SessionUnavailablePort extends ScriptedSessionPort {
+		override async status(): Promise<any> {
+			throw new Error('gjc sdk session status reported failure: {"code":"session_unavailable"}');
 		}
 	}
 
-	const port = new FailingLockPort();
+	const port = new SessionUnavailablePort();
 	const logs: string[] = [];
 	const governor = new LaneGovernor({
 		database,
@@ -617,22 +640,169 @@ test("#340: per-lane error handling continues sweep when retire() throws", async
 		log: (line) => logs.push(line),
 	});
 
-	// Without per-lane error handling, lock failure for lane A would abort sweep.
-	// With fix, error is caught and sweep continues.
-	const retired = await governor.sweep();
-	expect(retired).toBe(1); // Only lane B retired.
+	// When session is dead, session_unavailable error should be treated as settled (via liveness)
+	port.setSessionState(SESSION_ID, { live: false, repo: "/tmp/worker-repo" });
+	const deadOutcome = await governor.retire("a", "operator");
+	expect(deadOutcome.retired).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=a"))).toBe(true);
+});
 
-	// Lane A close not attempted (error during lock).
-	// Lane B close attempted and succeeded.
-	expect(port.closes.length).toBe(1);
-	expect(port.closes[0].sessionId).toBe("sess-b");
+test("#360: session_unavailable with live session does not settle", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("a", NOW - 10 * 60_000, SESSION_ID);
+	const identity = laneJobIdentity("a");
+	const opRef = newOpRef("governor-session-unavail-live");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/a",
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW - 300_000),
+	});
+	record = appendAttempt(record, { opRef, sessionId: SESSION_ID, startedAt: new Date(NOW - 240_000).toISOString() });
+	record = closeAttempt({
+		record,
+		opRef,
+		endState: "attempt_ended",
+		errorCode: "gateway_turn_reaped",
+		endedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
 
-	// Lane A stays bound (error during retire).
-	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
-	// Lane B is retired.
-	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+	class SessionUnavailablePort2 extends ScriptedSessionPort {
+		override async status(): Promise<any> {
+			throw new Error('gjc sdk session status reported failure: {"code":"session_unavailable"}');
+		}
+	}
 
-	// Error should be logged.
-	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
-	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
+	const port = new SessionUnavailablePort2();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// When session is live, session_unavailable error should NOT settle
+	port.setSessionState(SESSION_ID, { live: true, repo: "/tmp/worker-repo" });
+	const liveOutcome = await governor.retire("a", "operator");
+	expect(liveOutcome.retired).toBe(false);
+	expect(liveOutcome.retired === false && liveOutcome.reason).toMatch(/broker reports/);
+});
+
+test("#360: forceRetire refuses live sessions but closes dead ones", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("live", NOW, "sess-live");
+	persistJob("live", "running", false);
+	bind("dead", NOW, "sess-dead");
+	persistJob("dead", "running", false);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Force retire on live session: should refuse
+	port.setSessionState("sess-live", { live: true });
+	const liveRefused = await governor.forceRetire("live");
+	expect(liveRefused.retired).toBe(false);
+	expect(liveRefused.retired === false && liveRefused.reason).toMatch(/still live/);
+	expect(logs.some((line) => line.includes("lane_force_retire_rejected"))).toBe(true);
+
+	// Force retire on dead session: should succeed
+	port.setSessionState("sess-dead", { live: false });
+	const deadRetired = await governor.forceRetire("dead");
+	expect(deadRetired.retired).toBe(true);
+	if (deadRetired.retired) {
+		expect(deadRetired.forced).toBe(true);
+	}
+	expect(logs.some((line) => line.includes("lane_retired name=dead") && line.includes("reason=operator_force"))).toBe(true);
+	expect(port.closes).toContainEqual({ sessionId: "sess-dead", repo: "/tmp/worker-repo" });
+});
+
+test("#360: sweep releases dead lanes and quarantined lanes don't count toward capacity", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane 1: dead session
+	bind("dead-lane", NOW - 120_000, "sess-dead");
+	persistJob("dead-lane", "running", false); // not open
+
+	// Lane 2: live lane (should not be retired)
+	bind("live-lane", NOW - 10_000, "sess-live");
+	persistJob("live-lane", "running", false);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		maxLanes: 2,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Both lanes fit within maxLanes
+	const lanes = governor.activeLanes();
+	expect(lanes.map((l) => l.name).sort()).toEqual(["dead-lane", "live-lane"]);
+
+	// Test that we can still admit since we're at capacity
+	expect(() => governor.assertAdmission("dead-lane")).not.toThrow();
+	expect(() => governor.assertAdmission("live-lane")).not.toThrow();
+
+	// Test that sweep releases dead lanes
+	port.setSessionState("sess-dead", { live: false });
+	port.setSessionState("sess-live", { live: true });
+
+	const retiredCount = await governor.sweep();
+	expect(retiredCount).toBe(1); // Only dead-lane should be retired by sweep
+
+	expect(logs.some((line) => line.includes("lane_retired name=dead-lane"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=live-lane"))).toBe(false); // live lane not retired
+
+	// Verify only dead-lane was closed
+	expect(port.closes).toContainEqual({ sessionId: "sess-dead", repo: "/tmp/worker-repo" });
+	expect(port.closes).not.toContainEqual({ sessionId: "sess-live", repo: "/tmp/worker-repo" });
+});
+
+test("#360: retireAllDead retires only dead lanes, skipping live and quarantined", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane 1: dead
+	bind("dead1", NOW - 120_000, "sess-dead1");
+	// Lane 2: dead
+	bind("dead2", NOW - 120_000, "sess-dead2");
+	// Lane 3: live
+	bind("live", NOW - 10_000, "sess-live");
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Set session states
+	port.setSessionState("sess-dead1", { live: false });
+	port.setSessionState("sess-dead2", { live: false });
+	port.setSessionState("sess-live", { live: true });
+
+	const result = await governor.retireAllDead();
+	expect(result.count).toBe(2); // Only the two dead lanes
+	expect(result.names.sort()).toEqual(["dead1", "dead2"]);
+
+	expect(logs.filter((line) => line.includes("lane_retired")).length).toBe(2);
+	expect(logs.some((line) => line.includes("lane_retired name=dead1"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=dead2"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=live"))).toBe(false);
+
+	expect(port.closes.length).toBe(2);
+	expect(port.closes.map((c) => c.sessionId).sort()).toEqual(["sess-dead1", "sess-dead2"]);
 });
