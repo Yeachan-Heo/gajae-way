@@ -305,7 +305,15 @@ export class ScriptedSessionPort implements SessionPort {
 	}> = [];
 	readonly failedTransportCauseMap = new Map<
 		string,
-		{ kind: string; nativeErrorCode?: string; http2RstCode?: number; status?: number; requestBytes?: number; retryMaxAttempts?: number; endpointClass?: string }
+		{
+			kind: string;
+			nativeErrorCode?: string;
+			http2RstCode?: number;
+			status?: number;
+			requestBytes?: number;
+			retryMaxAttempts?: number;
+			endpointClass?: string;
+		}
 	>();
 
 	setFailedTurnEvidence(
@@ -317,7 +325,15 @@ export class ScriptedSessionPort implements SessionPort {
 
 	setFailedTransportCause(
 		sessionId: string,
-		cause: { kind: string; nativeErrorCode?: string; http2RstCode?: number; status?: number; requestBytes?: number; retryMaxAttempts?: number; endpointClass?: string },
+		cause: {
+			kind: string;
+			nativeErrorCode?: string;
+			http2RstCode?: number;
+			status?: number;
+			requestBytes?: number;
+			retryMaxAttempts?: number;
+			endpointClass?: string;
+		},
 	): void {
 		this.failedTransportCauseMap.set(sessionId, cause);
 	}

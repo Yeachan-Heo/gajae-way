@@ -23,7 +23,13 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
-import { type FailedTransportCause, type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence, readFailedTransportCause } from "./failed-turn-evidence";
+import {
+	type FailedTransportCause,
+	type FailedTurnEvidence,
+	type FailedTurnEvidenceInput,
+	readFailedTransportCause,
+	readFailedTurnEvidence,
+} from "./failed-turn-evidence";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,

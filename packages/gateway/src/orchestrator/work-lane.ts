@@ -39,8 +39,8 @@ import {
 	workAttemptDeliveryId,
 	workAttemptReportId,
 } from "../store/db";
-import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { readFailedTransportCause } from "./failed-turn-evidence";
+import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";

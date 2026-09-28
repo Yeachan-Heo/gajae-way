@@ -270,11 +270,7 @@ export async function readFailedTransportCause(
 	const facts = record(message.transportFailure);
 	if (!facts || facts.kind !== "transport") return undefined;
 	// Reject if status conflict: if both errorStatus and transport.status are defined, they must match
-	if (
-		message.errorStatus !== undefined &&
-		facts.status !== undefined &&
-		message.errorStatus !== facts.status
-	)
+	if (message.errorStatus !== undefined && facts.status !== undefined && message.errorStatus !== facts.status)
 		return undefined;
 	// Build allowlisted object
 	const fields: Record<string, unknown> = { kind: "transport" };
