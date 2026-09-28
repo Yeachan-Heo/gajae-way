@@ -5,6 +5,31 @@ on:
   pull_request:
 
 jobs:
+  verify-pr-verdict:
+    name: verify PR merge approval
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - name: Fetch PR data and reviews
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Fetch PR data including reviews from GitHub API
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER --jq '.'
+            | jq --argjson reviews "$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews --paginate --jq '.[]'|jq -s .)" '. + {reviews: $reviews}')
+          echo "$PR_DATA" > /tmp/pr-data.json
+      - name: Verify PR merge approval
+        run: bun run scripts/verify-pr-verdict.ts /tmp/pr-data.json
+
   test:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
