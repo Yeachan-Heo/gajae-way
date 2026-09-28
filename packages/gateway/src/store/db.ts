@@ -134,6 +134,16 @@ export interface WorkAttemptOutput {
 	readonly proof: WorkAttemptOutputProof | null;
 	/** Proven original attempt-final silence survives output loss and ledger pruning. */
 	readonly knownSilence: WorkAttemptOutputProof | null;
+	/** Transport failure details for failed attempts with terminal_missing_receipt. */
+	readonly transportCause?: {
+		readonly kind: string;
+		readonly nativeErrorCode?: string;
+		readonly http2RstCode?: number;
+		readonly status?: number;
+		readonly requestBytes?: number;
+		readonly retryMaxAttempts?: number;
+		readonly endpointClass?: string;
+	};
 }
 export interface WorkAttemptTerminalEvidence {
 	readonly kind: "broker" | "local";

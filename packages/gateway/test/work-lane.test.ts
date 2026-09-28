@@ -1693,3 +1693,57 @@ test("quarantined accepted work reserves its name without querying the shared br
 	expect(f.port.sends).toHaveLength(sends + 1);
 	expect(f.notices).toHaveLength(0);
 });
+
+test("transport failure ECONNRESET without errorStatus yields transport cause in lane notice", async () => {
+	const f = await fixture();
+	const result = await started(f, "a", origin);
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "failed", receiptState: "missing" },
+		summaryCompleted: true,
+	});
+	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	// Mock the transport failure
+	f.port.setFailedTransportCause(result.sessionId, {
+		kind: "transport",
+		nativeErrorCode: "ECONNRESET",
+		requestBytes: 1238792,
+		endpointClass: "custom",
+		retryMaxAttempts: 1,
+	});
+	await until(() => f.db.workAttemptOpen().length === 0);
+	const attempt = f.db.workAttemptGet(result.opRef);
+	expect(attempt?.terminal?.reasonCode).toBe("terminal_missing_receipt");
+	expect(attempt?.output?.transportCause).toEqual({
+		kind: "transport",
+		nativeErrorCode: "ECONNRESET",
+		requestBytes: 1238792,
+		endpointClass: "custom",
+		retryMaxAttempts: 1,
+	});
+	const notice = f.notices[0]?.text ?? "";
+	expect(notice).toContain("final_response_missing");
+	expect(notice).toContain("cause=transport");
+	expect(notice).toContain("ECONNRESET");
+	expect(notice).toContain("requestBytes=1238792");
+	expect(notice).toContain("retryMaxAttempts=1");
+	expect(notice).toContain("endpointClass=custom");
+});
+
+test("transport failure never leaks errorMessage secrets in lane notice", async () => {
+	const f = await fixture();
+	const result = await started(f, "a", origin);
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "failed", receiptState: "missing" },
+		summaryCompleted: true,
+	});
+	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	await until(() => f.db.workAttemptOpen().length === 0);
+	const attempt = f.db.workAttemptGet(result.opRef);
+	const notice = f.notices[0]?.text ?? "";
+	// Private error messages must never appear in lane notice
+	expect(notice).not.toContain("secret");
+	expect(notice).not.toContain("private");
+	expect(notice).not.toContain("authentication");
+});

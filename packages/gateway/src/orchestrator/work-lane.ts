@@ -40,6 +40,7 @@ import {
 	workAttemptReportId,
 } from "../store/db";
 import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import { readFailedTransportCause } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
@@ -817,6 +818,40 @@ export class WorkLaneManager {
 			const name = runtime.sessionKey.slice("work/task/".length);
 			const at = this.#at();
 			const reason = runtime.terminal!.reasonCode;
+			// Extract transport cause for sdk_failed/terminal_missing_receipt failures
+			let output = runtime.output;
+			if (
+				(reason === "sdk_failed" || reason === "terminal_missing_receipt") &&
+				output.disposition === "unavailable" &&
+				!output.transportCause
+			) {
+				try {
+					const terminalAt = runtime.terminal?.status?.terminalAt ?? Date.parse(runtime.terminal?.observedAt ?? "");
+					if (Number.isFinite(terminalAt)) {
+						const input = {
+							sessionId: runtime.sessionId,
+							repo: runtime.cwd,
+							startedAtMs: Date.parse(runtime.startedAt),
+							terminalAtMs: terminalAt,
+						};
+						// Try port method first (for testing), then file-based reader
+						let cause = await this.#port.failedTransportCause?.(input);
+						if (!cause) {
+							cause = await readFailedTransportCause(undefined, input);
+						}
+						if (cause) {
+							output = { ...output, transportCause: cause };
+							const parts = [`kind=${cause.kind}`];
+							if (cause.nativeErrorCode) parts.push(`nativeErrorCode=${cause.nativeErrorCode}`);
+							if (cause.http2RstCode !== undefined) parts.push(`http2RstCode=${cause.http2RstCode}`);
+							if (cause.status !== undefined) parts.push(`status=${cause.status}`);
+							console.error(`work_transport_failure opRef=${runtime.opRef} ${parts.join(" ")}`);
+						}
+					}
+				} catch (error) {
+					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
+				}
+			}
 			const endState =
 				reason === "end_turn"
 					? "completed"
@@ -848,7 +883,7 @@ export class WorkLaneManager {
 				});
 			}
 
-			const text = reportText(name, endState, reason, runtime.opRef, runtime.output);
+			const text = reportText(name, endState, reason, runtime.opRef, output);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -896,7 +931,7 @@ export class WorkLaneManager {
 				runtime.opRef,
 				runtime.version,
 				job,
-				{ decision, settledAt: at },
+				{ decision, settledAt: at, ...(output !== runtime.output ? { output } : {}) },
 				admission,
 			);
 			if (!settled) return undefined;
@@ -1692,12 +1727,24 @@ export function reportText(
 	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
-	const body =
+	let body =
 		output.disposition === "unavailable"
 			? reason === "terminal_missing_receipt"
 				? `final_response_missing opRef=${opRef}`
 				: "output_unavailable"
 			: (output.excerpt ?? "");
+	// Include transport cause details if present
+	if (reason === "terminal_missing_receipt" && output.transportCause) {
+		const transport = output.transportCause;
+		const parts: string[] = [body, `cause=transport`];
+		if (transport.nativeErrorCode) parts.push(transport.nativeErrorCode);
+		if (transport.http2RstCode !== undefined) parts.push(`http2RstCode=${transport.http2RstCode}`);
+		if (transport.status !== undefined) parts.push(`status=${transport.status}`);
+		if (transport.requestBytes !== undefined) parts.push(`requestBytes=${transport.requestBytes}`);
+		if (transport.retryMaxAttempts !== undefined) parts.push(`retryMaxAttempts=${transport.retryMaxAttempts}`);
+		if (transport.endpointClass !== undefined) parts.push(`endpointClass=${transport.endpointClass}`);
+		body = parts.join(" ");
+	}
 	const content = utf8Prefix(body, 2048 - Buffer.byteLength(head, "utf8"));
 	const text = head + content;
 	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");

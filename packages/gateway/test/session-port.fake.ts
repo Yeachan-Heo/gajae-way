@@ -303,6 +303,10 @@ export class ScriptedSessionPort implements SessionPort {
 		startedAtMs: number;
 		terminalAtMs: number;
 	}> = [];
+	readonly failedTransportCauseMap = new Map<
+		string,
+		{ kind: string; nativeErrorCode?: string; http2RstCode?: number; status?: number; requestBytes?: number; retryMaxAttempts?: number; endpointClass?: string }
+	>();
 
 	setFailedTurnEvidence(
 		sessionId: string,
@@ -311,9 +315,20 @@ export class ScriptedSessionPort implements SessionPort {
 		this.failureEvidence.set(sessionId, { reason });
 	}
 
+	setFailedTransportCause(
+		sessionId: string,
+		cause: { kind: string; nativeErrorCode?: string; http2RstCode?: number; status?: number; requestBytes?: number; retryMaxAttempts?: number; endpointClass?: string },
+	): void {
+		this.failedTransportCauseMap.set(sessionId, cause);
+	}
+
 	async failedTurnEvidence(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
 		this.failureEvidenceProbes.push(input);
 		return this.failureEvidence.get(input.sessionId);
+	}
+
+	async failedTransportCause(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
+		return this.failedTransportCauseMap.get(input.sessionId);
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {

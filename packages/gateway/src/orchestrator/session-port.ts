@@ -23,7 +23,7 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
-import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
+import { type FailedTransportCause, type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence, readFailedTransportCause } from "./failed-turn-evidence";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
@@ -62,6 +62,8 @@ export interface SessionPort {
 	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
+	/** Transport failure cause from the same session transcript. */
+	failedTransportCause?(input: FailedTurnEvidenceInput): Promise<FailedTransportCause | undefined>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
