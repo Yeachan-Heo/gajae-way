@@ -1088,6 +1088,14 @@ class OriginActor {
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
 		} catch (error) {
+			// No prompt was sent, so this lifecycle can never reach a terminal: the
+			// trigger is re-dispatched under a new one (below, or by recovery).
+			await this.#releaseLifecycle(lifecycle, {
+				originKey: this.originKey,
+				epoch,
+				sessionId: binding.sessionId,
+				turn,
+			});
 			// The relay refusing to attach because the broker no longer serves the
 			// session (`endpoint_stale`) is the same proof as a disowning send: the
 			// prompt never landed. Release the bound row and rebind, never hold.
@@ -2377,8 +2385,12 @@ class OriginActor {
 
 	/** Best-effort: a presentation hook failing must never keep the origin from re-dispatching. */
 	async #notifyReleased(bound: BoundTurn): Promise<void> {
+		await this.#releaseLifecycle(bound.lifecycle, bound);
+	}
+
+	async #releaseLifecycle(lifecycle: PersonaTurnLifecycle, identity: PersonaTurnIdentity): Promise<void> {
 		try {
-			await bound.lifecycle.onReleased?.(bound);
+			await lifecycle.onReleased?.(identity);
 		} catch (error) {
 			this.#manager.log(`persona_release_hook_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
 		}

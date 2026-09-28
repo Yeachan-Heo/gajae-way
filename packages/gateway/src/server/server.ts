@@ -1756,8 +1756,12 @@ async function createInboundTurnLifecycle(
 	// One inbound message is one turn; it carries the live requester/voice context.
 	const row = input.trigger;
 	const laneReport = row.source === "lane_report";
+	// The requester context (turnId, connection, voice) outlives this lifecycle:
+	// a turn released before its prompt landed (attach/model/send refusal, or
+	// recovery requeueing an unaccepted turn) re-dispatches the same trigger under
+	// a new lifecycle, which must still answer the original request. It is
+	// dropped once the trigger settles (onSettled) or is discarded (onInboundDiscard).
 	const context = runtime.inbound.get(row.message_id);
-	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? [...runtime.connections][0];
 	const turnId = context?.turnId ?? crypto.randomUUID();
 	const voiceTurn = context?.voice === true;
@@ -2266,6 +2270,16 @@ async function createInboundTurnLifecycle(
 					broadcastDelivery(runtime, notice);
 				}
 			}
+			// A loopback requester waits for a final chat.message on its turnId; without
+			// this it waits out its whole turn timeout for a turn that already failed.
+			if (!nonLoopback && connection)
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "event",
+					event: "chat.message",
+					...(context ? { id: context.requestId } : {}),
+					payload: { turnId, origin, role: "assistant", text: failureNotice, final: true },
+				});
 			// The `[turn failed]` notice is a diagnostic, not an answer: it never
 			// claims the slot, but visible interim output before the failure does.
 			closeTerminalLink(nonLoopback ? "turn_failed" : "loopback");
@@ -2274,6 +2288,7 @@ async function createInboundTurnLifecycle(
 		}
 	};
 	const onSettled = ({ terminalDeliveryId }: PersonaTurnSettledInput) => {
+		if (runtime.inbound.get(row.message_id) === context) runtime.inbound.delete(row.message_id);
 		if (engagement?.authorIsBot !== true || terminalDeliveryId !== null) return;
 		// A delivered `[turn failed]` notice is a diagnostic, not an answer: it is
 		// deliberately emitted under a different delivery/turn identity, so it does

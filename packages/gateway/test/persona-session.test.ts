@@ -1498,6 +1498,29 @@ test("startup recovery releases a retired bound turn the broker disowns instead 
 	expect(logs.filter((line) => line.includes(`opRef=${ghostOpRef}`) && line.startsWith("recovery_hold"))).toEqual([]);
 });
 
+test("a tail attach that fails before any send releases the lifecycle it created", async () => {
+	class HelloLostOncePort extends ScriptedSessionPort {
+		failures = 0;
+		override async attachTail(input: TailAttachInput) {
+			if (this.failures === 0) {
+				this.failures += 1;
+				throw new Error("host hello did not arrive");
+			}
+			return await super.attachTail(input);
+		}
+	}
+	const port = new HelloLostOncePort();
+	const released: string[] = [];
+	await harness(port, { released: (opRef) => released.push(opRef) });
+	enqueue("hello-lost", "reply after the relay recovers");
+	await manager?.notifyInbound(KEY).catch(() => undefined);
+
+	expect(port.failures).toBe(1);
+	expect(port.sends).toEqual([]);
+	expect(released).toEqual([latestOpRef]);
+	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+});
+
 test("startup recovery reconstructs an accepted durable turn and reconciles status plus turn.result", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
