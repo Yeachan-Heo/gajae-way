@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/main";
@@ -11,7 +11,7 @@ import {
 	type ServiceProcess,
 	supervisorArgv,
 } from "../src/restart-stack";
-import { GATEWAY_UNIT } from "../src/services";
+import { GATEWAY_UNIT, serviceSpecs, systemdUnitPath } from "../src/services";
 
 const DEPLOYED_AT = Date.parse("2026-08-29T06:40:00.000Z");
 
@@ -51,6 +51,7 @@ function fakeHost(stuck: ReadonlySet<string> = new Set()) {
 			},
 			probe: async (label: string) => processes.get(label),
 			binaryModifiedAt: async () => DEPLOYED_AT,
+			isServiceInstalled: async () => true,
 		},
 	};
 }
@@ -149,6 +150,7 @@ test("on systemd one gateway restart carries the dependents, each still verified
 			},
 			probe: async (label) => ({ pid: 9, startedAt: clock + 1_000, binary: `/opt/bin/${label}` }),
 			binaryModifiedAt: async () => DEPLOYED_AT,
+			isServiceInstalled: async () => true,
 		});
 		expect(ran).toEqual([["systemctl", "--user", "restart", GATEWAY_UNIT]]);
 		expect(receipt.state).toBe("ok");
@@ -208,4 +210,155 @@ test("the supervisor never uses bootout and escapes the gateway cgroup on system
 	expect(linux).toContain("--unit=gajaeway-restart-stack-r6");
 	expect(linux.slice(-worker.length)).toEqual(worker);
 	expect([...linux, ...worker]).not.toContain("bootout");
+});
+
+test("an uninstalled service is skipped and does not abort remaining services", async () => {
+	const { home, cleanup } = await tempHome();
+	try {
+		let clock = DEPLOYED_AT + 60_000;
+		let pid = 8000;
+		const ran: string[] = [];
+		const processes = new Map<string, ServiceProcess>();
+		// Only gateway and admin are installed/running; adapter-discord is not installed
+		processes.set("dev.gajaeway.gateway", {
+			pid: pid++,
+			startedAt: DEPLOYED_AT - 3_600_000,
+			binary: "/opt/bin/gateway",
+		});
+		// adapter-discord is intentionally not in the map (not installed)
+		processes.set("dev.gajaeway.adapter-slack", {
+			pid: pid++,
+			startedAt: DEPLOYED_AT - 3_600_000,
+			binary: "/opt/bin/adapter-slack",
+		});
+		processes.set("dev.gajaeway.admin", { pid: pid++, startedAt: DEPLOYED_AT - 3_600_000, binary: "/opt/bin/admin" });
+
+		const receipt = await runRestartStack({
+			home,
+			id: "r7",
+			platform: "darwin",
+			uid: 501,
+			now: () => clock,
+			sleep: async (ms: number) => {
+				clock += ms;
+			},
+			verifyTimeoutMs: 5_000,
+			pollMs: 1_000,
+			runner: (command: readonly string[]) => {
+				const label = command.at(-1)?.split("/").at(-1) ?? "";
+				ran.push(label);
+				const previous = processes.get(label);
+				if (previous) processes.set(label, { ...previous, pid: pid++, startedAt: clock + 1_000 });
+				return 0;
+			},
+			probe: async (label: string) => {
+				// Return undefined for uninstalled service
+				return processes.get(label);
+			},
+			isServiceInstalled: async (label) => {
+				// Only adapter-discord is not installed
+				return label !== "dev.gajaeway.adapter-discord";
+			},
+			binaryModifiedAt: async (_path: string) => {
+				return DEPLOYED_AT;
+			},
+		});
+
+		// The receipt should be ok because the uninstalled service is skipped
+		expect(receipt.state).toBe("ok");
+		// gateway: ok, adapter-discord: skipped (not installed), adapter-slack: ok, admin: ok
+		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "skipped", "ok", "ok"]);
+		// The restart commands should have been run for installed services
+		expect(ran).toContain("dev.gajaeway.gateway");
+		expect(ran).not.toContain("dev.gajaeway.adapter-discord");
+		expect(ran).toContain("dev.gajaeway.adapter-slack");
+		expect(ran).toContain("dev.gajaeway.admin");
+		// adapter-discord should have a skip detail
+		const discord = receipt.steps[1];
+		expect(discord?.detail).toContain("not installed");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("default check skips services not in the unit dir", async () => {
+	const { home: gajaewayHome, cleanup: cleanupGajaeway } = await tempHome();
+	const { home: unitDir, cleanup: cleanupUnitDir } = await tempHome();
+	try {
+		let clock = DEPLOYED_AT + 60_000;
+		let pid = 8000;
+		const ran: string[] = [];
+		const processes = new Map<string, ServiceProcess>();
+		// All services are running
+		processes.set("dev.gajaeway.gateway", {
+			pid: pid++,
+			startedAt: DEPLOYED_AT - 3_600_000,
+			binary: "/opt/bin/gateway",
+		});
+		processes.set("dev.gajaeway.adapter-discord", {
+			pid: pid++,
+			startedAt: DEPLOYED_AT - 3_600_000,
+			binary: "/opt/bin/adapter-discord",
+		});
+		processes.set("dev.gajaeway.adapter-slack", {
+			pid: pid++,
+			startedAt: DEPLOYED_AT - 3_600_000,
+			binary: "/opt/bin/adapter-slack",
+		});
+		processes.set("dev.gajaeway.admin", {
+			pid: pid++,
+			startedAt: DEPLOYED_AT - 3_600_000,
+			binary: "/opt/bin/admin",
+		});
+
+		// Only create unit file for gateway
+		const gatewaySpec = serviceSpecs().find((s) => s.id === "gateway");
+		if (!gatewaySpec) throw new Error("gateway spec not found");
+		const gatewayUnitPath = systemdUnitPath(gatewaySpec, unitDir);
+		await writeFile(gatewayUnitPath, "[Unit]\nDescription=test\n", { encoding: "utf8" });
+
+		const receipt = await runRestartStack({
+			home: gajaewayHome,
+			id: "r8",
+			platform: "linux",
+			now: () => clock,
+			sleep: async (ms: number) => {
+				clock += ms;
+			},
+			verifyTimeoutMs: 5_000,
+			pollMs: 1_000,
+			runner: (command: readonly string[]) => {
+				ran.push(command.join(" "));
+				// Restart the gateway by updating its process start time
+				const previous = processes.get("dev.gajaeway.gateway");
+				if (previous) processes.set("dev.gajaeway.gateway", { ...previous, pid: pid++, startedAt: clock + 1_000 });
+				return 0;
+			},
+			probe: async (label: string) => {
+				return processes.get(label);
+			},
+			binaryModifiedAt: async () => DEPLOYED_AT,
+			env: { HOME: "/home/testuser" },
+			unitDir,
+		});
+
+		// The receipt should be ok because uninstalled services are skipped
+		expect(receipt.state).toBe("ok");
+		// gateway: ok, others: skipped (not in unitDir)
+		expect(receipt.steps.map((step) => step.result)).toEqual(["ok", "skipped", "skipped", "skipped"]);
+		// Only the systemctl restart command should have run (for gateway)
+		expect(ran).toHaveLength(1);
+		expect(ran[0]).toContain("systemctl");
+		expect(ran[0]).toContain(GATEWAY_UNIT);
+		// Adapters and admin should have skip details
+		const discord = receipt.steps[1];
+		expect(discord?.detail).toContain("not installed");
+		const slack = receipt.steps[2];
+		expect(slack?.detail).toContain("not installed");
+		const admin = receipt.steps[3];
+		expect(admin?.detail).toContain("not installed");
+	} finally {
+		await cleanupGajaeway();
+		await cleanupUnitDir();
+	}
 });

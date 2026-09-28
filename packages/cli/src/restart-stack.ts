@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	currentPlatform,
+	launchAgentPlistPath,
 	restartOrder,
 	restartStackCommands,
 	type ServicePlatform,
 	serviceSpecs,
+	systemdUnitDir,
 	systemdUnitName,
+	systemdUnitPath,
 } from "./services";
 
 /**
@@ -58,6 +62,7 @@ export interface ServiceProcess {
 
 export type CommandRunner = (command: readonly string[]) => number | PromiseLike<number>;
 export type ServiceProbe = (label: string) => Promise<ServiceProcess | undefined>;
+export type IsServiceInstalled = (label: string) => Promise<boolean>;
 
 export interface RunRestartOptions {
 	readonly home: string;
@@ -66,6 +71,8 @@ export interface RunRestartOptions {
 	readonly uid?: number;
 	readonly runner?: CommandRunner;
 	readonly probe?: ServiceProbe;
+	/** Checks if a service is installed; if not provided, defaults to checking the service manager's files. */
+	readonly isServiceInstalled?: IsServiceInstalled;
 	/** Epoch ms modification time of a deployed binary. */
 	readonly binaryModifiedAt?: (path: string) => Promise<number>;
 	readonly now?: () => number;
@@ -73,6 +80,12 @@ export interface RunRestartOptions {
 	/** How long one service may take to come back verified; covers the gateway's ordered shutdown. */
 	readonly verifyTimeoutMs?: number;
 	readonly pollMs?: number;
+	/** Environment variables; used to determine systemd unit dir on linux. Defaults to process.env. */
+	readonly env?: NodeJS.ProcessEnv;
+	/** LaunchAgents directory on darwin. Defaults to ~/Library/LaunchAgents. */
+	readonly launchAgentsDir?: string;
+	/** systemd unit directory on linux. Defaults to $XDG_CONFIG_HOME/systemd/user. */
+	readonly unitDir?: string;
 }
 
 const RECEIPT_FILE = "restart-stack.json";
@@ -166,6 +179,42 @@ async function defaultBinaryModifiedAt(path: string): Promise<number> {
 	return (await stat(path)).mtimeMs;
 }
 
+/** Checks if a service is installed by verifying the service manager's definition file exists. */
+function defaultIsServiceInstalled(options: {
+	readonly platform: ServicePlatform;
+	readonly env: NodeJS.ProcessEnv;
+	readonly launchAgentsDir?: string;
+	readonly unitDir?: string;
+}): IsServiceInstalled {
+	return async (label: string) => {
+		const spec = serviceSpecs().find((s) => s.label === label);
+		if (spec === undefined) return false;
+
+		if (options.platform === "darwin") {
+			const userHome = options.env.HOME || homedir();
+			const agentsDir = options.launchAgentsDir || join(userHome, "Library", "LaunchAgents");
+			const plistPath = launchAgentPlistPath(spec, agentsDir);
+			try {
+				await access(plistPath);
+				return true;
+			} catch {
+				return false;
+			}
+		}
+
+		// linux
+		const userHome = options.env.HOME || homedir();
+		const unitDirPath = options.unitDir || systemdUnitDir(options.env, userHome);
+		const unitPath = systemdUnitPath(spec, unitDirPath);
+		try {
+			await access(unitPath);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+}
+
 function floorSecond(ms: number): number {
 	return Math.floor(ms / 1_000) * 1_000;
 }
@@ -180,6 +229,14 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 	const runner = options.runner ?? defaultCommandRunner;
 	const probe = options.probe ?? defaultServiceProbe(platform);
 	const modifiedAt = options.binaryModifiedAt ?? defaultBinaryModifiedAt;
+	const isInstalled =
+		options.isServiceInstalled ??
+		defaultIsServiceInstalled({
+			platform,
+			env: options.env ?? process.env,
+			launchAgentsDir: options.launchAgentsDir,
+			unitDir: options.unitDir,
+		});
 	const now = options.now ?? Date.now;
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const timeoutMs = options.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS;
@@ -201,6 +258,15 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 			continue;
 		}
 		try {
+			// Check if the service is installed before trying to restart it
+			const installed = await isInstalled(step.label);
+			if (!installed) {
+				step.result = "skipped";
+				step.detail = "service is not installed";
+				await writeReceipt(options.home, receipt);
+				continue;
+			}
+
 			if (step.command !== undefined) {
 				issuedAt = now();
 				const status = await runner(step.command);
@@ -215,7 +281,9 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 			step.result = "failed";
 			step.detail = error instanceof Error ? error.message : String(error);
 		}
-		if (step.result !== "ok") receipt.state = step.result === "stale" ? "stale" : "failed";
+		if (step.result !== "ok" && step.result !== "skipped") {
+			receipt.state = step.result === "stale" ? "stale" : "failed";
+		}
 		await writeReceipt(options.home, receipt);
 	}
 	if (receipt.state === "running") receipt.state = "ok";
