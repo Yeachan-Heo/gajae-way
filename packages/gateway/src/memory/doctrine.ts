@@ -18,6 +18,10 @@ function gitEnv(): Record<string, string> {
 	return {
 		PATH: process.env.PATH ?? "/usr/bin:/bin",
 		HOME: process.env.HOME ?? "/tmp",
+		// Callers match git's English diagnostics ("nothing to commit", "does not
+		// have any commits"). macOS Homebrew git follows the system language even
+		// with LANG unset, so the locale is pinned rather than inherited.
+		LC_ALL: "C",
 		GIT_AUTHOR_NAME: "gajaeway",
 		GIT_AUTHOR_EMAIL: "gajaeway@local",
 		GIT_COMMITTER_NAME: "gajaeway",

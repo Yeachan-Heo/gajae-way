@@ -2,7 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendDaily, initializeMemory, mapListsAxis, memoryGit, regenerateMap } from "../src/memory/doctrine";
+import {
+	appendDaily,
+	CorpusWriter,
+	initializeMemory,
+	mapListsAxis,
+	memoryGit,
+	regenerateMap,
+} from "../src/memory/doctrine";
 import {
 	type AxisDescriptor,
 	type AxisRegistry,
@@ -23,6 +30,21 @@ let home = "";
 afterEach(async () => {
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
+});
+
+// The memory code recognises git's "does not have any commits" and "nothing to
+// commit" by their English text. macOS Homebrew git follows the system language
+// even with LANG unset, so git must run in the C locale for those checks to hold.
+test("memory git diagnostics stay in the C locale the memory code matches", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-git-locale-"));
+	await memoryGit(home, ["init"]);
+	await expect(memoryGit(home, ["log", "-1", "--format=%H"])).rejects.toThrow("does not have any commits yet");
+	const writer = new CorpusWriter(home);
+	expect(await writer.findCommitByTrailer("intent-id: none")).toBeUndefined();
+	await writeFile(join(home, "note.md"), "x\n");
+	await writer.stageFiles("note.md");
+	expect(await writer.commit("first")).toMatch(/^[0-9a-f]{40}$/);
+	expect(await writer.commit("nothing staged")).toBeUndefined();
 });
 
 test("capture follows the registered root of the capture axis, not a hardcoded daily/", async () => {
