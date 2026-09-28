@@ -122,6 +122,8 @@ test("tail frames deliver an assistant finding before the persistent operation r
 	const midTurn = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 	expect(midTurn).toHaveLength(1);
 	expect(midTurn[0].payload.text).toContain("every 3 minutes");
+	// Mid-work speech must not end the adapter's working status: the turn runs on.
+	expect(midTurn[0].payload.final).toBe(false);
 	sessionPort.complete(send.opRef, "done: found the culprit");
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const count = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message").length;
@@ -131,6 +133,17 @@ test("tail frames deliver an assistant finding before the persistent operation r
 	const messages = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(2);
 	expect(messages[1].payload.text).toContain("found the culprit");
+	// The answer reached the gateway on the tail first, so it shipped as a
+	// streamed part; the turn's end is the unconditional final progress tick,
+	// emitted once the terminal path ran - that is what tears the status down.
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (client.frames.some((frame: any) => frame.event === "chat.progress" && frame.payload.final === true)) break;
+		await Bun.sleep(5);
+	}
+	const finalTick = client.frames.findIndex(
+		(frame: any) => frame.event === "chat.progress" && frame.payload.final === true,
+	);
+	expect(finalTick).toBeGreaterThan(client.frames.indexOf(messages[0]));
 });
 
 test("a message arriving during an active persistent turn is steered without a second send", async () => {

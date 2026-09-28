@@ -285,6 +285,7 @@ for (const reaction of [false, true]) {
 				origin,
 				text: "reply",
 				deliveryId: "delivery",
+				final: true,
 				...(reaction ? { reaction: { targetMessageId: "C1:1.001", emoji: "👍", emojiName: "thumbsup" } } : {}),
 			} as ChatMessagePayload;
 			await settleSlackDelivery(gateway, f.api, message, console, {
@@ -293,12 +294,51 @@ for (const reaction of [false, true]) {
 					cleared++;
 					throw new Error("Slack cleanup failed");
 				},
+				async reassert() {
+					throw new Error("final delivery must not reassert");
+				},
 			});
 			expect(cleared).toBe(1);
 			expect(gateway.requests).toEqual([fails ? "delivery.fail" : "delivery.confirm"]);
 		});
 	}
 }
+
+test("Slack interim delivery keeps presence and re-sets the status line; the final reply clears it", async () => {
+	const f = fixture();
+	const gateway = new Gateway();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	expect(f.statuses).toEqual([`C1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`]);
+	const interim = { origin, text: "still working", deliveryId: "d1", final: false } as ChatMessagePayload;
+	await settleSlackDelivery(gateway, f.api, interim, console, f.status);
+	await flush();
+	// Slack cleared the line when the interim posted; it is set again, markers stay.
+	expect(f.statuses).toHaveLength(2);
+	expect(f.statuses[1]).toBe(f.statuses[0]);
+	expect(f.removes).toEqual([]);
+	const reaction = {
+		origin,
+		text: "👍",
+		deliveryId: "d2",
+		final: false,
+		reaction: { targetMessageId: "C1:1.000", emoji: "👍", emojiName: "thumbsup" },
+	} as ChatMessagePayload;
+	await settleSlackDelivery(gateway, f.api, reaction, console, f.status);
+	await flush();
+	expect(f.statuses).toHaveLength(2);
+	expect(f.removes).toEqual([]);
+	await settleSlackDelivery(
+		gateway,
+		f.api,
+		{ origin, text: "done", deliveryId: "d3", final: true } as ChatMessagePayload,
+		console,
+		f.status,
+	);
+	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
+	expect(f.statuses.at(-1)).toBe("C1:1.000:");
+	expect(gateway.requests).toEqual(["delivery.confirm", "delivery.confirm", "delivery.confirm"]);
+});
 
 test("Slack inbound arms presence for every engaged turn, on the triggering message", async () => {
 	// Engagement is the gateway's call: it admits un-mentioned thread follow-ups,
@@ -394,7 +434,7 @@ test("Slack presence: cleanup failures are logged, never thrown, and never block
 	await settleSlackDelivery(
 		gateway,
 		f.api,
-		{ origin, text: "reply", deliveryId: "d" } as ChatMessagePayload,
+		{ origin, text: "reply", deliveryId: "d", final: true } as ChatMessagePayload,
 		console,
 		f.status,
 	);

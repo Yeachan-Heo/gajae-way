@@ -19,13 +19,19 @@ export interface DeliveryRequeue {
 	readonly payloads: readonly ChatMessagePayload[];
 }
 
-/** Pure construction shared by ordinary dispatch and atomic work settlement. */
+/**
+ * Pure construction shared by ordinary dispatch and atomic work settlement.
+ * `final` is false for mid-turn speech: adapters keep the turn's working
+ * status alive through it and tear it down only on the terminal reply (or the
+ * final progress tick).
+ */
 export function buildDeliveryPayload(
 	turnId: string,
 	origin: OriginRef,
 	text: string,
 	deliveryId: string,
 	replyToMessageId?: string,
+	final = true,
 ): ChatMessagePayload | undefined {
 	if (isSilentOutput(text)) return undefined;
 	originKey(origin);
@@ -34,7 +40,7 @@ export function buildDeliveryPayload(
 		origin,
 		role: "assistant",
 		text,
-		final: true,
+		final,
 		deliveryId,
 		...(replyToMessageId ? { replyToMessageId } : {}),
 	};
@@ -51,8 +57,9 @@ export class DeliveryService {
 		text: string,
 		replyToMessageId?: string,
 		deliveryId: string = crypto.randomUUID(),
+		final = true,
 	): ChatMessagePayload | undefined {
-		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId);
+		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId, final);
 		if (!payload) return undefined;
 		if (
 			!this.#ledger.createPending({
@@ -97,6 +104,10 @@ export class DeliveryService {
 	 *
 	 * `text` is the bare unicode emoji: an adapter that ignores `reaction` degrades
 	 * to a visible acknowledgement instead of dropping the delivery.
+	 *
+	 * A reaction never ends a turn (`final: false`): a mid-turn reaction or the
+	 * 👀 steer acknowledgement must not tear down the working status of a turn
+	 * that is still running. Turn end is signalled by the final progress tick.
 	 */
 	prepareReaction(turnId: string, origin: OriginRef, reaction: ReactionRef): ChatMessagePayload {
 		const deliveryId = crypto.randomUUID();
@@ -105,7 +116,7 @@ export class DeliveryService {
 			origin,
 			role: "assistant",
 			text: reaction.emoji,
-			final: true,
+			final: false,
 			deliveryId,
 			reaction,
 		};

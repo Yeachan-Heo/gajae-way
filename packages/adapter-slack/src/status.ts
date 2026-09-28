@@ -160,6 +160,18 @@ export class WorkingStatus {
 		await this.#retire(conversationId, entry);
 	}
 
+	/**
+	 * A mid-turn message posted into the thread: Slack clears the native status
+	 * line on every reply, but the turn is still running. Forget the confirmed
+	 * line and reconcile so it is set again; reactions are untouched.
+	 */
+	async reassert(conversationId: string): Promise<void> {
+		const entry = this.#entries.get(conversationId);
+		if (!entry?.wanted) return;
+		entry.shownStatus = "";
+		await this.#reconcile(conversationId, entry);
+	}
+
 	/** Marks the gradient unwanted and drives the reconcile that takes every marker off. */
 	async #retire(key: string, entry: Entry): Promise<void> {
 		entry.wanted = false;

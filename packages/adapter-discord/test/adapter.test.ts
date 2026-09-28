@@ -499,6 +499,46 @@ test("working status is a reaction gradient on the triggering message and clears
 	expect(removed).toHaveLength(before);
 });
 
+test("an interim delivery keeps the working status and re-pulses typing; only the final reply clears", async () => {
+	const { discord, removed } = presenceDiscord();
+	let typingCount = 0;
+	const typingDiscord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {}, sendTyping: async () => void typingCount++ }) },
+	};
+	const typing = new TypingIndicator(typingDiscord, 10_000, 60_000, { error: () => {} });
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	status.arm("channel-1", "m-1");
+	typing.begin("channel-1");
+	await Bun.sleep(5);
+	const beforeInterim = typingCount;
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await settleDiscordDelivery(
+		mockGateway(requests),
+		discord,
+		{ ...delivery("still working"), final: false },
+		typing,
+		status,
+	);
+	await Bun.sleep(5);
+	// Posting cleared Discord's hint; it was re-sent at once, not after the 10s tick.
+	expect(typingCount).toBe(beforeInterim + 1);
+	expect(removed).toEqual([]);
+	await settleDiscordDelivery(
+		mockGateway(requests),
+		discord,
+		{ ...delivery("👍"), final: false, reaction: { targetMessageId: "m-1", emoji: "👍", emojiName: "thumbsup" } },
+		typing,
+		status,
+	);
+	expect(removed).toEqual([]);
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("done"), typing, status);
+	expect(removed).toEqual(["⏳:bot-1"]);
+	const settled = typingCount;
+	typing.refresh("channel-1");
+	await Bun.sleep(5);
+	expect(typingCount).toBe(settled);
+});
+
 test("working status ignores non-discord progress and survives channel failures", async () => {
 	const failing: DiscordClientLike = {
 		channels: {

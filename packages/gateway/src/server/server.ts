@@ -2023,7 +2023,18 @@ async function createInboundTurnLifecycle(
 				);
 				if (owner !== deliveryId) continue;
 			}
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
+			// Mid-work speech is not the end of the turn: `final: false` keeps the
+			// adapter's working status (typing, presence, Slack status line) alive
+			// while the persona keeps streaming. Only the terminal reply - or the
+			// unconditional final progress tick - tears it down.
+			const payload = runtime.delivery.prepare(
+				crypto.randomUUID(),
+				origin,
+				step.body,
+				step.replyTo,
+				deliveryId,
+				source === "terminal",
+			);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
 			deliveredIds.push(payload.deliveryId as string);

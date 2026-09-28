@@ -225,7 +225,13 @@ export interface ChatMessagePayload {
 	readonly origin: OriginRef;
 	readonly role: "assistant";
 	readonly text: string;
-	/** True when this is the final message of the turn. */
+	/**
+	 * True when this is the final message of the turn. Mid-work speech and
+	 * reactions are `false`: the turn is still running, so adapters keep its
+	 * working status (typing, presence) up. A reply that already streamed
+	 * mid-turn is not re-sent, so the final progress tick is the authoritative
+	 * end-of-turn signal.
+	 */
 	readonly final: boolean;
 	/**
 	 * Ledger delivery id when this message requires platform delivery

@@ -279,7 +279,7 @@ export async function settleSlackDelivery(
 	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
-	status?: Pick<WorkingStatus, "clear">,
+	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
@@ -287,7 +287,7 @@ export async function settleSlackDelivery(
 		try {
 			await settleSlackReaction(gateway, api, message);
 		} finally {
-			await status?.clear(message.origin.conversationId).catch(() => {});
+			await settleTurnPresence(message, status);
 		}
 		return;
 	}
@@ -312,9 +312,28 @@ export async function settleSlackDelivery(
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
 	} finally {
-		// Cosmetic cleanup must never turn a confirmed Slack delivery into a failure.
-		await status?.clear(message.origin.conversationId).catch(() => {});
+		await settleTurnPresence(message, status);
 	}
+}
+
+/**
+ * Only the turn's final reply ends its working status. Mid-turn speech and
+ * reactions arrive with `final: false` while the persona is still streaming;
+ * clearing on them left the thread looking idle for the rest of the turn.
+ * A posted reply does clear Slack's native status line, so it is re-set.
+ * Cosmetic cleanup must never turn a confirmed Slack delivery into a failure.
+ */
+async function settleTurnPresence(
+	message: ChatMessagePayload,
+	status: Pick<WorkingStatus, "clear" | "reassert"> | undefined,
+): Promise<void> {
+	if (!status) return;
+	const conversationId = message.origin.conversationId;
+	if (!message.final) {
+		if (!message.reaction) await status.reassert(conversationId).catch(() => {});
+		return;
+	}
+	await status.clear(conversationId).catch(() => {});
 }
 
 export async function settleSlackReaction(
@@ -344,7 +363,7 @@ export function subscribeSlackDeliveries(
 	gateway: GatewayClientLike,
 	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
 	log: Pick<Console, "error"> = console,
-	status?: Pick<WorkingStatus, "clear">,
+	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 ): () => void {
 	return gateway.onChatMessage((message) => {
