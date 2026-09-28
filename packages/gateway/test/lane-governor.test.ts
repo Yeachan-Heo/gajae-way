@@ -264,7 +264,7 @@ test("sweep retires idle and terminal jobs but preserves fresh lanes and open at
 	persistJob("aborted", "aborted");
 	persistJob("busy", "running", true);
 	const port = new ScriptedSessionPort();
-	const logs: string[]= [];
+	const logs: string[] = [];
 	const governor = new LaneGovernor({
 		database,
 		sessionPort: port,
@@ -721,7 +721,9 @@ test("#360: forceRetire refuses live sessions but closes dead ones", async () =>
 	if (deadRetired.retired) {
 		expect(deadRetired.forced).toBe(true);
 	}
-	expect(logs.some((line) => line.includes("lane_retired name=dead") && line.includes("reason=operator_force"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=dead") && line.includes("reason=operator_force"))).toBe(
+		true,
+	);
 	expect(port.closes).toContainEqual({ sessionId: "sess-dead", repo: "/tmp/worker-repo" });
 });
 
