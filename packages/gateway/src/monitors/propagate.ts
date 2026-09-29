@@ -923,13 +923,25 @@ export class MonitorPropagator {
 				const failureClass = classifyAuthoringFailure(error);
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
 				for (const row of leased) {
+					// Place JSON detail FIRST so it survives 500-char truncation. Convert undefined to null
+					// so operation/operation_args are never dropped by JSON.stringify. failureDetail comes after
+					// and may be truncated (#342).
+					const structuredDetail = JSON.stringify({
+						phase: dispatchPhase,
+						operation: dispatchOperation ?? null,
+						operation_args: dispatchOperationArgs ?? null,
+						sessionId: boundSessionId ?? null,
+						origin: sessionOriginKey,
+						attempt: row.dispatch_attempts + 1,
+					});
 					const failed = this.#database.monitorEventFencedFail(
 						row.event_id,
 						leaseId,
 						batchId,
 						code,
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
-						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
+						// Structured detail is placed first to protect from 500-char truncation (#342).
+						`dispatch phase failed (${code}): ${structuredDetail} ${failureDetail(error)}`,
 						now(),
 					);
 					if (failed) this.#emitStage(row, "failed");
