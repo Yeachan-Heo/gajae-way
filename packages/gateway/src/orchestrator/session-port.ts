@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -63,13 +64,45 @@ export type TerminateHostOutcome =
 	| { readonly outcome: "not_a_host"; readonly pid: number; readonly command: string }
 	| { readonly outcome: "refused"; readonly reason: string };
 
+/**
+ * What the session host is doing, as `gjc sdk session inspect` reports it:
+ * `state` ("idle", or whatever the host is busy with) since `at` (epoch ms).
+ */
+export interface SessionActivity {
+	readonly state: string;
+	readonly at: number;
+}
+
+/** Raw broker liveness; `activity` is present only when inspect reported a well-formed one. */
+export interface SessionLiveness {
+	readonly live: boolean | undefined;
+	readonly disowned: boolean;
+	readonly activity?: SessionActivity;
+}
+
+/**
+ * The parts of a reply the delivery path would post: split on `[BREAK]`,
+ * `[REPLY:id]` markers stripped, and every part that is or carries a silence
+ * token dropped whole.
+ */
+export function spokenParts(text: string): string[] {
+	return text
+		.split(/\n\s*\[BREAK\]\s*\n?/)
+		.map((part) => part.trim())
+		.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
+		.map((part) => part.replace(/\[REPLY:[^\]\s]+\]/g, "").trim())
+		.filter((part) => part.length > 0);
+}
+
+/** True when nothing in `text` would be posted. */
+export function isSilentReply(text: string): boolean {
+	return spokenParts(text).length === 0;
+}
+
 export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
-	liveness?(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
+	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
 	/**
@@ -121,13 +154,16 @@ export interface SessionPort {
 	 * (stamped at bind, before the send, and cleared on requeue). Turn-scoped
 	 * by wall clock, independent of gjc ring
 	 * coordinates (gajae-code#5200); undefined when the newest row predates
-	 * the turn.
+	 * the turn. With `preferSpoken`, the last row that is not a silent reply
+	 * wins over a later silent one (a trailing `[SILENT]` after a real answer);
+	 * a silent row is returned only when no spoken row qualifies.
 	 */
 	fetchAssistantSince?(input: {
 		sessionId: string;
 		repo: string;
 		notBeforeMs: number;
 		relay?: TailHandle;
+		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
@@ -606,11 +642,9 @@ export class BrokerSessionPort implements SessionPort {
 	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
 	 * `locator.repo`, which makes the subsession normalizer return undefined for a
 	 * perfectly well-known session. `disowned` = the broker rejects the id.
+	 * `activity` is the host's own `{state, at}` when inspect reports one.
 	 */
-	async liveness(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
+	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
 		this.#assertOwned(input);
 		try {
 			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
@@ -618,12 +652,21 @@ export class BrokerSessionPort implements SessionPort {
 			});
 			const envelope = JSON.parse(result.stdout) as {
 				ok?: unknown;
-				result?: { session?: { live?: unknown } };
+				result?: { session?: { live?: unknown; activity?: { state?: unknown; at?: unknown } } };
 				error?: { code?: unknown };
 			};
 			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
-			const live = envelope.result?.session?.live;
-			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
+			const session = envelope.result?.session;
+			const live = session?.live;
+			const state = session?.activity?.state;
+			const at = session?.activity?.at;
+			return {
+				live: typeof live === "boolean" ? live : undefined,
+				disowned: false,
+				...(typeof state === "string" && typeof at === "number" && Number.isFinite(at) && at > 0
+					? { activity: { state, at } }
+					: {}),
+			};
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return { live: undefined, disowned: isSessionGoneCode(sdkErrorCode(error)) };
@@ -995,14 +1038,22 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		notBeforeMs: number;
 		relay?: TailHandle;
+		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined> {
 		this.#assertOwned(input);
 		return await this.#overRelay(input, "transcript.list", async (sdk) => await this.#assistantSince(input, sdk));
 	}
 
-	async #assistantSince(input: { notBeforeMs: number }, sdk: SdkTransport): Promise<LastAssistantResult | undefined> {
+	async #assistantSince(
+		input: { notBeforeMs: number; preferSpoken?: boolean },
+		sdk: SdkTransport,
+	): Promise<LastAssistantResult | undefined> {
 		let cursor: string | undefined;
-		let latest: { role?: string; ts?: string; textSummary?: string; body?: string } | undefined;
+		type Row = { role?: string; ts?: string; textSummary?: string; body?: string };
+		const rowText = (row: Row): string =>
+			(typeof row.body === "string" && row.body) || (typeof row.textSummary === "string" ? row.textSummary : "");
+		let latest: Row | undefined;
+		let latestSpoken: Row | undefined;
 		const seenCursors = new Set<string>();
 		for (let pages = 1; pages <= 1_000; pages++) {
 			const result = await sdk("query", "transcript.list", {}, { timeoutMs: 15_000, ...(cursor ? { cursor } : {}) });
@@ -1022,14 +1073,15 @@ export class BrokerSessionPort implements SessionPort {
 			for (const row of page.items) {
 				if (row.role !== "assistant") continue;
 				const at = typeof row.ts === "string" ? Date.parse(row.ts) : Number.NaN;
-				if (Number.isFinite(at) && at + 2_000 >= input.notBeforeMs) latest = row;
+				if (!Number.isFinite(at) || at + 2_000 < input.notBeforeMs) continue;
+				latest = row;
+				const text = rowText(row);
+				if (text.trim() && !isSilentReply(text)) latestSpoken = row;
 			}
 			if (page.complete === true) {
-				if (!latest) return undefined;
-				const text =
-					(typeof latest.body === "string" && latest.body) ||
-					(typeof latest.textSummary === "string" ? latest.textSummary : "");
-				return { text, pages, complete: true };
+				const chosen = (input.preferSpoken ? latestSpoken : undefined) ?? latest;
+				if (!chosen) return undefined;
+				return { text: rowText(chosen), pages, complete: true };
 			}
 			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
 			if (!next || seenCursors.has(next))

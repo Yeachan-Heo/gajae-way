@@ -10,8 +10,10 @@ import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type { SessionRelayStream } from "../src/orchestrator/broker";
 import type {
 	RunningHostJob,
+	SessionActivity,
 	SessionBindInput,
 	SessionBinding,
+	SessionLiveness,
 	SessionPort,
 	SessionRequestInput,
 	SessionRequestResult,
@@ -21,7 +23,7 @@ import type {
 	WorkerOutputInput,
 	WorkerOutputResult,
 } from "../src/orchestrator/session-port";
-import { BrokerSessionPort, parseWorkerOutputResponse } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, isSilentReply, parseWorkerOutputResponse } from "../src/orchestrator/session-port";
 import {
 	RelayClosedError,
 	type RelayRequestOptions,
@@ -228,14 +230,19 @@ export class ScriptedSessionPort implements SessionPort {
 		return { outcome: "terminated", pid: 40_000 + this.closes.length };
 	}
 
+	readonly #activity = new Map<string, SessionActivity>();
+
+	/** What `session inspect` reports the host doing (`at` = when it entered that state). */
+	setActivity(sessionId: string, state: string, at: number = Date.now()): void {
+		this.#activity.set(sessionId, { state, at });
+	}
+
 	/** Broker liveness from the scripted state table; an unseeded id is disowned, like an id the broker never indexed. */
-	async liveness(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ live: boolean | undefined; disowned: boolean }> {
+	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state) return { live: undefined, disowned: true };
-		return { live: state.live, disowned: false };
+		const activity = this.#activity.get(input.sessionId);
+		return { live: state.live, disowned: false, ...(activity ? { activity } : {}) };
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
@@ -450,8 +457,24 @@ export class ScriptedSessionPort implements SessionPort {
 		);
 	}
 
+	readonly #assistantRows = new Map<string, Array<{ text: string; at: number }>>();
+
+	/** Scripts a transcript assistant row; a session with scripted rows answers fetchAssistantSince from them only. */
+	appendAssistant(sessionId: string, text: string, at: number = Date.now()): void {
+		const rows = this.#assistantRows.get(sessionId) ?? [];
+		rows.push({ text, at });
+		this.#assistantRows.set(sessionId, rows);
+	}
+
 	/** Same turn-floor rule as the broker port: only an assistant row produced at/after `notBeforeMs` counts. */
-	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
+	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number; preferSpoken?: boolean }) {
+		const rows = this.#assistantRows.get(input.sessionId);
+		if (rows) {
+			const eligible = rows.filter((row) => row.at + 2_000 >= input.notBeforeMs);
+			const chosen =
+				(input.preferSpoken ? eligible.filter((row) => !isSilentReply(row.text)).at(-1) : undefined) ?? eligible.at(-1);
+			return chosen ? { text: chosen.text, pages: 1, complete: true } : undefined;
+		}
 		const operation = [...this.#operations.values()]
 			.reverse()
 			.find((entry) => entry.sessionId === input.sessionId && entry.state === "terminal_ok");
