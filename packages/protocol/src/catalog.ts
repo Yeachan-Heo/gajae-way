@@ -913,9 +913,22 @@ export function isSilenceToken(text: string): boolean {
 	return (SILENCE_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
 }
 
-/** Existing embedded marker grammar; inspect original content before clipping. */
+/**
+ * Markdown code: closed fenced blocks, then inline spans of any backtick run
+ * length. Text inside code is quoted, never a directive.
+ */
+const MARKDOWN_CODE = /```[\s\S]*?```|(`+)[^\n]*?\1/g;
+
+/**
+ * Existing embedded marker grammar; inspect original content before clipping.
+ *
+ * A marker inside markdown code is a quoted mention, not a directive: a reply
+ * explaining the protocol ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a
+ * real answer. Counting it silenced two fully written Discord replies whole
+ * (live pilot, 2026-09-29).
+ */
 export function containsSilenceToken(text: string): boolean {
-	return /\[(SILENT|silent)\]/.test(text);
+	return /\[(SILENT|silent)\]/.test(text.replace(MARKDOWN_CODE, ""));
 }
 
 /**
