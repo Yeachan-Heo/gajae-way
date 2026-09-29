@@ -681,6 +681,90 @@ test("fetchAssistantSince follows transcript continuation pages and returns the 
 	}
 });
 
+test("fetchAssistantSince with preferSpoken skips a trailing silent row for the last spoken answer", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-spoken-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const floor = Date.now();
+	let items: Array<{ role: string; ts: string; body: string }> = [];
+	const run: CliRunner = async (args) => {
+		if (!args.includes("transcript.list")) throw new Error(`unexpected command ${args.join(" ")}`);
+		return { exitCode: 0, stdout: JSON.stringify({ page: { items, complete: true } }), stderr: "" };
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "instance-spoken",
+		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+	});
+	const row = (offsetMs: number, body: string) => ({
+		role: "assistant",
+		ts: new Date(floor + offsetMs).toISOString(),
+		body,
+	});
+	try {
+		await createOwnedSessionFixture(database, authority, {
+			sessionId: "11111111-2222-3333-4444-555555555555",
+			repo: join(home, "workspace"),
+			originKey: "work/spoken",
+			epoch: 0,
+		});
+		const target = {
+			sessionId: "11111111-2222-3333-4444-555555555555",
+			repo: join(home, "workspace"),
+			notBeforeMs: floor,
+		};
+		items = [
+			row(-60_000, "before the turn"),
+			row(1_000, "interim"),
+			row(2_000, "the real answer"),
+			row(3_000, "nothing to add.\n\n[SILENT]"),
+			row(4_000, "[SILENT]"),
+		];
+		expect((await port.fetchAssistantSince({ ...target, preferSpoken: true }))?.text).toBe("the real answer");
+		// Without the preference the newest row wins, silent or not (unchanged contract).
+		expect((await port.fetchAssistantSince(target))?.text).toBe("[SILENT]");
+		// Only silent rows since the floor: the silent row is still reported, never an older turn's answer.
+		items = [row(-60_000, "before the turn"), row(1_000, "[SILENT]")];
+		expect((await port.fetchAssistantSince({ ...target, preferSpoken: true }))?.text).toBe("[SILENT]");
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("liveness carries the host's activity {state, at} from session inspect, and omits a malformed one", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-activity-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
+	let session: Record<string, unknown> = {};
+	const run: CliRunner = async (args) => {
+		if (!args.includes("inspect")) throw new Error(`unexpected command ${args.join(" ")}`);
+		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { session } }), stderr: "" };
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "activity",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const target = { sessionId: "owned", repo };
+	session = { live: true, activity: { state: "idle", at: 1_790_653_835_000 } };
+	expect(await port.liveness(target)).toEqual({
+		live: true,
+		disowned: false,
+		activity: { state: "idle", at: 1_790_653_835_000 },
+	});
+	session = { live: true, activity: { state: "tool" } };
+	expect(await port.liveness(target)).toEqual({ live: true, disowned: false });
+	session = { live: true };
+	expect(await port.liveness(target)).toEqual({ live: true, disowned: false });
+});
+
 test("close uses the global lifecycle route: the per-session control route prohibits session.close for the daemon CLI", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
