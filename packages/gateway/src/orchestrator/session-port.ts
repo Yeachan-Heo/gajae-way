@@ -392,7 +392,8 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			if (input.epochRecovery === false || !isRebindableCode(sdkErrorCode(error))) throw error;
+			const poisonedCode = poisonedCreateKeyCode(error, idempotencyKey);
+			if (input.epochRecovery === false || poisonedCode === undefined) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
 				console.error(
@@ -403,7 +404,7 @@ export class BrokerSessionPort implements SessionPort {
 			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
 			console.error(
-				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
+				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key code=${poisonedCode}`,
 			);
 			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
 		}
@@ -1415,13 +1416,56 @@ function stableErrorCode(value: unknown): string | undefined {
 	return value;
 }
 
+/**
+ * The rebindable code of a session.create failure whose idempotency key can
+ * never succeed, or undefined when the same key must be retried.
+ *
+ * gjc <= 0.17 reported a condemned key by its internal code (`terminal_uncertain`,
+ * `spawn_failed`, ...). gjc 0.18's public error contract collapses every
+ * internal code to `operation_failed`; the only remaining evidence that the key
+ * itself is undecidable is `outcomeCertainty: "unknown"` with that exact key
+ * named as a reference. Measured on gaebal-gajae 2026-09-30: 32 creates left
+ * `terminal_uncertain` by a broker kill loop answered exactly that envelope,
+ * deterministically, on every replay, and six channels stayed mute for hours.
+ * A bare `operation_failed` without the key reference stays a same-key retry.
+ */
+function poisonedCreateKeyCode(error: unknown, idempotencyKey: string): string | undefined {
+	const code = sdkErrorCode(error);
+	if (isRebindableCode(code)) return code;
+	if (code !== "operation_failed" || !(error instanceof GjcCliError)) return undefined;
+	const details = recordOf(error.details);
+	if (details?.outcomeCertainty !== "unknown") return undefined;
+	const references = Array.isArray(details.references) ? details.references : [];
+	const namesKey = references.some((reference) => {
+		const ref = recordOf(reference);
+		return ref?.kind === "idempotencyKey" && ref.value === idempotencyKey;
+	});
+	return namesKey ? code : undefined;
+}
+
+const OUTCOME_CERTAINTIES = new Set(["applied", "not-applied", "unknown"]);
+
 function sanitizedDetails(details: unknown): unknown {
 	const code = stableErrorCode(envelopeErrorCode(details));
-	const message =
-		typeof details === "object" && details !== null && typeof (details as { message?: unknown }).message === "string"
-			? sanitizeDiagnostic((details as { message: string }).message)
+	const record = recordOf(details);
+	const message = typeof record?.message === "string" ? sanitizeDiagnostic(record.message) : undefined;
+	const outcomeCertainty =
+		typeof record?.outcomeCertainty === "string" && OUTCOME_CERTAINTIES.has(record.outcomeCertainty)
+			? record.outcomeCertainty
 			: undefined;
-	return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
+	// Only idempotency-key references survive: the gateway minted them, and
+	// poisonedCreateKeyCode matches them exactly against the key it sent.
+	const references = (Array.isArray(record?.references) ? record.references : []).flatMap((reference) => {
+		const ref = recordOf(reference);
+		const value = stableErrorCode(ref?.value);
+		return ref?.kind === "idempotencyKey" && value ? [{ kind: "idempotencyKey", value }] : [];
+	});
+	return {
+		...(code ? { code } : {}),
+		...(message ? { message } : {}),
+		...(outcomeCertainty ? { outcomeCertainty } : {}),
+		...(references.length > 0 ? { references } : {}),
+	};
 }
 
 function sanitizeSdkFailure(error: unknown): Error {

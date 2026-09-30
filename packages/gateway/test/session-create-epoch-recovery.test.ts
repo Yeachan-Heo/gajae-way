@@ -242,3 +242,111 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+/** The exact envelope gjc 0.18.1 printed on gaebal-gajae for a create key its ledger held as terminal_uncertain. */
+function publicUndecidableCreate(referencedKey: string): CliResult {
+	return {
+		exitCode: 1,
+		stdout: JSON.stringify({
+			schema: "gjc.command-error",
+			version: 1,
+			ok: false,
+			command: ["sdk", "session", "raw", "global"],
+			error: {
+				code: "operation_failed",
+				category: "operation",
+				message: "The operation failed. Its outcome could not be established.",
+				retryability: "unknown",
+				outcomeCertainty: "unknown",
+				references: [
+					{ kind: "idempotencyKey", value: referencedKey },
+					{ kind: "idempotencyKey", value: referencedKey },
+				],
+				nextSteps: [],
+			},
+			complete: true,
+			evidence: { status: "inline" },
+			continuation: null,
+		}),
+		stderr: "",
+	};
+}
+
+test("gjc 0.18 operation_failed naming the sent create key as undecidable rotates one epoch to a fresh key", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-public-uncertain-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	const repo = join(home, "workspace");
+	const originKey = "discord/channel/stuck";
+	const poisonedKey = `gw-bind-${createHash("sha256").update(`public-uncertain|${originKey}|0|${repo}`).digest("hex").slice(0, 32)}`;
+	const idempotencyKeys: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			const key = args[args.indexOf("--idempotency-key") + 1]!;
+			idempotencyKeys.push(key);
+			if (key === poisonedKey) return publicUndecidableCreate(key);
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }), stderr: "" };
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "fresh-session", live: true } } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "public-uncertain",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+	try {
+		const binding = await port.bind({ originKey, epoch: 0, repo });
+		expect(idempotencyKeys).toHaveLength(2);
+		expect(idempotencyKeys[0]).toBe(poisonedKey);
+		expect(idempotencyKeys[1]).not.toBe(poisonedKey);
+		expect(binding).toMatchObject({ sessionId: "fresh-session", epoch: 1 });
+		expect(database.getSessionRecord(originKey)).toMatchObject({ epoch: 1, sessionId: "fresh-session" });
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("gjc 0.18 operation_failed naming a different key is not proof about the sent key and retries it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-foreign-ref-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	const repo = join(home, "workspace");
+	const idempotencyKeys: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		idempotencyKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
+		return publicUndecidableCreate("gw-bind-00000000000000000000000000000000");
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "foreign-ref",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	try {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const error = await port.bind({ originKey: "foreign", epoch: 0, repo }).catch((caught: unknown) => caught);
+			expect(error).toMatchObject({ name: "GjcCliError", details: { code: "operation_failed" } });
+		}
+		expect(idempotencyKeys).toHaveLength(2);
+		expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
+		expect(database.getSessionRecord("foreign")).toBeUndefined();
+		expect(database.metaGet("create_rotation:foreign")).toBeUndefined();
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
