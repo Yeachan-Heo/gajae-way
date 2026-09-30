@@ -25,6 +25,7 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseOriginKey,
 	parseReactionReply,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
@@ -44,6 +45,7 @@ import {
 	BotAudienceTurnGuard,
 	decideEngagement,
 	resolveBotAudienceLimits,
+	resolveChannelPolicy,
 	threadFollowUpEngaged,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
@@ -75,7 +77,12 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
-import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
+import {
+	deterministicHeldPostDeliveryId,
+	deterministicInterimDeliveryId,
+	deterministicPostDeliveryId,
+	deterministicTerminalDeliveryId,
+} from "../orchestrator/tail-runner";
 import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
@@ -2321,7 +2328,13 @@ async function createInboundTurnLifecycle(
 		}
 		deliverTerminalLine(renderHandoffPointer(handoff.target));
 	};
-	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
+	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
+	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
+	/** [POST:] parts the final answer itself carried; a held copy of one is not posted twice. */
+	const terminalPosts = new Set<string>();
+	/** A refused [POST:] part is logged once, not on every pass over the same text. */
+	const postRefusalsLogged = new Set<string>();
+	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		const handoff = parseHandoffReply(rawMessage);
 		if (handoff) {
@@ -2407,21 +2420,44 @@ async function createInboundTurnLifecycle(
 					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
 						? engagement.replyTo.messageId
 						: undefined;
-		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
-		for (const part of parts) {
+		const planned: PlannedPart[] = [];
+		for (const rawPart of parts) {
 			if (planned.length >= maxTurnParts) break;
+			// Cross-room post: a part opening with [POST:<origin key>] goes to that
+			// configured channel instead of this conversation. A refused target keeps
+			// the part here (token stripped) so its content is never lost.
+			let part = rawPart;
+			let post: PlannedPart["post"];
+			const postMatch = rawPart.match(POST_TOKEN);
+			if (postMatch) {
+				part = rawPart.slice(postMatch[0].length);
+				const resolved = resolvePostTarget(postMatch[1] ?? "", origin, runtime.config);
+				if (resolved.ok) post = { origin: resolved.target, key: resolved.key };
+				else if (resolved.reason !== "current_conversation" && !postRefusalsLogged.has(rawPart)) {
+					postRefusalsLogged.add(rawPart);
+					console.error(
+						`gateway post target refused origin=${key} target=${JSON.stringify(sanitizeDiagnostic(postMatch[1] ?? "").slice(0, 160))} reason=${resolved.reason}; delivering the part here`,
+					);
+				}
+			}
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
 			// answer a specific message; mentions are plain <@author id> in the text.
+			// A reply target belongs to this conversation, so a post ignores it.
 			const replyMatch = part.match(/\[REPLY:([^\]\s]+)\]/);
 			const body = (replyMatch ? part.replace(/\s*\[REPLY:[^\]\s]+\]\s*/g, " ") : part)
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
+			if (post) {
+				planned.push({ body, post });
+				continue;
+			}
 			const replyTo = replyMatch?.[1] || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
+		const local = planned.filter((step) => step.post === undefined);
 		const spoken = spokenReply(
-			planned.map((step) => step.body),
+			local.map((step) => step.body),
 			voiceTurn,
 		);
 		for (let index = 0; index < planned.length; index++) {
@@ -2429,7 +2465,21 @@ async function createInboundTurnLifecycle(
 			// answer always records its claim: with an ungated stream a chatty turn
 			// could otherwise exhaust the budget on interims and lose its final.
 			if (source === "interim" && deliveredParts.length >= maxTurnParts) return;
-			const step = planned[index] as { body: string; replyTo?: string };
+			const step = planned[index] as PlannedPart;
+			if (step.post) {
+				// A post leaves this conversation, so it is sent once, from the
+				// finished answer: mid-work speech only holds it for the turn's end.
+				const postKey = `${step.post.key}\n${step.body}`;
+				if (source === "interim") {
+					heldPosts.set(postKey, { body: step.body, post: step.post });
+					continue;
+				}
+				terminalPosts.add(postKey);
+				const postId = deterministicPostDeliveryId(key, step.post.key, input.turn.triggerMessageId, index);
+				if (options.database.inboundTurnClaimTerminal(input.turn.opRef, index, postId) !== postId) continue;
+				postElsewhere(step.body, step.post, postId);
+				continue;
+			}
 			// Interim parts are keyed on (trigger, text, part): distinct findings get
 			// distinct rows, a replayed finding (stream backfill, id-less frame after
 			// restart) collides. The terminal reply owns ONE slot per part keyed on
@@ -2467,8 +2517,53 @@ async function createInboundTurnLifecycle(
 			deliveredParts.push(step.body);
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
-			const isLast = index === planned.length - 1;
+			const isLast = step === local.at(-1);
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
+		}
+	};
+	/**
+	 * Sends one [POST:] part to its target conversation through the ordinary
+	 * ledger, and records it there as the persona's own words: a context row the
+	 * target session reads as unread (and, fresh, as recent history) plus the
+	 * target's daily memory. `final: false` - the post must not end a working
+	 * status that belongs to a turn running in the target room.
+	 */
+	const postElsewhere = (body: string, post: NonNullable<PlannedPart["post"]>, deliveryId: string) => {
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), post.origin, body, undefined, deliveryId, false);
+		if (!payload) return;
+		options.database.contextRecord({
+			messageId: `post/${deliveryId}`,
+			originKey: post.key,
+			authorName: `you (posted here from ${place})`,
+			body,
+		});
+		runtime.memory.enqueue({
+			kind: "daily_capture",
+			originRefJson: JSON.stringify(post.origin),
+			userText: `(posted here from ${place})`,
+			replyText: body,
+		});
+		console.error(`gateway post origin=${key} target=${post.key} delivery=${deliveryId}`);
+		deliveredParts.push(`[posted to ${post.key}] ${body}`);
+		deliveredIds.push(deliveryId);
+		assistantDeliveryStarted = true;
+		broadcastDelivery(runtime, payload);
+	};
+	/**
+	 * The turn's text passes: mid-work speech holds its [POST:] parts; the
+	 * terminal pass posts its own and then any held one the final answer did not
+	 * repeat (text-keyed id, so a second terminal pass cannot post it again).
+	 */
+	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
+		await deliverTurnText(rawMessage, source);
+		if (source !== "terminal" || !nonLoopback) return;
+		for (const [postKey, held] of heldPosts) {
+			if (terminalPosts.has(postKey)) continue;
+			postElsewhere(
+				held.body,
+				held.post,
+				deterministicHeldPostDeliveryId(key, held.post.key, input.turn.triggerMessageId, held.body),
+			);
 		}
 	};
 
@@ -2976,6 +3071,50 @@ function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: st
 	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
 }
 
+/** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */
+interface PlannedPart {
+	readonly body: string;
+	readonly replyTo?: string;
+	readonly post?: { readonly origin: OriginRef; readonly key: string };
+}
+
+/** A part that opens with `[POST:<origin key>]` is meant for that conversation. */
+const POST_TOKEN = /^\[POST:([^\]]*)\]\s*/;
+
+export type PostTargetResolution =
+	| { readonly ok: true; readonly target: OriginRef; readonly key: string }
+	| {
+			readonly ok: false;
+			readonly reason:
+				| "invalid_origin_key"
+				| "current_conversation"
+				| "other_platform"
+				| "not_a_channel"
+				| "unconfigured_channel";
+	  };
+
+/**
+ * Where a [POST:] part may go: a canonical origin key (the protocol parser,
+ * nothing looser) naming a `channel` on the current platform that the gateway
+ * configuration lists. DMs, threads, other platforms and unlisted rooms are
+ * refused so a persona cannot write into a conversation nobody configured.
+ */
+export function resolvePostTarget(raw: string, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
+	let target: OriginRef;
+	try {
+		target = parseOriginKey(raw.trim());
+	} catch {
+		return { ok: false, reason: "invalid_origin_key" };
+	}
+	const key = originKey(target);
+	if (key === originKey(origin)) return { ok: false, reason: "current_conversation" };
+	if (target.platform !== origin.platform || !isChatPlatform(target.platform))
+		return { ok: false, reason: "other_platform" };
+	if (target.kind !== "channel") return { ok: false, reason: "not_a_channel" };
+	if (!resolveChannelPolicy(target, config)) return { ok: false, reason: "unconfigured_channel" };
+	return { ok: true, target, key };
+}
+
 /**
  * Session-context grounding (live finding: without it the persona could not
  * tell which conversation it was in and imported other origins' memory as if
@@ -3009,6 +3148,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
+					`Posting to another room: start a reply part with [POST:<origin key>] (for example [POST:${origin.platform}/channel/<channel id>]) to send that part to another channel instead of this conversation; the token never appears in the delivered text. Only ${origin.platform} channels configured in the gateway are allowed - never a DM or a thread, never another platform - and a refused target is posted here with the token removed. A post is sent once, when your answer is final, and a reply-threading token in the same part is ignored. In Discord and Slack text, a channel link is <#channel id>.`,
 				]
 			: []),
 		...(isChatPlatform(origin.platform)

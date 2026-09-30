@@ -17,9 +17,28 @@ test("a chat conversation notice names the reply-threading token", () => {
 	}
 });
 
+// Owner request 2026-10-01: post a work-done line to another configured room.
+test("a chat conversation notice names the cross-room [POST:] token and its limits", () => {
+	const discordChannel: OriginRef = { platform: "discord", kind: "channel", conversationId: "1480171104348930221" };
+	const discord = currentConversationNotice(discordChannel);
+	expect(discord).toContain("[POST:<origin key>]");
+	expect(discord).toContain("[POST:discord/channel/<channel id>]");
+	expect(discord).toContain("Only discord channels configured in the gateway are allowed");
+	expect(discord).toContain("never a DM or a thread");
+	expect(discord).toContain("a refused target is posted here with the token removed");
+	expect(discord).toContain("<#channel id>");
+	// No specific room is baked into the notice.
+	expect(discord).not.toContain("1554742285260816455");
+	expect(discord).not.toContain("업무보고");
+	expect(currentConversationNotice(slackDm)).toContain("[POST:slack/channel/<channel id>]");
+	const lines = discord.split("\n");
+	expect(lines.filter((line) => line.includes("[POST:")).length).toBe(1);
+});
+
 test("loopback has no platform threads, so it is not told about the token", () => {
 	const notice = currentConversationNotice(loopback);
 	expect(notice).not.toContain("[REPLY:");
+	expect(notice).not.toContain("[POST:");
 	expect(notice).toContain("loopback");
 });
 
