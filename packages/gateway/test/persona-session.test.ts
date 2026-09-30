@@ -656,13 +656,22 @@ test("provider quota exhaustion gives a safe notice and does not reset or rebind
 	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+// A submission failure that is not a wedged agent run (that one resets on the
+// first failure, see WEDGED_SUBMISSION) resets only when it repeats.
+const REPEATABLE_SUBMISSION = {
+	code: "internal",
+	phase: "submission",
+	category: "provider_transport",
+	provenance: "agent_failed",
+};
+
 test("two consecutive internal submission failures reset the next inbound to a new epoch", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,
 		onSend: (input, scripted) =>
 			scripted.fail(input.opRef, "Prompt submission failed.", {
 				code: "internal",
-				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				outcome: REPEATABLE_SUBMISSION,
 			}),
 	});
 	const logs: string[] = [];
@@ -689,7 +698,7 @@ test("a healthy turn clears consecutive internal submission failures", async () 
 			else
 				scripted.fail(input.opRef, "Prompt submission failed.", {
 					code: "internal",
-					outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+					outcome: REPEATABLE_SUBMISSION,
 				});
 		},
 	});
@@ -722,7 +731,7 @@ test("repeated submission failures respect the reset cap and log it once per ses
 		onSend: (input, scripted) =>
 			scripted.fail(input.opRef, "Prompt submission failed.", {
 				code: "internal",
-				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				outcome: REPEATABLE_SUBMISSION,
 			}),
 	});
 	const logs: string[] = [];
@@ -904,6 +913,71 @@ for (const evidence of ["missing", "throws"] as const)
 		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(port.sends).toHaveLength(1);
 		expect(failures).toEqual(["429 rate limited"]);
+	});
+
+const WEDGED_SUBMISSION = {
+	phase: "submission",
+	provenance: "agent_failed",
+	category: "agent_runtime",
+	providerCode: "internal",
+};
+
+test("a wedged submission resets the next binding once without transcript evidence", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	// gjc reports a never-started prompt without startedAt.
+	port.omitStartedAt = true;
+	const failures: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) }, (line) => logs.push(line));
+	enqueue("wedged", "first");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	port.fail(first.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	// #424 re-sends a never-started prompt once on the same session; only a wedge that survives it resets.
+	await eventually(() => port.sends.length === 2, "wedged submission was not re-sent");
+	const retry = port.sends[1]!;
+	expect(retry).toMatchObject({ text: "first", sessionId: "session-e0" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(failures).toEqual([]);
+	port.fail(retry.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => manager!.state(KEY) === "idle", "wedged submission did not settle");
+	expect(port.failureEvidenceProbes).toEqual([]);
+	expect(failures).toEqual(["internal: Prompt submission failed."]);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs.some((line) => line.includes("reason=submission_wedged"))).toBe(true);
+	enqueue("next", "second");
+	await manager!.notifyInbound(KEY);
+	expect(port.sends.map((send) => send.text)).toEqual(["first", "first", "second"]);
+	expect(port.sends[2]!.sessionId).toBe("session-e1");
+	// The cap holds until a healthy turn: a second wedge on the fresh session stays put.
+	port.fail(port.sends[2]!.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => port.sends.length === 4, "capped wedge was not re-sent");
+	port.fail(port.sends[3]!.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => manager!.state(KEY) === "idle", "capped wedge did not settle");
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+});
+
+for (const [label, detail] of [
+	["aborted submission", { code: "aborted", outcome: { ...WEDGED_SUBMISSION, providerCode: "aborted" } }],
+	[
+		"provider transport submission",
+		{ code: "provider_down", outcome: { ...WEDGED_SUBMISSION, category: "provider_transport" } },
+	],
+	["post-start agent failure", { code: "internal", outcome: { ...WEDGED_SUBMISSION, phase: "post_start" } }],
+] as const)
+	test(`${label} never resets without transcript evidence`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		await harness(port);
+		enqueue("kept", "original");
+		await manager!.notifyInbound(KEY);
+		port.fail(port.sends[0]!.opRef, "failed", detail);
+		// A submission-phase failure is re-sent once (#424); fail the re-send the same way.
+		if (detail.outcome.phase === "submission") {
+			await eventually(() => port.sends.length === 2, "submission failure was not re-sent");
+			port.fail(port.sends[1]!.opRef, "failed", detail);
+		}
+		await eventually(() => manager!.state(KEY) === "idle", "failure did not settle");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
 	});
 
 for (const missing of ["start", "terminal", "nan", "reversed", "future", "op-ref"] as const)

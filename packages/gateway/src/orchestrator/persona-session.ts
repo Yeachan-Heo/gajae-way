@@ -3024,12 +3024,16 @@ class OriginActor {
 		}
 	}
 
-	/** Exact context/request failures and repeated submission failures reset only the next binding. */
+	/**
+	 * Exact context/request failures, a wedged prompt submission and repeated
+	 * submission failures reset only the next binding; the failed trigger is
+	 * completed, never resent. Quota failures never reset.
+	 */
 	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
-		if (evidence)
-			this.#manager.log(
-				`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
-			);
+		const wedged = isWedgedSubmission(report);
+		const reason = wedged ? "submission_wedged" : evidence?.reason;
+		if (reason !== undefined)
+			this.#manager.log(`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${reason}`);
 		if (
 			report.status.status !== "failed" ||
 			report.operationRef !== bound.turn.opRef ||
@@ -3038,19 +3042,25 @@ class OriginActor {
 			bound.epoch !== this.#epoch() ||
 			bound.brokerGeneration !== this.#manager.brokerGeneration ||
 			this.#stopped ||
-			this.#manager.stopped ||
-			typeof report.status.startedAt !== "number" ||
-			!Number.isFinite(report.status.startedAt) ||
-			report.status.startedAt <= 0 ||
-			typeof report.status.terminalAt !== "number" ||
-			!Number.isFinite(report.status.terminalAt) ||
-			report.status.terminalAt < report.status.startedAt ||
-			report.status.terminalAt > this.#manager.now() ||
-			bound.dispatchedAtMs === undefined ||
-			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
+			this.#manager.stopped
 		)
 			return false;
-		if (evidence?.reason === "provider_quota_exhausted") {
+		// A wedged submission never started, so gjc reports no start time; only
+		// transcript evidence is tied to the turn's own time window.
+		if (
+			!wedged &&
+			(typeof report.status.startedAt !== "number" ||
+				!Number.isFinite(report.status.startedAt) ||
+				report.status.startedAt <= 0 ||
+				typeof report.status.terminalAt !== "number" ||
+				!Number.isFinite(report.status.terminalAt) ||
+				report.status.terminalAt < report.status.startedAt ||
+				report.status.terminalAt > this.#manager.now() ||
+				bound.dispatchedAtMs === undefined ||
+				report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs)
+		)
+			return false;
+		if (reason === "provider_quota_exhausted") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
@@ -3061,8 +3071,9 @@ class OriginActor {
 			this.#submissionFailures.set(bound.sessionId, count);
 			repeatedSubmissionFailure = count >= 2;
 		} else this.#submissionFailures.delete(bound.sessionId);
-		const resetReason =
-			evidence?.reason === "unsupported_input_status" || evidence?.reason === "context_exhausted"
+		const resetReason = wedged
+			? "submission_wedged"
+			: evidence?.reason === "unsupported_input_status" || evidence?.reason === "context_exhausted"
 				? evidence.reason
 				: repeatedSubmissionFailure
 					? "repeated_submission_failure"
@@ -3093,6 +3104,23 @@ class OriginActor {
 		);
 		return true;
 	}
+}
+
+/**
+ * gajae-code reports a prompt the host accepted but never got into the agent as
+ * `phase=submission` (no start, no activity). An agent-runtime cause there - e.g.
+ * `Timed out waiting for prior agent run to finish before prompting.` while the
+ * pre-prompt compaction of a session at gjc's 300K-token ceiling holds the agent -
+ * repeats on every later prompt to the same session (2026-09-30: eight in a row
+ * over 80 minutes, fixed only by the 3h idle reset). It earns the same one-shot
+ * reset as an exhausted context. Provider/transport failures and cancellations
+ * stay on their session.
+ */
+function isWedgedSubmission(report: StatusReport): boolean {
+	const outcome = report.status.outcome;
+	if (outcome?.phase !== "submission" || outcome.provenance !== "agent_failed" || outcome.category !== "agent_runtime")
+		return false;
+	return ![report.status.error?.code, outcome.code, outcome.providerCode].includes("aborted");
 }
 
 /**
