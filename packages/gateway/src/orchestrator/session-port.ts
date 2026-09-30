@@ -112,6 +112,11 @@ export interface SessionPort {
 	 */
 	runningJobs?(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]>;
 	/**
+	 * Context-window usage of the session in percent (`context.get`), read on the
+	 * turn's owned relay. Undefined when the host does not report it.
+	 */
+	contextPercent?(input: { sessionId: string; repo: string; relay: TailHandle }): Promise<number | undefined>;
+	/**
 	 * Ends the host process of a session this gateway created and has retired.
 	 * Ownership is the point: the shared GJC daemon and broker are never touched,
 	 * only a `session-host-internal` whose pid the broker reports for THIS
@@ -371,6 +376,7 @@ function createRotationMetaKey(originKey: string): string {
 export const SESSION_BUSY_CODE = "busy";
 const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
+const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
 
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
@@ -1005,6 +1011,17 @@ export class BrokerSessionPort implements SessionPort {
 			{ timeoutMs: 10_000 },
 		);
 		return parseRunningJobs(result.stdout);
+	}
+
+	async contextPercent(input: { sessionId: string; repo: string; relay: TailHandle }): Promise<number | undefined> {
+		this.#assertOwned(input);
+		this.#database.assertBrokerAuthority(this.#authority);
+		const response = await input.relay.query("context.get", {}, { timeoutMs: CONTEXT_QUERY_TIMEOUT_MS });
+		if (!response.ok) return undefined;
+		const items = response.page?.items;
+		const snapshot = Array.isArray(items) ? recordOf(items[0]) : undefined;
+		const percent = recordOf(snapshot?.usage)?.percent;
+		return typeof percent === "number" && Number.isFinite(percent) ? percent : undefined;
 	}
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
