@@ -6,12 +6,14 @@ import { join } from "node:path";
 import { isSilenceToken } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import {
+	PERSONA_COMPACTION_TOKENS,
 	PERSONA_PREAMBLE_REFRESH_SENDS,
 	PersonaSessionManager,
 	personaTurnOpRef,
 	WEDGED_TURN_IDLE_MS,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
+import type { SessionCompactionStatus, SessionContextUsage } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
@@ -2745,10 +2747,13 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(logs.some((line) => line.startsWith("session_gc"))).toBe(false);
 });
 
-/** Reports a scripted context usage, like `context.get` on the turn's relay. */
+/** Reports a scripted context usage of a 1M-token window, like `context.get` on the turn's relay. */
 class ContextUsagePort extends ScriptedSessionPort {
 	percent: number | undefined = 1;
 	readonly failing = new Set<string>();
+	compactionStatus: SessionCompactionStatus = "succeeded";
+	/** How many sends had been made when each compaction ran. */
+	readonly compactedAfterSends: number[] = [];
 
 	constructor() {
 		super({
@@ -2759,8 +2764,14 @@ class ContextUsagePort extends ScriptedSessionPort {
 		});
 	}
 
-	async contextPercent(): Promise<number | undefined> {
-		return this.percent;
+	async contextUsage(): Promise<SessionContextUsage | undefined> {
+		return this.percent === undefined ? undefined : { percent: this.percent, tokens: this.percent * 10_000 };
+	}
+
+	override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
+		this.compactedAfterSends.push(this.sends.length);
+		if (this.compactionStatus === "succeeded") this.percent = undefined;
+		return { status: this.compactionStatus };
 	}
 }
 
@@ -2769,6 +2780,7 @@ const PERSONA = "## SOUL.md\npersona rules";
 async function preambleHarness(
 	port: ScriptedSessionPort,
 	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
+	log?: (line: string) => void,
 ): Promise<void> {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -2778,6 +2790,7 @@ async function preambleHarness(
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
+		...(log ? { log } : {}),
 		onTurnStart: ({ trigger }) => {
 			const bootstrap = lifecycle.bootstrap?.();
 			return {
@@ -2820,14 +2833,16 @@ test("persona preamble rides the first send only while the context keeps growing
 test("persona preamble is resent after the context shrank (compaction)", async () => {
 	const port = new ContextUsagePort();
 	await preambleHarness(port, { persona: () => PERSONA });
-	port.percent = 29;
+	// gjc compacted on its own: the actor's compaction line is never reached.
+	port.percent = 15;
 	expect(await sendTurn(port, "first")).toBe(PERSONA);
-	port.percent = 29.5;
+	port.percent = 15.5;
 	expect(await sendTurn(port, "grown")).toBeUndefined();
 	port.percent = 4;
 	expect(await sendTurn(port, "after compaction")).toBe(PERSONA);
 	port.percent = 4.5;
 	expect(await sendTurn(port, "grown again")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([]);
 });
 
 test("persona preamble is resent when its text changes", async () => {
@@ -2867,11 +2882,99 @@ test("persona preamble is refreshed after the bounded number of sends without it
 	await preambleHarness(port, { persona: () => PERSONA });
 	const carried: boolean[] = [];
 	for (let send = 0; send <= PERSONA_PREAMBLE_REFRESH_SENDS; send++) {
-		port.percent = 1 + send;
+		// Growing, but below the compaction line throughout.
+		port.percent = 1 + send * 0.5;
 		carried.push((await sendTurn(port, `turn ${send}`)) === PERSONA);
 	}
+	expect(port.compactedAfterSends).toEqual([]);
 	expect(carried.map((value, index) => (value ? index : -1)).filter((index) => index >= 0)).toEqual([
 		0,
 		PERSONA_PREAMBLE_REFRESH_SENDS,
 	]);
+});
+
+/** Percent of the fake 1M-token window at which the actor compacts. */
+const COMPACTION_PERCENT = PERSONA_COMPACTION_TOKENS / 10_000;
+
+test("a session at the compaction line is compacted before the send, which carries the persona again", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.percent = COMPACTION_PERCENT - 0.01;
+	expect(await sendTurn(port, "just under the line")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([]);
+
+	port.percent = COMPACTION_PERCENT;
+	expect(await sendTurn(port, "at the line")).toBe(PERSONA);
+	expect(port.compactedAfterSends).toEqual([2]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("persona_compaction ") &&
+				line.includes(`tokens=${PERSONA_COMPACTION_TOKENS}`) &&
+				line.includes("status=succeeded"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+
+	// Regrowing from the compacted size rides the copy the compacted send put back.
+	port.percent = 3;
+	expect(await sendTurn(port, "after compaction")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([2]);
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("a compaction that does not succeed still sends the turn on the same session", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.compactionStatus = "failed";
+	port.percent = COMPACTION_PERCENT + 5;
+	expect(await sendTurn(port, "compaction fails")).toBeUndefined();
+	port.compactionStatus = "unavailable";
+	port.percent = COMPACTION_PERCENT + 6;
+	expect(await sendTurn(port, "compaction unavailable")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([1, 2]);
+	expect(port.sends.map((send) => send.text)).toEqual(["first", "compaction fails", "compaction unavailable"]);
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+	expect(
+		logs.filter((line) => line.startsWith("persona_compaction ")).map((line) => line.match(/status=\w+/)?.[0]),
+	).toEqual(["status=failed", "status=unavailable"]);
+});
+
+test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {
+	let releaseCompaction!: () => void;
+	const compactionGate = new Promise<void>((resolve) => {
+		releaseCompaction = resolve;
+	});
+	class GatedCompactionPort extends ContextUsagePort {
+		override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
+			const result = super.runCompaction();
+			await compactionGate;
+			return await result;
+		}
+	}
+	const port = new GatedCompactionPort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	port.percent = COMPACTION_PERCENT + 1;
+	enqueue("m-full", "lands after compaction");
+	void manager!.notifyInbound(KEY);
+	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
+	enqueue("m-during", "arrives during compaction");
+	void manager!.notifyInbound(KEY);
+	await Bun.sleep(20);
+	expect(port.sends).toHaveLength(0);
+	expect(port.steers).toHaveLength(0);
+
+	releaseCompaction();
+	await eventually(
+		() => port.sends.length + port.steers.length === 2 && manager!.state(KEY) === "idle",
+		"queued messages did not follow the compacted send",
+	);
+	expect(port.sends[0]).toMatchObject({ text: "lands after compaction", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([0]);
 });

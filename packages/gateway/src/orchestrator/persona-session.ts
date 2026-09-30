@@ -29,6 +29,7 @@ import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import {
 	isSilentReply,
 	type SessionBinding,
+	type SessionContextUsage,
 	type SessionLiveness,
 	type SessionPort,
 	spokenParts,
@@ -103,6 +104,15 @@ const WEDGED_PROBE_INTERVAL_MS = 30_000;
  * bounds how long such a session can run without its persona.
  */
 export const PERSONA_PREAMBLE_REFRESH_SENDS = 25;
+/**
+ * Context size at which the persona actor compacts a session itself before the
+ * next send. gjc compacts at 300K tokens by default, and a prompt that pushes a
+ * session over that line makes gjc compact before accepting it, inside a 30s
+ * wait it cannot meet at that size: #회의실 failed eight turns in a row that way
+ * (2026-09-30). Compacting here, between turns with the origin's queue held,
+ * leaves a whole turn (preamble, message, tool output) of room below gjc's line.
+ */
+export const PERSONA_COMPACTION_TOKENS = 200_000;
 
 /** What the actor last put into one session's context: the persona preamble and the usage seen since. */
 type PersonaPreambleState = {
@@ -110,6 +120,9 @@ type PersonaPreambleState = {
 	readonly contextPercent: number;
 	readonly sendsSince: number;
 };
+
+/** A session's context right before a send: its usage when readable, and whether the actor just compacted it. */
+type PreparedContext = { readonly usage?: SessionContextUsage; readonly compacted: boolean };
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -1234,6 +1247,9 @@ class OriginActor {
 				);
 			return;
 		}
+		// Before the turn starts: the stall clock is not running yet and the
+		// actor queue holds every steer and later send until the context is ready.
+		const context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,
@@ -1317,7 +1333,7 @@ class OriginActor {
 			);
 			return;
 		}
-		const preamble = await this.#preambleForSend(binding.sessionId, epoch, lifecycle, tail);
+		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
@@ -2673,44 +2689,35 @@ class OriginActor {
 	 * Decides what trusted preamble one send carries. The persona preamble is
 	 * resent only when the session's context may not hold its current text: no
 	 * record for the session (first send, new session, gateway restart), changed
-	 * text, usage unreadable, usage lower than at the previous send (compaction or
-	 * pruning removed history), or the refresh bound reached. Resending it on
-	 * every turn grew #회의실 by ~12K tokens per message until pre-prompt
-	 * compaction wedged eight turns in a row (2026-09-30).
+	 * text, compacted just now, usage unreadable, usage lower than at the previous
+	 * send (compaction or pruning removed history), or the refresh bound reached.
+	 * Resending it on every turn grew #회의실 by ~12K tokens per message until
+	 * pre-prompt compaction wedged eight turns in a row (2026-09-30).
 	 */
-	async #preambleForSend(
+	#preambleForSend(
 		sessionId: string,
 		epoch: number,
 		lifecycle: PersonaTurnLifecycle,
-		tail: TailHandle,
-	): Promise<{ readonly text?: string; readonly next?: PersonaPreambleState }> {
+		context: PreparedContext,
+	): { readonly text?: string; readonly next?: PersonaPreambleState } {
 		const persona = lifecycle.systemPreamble;
 		if (!persona) return lifecycle.sessionBootstrap ? { text: lifecycle.sessionBootstrap } : {};
 		const signature = createHash("sha256").update(persona).digest("hex");
-		let contextPercent: number | undefined;
-		try {
-			contextPercent = await this.#manager.port.contextPercent?.({
-				sessionId,
-				repo: this.#manager.repo,
-				relay: tail,
-			});
-		} catch (error) {
-			this.#manager.log(
-				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
-			);
-		}
+		const contextPercent = context.usage?.percent;
 		const previous = this.#personaPreamble.get(sessionId);
 		const reason = !previous
 			? "first"
 			: previous.signature !== signature
 				? "changed"
-				: contextPercent === undefined
-					? "usage_unknown"
-					: contextPercent < previous.contextPercent
-						? "context_shrank"
-						: previous.sendsSince + 1 >= PERSONA_PREAMBLE_REFRESH_SENDS
-							? "refresh"
-							: undefined;
+				: context.compacted
+					? "compacted"
+					: contextPercent === undefined
+						? "usage_unknown"
+						: contextPercent < previous.contextPercent
+							? "context_shrank"
+							: previous.sendsSince + 1 >= PERSONA_PREAMBLE_REFRESH_SENDS
+								? "refresh"
+								: undefined;
 		if (reason === undefined && previous && contextPercent !== undefined)
 			return {
 				...(lifecycle.sessionBootstrap ? { text: lifecycle.sessionBootstrap } : {}),
@@ -2723,6 +2730,37 @@ class OriginActor {
 			text: lifecycle.sessionBootstrap ? `${persona}\n\n${lifecycle.sessionBootstrap}` : persona,
 			next: { signature, contextPercent: contextPercent ?? 0, sendsSince: 0 },
 		};
+	}
+
+	/**
+	 * Reads the session's context usage on the turn's relay and, at
+	 * PERSONA_COMPACTION_TOKENS or more, has gjc compact the session before the
+	 * send, so no prompt ever lands on a session gjc would compact first. A
+	 * compaction that fails or is unavailable is logged and the send goes ahead:
+	 * gjc's own compaction and the wedged-submission reset stay the fallback.
+	 */
+	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		let usage: SessionContextUsage | undefined;
+		try {
+			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			this.#manager.log(
+				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+			);
+			return { compacted: false };
+		}
+		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
+		const startedAt = this.#manager.now();
+		const { status } = await this.#manager.port.runCompaction({
+			sessionId,
+			repo: this.#manager.repo,
+			originKey: this.originKey,
+		});
+		this.#manager.log(
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+		);
+		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
