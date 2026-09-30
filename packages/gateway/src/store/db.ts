@@ -3120,6 +3120,8 @@ export class GatewayDatabase {
 	 * Recent conversation for a fresh session: the last `limit` platform messages
 	 * (consumed or not) plus the persona's own confirmed replies, oldest first.
 	 * Gives a new epoch the thread it is joining instead of only the unread diff.
+	 * A reply posted here from another conversation ([POST:]) appears once, as
+	 * its `post/<delivery id>` context row, not also as a delivery.
 	 */
 	recentConversation(
 		originKey: string,
@@ -3152,7 +3154,7 @@ export class GatewayDatabase {
 			}));
 		const replies = this.#database
 			.query<{ created_at: string; payload_json: string }, [string, string, number]>(
-				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM conversation_context WHERE conversation_context.message_id = 'post/' || deliveries.delivery_id) ORDER BY created_at DESC LIMIT ?",
 			)
 			.all(conversationId, floorAt, limit)
 			.map((row) => {
@@ -3168,7 +3170,8 @@ export class GatewayDatabase {
 	 * what people said around it. Deliberately excludes the persona's own replies:
 	 * they are long, and measured on 14 real owner messages including them at 200
 	 * chars dropped the judge's help score from 0.730 to 0.521 median and turned 5
-	 * of 14 into false skips. Read-only - it consumes nothing and sets no floor.
+	 * of 14 into false skips. A [POST:] from another conversation (`post/` row) is
+	 * the persona's own words too. Read-only - it consumes nothing and sets no floor.
 	 */
 	recentInbound(
 		originKey: string,
@@ -3192,7 +3195,7 @@ export class GatewayDatabase {
 				},
 				[string, string, number, number]
 			>(
-				"SELECT message_id, author_name, author_id, body, received_at FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
+				"SELECT message_id, author_name, author_id, body, received_at FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND message_id NOT LIKE 'post/%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
 			)
 			.all(originKey, floorAt, state?.floor_row_id ?? 0, limit)
 			.map((row) => ({
