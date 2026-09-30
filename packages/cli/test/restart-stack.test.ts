@@ -281,6 +281,42 @@ test("an uninstalled service is skipped and does not abort remaining services", 
 	}
 });
 
+test("a restart ps reports one second early is ok; a process older than that is stale", async () => {
+	const { home, cleanup } = await tempHome();
+	try {
+		const run = async (reportedOffsetMs: number) => {
+			// Restart issued at 10:55:50.039; systemd starts the gateway at 10:55:50.170
+			// and Linux `ps -o lstart` reports it as 10:55:49 (gaebal-gajae, 2026-09-30).
+			const issuedAt = Date.parse("2026-09-30T10:55:50.039Z");
+			let clock = issuedAt;
+			let current: ServiceProcess = { pid: 1, startedAt: issuedAt - 3_600_000, binary: "/opt/bin/gateway" };
+			return await runRestartStack({
+				home,
+				id: `skew-${reportedOffsetMs}`,
+				platform: "linux",
+				uid: 1000,
+				now: () => clock,
+				sleep: async (ms: number) => {
+					clock += ms;
+				},
+				verifyTimeoutMs: 3_000,
+				pollMs: 1_000,
+				runner: () => {
+					current = { ...current, pid: 2, startedAt: Date.parse("2026-09-30T10:55:50.000Z") + reportedOffsetMs };
+					return 0;
+				},
+				probe: async (label) => (label === "dev.gajaeway.gateway" ? current : undefined),
+				isServiceInstalled: async (label) => label === "dev.gajaeway.gateway",
+				binaryModifiedAt: async () => Date.parse("2026-09-30T10:55:49.601Z"),
+			});
+		};
+		expect((await run(-1_000)).steps[0]?.result).toBe("ok");
+		expect((await run(-2_000)).steps[0]?.result).toBe("stale");
+	} finally {
+		await cleanup();
+	}
+});
+
 test("default check skips services not in the unit dir", async () => {
 	const { home: gajaewayHome, cleanup: cleanupGajaeway } = await tempHome();
 	const { home: unitDir, cleanup: cleanupUnitDir } = await tempHome();

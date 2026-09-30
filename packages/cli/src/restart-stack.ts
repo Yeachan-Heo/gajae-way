@@ -215,9 +215,17 @@ function defaultIsServiceInstalled(options: {
 	};
 }
 
-function floorSecond(ms: number): number {
-	return Math.floor(ms / 1_000) * 1_000;
+/**
+ * `ps -o lstart` is whole seconds, and on Linux it is derived from the boot
+ * time plus clock ticks, so it can read up to one second EARLY. Measured on
+ * gaebal-gajae 2026-09-30: systemd logged `Started` at 10:55:50.170 while
+ * `ps` reported 10:55:49, and the freshly restarted gateway was judged stale,
+ * aborting the rest of the stack. The bound is floored and allowed that second.
+ */
+function psStartBound(ms: number): number {
+	return Math.floor(ms / 1_000) * 1_000 - PS_START_SKEW_MS;
 }
+const PS_START_SKEW_MS = 1_000;
 
 /**
  * Runs the ordered restart, verifying each service before the next command,
@@ -302,8 +310,7 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 				step.processStartedAt = new Date(running.startedAt).toISOString();
 				step.binary = running.binary;
 				step.binaryModifiedAt = new Date(binaryModifiedAt).toISOString();
-				// `ps` has one-second resolution, so the bound is floored to match.
-				if (running.startedAt >= floorSecond(Math.max(binaryModifiedAt, since))) {
+				if (running.startedAt >= psStartBound(Math.max(binaryModifiedAt, since))) {
 					step.result = "ok";
 					delete step.detail;
 					return;
