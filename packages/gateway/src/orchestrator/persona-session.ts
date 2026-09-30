@@ -96,6 +96,20 @@ const HOLD_RELEASE_SWEEPS = 2;
 export const WEDGED_TURN_IDLE_MS = 10 * 60_000;
 /** A held turn's liveness is re-probed for the wedge rule at most this often (reconcile runs every few seconds). */
 const WEDGED_PROBE_INTERVAL_MS = 30_000;
+/**
+ * Sends between full persona preambles on one session when nothing proved the
+ * context lost it. A compaction that both starts and regrows inside one turn
+ * leaves no drop in the context percentage sampled before each send; this
+ * bounds how long such a session can run without its persona.
+ */
+export const PERSONA_PREAMBLE_REFRESH_SENDS = 25;
+
+/** What the actor last put into one session's context: the persona preamble and the usage seen since. */
+type PersonaPreambleState = {
+	readonly signature: string;
+	readonly contextPercent: number;
+	readonly sendsSince: number;
+};
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -106,7 +120,15 @@ export type PersonaActorState = "idle" | "turn-running";
  */
 export interface PersonaTurnLifecycle {
 	readonly text: string;
+	/**
+	 * Stable persona preamble. The actor puts it into a session's context on the
+	 * first send, after it changes, after the context shrank (compaction) or a
+	 * failed turn, and every PERSONA_PREAMBLE_REFRESH_SENDS sends; other sends
+	 * rely on the copy already in the context.
+	 */
 	readonly systemPreamble?: string;
+	/** One-shot trusted context for this send only (the per-epoch session bootstrap). */
+	readonly sessionBootstrap?: string;
 	/** The selection applied by `model.set` before this session's first send. */
 	readonly effectiveModel?: GjcModelSelection;
 	/** GJC request tier; `priority` enables provider fast mode where supported. */
@@ -612,6 +634,7 @@ class OriginActor {
 	readonly #submissionFailures = new Map<string, number>();
 	/** Prevents repeating the capped-reset warning for the same bound session. */
 	readonly #loggedCappedFailedTurnSessions = new Set<string>();
+	readonly #personaPreamble = new Map<string, PersonaPreambleState>();
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
@@ -1294,6 +1317,7 @@ class OriginActor {
 			);
 			return;
 		}
+		const preamble = await this.#preambleForSend(binding.sessionId, epoch, lifecycle, tail);
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
@@ -1301,11 +1325,12 @@ class OriginActor {
 				text: lifecycle.text,
 				opRef,
 				relay: tail,
-				...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
+				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.inboundTurnAccept(opRef);
+			if (preamble.next) this.#personaPreamble.set(binding.sessionId, preamble.next);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
@@ -2548,6 +2573,9 @@ class OriginActor {
 		// Persist the failure notice before settling its trigger. If delivery fails,
 		// recovery can retry the same deterministic notice without losing it. Reset
 		// completion and its budget are then committed atomically below.
+		// A failed turn may never have put its preamble into the context: the next
+		// send on this session carries it again.
+		if (report.status.status !== "terminal_ok") this.#personaPreamble.delete(bound.sessionId);
 		const resetApplied = this.#resetFailedTurn(bound, report, failedTurnEvidence);
 		const completed = resetApplied
 			? 1
@@ -2639,6 +2667,62 @@ class OriginActor {
 				"error",
 			);
 		}
+	}
+
+	/**
+	 * Decides what trusted preamble one send carries. The persona preamble is
+	 * resent only when the session's context may not hold its current text: no
+	 * record for the session (first send, new session, gateway restart), changed
+	 * text, usage unreadable, usage lower than at the previous send (compaction or
+	 * pruning removed history), or the refresh bound reached. Resending it on
+	 * every turn grew #회의실 by ~12K tokens per message until pre-prompt
+	 * compaction wedged eight turns in a row (2026-09-30).
+	 */
+	async #preambleForSend(
+		sessionId: string,
+		epoch: number,
+		lifecycle: PersonaTurnLifecycle,
+		tail: TailHandle,
+	): Promise<{ readonly text?: string; readonly next?: PersonaPreambleState }> {
+		const persona = lifecycle.systemPreamble;
+		if (!persona) return lifecycle.sessionBootstrap ? { text: lifecycle.sessionBootstrap } : {};
+		const signature = createHash("sha256").update(persona).digest("hex");
+		let contextPercent: number | undefined;
+		try {
+			contextPercent = await this.#manager.port.contextPercent?.({
+				sessionId,
+				repo: this.#manager.repo,
+				relay: tail,
+			});
+		} catch (error) {
+			this.#manager.log(
+				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+			);
+		}
+		const previous = this.#personaPreamble.get(sessionId);
+		const reason = !previous
+			? "first"
+			: previous.signature !== signature
+				? "changed"
+				: contextPercent === undefined
+					? "usage_unknown"
+					: contextPercent < previous.contextPercent
+						? "context_shrank"
+						: previous.sendsSince + 1 >= PERSONA_PREAMBLE_REFRESH_SENDS
+							? "refresh"
+							: undefined;
+		if (reason === undefined && previous && contextPercent !== undefined)
+			return {
+				...(lifecycle.sessionBootstrap ? { text: lifecycle.sessionBootstrap } : {}),
+				next: { signature, contextPercent, sendsSince: previous.sendsSince + 1 },
+			};
+		this.#manager.log(
+			`persona_preamble origin=${this.originKey} epoch=${epoch} session=${sessionId} reason=${reason} context_percent=${contextPercent ?? "unknown"}${previous ? ` previous_percent=${previous.contextPercent}` : ""}`,
+		);
+		return {
+			text: lifecycle.sessionBootstrap ? `${persona}\n\n${lifecycle.sessionBootstrap}` : persona,
+			next: { signature, contextPercent: contextPercent ?? 0, sendsSince: 0 },
+		};
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {

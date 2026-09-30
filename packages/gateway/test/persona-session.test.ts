@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSilenceToken } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import { PersonaSessionManager, personaTurnOpRef, WEDGED_TURN_IDLE_MS } from "../src/orchestrator/persona-session";
+import {
+	PERSONA_PREAMBLE_REFRESH_SENDS,
+	PersonaSessionManager,
+	personaTurnOpRef,
+	WEDGED_TURN_IDLE_MS,
+} from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
@@ -2738,4 +2743,135 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(port.indexScans).toBe(0);
 	expect(port.deleted).toEqual([]);
 	expect(logs.some((line) => line.startsWith("session_gc"))).toBe(false);
+});
+
+/** Reports a scripted context usage, like `context.get` on the turn's relay. */
+class ContextUsagePort extends ScriptedSessionPort {
+	percent: number | undefined = 1;
+	readonly failing = new Set<string>();
+
+	constructor() {
+		super({
+			onSend: (input, port) => {
+				if (this.failing.has(input.text)) port.fail(input.opRef, "post-start failure");
+				else port.complete(input.opRef, "ok");
+			},
+		});
+	}
+
+	async contextPercent(): Promise<number | undefined> {
+		return this.percent;
+	}
+}
+
+const PERSONA = "## SOUL.md\npersona rules";
+
+async function preambleHarness(
+	port: ScriptedSessionPort,
+	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
+): Promise<void> {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => {
+			const bootstrap = lifecycle.bootstrap?.();
+			return {
+				text: trigger.body,
+				systemPreamble: lifecycle.persona(),
+				...(bootstrap ? { sessionBootstrap: bootstrap } : {}),
+			};
+		},
+	});
+}
+
+async function sendTurn(port: ScriptedSessionPort, body: string): Promise<string | undefined> {
+	const before = port.sends.length;
+	enqueue(`m-${before}-${body}`, body);
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => port.sends.length === before + 1 && manager!.state(KEY) === "idle",
+		`turn ${body} did not settle`,
+	);
+	return port.sends[before]!.systemPreamble;
+}
+
+test("persona preamble rides the first send only while the context keeps growing", async () => {
+	const port = new ContextUsagePort();
+	let bootstrap: string | undefined = "bootstrap once";
+	await preambleHarness(port, { persona: () => PERSONA, bootstrap: () => bootstrap });
+
+	expect(await sendTurn(port, "first")).toBe(`${PERSONA}\n\nbootstrap once`);
+	bootstrap = undefined;
+	port.percent = 2;
+	expect(await sendTurn(port, "second")).toBeUndefined();
+	port.percent = 2;
+	expect(await sendTurn(port, "same usage")).toBeUndefined();
+	bootstrap = "bootstrap without persona";
+	port.percent = 3;
+	expect(await sendTurn(port, "bootstrap only")).toBe("bootstrap without persona");
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("persona preamble is resent after the context shrank (compaction)", async () => {
+	const port = new ContextUsagePort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	port.percent = 29;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.percent = 29.5;
+	expect(await sendTurn(port, "grown")).toBeUndefined();
+	port.percent = 4;
+	expect(await sendTurn(port, "after compaction")).toBe(PERSONA);
+	port.percent = 4.5;
+	expect(await sendTurn(port, "grown again")).toBeUndefined();
+});
+
+test("persona preamble is resent when its text changes", async () => {
+	const port = new ContextUsagePort();
+	let persona = PERSONA;
+	await preambleHarness(port, { persona: () => persona });
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	persona = `${PERSONA}\nnew rule`;
+	port.percent = 2;
+	expect(await sendTurn(port, "edited")).toBe(persona);
+	port.percent = 3;
+	expect(await sendTurn(port, "unchanged")).toBeUndefined();
+});
+
+test("persona preamble is resent on every send while context usage is unreadable", async () => {
+	const port = new ContextUsagePort();
+	port.percent = undefined;
+	await preambleHarness(port, { persona: () => PERSONA });
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	expect(await sendTurn(port, "second")).toBe(PERSONA);
+});
+
+test("a failed turn makes the next send carry the persona preamble again", async () => {
+	const port = new ContextUsagePort();
+	port.failing.add("fails");
+	await preambleHarness(port, { persona: () => PERSONA });
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.percent = 2;
+	expect(await sendTurn(port, "fails")).toBeUndefined();
+	port.percent = 2;
+	expect(await sendTurn(port, "after failure")).toBe(PERSONA);
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("persona preamble is refreshed after the bounded number of sends without it", async () => {
+	const port = new ContextUsagePort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	const carried: boolean[] = [];
+	for (let send = 0; send <= PERSONA_PREAMBLE_REFRESH_SENDS; send++) {
+		port.percent = 1 + send;
+		carried.push((await sendTurn(port, `turn ${send}`)) === PERSONA);
+	}
+	expect(carried.map((value, index) => (value ? index : -1)).filter((index) => index >= 0)).toEqual([
+		0,
+		PERSONA_PREAMBLE_REFRESH_SENDS,
+	]);
 });

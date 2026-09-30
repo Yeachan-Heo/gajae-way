@@ -1393,3 +1393,49 @@ test("splitThinkingSuffix separates a trailing thinking level and leaves other c
 	expect(splitThinkingSuffix("anthropic/claude-opus-5-5:turbo")).toEqual({ model: "anthropic/claude-opus-5-5:turbo" });
 	expect(splitThinkingSuffix(":xhigh")).toEqual({ model: ":xhigh" });
 });
+
+test("contextPercent reads context.get usage from the relay's query page", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo,
+		originKey: "context-usage",
+		epoch: 0,
+	});
+	const run: CliRunner = async (args) => {
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	// The live host answers resource queries with a top-level page, not a result
+	// (measured: gjc 0.17 context.get on a live gateway session, 2026-09-30).
+	let reply: Record<string, unknown> = {
+		ok: true,
+		page: {
+			items: [{ usage: { contextWindow: 1_000_000, percent: 17.7493, source: "provider_anchor" }, isStreaming: false }],
+			complete: true,
+		},
+	};
+	const relay = scriptedRelay((request) => {
+		expect(request).toEqual({ type: "query_request", operation: "context.get", input: {} });
+		return reply as ReturnType<Parameters<typeof scriptedRelay>[0]>;
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+	});
+	const tail = await port.attachTail({ sessionId: "sdk-1", brokerGeneration: 0, repo });
+	try {
+		expect(await port.contextPercent({ sessionId: "sdk-1", repo, relay: tail })).toBe(17.7493);
+		reply = { ok: true, page: { items: [{ usage: { contextWindow: 1_000_000, percent: null, source: "unknown" } }] } };
+		expect(await port.contextPercent({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
+		reply = { ok: false, error: { code: "unsupported_query", message: "context.get is unavailable" } };
+		expect(await port.contextPercent({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
+	} finally {
+		await tail.close();
+	}
+});
