@@ -112,10 +112,15 @@ export interface SessionPort {
 	 */
 	runningJobs?(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]>;
 	/**
-	 * Context-window usage of the session in percent (`context.get`), read on the
-	 * turn's owned relay. Undefined when the host does not report it.
+	 * Context-window usage of the session (`context.get`), read on the turn's
+	 * owned relay. Undefined when the host does not report it (gjc reports none
+	 * between a compaction and the next model response).
 	 */
-	contextPercent?(input: { sessionId: string; repo: string; relay: TailHandle }): Promise<number | undefined>;
+	contextUsage?(input: {
+		sessionId: string;
+		repo: string;
+		relay: TailHandle;
+	}): Promise<SessionContextUsage | undefined>;
 	/**
 	 * Ends the host process of a session this gateway created and has retired.
 	 * Ownership is the point: the shared GJC daemon and broker are never touched,
@@ -195,6 +200,12 @@ export interface RunningHostJob {
 }
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
+
+/** Session context usage: percent of the model's context window and the token count it stands for. */
+export interface SessionContextUsage {
+	readonly percent: number;
+	readonly tokens: number;
+}
 
 export interface SessionCompactionInput {
 	readonly sessionId: string;
@@ -377,6 +388,12 @@ export const SESSION_BUSY_CODE = "busy";
 const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
 const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
+/**
+ * `compaction.run` answers only after gjc finished compacting, which takes tens
+ * of seconds at a few hundred thousand tokens (measured 27-45s at 270-295K,
+ * 2026-09-30); the default 30s command bound reported such runs as failed.
+ */
+const COMPACTION_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
@@ -1013,15 +1030,24 @@ export class BrokerSessionPort implements SessionPort {
 		return parseRunningJobs(result.stdout);
 	}
 
-	async contextPercent(input: { sessionId: string; repo: string; relay: TailHandle }): Promise<number | undefined> {
+	async contextUsage(input: {
+		sessionId: string;
+		repo: string;
+		relay: TailHandle;
+	}): Promise<SessionContextUsage | undefined> {
 		this.#assertOwned(input);
 		this.#database.assertBrokerAuthority(this.#authority);
 		const response = await input.relay.query("context.get", {}, { timeoutMs: CONTEXT_QUERY_TIMEOUT_MS });
 		if (!response.ok) return undefined;
 		const items = response.page?.items;
 		const snapshot = Array.isArray(items) ? recordOf(items[0]) : undefined;
-		const percent = recordOf(snapshot?.usage)?.percent;
-		return typeof percent === "number" && Number.isFinite(percent) ? percent : undefined;
+		const usage = recordOf(snapshot?.usage);
+		const percent = usage?.percent;
+		const window = usage?.contextWindow;
+		if (typeof percent !== "number" || !Number.isFinite(percent)) return undefined;
+		if (typeof window !== "number" || !Number.isFinite(window) || window <= 0) return undefined;
+		// The wire usage carries no token count; percent is tokens over the window.
+		return { percent, tokens: Math.round((percent / 100) * window) };
 	}
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
@@ -1130,17 +1156,10 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"control",
-					input.sessionId,
-					"--op",
-					"compaction.run",
-					"--json-input",
-					"{}",
-				]),
+				await this.#cli(
+					["sdk", "session", "raw", "control", input.sessionId, "--op", "compaction.run", "--json-input", "{}"],
+					{ timeoutMs: COMPACTION_TIMEOUT_MS },
+				),
 				"compaction.run",
 			);
 			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });

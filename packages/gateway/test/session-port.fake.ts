@@ -14,6 +14,7 @@ import type {
 	SessionActivity,
 	SessionBindInput,
 	SessionBinding,
+	SessionCompactionStatus,
 	SessionLiveness,
 	SessionPort,
 	SessionRequestInput,
@@ -500,7 +501,7 @@ export class ScriptedSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		originKey: string;
-	}): Promise<{ readonly status: "unavailable" }> {
+	}): Promise<{ readonly status: SessionCompactionStatus }> {
 		return { status: "unavailable" };
 	}
 

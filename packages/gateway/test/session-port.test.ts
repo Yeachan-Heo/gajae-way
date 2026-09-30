@@ -1394,7 +1394,7 @@ test("splitThinkingSuffix separates a trailing thinking level and leaves other c
 	expect(splitThinkingSuffix(":xhigh")).toEqual({ model: ":xhigh" });
 });
 
-test("contextPercent reads context.get usage from the relay's query page", async () => {
+test("contextUsage reads context.get usage from the relay's query page", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -1430,12 +1430,50 @@ test("contextPercent reads context.get usage from the relay's query page", async
 	});
 	const tail = await port.attachTail({ sessionId: "sdk-1", brokerGeneration: 0, repo });
 	try {
-		expect(await port.contextPercent({ sessionId: "sdk-1", repo, relay: tail })).toBe(17.7493);
+		// The wire usage has no token count: tokens are the percent of the window.
+		expect(await port.contextUsage({ sessionId: "sdk-1", repo, relay: tail })).toEqual({
+			percent: 17.7493,
+			tokens: 177_493,
+		});
 		reply = { ok: true, page: { items: [{ usage: { contextWindow: 1_000_000, percent: null, source: "unknown" } }] } };
-		expect(await port.contextPercent({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
+		expect(await port.contextUsage({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
+		reply = { ok: true, page: { items: [{ usage: { percent: 12, source: "heuristic" } }] } };
+		expect(await port.contextUsage({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
 		reply = { ok: false, error: { code: "unsupported_query", message: "context.get is unavailable" } };
-		expect(await port.contextPercent({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
+		expect(await port.contextUsage({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
 	} finally {
 		await tail.close();
 	}
+});
+
+test("runCompaction waits minutes for gjc to finish compacting and maps its receipt", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
+	let reply: Record<string, unknown> = { ok: true, result: { started: true } };
+	const run: CliRunner = async (args, options) => {
+		calls.push({ args: [...args], timeoutMs: options?.timeoutMs });
+		return { exitCode: 0, stdout: JSON.stringify(reply), stderr: "" };
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const target = { sessionId: "sdk-1", repo, originKey: "compact" };
+	// gjc answers compaction.run only once compaction finished: tens of seconds
+	// at a few hundred thousand tokens, past the 30s default command bound.
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded" });
+	expect(calls).toHaveLength(1);
+	expect(calls[0]!.args).toContain("compaction.run");
+	expect(calls[0]!.timeoutMs).toBeGreaterThanOrEqual(120_000);
+	reply = { ok: true, result: { skipped: true } };
+	expect(await port.runCompaction(target)).toEqual({ status: "skipped" });
+	reply = { ok: true, result: {} };
+	expect(await port.runCompaction(target)).toEqual({ status: "failed" });
 });
