@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { bootGateway } from "../src/boot";
-import { MIN_GJC_VERSION } from "../src/orchestrator/broker";
+import { MIN_GJC_VERSION } from "../src/orchestrator/gjc-contract";
 import {
 	acquireGatewayHome,
 	claimGatewayHome,

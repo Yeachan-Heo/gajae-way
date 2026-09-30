@@ -58,6 +58,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
+import { BrokerSpawnerGuard } from "../orchestrator/broker-spawner-guard";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaBindHoldInput,
@@ -641,6 +642,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
 		| undefined;
+	const spawnerGuard =
+		brokerWithGeneration?.agentDir && brokerWithGeneration.executable
+			? new BrokerSpawnerGuard({ agentDir: brokerWithGeneration.agentDir, executable: brokerWithGeneration.executable })
+			: undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
 			? brokerWithGeneration.onGeneration((generation) => {
@@ -652,6 +657,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 						.catch((error: unknown) =>
 							console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
 						);
+					// A new broker is the first observable sign of a gjc upgrade: re-check
+					// the runtime version and whether a pre-upgrade process is killing brokers.
+					if (typeof brokerWithGeneration.refreshVersion === "function")
+						void brokerWithGeneration
+							.refreshVersion()
+							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
+					void spawnerGuard
+						?.observe()
+						.catch((error: unknown) => console.error(`broker spawner guard failed: ${diagnostic(error)}`));
 				})
 			: undefined;
 	runtime = {
@@ -675,6 +689,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		cycle: new RuntimeCycleProjector(options.database, memory, {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.broker?.agentDir,
+			gjcVersion: () => options.broker?.gjcVersion,
 		}),
 		lanes,
 		work,

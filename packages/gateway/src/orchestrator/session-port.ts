@@ -30,6 +30,7 @@ import {
 	readFailedTransportCause,
 	readFailedTurnEvidence,
 } from "./failed-turn-evidence";
+import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
@@ -355,7 +356,7 @@ export class BrokerSessionPort implements SessionPort {
 					result?: { session?: { live?: unknown; deleted?: unknown } };
 					error?: { code?: unknown };
 				};
-				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
+				if (envelope.ok === false) indexed = !isSessionGoneCode(envelope.error?.code);
 				if (envelope.ok === true && envelope.result?.session?.live === false) {
 					if (envelope.result.session.deleted !== true) {
 						try {
@@ -470,7 +471,7 @@ export class BrokerSessionPort implements SessionPort {
 				// Only a broker that explicitly reports the id as not indexed / not
 				// live keeps us waiting; anything else is treated as ready (the send
 				// path still has its own recovery if that turns out to be wrong).
-				const disowned = envelope.ok === false && envelope.error?.code === "session_unavailable";
+				const disowned = envelope.ok === false && isSessionGoneCode(envelope.error?.code);
 				const notLive =
 					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
 				if (!disowned && !notLive) return;
@@ -478,7 +479,7 @@ export class BrokerSessionPort implements SessionPort {
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
 				const code = sdkErrorCode(error);
-				if (code !== "session_unavailable") return;
+				if (!isSessionGoneCode(code)) return;
 				lastCode = code;
 			}
 			if (Date.now() >= deadline)
@@ -560,12 +561,12 @@ export class BrokerSessionPort implements SessionPort {
 				result?: { session?: { live?: unknown } };
 				error?: { code?: unknown };
 			};
-			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
+			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
 			const live = envelope.result?.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			return { live: undefined, disowned: sdkErrorCode(error) === "session_unavailable" };
+			return { live: undefined, disowned: isSessionGoneCode(sdkErrorCode(error)) };
 		}
 	}
 
@@ -606,7 +607,7 @@ export class BrokerSessionPort implements SessionPort {
 			live = typeof session?.live === "boolean" ? session.live : undefined;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			return sdkErrorCode(error) === "session_unavailable"
+			return isSessionGoneCode(sdkErrorCode(error))
 				? { outcome: "already_gone" }
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
@@ -1205,17 +1206,17 @@ export function parseWorkerOutputResponse(
 		const code = workerRecord(envelope.error)?.code;
 		if (
 			typeof code === "string" &&
-			[
-				"session_unavailable",
-				"resource_gone",
-				"unavailable",
-				"unsupported_operation",
-				"unknown_operation",
-				"unknown_query",
-				"unsupported_query",
-				"not_supported",
-				"operation_not_session_owned",
-			].includes(code)
+			(isSessionGoneCode(code) ||
+				[
+					"resource_gone",
+					"unavailable",
+					"unsupported_operation",
+					"unknown_operation",
+					"unknown_query",
+					"unsupported_query",
+					"not_supported",
+					"operation_not_session_owned",
+				].includes(code))
 		)
 			return { status: "unavailable", code: "output_unavailable" };
 		return { status: "absent", code: "transport_error" };

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SessionRelayStream } from "./broker";
+import { isSessionGoneCode } from "./gjc-contract";
 import { sanitizeDiagnostic } from "./rebind";
 
 /**
@@ -178,7 +179,7 @@ export class RelayRefusedError extends Error {
 	constructor(sessionId: string, code: string, message: string | undefined) {
 		super(`relay for ${sessionId} refused: ${code}${message ? ` - ${message}` : ""}`);
 		this.name = "RelayRefusedError";
-		this.code = code === "endpoint_stale" || code === "not_found" ? "session_unavailable" : code;
+		this.code = isSessionGoneCode(code) ? "session_unavailable" : code;
 	}
 }
 

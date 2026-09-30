@@ -16,6 +16,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type GatewayDatabase, type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
+import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
 import {
@@ -2738,7 +2739,7 @@ function sdkStatusErrorCode(error: unknown): string | undefined {
 			: typeof detailCode === "string" && /^[a-z0-9_.-]{1,64}$/i.test(detailCode)
 				? detailCode
 				: undefined;
-	if (raw === "endpoint_stale" || raw === "not_found") return "session_unavailable";
+	if (isSessionGoneCode(raw)) return "session_unavailable";
 	if (raw) return raw;
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable|endpoint_stale/.test(message) ? "session_unavailable" : undefined;

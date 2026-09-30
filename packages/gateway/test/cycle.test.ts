@@ -42,6 +42,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
 		agentDisk: null,
+		gjcVersion: undefined,
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -64,6 +65,18 @@ const boundSession = {
 };
 
 describe("runtime cycle projection", () => {
+	test("a gjc newer than the verified contract is a gate; verified and unknown versions are not", () => {
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.0" }), generatedAt).gates).toContain(
+			"gjc_unverified_version",
+		);
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.18.7" }), generatedAt).gates).not.toContain(
+			"gjc_unverified_version",
+		);
+		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(
+			"gjc_unverified_version",
+		);
+	});
+
 	// Issue #15: the GJC agent directory grew to 70+ GB with no reaper; the
 	// gateway must surface the disk-full cliff before session creation fails.
 	test("agent-directory disk headroom below the floor or unobservable is a gate", () => {

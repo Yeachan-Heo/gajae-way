@@ -9,6 +9,7 @@ import {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 } from "./broker-liveness";
+import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { sanitizeDiagnostic } from "./rebind";
 
 export {
@@ -21,7 +22,6 @@ export {
 	readBrokerDiscovery,
 } from "./broker-liveness";
 
-export const MIN_GJC_VERSION = "0.16.0";
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
 // GJC's authoritative shared session flags are in packages/coding-agent/src/commands/sdk.ts;
@@ -349,7 +349,28 @@ export class GlobalGjcClient {
 			MIN_GJC_VERSION,
 			this.cli,
 		);
-		this.#gjcVersion = result.version;
+		this.#noteVersion(result.version);
+	}
+	/**
+	 * Re-reads `gjc --version`. gjc is upgraded underneath a running gateway,
+	 * and the first observable sign is a new broker generation, so the gateway
+	 * re-checks there instead of trusting the version it booted with.
+	 */
+	async refreshVersion(): Promise<string | undefined> {
+		const result = await this.#run(["--version"], COMMAND_TIMEOUT_MS);
+		const version = (result.stdout || result.stderr).match(/(\d+\.\d+\.\d+)/)?.[1];
+		if (result.exitCode === 0 && version) this.#noteVersion(version);
+		return this.#gjcVersion;
+	}
+	#noteVersion(version: string): void {
+		const previous = this.#gjcVersion;
+		this.#gjcVersion = version;
+		if (previous !== undefined && previous !== version)
+			console.error(`gjc_version_changed from=${previous} to=${version}`);
+		if (previous !== version && !isVerifiedGjcVersion(version))
+			console.error(
+				`gjc_unverified_version version=${version} verifiedThrough=${VERIFIED_GJC_THROUGH}.x reason=error_contract_unverified`,
+			);
 	}
 	async start(): Promise<void> {
 		if (this.#starting) return this.#starting;
