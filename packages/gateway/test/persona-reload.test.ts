@@ -168,3 +168,30 @@ test("persona workspace accepts a workspace that itself links to the corpus's pa
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("#377 AGENTS.md is removed from persona preamble so gjc discovery owns it uniquely", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-agents-once-"));
+	try {
+		const persona = new PersonaLoader(home);
+		await persona.ensureWorkspace();
+		// Create SOUL.md, AGENTS.md, and USER.md in the workspace.
+		const workspace = join(home, "workspace");
+		await writeFile(join(workspace, "SOUL.md"), "soul content");
+		await writeFile(join(workspace, "AGENTS.md"), "agents content");
+		await writeFile(join(workspace, "USER.md"), "user content");
+		// The persona preamble should NOT include AGENTS.md.
+		const preamble = await persona.systemPreamble();
+		expect(preamble).toContain("## SOUL.md");
+		expect(preamble).toContain("soul content");
+		expect(preamble).toContain("## USER.md");
+		expect(preamble).toContain("user content");
+		// AGENTS.md should NOT appear as a section header in the preamble.
+		expect(preamble).not.toContain("## AGENTS.md");
+		// But AGENTS.md content might exist if it was accidentally included,
+		// so let's verify the section is really absent.
+		const agentsSectionPattern = /## AGENTS\.md\s*\n/;
+		expect(agentsSectionPattern.test(preamble)).toBe(false);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
