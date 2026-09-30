@@ -559,6 +559,8 @@ export class BrokerSessionPort implements SessionPort {
 				result?: { session?: { live?: unknown } };
 				error?: { code?: unknown };
 			};
+			// Inspect's raw envelope uses the literal `session_unavailable` code for
+			// disowning; do not apply relay normalization aliases to this contract.
 			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
 			const live = envelope.result?.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
