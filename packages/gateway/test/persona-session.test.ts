@@ -100,11 +100,14 @@ async function harness(
 
 async function settleFailedInbound(port: ScriptedSessionPort, messageId: string) {
 	enqueue(messageId, messageId);
-	await manager!.notifyInbound(KEY);
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	await activeManager.notifyInbound(KEY);
 	const send = port.sends.at(-1);
 	if (!send) throw new Error(`failed turn ${messageId} was not dispatched`);
 	await eventually(
-		() => database!.inboundTurnRow(send.opRef)?.turn_state === "done" && manager!.state(KEY) === "idle",
+		() => activeDatabase.inboundTurnRow(send.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
 		`failed turn ${messageId} did not settle`,
 	);
 	return send;
@@ -603,7 +606,7 @@ test("two consecutive internal submission failures reset the next inbound to a n
 	const second = await settleFailedInbound(port, "submission-2");
 	expect(first.sessionId).toBe("session-e0");
 	expect(second.sessionId).toBe(first.sessionId);
-	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(logs).toContain(
 		`session_reset_after_failed_turn origin=${KEY} epoch=0 nextEpoch=1 opRef=${second.opRef} reason=repeated_submission_failure`,
 	);
@@ -626,20 +629,24 @@ test("a healthy turn clears consecutive internal submission failures", async () 
 	});
 	const logs: string[] = [];
 	await harness(port, {}, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
 	const first = await settleFailedInbound(port, "submission-before-healthy");
 	const healthy = "healthy";
 	enqueue(healthy, healthy);
-	await manager!.notifyInbound(KEY);
-	const successful = port.sends.at(-1)!;
+	await activeManager.notifyInbound(KEY);
+	const successful = port.sends.at(-1);
+	if (!successful) throw new Error("healthy turn was not dispatched");
 	await eventually(
-		() => database!.inboundTurnRow(successful.opRef)?.turn_state === "done" && manager!.state(KEY) === "idle",
+		() => activeDatabase.inboundTurnRow(successful.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
 		"healthy turn did not settle",
 	);
 	const last = await settleFailedInbound(port, "submission-after-healthy");
 
 	expect(successful.sessionId).toBe(first.sessionId);
 	expect(last.sessionId).toBe(first.sessionId);
-	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(activeDatabase.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
 });
 
@@ -657,6 +664,8 @@ test("repeated submission failures respect the reset cap and log it once per ses
 
 	const sends: (typeof port.sends)[number][] = [];
 	for (let index = 0; index < 6; index++) sends.push(await settleFailedInbound(port, `capped-submission-${index + 1}`));
+	const capped = sends[3];
+	if (!capped) throw new Error("reset cap failure was not recorded");
 
 	expect(sends.slice(0, 2).map((send) => send.sessionId)).toEqual(["session-e0", "session-e0"]);
 	expect(sends.slice(2).map((send) => send.sessionId)).toEqual([
@@ -665,9 +674,9 @@ test("repeated submission failures respect the reset cap and log it once per ses
 		"session-e1",
 		"session-e1",
 	]);
-	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(logs.filter((line) => line.startsWith("failed_turn_reset_capped "))).toEqual([
-		`failed_turn_reset_capped origin=${KEY} epoch=1 session=session-e1 opRef=${sends[3]!.opRef} reason=repeated_submission_failure`,
+		`failed_turn_reset_capped origin=${KEY} epoch=1 session=session-e1 opRef=${capped.opRef} reason=repeated_submission_failure`,
 	]);
 });
 
