@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -417,9 +417,9 @@ test("legacy bootstrapped sessions receive an AGENTS.md deletion notice once", a
 		// Version 25 adds these columns as -1/NULL for sessions already bootstrapped.
 		const raw = new Database(gateway.config.dbPath);
 		try {
-			raw.query("UPDATE sessions SET agents_md_epoch = -1, agents_md_digest = NULL WHERE origin_key = ?").run(
-				originKey(LOOPBACK_ORIGIN),
-			);
+			raw
+				.query("UPDATE sessions SET agents_md_epoch = -1, agents_md_digest = NULL WHERE origin_key = ?")
+				.run(originKey(LOOPBACK_ORIGIN));
 		} finally {
 			raw.close();
 		}
