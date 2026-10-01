@@ -88,6 +88,19 @@ const pendingOutput = () => ({
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
+function workAttemptEndState(
+	reason: string,
+): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
+	return reason === "end_turn"
+		? "completed"
+		: reason === "terminal_missing_receipt"
+			? "terminal_missing_receipt"
+			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
+				? "terminal_uncertain"
+				: ["sdk_failed", "send_rejected"].includes(reason)
+					? "failed"
+					: "attempt_ended";
+}
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
 	readonly generation: number;
@@ -238,11 +251,18 @@ export class WorkLaneManager {
 		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
 		if (attempt.endedAt !== undefined) return false;
 
-		const terminal: WorkAttemptTerminalEvidence = runtime.terminal ?? {
+		const recordedTerminal = runtime.terminal;
+		const terminal: WorkAttemptTerminalEvidence = recordedTerminal ?? {
 			kind: "local",
 			observedAt: endedAt,
 			reasonCode: reason,
 		};
+		const endState = recordedTerminal ? workAttemptEndState(terminal.reasonCode) : "attempt_ended";
+		const errorCode = recordedTerminal
+			? terminal.reasonCode === "end_turn"
+				? undefined
+				: terminal.reasonCode
+			: "host_lost";
 		const output =
 			runtime.output.disposition === "pending"
 				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
@@ -250,11 +270,11 @@ export class WorkLaneManager {
 		const closed = closeAttempt({
 			record,
 			opRef,
-			endState: "attempt_ended",
-			errorCode: "host_lost",
+			endState,
+			errorCode,
 			endedAt,
 		});
-		const text = reportText(name, "attempt_ended", terminal.reasonCode, opRef, output);
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
 		if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -307,6 +327,7 @@ export class WorkLaneManager {
 			admission,
 		);
 		if (!settled) return false;
+		this.#finishWaiters(opRef);
 		for (const payload of [settled.fallbackPayload, settled.childFallback]) {
 			if (!payload) continue;
 			try {
@@ -963,16 +984,7 @@ export class WorkLaneManager {
 					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
 				}
 			}
-			const endState =
-				reason === "end_turn"
-					? "completed"
-					: reason === "terminal_missing_receipt"
-						? "terminal_missing_receipt"
-						: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
-							? "terminal_uncertain"
-							: ["sdk_failed", "send_rejected"].includes(reason)
-								? "failed"
-								: "attempt_ended";
+			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
 				opRef: runtime.opRef,
@@ -1046,7 +1058,7 @@ export class WorkLaneManager {
 				admission,
 			);
 			if (!settled) return undefined;
-			for (const waiter of [...(this.#waiters.get(runtime.opRef) ?? [])]) waiter.finish();
+			this.#finishWaiters(runtime.opRef);
 			return settled;
 		});
 
@@ -1105,6 +1117,9 @@ export class WorkLaneManager {
 			await observer.tail?.close();
 			observer.tail = undefined;
 		}
+	}
+	#finishWaiters(opRef: string): void {
+		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;

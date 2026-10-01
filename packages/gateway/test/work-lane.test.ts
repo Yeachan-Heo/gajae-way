@@ -641,6 +641,42 @@ test("force-retiring an open dead lane settles its runtime and permits later wor
 	await expect(f.manager.recover()).resolves.toBeUndefined();
 });
 
+test("force retirement releases a pending work.run waiter promptly", async () => {
+	const f = await fixture({ waitTimeoutMs: 60_000 });
+	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {}).then(
+		(value) => ({ value }),
+		(error: unknown) => ({ error }),
+	);
+	await until(() => f.port.sends.length === 1);
+	await Bun.sleep(10);
+	const { sessionId } = f.port.sends[0]!;
+	f.port.setSessionState(sessionId, { live: false });
+
+	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+	const outcome = await Promise.race([run, Bun.sleep(250).then(() => null)]);
+	expect(outcome).not.toBeNull();
+	expect(outcome).toMatchObject({ error: { detail: { reasonCode: "session_dead" } } });
+});
+
+test("force retirement preserves a recorded terminal outcome in lane history", async () => {
+	const f = await fixture({ ownerTarget: () => origin });
+	f.port.fetchWorkerOutput = async () => ({ status: "absent", code: "output_pending" });
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "durable result");
+	await until(() => {
+		const runtime = f.db.workAttemptGet(result.opRef);
+		return runtime?.terminal?.reasonCode === "end_turn" && runtime.output.reads > 0;
+	});
+	f.port.setSessionState(result.sessionId, { live: false });
+
+	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+	const runtime = f.db.workAttemptGet(result.opRef);
+	const attempt = f.job().attempts[0];
+	expect(runtime?.terminal).toMatchObject({ kind: "broker", reasonCode: "end_turn" });
+	expect(attempt).toMatchObject({ endState: "completed" });
+	expect(attempt?.errorCode).toBeUndefined();
+});
+
 test("force-retiring a disowned lane records a session_disowned terminal", async () => {
 	const f = await fixture();
 	const result = await started(f);
