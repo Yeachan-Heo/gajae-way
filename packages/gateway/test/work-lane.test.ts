@@ -3,7 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
-import { appendAttempt, createLaneJobRecord, GjcCliError, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import {
+	appendAttempt,
+	closeAttempt,
+	createLaneJobRecord,
+	GjcCliError,
+	parseLaneJobRecord,
+} from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import {
@@ -13,7 +19,7 @@ import {
 	WorkLaneManager,
 	type WorkLaneManagerOptions,
 } from "../src/orchestrator/work-lane";
-import { GatewayDatabase } from "../src/store/db";
+import { GatewayDatabase, WorkAttemptStateError } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -613,6 +619,89 @@ test("dead restart settles uncertainty into a sticky hold, never replacement bin
 		held: true,
 	});
 	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: session_dead: output_unavailable");
+});
+
+test("force-retiring an open dead lane settles its runtime and permits later work", async () => {
+	const f = await fixture({ ownerTarget: () => origin });
+	const result = await started(f, "a", origin);
+	f.port.setSessionState(result.sessionId, { live: false });
+
+	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	const runtime = f.db.workAttemptGet(result.opRef);
+	const attempt = f.job().attempts[0];
+	expect(runtime).toBeDefined();
+	expect(attempt).toBeDefined();
+	expect(runtime?.settledAt).toBe(attempt?.endedAt);
+	expect(runtime?.terminal).toMatchObject({ kind: "local", reasonCode: "session_dead" });
+	expect(attempt).toMatchObject({ endState: "attempt_ended", errorCode: "host_lost" });
+	expect(f.db.workAttemptOpen()).toHaveLength(0);
+
+	const next = await f.manager.start({ name: "a", text: "again", cwd: f.directory, resume: true });
+	expect(next.started).toBe(true);
+	await expect(f.manager.recover()).resolves.toBeUndefined();
+});
+
+test("force-retiring a disowned lane records a session_disowned terminal", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	f.port.liveness = async () => ({ live: undefined, disowned: true });
+
+	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	const runtime = f.db.workAttemptGet(result.opRef);
+	const attempt = f.job().attempts[0];
+	expect(runtime?.settledAt).toBe(attempt?.endedAt);
+	expect(runtime?.terminal).toMatchObject({ kind: "local", reasonCode: "session_disowned" });
+});
+
+test("one inconsistent runtime is logged with its opRef and does not block other lane recovery", async () => {
+	const f = await fixture();
+	const bad = await started(f, "a");
+	const good = await started(f, "b");
+	await f.manager.stop();
+	const closed = closeAttempt({
+		record: f.job("a"),
+		opRef: bad.opRef,
+		endState: "attempt_ended",
+		errorCode: "host_lost",
+		endedAt: new Date(Date.now() + 1_000).toISOString(),
+	});
+	const identity = laneJobIdentity("a");
+	f.db.putLaneJob({ ...closed, laneKey: identity.laneKey, json: JSON.stringify(closed) });
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	let recoveredOther = false;
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		if (input.opRef === good.opRef) recoveredOther = true;
+		return status(input);
+	};
+
+	await expect(f.restart()).resolves.toBeDefined();
+	await until(() => recoveredOther);
+	let failure: unknown;
+	try {
+		f.db.workAttemptGet(bad.opRef);
+	} catch (error) {
+		failure = error;
+	}
+	expect(failure).toBeInstanceOf(WorkAttemptStateError);
+	expect(failure).toMatchObject({
+		opRef: bad.opRef,
+		assertion: "attempt.endedAt matches runtime.settledAt",
+	});
+	expect((failure as Error).message).toContain(`opRef=${JSON.stringify(bad.opRef)}`);
+	expect(
+		errors.mock.calls.some((call) => {
+			const line = String(call[0]);
+			return (
+				line.includes("work_recovery_invalid_attempt") &&
+				line.includes(bad.opRef) &&
+				line.includes("attempt.endedAt matches runtime.settledAt")
+			);
+		}),
+	).toBe(true);
+	f.port.complete(good.opRef, "recovered other lane");
+	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt !== null);
 });
 
 test("saved terminal proof wins over dead liveness and output recovery consumes saved budget", async () => {

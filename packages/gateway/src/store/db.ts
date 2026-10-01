@@ -229,9 +229,15 @@ export interface LaneReportRow {
 	readonly updated_at: string;
 }
 export class WorkAttemptStateError extends Error {
-	constructor() {
-		super("work lane state unavailable");
+	readonly opRef: string | undefined;
+	readonly assertion: string;
+	constructor(opRef?: string, assertion = "work attempt payload validation") {
+		super(
+			`work lane state unavailable${opRef === undefined ? "" : ` opRef=${JSON.stringify(opRef)}`} assertion=${assertion}`,
+		);
 		this.name = "WorkAttemptStateError";
+		this.opRef = opRef;
+		this.assertion = assertion;
 	}
 }
 
@@ -295,8 +301,8 @@ const WORK_REASON_CODES = new Set([
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
-function workAssert(condition: unknown): asserts condition {
-	if (!condition) throw new WorkAttemptStateError();
+function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {
+	if (!condition) throw new WorkAttemptStateError(undefined, assertion);
 }
 function workTime(value: unknown): boolean {
 	return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
@@ -1009,25 +1015,52 @@ export class GatewayDatabase {
 		try {
 			const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 			validateWorkRuntime(runtime, this.instanceId);
-			workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key);
-			workAssert(runtime.sessionId === row.session_id && runtime.version === row.version);
-			workAssert(runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id);
+			workAssert(
+				runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key,
+				"runtime identity matches database columns",
+			);
+			workAssert(
+				runtime.sessionId === row.session_id && runtime.version === row.version,
+				"runtime session and version match database columns",
+			);
+			workAssert(
+				runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id,
+				"runtime settlement and delivery id match database columns",
+			);
 			this.#workHistory(runtime);
 			return runtime;
-		} catch {
-			throw new WorkAttemptStateError();
+		} catch (error) {
+			throw new WorkAttemptStateError(
+				opRef,
+				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
+			);
 		}
 	}
 
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
-	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
+	workAttemptOpen(
+		limit = 100,
+		afterOpRef = "",
+		onInvalid?: (error: WorkAttemptStateError) => void,
+	): readonly WorkAttemptRuntime[] {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
-		return this.#database
+		const rows = this.#database
 			.query<{ op_ref: string }, [string, number]>(
 				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref LIMIT ?",
 			)
-			.all(afterOpRef, limit)
-			.map((row) => this.workAttemptGet(row.op_ref)!);
+			.all(afterOpRef, limit);
+		if (!onInvalid) return rows.map((row) => this.workAttemptGet(row.op_ref)!);
+		const attempts: WorkAttemptRuntime[] = [];
+		for (const row of rows) {
+			try {
+				const runtime = this.workAttemptGet(row.op_ref);
+				if (runtime) attempts.push(runtime);
+			} catch (error) {
+				if (!(error instanceof WorkAttemptStateError)) throw error;
+				onInvalid(error);
+			}
+		}
+		return attempts;
 	}
 
 	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
@@ -1558,16 +1591,29 @@ export class GatewayDatabase {
 
 	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
 		const record = parseLaneJobRecord(JSON.stringify(input));
-		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd);
+		workAssert(
+			record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd,
+			"history job identity matches runtime",
+		);
 		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt);
-		workAssert(runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt);
-		if (runtime.settledAt === null) workAssert(record.attempts.at(-1)?.opRef === runtime.opRef);
+		workAssert(
+			attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt,
+			"history attempt identity matches runtime",
+		);
+		workAssert(
+			runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt,
+			"attempt.endedAt matches runtime.settledAt",
+		);
+		if (runtime.settledAt === null)
+			workAssert(record.attempts.at(-1)?.opRef === runtime.opRef, "open runtime belongs to latest history attempt");
 	}
 
 	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
 		const json = this.laneJobJson(runtime.jobId);
-		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+		workAssert(
+			json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json,
+			"lane history rows share one serialized record",
+		);
 		const record = parseLaneJobRecord(json);
 		this.#workValidateHistory(runtime, record);
 		return record;

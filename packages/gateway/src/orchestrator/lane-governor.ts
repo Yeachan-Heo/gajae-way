@@ -1,5 +1,5 @@
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
-import { closeAttempt, type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
@@ -69,6 +69,9 @@ export interface SweepNomination {
 	readonly now: number;
 }
 
+export type LaneForceRetireReason = "session_dead" | "session_disowned";
+type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
+
 export interface LaneGovernorOptions {
 	readonly database: GatewayDatabase;
 	readonly sessionPort: SessionPort;
@@ -95,6 +98,7 @@ export class LaneGovernor {
 	readonly #now: () => number;
 	readonly #log: (line: string) => void;
 	#recoveryGate?: () => Promise<void>;
+	#forceRetireSettlement?: ForceRetireSettlement;
 	#stopped = false;
 	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
 
@@ -111,6 +115,11 @@ export class LaneGovernor {
 	setRecoveryGate(gate: () => Promise<void>): void {
 		this.#recoveryGate = gate;
 		this.#stopped = false;
+	}
+
+	/** Installed by the attempt owner so forced retirement settles history and runtime atomically. */
+	setForceRetireSettlement(settle: ForceRetireSettlement): void {
+		this.#forceRetireSettlement = settle;
 	}
 
 	async stop(): Promise<void> {
@@ -323,10 +332,16 @@ export class LaneGovernor {
 		if (this.#stopped)
 			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "gateway is stopping" });
 		const task = (async () => {
-			await this.#recoveryGate?.();
-			if (this.#stopped)
-				return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
-			return this.#forceRetire(name);
+			try {
+				await this.#recoveryGate?.();
+				if (this.#stopped)
+					return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
+				return await this.#forceRetire(name);
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_force_retire_failed name=${name} reason=${detail}`);
+				return { retired: false as const, sessionKey: workSessionKey(name), reason: detail };
+			}
 		})();
 		this.#mutations.add(task);
 		void task.then(
@@ -373,23 +388,16 @@ export class LaneGovernor {
 					reason: "session is still live; cannot force retire",
 				};
 			}
-			// Session is confirmed dead or disowned; close the ledger attempt as host_lost.
-			if (record) {
-				const lastAttempt = record.attempts.at(-1);
-				if (lastAttempt && !lastAttempt.endedAt) {
-					// Attempt is still open; close it as host_lost
-					const closedJob = closeAttempt({
-						record,
-						opRef: lastAttempt.opRef,
-						endState: "attempt_ended",
-						errorCode: "host_lost",
-						endedAt: new Date().toISOString(),
-					});
-					this.#database.putLaneJob({
-						...closedJob,
-						laneKey: laneJobIdentity(name).laneKey,
-						json: JSON.stringify(closedJob),
-					});
+			// Session is confirmed dead or disowned; the attempt owner closes the
+			// history and runtime row together before we retire the binding.
+			const lastAttempt = record?.attempts.at(-1);
+			if (lastAttempt && !lastAttempt.endedAt) {
+				const reason: LaneForceRetireReason = liveness.disowned ? "session_disowned" : "session_dead";
+				const endedAt = new Date(this.#now()).toISOString();
+				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, reason, endedAt)) {
+					const detail = "work attempt could not be settled";
+					this.#log(`lane_force_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+					return { retired: false, sessionKey, reason: detail };
 				}
 			}
 			// Close the session and rebind the epoch.

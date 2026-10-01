@@ -727,6 +727,27 @@ test("#360: forceRetire refuses live sessions but closes dead ones", async () =>
 	expect(port.closes).toContainEqual({ sessionId: "sess-dead", repo: "/tmp/worker-repo" });
 });
 
+test("forceRetire catches and logs recovery-gate rejection instead of leaking a rejected promise", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("dead", NOW, "sess-dead");
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: new ScriptedSessionPort(),
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+	governor.setRecoveryGate(async () => {
+		throw new Error("recovery failed");
+	});
+
+	await expect(governor.forceRetire("dead")).resolves.toMatchObject({
+		retired: false,
+		reason: "recovery failed",
+	});
+	expect(logs).toContain("lane_force_retire_failed name=dead reason=recovery failed");
+});
+
 test("#360: sweep releases dead lanes and quarantined lanes don't count toward capacity", async () => {
 	database = await GatewayDatabase.open(":memory:");
 
