@@ -92,7 +92,7 @@ For how memory, monitors, and the gateway work end to end, see [the documentatio
 
 ## Make it yours
 
-Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. They are read for each turn and that workspace is also your persona's working directory. Keep the home directory private: it contains configuration, the gateway database, your workspace, and memory.
+Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. `SOUL.md` and `USER.md` are read for each turn. gjc discovers `AGENTS.md` when a session starts; a later edit or deletion supersedes that project-context copy on the next turn. The workspace is also your persona's working directory. Keep the home directory private: it contains configuration, the gateway database, your workspace, and memory.
 
 - [Deployment guide](docs/deployment.md) — configuration, credentials, and service-manager setup
 - [Memory guide](docs/memory.md) — readable memory and search

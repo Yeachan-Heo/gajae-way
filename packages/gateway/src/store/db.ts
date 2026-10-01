@@ -569,7 +569,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 24;
+const LATEST_SCHEMA_VERSION = 25;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -1661,6 +1661,8 @@ export class GatewayDatabase {
 		| {
 				epoch: number;
 				lastBootstrappedEpoch: number;
+				agentsMdEpoch: number;
+				agentsMdDigest: string | null;
 				appliedAt: string | null;
 				includedSections: readonly string[];
 				byteCount: number;
@@ -1673,6 +1675,8 @@ export class GatewayDatabase {
 				{
 					epoch: number;
 					last_bootstrapped_epoch: number;
+					agents_md_epoch: number;
+					agents_md_digest: string | null;
 					bootstrap_applied_at: string | null;
 					bootstrap_sections_json: string;
 					bootstrap_byte_count: number;
@@ -1681,19 +1685,32 @@ export class GatewayDatabase {
 				},
 				[string]
 			>(
-				"SELECT epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
+				"SELECT epoch, last_bootstrapped_epoch, agents_md_epoch, agents_md_digest, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
 			)
 			.get(originKey);
 		if (!row) return undefined;
 		return {
 			epoch: row.epoch,
 			lastBootstrappedEpoch: row.last_bootstrapped_epoch,
+			agentsMdEpoch: row.agents_md_epoch,
+			agentsMdDigest: row.agents_md_digest,
 			appliedAt: row.bootstrap_applied_at,
 			includedSections: parseStringList(row.bootstrap_sections_json),
 			byteCount: row.bootstrap_byte_count,
 			truncated: row.bootstrap_truncated === 1,
 			diagnostics: parseStringList(row.bootstrap_diagnostics_json),
 		};
+	}
+
+	/** Records the current AGENTS.md digest for a session epoch when it changes. */
+	recordSessionAgentsBaseline(originKey: string, epoch: number, digest: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET agents_md_epoch = ?, agents_md_digest = ? WHERE origin_key = ? AND epoch = ? AND (agents_md_epoch < ? OR (agents_md_epoch = ? AND agents_md_digest IS NOT ?))",
+				)
+				.run(epoch, digest, originKey, epoch, epoch, epoch, digest).changes === 1
+		);
 	}
 
 	markSessionBootstrapped(
@@ -4466,6 +4483,25 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(24, new Date().toISOString());
+			});
+		}
+		if (current < 25) {
+			this.withTransaction(() => {
+				// Track each epoch's AGENTS.md baseline. Only the digest is persisted;
+				// prompt content remains in the workspace and is re-read on each turn.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("agents_md_epoch"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_epoch INTEGER NOT NULL DEFAULT -1");
+				if (!columns.has("agents_md_digest"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_digest TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(25, new Date().toISOString());
 			});
 		}
 	}

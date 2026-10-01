@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { unlink } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	CAPABILITIES,
@@ -105,6 +105,32 @@ const RECENT_HISTORY_MAX = 300;
 const KEV_SHADOW_CONTEXT_TURNS = 16;
 const KEV_SHADOW_CONTEXT_WINDOW_MS = 6 * 60 * 60_000;
 const RESTART_EXIT_CODE = 75;
+const AGENTS_MD_MISSING_DIGEST = "missing";
+const UPDATED_AGENTS_MD_HEADING =
+	"## AGENTS.md (updated since this session started; supersedes the project-context copy loaded at session start)";
+
+interface AgentsMdSnapshot {
+	readonly digest: string;
+	readonly text?: string;
+}
+
+async function readWorkspaceAgentsMd(home: string): Promise<AgentsMdSnapshot> {
+	try {
+		const content = await readFile(join(home, "workspace", "AGENTS.md"));
+		return {
+			digest: createHash("sha256").update(content).digest("hex"),
+			text: content.toString("utf8"),
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return { digest: AGENTS_MD_MISSING_DIGEST };
+	}
+}
+
+function updatedAgentsMdSection(snapshot: AgentsMdSnapshot): string {
+	return `${UPDATED_AGENTS_MD_HEADING}\n${snapshot.text ?? "[AGENTS.md was deleted from the workspace after this session started.]"}`;
+}
+
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -1845,6 +1871,16 @@ async function createInboundTurnLifecycle(
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	const bootstrapState = options.database.getSessionBootstrap(key);
+	const bootstrapPending = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+	const agentsMdSnapshot = await readWorkspaceAgentsMd(runtime.config.home);
+	const hasAgentsMdBaseline = bootstrapState?.agentsMdEpoch === input.epoch;
+	const legacyBootstrappedSession = !bootstrapPending && !hasAgentsMdBaseline;
+	const agentsMdChanged = hasAgentsMdBaseline
+		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
+		: legacyBootstrappedSession;
+	if (!hasAgentsMdBaseline || agentsMdChanged)
+		options.database.recordSessionAgentsBaseline(key, input.epoch, agentsMdSnapshot.digest);
+	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
@@ -1872,7 +1908,7 @@ async function createInboundTurnLifecycle(
 		// A fresh session (new epoch) also gets the recent thread it is joining,
 		// not only the unread diff: without it the persona answers as if the
 		// conversation had just started.
-		const isFreshSession = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+		const isFreshSession = bootstrapPending;
 		const recent = isFreshSession
 			? options.database.recentConversation(
 					key,
@@ -1898,18 +1934,18 @@ async function createInboundTurnLifecycle(
 		turnText = `${header}${laneReport ? laneReportTriggerText(userText) : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
 	}
 
-	const bootstrap =
-		!bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch
-			? await buildSessionBootstrap({
-					home: runtime.config.home,
-					origin,
-					epoch: input.epoch,
-					engagement,
-					config: runtime.config,
-				})
-			: undefined;
+	const bootstrap = bootstrapPending
+		? await buildSessionBootstrap({
+				home: runtime.config.home,
+				origin,
+				epoch: input.epoch,
+				engagement,
+				config: runtime.config,
+			})
+		: undefined;
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
+		...(agentsMdSection ? [agentsMdSection] : []),
 		currentConversationNotice(origin),
 		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
