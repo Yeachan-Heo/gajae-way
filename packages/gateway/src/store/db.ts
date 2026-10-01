@@ -2373,6 +2373,11 @@ export class GatewayDatabase {
 		this.metaSet(failedTurnResetCapKey(originKey), "0");
 	}
 
+	failedTurnResetCapped(originKey: string): boolean {
+		const cap = this.metaGet(failedTurnResetCapKey(originKey));
+		return cap !== undefined && cap !== "0";
+	}
+
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
 		const value = Number.parseInt(this.metaGet(freshTurnMetaKey(originKey, epoch, triggerMessageId)) ?? "0", 10);
 		return Number.isSafeInteger(value) && value >= 0 ? value : 0;

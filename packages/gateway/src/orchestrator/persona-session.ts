@@ -534,6 +534,10 @@ class OriginActor {
 	readonly #graceTimers = new Set<unknown>();
 	readonly #appliedModel = new Map<string, string>();
 	readonly #appliedServiceTier = new Map<string, GjcServiceTier>();
+	/** Consecutive submission-phase failures for each session still bound to this origin. */
+	readonly #submissionFailures = new Map<string, number>();
+	/** Prevents repeating the capped-reset warning for the same bound session. */
+	readonly #loggedCappedFailedTurnSessions = new Set<string>();
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
@@ -2195,8 +2199,10 @@ class OriginActor {
 						report.status.terminalAt >= report.status.startedAt &&
 						report.status.terminalAt <= this.#manager.now() &&
 						this.#manager.database.getSessionRecord(this.originKey)?.sessionId === bound.sessionId
-					)
+					) {
 						this.#manager.database.clearFailedTurnResetCap(this.originKey);
+						this.#submissionFailures.delete(bound.sessionId);
+					}
 					return changed;
 				});
 		// Read the terminal slot from the durable trigger row AFTER completion. A
@@ -2571,17 +2577,12 @@ class OriginActor {
 		}
 	}
 
-	/** Exact context/request failures reset only the next binding; quota failures never reset. */
+	/** Exact context/request failures and repeated submission failures reset only the next binding. */
 	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
-		if (
-			!evidence ||
-			!["unsupported_input_status", "context_exhausted", "provider_quota_exhausted"].includes(evidence.reason)
-		)
-			return false;
-		this.#manager.log(
-			`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
-		);
-		if (evidence.reason === "provider_quota_exhausted") return false;
+		if (evidence)
+			this.#manager.log(
+				`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
+			);
 		if (
 			report.status.status !== "failed" ||
 			report.operationRef !== bound.turn.opRef ||
@@ -2602,6 +2603,24 @@ class OriginActor {
 			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
+		if (evidence?.reason === "provider_quota_exhausted") {
+			this.#submissionFailures.delete(bound.sessionId);
+			return false;
+		}
+		const submissionFailure = report.status.outcome?.phase === "submission";
+		let repeatedSubmissionFailure = false;
+		if (submissionFailure) {
+			const count = Math.min(2, (this.#submissionFailures.get(bound.sessionId) ?? 0) + 1);
+			this.#submissionFailures.set(bound.sessionId, count);
+			repeatedSubmissionFailure = count >= 2;
+		} else this.#submissionFailures.delete(bound.sessionId);
+		const resetReason =
+			evidence?.reason === "unsupported_input_status" || evidence?.reason === "context_exhausted"
+				? evidence.reason
+				: repeatedSubmissionFailure
+					? "repeated_submission_failure"
+					: undefined;
+		if (!resetReason) return false;
 		const nextEpoch = this.#manager.database.inboundFailedTurnReset({
 			originKey: this.originKey,
 			epoch: bound.epoch,
@@ -2609,9 +2628,21 @@ class OriginActor {
 			opRef: bound.turn.opRef,
 			triggerMessageId: bound.turn.triggerMessageId,
 		});
-		if (nextEpoch === undefined) return false;
+		if (nextEpoch === undefined) {
+			if (
+				this.#manager.database.failedTurnResetCapped(this.originKey) &&
+				!this.#loggedCappedFailedTurnSessions.has(bound.sessionId)
+			) {
+				this.#loggedCappedFailedTurnSessions.add(bound.sessionId);
+				this.#manager.log(
+					`failed_turn_reset_capped origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${bound.turn.opRef} reason=${resetReason}`,
+				);
+			}
+			return false;
+		}
+		this.#submissionFailures.delete(bound.sessionId);
 		this.#manager.log(
-			`session_reset_after_failed_turn origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
+			`session_reset_after_failed_turn origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} reason=${resetReason}`,
 		);
 		return true;
 	}
