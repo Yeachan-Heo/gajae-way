@@ -344,53 +344,34 @@ test("terminal delivery claims are per-part and first claimant wins", async () =
 	});
 });
 
-test("an explicit refusal block survives reopening and preserves the original trigger identity", async () => {
-	let db = await open();
-	db.inboundEnqueue(message("blocked-trigger", "original"));
-	db.inboundEnqueue(message("unrelated-trigger", "later"));
-	db.inboundBindTurn({
-		messageId: "blocked-trigger",
-		originKey: ORIGIN_KEY,
-		epoch: 0,
-		opRef: "gw-p-blocked",
-		sessionId: "session-blocked",
-		dispatchedAt: new Date().toISOString(),
-	});
-	expect(db.inboundTurnBlock("gw-p-missing", "model_not_selected")).toBe(false);
-	expect(db.inboundTurnBlock("gw-p-blocked", "model_not_selected")).toBe(true);
-	const before = db.inboundTurnRow("gw-p-blocked");
-	db.close();
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	db = database;
-	expect(db.inboundTurnIsBlocked("gw-p-blocked")).toBe(true);
-	expect(db.inboundTurnRow("gw-p-blocked")).toEqual(before);
-	expect(db.inboundEnqueue(message("blocked-trigger", "duplicate"))).toBe(false);
-	expect(db.freshTurnAttempt(ORIGIN_KEY, 0, "blocked-trigger")).toBe(0);
-	// Database-level release is explicit; this is not an operator recovery command.
-	expect(db.inboundTurnRequeue("gw-p-blocked")).toBe(1);
-	expect(db.inboundTurnIsBlocked("gw-p-blocked")).toBe(false);
-	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(2);
-	expect(db.inboundPendingOldest(ORIGIN_KEY)?.message_id).toBe("blocked-trigger");
-	expect(db.inboundEnqueue(message("blocked-trigger", "duplicate after release"))).toBe(false);
-});
-
-test("an explicit refusal cannot block an accepted turn or alter its delivery claim", async () => {
+test("a proven refusal requeues its bound trigger as plain pending input", async () => {
 	const db = await open();
-	db.inboundEnqueue(message("accepted-trigger", "accepted"));
+	db.inboundEnqueue(message("refused-trigger", "original"));
+	db.inboundEnqueue(message("later-trigger", "later"));
 	db.inboundBindTurn({
-		messageId: "accepted-trigger",
+		messageId: "refused-trigger",
 		originKey: ORIGIN_KEY,
 		epoch: 0,
-		opRef: "gw-p-accepted",
-		sessionId: "session-accepted",
+		opRef: "gw-p-refused",
+		sessionId: "session-refused",
 		dispatchedAt: new Date().toISOString(),
 	});
-	expect(db.inboundTurnAccept("gw-p-accepted")).toBe(true);
-	expect(db.inboundTurnClaimTerminal("gw-p-accepted", 0, "gw-t-accepted")).toBe("gw-t-accepted");
-	const before = db.inboundTurnRow("gw-p-accepted");
-	expect(db.inboundTurnBlock("gw-p-accepted", "model_not_selected")).toBe(false);
-	expect(db.inboundTurnIsBlocked("gw-p-accepted")).toBe(false);
-	expect(db.inboundTurnRow("gw-p-accepted")).toEqual(before);
+
+	expect(db.inboundTurnRequeue("gw-p-refused")).toBe(1);
+	expect(db.inboundTurnRow("gw-p-refused")).toBeUndefined();
+	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(2);
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "refused-trigger",
+		state: "pending",
+		turn_role: null,
+		turn_epoch: null,
+		turn_state: null,
+		turn_op_ref: null,
+		bound_session_id: null,
+		dispatched_at: null,
+		terminal_delivery_id: null,
+	});
+	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([]);
 });
 
 test("an accepted turn with a delivered steer requeues its trigger for fresh attempts", async () => {

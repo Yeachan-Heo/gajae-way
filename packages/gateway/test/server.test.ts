@@ -8,6 +8,7 @@ import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/su
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
+import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -789,6 +790,106 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	expect(notice.payload.deliveryId).toBe(deterministicTerminalDeliveryId("discord/dm/c1/peer=p1", "failed-message", 0));
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "dm")).toBeUndefined();
 	client.close();
+});
+
+test("model refusals notify once without consuming the pending message's eventual answer", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-model-refusal-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = new ScriptedSessionPort({
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
+		onSend: (input, scripted) => scripted.complete(input.opRef, "the original message is answered"),
+	});
+	const send = port.send.bind(port);
+	let attempts = 0;
+	port.send = async (input) => {
+		attempts++;
+		if (attempts <= 2) throw new ModelNotSelectedError(input.opRef);
+		return send(input);
+	};
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	const origin = { platform: "discord", kind: "dm", conversationId: "model-refusal", peerId: "p1" };
+	const key = "discord/dm/model-refusal/peer=p1";
+	const engagement = { mentioned: false, group: false, authorId: "p1" };
+	const until = async (condition: () => boolean) => {
+		for (let attempt = 0; attempt < 600 && !condition(); attempt++) await Bun.sleep(5);
+		expect(condition()).toBe(true);
+	};
+	const notices = () =>
+		client.frames.filter(
+			(frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed] model_not_selected:"),
+		);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "original",
+			verb: "chat.send",
+			params: { origin, engagement, messageId: "refused-original", text: "please answer this" },
+		});
+		await until(() => notices().length === 1 && database.inboundPendingOldest(key) !== undefined);
+		const pending = database.inboundPendingOldest(key);
+		expect(pending).toMatchObject({
+			message_id: "refused-original",
+			state: "pending",
+			turn_state: null,
+			turn_op_ref: null,
+			bound_session_id: null,
+			dispatched_at: null,
+			terminal_delivery_id: null,
+		});
+		expect(notices()[0].payload.text).toEndWith("Send /model <id> or /new");
+		expect(notices()[0].payload.deliveryId).not.toBe(deterministicTerminalDeliveryId(key, "refused-original", 0));
+		const sessionId = database.getSessionRecord(key)?.sessionId;
+		if (!sessionId) throw new Error("refused message lost its session binding");
+
+		// Successful control alone does not prove the next prompt will be admitted.
+		// A second explicit refusal must not create another logical notice.
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "model-again",
+			verb: "chat.send",
+			params: { origin, engagement, text: "/model next" },
+		});
+		await until(() => attempts === 2 && database.inboundPendingOldest(key) !== undefined);
+		expect(notices()).toHaveLength(1);
+		expect(database.inboundPendingOldest(key)?.terminal_delivery_id).toBeNull();
+
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "model-working",
+			verb: "chat.send",
+			params: { origin, engagement, text: "/model working" },
+		});
+		await until(() =>
+			client.frames.some(
+				(frame) => frame.event === "chat.message" && frame.payload.text === "the original message is answered",
+			),
+		);
+		await until(() => database.inboundTurnRow(port.sends[0]!.opRef)?.state === "done");
+		expect(attempts).toBe(3);
+		expect(port.sends).toHaveLength(1);
+		expect(port.sends[0]?.sessionId).toBe(sessionId);
+		expect(port.binds).toHaveLength(1);
+		expect(notices()).toHaveLength(1);
+		expect(database.inboundTurnRow(port.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+	} finally {
+		client.close();
+	}
 });
 
 test("long turns broadcast throttled chat.progress liveness events", async () => {
