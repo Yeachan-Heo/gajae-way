@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
+import { type PersonaFailureInput, PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
@@ -92,6 +92,7 @@ async function harness(
 		released?: (opRef: string) => void;
 		failure?: (message: string) => void;
 		failureError?: (error: Error) => void;
+		modelRefusal?: (input: PersonaFailureInput) => void;
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
@@ -117,6 +118,7 @@ async function harness(
 					hooks.failure?.(error.message);
 					hooks.failureError?.(error);
 				},
+				...(hooks.modelRefusal ? { onModelRefusal: hooks.modelRefusal } : {}),
 				onRetired: () => hooks.retired?.(),
 				onReleased: ({ turn: released }) => hooks.released?.(released.opRef),
 			};
@@ -1717,52 +1719,202 @@ class GhostSendPort extends ScriptedSessionPort {
 
 class ModelNotSelectedPort extends ScriptedSessionPort {
 	repaired = false;
+	modelFailure: Error | undefined;
+
+	constructor(options: ConstructorParameters<typeof ScriptedSessionPort>[0] = {}) {
+		super({
+			...options,
+			onBind: options.onBind ?? ((input) => `session-e${input.epoch}`),
+		});
+	}
 
 	override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
-		if (this.repaired) return await super.send(input);
-		this.sendAttempts.push(input);
-		throw new ModelNotSelectedError(input.opRef);
+		if (!this.repaired) {
+			this.sendAttempts.push(input);
+			throw new ModelNotSelectedError(input.opRef);
+		}
+		return await super.send(input);
+	}
+
+	override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+		if (this.modelFailure) throw this.modelFailure;
+		const receipt = await super.setModel(input);
+		this.repaired = true;
+		return receipt;
 	}
 }
 
-class AmbiguousModelNotSelectedPort extends ScriptedSessionPort {
+class UnprovenModelNotSelectedPort extends ScriptedSessionPort {
+	readonly error: Error;
+
+	constructor(error: Error) {
+		super({ onBind: (input) => `session-e${input.epoch}` });
+		this.error = error;
+	}
+
 	override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): Promise<never> {
 		this.sendAttempts.push(input);
-		throw new GjcCliError("relay disconnected before the prompt reply", 0, "", { code: "model_not_selected" });
+		throw this.error;
 	}
 }
 
-test("model_not_selected refusal blocks the bound trigger durably without retry or epoch churn", async () => {
-	const port = new ModelNotSelectedPort({ onBind: (input) => `session-e${input.epoch}` });
-	let tailAttaches = 0;
-	const attachTail = port.attachTail.bind(port);
-	port.attachTail = async (input) => {
-		tailAttaches++;
-		return await attachTail(input);
-	};
-	const terminal: string[] = [];
+test("authenticated model_not_selected refusal requeues plain pending, notices once, and pauses hot-loop dispatch", async () => {
+	const port = new ModelNotSelectedPort();
+	const notices: PersonaFailureInput[] = [];
+	const noticeStates: Array<string | null | undefined> = [];
 	const logs: string[] = [];
-	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
-	enqueue("model-not-selected", "keep this trigger blocked");
+	await harness(
+		port,
+		{
+			modelRefusal: (input) => {
+				notices.push(input);
+				noticeStates.push(database!.inboundTurnRow(input.turn.opRef)?.turn_state);
+			},
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("model-not-selected", "keep this trigger pending");
 	await manager!.notifyInbound(KEY);
-	const opRef = latestOpRef;
-	const original = database!.inboundTurnRow(opRef)!;
-	expect(original).toMatchObject({ state: "pending", turn_state: "bound", bound_session_id: "session-e0" });
-	expect(database!.inboundTurnIsBlocked(opRef)).toBe(true);
+	const refusedOpRef = latestOpRef;
+	expect(database!.inboundTurnRow(refusedOpRef)).toBeUndefined();
+	expect(database!.inboundPendingOldest(KEY)).toMatchObject({
+		message_id: "model-not-selected",
+		state: "pending",
+		turn_role: null,
+		turn_state: null,
+		turn_op_ref: null,
+		bound_session_id: null,
+		dispatched_at: null,
+		terminal_delivery_id: null,
+	});
+	expect(database!.freshTurnAttempt(KEY, 0, "model-not-selected")).toBe(1);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
-	expect(tailAttaches).toBe(1);
+	expect(manager!.state(KEY)).toBe("idle");
+	expect(database!.inboundNonterminalTurns(KEY)).toEqual([]);
+	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(notices).toHaveLength(1);
+	expect(noticeStates).toEqual(["bound"]);
+	expect(notices[0]?.error).toMatchObject({
+		code: "model_not_selected",
+		runtimeMessage: "request was not admitted because no model is selected",
+	});
+	expect(`${formatFailureNotice(notices[0]!.error)} Send /model <id> or /new`).toBe(
+		"[turn failed] model_not_selected: request was not admitted because no model is selected Send /model <id> or /new",
+	);
 
-	enqueue("later-message", "wait behind the refused turn");
+	enqueue("later-message", "wait behind the paused refusal");
 	await manager!.notifyInbound(KEY);
-	for (let sweep = 0; sweep < 3; sweep++) await manager!.tick(KEY);
+	for (let sweep = 0; sweep < 3; sweep++) {
+		await manager!.tick(KEY);
+		await manager!.recover();
+	}
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.steers).toHaveLength(0);
-	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
-	expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("later-message");
+	expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("model-not-selected");
+	expect(database!.inboundPendingCount(KEY)).toBe(2);
+	expect(notices).toHaveLength(1);
+	expect(
+		logs.some((line) => line.includes(`opRef=${refusedOpRef}`) && line.includes("reason=model_not_selected")),
+	).toBe(true);
+});
 
+test("failed refusal-notice persistence propagates while the pause prevents retries", async () => {
+	const port = new ModelNotSelectedPort();
+	let noticeAttempts = 0;
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			modelRefusal: () => {
+				noticeAttempts++;
+				throw new Error("notice persistence failed");
+			},
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("notice-persist-failure", "do not lose the refusal notice");
+	await expect(manager!.notifyInbound(KEY)).rejects.toThrow("notice persistence failed");
+	const refusedOpRef = latestOpRef;
+	port.repaired = true;
+	for (let sweep = 0; sweep < 3; sweep++) {
+		await manager!.notifyInbound(KEY);
+		await manager!.tick(KEY);
+	}
+	expect(database!.inboundTurnRow(refusedOpRef)).toBeUndefined();
+	expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("notice-persist-failure");
+	expect(manager!.state(KEY)).toBe("idle");
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(port.sends).toHaveLength(0);
+	expect(noticeAttempts).toBe(1);
+	expect(logs.some((line) => line.includes("notice persistence failed"))).toBe(true);
+});
+
+test("successful /model resumes the refused trigger on its existing session", async () => {
+	const port = new ModelNotSelectedPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "fresh reply"),
+	});
+	const terminal: string[] = [];
+	const notices: PersonaFailureInput[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text), modelRefusal: (input) => notices.push(input) });
+	enqueue("refused-before-model", "replay after model selection");
+	await manager!.notifyInbound(KEY);
+	const refusedOpRef = latestOpRef;
+	await manager!.rebindModel(KEY, "provider/model");
+	await eventually(() => terminal.length === 1, "successful model selection did not resume the pending trigger");
+	expect(port.models).toContainEqual({
+		sessionId: "session-e0",
+		repo: join(home, "workspace"),
+		selection: "provider/model",
+	});
+	expect(port.sendAttempts).toHaveLength(2);
+	expect(port.sends).toHaveLength(1);
+	expect(port.sends[0]).toMatchObject({ sessionId: "session-e0", text: "replay after model selection" });
+	expect(port.sends[0]?.opRef).not.toBe(refusedOpRef);
+	expect(terminal).toEqual(["fresh reply"]);
+	expect(database!.inboundTurnRow(port.sends[0]!.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(notices).toHaveLength(1);
+	expect(port.steers).toHaveLength(0);
+});
+
+test("failed /model keeps the pending refusal paused", async () => {
+	const port = new ModelNotSelectedPort();
+	port.modelFailure = new Error("selection unavailable");
+	const notices: PersonaFailureInput[] = [];
+	await harness(port, { modelRefusal: (input) => notices.push(input) });
+	enqueue("failed-model-selection", "must stay pending");
+	await manager!.notifyInbound(KEY);
+	const refusedOpRef = latestOpRef;
+	await expect(manager!.rebindModel(KEY, "provider/model")).rejects.toThrow("selection unavailable");
+	port.modelFailure = undefined;
+	port.repaired = true;
+	enqueue("after-failed-model", "also waits");
+	await manager!.notifyInbound(KEY);
+	for (let sweep = 0; sweep < 3; sweep++) await manager!.tick(KEY);
+	expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("failed-model-selection");
+	expect(database!.inboundTurnRow(refusedOpRef)).toBeUndefined();
+	expect(port.models).toEqual([]);
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(port.sends).toHaveLength(0);
+	expect(port.steers).toHaveLength(0);
+	expect(notices).toHaveLength(1);
+});
+
+test("process restart clears the in-memory refusal pause and retries the pending message", async () => {
+	const port = new ModelNotSelectedPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "only reply"),
+	});
+	const terminal: string[] = [];
+	const notices: PersonaFailureInput[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text), modelRefusal: (input) => notices.push(input) });
+	enqueue("restart-model-refusal", "retry after restart");
+	await manager!.notifyInbound(KEY);
+	const rejectedOpRef = latestOpRef;
+	expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("restart-model-refusal");
 	await manager!.stop();
 	manager = undefined;
+	port.repaired = true;
 	database!.close();
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	registerFixtureBindings(port);
@@ -1771,141 +1923,81 @@ test("model_not_selected refusal blocks the bound trigger durably without retry 
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
-		log: (line) => logs.push(line),
-		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+		}),
 	});
-	await manager.recover();
-	await manager.tick(KEY);
-	expect(manager.state(KEY)).toBe("turn-running");
-	expect(database.inboundTurnIsBlocked(opRef)).toBe(true);
-	expect(database.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound", bound_session_id: "session-e0" });
-	expect(database.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
-	expect(port.binds).toHaveLength(1);
-	expect(port.sendAttempts).toHaveLength(1);
-	expect(port.sends).toHaveLength(0);
-	expect(port.steers).toHaveLength(0);
-	expect(port.workerOutputReads).toHaveLength(0);
-	// Recovery adopts the explicit hold without reopening a recovery tail.
-	expect(tailAttaches).toBe(1);
-	expect(terminal).toEqual([]);
-	expect(logs.some((line) => line.includes(`opRef=${opRef}`) && line.includes("reason=model_not_selected"))).toBe(true);
-});
-
-test("model selection does not release a refusal, while /new permits repaired new-epoch input without replay", async () => {
-	const port = new ModelNotSelectedPort({
-		onBind: (input) => `session-e${input.epoch}`,
-		onSend: (input, scripted) => scripted.complete(input.opRef, "fresh reply"),
-	});
-	let tailAttaches = 0;
-	const attachTail = port.attachTail.bind(port);
-	port.attachTail = async (input) => {
-		tailAttaches++;
-		return await attachTail(input);
-	};
-	const terminal: string[] = [];
-	await harness(port, { terminal: (text) => terminal.push(text) });
-	enqueue("refused-before-model", "do not replay this input");
-	await manager!.notifyInbound(KEY);
-	const refusedOpRef = latestOpRef;
-	const original = database!.inboundTurnRow(refusedOpRef);
-	await manager!.rebindModel(KEY, "provider/model");
-	port.repaired = true;
-	for (let sweep = 0; sweep < 3; sweep++) await manager!.tick(KEY);
-	expect(port.models).toContainEqual({
-		sessionId: "session-e0",
-		repo: join(home, "workspace"),
-		selection: "provider/model",
-	});
-	expect(database!.inboundTurnIsBlocked(refusedOpRef)).toBe(true);
-	expect(database!.inboundTurnRow(refusedOpRef)).toEqual(original);
-	expect(port.sendAttempts).toHaveLength(1);
-	expect(port.sends).toHaveLength(0);
-	expect(tailAttaches).toBe(1);
-
-	await manager!.reset(KEY, JSON.stringify(ORIGIN));
-	await manager!.tick(KEY);
-	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database!.inboundTurnIsBlocked(refusedOpRef)).toBe(true);
-	expect(database!.inboundTurnRow(refusedOpRef)).toEqual(original);
-	expect(tailAttaches).toBe(1);
-	enqueue("after-new", "fresh input after explicit reset");
-	await manager!.notifyInbound(KEY);
-	await eventually(() => terminal.length === 1, "new-epoch input did not complete");
-	expect(port.sendAttempts).toHaveLength(2);
-	expect(port.sends).toHaveLength(1);
-	expect(port.sends[0]).toMatchObject({ sessionId: "session-e1", text: "fresh input after explicit reset" });
-	expect(port.sends[0]?.opRef).not.toBe(refusedOpRef);
-	expect(terminal).toEqual(["fresh reply"]);
-	expect(database!.inboundTurnIsBlocked(refusedOpRef)).toBe(true);
-	expect(database!.inboundTurnRow(refusedOpRef)).toEqual(original);
-	expect(tailAttaches).toBe(2);
-	expect(port.steers).toHaveLength(0);
-});
-
-test("explicitly releasing a proven refusal after repair executes and delivers once across restart", async () => {
-	const port = new ModelNotSelectedPort({
-		onSend: (input, scripted) => scripted.complete(input.opRef, "only reply"),
-	});
-	const terminal: string[] = [];
-	await harness(port, { terminal: (text) => terminal.push(text) });
-	enqueue("repair-original", "original prompt");
-	await manager!.notifyInbound(KEY);
-	const rejectedOpRef = latestOpRef;
-	expect(database!.inboundTurnIsBlocked(rejectedOpRef)).toBe(true);
-	await manager!.stop();
-	manager = undefined;
-	// Offline simulation of a fenced, separately authorized release after repair.
-	expect(database!.inboundTurnRequeue(rejectedOpRef)).toBe(1);
-	expect(database!.inboundTurnIsBlocked(rejectedOpRef)).toBe(false);
-	port.repaired = true;
-	database!.close();
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	registerFixtureBindings(port);
-	const reopenManager = () =>
-		new PersonaSessionManager({
-			database: database!,
-			port,
-			instanceId: "instance-test",
-			repo: join(home, "workspace"),
-			onTurnStart: ({ trigger }) => ({
-				text: trigger.body,
-				onTerminal: ({ text }) => {
-					terminal.push(text);
-				},
-			}),
-		});
-	manager = reopenManager();
 	await manager.recover();
 	await eventually(() => terminal.length === 1, "released trigger did not deliver");
 	expect(port.sendAttempts).toHaveLength(2);
 	expect(port.sends).toHaveLength(1);
 	expect(port.sends[0]!.opRef).not.toBe(rejectedOpRef);
-	expect(port.sends[0]!.text).toBe("original prompt");
-	expect(terminal).toEqual(["only reply"]);
-	await manager.stop();
-	manager = reopenManager();
-	await manager.recover();
-	await manager.tick(KEY);
-	expect(port.sends).toHaveLength(1);
+	expect(port.sends[0]).toMatchObject({ sessionId: "session-e0", text: "retry after restart" });
 	expect(terminal).toEqual(["only reply"]);
 	expect(database.inboundPendingCount(KEY)).toBe(0);
+	expect(database.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(notices).toHaveLength(1);
 });
 
-test("a transport error carrying model_not_selected remains ambiguous, not a durable refusal", async () => {
-	const port = new AmbiguousModelNotSelectedPort({ onBind: (input) => `session-e${input.epoch}` });
-	const logs: string[] = [];
-	await harness(port, {}, (line) => logs.push(line));
-	enqueue("model-transport", "do not classify a torn transport as rejection");
+test("/new discards the paused trigger and admits fresh input in the next epoch", async () => {
+	const port = new ModelNotSelectedPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "new session reply"),
+	});
+	const terminal: string[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) });
+	enqueue("discard-refused", "discard this refused prompt");
 	await manager!.notifyInbound(KEY);
-	const opRef = latestOpRef;
-	expect(database!.inboundTurnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
-	expect(database!.inboundTurnIsBlocked(opRef)).toBe(false);
-	expect(port.sendAttempts).toHaveLength(1);
-	expect(port.binds).toHaveLength(1);
-	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
-	expect(logs.some((line) => line.includes(`persona_send_ambiguous origin=${KEY} opRef=${opRef}`))).toBe(true);
-	expect(logs.some((line) => line.includes(`persona_send_blocked origin=${KEY} opRef=${opRef}`))).toBe(false);
+	const refusedOpRef = latestOpRef;
+	await manager!.reset(KEY, JSON.stringify(ORIGIN), new Date(Date.now() + 1_000).toISOString());
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.inboundTurnRow(refusedOpRef)).toBeUndefined();
+	expect(database!.inboundPendingOldest(KEY)).toBeUndefined();
+	port.repaired = true;
+	enqueue("fresh-after-new", "fresh traffic after /new");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => terminal.length === 1, "fresh post-/new traffic did not dispatch");
+	expect(port.sendAttempts).toHaveLength(2);
+	expect(port.sends).toHaveLength(1);
+	expect(port.sends[0]).toMatchObject({ sessionId: "session-e1", text: "fresh traffic after /new" });
+	expect(port.sends[0]?.opRef).not.toBe(refusedOpRef);
+	expect(terminal).toEqual(["new session reply"]);
+	expect(database!.inboundPendingCount(KEY)).toBe(0);
 });
+
+for (const fixture of [
+	{
+		name: "transport failure with the exact code",
+		error: new GjcCliError("relay disconnected before the prompt reply", 0, "", { code: "model_not_selected" }),
+	},
+	{ name: "diagnostic text only", error: new GjcCliError("failed", 0, "", { message: "model_not_selected" }) },
+	{
+		name: "nested code",
+		error: new GjcCliError("failed", 0, "", { detail: { code: "model_not_selected" } }),
+	},
+	{ name: "malformed code", error: new GjcCliError("failed", 0, "", { code: 42 }) },
+	{ name: "plain error text", error: new Error("model_not_selected") },
+	{ name: "refusal for a different op-ref", error: new ModelNotSelectedError("different-op-ref") },
+] as const)
+	test(`${fixture.name} is not retried as an authenticated model refusal`, async () => {
+		const port = new UnprovenModelNotSelectedPort(fixture.error);
+		const notices: PersonaFailureInput[] = [];
+		const logs: string[] = [];
+		await harness(port, { modelRefusal: (input) => notices.push(input) }, (line) => logs.push(line));
+		enqueue("unproven-model-refusal", "never duplicate uncertain input");
+		await manager!.notifyInbound(KEY);
+		const opRef = latestOpRef;
+		await manager!.tick(KEY);
+		await manager!.recover();
+		expect(database!.inboundTurnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+		expect(manager!.state(KEY)).toBe("turn-running");
+		expect(port.sendAttempts).toHaveLength(1);
+		expect(port.sends).toHaveLength(0);
+		expect(notices).toHaveLength(0);
+		expect(logs.some((line) => line.includes(`persona_send_ambiguous origin=${KEY} opRef=${opRef}`))).toBe(true);
+	});
 
 test("a refused running steer waits without rotating or retrying, then sends on the same session", async () => {
 	const port = new ScriptedSessionPort({

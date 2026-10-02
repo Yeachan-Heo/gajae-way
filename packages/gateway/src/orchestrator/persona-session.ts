@@ -109,6 +109,8 @@ export interface PersonaTurnLifecycle {
 	onFrame?(input: PersonaTailFrameInput): boolean | void | Promise<boolean | void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
+	/** Persists one safe notice for an authenticated prompt refusal before its trigger is requeued. */
+	onModelRefusal?(input: PersonaFailureInput): void | Promise<void>;
 	onSettled?(input: PersonaTurnSettledInput): void | Promise<void>;
 	onRetired?(input: PersonaTurnIdentity): void | Promise<void>;
 	/**
@@ -548,6 +550,8 @@ class OriginActor {
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
+	/** A proven refusal waits for an explicit model change or /new; process restart clears it. */
+	#modelRefusalPaused = false;
 
 	constructor(manager: PersonaSessionManager, originKey: string) {
 		this.#manager = manager;
@@ -616,6 +620,7 @@ class OriginActor {
 			discarded = this.#manager.database.inboundDiscardBefore(this.originKey, floorAt);
 			this.#manager.database.clearFailedTurnResetCap(this.originKey);
 		});
+		this.#modelRefusalPaused = false;
 		await this.#manager.discardInbound(discarded);
 		if (previous) {
 			previous.retired = true;
@@ -660,6 +665,10 @@ class OriginActor {
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
 		);
+		if (this.#modelRefusalPaused) {
+			this.#modelRefusalPaused = false;
+			await this.#dispatchNext();
+		}
 	}
 
 	async reconcile(): Promise<void> {
@@ -680,11 +689,7 @@ class OriginActor {
 				// like the other disowned paths instead of crashing the actor. Every
 				// main cutover from a schema-16 home hit this (three boxes, 2026-09-05)
 				// and each needed the row hand-edited before the origin worked again.
-				if (
-					turn.state === "bound" &&
-					!this.#manager.database.inboundTurnIsBlocked(turn.opRef) &&
-					sdkStatusErrorCode(error) === "session_unavailable"
-				) {
+				if (turn.state === "bound" && sdkStatusErrorCode(error) === "session_unavailable") {
 					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 					const retired = turn.epoch < this.#epoch();
 					const nextEpoch = retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
@@ -727,14 +732,6 @@ class OriginActor {
 			);
 			return;
 		}
-		if (this.#manager.database.inboundTurnIsBlocked(turn.opRef)) {
-			await this.#adoptRecoveredTurn(turn, sessionId, retired, false, true);
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=model_not_selected`,
-			);
-			return;
-		}
-
 		// The table's authority decision is deliberately inspect -> status -> inspect.
 		// A broker replacement between either inspect is an authority shift, never a
 		// reason to resend an accepted operation.
@@ -909,7 +906,6 @@ class OriginActor {
 		sessionId: string,
 		retired: boolean,
 		knownTerminal: boolean,
-		blocked = false,
 	): Promise<BoundTurn> {
 		const trigger = this.#manager.database.inboundTurnRow(turn.opRef);
 		if (!trigger) throw new Error(`turn ${turn.opRef} disappeared during recovery`);
@@ -928,7 +924,7 @@ class OriginActor {
 			// holds, so the host will not stream its content here. The relay is
 			// opened for commands (status, steer) and for the stall alarm only;
 			// terminal settlement reads status and the original result.
-			if (!knownTerminal && !blocked) tail = await this.#attachTail(sessionId, turn.epoch, retired);
+			if (!knownTerminal) tail = await this.#attachTail(sessionId, turn.epoch, retired);
 		} catch (error) {
 			if (!retired || !(error instanceof TailCapacityError)) throw error;
 			detached = true;
@@ -1085,7 +1081,7 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#state !== "idle" || this.#current || this.#dispatchRetry || this.#modelRefusalPaused) return;
 		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
@@ -1254,14 +1250,31 @@ class OriginActor {
 			this.#clearBindWedgeProbe();
 		} catch (error) {
 			if (error instanceof ModelNotSelectedError && error.opRef === opRef) {
-				if (!this.#manager.database.inboundTurnBlock(opRef, "model_not_selected"))
-					throw new Error(`model_not_selected refusal did not match bound turn ${opRef}`);
-				await tail.close();
-				delete current.tail;
-				current.tailEvidenceUnavailable = true;
-				this.#manager.log(
-					`persona_send_blocked origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} opRef=${opRef} reason=model_not_selected`,
+				const refusal = new GjcRuntimeError(
+					"model_not_selected: request was not admitted because no model is selected",
+					{
+						code: "model_not_selected",
+						message: "request was not admitted because no model is selected",
+					},
 				);
+				this.#modelRefusalPaused = true;
+				let noticeFailure: unknown;
+				let noticeFailed = false;
+				try {
+					await current.lifecycle.onModelRefusal?.({ ...current, error: refusal });
+				} catch (callbackError) {
+					noticeFailure = callbackError;
+					noticeFailed = true;
+				}
+				await tail.close();
+				const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+				this.#current = undefined;
+				this.#state = "idle";
+				await this.#notifyReleased(current);
+				this.#manager.log(
+					`persona_send_refused origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} opRef=${opRef} message=${trigger.message_id} attempt=${attempt} reason=model_not_selected`,
+				);
+				if (noticeFailed) throw noticeFailure;
 				return;
 			}
 			// Only the established session_unavailable status proves this send did
@@ -1557,8 +1570,14 @@ class OriginActor {
 	 */
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
-		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
-		if (this.#manager.database.inboundTurnIsBlocked(current.turn.opRef)) return;
+		if (
+			this.#modelRefusalPaused ||
+			!current ||
+			current.retired ||
+			current.replyVisible ||
+			this.#state !== "turn-running"
+		)
+			return;
 		if (this.#deferredSteerOpRef === current.turn.opRef) return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
@@ -2043,12 +2062,6 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
-		if (this.#manager.database.inboundTurnIsBlocked(bound.turn.opRef)) {
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=model_not_selected`,
-			);
-			return;
-		}
 		let report: StatusReport;
 		try {
 			report = await this.#statusOf(bound);
