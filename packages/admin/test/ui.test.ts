@@ -34,6 +34,123 @@ async function html(monitors?: (typeof MONITOR)[]): Promise<string> {
 	return renderIndex(await state(monitors), DEFAULT_ALLOWLIST);
 }
 
+type UiEvent = { readonly data?: string };
+type UiListener = (event: UiEvent) => void;
+
+class UiNode {
+	textContent = "";
+	value = "";
+	hidden = false;
+	readonly dataset: Record<string, string> = {};
+	readonly attributes = new Map<string, string>();
+	readonly children = new Map<string, UiNode>();
+	readonly listeners = new Map<string, UiListener>();
+	firstElementChild: UiNode | null = null;
+	content = { firstElementChild: null as UiNode | null };
+
+	constructor(state = "") {
+		if (state) this.attributes.set("data-state", state);
+	}
+
+	addEventListener(name: string, listener: UiListener): void {
+		this.listeners.set(name, listener);
+	}
+
+	getAttribute(name: string): string | null {
+		return this.attributes.get(name) ?? null;
+	}
+
+	hasAttribute(name: string): boolean {
+		return this.attributes.has(name);
+	}
+
+	setAttribute(name: string, value: string): void {
+		this.attributes.set(name, value);
+	}
+
+	removeAttribute(name: string): void {
+		this.attributes.delete(name);
+	}
+
+	querySelector(selector: string): UiNode | null {
+		return this.children.get(selector) ?? null;
+	}
+
+	querySelectorAll(_selector: string): UiNode[] {
+		return [];
+	}
+
+	replaceChildren(): void {
+		this.firstElementChild = null;
+	}
+
+	appendChild(child: UiNode): void {
+		if (!this.firstElementChild) this.firstElementChild = child;
+	}
+}
+
+function runInlineHealthScript(markup: string, snapshot: ConsoleSnapshot) {
+	const scriptStart = markup.indexOf("<script>");
+	if (scriptStart < 0) throw new Error("inline console script is missing");
+	const bodyStart = scriptStart + "<script>".length;
+	const bodyEnd = markup.indexOf("</script>", bodyStart);
+	if (bodyEnd < 0) throw new Error("inline console script is unterminated");
+	const streamState = new UiNode();
+	const statusBar = new UiNode();
+	const livePanel = new UiNode("ready");
+	const sections = new Map<string, UiNode>();
+	for (const name of ["attention", "live", "sessions", "monitors", "audit"]) {
+		const section = new UiNode("ready");
+		section.children.set("[data-note]", new UiNode());
+		section.children.set("[data-count]", new UiNode());
+		// This harness exercises stream health, not keyed row reconciliation.
+		// Omit row containers so the real reconciliation guard skips that surface.
+		sections.set(name, section);
+	}
+	const nodes = new Map<string, UiNode>([
+		["bootstrap", Object.assign(new UiNode(), { textContent: JSON.stringify(snapshot) })],
+		["ops-meta", Object.assign(new UiNode(), { textContent: JSON.stringify({ operations: [] }) })],
+		["stream-state", streamState],
+		["statusbar", statusBar],
+		["raw-json", new UiNode()],
+		["ops", new UiNode()],
+		["ops-op", new UiNode()],
+		["ops-fields", new UiNode()],
+		["ops-summary", new UiNode()],
+		...["ops-next", "ops-cancel", "ops-again", "ops-run", "ops-actor"].map((id) => [id, new UiNode()] as const),
+	]);
+	const document = {
+		getElementById: (id: string) => nodes.get(id) ?? null,
+		querySelector: (selector: string) => {
+			const match = selector.match(/^\[data-panel="([^"]+)"\]$/);
+			return match ? (sections.get(match[1]!) ?? null) : null;
+		},
+		querySelectorAll: (selector: string) => (selector === '.panel[data-live="1"]' ? [livePanel] : []),
+	};
+	const eventListeners = new Map<string, UiListener>();
+	const source = {
+		addEventListener: (name: string, listener: UiListener) => eventListeners.set(name, listener),
+	};
+	const EventSource = function (_url: string) {
+		return source;
+	};
+	const fetch = () => new Promise<{ json: () => Promise<unknown> }>(() => {});
+	const setInterval = (_callback: () => void, _delay: number): number => 0;
+	new Function("document", "EventSource", "fetch", "setInterval", markup.slice(bodyStart, bodyEnd))(
+		document,
+		EventSource,
+		fetch,
+		setInterval,
+	);
+	return {
+		streamState,
+		livePanel,
+		emit(name: string, data?: unknown) {
+			eventListeners.get(name)?.({ data: JSON.stringify(data) });
+		},
+	};
+}
+
 /** Everything between `<main>` and `</main>`: the primary surfaces. */
 function main(document: string): string {
 	return document.slice(document.indexOf("<main>"), document.indexOf("</main>"));
@@ -84,6 +201,54 @@ describe("document shape", () => {
 		const document = await html();
 		expect(document).toContain("@media (min-width: 56rem)");
 		expect(document).toContain("repeat(auto-fit, minmax(24rem, 1fr))");
+	});
+});
+
+describe("stream health", () => {
+	test("inline handlers distinguish gateway loss and wait for a recovery snapshot", async () => {
+		const snapshot = await state();
+		const page = runInlineHealthScript(await html(), snapshot);
+		const outagePage = runInlineHealthScript(await html(), {
+			...snapshot,
+			gateway: { reachable: false, error: "gateway disconnected" },
+		});
+		expect(outagePage.streamState.textContent).toContain("gateway disconnected");
+
+		page.emit("open");
+		expect(page.streamState.textContent).toMatch(/^stream .+ data /);
+		page.emit("error");
+		expect(page.streamState.textContent).toContain("console stream lost");
+		expect(page.streamState.textContent).not.toContain("gateway disconnected");
+
+		page.emit("open");
+		page.emit("gateway.stopping");
+		expect(page.streamState.textContent).toContain("gateway is stopping");
+		page.emit("gateway.connection", { connected: false });
+		expect(page.streamState.textContent).toContain("gateway disconnected");
+		expect(page.livePanel.getAttribute("data-stale")).toBe("1");
+
+		// A successful response already in flight when the local socket dropped is stale.
+		page.emit("snapshot", snapshot);
+		expect(page.streamState.textContent).toContain("gateway disconnected");
+
+		// Recovery while the browser is offline arrives only in its next full snapshot.
+		page.emit("error");
+		page.emit("open");
+		expect(page.streamState.textContent).toContain("waiting for a fresh snapshot");
+		page.emit("snapshot", snapshot);
+		expect(page.streamState.textContent).toMatch(/^stream .+ data /);
+
+		page.emit("gateway.connection", { connected: false });
+		expect(page.streamState.textContent).toContain("gateway disconnected");
+
+		page.emit("gateway.connection", { connected: true });
+		expect(page.streamState.textContent).toContain("waiting for a fresh snapshot");
+		expect(page.streamState.textContent).not.toContain("gateway is stopping");
+		expect(page.streamState.textContent).not.toMatch(/^stream .+ data /);
+
+		page.emit("snapshot", snapshot);
+		expect(page.streamState.textContent).toMatch(/^stream .+ data /);
+		expect(page.livePanel.getAttribute("data-stale")).toBeNull();
 	});
 });
 

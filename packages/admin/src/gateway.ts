@@ -2,11 +2,18 @@ import { GajaewayClient } from "@gajae-gateway/sdk";
 
 type GatewayEventHandler = (payload: unknown) => void;
 
-const DEFAULT_RETRY_DELAY_MS = 1_000;
+const INITIAL_RETRY_DELAY_MS = 500;
+const MAX_RETRY_DELAY_MS = 30_000;
+
+export type AdminGatewayRetryOptions = {
+	readonly random?: () => number;
+	readonly setTimeout?: typeof setTimeout;
+	readonly clearTimeout?: typeof clearTimeout;
+};
 
 export class AdminGateway {
-	static async connect(socketPath: string, retryDelayMs = DEFAULT_RETRY_DELAY_MS): Promise<AdminGateway> {
-		const gateway = new AdminGateway(socketPath, retryDelayMs);
+	static async connect(socketPath: string, retryOptions: AdminGatewayRetryOptions = {}): Promise<AdminGateway> {
+		const gateway = new AdminGateway(socketPath, retryOptions);
 		const client = await GajaewayClient.connectSocket(socketPath);
 		gateway.#attach(client);
 		return gateway;
@@ -17,19 +24,33 @@ export class AdminGateway {
 	#connecting?: Promise<void>;
 	#connectionAbort?: AbortController;
 	#retryTimer?: ReturnType<typeof setTimeout>;
+	#retryAttempt = 0;
+	#reconnectNeeded = false;
 	#disconnectOff?: () => void;
+	#connectionHandlers = new Set<(connected: boolean) => void>();
 	#handlers = new Map<string, Set<GatewayEventHandler>>();
 	#eventOffs = new Map<string, Map<GatewayEventHandler, () => void>>();
 	readonly #socketPath: string;
-	readonly #retryDelayMs: number;
+	readonly #random: () => number;
+	readonly #setTimeout: typeof setTimeout;
+	readonly #clearTimeout: typeof clearTimeout;
 
-	private constructor(socketPath: string, retryDelayMs: number) {
+	private constructor(socketPath: string, retryOptions: AdminGatewayRetryOptions) {
 		this.#socketPath = socketPath;
-		this.#retryDelayMs = retryDelayMs;
+		this.#random = retryOptions.random ?? Math.random;
+		this.#setTimeout = retryOptions.setTimeout ?? setTimeout;
+		this.#clearTimeout = retryOptions.clearTimeout ?? clearTimeout;
 	}
 
 	get connected(): boolean {
 		return this.#client !== undefined;
+	}
+
+	onConnectionChange(handler: (connected: boolean) => void): () => void {
+		handler(this.connected);
+		if (this.#closed) return () => {};
+		this.#connectionHandlers.add(handler);
+		return () => this.#connectionHandlers.delete(handler);
 	}
 
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
@@ -56,7 +77,7 @@ export class AdminGateway {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
-		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
+		if (this.#retryTimer !== undefined) this.#clearTimeout(this.#retryTimer);
 		this.#retryTimer = undefined;
 		this.#connectionAbort?.abort();
 		const connecting = this.#connecting;
@@ -65,6 +86,8 @@ export class AdminGateway {
 		this.#disconnectOff?.();
 		this.#disconnectOff = undefined;
 		this.#detachEvents();
+		if (client) this.#notifyConnection();
+		this.#connectionHandlers.clear();
 		await Promise.all([client?.close(), connecting]);
 	}
 
@@ -73,11 +96,20 @@ export class AdminGateway {
 			void client.close().catch(() => {});
 			return;
 		}
+		const recovered = this.#reconnectNeeded;
 		this.#client = client;
 		this.#disconnectOff = client.onDisconnect(() => this.#disconnected(client));
 		if (this.#client !== client) return;
 		for (const [event, handlers] of this.#handlers)
 			for (const handler of handlers) this.#subscribe(client, event, handler);
+		this.#retryAttempt = 0;
+		this.#reconnectNeeded = false;
+		if (recovered) console.error("Admin gateway reconnected.");
+		this.#notifyConnection();
+	}
+
+	#notifyConnection(): void {
+		for (const handler of this.#connectionHandlers) handler(this.connected);
 	}
 
 	#subscribe(client: GajaewayClient, event: string, handler: GatewayEventHandler): void {
@@ -101,15 +133,23 @@ export class AdminGateway {
 		this.#disconnectOff?.();
 		this.#disconnectOff = undefined;
 		this.#detachEvents();
+		this.#reconnectNeeded = true;
+		console.error("Admin gateway disconnected; reconnecting.");
 		this.#scheduleRetry();
+		this.#notifyConnection();
 	}
 
 	#scheduleRetry(): void {
 		if (this.#closed || this.#client || this.#connecting || this.#retryTimer !== undefined) return;
-		this.#retryTimer = setTimeout(() => {
-			this.#retryTimer = undefined;
-			this.#reconnect();
-		}, this.#retryDelayMs);
+		const delay = Math.min(MAX_RETRY_DELAY_MS, INITIAL_RETRY_DELAY_MS * 2 ** Math.min(this.#retryAttempt++, 6));
+		const jitter = Math.floor(this.#random() * Math.max(1, delay / 4));
+		this.#retryTimer = this.#setTimeout(
+			() => {
+				this.#retryTimer = undefined;
+				this.#reconnect();
+			},
+			Math.min(MAX_RETRY_DELAY_MS, delay + jitter),
+		);
 		this.#retryTimer.unref?.();
 	}
 
