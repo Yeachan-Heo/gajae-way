@@ -642,6 +642,10 @@ function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: st
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
 }
 
+function inboundTurnBlockMetaKey(opRef: string): string {
+	return `inbound_turn_block:${opRef}`;
+}
+
 function failedTurnResetCapKey(originKey: string): string {
 	return `failed-turn-reset-cap:${createHash("sha256")
 		.update(JSON.stringify([originKey]))
@@ -2570,6 +2574,22 @@ export class GatewayDatabase {
 		});
 	}
 
+	/** Durably blocks an explicitly refused prompt without pretending it was accepted. */
+	inboundTurnBlock(opRef: string, reason: "model_not_selected"): boolean {
+		return this.withTransaction(() => {
+			const trigger = this.inboundTurnRow(opRef);
+			if (!trigger || trigger.state !== "pending" || trigger.turn_state !== "bound") return false;
+			this.#assertNotQuarantined("inbound", trigger.message_id);
+			this.metaSet(inboundTurnBlockMetaKey(opRef), reason);
+			return true;
+		});
+	}
+
+	/** Whether an op-ref has a durable explicit-refusal block. */
+	inboundTurnIsBlocked(opRef: string): boolean {
+		return this.metaGet(inboundTurnBlockMetaKey(opRef)) !== undefined;
+	}
+
 	/** The turn's pre-send dispatch stamp. */
 	inboundTurnDispatchedAt(opRef: string): string | undefined {
 		return (
@@ -2682,6 +2702,7 @@ export class GatewayDatabase {
 					"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
 				)
 				.run(opRef);
+			this.metaDelete(inboundTurnBlockMetaKey(opRef));
 			return attempt;
 		});
 	}
