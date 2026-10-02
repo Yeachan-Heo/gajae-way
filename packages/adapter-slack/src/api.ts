@@ -271,6 +271,21 @@ export class SlackWebApi {
 		});
 	}
 
+	/**
+	 * Edits a message this bot already posted (chat.update; same chat:write
+	 * scope as posting). Content settlement, so it takes delivery priority —
+	 * an edit that carries ledger text must not queue behind status writes.
+	 */
+	async updateMessage(
+		channel: string,
+		ts: string,
+		text: string,
+		priority: "delivery" | "cosmetic" = "delivery",
+	): Promise<void> {
+		await this.limiter?.acquire(channel, priority);
+		await this.call("chat.update", { channel, ts, text, mrkdwn: true });
+	}
+
 	async addReaction(
 		channel: string,
 		timestamp: string,

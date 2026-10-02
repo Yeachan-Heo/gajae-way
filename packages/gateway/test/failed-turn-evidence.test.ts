@@ -91,6 +91,32 @@ test("explicit provider context code and measured prompt-too-long errors", async
 	expect(await evidence()).toEqual({ reason: "context_exhausted" });
 });
 
+test("HTTP 402 assistant errors classify quota exhaustion without returning provider text", async () => {
+	for (const fields of [
+		{ errorStatus: 402 },
+		{ errorStatus: undefined, transportFailure: { kind: "transport", status: 402 } },
+		{ errorStatus: 402, transportFailure: { kind: "transport", status: 402 } },
+	]) {
+		await save([
+			prompt(),
+			failure("user", {
+				errorMessage: '402 "Grok Build usage balance exhausted"',
+				...fields,
+			}),
+		]);
+		expect(await evidence()).toEqual({ reason: "provider_quota_exhausted" });
+		expect(JSON.stringify(await evidence())).not.toContain("Grok Build");
+	}
+	await save([
+		prompt(),
+		failure("user", {
+			errorStatus: 402,
+			transportFailure: { kind: "transport", status: 500 },
+		}),
+	]);
+	expect(await evidence()).toBeUndefined();
+});
+
 for (const errorStatus of [400, 413]) {
 	test(`HTTP ${errorStatus} request_too_large is not context exhaustion`, async () => {
 		await save([

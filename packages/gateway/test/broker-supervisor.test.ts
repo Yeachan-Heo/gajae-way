@@ -115,6 +115,96 @@ test("CLI timeout with unconfirmed termination fences client generation until ob
 	}
 }, 10_000);
 
+test("unconfirmed child with healthy broker triggers exit after deadline", async () => {
+	// Issue #330: After child termination fails, if broker stays healthy but child
+	// stays unconfirmed past liveOutageLimitMs, the client must exit via
+	// onLiveOutageExceeded so systemd can restart it.
+	let finish = (_code: number) => {};
+	const exited = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	const outageHandlerCalls: string[] = [];
+	const spawn = (() => ({
+		exited,
+		stdout: new Blob([]).stream(),
+		stderr: new Blob([]).stream(),
+		kill() {},
+	})) as unknown as SpawnFn;
+	const value = client({
+		spawn,
+		command: undefined,
+		// Short deadline for test
+		liveOutageLimitMs: 100,
+		onLiveOutageExceeded: (detail) => outageHandlerCalls.push(detail),
+	});
+	await value.start();
+	const gen1 = value.generation;
+	try {
+		// Spawn child that fails to terminate
+		await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toThrow("termination failed");
+		// Child is unconfirmed, client is stopped
+		await expect(value.cli(["sdk", "session", "list"])).rejects.toThrow("stopped");
+		await expect(value.start()).rejects.toThrow("exit remains unconfirmed");
+		// Wait for exit callback to fire (100ms deadline + observation delay)
+		const deadline = Date.now() + 500;
+		while (outageHandlerCalls.length === 0 && Date.now() < deadline) {
+			await Bun.sleep(10);
+		}
+		// Verify exit callback was called due to unconfirmed child timeout
+		expect(outageHandlerCalls.length).toBeGreaterThan(0);
+		expect(outageHandlerCalls[0]).toContain("owned child unconfirmed");
+		// Generation unchanged: no second generation started while child unconfirmed
+		expect(value.generation).toBe(gen1);
+	} finally {
+		finish(0);
+		await exited;
+		await value.stop();
+	}
+}, 10_000);
+
+test("unconfirmed child can restart once exit is confirmed", async () => {
+	// Issue #330: After child termination fails and client becomes stuck-stopped,
+	// once the child process actually exits (confirmed), the client should
+	// automatically recover and restart.
+	let finish = (_code: number) => {};
+	const exited = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	const spawn = (() => ({
+		exited,
+		stdout: new Blob([]).stream(),
+		stderr: new Blob([]).stream(),
+		kill() {},
+	})) as unknown as SpawnFn;
+	const value = client({ spawn, command: undefined });
+	await value.start();
+	try {
+		// Spawn child that fails to terminate
+		await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toThrow("termination failed");
+		// Child is unconfirmed, client is stopped
+		await expect(value.cli(["sdk", "session", "list"])).rejects.toThrow("stopped");
+		await expect(value.start()).rejects.toThrow("exit remains unconfirmed");
+		// Confirm the child exit
+		finish(0);
+		await exited;
+		// Wait for automatic restart to clear the stop state
+		const deadline = Date.now() + 500;
+		while (true) {
+			try {
+				// After child exit confirmation and automatic recovery,
+				// start() should succeed without throwing "exit remains unconfirmed"
+				await value.start();
+				break; // Successfully restarted
+			} catch (e) {
+				if (Date.now() >= deadline) throw e;
+				await Bun.sleep(10);
+			}
+		}
+	} finally {
+		await value.stop();
+	}
+}, 10_000);
+
 test("normal owned relay exit is observed and allows clean idempotent stop", async () => {
 	let finish = (_code: number) => {};
 	const exited = new Promise<number>((resolve) => {

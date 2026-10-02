@@ -295,7 +295,9 @@ test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh ep
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "the message was not dispatched after the stale relay");
 		expect(port.refusals).toBe(1);
-		expect(target.logs.some((line) => line.startsWith("persona_attach_session_gone"))).toBe(true);
+		expect(target.logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind stage=attach"))).toBe(
+			true,
+		);
 		// The stale session's binding was rotated: the send rode a NEW session.
 		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
 		port.complete(port.sends[0]!.opRef, "answer on the fresh session");

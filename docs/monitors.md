@@ -49,13 +49,13 @@ For webhook monitors, the registry replaces the supplied route with a generated 
 
 ## Event sessions and propagation
 
-Event types are declared at monitor creation; they are never inferred. A declared type uses its own monitor-event-type session (`monitor/eventtype/<event type>`). An undeclared type is deliberately routed to the single `monitor/eventtype/catch-all` session, preventing accidental mixing with a declared workflow.
+Event types are declared at monitor creation; they are never inferred. Every session is owned by one monitor: a declared type uses that monitor's session for the type (`monitor/eventtype/<event type>/parent=<monitor id>`), and an undeclared type is routed to that monitor's catch-all session (`monitor/eventtype/catch-all/parent=<monitor id>`), so it cannot mix with a declared workflow. Two monitors that declare the same event type never share a session, its history, its instruction, or its failure domain: a poisoned session fails only the monitor that owns it. Rows keyed by the old event-type-only origin (`monitor/eventtype/<event type>`) are no longer bound after the upgrade. Their history is left unused, not re-keyed, because it already mixes monitors.
 
 The durable propagation path is:
 
 1. **Admitted** — persist the incoming event before work begins and emit its systematic event record.
 2. **Batched** — apply the monitor burst policy and assign a batch.
-3. **Session selected** — choose the declared-type session or catch-all session.
+3. **Session selected** — choose the monitor's declared-type session or its catch-all session.
 4. **Authored** — ask Gajae for exactly one note per event, then persist each authored output.
 5. **Memory queued** — create a durable `monitor-event` memory intent for the authored note.
 6. **Delivered** — when a `channelTarget` exists, prepare and mark an outbound ledger delivery.

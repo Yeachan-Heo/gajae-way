@@ -225,7 +225,13 @@ export interface ChatMessagePayload {
 	readonly origin: OriginRef;
 	readonly role: "assistant";
 	readonly text: string;
-	/** True when this is the final message of the turn. */
+	/**
+	 * True when this is the final message of the turn. Mid-work speech and
+	 * reactions are `false`: the turn is still running, so adapters keep its
+	 * working status (typing, presence) up. A reply that already streamed
+	 * mid-turn is not re-sent, so the final progress tick is the authoritative
+	 * end-of-turn signal.
+	 */
 	readonly final: boolean;
 	/**
 	 * Ledger delivery id when this message requires platform delivery
@@ -472,12 +478,12 @@ export interface WorkRunParams {
 	readonly resume?: boolean;
 	/** Startup model: an explicit model id or a model profile preset; applied at session create and on every send. */
 	readonly model?: string | { readonly preset: string };
+	/** Untrusted routing hint linking this request to the calling GJC session. */
+	readonly callerSessionId?: string;
 }
 
-/** Only asynchronous starts snapshot a completion notification target. */
-export interface WorkStartParams extends WorkRunParams {
-	readonly notify?: OriginRef;
-}
+/** Asynchronous starts and synchronous runs share the same caller metadata. */
+export type WorkStartParams = WorkRunParams;
 
 export type WorkStartResult =
 	| {
@@ -539,16 +545,28 @@ export type WorkSteerResult =
 	| { readonly steered: false; readonly reason: string };
 
 export interface WorkRetireParams {
-	readonly name: string;
+	readonly name?: string;
+	readonly force?: boolean;
+	readonly allDead?: boolean;
 }
 
 /**
  * Retirement closes the worker's gjc session and clears the gateway binding,
  * so the next `work.run` for that name creates a fresh session. A lane with an
  * open attempt is never retired from under its turn.
+ *
+ * When `force` is true, skip attempt-state checks and require broker liveness
+ * proving the session dead or disowned; if found dead, close as `host_lost` and
+ * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
  */
 export type WorkRetireResult =
-	| { readonly retired: true; readonly sessionKey: string; readonly sessionId: string; readonly closed: boolean }
+	| {
+			readonly retired: true;
+			readonly sessionKey: string;
+			readonly sessionId: string;
+			readonly closed: boolean;
+			readonly forced?: boolean;
+	  }
 	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
 
 /** Structured detail carried by a `lane_capacity` error. */
@@ -598,6 +616,12 @@ export interface WorkJobsResult {
 		readonly accepted_at?: string;
 		/** The current attempt, a detail of the job; absent on a corrupt record. */
 		readonly attempt?: { readonly op_ref: string; readonly started_at: string; readonly ended_at?: string } | null;
+		readonly reports?: {
+			readonly pending: number;
+			readonly claimed: number;
+			readonly held: number;
+			readonly undeliverable: number;
+		};
 	}>;
 }
 
@@ -689,7 +713,8 @@ export type CycleGateReason =
 	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
 	| "inbound_starved"
-	| "agent_disk_headroom";
+	| "agent_disk_headroom"
+	| "gjc_unverified_version";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -889,9 +914,32 @@ export function isSilenceToken(text: string): boolean {
 	return (SILENCE_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
 }
 
-/** Existing embedded marker grammar; inspect original content before clipping. */
+/**
+ * Markdown code: closed fenced blocks, then inline spans of any backtick run
+ * length. Text inside code is quoted, never a directive.
+ */
+const MARKDOWN_CODE = /```[\s\S]*?```|(`+)[^\n]*?\1/g;
+
+/**
+ * Existing embedded marker grammar; inspect original content before clipping.
+ *
+ * A marker inside markdown code is a quoted mention, not a directive: a reply
+ * explaining the protocol ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a
+ * real answer. Counting it silenced two fully written Discord replies whole
+ * (live pilot, 2026-09-29).
+ */
 export function containsSilenceToken(text: string): boolean {
-	return /\[(SILENT|silent)\]/.test(text);
+	return /\[(SILENT|silent)\]/.test(text.replace(MARKDOWN_CODE, ""));
+}
+
+/**
+ * Unified silence check: a note is silent if it is EITHER an exact match to
+ * a silence token OR contains an embedded [SILENT] marker (issue #338).
+ * Use this in all delivery and recovery paths to prevent silent content from
+ * leaking into deliveries while preserving authored notes in records.
+ */
+export function isSilentOutput(text: string): boolean {
+	return isSilenceToken(text) || containsSilenceToken(text);
 }
 
 function unbracket(text: string): string {

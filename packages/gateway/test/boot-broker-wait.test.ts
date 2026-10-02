@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { bootGateway, waitForBroker } from "../src/boot";
-import { GjcCliUnavailableError, MIN_GJC_VERSION } from "../src/orchestrator/broker";
+import { GjcCliUnavailableError } from "../src/orchestrator/broker";
+import { MIN_GJC_VERSION } from "../src/orchestrator/gjc-contract";
 
 const directories: string[] = [];
 afterEach(async () => {

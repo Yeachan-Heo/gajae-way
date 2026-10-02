@@ -125,7 +125,12 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			// process cwd (which is typically the product source checkout): a session
 			// bound to the app repo reports that repo's git state as its own.
 			const personaWorkspace = join(config.home, "workspace");
-			const startedAt = new Date().toISOString();
+			// The process start, not this line: preflight and database open take
+			// seconds, and an adapter the service manager started alongside this
+			// gateway reports a start inside that window. Measured on jip-gajae
+			// 2026-09-30: every restart-stack flagged the co-started Discord adapter
+			// `staleGeneration` (adapter 10:44:15.235, boot line 10:44:15.918).
+			const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
 			await waitForBroker("start", () => client.start(), options.brokerWait);
 			const supervisor = broker;
 			const tailRunner = new TailRunner({

@@ -293,21 +293,58 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
-	readonly failureEvidence = new Map<string, { reason: "unsupported_input_status" | "context_exhausted" }>();
+	readonly failureEvidence = new Map<
+		string,
+		{ reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted" }
+	>();
 	readonly failureEvidenceProbes: Array<{
 		sessionId: string;
 		repo: string;
 		startedAtMs: number;
 		terminalAtMs: number;
 	}> = [];
+	readonly failedTransportCauseMap = new Map<
+		string,
+		{
+			kind: string;
+			nativeErrorCode?: string;
+			http2RstCode?: number;
+			status?: number;
+			requestBytes?: number;
+			retryMaxAttempts?: number;
+			endpointClass?: string;
+		}
+	>();
 
-	setFailedTurnEvidence(sessionId: string, reason: "unsupported_input_status" | "context_exhausted"): void {
+	setFailedTurnEvidence(
+		sessionId: string,
+		reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted",
+	): void {
 		this.failureEvidence.set(sessionId, { reason });
+	}
+
+	setFailedTransportCause(
+		sessionId: string,
+		cause: {
+			kind: string;
+			nativeErrorCode?: string;
+			http2RstCode?: number;
+			status?: number;
+			requestBytes?: number;
+			retryMaxAttempts?: number;
+			endpointClass?: string;
+		},
+	): void {
+		this.failedTransportCauseMap.set(sessionId, cause);
 	}
 
 	async failedTurnEvidence(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
 		this.failureEvidenceProbes.push(input);
 		return this.failureEvidence.get(input.sessionId);
+	}
+
+	async failedTransportCause(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
+		return this.failedTransportCauseMap.get(input.sessionId);
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
@@ -466,7 +503,19 @@ export class ScriptedSessionPort implements SessionPort {
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
 		const relay = await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo });
 		relay.beginTurn(input.opRef);
-		const receipt = await this.send({ ...input, relay });
+		let receipt: SendReceipt;
+		try {
+			receipt = await this.send({ ...input, relay });
+		} catch (error) {
+			// Same contract as BrokerSessionPort.request: an op-ref the runtime already
+			// accepted is observed under that clientRef, never re-prompted.
+			const known = this.#operations.get(input.opRef);
+			if (!(error instanceof OpRefRejectedError) || known?.sessionId !== input.sessionId) {
+				await relay.close();
+				throw error;
+			}
+			receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
+		}
 		for (let attempts = 0; attempts < 10_000; attempts++) {
 			const status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			if (status.status.status === "terminal_ok") {

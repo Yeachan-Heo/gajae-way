@@ -5,7 +5,7 @@ import selfOpsSkill from "./self-ops/SKILL.md" with { type: "text" };
 import selfOpsService from "./self-ops/service-control.md" with { type: "text" };
 import selfOpsState from "./self-ops/state-inspection.md" with { type: "text" };
 
-const PERSONA_FILES = ["SOUL.md", "AGENTS.md", "USER.md"] as const;
+const PERSONA_FILES = ["SOUL.md", "USER.md"] as const;
 
 const SELF_OPS_FILES = {
 	"SKILL.md": selfOpsSkill,

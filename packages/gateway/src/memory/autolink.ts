@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
-import { corpusEntries, memoryGit, regenerateMap } from "./doctrine";
+import type { MemoryClosureQueue } from "./closure";
+import { type CorpusWriter, corpusEntries, regenerateMap } from "./doctrine";
 import { loadRegistry } from "./registry";
 
 /**
@@ -213,7 +214,7 @@ export function autolinkText(
 	return { text: out, added: edits.length };
 }
 
-export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
+export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue): Promise<AutolinkReport> {
 	const registry = await loadRegistry(root);
 	const raw = new Set(registry.byPriority.filter((axis) => axis.id === "daily").map((axis) => axis.root));
 	const files = (await corpusEntries(root)).filter(
@@ -234,27 +235,40 @@ export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
 	const index = await buildAliasIndex(root, writableFiles, texts);
 	let filesChanged = 0;
 	let linksAdded = 0;
+	const modifiedFiles: { path: string; rewritten: string; added: number }[] = [];
+
+	// Detect changes (fast path, outside lock)
 	for (let position = 0; position < writableFiles.length; position++) {
 		const path = writableFiles[position] as string;
 		const text = texts.get(path);
 		if (text === undefined) continue;
 		const { text: rewritten, added } = autolinkText(text, path, index);
 		if (added > 0) {
-			await writeFile(join(root, path), rewritten);
-			filesChanged++;
+			modifiedFiles.push({ path, rewritten, added });
 			linksAdded += added;
 		}
-		// Yield the event loop regularly: the sweep must never freeze live turns.
 		if (position % 20 === 19) await Bun.sleep(0);
 	}
-	if (filesChanged > 0) {
+
+	if (modifiedFiles.length === 0) return { filesChanged: 0, linksAdded: 0, aliases: index.length };
+	filesChanged = modifiedFiles.length;
+
+	// If no closure, just write locally (test mode, no commit)
+	if (!closure) {
+		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
 		await regenerateMap(root, registry);
-		try {
-			await memoryGit(root, ["add", "-A"]);
-			await memoryGit(root, ["commit", "-m", `Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`]);
-		} catch {
-			// A bare tree without prior commits still gets the file changes.
-		}
+		return { filesChanged, linksAdded, aliases: index.length };
 	}
+
+	// With closure: write + stage + commit inside lock (#341 fix)
+	await closure.coordinateCommit(root, async () => {
+		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
+		await regenerateMap(root, registry);
+		const writer = closure.getWriter(root);
+		for (const { path } of modifiedFiles) await writer.stageFiles(path);
+		await writer.stageFiles("MEMORY.md");
+		await writer.commit(`Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`);
+	});
+
 	return { filesChanged, linksAdded, aliases: index.length };
 }

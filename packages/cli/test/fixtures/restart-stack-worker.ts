@@ -34,4 +34,5 @@ await runRestartStack({
 		return startedAt === undefined ? undefined : { pid: 4242, startedAt, binary: `/opt/bin/${label}` };
 	},
 	binaryModifiedAt: async () => 0,
+	isServiceInstalled: async () => true,
 });

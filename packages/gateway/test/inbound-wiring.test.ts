@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
+import { RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
@@ -56,6 +57,84 @@ async function waitFor(frames: any[], count: number): Promise<void> {
 function chatSend(id: string, messageId: string, text: string): unknown {
 	return { v: "0.1", type: "request", id, verb: "chat.send", params: { origin: ORIGIN, text, messageId } };
 }
+
+async function negotiated(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
+	const client = await connect(socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	return client;
+}
+
+async function eventually(predicate: () => boolean, message: string): Promise<void> {
+	for (let attempt = 0; attempt < 400 && !predicate(); attempt++) await Bun.sleep(5);
+	expect(predicate(), message).toBe(true);
+}
+
+test("a trigger re-dispatched after its first attach failed still answers the loopback requester", async () => {
+	class StaleFirstPort extends ScriptedSessionPort {
+		refusals = 0;
+		override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+			if (this.refusals === 0) {
+				this.refusals += 1;
+				throw new RelayRefusedError(input.sessionId, "endpoint_stale", "endpoint is not live");
+			}
+			return await super.attachTail(input);
+		}
+	}
+	const config = await makeConfig();
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new StaleFirstPort({
+		onBind: (input) => `${input.originKey}#${input.epoch}`,
+		onSend: (input, scripted) => scripted.complete(input.opRef, "answer on the fresh session"),
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	// Connected first, like an adapter: an answer without its requester context
+	// falls back to the first connection.
+	const adapter = await negotiated(config.socketPath);
+	const requester = await negotiated(config.socketPath);
+
+	requester.send(chatSend("ask", "msg-stale", "hello after a stale endpoint"));
+	await eventually(
+		() => requester.frames.some((frame) => frame.event === "chat.message" && frame.payload.final === true),
+		"the requester never received the final answer",
+	);
+
+	expect(sessionPort.refusals).toBe(1);
+	expect(sessionPort.sends).toHaveLength(1);
+	const turnId = requester.frames.find((frame) => frame.type === "response" && frame.id === "ask").result.turnId;
+	const answer = requester.frames.find((frame) => frame.event === "chat.message");
+	expect(answer.payload).toMatchObject({ turnId, text: "answer on the fresh session", final: true });
+	expect(adapter.frames.filter((frame) => frame.event === "chat.message")).toEqual([]);
+	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
+	adapter.close();
+	requester.close();
+});
+
+test("a failed loopback turn ends the requester's wait with a final failure notice", async () => {
+	const config = await makeConfig();
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => `${input.originKey}#${input.epoch}`,
+		onSend: (input, scripted) => scripted.fail(input.opRef, "provider exploded"),
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const requester = await negotiated(config.socketPath);
+
+	requester.send(chatSend("ask", "msg-fail", "this turn fails"));
+	await eventually(
+		() => requester.frames.some((frame) => frame.event === "chat.message" && frame.payload.final === true),
+		"the requester never learned that its turn failed",
+	);
+
+	const turnId = requester.frames.find((frame) => frame.type === "response" && frame.id === "ask").result.turnId;
+	const notice = requester.frames.find((frame) => frame.event === "chat.message");
+	expect(notice.payload.turnId).toBe(turnId);
+	expect(notice.payload.text).toStartWith("[turn failed]");
+	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
+	requester.close();
+});
 
 test("a duplicate message id is acknowledged but never dispatched twice", async () => {
 	const config = await makeConfig();

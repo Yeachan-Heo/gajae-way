@@ -7,19 +7,21 @@ const fixtures: WorkFixture[] = [];
 afterEach(async () => {
 	for (const fixture of fixtures.splice(0)) await fixture.cleanup();
 });
-async function fixture(barrier?: Barrier) {
-	const fixture = await WorkFixture.create();
+async function fixture(barrier?: Barrier | { readonly allowNested?: boolean }) {
+	const options = typeof barrier === "object" ? barrier : {};
+	const barrierPoint = typeof barrier === "string" ? barrier : undefined;
+	const fixture = await WorkFixture.create(options);
 	fixtures.push(fixture);
-	await fixture.start(barrier);
+	await fixture.start(barrierPoint);
 	return fixture;
 }
-async function start(f: WorkFixture, name = "crash") {
+async function start(f: WorkFixture, name = "crash", callerSessionId?: string) {
 	const client = await f.connect();
 	const response = await client.request("work.start", {
 		name,
 		text: "fixture-owned work",
 		cwd: f.home,
-		notify: noticeOrigin,
+		...(callerSessionId ? { callerSessionId } : {}),
 	});
 	expect(response.error).toBeUndefined();
 	expect(response.result).toMatchObject({ started: true, sessionKey: `work/task/${name}` });
@@ -118,7 +120,7 @@ for (const point of ["prepared", "accepted-before-save"] as const) {
 			type: "request",
 			id: "start",
 			verb: "work.start",
-			params: { name: "crash", text: "one dispatch", cwd: f.home, notify: noticeOrigin },
+			params: { name: "crash", text: "one dispatch", cwd: f.home },
 		});
 		await f.barrier(point);
 		expect(client.frames.some((frame) => frame.id === "start" && frame.result?.started)).toBe(false);
@@ -163,7 +165,7 @@ for (const point of [
 		const before = f.snapshot();
 		expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
 		if (point === "settle-commit") {
-			expect(before.runtimes[0].decision).toBe("enqueued");
+			expect(before.runtimes[0].decision).toBe("fallback");
 			expect(before.sessions[0]?.last_activity_at).toBe(before.runtimes[0].settledAt);
 			expect(before.jobs[0].attempts[0].endState).toBe("completed");
 			expect(before.deliveries).toHaveLength(1);
@@ -192,6 +194,176 @@ for (const point of [
 	}, 30_000);
 }
 
+for (const point of ["settle-before", "settle-report", "settle-commit"] as const) {
+	test(`persona parent crash at ${point}: one durable inbound report and one persona send`, async () => {
+		const f = await fixture();
+		const rootKey = "discord/channel/fixture";
+		const rootSessionId = await f.seedPersonaSession();
+		const priorPersonaSends = f.calls("send").filter((call) => call.input.sessionId === rootSessionId).length;
+		const { client, receipt } = await start(f, "persona-child", rootSessionId);
+		await f.armBarrier(point);
+		await f.control(receipt.opRef, { terminal: true, text: `persona report at ${point}` });
+		await f.barrier(point);
+		const before = f.snapshot();
+		if (point === "settle-commit") {
+			expect(before.inbound.filter((row) => row.source === "lane_report")).toHaveLength(1);
+		} else {
+			expect(before.inbound.filter((row) => row.source === "lane_report")).toHaveLength(0);
+		}
+		expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
+		await f.kill();
+		await f.start();
+		const replay = await f.connect();
+		const after = await eventually(
+			() => f.snapshot(),
+			(snapshot) =>
+				snapshot.inbound.some((row) => row.source === "lane_report" && row.message_id === before.runtimes[0].reportId),
+			"persona lane report was not admitted after restart",
+		);
+		expect(
+			after.inbound.filter((row) => row.source === "lane_report" && row.message_id === after.runtimes[0].reportId),
+		).toHaveLength(1);
+		expect(after.deliveries).toHaveLength(0);
+		await eventually(
+			() => f.calls("send").filter((call) => call.input.sessionId === rootSessionId).length,
+			(count) => count === priorPersonaSends + 1,
+			"persona actor did not dispatch exactly one internal turn",
+		);
+		expect(f.calls("send").filter((call) => call.input.sessionId === rootSessionId)).toHaveLength(
+			priorPersonaSends + 1,
+		);
+		expect(
+			replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.includes("[lane ")),
+		).toHaveLength(0);
+		client.close();
+	}, 30_000);
+}
+
+test("lane parent crash after report claim replays the same deterministic wake once", async () => {
+	const f = await fixture({ allowNested: true });
+	const rootSessionId = await f.seedPersonaSession();
+	const parent = await start(f, "parent", rootSessionId);
+	await f.control(parent.receipt.opRef, { terminal: true, text: "parent initial result" });
+	await eventually(
+		() => f.snapshot(),
+		(snapshot) =>
+			snapshot.runtimes.some((runtime) => runtime.opRef === parent.receipt.opRef && runtime.settledAt !== null),
+		"parent lane did not settle",
+	);
+	const child = await start(f, "child", parent.receipt.sessionId);
+	await f.armBarrier("report-claim");
+	await f.control(child.receipt.opRef, { terminal: true, text: "child report" });
+	await f.barrier("report-claim");
+	const claimed = f.snapshot().laneReports.find((row) => row.parent_name === "parent");
+	if (!claimed?.claim_ref) throw new Error("parent report claim was not persisted");
+	const wakeOpRef = claimed.claim_ref;
+	expect(claimed.state).toBe("claimed");
+	expect(f.calls("send").some((call) => call.input.opRef === wakeOpRef)).toBe(false);
+	await f.kill();
+	await f.start();
+	const replay = await f.connect();
+	const after = await eventually(
+		() => f.snapshot(),
+		(snapshot) => snapshot.laneReports.find((row) => row.report_id === claimed.report_id)?.state === "consumed",
+		"claimed parent wake was not replayed",
+	);
+	expect(after.laneReports.find((row) => row.report_id === claimed.report_id)).toMatchObject({
+		state: "consumed",
+		claim_ref: wakeOpRef,
+		consumed_op_ref: wakeOpRef,
+	});
+	expect(f.calls("send").filter((call) => call.input.opRef === wakeOpRef)).toHaveLength(1);
+	expect(
+		replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.startsWith("[lane ")),
+	).toHaveLength(0);
+}, 30_000);
+
+for (const point of ["prepared", "accepted-before-save", "report-consume"] as const) {
+	test(`lane parent crash at ${point} is replayed by proof with one stable wake identity`, async () => {
+		const f = await fixture({ allowNested: true });
+		const rootSessionId = await f.seedPersonaSession();
+		const parent = await start(f, "parent", rootSessionId);
+		await f.control(parent.receipt.opRef, { terminal: true, text: "parent initial result" });
+		await eventually(
+			() => f.snapshot(),
+			(snapshot) =>
+				snapshot.runtimes.some((runtime) => runtime.opRef === parent.receipt.opRef && runtime.settledAt !== null),
+			"parent lane did not settle",
+		);
+		const child = await start(f, "child", parent.receipt.sessionId);
+		await f.armBarrier(point);
+		await f.control(child.receipt.opRef, { terminal: true, text: "child report" });
+		await f.barrier(point);
+		const before = f.snapshot();
+		const childReport = before.laneReports.find((row) => row.parent_name === "parent");
+		if (!childReport?.claim_ref) throw new Error("child lane report claim was not persisted");
+		const wakeOpRef = childReport.claim_ref;
+		expect(childReport.state).toBe("claimed");
+		const beforeWakeCalls = f.calls("send").filter((call) => call.input.opRef === wakeOpRef).length;
+		expect(beforeWakeCalls).toBe(point === "prepared" ? 0 : 1);
+		await f.kill();
+		if (point === "prepared") await f.control(parent.receipt.opRef, { live: "dead", unknown: true });
+		if (point === "accepted-before-save") await f.persistAcceptedSend(wakeOpRef);
+		if (point !== "prepared") await f.control(wakeOpRef, { terminal: true, text: "wake completed" });
+		await f.start();
+		const replay = await f.connect();
+		const after = await eventually(
+			() => f.snapshot(),
+			(snapshot) => {
+				const row = snapshot.laneReports.find((report) => report.report_id === childReport.report_id);
+				return point === "prepared" ? row?.state === "held" : row?.state === "consumed";
+			},
+			"lane parent wake did not reach its proof-backed state",
+		);
+		const finalRow = after.laneReports.find((row) => row.report_id === childReport.report_id)!;
+		if (point === "prepared") {
+			expect(finalRow).toMatchObject({ state: "held", hold_reason: "wake_acceptance_uncertain" });
+			expect(f.calls("send").filter((call) => call.input.opRef === wakeOpRef)).toHaveLength(0);
+		} else {
+			expect(finalRow).toMatchObject({ state: "consumed", claim_ref: wakeOpRef, consumed_op_ref: wakeOpRef });
+			expect(f.calls("send").filter((call) => call.input.opRef === wakeOpRef)).toHaveLength(1);
+		}
+		expect(after.runtimes.filter((runtime) => runtime.opRef === wakeOpRef)).toHaveLength(1);
+		expect(
+			replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.startsWith("[lane ")),
+		).toHaveLength(0);
+	}, 30_000);
+}
+
+test("nested run refusal survives gateway restart without binding or sending", async () => {
+	const f = await fixture();
+	const parent = await start(f, "nested-parent");
+	const sends = f.calls("send").length;
+	const binds = f.calls("bind").length;
+	const first = await parent.client.request("work.run", {
+		name: "nested-child",
+		text: "must not run",
+		cwd: f.home,
+		callerSessionId: parent.receipt.sessionId,
+	});
+	expect(first.error).toMatchObject({
+		code: "unauthorized",
+		detail: { reasonCode: "nested_lane_forbidden", verb: "run" },
+	});
+	expect(f.calls("send")).toHaveLength(sends);
+	expect(f.calls("bind")).toHaveLength(binds);
+	await f.kill();
+	await f.start();
+	const replay = await f.connect();
+	const second = await replay.request("work.run", {
+		name: "nested-child",
+		text: "must not run after restart",
+		cwd: f.home,
+		callerSessionId: parent.receipt.sessionId,
+	});
+	expect(second.error).toMatchObject({
+		code: "unauthorized",
+		detail: { reasonCode: "nested_lane_forbidden", verb: "run" },
+	});
+	expect(f.calls("send")).toHaveLength(sends);
+	expect(f.calls("bind")).toHaveLength(binds);
+	expect(f.snapshot().jobs.some((job) => job.lane_key === "work-nested-child")).toBe(false);
+});
 test("three claimed post-terminal reads stay consumed across three process crashes", async () => {
 	const f = await fixture("output-claim");
 	const { receipt } = await start(f);
@@ -289,7 +461,7 @@ test("delivery replay keeps one logical identity; confirm and real ledger prunin
 	const final = await f.connect();
 	await final.request("work.status", { name: "crash" });
 	await final.request("gateway.status");
-	expect(f.snapshot().runtimes[0].decision).toBe("enqueued");
+	expect(f.snapshot().runtimes[0].decision).toBe("fallback");
 	expect(f.snapshot().deliveries).toHaveLength(0);
 	expect(final.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
 	singleEffect(f, receipt.opRef, receipt.sessionId);

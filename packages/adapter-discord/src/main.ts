@@ -173,6 +173,8 @@ export interface DiscordTypingChannelLike {
 
 export interface TypingPort {
 	begin(conversationId: string): void;
+	/** Re-sends the hint now for a running turn (a posted message clears it); no-op when none runs. */
+	refresh(conversationId: string): void;
 	end(conversationId: string): void;
 }
 
@@ -423,7 +425,7 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
  * because the typing hint is cosmetic and must never compete with delivery.
  */
 export class TypingIndicator implements TypingPort {
-	readonly #runs = new Map<string, { deadline: number; timer: ReturnType<typeof setTimeout> | undefined }>();
+	readonly #runs = new Map<string, TypingRun>();
 
 	constructor(
 		readonly discord: DiscordClientLike,
@@ -438,8 +440,22 @@ export class TypingIndicator implements TypingPort {
 			existing.deadline = Date.now() + this.maxMs;
 			return;
 		}
-		const run = { deadline: Date.now() + this.maxMs, timer: undefined };
+		const run: TypingRun = { deadline: Date.now() + this.maxMs, timer: undefined, pulsing: false, again: false };
 		this.#runs.set(conversationId, run);
+		void this.#pulse(conversationId, run);
+	}
+
+	refresh(conversationId: string): void {
+		const run = this.#runs.get(conversationId);
+		if (!run) return;
+		// A pulse already in flight may have landed before the message that
+		// cleared the hint; it re-pulses as soon as it settles.
+		if (run.pulsing) {
+			run.again = true;
+			return;
+		}
+		if (run.timer) clearTimeout(run.timer);
+		run.timer = undefined;
 		void this.#pulse(conversationId, run);
 	}
 
@@ -450,11 +466,10 @@ export class TypingIndicator implements TypingPort {
 		this.#runs.delete(conversationId);
 	}
 
-	async #pulse(
-		conversationId: string,
-		run: { deadline: number; timer: ReturnType<typeof setTimeout> | undefined },
-	): Promise<void> {
+	async #pulse(conversationId: string, run: TypingRun): Promise<void> {
 		if (this.#runs.get(conversationId) !== run) return;
+		run.pulsing = true;
+		run.again = false;
 		try {
 			const channel = await this.discord.channels.fetch(conversationId);
 			if (!isDiscordTypingChannel(channel)) {
@@ -468,15 +483,30 @@ export class TypingIndicator implements TypingPort {
 			);
 			this.#runs.delete(conversationId);
 			return;
+		} finally {
+			run.pulsing = false;
 		}
 		if (this.#runs.get(conversationId) !== run) return;
 		if (Date.now() >= run.deadline) {
 			this.#runs.delete(conversationId);
 			return;
 		}
+		if (run.again) {
+			void this.#pulse(conversationId, run);
+			return;
+		}
 		run.timer = setTimeout(() => void this.#pulse(conversationId, run), this.refreshMs);
 	}
 }
+
+type TypingRun = {
+	deadline: number;
+	timer: ReturnType<typeof setTimeout> | undefined;
+	/** A sendTyping round-trip is in flight. */
+	pulsing: boolean;
+	/** A refresh arrived mid-pulse; pulse again once it settles. */
+	again: boolean;
+};
 
 /** The slice of a fetched Discord message presence needs: react, and remove our own reaction. */
 export interface PresenceMessageLike {
@@ -725,8 +755,7 @@ export async function settleDiscordDelivery(
 		try {
 			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		} finally {
-			await status?.clear(message.origin.conversationId);
-			typing?.end(message.origin.conversationId);
+			await settleTurnPresence(message, typing, status);
 		}
 		return;
 	}
@@ -760,9 +789,28 @@ export async function settleDiscordDelivery(
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
 	} finally {
-		await status?.clear(message.origin.conversationId);
-		typing?.end(message.origin.conversationId);
+		await settleTurnPresence(message, typing, status);
 	}
+}
+
+/**
+ * Only the turn's final reply ends its working status. Mid-turn speech and
+ * reactions arrive with `final: false` while the persona is still streaming:
+ * tearing presence down on them left the room looking idle for the rest of the
+ * turn. Posting a message does clear Discord's typing hint, so it is re-sent
+ * at once instead of waiting for the next refresh tick.
+ */
+async function settleTurnPresence(
+	message: ChatMessagePayload,
+	typing: TypingPort | undefined,
+	status: WorkingStatus | undefined,
+): Promise<void> {
+	if (!message.final) {
+		if (!message.reaction) typing?.refresh(message.origin.conversationId);
+		return;
+	}
+	await status?.clear(message.origin.conversationId);
+	typing?.end(message.origin.conversationId);
 }
 
 interface ArchivableThreadLike {

@@ -1,0 +1,1583 @@
+bun test v1.4.0 (34cbb9a40)
+
+packages/adapter-discord/test/adapter.test.ts:
+Discord /model autocomplete failed: gateway down
+
+packages/adapter-discord/test/message-edit.test.ts:
+Discord recovery cursor load failed: ENOTDIR: not a directory, open '/dev/null/recovery-cursor.json'
+Discord adapter gateway reconnecting in 517ms.
+
+packages/adapter-discord/test/recovery.test.ts:
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery retrying in 1000ms.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel thread-1.
+Discord recovery could not read conversation thread-blocked: Missing Access; cursor unchanged, retrying with backoff (1/3).
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel thread-good.
+Discord recovery retrying in 1000ms.
+Discord recovery could not read conversation thread-blocked: Missing Access; cursor unchanged, retrying with backoff (2/3).
+Discord recovery quarantined unreadable conversation thread-blocked after 3 attempts (Missing Access); its watermark is retained and other conversations may complete. It will be probed again on reconnect.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel dm-1.
+Discord recovery holding message 1553140414863638528 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: gateway down); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1553140410669334528; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 500 skip(s); cursor advanced to 1552974337391198208.
+Discord recovery retrying in 1000ms.
+Discord recovery backfilled 0 fresh message(s), found 0 duplicate(s), skipped 20, and discarded 0 for channel channel-1.
+Discord recovery proposes discarding message 1553140415211765760 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content exceeds limit); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553140415211765760 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content exceeds limit). Dead-lettered; the rest of the backfill continues.
+Discord recovery backfilled 2 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 1 for channel channel-1.
+Discord recovery retrying in 1000ms.
+Discord recovery cursor load failed: EISDIR: illegal operation on a directory, read
+Discord recovery refused: cursor store /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-discord-recovery-q4bvDC/unreadable/recovery-cursor.json is unusable (EISDIR: illegal operation on a directory, read); retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord adapter gateway reconnecting in 1090ms.
+Discord recovery retrying in 1000ms.
+Discord adapter gateway reconnecting in 578ms.
+Discord adapter gateway reconnecting in 565ms.
+Discord adapter gateway reconnecting in 1182ms.
+Discord adapter gateway reconnecting in 1058ms.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 2000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord recovery cursor load failed: EISDIR: illegal operation on a directory, read
+Discord recovery refused: cursor store /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-discord-recovery-q4bvDC/unreadable/recovery-cursor.json is unusable (EISDIR: illegal operation on a directory, read); retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord adapter gateway reconnecting in 2385ms.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-2.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery proposes discarding message 1553064918930948096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064918930948096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919014834176 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919014834176 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919098720256 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919098720256 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919182606336 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919182606336 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919266492416 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919266492416 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919350378496 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919350378496 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919434264576 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919434264576 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919518150656 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919518150656 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919602036736 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919602036736 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919685922816 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919685922816 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919769808896 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919769808896 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919853694976 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919853694976 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064919937581056 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064919937581056 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920021467136 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920021467136 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920105353216 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920105353216 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920189239296 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920189239296 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920273125376 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920273125376 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920357011456 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920357011456 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920440897536 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920440897536 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920524783616 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920524783616 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920608669696 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920608669696 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920692555776 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920692555776 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920776441856 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920776441856 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920860327936 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920860327936 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064920944214016 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064920944214016 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921028100096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921028100096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921111986176 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921111986176 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921195872256 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921195872256 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921279758336 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921279758336 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921363644416 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921363644416 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921447530496 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921447530496 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921531416576 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921531416576 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921615302656 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921615302656 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921699188736 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921699188736 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921783074816 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921783074816 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921866960896 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921866960896 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064921950846976 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064921950846976 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922034733056 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922034733056 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922118619136 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922118619136 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922202505216 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922202505216 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922286391296 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922286391296 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922370277376 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922370277376 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922454163456 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922454163456 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922538049536 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922538049536 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922621935616 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922621935616 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922705821696 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922705821696 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922789707776 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922789707776 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922873593856 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922873593856 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064922957479936 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064922957479936 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064923041366016 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064923041366016 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064923125252096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064923125252096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064923209138176 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064923209138176 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery proposes discarding message 1553064923293024256 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553064923293024256 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long for this platform). Dead-lettered; the rest of the backfill continues.
+Discord recovery backfilled 53 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 53 for channel channel-1.
+Discord adapter gateway reconnecting in 2147ms.
+Discord adapter gateway reconnecting in 2310ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery proposes discarding message 1553140421096374272 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553140421096374272 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long). Dead-lettered; the rest of the backfill continues.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 1 for channel channel-1.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery retrying in 1000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery retrying in 1000ms.
+Discord recovery holding message 1553140421276729344 in channel channel-1 after 3 failed chat.send attempts (terminal-message: payload_too_large: content too long); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132905529344; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery holding message 1553140421276729344 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132905529344; gateway unavailable, retrying with backoff.
+Discord recovery proposes discarding message 1553140421276729344 in channel channel-1 after 5 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553140421276729344 in channel channel-1 after 5 terminal chat.send rejections (payload_too_large: content too long). Dead-lettered; the rest of the backfill continues.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 1 for channel channel-1.
+Discord recovery proposes discarding message 1553140421297700864 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553140421297700864 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long). Dead-lettered; the rest of the backfill continues.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 1 for channel channel-1.
+Discord recovery proposes discarding message 1553140421297700864 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery is DISCARDING message 1553140421297700864 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long). Dead-lettered; the rest of the backfill continues.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 1 for channel channel-1.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 3 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 1000ms.
+Discord recovery could not read conversation channel-gone: deleted, no access, or not a text channel; cursor unchanged, retrying with backoff (1/3).
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery retrying in 1000ms.
+Discord recovery could not read conversation channel-gone: deleted, no access, or not a text channel; cursor unchanged, retrying with backoff (2/3).
+Discord recovery quarantined unreadable conversation channel-gone after 3 attempts (deleted, no access, or not a text channel); its watermark is retained and other conversations may complete. It will be probed again on reconnect.
+
+packages/adapter-discord/test/voice.test.ts:
+Discord ingress failed: boom
+
+packages/adapter-discord/test/cli.test.ts:
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 4000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord recovery backfilled 1 fresh message(s), found 0 duplicate(s), skipped 0, and discarded 0 for channel channel-1.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord adapter gateway reconnecting in 1005ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 2000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord adapter gateway reconnecting in 4393ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 6 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 2000ms.
+Discord adapter gateway reconnecting in 4648ms.
+Discord adapter gateway reconnecting in 2189ms.
+Discord adapter gateway reconnecting in 4226ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 4000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 9 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 4000ms.
+Discord adapter gateway reconnecting in 4499ms.
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 8000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Discord adapter gateway reconnecting in 8385ms.
+
+packages/adapter-slack/test/redteam.test.ts:
+Slack adapter gateway reconnecting in 556ms.
+Slack ingress failed: Slack message id requires a safe channel and timestamp
+Slack ingress failed: Slack message id requires a safe channel and timestamp
+Slack ingress failed: Slack message id requires a safe channel and timestamp
+Slack ingress failed: Slack message id requires a safe channel and timestamp
+Slack ingress failed: Slack message id requires a safe channel and timestamp
+Slack adapter gateway reconnecting in 573ms.
+Slack adapter gateway reconnecting in 514ms.
+Slack adapter gateway reconnecting in 509ms.
+Slack adapter gateway reconnecting in 608ms.
+Slack chat.edit failed; edit of C1:1.0 kept for replay: offline
+Slack adapter gateway reconnecting in 559ms.
+Slack adapter gateway reconnecting in 594ms.
+Slack chat.send failed: offline
+Slack adapter gateway reconnecting in 542ms.
+Slack adapter gateway reconnecting in 589ms.
+Slack chat.send failed: gateway connection closed
+Slack chat.send failed: gateway connection closed
+Discord adapter gateway reconnecting in 8531ms.
+Slack adapter gateway reconnecting in 558ms.
+Slack adapter gateway reconnecting in 613ms.
+Slack adapter gateway reconnecting in 587ms.
+Slack chat.send failed: refused
+Slack adapter gateway reconnecting in 510ms.
+Slack chat.send failed: connection closed
+Slack adapter gateway reconnecting in 503ms.
+Slack chat.send failed: refused
+Slack adapter gateway reconnecting in 605ms.
+Slack chat.send failed: refused
+Slack adapter gateway reconnecting in 601ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 512ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 573ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 570ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 575ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 514ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 500ms.
+Slack chat.send failed: boom
+Slack adapter gateway reconnecting in 586ms.
+Slack adapter gateway reconnecting in 500ms.
+Slack adapter gateway reconnecting in 555ms.
+Slack chat.send failed: gateway connection closed
+Discord adapter gateway reconnecting in 9088ms.
+Slack adapter gateway reconnecting in 1185ms.
+Slack adapter gateway reconnecting in 1161ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 8000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 12 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 8000ms.
+Slack adapter gateway reconnecting in 2478ms.
+Slack adapter gateway reconnecting in 2293ms.
+Discord adapter gateway reconnecting in 9446ms.
+Slack adapter gateway reconnecting in 4998ms.
+Slack adapter gateway reconnecting in 4592ms.
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 16000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Slack adapter gateway reconnecting in 556ms.
+Slack adapter gateway reconnecting in 591ms.
+Slack adapter gateway reconnecting in 511ms.
+Slack adapter gateway reconnecting in 546ms.
+Discord adapter gateway reconnecting in 19861ms.
+Discord adapter gateway reconnecting in 19616ms.
+Slack adapter gateway reconnecting in 8799ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 16000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 15 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 16000ms.
+Slack adapter gateway reconnecting in 8059ms.
+Slack adapter gateway reconnecting in 552ms.
+Slack adapter gateway reconnecting in 567ms.
+Discord adapter gateway reconnecting in 16987ms.
+Discord adapter gateway reconnecting in 19760ms.
+Slack adapter gateway reconnecting in 18203ms.
+Slack adapter gateway reconnecting in 19903ms.
+
+packages/adapter-slack/test/adapter.test.ts:
+Slack adapter gateway reconnecting in 584ms.
+Slack adapter gateway reconnecting in 567ms.
+Slack adapter gateway reconnecting in 562ms.
+Slack adapter gateway reconnecting in 503ms.
+Slack adapter gateway reconnecting in 589ms.
+Slack adapter gateway reconnecting in 622ms.
+Slack adapter gateway reconnecting in 545ms.
+Slack adapter gateway reconnecting in 563ms.
+Slack adapter gateway reconnecting in 610ms.
+Slack adapter gateway reconnecting in 533ms.
+Slack adapter gateway reconnecting in 538ms.
+Slack adapter gateway reconnecting in 562ms.
+Slack adapter gateway reconnecting in 562ms.
+Slack adapter gateway reconnecting in 544ms.
+Slack adapter gateway reconnecting in 518ms.
+Slack adapter gateway reconnecting in 596ms.
+Slack adapter gateway reconnecting in 610ms.
+Slack adapter gateway reconnecting in 618ms.
+Slack adapter gateway reconnecting in 562ms.
+Slack adapter gateway reconnecting in 592ms.
+Slack adapter gateway reconnecting in 524ms.
+Slack chat.send failed: gateway down
+Slack adapter gateway reconnecting in 557ms.
+Slack adapter gateway reconnecting in 550ms.
+Slack adapter gateway reconnecting in 574ms.
+Slack chat.send failed: gateway connection closed
+Slack adapter gateway reconnecting in 578ms.
+Slack adapter gateway reconnecting in 583ms.
+Slack adapter gateway reconnecting in 624ms.
+Slack adapter gateway reconnecting in 506ms.
+Slack chat.send failed: chat.send requires non-empty text
+Slack adapter gateway reconnecting in 544ms.
+Slack chat.send failed: chat.send requires non-empty text
+Slack adapter gateway reconnecting in 622ms.
+Slack chat.send failed: gateway connection closed
+Slack adapter gateway reconnecting in 518ms.
+Slack chat.send failed: chat.send requires non-empty text
+Slack adapter gateway reconnecting in 561ms.
+Slack adapter gateway reconnecting in 527ms.
+Slack adapter gateway reconnecting in 603ms.
+Slack chat.edit failed; edit of C1:1700000001.000001 kept for replay: gateway connection closed
+Slack adapter gateway reconnecting in 602ms.
+Slack adapter gateway reconnecting in 610ms.
+Slack adapter gateway reconnecting in 558ms.
+
+packages/adapter-slack/test/api.test.ts:
+Slack adapter gateway reconnecting in 1214ms.
+Slack adapter gateway reconnecting in 2013ms.
+
+packages/cli/test/main.test.ts:
+Validated SQLite backup: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-cli-restore-9vCd07/backup.db
+Copied current database to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-cli-restore-9vCd07/gateway.db.pre-restore-2026-09-25T21-26-00-414Z
+Restored backup to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-cli-restore-9vCd07/gateway.db
+Validated SQLite backup: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-cli-restore-dbpath-rwypVT/backup.db
+Copied current database to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-cli-restore-dbpath-rwypVT/custom/live.db.pre-restore-2026-09-25T21-26-00-453Z
+Restored backup to: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-cli-restore-dbpath-rwypVT/custom/live.db
+
+packages/gateway/test/monitor-instruction.test.ts:
+Slack adapter gateway reconnecting in 4170ms.
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 32000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 32000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 32000ms.
+
+packages/gateway/test/shared-steer-proof.test.ts:
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 32000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 32000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 32000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 32000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 32000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 18 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 32000ms.
+
+packages/gateway/test/tail-liveness.test.ts:
+persona_model origin=loopback/loopback/tail-liveness epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+recovery_hold origin=loopback/loopback/tail-liveness epoch=0 opRef=gw-p-5c4da893a7d3390784d0631e6351ba5a reason=tail_terminal_evidence_unavailable
+persona_model origin=loopback/loopback/tail-liveness epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/bot-audience-turn-refund.test.ts:
+persona_model origin=discord/channel/bot-budget epoch=0 session=session-discord/channel/bot-budget-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/bot-budget epoch=0 opRef=gw-p-ca6367dd236528aa4022a6241636dbc9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=discord/channel/bot-budget epoch=0 session=session-discord/channel/bot-budget-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/bot-budget epoch=0 session=session-discord/channel/bot-budget-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/bot-budget epoch=0 opRef=gw-p-ca6367dd236528aa4022a6241636dbc9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=discord/channel/bot-budget epoch=0 session=session-discord/channel/bot-budget-0 effective=gjc-default changed=false source=turn
+gateway bot audience admission declined origin=discord/channel/bot-budget message=bot-status-2 reason=budget_spent consecutive=1 window=1 declines=1 rateLimited=0
+terminal_failure origin=discord/channel/bot-budget epoch=0 opRef=gw-p-a40216a6d21f2df7c81fd6bf1e9ebae9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] scripted failure
+persona_model origin=discord/channel/bot-budget epoch=0 session=session-discord/channel/bot-budget-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/bot-budget opRef=gw-p-222818b5243307436cd12e524018a123 messageId=bot-loop-2
+gateway bot audience admission declined origin=discord/channel/bot-budget message=bot-loop-3 reason=rate_limited consecutive=2 window=2 declines=1 rateLimited=1
+terminal_failure origin=discord/channel/bot-budget epoch=0 opRef=gw-p-222818b5243307436cd12e524018a123 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] scripted failure
+
+packages/gateway/test/slack-adapter-redteam.e2e.test.ts:
+Slack adapter connected to gateway.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Discord adapter gateway reconnecting in 30019ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 8532ms.
+persona_model origin=telegram/channel/C2 epoch=0 session=session-telegram/channel/C2-0 effective=gjc-default changed=false source=turn
+gateway reaction skipped for telegram/channel/C2: telegram cannot react with ✅ (check)
+Slack adapter connected to gateway.
+Slack adapter connected to gateway.
+persona_model origin=slack/thread/C1:1.0/parent=C1 epoch=0 session=session-slack/thread/C1:1.0/parent=C1-0 effective=gjc-default changed=false source=turn
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Discord adapter gateway reconnecting in 36865ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/dm/D1/peer=U1 epoch=0 session=session-slack/dm/D1/peer=U1-0 effective=gjc-default changed=false source=turn
+Slack adapter connected to gateway.
+persona_model origin=slack/dm/D1/peer=U1 epoch=0 session=session-slack/dm/D1/peer=U1-0 effective=gjc-default changed=false source=turn
+Discord adapter gateway reconnecting in 33705ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter connected to gateway.
+persona_model origin=discord/channel/C1 epoch=0 session=session-discord/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter connected to gateway.
+persona_model origin=telegram/channel/C1 epoch=0 session=session-telegram/channel/C1-0 effective=gjc-default changed=false source=turn
+Discord adapter gateway reconnecting in 32592ms.
+Slack adapter connected to gateway.
+persona_new origin=slack/channel/C1 epoch=1 discarded_pending=0
+persona_model origin=slack/channel/C1 epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 18871ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 31167ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+persona_new origin=slack/channel/C1 epoch=1 discarded_pending=0
+retired_session_host origin=slack/channel/C1 session=session-slack/channel/C1-0 reason=reset outcome=terminated pid=40001
+
+packages/gateway/test/cycle-e2e.test.ts:
+Slack adapter gateway reconnecting in 35046ms.
+
+packages/gateway/test/work-lane.test.ts:
+work_send_error opRef=gw-work-a-01m3d7cer0hbbgatjjcf645fnr code=transport_unavailable
+work_reconciliation_unavailable opRef=gw-work-a-01m3d7chktrwhha8k65fgj5gd2 failures=1 reason=Error: invalid status identity
+work_observer_readopted opRef=gw-work-a-01m3d7chktrwhha8k65fgj5gd2 cause=binding_changed failures=0
+work_reconciliation_unavailable opRef=gw-work-a-01m3d7chrgt7fn89vc5nmqh0ar failures=1 reason=Error: offline
+work_observer_readopted opRef=gw-work-a-01m3d7chrgt7fn89vc5nmqh0ar cause=reconciliation_unavailable failures=8
+work_observer_readopted opRef=gw-work-a-01m3d7cjgykgjn3g13qcqt75bw cause=binding_changed failures=0
+work_send_error opRef=gw-work-a-01m3d7ck28e55ntf26tv8z8d64 code=transport_unavailable
+work_send_error opRef=gw-work-b-01m3d7ck3dg83ryjgt04stcbm0 code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7ck4vshxdty1dct3xstt6 code=busy
+work_reconciliation_unavailable opRef=gw-work-a-01m3d7ckbwrxennq2j92hpycb3 failures=1 reason=Error: injected pre-transaction crash
+work_send_error opRef=gw-work-a-01m3d7ckjcm9qfr749bdd7xngh code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7ckn6bjwenpk54nk018b3 code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7ckr6k1epqze1tszsq6be code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cktvc31x0s5yx913f3vr code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7ckxe806pgqphj9544415 code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cm0n4dnqvpzgs14qv4ey code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cm3g55fgg29zv8h583cc code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cm6btgapwreh1yhcfpcr code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cm955ntg06pyj7ww7e1r code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmc0zf3yjw6vgh8nttc3 code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmekvqxjq3yfnyryhwxk code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmh4m24x0f45s8rqn4cq code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmkqmrdgahd9qzycrfrf code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmpm1t1k9krk3w7h9cje code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmsx0d18tv51ds7njv99 code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmwxx751snhk7x5xkm3f code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cmzy4qe5fsd8z4zma0n3 code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cn2jkqmv85svjy7fqtvr code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cn50m4zrqjb5af624nvn code=transport_unavailable
+work_send_error opRef=gw-work-a-01m3d7cn7gyg5pyjeydekympce code=transport_unavailable
+
+packages/gateway/test/monitor-recovery.test.ts:
+monitor dispatch rejected invalid event type: events d15365fa-6f61-4624-be43-1bd0742f9626
+monitor registry ignored invalid persisted record: monitor e9456aae-d28d-4efc-a44f-218970512d7a
+monitor registry ignored invalid persisted record: monitor e9456aae-d28d-4efc-a44f-218970512d7a
+monitor dispatch rejected missing or invalid monitor: events 94fad670-83ef-4985-8f19-3c18f205f122
+monitor dispatch failed (authoring_turn_failed): events ad260c6b-cc77-4fc9-b664-5725dfaf6e20
+monitor dispatch failed (internal_error): events fa01e661-a27b-4353-9ede-c184c93bf0af
+monitor dispatch failed (internal_error): events fef1b019-310b-4bcf-b662-31289caf815a
+monitor dispatch failed (authoring_turn_failed): events 250d31fe-014c-4d1b-9251-201a5f1b0f54
+monitor dispatch failed (internal_error): events 2244bce6-7654-4261-a57e-ed115a02c2de
+monitor dispatch failed (internal_error): events 178252e1-1528-49be-8a32-78f87d7ccd22
+monitor dispatch failed (internal_error): events 83ac1cb1-6885-409e-a6ad-0f956fb43410
+monitor dispatch failed (internal_error): events f775cc32-769f-4b9e-8776-d90b0830d7ae
+monitor dispatch failed (internal_error): events 0a4cce01-d2d6-42f1-bd04-8e3495ea7bc9
+monitor dispatch failed (internal_error): events e7eac2db-bd32-45bd-b3f9-7b3426ba5363
+monitor dispatch failed (internal_error): events e7eac2db-bd32-45bd-b3f9-7b3426ba5363
+monitor dispatch failed (internal_error): events e7eac2db-bd32-45bd-b3f9-7b3426ba5363
+monitor dispatch failed (internal_error): events e7eac2db-bd32-45bd-b3f9-7b3426ba5363
+monitor dispatch failed (internal_error): events e7eac2db-bd32-45bd-b3f9-7b3426ba5363
+monitor dispatch failed (internal_error): events 541fbf9d-b12f-4f49-a11f-1abc03fd7c87
+monitor dispatch failed (internal_error): events 541fbf9d-b12f-4f49-a11f-1abc03fd7c87
+monitor dispatch failed (internal_error): events 541fbf9d-b12f-4f49-a11f-1abc03fd7c87
+monitor dispatch failed (internal_error): events 541fbf9d-b12f-4f49-a11f-1abc03fd7c87
+monitor dispatch interrupted by shutdown: event ba072011-5f61-4b80-b635-766189cca466 session=s1
+monitor dispatch failed (internal_error): events c1980287-5ea9-453c-b4fe-74c8d1e1a60b
+monitor dispatch failed (internal_error): events d5ae5ad0-55ce-4f6b-bf9a-ddfd38f14874
+monitor dispatch failed (authoring_response_invalid): events c425f633-3e39-4581-8dd6-d3a261b29918,592905ca-53f5-433c-8e11-5028f7e2637a
+monitor answer off contract for monitor/eventtype/memory.canonicalize (monitor 12bbc7a5-dd01-45b4-bff6-cc33323740e5): reason=protocol_omitted_event protocol_failures=1/3 context_failures=0 (unchanged)
+
+packages/gateway/test/persona-reload.test.ts:
+persona_model origin=loopback/loopback/loopback epoch=0 session=loopback/loopback/loopback#0 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/loopback epoch=0 session=loopback/loopback/loopback#0 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/session-create-epoch-recovery.test.ts:
+session_create_epoch_rotated origin=monitor/eventtype/memory.canonicalize epoch=0 nextEpoch=1 reason=poisoned_create_key
+
+packages/gateway/test/monitor-compaction.test.ts:
+monitor dispatch failed (authoring_context_exhausted): events 4ea5bf13-c090-43b3-b1ab-43f24bfaa97d
+monitor dispatch failed (authoring_context_exhausted): events 15a94e1a-c9ca-4dcd-869e-6a4f6c26ba05
+monitor session safety net armed for monitor/eventtype/digest.tick (monitor b1d325e4-3fd5-45c4-b93b-82c0dad80de1): reason=context_failures_native_compaction_unavailable context_failures=2/2 native_compaction=unavailable turns=5
+monitor session rolled for monitor/eventtype/digest.tick (monitor b1d325e4-3fd5-45c4-b93b-82c0dad80de1): reason=context_failures_native_compaction_unavailable native_compaction=unavailable digest=592B.
+monitor dispatch failed (authoring_context_exhausted): events 073c4977-8e75-4ea4-b587-a884bf4c2e83
+monitor dispatch failed (authoring_context_exhausted): events 0bba613b-11c0-4be6-aabc-aa85c4eac766
+monitor dispatch failed (authoring_context_exhausted): events a2884ab3-60ca-4295-a9de-7f6b3fd609fe
+monitor dispatch failed (authoring_context_exhausted): events 39e3f7bd-8183-46fc-85ea-44e30c173e35
+monitor dispatch failed (authoring_context_exhausted): events 60ea4f4c-58a5-4ae4-b3ec-cea230559ff9
+monitor dispatch failed (authoring_context_exhausted): events 7463ddb2-b650-478d-9a88-1ae70b9e056f
+monitor dispatch failed (authoring_context_exhausted): events d63e6b78-486b-401f-8a44-f6b162f9cbcb
+monitor session safety net armed for monitor/eventtype/nf.tick (monitor ce833c6a-ced8-47d4-8289-b5481a5097aa): reason=context_failures_native_compaction_failed context_failures=1/1 native_compaction=failed turns=1
+monitor session rolled for monitor/eventtype/nf.tick (monitor ce833c6a-ced8-47d4-8289-b5481a5097aa): reason=context_failures_native_compaction_failed native_compaction=failed digest=266B.
+monitor dispatch failed (authoring_response_invalid): events db593960-c026-476e-8a45-e9d8de7432c0
+monitor answer off contract for monitor/eventtype/bad.tick (monitor 37520215-ab33-48f4-8a5b-143965b72972): reason=protocol_unparseable_json protocol_failures=1/3 context_failures=0 (unchanged)
+monitor dispatch failed (authoring_response_invalid): events 3041ae65-e0ef-45d4-877c-23cb3dfad311
+monitor answer off contract for monitor/eventtype/bad.tick (monitor 37520215-ab33-48f4-8a5b-143965b72972): reason=protocol_unparseable_json protocol_failures=2/3 context_failures=0 (unchanged)
+monitor dispatch failed (authoring_response_invalid): events f5450025-2832-4235-9e37-bcaf2a22b25e
+monitor answer off contract for monitor/eventtype/bad.tick (monitor 37520215-ab33-48f4-8a5b-143965b72972): reason=protocol_unparseable_json protocol_failures=3/3 context_failures=0 (unchanged)
+monitor session safety net armed for monitor/eventtype/bad.tick (monitor 37520215-ab33-48f4-8a5b-143965b72972): reason=protocol_failures_off_contract protocol_failures=3/3 last_reason=protocol_unparseable_json turns=3
+monitor session rolled for monitor/eventtype/bad.tick (monitor 37520215-ab33-48f4-8a5b-143965b72972): reason=protocol_failures_off_contract native_compaction=not_attempted digest=261B.
+monitor dispatch failed (authoring_response_invalid): events 6d20d8da-6fa6-49e6-aa50-0dacad59d84b
+monitor answer off contract for monitor/eventtype/bad.tick (monitor 37520215-ab33-48f4-8a5b-143965b72972): reason=protocol_unparseable_json protocol_failures=1/3 context_failures=0 (unchanged)
+monitor dispatch failed (authoring_context_exhausted): events 9f0d1ad2-beb4-431f-959e-4f6b99603638
+monitor dispatch failed (authoring_context_exhausted): events cd9d9477-ddf8-4109-8607-45b472567bd5
+monitor session safety net armed for monitor/eventtype/boundary.tick (monitor 1b7bc207-2528-4bd7-a71b-28a7e589853d): reason=context_failures_native_compaction_unavailable context_failures=2/2 native_compaction=unavailable turns=5
+monitor session rolled for monitor/eventtype/boundary.tick (monitor 1b7bc207-2528-4bd7-a71b-28a7e589853d): reason=context_failures_native_compaction_unavailable native_compaction=unavailable digest=530B.
+monitor dispatch failed (authoring_context_exhausted): events 14192e74-28cf-4880-9de4-f59e43f0905b
+monitor session safety net armed for monitor/eventtype/plain.tick (monitor 05aa1cde-a14e-4fd2-ae03-d764336fe2f8): reason=context_failures_native_compaction_unavailable context_failures=1/1 native_compaction=unavailable turns=2
+monitor session rolled for monitor/eventtype/plain.tick (monitor 05aa1cde-a14e-4fd2-ae03-d764336fe2f8): reason=context_failures_native_compaction_unavailable native_compaction=unavailable digest=348B.
+monitor dispatch failed (authoring_context_exhausted): events e554c0c7-b254-459e-b34d-6a089690070e
+monitor dispatch failed (authoring_context_exhausted): events 78925eaf-9286-4a7f-97d4-49d500504e36
+monitor dispatch failed (executor_failed): events 22590064-670f-4b31-b9d3-d808c898cc33
+monitor dispatch failed (authoring_context_exhausted): events 22590064-670f-4b31-b9d3-d808c898cc33
+monitor context failure not counted for monitor/eventtype/stale.tick (monitor 4d4dd943-f573-41cd-b54d-cdb08ac8fc68): replayed=true current_epoch=true
+monitor dispatch failed (authoring_context_exhausted): events f82323f3-d19f-4318-8170-514adaa15dd8
+monitor session safety net armed for monitor/eventtype/stale.tick (monitor 4d4dd943-f573-41cd-b54d-cdb08ac8fc68): reason=context_failures_native_compaction_unavailable context_failures=1/1 native_compaction=unavailable turns=0
+monitor dispatch failed (aside_timeout): events 0672ac5a-1bdd-4297-99d5-10541183ba17
+monitor dispatch failed (aside_timeout): events a6e85cba-2e7e-4f60-91f9-1b6327968fd3
+monitor dispatch failed (aside_timeout): events b4586175-bcf6-4a40-a83c-59271a2fb73a
+monitor dispatch failed (aside_timeout): events e333f5d9-2e05-4fb1-b14a-06ea1c9719c7
+monitor dispatch failed (aside_timeout): events 802d9a3f-5c3f-435d-a913-0476d4d457c7
+monitor dispatch failed (orphaned_executor): events 4a5f4409-00b9-4582-a836-6417daafeddb
+monitor executor orphaned for monitor/eventtype/orphan.tick (monitor 69b8f6a6-1065-4fc7-bd02-9cf136892a11): reason=executor_orphaned_external_work orphaned_failures=1 context_failures=0 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (orphaned_executor): events da9ba37a-228d-4686-8002-51609f60ab98
+monitor executor orphaned for monitor/eventtype/orphan.tick (monitor 69b8f6a6-1065-4fc7-bd02-9cf136892a11): reason=executor_orphaned_external_work orphaned_failures=2 context_failures=0 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (orphaned_executor): events feca498e-996d-4a58-b8c9-f4790c8e92a5
+monitor executor orphaned for monitor/eventtype/orphan.tick (monitor 69b8f6a6-1065-4fc7-bd02-9cf136892a11): reason=executor_orphaned_external_work orphaned_failures=3 context_failures=0 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (orphaned_executor): events a7ea002b-8fc5-4e4f-a5f5-6456de8f6ed9
+monitor executor orphaned for monitor/eventtype/orphan.tick (monitor 69b8f6a6-1065-4fc7-bd02-9cf136892a11): reason=executor_orphaned_external_work orphaned_failures=4 context_failures=0 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (orphaned_executor): events 310ab9df-95a1-41e8-bb2c-c4a3fbca56ca
+monitor executor orphaned for monitor/eventtype/orphan.tick (monitor 69b8f6a6-1065-4fc7-bd02-9cf136892a11): reason=executor_orphaned_external_work orphaned_failures=5 context_failures=0 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (orphaned_executor): events e036290d-c5d1-48b3-afaf-e3f0fdb11369
+monitor executor orphaned for monitor/eventtype/mixed.tick (monitor 9cf0b2c9-e1d8-4e49-af26-edf05f6f158e): reason=executor_orphaned_external_work orphaned_failures=1 context_failures=0 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (authoring_context_exhausted): events 85ff40fc-4d7f-4221-a3c4-389b0eb1cdf4
+monitor dispatch failed (orphaned_executor): events 0c738f5b-e374-4794-a2e3-ba32de346d23
+monitor executor orphaned for monitor/eventtype/mixed.tick (monitor 9cf0b2c9-e1d8-4e49-af26-edf05f6f158e): reason=executor_orphaned_external_work orphaned_failures=2 context_failures=1 (unchanged) — external executor work was not reclaimed; the session is left untouched.
+monitor dispatch failed (authoring_context_exhausted): events 4e19bc86-4a26-419b-b96b-8937ad86122c
+monitor session safety net armed for monitor/eventtype/mixed.tick (monitor 9cf0b2c9-e1d8-4e49-af26-edf05f6f158e): reason=context_failures_native_compaction_unavailable context_failures=2/2 native_compaction=unavailable turns=0
+monitor dispatch failed (session_busy): events 0dc25de1-c3eb-47f7-b272-0fc4907bf5e0
+monitor session busy for monitor/eventtype/threads.tick (monitor 410345ef-a286-46be-ba03-bdfbedace5e6): busy_failures=1/2 replayed=false context_failures=0 (unchanged)
+monitor dispatch failed (session_busy): events 0dc25de1-c3eb-47f7-b272-0fc4907bf5e0
+monitor session busy for monitor/eventtype/threads.tick (monitor 410345ef-a286-46be-ba03-bdfbedace5e6): busy_failures=2/2 replayed=true context_failures=0 (unchanged)
+monitor session safety net armed for monitor/eventtype/threads.tick (monitor 410345ef-a286-46be-ba03-bdfbedace5e6): reason=session_busy_stalled busy_failures=2/2 session=event-session-e0 turns=0
+monitor session rolled for monitor/eventtype/threads.tick (monitor 410345ef-a286-46be-ba03-bdfbedace5e6): reason=session_busy_stalled native_compaction=not_attempted digest=260B.
+monitor stalled session host for monitor/eventtype/threads.tick: session=event-session-e0 outcome=terminated
+
+packages/gateway/test/tail-progress.test.ts:
+persona_model origin=loopback/loopback/tail epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+recovery_hold origin=loopback/loopback/tail epoch=0 opRef=gw-p-425c2661a667cfba6e17894aa631513b reason=tail_terminal_evidence_unavailable
+persona_model origin=loopback/loopback/nospawn epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/silent epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/retired epoch=0 session=session-0 effective=gjc-default changed=false source=turn
+retired_hold originKey=loopback/loopback/retired epoch=0 opRef=gw-p-0e0b80b2c3b81d0f8911476fdc42f988 reason=/new
+persona_new origin=loopback/loopback/retired epoch=1 discarded_pending=0
+terminal_status_reconciled origin=loopback/loopback/retired epoch=0 opRef=gw-p-0e0b80b2c3b81d0f8911476fdc42f988 tail_evidence=unavailable
+retired_session_host origin=loopback/loopback/retired session=session-0 reason=retired_turn_reconciled outcome=terminated pid=40001
+
+packages/gateway/test/redteam-generation5.test.ts:
+persona_model origin=discord/dm/generation-5/peer=owner epoch=0 session=discord/dm/generation-5/peer=owner-session-0 effective=gjc-default changed=false source=turn
+steer_ambiguous origin=discord/dm/generation-5/peer=owner message=m-2 action=replay attempt=1 detail=gjc sdk turn.steer exited 1
+steer_ambiguous origin=discord/dm/generation-5/peer=owner message=m-2 action=replay attempt=2 detail=gjc sdk turn.steer exited 1
+steer_hold origin=discord/dm/generation-5/peer=owner message=m-2 opRef=gw-p-bc8380cc85561eda204116b38922fafc reason=transport_torn detail=gjc sdk turn.steer exited 1
+steer_ambiguous origin=discord/dm/generation-5/peer=owner message=m-2 action=replay attempt=1 detail=gjc sdk turn.steer exited 1
+steer_ambiguous origin=discord/dm/generation-5/peer=owner message=m-2 action=replay attempt=2 detail=gjc sdk turn.steer exited 1
+steer_hold origin=discord/dm/generation-5/peer=owner message=m-2 opRef=gw-p-bc8380cc85561eda204116b38922fafc reason=transport_torn detail=gjc sdk turn.steer exited 1
+steer_delivered originKey=discord/dm/generation-5/peer=owner opRef=gw-p-bc8380cc85561eda204116b38922fafc messageId=m-2
+persona_model origin=discord/dm/generation-5/peer=owner epoch=0 session=discord/dm/generation-5/peer=owner-session-0 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/broker-wedge.test.ts:
+session_create_epoch_rotated origin=discord/channel/broker-wedge epoch=0 nextEpoch=1 reason=poisoned_create_key
+session_create_epoch_rotated origin=discord/channel/broker-wedge epoch=2 nextEpoch=3 reason=poisoned_create_key
+
+packages/gateway/test/persona-session.test.ts:
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+recovery_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-1b96cd81ed28f54cc168540bda726de5 reason=tail_terminal_evidence_unavailable
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-1b96cd81ed28f54cc168540bda726de5 tail_evidence=unavailable
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+recovery_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-1b96cd81ed28f54cc168540bda726de5 reason=tail_terminal_evidence_unavailable
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-1b96cd81ed28f54cc168540bda726de5 tail_evidence=unavailable
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+recovery_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-ca37e26a5ffe10b6c1da8f9dc85c500f reason=tail_terminal_evidence_unavailable
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-ca37e26a5ffe10b6c1da8f9dc85c500f tail_evidence=unavailable
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/persona opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 messageId=m-2
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-30145fbf224b0ec512bdcba5c040f2ae status=failed code=prompt_failed provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-349a3811664d7ccd0e816481ee0eba78 status=failed code=spawn_failed provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-703b88e323137f6a27fc0ec3aea5f7d3 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-0d98de3d278bfb9215ba3ba17c618b97 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_terminal_delivery_failed origin=loopback/loopback/persona opRef=gw-p-0d98de3d278bfb9215ba3ba17c618b97 detail=notice persistence interrupted
+persona actor loopback/loopback/persona failed: notice persistence interrupted
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-0d98de3d278bfb9215ba3ba17c618b97 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-0d98de3d278bfb9215ba3ba17c618b97 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-0d98de3d278bfb9215ba3ba17c618b97 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-bdba87f2cb362d527c0c7aab393e0f0f status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-bdba87f2cb362d527c0c7aab393e0f0f reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-bdba87f2cb362d527c0c7aab393e0f0f reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=context_exhausted
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=context_exhausted
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=1 opRef=gw-p-51c7b654059ed48b6821c12fc5d61104 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-51c7b654059ed48b6821c12fc5d61104 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=1 opRef=gw-p-51c7b654059ed48b6821c12fc5d61104 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-51c7b654059ed48b6821c12fc5d61104 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/persona opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b messageId=steer
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+steer_ambiguous origin=loopback/loopback/persona message=steer action=replay attempt=1 detail=unknown transport outcome
+steer_ambiguous origin=loopback/loopback/persona message=steer action=replay attempt=2 detail=unknown transport outcome
+steer_hold origin=loopback/loopback/persona message=steer opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=transport_torn detail=unknown transport outcome
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unsupported_input_status
+steer_hold origin=loopback/loopback/persona message=steer opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unresolved_at_terminal detail=unknown transport outcome
+steer_hold origin=loopback/loopback/persona message=steer opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unresolved_after_terminal detail=unknown transport outcome
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+steer_hold origin=loopback/loopback/persona message=steer opRef=gw-p-b24cf2245c623f7bc58143ddebab1d1b reason=unresolved_after_terminal detail=unknown transport outcome
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-060615dc8ef024087afff4cef3c04e94 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-060615dc8ef024087afff4cef3c04e94 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_evidence_unavailable origin=loopback/loopback/persona opRef=gw-p-060615dc8ef024087afff4cef3c04e94
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b44888f7651cef23036c22e55427ef32 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b44888f7651cef23036c22e55427ef32 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b44888f7651cef23036c22e55427ef32 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b44888f7651cef23036c22e55427ef32 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b44888f7651cef23036c22e55427ef32 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-b44888f7651cef23036c22e55427ef32 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+Slack adapter gateway reconnecting in 33726ms.
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+retired_hold originKey=loopback/loopback/persona epoch=0 opRef=gw-p-f5792a29249c9ca9b92c25bb701eeaa4 reason=/new
+persona_new origin=loopback/loopback/persona epoch=1 discarded_pending=0
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+recovery_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-f5792a29249c9ca9b92c25bb701eeaa4 reason=tail_terminal_evidence_unavailable
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-820a52664d730ff8f2a2dcdd73ba0294 tail_evidence=unavailable
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-820a52664d730ff8f2a2dcdd73ba0294 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-820a52664d730ff8f2a2dcdd73ba0294 tail_evidence=unavailable
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-820a52664d730ff8f2a2dcdd73ba0294 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-820a52664d730ff8f2a2dcdd73ba0294 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-820a52664d730ff8f2a2dcdd73ba0294 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-62fb1068a50ac24e1264d47f63ef4e19 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-62fb1068a50ac24e1264d47f63ef4e19 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-62fb1068a50ac24e1264d47f63ef4e19 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=1 opRef=gw-p-9a2ee854156aba9c63b24b1d5df795dc status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_answer_recovered origin=loopback/loopback/persona epoch=1 opRef=gw-p-9a2ee854156aba9c63b24b1d5df795dc chars=14
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-9a2ee854156aba9c63b24b1d5df795dc reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=1 nextEpoch=2 opRef=gw-p-9a2ee854156aba9c63b24b1d5df795dc reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-62fb1068a50ac24e1264d47f63ef4e19 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-62fb1068a50ac24e1264d47f63ef4e19 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-62fb1068a50ac24e1264d47f63ef4e19 reason=unsupported_input_status
+persona_new origin=loopback/loopback/persona epoch=2 discarded_pending=0
+persona_model origin=loopback/loopback/persona epoch=2 session=session-e2 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=2 opRef=gw-p-a20d1f63fcc507c131a6edb6c1042db5 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-a20d1f63fcc507c131a6edb6c1042db5 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=2 nextEpoch=3 opRef=gw-p-a20d1f63fcc507c131a6edb6c1042db5 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=1 opRef=gw-p-942de4fdfc5070505c718271a05bddc3 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_answer_recovered origin=loopback/loopback/persona epoch=1 opRef=gw-p-942de4fdfc5070505c718271a05bddc3 chars=14
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-942de4fdfc5070505c718271a05bddc3 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+session_reset_after_failed_turn origin=loopback/loopback/persona epoch=0 nextEpoch=1 opRef=gw-p-006bce3b313424f503d46737c32f7dc9 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=1 opRef=gw-p-942de4fdfc5070505c718271a05bddc3 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_answer_recovered origin=loopback/loopback/persona epoch=1 opRef=gw-p-942de4fdfc5070505c718271a05bddc3 chars=14
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-942de4fdfc5070505c718271a05bddc3 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_failure origin=loopback/loopback/persona epoch=0 opRef=gw-p-f8b565a3063d613db6135717c3eae041 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_classified origin=loopback/loopback/persona opRef=gw-p-f8b565a3063d613db6135717c3eae041 reason=unsupported_input_status
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+shutdown_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+retired_hold originKey=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=/new
+persona_new origin=loopback/loopback/persona epoch=1 discarded_pending=0
+recovery_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=tail_terminal_evidence_unavailable
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 tail_evidence=unavailable
+retired_session_host origin=loopback/loopback/persona session=session-1 reason=retired_turn_reconciled outcome=terminated pid=40001
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+steer_failed origin=loopback/loopback/persona message=m-2 action=recover detail=gjc sdk turn.steer reported failure: {"code":"busy","message":"no running turn"}
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=1 detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=2 detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=transport_torn detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=1 detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=2 detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=transport_torn detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=1 detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=2 detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=transport_torn detail=uncertain receipt
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 tail_evidence=unavailable
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=unresolved_at_terminal detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=unresolved_after_terminal detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=unresolved_after_terminal detail=uncertain receipt
+steer_delivered originKey=loopback/loopback/persona opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 messageId=m-2
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=1 detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=2 detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=transport_torn detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=1 detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=2 detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=transport_torn detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=1 detail=uncertain receipt
+steer_ambiguous origin=loopback/loopback/persona message=m-2 action=replay attempt=2 detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=transport_torn detail=uncertain receipt
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 tail_evidence=unavailable
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=unresolved_at_terminal detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=unresolved_after_terminal detail=uncertain receipt
+steer_hold origin=loopback/loopback/persona message=m-2 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=unresolved_after_terminal detail=uncertain receipt
+steer_delivered originKey=loopback/loopback/persona opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 messageId=m-2
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+persona_send_ambiguous origin=loopback/loopback/persona opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 detail=gjc sdk session send reported failure
+recovery_hold origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=operation_state_unknown sweeps=1
+retired_hold originKey=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 reason=/new
+persona_new origin=loopback/loopback/persona epoch=1 discarded_pending=0
+persona_model origin=loopback/loopback/persona epoch=1 session=session-e1 effective=gjc-default changed=false source=turn
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 60000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+terminal_status_reconciled origin=loopback/loopback/persona epoch=0 opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 tail_evidence=unavailable
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/persona epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/persona opRef=gw-p-2c0ce1f00d39b11f279fa2d552a78b76 messageId=m-2
+
+packages/gateway/test/inbound-wiring.test.ts:
+persona_model origin=loopback/loopback/loopback epoch=0 session=loopback/loopback/loopback#0 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/loopback epoch=0 session=loopback/loopback/loopback#0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/loopback opRef=gw-p-b509e6a8b36d9ab32599630749a397a9 messageId=msg-2
+
+packages/gateway/test/memory-doctrine.test.ts:
+Discord adapter gateway reconnecting in 36668ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 21 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Slack adapter gateway reconnecting in 512ms.
+Slack adapter gateway reconnecting in 1130ms.
+Slack adapter gateway reconnecting in 2386ms.
+memory git: removed orphaned /private/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-memory-lock-TgNLFe/memory/.git/index.lock (age 65s)
+
+packages/gateway/test/redteam-canonical.test.ts:
+persona_model origin=discord/dm/canonical-dm/peer=owner epoch=0 session=discord/dm/canonical-dm/peer=owner-session-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/dm/canonical-dm/peer=owner opRef=gw-p-0d054839583b0c42e5164c8a9736d583 messageId=edit:race-message:c18804dc486539bd
+persona_model origin=discord/dm/canonical-dm/peer=owner epoch=0 session=discord/dm/canonical-dm/peer=owner-session-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/dm/canonical-dm/peer=owner opRef=gw-p-18167fdae1df79024135f0ec60480fd0 messageId=edit:edit-target:a67d5f46542514f5
+gateway steer acknowledgement skipped (duplicate) for discord/dm/canonical-dm/peer=owner message edit-target: 👀 is already applied to message edit-target
+steer_delivered originKey=discord/dm/canonical-dm/peer=owner opRef=gw-p-18167fdae1df79024135f0ec60480fd0 messageId=edit:edit-target:e8025083e0baf1ea
+persona_model origin=discord/channel/context-channel epoch=0 session=discord/channel/context-channel-session-0 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/edit-loopback epoch=0 session=loopback/loopback/edit-loopback-session-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/edit-loopback opRef=gw-p-d6f0bfe0b238435590e92c7409362f2c messageId=edit:loopback-message:6bfe193a849a50b4
+D4>>> [2000,4000,8000,16000] 5 ["persona_bind_failed origin=loopback/loopback/canonical-redteam epoch=0 message=backoff-1 attempts=1 detail=scripted bind failure 1","persona_bind_failed origin=loopback/loopback/canonical-redteam epoch=0 message=backoff-1 attempts=2 detail=scripted bind failure 2","persona_bind_failed origin=loopback/loopback/canonical-redteam epoch=0 message=backoff-1 attempts=3 detail=scripted bind failure 3","persona_bind_failed origin=loopback/loopback/canonical-redteam epoch=0 message=backoff-1 attempts=4 detail=scripted bind failure 4"]
+persona_model origin=discord/dm/canonical-dm/peer=owner epoch=0 session=discord/dm/canonical-dm/peer=owner-session-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/dm/canonical-dm/peer=owner opRef=gw-p-683e95c9d76a6a772982ee05392b8a33 messageId=dm-steer
+persona_model origin=loopback/loopback/canonical-redteam epoch=0 session=loopback/loopback/canonical-redteam-session-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/canonical-redteam opRef=gw-p-6dbe291b5931096f00ea544cf873caaa messageId=9aea4fca-6f0b-49ec-8296-6e2cd97c85cc
+persona_model origin=discord/channel/d7-chan epoch=0 session=discord/channel/d7-chan-session-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/d7-chan opRef=gw-p-324dda20c00513d4bd51f2463cf51023 messageId=ch-steer
+recovery_hold origin=discord/dm/canonical-dm/peer=owner epoch=0 opRef=gw-p-683e95c9d76a6a772982ee05392b8a33 reason=tail_terminal_evidence_unavailable
+recovery_hold origin=loopback/loopback/canonical-redteam epoch=0 opRef=gw-p-6dbe291b5931096f00ea544cf873caaa reason=tail_terminal_evidence_unavailable
+recovery_hold origin=discord/channel/d7-chan epoch=0 opRef=gw-p-324dda20c00513d4bd51f2463cf51023 reason=tail_terminal_evidence_unavailable
+Discord adapter gateway reconnecting in 31538ms.
+
+packages/gateway/test/boot-broker-wait.test.ts:
+{"recovery":{"recovered":0,"pending":0,"pruned":0}}
+
+packages/gateway/test/broker-supervisor.test.ts:
+Slack adapter gateway reconnecting in 4418ms.
+Discord adapter gateway reconnecting in 36952ms.
+Discord adapter gateway reconnecting in 35347ms.
+Slack adapter gateway reconnecting in 582ms.
+Slack adapter gateway reconnecting in 545ms.
+Slack adapter gateway reconnecting in 1132ms.
+Slack adapter gateway reconnecting in 34629ms.
+Slack adapter gateway reconnecting in 566ms.
+Slack adapter gateway reconnecting in 1077ms.
+Slack adapter gateway reconnecting in 8989ms.
+Slack adapter gateway reconnecting in 1081ms.
+Slack adapter gateway reconnecting in 594ms.
+Slack adapter gateway reconnecting in 573ms.
+Slack adapter gateway reconnecting in 2313ms.
+Slack adapter gateway reconnecting in 573ms.
+Slack adapter gateway reconnecting in 2243ms.
+Slack adapter gateway reconnecting in 1028ms.
+Slack adapter gateway reconnecting in 1220ms.
+Slack adapter gateway reconnecting in 544ms.
+Slack adapter gateway reconnecting in 2436ms.
+Slack adapter gateway reconnecting in 1110ms.
+Slack adapter gateway reconnecting in 1101ms.
+Slack adapter gateway reconnecting in 549ms.
+Slack adapter gateway reconnecting in 2414ms.
+Slack adapter gateway reconnecting in 2397ms.
+Slack adapter gateway reconnecting in 606ms.
+Slack adapter gateway reconnecting in 1105ms.
+Slack adapter gateway reconnecting in 2191ms.
+Slack adapter gateway reconnecting in 2360ms.
+Slack adapter gateway reconnecting in 4999ms.
+Slack adapter gateway reconnecting in 1032ms.
+Slack adapter gateway reconnecting in 4690ms.
+Slack adapter gateway reconnecting in 525ms.
+
+packages/gateway/test/work-lane-store.test.ts:
+Slack adapter gateway reconnecting in 2488ms.
+
+packages/gateway/test/memory-registry-adversarial.test.ts:
+Slack adapter gateway reconnecting in 4465ms.
+Slack adapter gateway reconnecting in 1146ms.
+Slack adapter gateway reconnecting in 555ms.
+Slack adapter gateway reconnecting in 2312ms.
+
+packages/gateway/test/relay-redteam.test.ts:
+Slack adapter gateway reconnecting in 4682ms.
+Slack adapter gateway reconnecting in 1043ms.
+session_busy_wait session=s opRef=redteam-op
+session_busy_wait session=s opRef=redteam-op
+Slack adapter gateway reconnecting in 4760ms.
+Slack adapter gateway reconnecting in 4785ms.
+Slack adapter gateway reconnecting in 550ms.
+
+packages/gateway/test/speech-gate.test.ts:
+Slack adapter gateway reconnecting in 2261ms.
+Slack adapter gateway reconnecting in 4655ms.
+Slack adapter gateway reconnecting in 1084ms.
+Slack adapter gateway reconnecting in 2371ms.
+Slack adapter gateway reconnecting in 34018ms.
+Slack adapter gateway reconnecting in 4731ms.
+Slack adapter gateway reconnecting in 2491ms.
+Slack adapter gateway reconnecting in 4770ms.
+Slack adapter gateway reconnecting in 4581ms.
+Slack adapter gateway reconnecting in 8726ms.
+Slack adapter gateway reconnecting in 608ms.
+Slack adapter gateway reconnecting in 8948ms.
+Slack adapter gateway reconnecting in 4032ms.
+Slack adapter gateway reconnecting in 9318ms.
+Slack adapter gateway reconnecting in 623ms.
+Slack adapter gateway reconnecting in 1248ms.
+Slack adapter gateway reconnecting in 578ms.
+Slack adapter gateway reconnecting in 4735ms.
+Slack adapter gateway reconnecting in 1030ms.
+Slack adapter gateway reconnecting in 8349ms.
+Slack adapter gateway reconnecting in 16344ms.
+Slack adapter gateway reconnecting in 1046ms.
+
+packages/gateway/test/memory-closure-crash.e2e.test.ts:
+Slack adapter gateway reconnecting in 9815ms.
+Slack adapter gateway reconnecting in 8165ms.
+Slack adapter gateway reconnecting in 2006ms.
+
+packages/gateway/test/slack-adapter.e2e.test.ts:
+Slack adapter gateway reconnecting in 9523ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 2453ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 2010ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/thread/C1:1726543210.000300/parent=C1 epoch=0 session=session-slack/thread/C1:1726543210.000300/parent=C1-0 effective=gjc-default changed=false source=turn
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 8915ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 9931ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 4480ms.
+Slack adapter gateway reconnecting in 9823ms.
+Slack adapter connected to gateway.
+Slack adapter gateway reconnecting in 8402ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/dm/D1/peer=U1 epoch=0 session=session-slack/dm/D1/peer=U1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 4011ms.
+Slack adapter gateway reconnecting in 4512ms.
+Slack adapter connected to gateway.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/lane-governor-redteam.test.ts:
+Slack adapter gateway reconnecting in 9472ms.
+lane_retired name=recycled session=ace216b0-dc5b-46c7-a86f-6d5f5142becf reason=operator closed=true
+lane_retired name=idle session=09f8f736-a8f0-41a6-8ad8-3402bb80a5d4 reason=idle closed=true
+lane_retired name=a session=c06590f2-9369-4dad-a258-d64ebd7b2dae reason=operator closed=true
+lane_close_failed name=a session=3ee08cb5-459f-478e-88e2-882034ae5fd5 detail=close transport lost action=retained
+lane_close_failed name=a session=3ee08cb5-459f-478e-88e2-882034ae5fd5 detail=close transport lost action=session_gone
+lane_retired name=a session=3ee08cb5-459f-478e-88e2-882034ae5fd5 reason=operator closed=false
+lane_retired name=a session=5ae7d46e-bc43-47bb-8bc2-df48170db308 reason=idle closed=true
+Slack adapter gateway reconnecting in 9357ms.
+lane_retired name=a session=3d6ca0fb-503f-45ad-8fd5-320b74e23f8e reason=operator closed=true
+lane_retired name=a session=1746683d-ef18-47ca-9140-00989fb5ff53 reason=operator closed=true
+Slack adapter gateway reconnecting in 9273ms.
+lane_retired name=a session=0000aaaa-0000-4000-8000-00000000a003 reason=operator closed=true
+lane_retired name=a session=9c99d22f-5f55-4717-bb09-06f24439dc72 reason=idle closed=true
+
+packages/gateway/test/work-lane-crash.e2e.test.ts:
+Slack adapter gateway reconnecting in 16978ms.
+Slack adapter gateway reconnecting in 18117ms.
+Slack adapter gateway reconnecting in 8740ms.
+lane_retired name=crash session=78d87dd8-b067-4b59-944b-34216c576e9f reason=operator closed=true
+Slack adapter gateway reconnecting in 18984ms.
+Slack adapter gateway reconnecting in 18259ms.
+lane_retired name=crash session=a04db0f4-4cbe-4a50-b702-312b97e1ef93 reason=operator closed=true
+Slack adapter gateway reconnecting in 19343ms.
+Slack adapter gateway reconnecting in 17784ms.
+Slack adapter gateway reconnecting in 16345ms.
+Slack adapter gateway reconnecting in 18402ms.
+Slack adapter gateway reconnecting in 18244ms.
+Slack adapter gateway reconnecting in 30361ms.
+Slack adapter gateway reconnecting in 16409ms.
+Slack adapter gateway reconnecting in 16571ms.
+Slack adapter gateway reconnecting in 18780ms.
+Slack adapter gateway reconnecting in 36352ms.
+Slack adapter gateway reconnecting in 16860ms.
+Slack adapter gateway reconnecting in 16110ms.
+Slack adapter gateway reconnecting in 19131ms.
+Discord adapter gateway reconnecting in 32492ms.
+Discord adapter gateway reconnecting in 36433ms.
+
+packages/gateway/test/message-edit.test.ts:
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/dm/d1/peer=owner opRef=gw-p-0bcfc4629ccc00defe771a40ad02c531 messageId=edit:m-1:c3f9b1d3f6dff5eb
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+Discord adapter gateway reconnecting in 33720ms.
+persona_model origin=discord/channel/c1 epoch=0 session=discord/channel/c1#0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/c1 opRef=gw-p-c54b78a635256250b5edaccfd83ddc2c messageId=edit:m-2:bfc0f4e1dbb82da3
+persona_model origin=discord/channel/c1 epoch=0 session=discord/channel/c1#0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+steer_ambiguous origin=discord/dm/d1/peer=owner message=m-2 action=replay attempt=1 detail=gjc sdk turn.steer exited 1
+steer_ambiguous origin=discord/dm/d1/peer=owner message=m-2 action=replay attempt=2 detail=gjc sdk turn.steer exited 1
+steer_hold origin=discord/dm/d1/peer=owner message=m-2 opRef=gw-p-90d33145059826efd5bd129fa1cd21ff reason=transport_torn detail=gjc sdk turn.steer exited 1
+steer_delivered originKey=discord/dm/d1/peer=owner opRef=gw-p-90d33145059826efd5bd129fa1cd21ff messageId=m-2
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+steer_ambiguous origin=discord/dm/d1/peer=owner message=m-2 action=replay attempt=1 detail=gjc sdk turn.steer exited 1
+steer_ambiguous origin=discord/dm/d1/peer=owner message=m-2 action=replay attempt=2 detail=gjc sdk turn.steer exited 1
+steer_hold origin=discord/dm/d1/peer=owner message=m-2 opRef=gw-p-18b613137f04bd6105bbb1d0be5cf33a reason=transport_torn detail=gjc sdk turn.steer exited 1
+Slack adapter gateway reconnecting in 31208ms.
+steer_hold origin=discord/dm/d1/peer=owner message=m-2 opRef=gw-p-18b613137f04bd6105bbb1d0be5cf33a reason=unresolved_at_terminal detail=gjc sdk turn.steer exited 1
+steer_hold origin=discord/dm/d1/peer=owner message=m-2 opRef=gw-p-18b613137f04bd6105bbb1d0be5cf33a reason=unresolved_after_terminal detail=gjc sdk turn.steer exited 1
+steer_delivered originKey=discord/dm/d1/peer=owner opRef=gw-p-18b613137f04bd6105bbb1d0be5cf33a messageId=m-2
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=discord/dm/d1/peer=owner#0 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/session-restart.test.ts:
+Discord adapter gateway reconnecting in 34709ms.
+Slack adapter gateway reconnecting in 32134ms.
+Slack adapter gateway reconnecting in 35385ms.
+Slack adapter gateway reconnecting in 35585ms.
+Slack adapter gateway reconnecting in 32321ms.
+Slack adapter gateway reconnecting in 30512ms.
+
+packages/gateway/test/latency-fixes.test.ts:
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=mock-session effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/chan-1 opRef=gw-p-c35b0f9ce2f373f381a7c8bd029bf94a messageId=m-d2
+Slack adapter gateway reconnecting in 35604ms.
+Slack adapter gateway reconnecting in 37066ms.
+Slack adapter gateway reconnecting in 32333ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-e0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/chan-1 epoch=0 opRef=gw-p-d949c1473917b1f54bdc31b526da2521 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] session send failed: Session "dead-beef" not found.
+
+packages/gateway/test/memory-storm.test.ts:
+Slack adapter gateway reconnecting in 36495ms.
+Slack adapter gateway reconnecting in 37226ms.
+Slack adapter gateway reconnecting in 34540ms.
+memory intent faaafe49-560b-4a72-9b23-d24b5c33a79e failed; left for boot recovery: invalid memory intent faaafe49-560b-4a72-9b23-d24b5c33a79e
+Slack adapter gateway reconnecting in 34039ms.
+
+packages/gateway/test/rapid-fragments.test.ts:
+persona_model origin=loopback/loopback/coalesce epoch=0 session=session-1 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/coalesce opRef=gw-p-ac88e7b0243ef16b255672d4f1104916 messageId=m-2
+steer_delivered originKey=loopback/loopback/coalesce opRef=gw-p-ac88e7b0243ef16b255672d4f1104916 messageId=m-3
+
+packages/gateway/test/coverage-audit.test.ts:
+persona_model origin=loopback/loopback/coverage epoch=0 session=session-loopback/loopback/coverage-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/coverage opRef=gw-p-3665d2ac06d88172c297092ef5781ab8 messageId=boundary-member
+persona_model origin=loopback/loopback/coverage epoch=0 session=session-loopback/loopback/coverage-0 effective=gjc-default changed=false source=turn
+steer_failed origin=loopback/loopback/coverage message=steer-failure action=recover detail=gjc sdk turn.steer reported failure: {"code":"busy","message":"no running turn"}
+persona_model origin=loopback/loopback/coverage epoch=0 session=session-loopback/loopback/coverage-0 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/coverage epoch=0 session=session-loopback/loopback/coverage-0 effective=gjc-default changed=false source=turn
+broker_generation_fenced originKey=loopback/loopback/coverage epoch=0 oldGeneration=1 generation=2
+steer_delivered originKey=loopback/loopback/coverage opRef=gw-p-85ed6b3379f0eae0582318fd687276d4 messageId=restart-steer
+terminal_status_reconciled origin=loopback/loopback/coverage epoch=0 opRef=gw-p-85ed6b3379f0eae0582318fd687276d4 tail_evidence=unavailable
+
+packages/gateway/test/context-turn.test.ts:
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/context-turn epoch=0 opRef=gw-p-e8b8a716ad6dba1ce7df5c98fd6d428c status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] runtime failed before reply
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/context-turn epoch=0 opRef=gw-p-c6ec711fe1d6ce6fb1e7fe1666364000 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] runtime failed after visible reply
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/context-turn epoch=0 opRef=gw-p-38b2f361db9e92059494fdb1e99b6182 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+failed_turn_answer_recovered origin=discord/channel/context-turn epoch=0 opRef=gw-p-38b2f361db9e92059494fdb1e99b6182 chars=8
+[turn failed] runtime failed before reply
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/context-turn epoch=0 opRef=gw-p-a8ea2ff2a89fc9600841ee041d5a6455 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] runtime failed after visible reaction
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/context-turn opRef=gw-p-3d740d559d3efba31449d0da3248fd06 messageId=queued-before-reset
+retired_hold originKey=discord/channel/context-turn epoch=0 opRef=gw-p-3d740d559d3efba31449d0da3248fd06 reason=/new
+persona_new origin=discord/channel/context-turn epoch=1 discarded_pending=0
+terminal_status_reconciled origin=discord/channel/context-turn epoch=0 opRef=gw-p-3d740d559d3efba31449d0da3248fd06 tail_evidence=unavailable
+retired_session_host origin=discord/channel/context-turn session=session-discord/channel/context-turn-0 reason=retired_turn_reconciled outcome=terminated pid=40001
+persona_new origin=discord/channel/context-turn epoch=1 discarded_pending=0
+persona_model origin=discord/channel/context-turn epoch=1 session=session-discord/channel/context-turn-1 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/context-turn epoch=0 opRef=gw-p-9dfaaac8af79a1a571beab8fc78e2a0c status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] failed before delivery
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/channel/context-turn epoch=0 opRef=gw-p-c57f31a2521cc00ba15625ba4c7c33a3 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] failed after delivery
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_new origin=discord/channel/context-turn epoch=1 discarded_pending=0
+retired_session_host origin=discord/channel/context-turn session=session-discord/channel/context-turn-0 reason=reset outcome=terminated pid=40001
+persona_model origin=discord/channel/context-turn epoch=1 session=session-discord/channel/context-turn-1 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/context-turn epoch=0 session=session-discord/channel/context-turn-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 31189ms.
+
+packages/gateway/test/monitor-batched-recovery.test.ts:
+monitor dispatch failed (authoring_response_invalid): events 657154ff-98ef-40e6-93b2-7f8b72ca3eae
+monitor answer off contract for monitor/eventtype/memory.canonicalize (monitor f3e483aa-e5f3-4d67-ad38-99fa360af418): reason=protocol_unknown_event protocol_failures=1/3 context_failures=0 (unchanged)
+Slack adapter gateway reconnecting in 35112ms.
+monitor dispatch failed (authoring_response_invalid): events 5709a0df-d489-42ac-b5e2-bdf94c764839
+monitor answer off contract for monitor/eventtype/memory.canonicalize (monitor 82f4b53e-0d21-48e6-92e4-ae5e74256cd4): reason=protocol_unknown_event protocol_failures=1/3 context_failures=0 (unchanged)
+monitor dispatch failed (internal_error): events a2b2129b-66a0-4f98-b2e9-61cdb547ff0e
+monitor dispatch failed (internal_error): events a2b2129b-66a0-4f98-b2e9-61cdb547ff0e
+
+packages/gateway/test/monitor-update.test.ts:
+Slack adapter gateway reconnecting in 36062ms.
+
+packages/gateway/test/lane-governor.test.ts:
+lane_retired name=a session=0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0 reason=idle closed=true
+
+packages/gateway/test/reactions.test.ts:
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/chan-1 opRef=gw-p-d7a64252b52464983a272c8fc5a0294f messageId=m2
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/chan-1 opRef=gw-p-e780b12bb34296d891b2f729197ecc60 messageId=m2
+gateway reaction rejected (duplicate) for discord/channel/chan-1 message m2: 👀 is already applied to message m2
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 31226ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 60000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+gateway reaction rejected (turn_cap) for discord/channel/chan-1 message 4: turn 1722c65c-cd13-4450-9f6d-5fafd184b252 already emitted 3 reaction(s), cap is 3
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+gateway reaction rejected (message_cap) for discord/channel/chan-1 message same: message same already carries 1 reaction(s), cap is 1
+gateway reaction rejected (duplicate) for discord/channel/chan-1 message same: 👍 is already applied to message same
+Slack adapter gateway reconnecting in 587ms.
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 24 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Slack adapter gateway reconnecting in 606ms.
+Slack adapter gateway reconnecting in 1217ms.
+Slack adapter gateway reconnecting in 518ms.
+Slack adapter gateway reconnecting in 1087ms.
+Slack adapter gateway reconnecting in 537ms.
+Slack adapter gateway reconnecting in 1013ms.
+Slack adapter gateway reconnecting in 32680ms.
+Slack adapter gateway reconnecting in 561ms.
+Slack adapter gateway reconnecting in 1199ms.
+Slack adapter gateway reconnecting in 2489ms.
+Slack adapter gateway reconnecting in 569ms.
+Slack adapter gateway reconnecting in 2459ms.
+Slack adapter gateway reconnecting in 1228ms.
+Slack adapter gateway reconnecting in 516ms.
+Slack adapter gateway reconnecting in 2151ms.
+Slack adapter gateway reconnecting in 1065ms.
+persona_model origin=telegram/channel/chan-1 epoch=0 session=session-telegram/channel/chan-1-0 effective=gjc-default changed=false source=turn
+gateway reaction skipped for telegram/channel/chan-1: telegram cannot react with ✅ (check)
+Slack adapter gateway reconnecting in 619ms.
+Slack adapter gateway reconnecting in 1171ms.
+persona_model origin=slack/channel/C1 epoch=0 session=session-slack/channel/C1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 2303ms.
+Slack adapter gateway reconnecting in 1131ms.
+Slack adapter gateway reconnecting in 2173ms.
+Slack adapter gateway reconnecting in 2451ms.
+
+packages/gateway/test/silence.test.ts:
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 2279ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 4346ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 2139ms.
+Slack adapter gateway reconnecting in 4340ms.
+Slack adapter gateway reconnecting in 4710ms.
+
+packages/gateway/test/session-port.test.ts:
+session_rebound origin=public-session-gone epoch=0 nextEpoch=1 session=saved-1 reason=not_live_or_disowned_by_broker
+session_rebound origin=monitor/eventtype/x epoch=1 nextEpoch=2 session=dead-session reason=not_live_or_disowned_by_broker
+session_busy_wait session=sdk-1 opRef=gw-p-busy1
+session_busy_wait session=sdk-1 opRef=gw-p-busy2
+status_relay_unavailable session=sdk-1 opRef=gw-torn-1
+status_relay_unavailable session=sdk-1 opRef=gw-torn-1
+{"recovery":{"recovered":0,"pending":0,"pruned":0}}
+persona_model origin=discord/channel/channel epoch=0 session=900c4d62-3044-445a-9049-5d7b3288d0f4 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/delivery-crash.e2e.test.ts:
+Slack adapter gateway reconnecting in 4033ms.
+gateway_pid_stale pid=65623 home=/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-crash-NpGo4F reason=not_a_live_gateway_for_this_home
+{"recovery":{"recovered":1,"pending":1,"pruned":0}}
+
+packages/gateway/test/terminate-host.test.ts:
+Slack adapter gateway reconnecting in 4303ms.
+
+packages/gateway/test/reactions-redteam.e2e.test.ts:
+Slack adapter gateway reconnecting in 4461ms.
+Slack adapter gateway reconnecting in 4984ms.
+Slack adapter gateway reconnecting in 4873ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 8638ms.
+Discord adapter gateway reconnecting in 31051ms.
+Slack adapter gateway reconnecting in 8909ms.
+Slack adapter gateway reconnecting in 8743ms.
+Slack adapter gateway reconnecting in 9164ms.
+Slack adapter gateway reconnecting in 9809ms.
+Slack adapter gateway reconnecting in 9710ms.
+Slack adapter gateway reconnecting in 8768ms.
+Slack adapter gateway reconnecting in 9152ms.
+Slack adapter gateway reconnecting in 33116ms.
+Discord adapter gateway reconnecting in 32372ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 31794ms.
+Slack adapter gateway reconnecting in 30628ms.
+Discord adapter gateway reconnecting in 32697ms.
+Slack adapter gateway reconnecting in 35484ms.
+Slack adapter gateway reconnecting in 19503ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 17345ms.
+Slack adapter gateway reconnecting in 18274ms.
+Slack adapter gateway reconnecting in 30425ms.
+Slack adapter gateway reconnecting in 17066ms.
+Discord adapter gateway reconnecting in 35687ms.
+Slack adapter gateway reconnecting in 16080ms.
+Slack adapter gateway reconnecting in 33054ms.
+Slack adapter gateway reconnecting in 16886ms.
+delivery_expired deliveryId=04701d85-b88b-486c-85d8-72fb3462447c origin=discord/channel/chan-1 attempts=5 reason=Unknown_Message
+Slack adapter gateway reconnecting in 18022ms.
+Slack adapter gateway reconnecting in 33967ms.
+Slack adapter gateway reconnecting in 19752ms.
+Slack adapter gateway reconnecting in 36095ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 33611ms.
+Slack adapter gateway reconnecting in 30608ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 32560ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 30482ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 33705ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 34643ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 30782ms.
+persona_model origin=loopback/loopback/loopback epoch=0 session=session-loopback/loopback/loopback-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 30260ms.
+persona_model origin=loopback/loopback/loopback epoch=0 session=session-loopback/loopback/loopback-0 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 33250ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 34629ms.
+Slack adapter gateway reconnecting in 35044ms.
+Slack adapter gateway reconnecting in 31471ms.
+Slack adapter gateway reconnecting in 36253ms.
+Slack adapter gateway reconnecting in 36179ms.
+persona_model origin=telegram/dm/22/peer=44 epoch=0 session=session-telegram/dm/22/peer=44-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 37104ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 30874ms.
+Slack adapter gateway reconnecting in 32867ms.
+
+packages/gateway/test/takeover.test.ts:
+{"recovery":{"recovered":0,"pending":0,"pruned":0}}
+
+packages/gateway/test/steering.test.ts:
+persona_model origin=loopback/loopback/steering epoch=0 session=session-loopback/loopback/steering-0 effective=gjc-default changed=false source=turn
+steer_delivered originKey=loopback/loopback/steering opRef=gw-p-31a59a15163e4838589c0a454115445a messageId=correction
+persona_model origin=loopback/loopback/steering epoch=0 session=session-loopback/loopback/steering-0 effective=gjc-default changed=false source=turn
+persona_model origin=loopback/loopback/steering epoch=0 session=session-loopback/loopback/steering-0 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/server.test.ts:
+persona_model origin=loopback/loopback/loopback epoch=0 session=a186f04c-e028-4037-8356-8a425fba3e2e effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/delivery-test/peer=owner epoch=0 session=6e75d545-d2b9-4d2f-bc76-384640964a0a effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 35710ms.
+Discord adapter gateway reconnecting in 33464ms.
+delivery_expired deliveryId=monitor-delivery origin=loopback/loopback/loopback attempts=5 reason=discord_503
+persona_new origin=slack/thread/C1:1700000000.000100/parent=C1 epoch=1 discarded_pending=0
+persona_model origin=discord/dm/c1/peer=p1 epoch=0 session=ae38473f-6e08-4b8b-b6d4-a3f9d15d770e effective=gjc-default changed=false source=turn
+terminal_failure origin=discord/dm/c1/peer=p1 epoch=0 opRef=gw-p-2033109be52086a89d15d0c5ebec0fb8 status=failed code=unknown provider_code=unknown phase=unknown category=unknown provenance=unknown
+[turn failed] session operation stalled without terminal evidence
+persona_model origin=discord/dm/c1/peer=p1 epoch=0 session=8b81963d-e5fb-40cf-aa97-3775fe93efb8 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 35732ms.
+persona_model origin=discord/dm/c1/peer=p1 epoch=0 session=ec3b19df-0c61-45ec-b658-74ac45707982 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/c1/peer=p1 epoch=0 session=414c45fb-43fa-4b64-9eac-c396d5c5e0fa effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/c1 epoch=0 session=d5ece506-add9-42d4-88c5-773c038f819f effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/c1 epoch=0 session=d5ece506-add9-42d4-88c5-773c038f819f effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d1/peer=owner epoch=0 session=ca3d312d-67d1-4713-bace-92219533449e effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/dm/d1/peer=owner opRef=gw-p-597d154c8579ff16965b8cd1da0197e7 messageId=e634eff2-269f-4fc8-baa5-fe4b8eb2bc26
+steer_delivered originKey=discord/dm/d1/peer=owner opRef=gw-p-597d154c8579ff16965b8cd1da0197e7 messageId=85c4b37d-7025-4b24-8840-218c277f42f4
+persona_model origin=discord/channel/c1 epoch=0 session=beb28ea3-998b-4cc3-9cc2-2ed80950b1d1 effective=gjc-default changed=false source=turn
+steer_delivered originKey=discord/channel/c1 opRef=gw-p-25e9b503f7f33b78a9935040bafbace9 messageId=m2
+steer_delivered originKey=discord/channel/c1 opRef=gw-p-25e9b503f7f33b78a9935040bafbace9 messageId=m3
+persona_model origin=discord/channel/c1 epoch=0 session=beb28ea3-998b-4cc3-9cc2-2ed80950b1d1 effective=gjc-default changed=false source=turn
+gateway restart requested by owner via discord/dm/d-owner/peer=owner
+persona_model origin=discord/channel/c1 epoch=0 session=b6d652db-83c9-4352-826d-294c9dafed0e effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/c1/peer=p1 epoch=0 session=569c5417-1f6d-44c1-ac74-deff4295d2ba effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 35322ms.
+Discord adapter gateway reconnecting in 36796ms.
+lane_retired name=a session=b4a2cfa7-478c-41dc-a4cb-43a12f1995cf reason=operator closed=true
+persona_model origin=loopback/loopback/loopback epoch=0 session=6c93b793-9862-416a-885e-8a65e7d4c554 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d-att/peer=owner epoch=0 session=6fe55000-6db0-410a-a7c1-76de8dfefe94 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d-hist/peer=owner epoch=0 session=3b0b20cb-2765-4078-a277-7a4159eff4c7 effective=gjc-default changed=false source=turn
+persona_model origin=discord/dm/d-hist/peer=owner epoch=0 session=3b0b20cb-2765-4078-a277-7a4159eff4c7 effective=gjc-default changed=false source=turn
+persona_model origin=discord/channel/c1 epoch=0 session=4344a371-2a8a-4b80-9f26-67249a2827fb effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 37028ms.
+persona_model origin=discord/channel/c1 epoch=0 session=4344a371-2a8a-4b80-9f26-67249a2827fb effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 36418ms.
+Slack adapter gateway reconnecting in 33491ms.
+
+packages/gateway/test/broker-authority-cutover.test.ts:
+Discord adapter gateway reconnecting in 36227ms.
+
+packages/gateway/test/config-reload-live.test.ts:
+gateway config reload (verb reload) FAILED; keeping the previous config: config_invalid: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-reload-3UMYat/config.json is missing; keeping the previous configuration
+gateway config reload (verb reload) ok; applied=[mentionAllowlist] restart-required=[] ignored=[]
+persona_model origin=discord/channel/c1 epoch=0 session=session-0 effective=gjc-default changed=false source=turn
+gateway config reload (verb reload) ok; applied=[] restart-required=[dbPath,model] ignored=[]
+gateway config reload (verb reload) FAILED; keeping the previous config: config_invalid: could not parse /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/gajaeway-reload-bQdP3x/config.json
+gateway config reload (SIGHUP) ok; applied=[mentionAllowlist] restart-required=[] ignored=[]
+gateway config reload (SIGHUP) FAILED; keeping the previous config: config_invalid: /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gw-test-54830-kL4whj/slack-rt-e2e-vQMQAa/config.json is missing; keeping the previous configuration
+persona_model origin=discord/channel/c1 epoch=0 session=session-0 effective=gjc-default changed=false source=turn
+
+packages/gateway/test/session-rebind.test.ts:
+recovery_hold origin=loopback/loopback/tail-evidence epoch=0 opRef=gw-p-c4982ff9c55cb8ad5888b8a771e762b5 reason=operation state terminal_uncertain is not decidable; do not resend, resume or recreate sweeps=1
+
+packages/gateway/test/monitor-settlement-protocol.test.ts:
+Slack adapter gateway reconnecting in 37491ms.
+delivery_expired deliveryId=e603fe80-c932-4426-af39-842414a04744 origin=loopback/loopback/loopback attempts=5 reason=adapter_down
+
+packages/gateway/test/context-diff.test.ts:
+Slack adapter gateway reconnecting in 32696ms.
+
+packages/gateway/test/memory-axes.test.ts:
+Slack adapter gateway reconnecting in 34024ms.
+
+packages/gateway/test/terminal-idempotency.e2e.test.ts:
+Slack adapter gateway reconnecting in 30699ms.
+Slack adapter gateway reconnecting in 34964ms.
+Discord adapter gateway reconnecting in 30112ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Slack adapter gateway reconnecting in 31402ms.
+Slack adapter gateway reconnecting in 30182ms.
+Slack adapter gateway reconnecting in 34829ms.
+Slack adapter gateway reconnecting in 32055ms.
+Slack adapter gateway reconnecting in 33568ms.
+Discord recovery hit the 5-page bound for channel channel-1 after 0 fresh message(s), 0 duplicate(s), and 0 skip(s); cursor unchanged at 1553140415232737280.
+Discord recovery retrying in 60000ms.
+Discord recovery holding message 1553140411088764928 in channel channel-1 after 3 failed chat.send attempts (retryable: ECONNRESET: connection reset); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122717564928; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery holding message 1553140411143290880 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: verb_failed: write path did something); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793122772090880; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Slack adapter gateway reconnecting in 33162ms.
+Slack adapter gateway reconnecting in 30324ms.
+shutdown_hold origin=discord/channel/chan-1 epoch=0 opRef=gw-p-e7f8d5c02324e2e7083f89ca0cc88b38
+terminal_status_reconciled origin=discord/channel/chan-1 epoch=0 opRef=gw-p-e7f8d5c02324e2e7083f89ca0cc88b38 tail_evidence=unavailable
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+Discord recovery holding message 1553140420974739456 in channel channel-1 after 3 failed chat.send attempts (write-path-unknown: invalid_params: non-loopback chat.send requires engagement); cursor stays behind it and the pass retries with backoff.
+Discord recovery paused for channel channel-1 at message 1552793132607733760; gateway unavailable, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421037654016 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421079597056 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140421121540096 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793132666454016; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery could not read history for channel channel-broken: discord history 500; other channels continue, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery aborted for conversation channel-broken: Discord thread channel-broken has no parent channel id
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421431918592 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140425626222592 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery proposes discarding message 1553140434014830592 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: message too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133111050240; 3 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Discord recovery proposes discarding message 1553140421545164800 in channel channel-1 after 27 terminal chat.send rejections (payload_too_large: content too long); held until a later message proves the write path works.
+Discord recovery paused for channel channel-1 at message 1552793133224296448; 1 message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing, retrying with backoff.
+Discord recovery retrying in 60000ms.
+Slack adapter gateway reconnecting in 30707ms.
+persona_model origin=discord/channel/chan-1 epoch=0 session=session-discord/channel/chan-1-0 effective=gjc-default changed=false source=turn
+
+ 2473 pass
+ 6 skip
+ 0 fail
+ 13243 expect() calls
+Ran 2479 tests across 173 files. [188.72s]

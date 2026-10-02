@@ -343,7 +343,7 @@ for (const unavailable of [false, true]) {
 			const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 			expect(await governor.retire("a", "operator")).toMatchObject({
 				retired: false,
-				reason: expect.stringContaining(unavailable ? "status unavailable" : "broker reports in_flight"),
+				reason: expect.stringContaining(unavailable ? "broker reports" : "broker reports in_flight"),
 			});
 			expect(await governor.sweep()).toBe(0);
 			expect(port.closes).toEqual([]);

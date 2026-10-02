@@ -7,7 +7,7 @@ import { GjcCliError } from "@gajae-gateway/subsession";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 let home = "";
@@ -28,6 +28,31 @@ afterEach(async () => {
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "persona" } as const;
 const KEY = "loopback/loopback/persona";
 
+async function establishStoredSession(port: ScriptedSessionPort, messageId: string) {
+	enqueue(messageId, "seed turn");
+	await manager!.notifyInbound(KEY);
+	const stored = port.sends.at(-1)!;
+	port.complete(stored.opRef, "seed answer");
+	await manager!.tick(KEY);
+	await eventually(
+		() => database!.inboundTurnRow(stored.opRef)?.turn_state === "done",
+		"seed turn did not settle before the stored session was exercised",
+	);
+	return stored;
+}
+
+function trackRecoveryCalls(): () => number {
+	let calls = 0;
+	const recover = manager!.recover.bind(manager!);
+	Object.defineProperty(manager, "recover", {
+		value: async () => {
+			calls++;
+			await recover();
+		},
+	});
+	return () => calls;
+}
+
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 200; attempt++) {
 		if (predicate()) return;
@@ -36,12 +61,13 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 	expect(predicate(), message).toBe(true);
 }
 
-function enqueue(messageId: string, body: string): void {
+function enqueue(messageId: string, body: string, source: "platform" | "lane_report" = "platform"): void {
 	const accepted = database?.inboundEnqueue({
 		messageId,
 		originKey: KEY,
 		originRefJson: JSON.stringify(ORIGIN),
 		body,
+		source,
 	});
 	expect(accepted).toBe(true);
 }
@@ -65,6 +91,7 @@ async function harness(
 		released?: (opRef: string) => void;
 		failure?: (message: string) => void;
 		failureError?: (error: Error) => void;
+		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
 	extra: { brokerGeneration?: () => number } = {},
@@ -83,6 +110,7 @@ async function harness(
 			latestOpRef = turn.opRef;
 			return {
 				text: trigger.body,
+				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				onTerminal: ({ text }) => hooks.terminal?.(text),
 				onFailure: ({ error }) => {
 					hooks.failure?.(error.message);
@@ -93,6 +121,21 @@ async function harness(
 			};
 		},
 	});
+}
+
+async function settleFailedInbound(port: ScriptedSessionPort, messageId: string) {
+	enqueue(messageId, messageId);
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	await activeManager.notifyInbound(KEY);
+	const send = port.sends.at(-1);
+	if (!send) throw new Error(`failed turn ${messageId} was not dispatched`);
+	await eventually(
+		() => activeDatabase.inboundTurnRow(send.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
+		`failed turn ${messageId} did not settle`,
+	);
+	return send;
 }
 
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
@@ -545,6 +588,123 @@ for (const reason of ["unsupported_input_status", "context_exhausted"] as const)
 		expect(port.sends[1]!.opRef).toBe(personaTurnOpRef("instance-test", KEY, 1, "next"));
 	});
 
+test("provider quota exhaustion gives a safe notice and does not reset or rebind the session", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	enqueue("provider-quota", "work");
+	await activeManager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("quota turn was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_quota_exhausted");
+	port.fail(first.opRef, '402 "Grok Build usage balance exhausted"');
+	await eventually(() => activeManager.state(KEY) === "idle", "quota failure did not settle");
+
+	expect(notices).toEqual([
+		"[turn failed] provider_quota_exhausted: model provider quota/billing is exhausted (HTTP 402); switch the model preset",
+	]);
+	expect(notices.join("\n")).not.toContain("Grok Build");
+	expect(logs).toContain(`failed_turn_classified origin=${KEY} opRef=${first.opRef} reason=provider_quota_exhausted`);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(activeDatabase.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
+test("two consecutive internal submission failures reset the next inbound to a new epoch", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "Prompt submission failed.", {
+				code: "internal",
+				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+			}),
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	const first = await settleFailedInbound(port, "submission-1");
+	const second = await settleFailedInbound(port, "submission-2");
+	expect(first.sessionId).toBe("session-e0");
+	expect(second.sessionId).toBe(first.sessionId);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs).toContain(
+		`session_reset_after_failed_turn origin=${KEY} epoch=0 nextEpoch=1 opRef=${second.opRef} reason=repeated_submission_failure`,
+	);
+
+	const third = await settleFailedInbound(port, "submission-3");
+	expect(third).toMatchObject({ sessionId: "session-e1", text: "submission-3" });
+});
+
+test("a healthy turn clears consecutive internal submission failures", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) => {
+			if (input.text === "healthy") scripted.complete(input.opRef, "healthy reply");
+			else
+				scripted.fail(input.opRef, "Prompt submission failed.", {
+					code: "internal",
+					outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				});
+		},
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	const first = await settleFailedInbound(port, "submission-before-healthy");
+	const healthy = "healthy";
+	enqueue(healthy, healthy);
+	await activeManager.notifyInbound(KEY);
+	const successful = port.sends.at(-1);
+	if (!successful) throw new Error("healthy turn was not dispatched");
+	await eventually(
+		() => activeDatabase.inboundTurnRow(successful.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
+		"healthy turn did not settle",
+	);
+	const last = await settleFailedInbound(port, "submission-after-healthy");
+
+	expect(successful.sessionId).toBe(first.sessionId);
+	expect(last.sessionId).toBe(first.sessionId);
+	expect(activeDatabase.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+});
+
+test("repeated submission failures respect the reset cap and log it once per session", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "Prompt submission failed.", {
+				code: "internal",
+				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+			}),
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	const sends: (typeof port.sends)[number][] = [];
+	for (let index = 0; index < 6; index++) sends.push(await settleFailedInbound(port, `capped-submission-${index + 1}`));
+	const capped = sends[3];
+	if (!capped) throw new Error("reset cap failure was not recorded");
+
+	expect(sends.slice(0, 2).map((send) => send.sessionId)).toEqual(["session-e0", "session-e0"]);
+	expect(sends.slice(2).map((send) => send.sessionId)).toEqual([
+		"session-e1",
+		"session-e1",
+		"session-e1",
+		"session-e1",
+	]);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs.filter((line) => line.startsWith("failed_turn_reset_capped "))).toEqual([
+		`failed_turn_reset_capped origin=${KEY} epoch=1 session=session-e1 opRef=${capped.opRef} reason=repeated_submission_failure`,
+	]);
+});
+
 for (const restart of [false, true])
 	test(`origin reset cap stops repeated fresh-session failures (restart=${restart})`, async () => {
 		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
@@ -748,13 +908,226 @@ test("a session the broker disowned mid-send has its host ended after the rebind
 	enqueue("gone", "gone");
 	await manager!.notifyInbound(KEY);
 	for (let i = 0; i < 4; i++) await manager!.tick(KEY);
-	expect(logs3.some((l) => l.startsWith("persona_send_session_gone"))).toBe(true);
+	expect(logs3.some((l) => l.startsWith("send_session_disowned action=inline_rebind stage=send"))).toBe(true);
 	expect(logs3.some((l) => l.includes("retired_session_host") && l.includes("reason=session_gone"))).toBe(true);
 	// The broker said the old session is gone; its host is ended anyway (it can
 	// be disowned and still running), and the message lands on the replacement.
 	expect(port.closes.map((c) => c.sessionId)).toContain("session-e0");
 	expect(port.sends.at(-1)?.sessionId).toBe("session-e1");
 });
+
+/** Structured prompt-command error used to exercise the ambiguous post-send path. */
+function sessionNotFound(): GjcCliError {
+	return new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", {
+		code: "session_not_found",
+		message: "The broker does not know this session.",
+	});
+}
+
+for (const acceptedBeforeError of [false, true] as const)
+	test(`structured session_not_found after send stays ambiguous (acceptedBeforeError=${acceptedBeforeError})`, async () => {
+		const acceptedPrompts: string[] = [];
+		class StructuredSessionNotFoundPort extends ScriptedSessionPort {
+			rejectStructuredNotFound = false;
+
+			override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+				if (this.rejectStructuredNotFound && input.text === "possibly accepted") {
+					if (acceptedBeforeError) await super.send(input);
+					else this.sendAttempts.push(input);
+					throw sessionNotFound();
+				}
+				return await super.send(input);
+			}
+		}
+		const port = new StructuredSessionNotFoundPort({
+			onBind: (input) => `session-e${input.epoch}`,
+			onSend: (input) => {
+				if (input.text === "possibly accepted") acceptedPrompts.push(input.text);
+			},
+		});
+		const logs: string[] = [];
+		await harness(port, {}, (line) => logs.push(line));
+		await establishStoredSession(port, `seed-session-not-found-${acceptedBeforeError}`);
+		port.rejectStructuredNotFound = true;
+		const recoveryCalls = trackRecoveryCalls();
+		const text = "possibly accepted";
+		enqueue(`session-not-found-${acceptedBeforeError}`, text);
+		await manager!.notifyInbound(KEY);
+		if (acceptedBeforeError)
+			await eventually(() => acceptedPrompts.length === 1, "accepted prompt was not recorded before the command error");
+
+		const attempted = port.sendAttempts.filter((attempt) => attempt.text === text);
+		expect(attempted).toHaveLength(1);
+		expect(port.sends.filter((send) => send.text === text)).toHaveLength(acceptedBeforeError ? 1 : 0);
+		expect(acceptedPrompts).toHaveLength(acceptedBeforeError ? 1 : 0);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(port.binds).toHaveLength(1);
+		expect(recoveryCalls()).toBe(0);
+		expect(logs.some((line) => line.startsWith("persona_send_ambiguous") && line.includes(attempted[0]!.opRef))).toBe(
+			true,
+		);
+		expect(logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind"))).toBe(false);
+		expect(database!.inboundTurnRow(attempted[0]!.opRef)?.turn_state).toBe(acceptedBeforeError ? "accepted" : "bound");
+	});
+
+for (const proof of [
+	{ name: "broker reports not live", result: { live: false, disowned: false } },
+	{ name: "broker reports disowned", result: { live: undefined, disowned: true } },
+])
+	test(`plain tail attach failure rebinds the stored session when ${proof.name}`, async () => {
+		class LivenessProvenAttachPort extends ScriptedSessionPort {
+			storedSessionId: string | undefined;
+
+			override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+				if (input.sessionId === this.storedSessionId) throw new Error("host hello did not arrive");
+				return await super.attachTail(input);
+			}
+
+			override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+				if (input.sessionId === this.storedSessionId) return proof.result;
+				return await super.liveness(input);
+			}
+		}
+		const port = new LivenessProvenAttachPort({ onBind: (input) => `session-e${input.epoch}` });
+		const logs: string[] = [];
+		await harness(port, {}, (line) => logs.push(line));
+		const stored = await establishStoredSession(port, `attach-${proof.name.replaceAll(" ", "-")}`);
+		port.storedSessionId = stored.sessionId;
+		const recoveryCalls = trackRecoveryCalls();
+		enqueue(`retry-${proof.name.replaceAll(" ", "-")}`, "one delivery");
+		await manager!.notifyInbound(KEY);
+		await eventually(() => port.sends.length === 2, "liveness-proven dead binding did not dispatch on replacement");
+
+		expect(port.sends[1]).toMatchObject({ sessionId: "session-e1", text: "one delivery" });
+		expect(
+			port.sendAttempts.filter((attempt) => attempt.text === "one delivery").map((attempt) => attempt.sessionId),
+		).toEqual(["session-e1"]);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+		expect(recoveryCalls()).toBe(0);
+		expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+		expect(
+			logs.some(
+				(line) =>
+					line.startsWith("send_session_disowned action=inline_rebind stage=attach") && line.includes("nextEpoch=1"),
+			),
+		).toBe(true);
+	});
+
+for (const behavior of ["no_probe", "live", "unknown", "failed_probe", "attach_authority", "probe_authority"] as const)
+	test(`plain tail attach failure does not rebind without broker proof (${behavior})`, async () => {
+		class UnprovenAttachPort extends ScriptedSessionPort {
+			storedSessionId: string | undefined;
+
+			override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+				if (input.sessionId === this.storedSessionId) {
+					if (behavior === "attach_authority") throw new BrokerAuthorityError("authority_mismatch");
+					throw new Error("host hello did not arrive");
+				}
+				return await super.attachTail(input);
+			}
+
+			override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+				if (input.sessionId === this.storedSessionId) {
+					if (behavior === "failed_probe") throw new Error("liveness transport failed");
+					if (behavior === "probe_authority") throw new BrokerAuthorityError("authority_mismatch");
+					if (behavior === "live") return { live: true, disowned: false };
+					return { live: undefined, disowned: false };
+				}
+				return await super.liveness(input);
+			}
+		}
+		const port = new UnprovenAttachPort({ onBind: (input) => `session-e${input.epoch}` });
+		const logs: string[] = [];
+		await harness(port, {}, (line) => logs.push(line));
+		const stored = await establishStoredSession(port, `unproven-${behavior}`);
+		port.storedSessionId = stored.sessionId;
+		if (behavior === "no_probe") Object.defineProperty(port, "liveness", { value: undefined });
+		enqueue(`unproven-retry-${behavior}`, "do not replay");
+		const failure = await manager!.notifyInbound(KEY).catch((error: unknown) => error);
+
+		if (behavior === "attach_authority" || behavior === "probe_authority")
+			expect(failure).toBeInstanceOf(BrokerAuthorityError);
+		else expect(failure).toMatchObject({ message: "host hello did not arrive" });
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds).toHaveLength(1);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind"))).toBe(false);
+	});
+
+test("session_not_found text without the broker error code remains ambiguous and is never replayed", async () => {
+	class AmbiguousSessionTextPort extends ScriptedSessionPort {
+		rejectAmbiguous = false;
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			if (!this.rejectAmbiguous) return await super.send(input);
+			this.sendAttempts.push(input);
+			throw new GjcCliError("turn.prompt failed: session_not_found", 0, "", { code: "timeout" });
+		}
+	}
+	const port = new AmbiguousSessionTextPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("ambiguous-session-seed", "seed turn");
+	await manager!.notifyInbound(KEY);
+	const stored = port.sends[0]!;
+	port.complete(stored.opRef, "seed answer");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inboundTurnRow(stored.opRef)?.turn_state === "done", "seed turn did not settle");
+	port.rejectAmbiguous = true;
+	enqueue("ambiguous-session-text", "do not duplicate");
+	await manager!.notifyInbound(KEY);
+
+	expect(port.sendAttempts).toHaveLength(2);
+	expect(port.sends).toHaveLength(1);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("persona_send_ambiguous"))).toBe(true);
+	expect(logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind"))).toBe(false);
+});
+
+for (const authorityFailure of ["direct", "probe"] as const)
+	test(`stale held steer propagates BrokerAuthorityError from ${authorityFailure}`, async () => {
+		let mode: "initial" | "direct" | "probe" = "initial";
+		class AuthorityFailurePort extends ScriptedSessionPort {
+			override async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]) {
+				this.steers.push(input);
+				if (mode === "direct") throw new BrokerAuthorityError("authority_mismatch");
+				throw new Error("unknown transport outcome");
+			}
+
+			override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+				if (mode === "probe") throw new BrokerAuthorityError("authority_mismatch");
+				return await super.liveness(input);
+			}
+		}
+		const port = new AuthorityFailurePort({ onBind: (input) => `session-e${input.epoch}` });
+		await harness(port);
+		enqueue(`held-steer-authority-${authorityFailure}`, "original");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		enqueue(`held-steer-${authorityFailure}`, "uncertain steer");
+		await manager!.notifyInbound(KEY);
+		expect(database!.inboundSteersHeld(first.opRef).map((row) => row.message_id)).toEqual([
+			`held-steer-${authorityFailure}`,
+		]);
+
+		port.complete(first.opRef, "answer");
+		await manager!.tick(KEY);
+		await eventually(
+			() => database!.inboundTurnRow(first.opRef)?.turn_state === "done",
+			"trigger did not become terminal before the stale steer replay",
+		);
+		mode = authorityFailure;
+		const priorSteers = port.steers.length;
+		const failure = await manager!.tick(KEY).catch((error: unknown) => error);
+
+		expect(failure).toBeInstanceOf(BrokerAuthorityError);
+		expect(port.steers).toHaveLength(priorSteers + 1);
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds).toHaveLength(1);
+		expect(database!.inboundSteersHeld(first.opRef).map((row) => row.message_id)).toEqual([
+			`held-steer-${authorityFailure}`,
+		]);
+	});
 
 for (const exact of [false, true])
 	test(`recovered failed terminal grace never resends its trigger (exact=${exact})`, async () => {
@@ -1016,6 +1389,148 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 		"retired turn did not reconcile",
 	);
 	expect(terminal).toEqual([]);
+});
+
+/** The gjc 0.17.x envelope for a session the broker stopped serving, as the CLI parser surfaces it. */
+function endpointStale(): GjcCliError {
+	return new GjcCliError('gjc sdk session status reported failure: {"code":"endpoint_stale"}', 0, "", {
+		code: "endpoint_stale",
+		category: "unavailable",
+		message: "The SDK endpoint is stale or unavailable.",
+	});
+}
+
+/** A broker restart dropped this session: every status read fails endpoint_stale and the host is gone. */
+class DroppedSessionPort extends ScriptedSessionPort {
+	readonly dropped = new Set<string>();
+	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+		if (this.dropped.has(input.sessionId)) throw endpointStale();
+		return await super.status(input);
+	}
+	override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+		if (this.dropped.has(input.sessionId)) return { live: false, disowned: false };
+		return await super.liveness(input);
+	}
+}
+
+test("a /new-retired turn whose session a broker restart dropped is closed instead of re-checked forever", async () => {
+	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("m-1", "old turn");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const old = port.sends[0]!;
+	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	expect(database?.inboundTurnRow(old.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+
+	port.dropped.add(old.sessionId);
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(old.opRef)?.turn_state === "done", "retired turn was not closed");
+	expect(logs.some((line) => line.startsWith("retired_turn_closed") && line.includes(old.opRef))).toBe(true);
+	// Recorded as a discarded turn, not as an answered-without-delivery one.
+	expect(database?.inboundTurnRow(old.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "retired" }));
+	// Closed, never re-sent: the discarded prompt is not replayed into the new session.
+	expect(port.sends).toHaveLength(1);
+	const holdsAfter = logs.filter((line) => line.startsWith("recovery_hold") && line.includes(old.opRef)).length;
+	await manager!.tick(KEY);
+	expect(logs.filter((line) => line.startsWith("recovery_hold") && line.includes(old.opRef)).length).toBe(holdsAfter);
+});
+
+test("an ACCEPTED live turn whose session answers endpoint_stale and is not live is closed with a notice, never re-sent", async () => {
+	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const failures: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) }, (line) => logs.push(line));
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	expect(database?.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
+
+	port.dropped.add(first.sessionId);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef)),
+		`endpoint_stale was not classified as session_unavailable:\n${logs.join("\n")}`,
+	);
+	// The model may already have run and acted: the trigger is closed, never re-sent.
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(port.sends).toHaveLength(1);
+	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+	// The owner is told the turn was cut off instead of waiting on silence.
+	expect(failures).toHaveLength(1);
+	expect(failures[0]).toContain("session_unavailable");
+	// The next message gets a fresh session instead of the dead one.
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	enqueue("m-2", "next question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2, "next message was not dispatched");
+	expect(port.sends[1]!.text).toBe("next question");
+	expect(port.sends[1]!.sessionId).not.toBe(first.sessionId);
+});
+
+test("an ACCEPTED turn whose status is endpoint_stale but whose liveness is unanswerable is held, never closed or re-sent", async () => {
+	class UnknownLivenessPort extends DroppedSessionPort {
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			if (this.dropped.has(input.sessionId)) return { live: undefined, disowned: false };
+			return await super.liveness(input);
+		}
+	}
+	const port = new UnknownLivenessPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	port.dropped.add(first.sessionId);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.startsWith("recovery_hold") && line.includes(first.opRef)),
+		"unanswerable liveness did not hold the turn",
+	);
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(port.sends).toHaveLength(1);
+	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
+});
+
+test("a dead-session close whose notice fails to persist leaves the turn open and retries the notice; it is never lost or duplicated", async () => {
+	const port = new DroppedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	let failNotice = true;
+	const notices: string[] = [];
+	await harness(
+		port,
+		{
+			failure: (message) => {
+				if (failNotice) throw new Error("ledger write failed");
+				notices.push(message);
+			},
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	port.dropped.add(first.sessionId);
+
+	await manager!.tick(KEY).catch(() => {});
+	// Persisting the notice failed: the trigger is NOT closed and the binding is kept.
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
+
+	failNotice = false;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "retry did not close the turn");
+	expect(notices).toHaveLength(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	// A further sweep finds it closed: no second notice, no resend.
+	await manager!.tick(KEY);
+	expect(notices).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
 });
 
 test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {
@@ -1326,6 +1841,29 @@ test("startup recovery releases a retired bound turn the broker disowns instead 
 	expect(logs.filter((line) => line.includes(`opRef=${ghostOpRef}`) && line.startsWith("recovery_hold"))).toEqual([]);
 });
 
+test("a tail attach that fails before any send releases the lifecycle it created", async () => {
+	class HelloLostOncePort extends ScriptedSessionPort {
+		failures = 0;
+		override async attachTail(input: TailAttachInput) {
+			if (this.failures === 0) {
+				this.failures += 1;
+				throw new Error("host hello did not arrive");
+			}
+			return await super.attachTail(input);
+		}
+	}
+	const port = new HelloLostOncePort();
+	const released: string[] = [];
+	await harness(port, { released: (opRef) => released.push(opRef) });
+	enqueue("hello-lost", "reply after the relay recovers");
+	await manager?.notifyInbound(KEY).catch(() => undefined);
+
+	expect(port.failures).toBe(1);
+	expect(port.sends).toEqual([]);
+	expect(released).toEqual([latestOpRef]);
+	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+});
+
 test("startup recovery reconstructs an accepted durable turn and reconciles status plus turn.result", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
@@ -1372,6 +1910,57 @@ test("notifyInbound immediately starts a turn while idle", async () => {
 	expect(port.sends).toEqual([expect.objectContaining({ text: "live policy", opRef: latestOpRef })]);
 });
 
+test("lane_report steer uses lane framing, not user framing", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("human-trigger", "first");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "initial persona turn did not start");
+	enqueue("lane-report-steer", "[lane child] completed: result", "lane_report");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.steers.length === 1, "lane report was not steered into the running turn");
+	expect(port.steers[0]?.text).toBe(
+		"[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[lane child] completed: result",
+	);
+	expect(port.steers[0]?.text).not.toContain("Additional message from the user");
+	expect(database!.inboundTurnRows(latestOpRef)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ message_id: "lane-report-steer", source: "lane_report", turn_role: "steer" }),
+		]),
+	);
+});
+
+test("/new keeps pending lane_report rows while discarding platform rows", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("platform-before-new", "old human", "platform");
+	enqueue("internal-before-new", "[lane child] attempt_ended", "lane_report");
+	await manager!.reset(KEY, JSON.stringify(ORIGIN), "2030-09-01T00:00:00.000Z");
+	await eventually(() => port.sends.length === 1, "pending lane report was not admitted after /new");
+	expect(database!.inboundTurnRow(latestOpRef)).toMatchObject({
+		message_id: "internal-before-new",
+		source: "lane_report",
+		state: "pending",
+	});
+	expect(port.sends[0]?.text).toBe("[lane child] attempt_ended");
+});
+
+test("admissionHold reports a quarantined nonterminal persona turn", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("quarantined-trigger", "original request");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const authority = database!.inspectBrokerAuthority().authority;
+	if (!authority) throw new Error("fixture broker authority missing");
+	database!.cutoverBrokerAuthority({
+		expectedAuthority: authority,
+		targetAuthority: { canonicalAgentDir: join(home, "next-agent"), identity: "next-owner" },
+		evidence: "test quarantine for admission hold",
+		disposition: "quarantine",
+	});
+	expect(manager!.admissionHold(KEY)).toBe("quarantined_turn");
+});
 test("two messages 50ms apart start one turn and steer the second", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
@@ -1427,6 +2016,159 @@ test("two messages 50ms apart start one turn and steer the second", async () => 
 			database?.inboundTurnRows(latestOpRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"turn rows did not complete after terminal tail evidence",
 	);
+});
+
+test("a pending message already rendered into the turn's unread context is closed, not steered twice", async () => {
+	// Live 2026-09-27: rows requeued by recovery were both listed as unread in the
+	// next turn's prompt AND steered into that turn, so every message was answered twice.
+	const port = new ScriptedSessionPort();
+	const lines: string[] = [];
+	await harness(port, { contextMessageIds: ["m-1", "m-2", "m-3"] }, (line) => lines.push(line));
+	const now = Date.now();
+	for (const [index, id] of ["m-1", "m-2", "m-3", "m-4"].entries())
+		expect(
+			database?.inboundEnqueue({
+				messageId: id,
+				originKey: KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body: `body ${id}`,
+				receivedAt: new Date(now + index * 10).toISOString(),
+			}),
+		).toBe(true);
+
+	await manager?.notifyInbound(KEY);
+
+	expect(manager?.state(KEY)).toBe("turn-running");
+	expect(port.sends).toEqual([expect.objectContaining({ text: "body m-1", opRef: latestOpRef })]);
+	// Only the message that was NOT in the prompt's unread context is steered.
+	expect(port.steers).toEqual([expect.objectContaining({ text: expect.stringMatching(/\nbody m-4$/) })]);
+	expect(database?.inboundPendingOldest(KEY)).toBeUndefined();
+	for (const id of ["m-2", "m-3"])
+		expect(database?.inboundTurnRows(latestOpRef).find((row) => row.message_id === id)).toMatchObject({
+			state: "done",
+			turn_role: "steer",
+			turn_state: "done",
+		});
+	expect(lines.filter((line) => line.startsWith("steer_skip "))).toHaveLength(2);
+
+	// A later tick must not re-offer the closed rows.
+	await manager?.notifyInbound(KEY);
+	expect(port.steers).toHaveLength(1);
+	port.complete(latestOpRef, "done");
+});
+
+test("PR #337: an edit row for a message in unread context IS still steered despite the original being in context", async () => {
+	// Regression: edits carry new text and must be steered even when the original message is in the prompt.
+	const port = new ScriptedSessionPort();
+	const lines: string[] = [];
+	await harness(port, { contextMessageIds: ["original-msg"] }, (line) => lines.push(line));
+	const now = Date.now();
+	expect(
+		database?.inboundEnqueue({
+			messageId: "trigger-msg",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "Start working",
+			receivedAt: new Date(now).toISOString(),
+		}),
+	).toBe(true);
+	expect(
+		database?.inboundEnqueue({
+			messageId: "edit-msg",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "Actually, do this instead",
+			receivedAt: new Date(now + 50).toISOString(),
+		}),
+	).toBe(true);
+
+	await manager?.notifyInbound(KEY);
+
+	expect(manager?.state(KEY)).toBe("turn-running");
+	expect(port.sends).toEqual([expect.objectContaining({ text: "Start working", opRef: latestOpRef })]);
+	// The edit is steered despite the original message being in context.
+	const sendSession = port.sends[0]?.sessionId;
+	expect(sendSession).toBeDefined();
+	expect(port.steers).toEqual([
+		expect.objectContaining({
+			sessionId: sendSession,
+			text: expect.stringMatching(/\nActually, do this instead$/),
+		}),
+	]);
+	expect(database?.inboundTurnRows(latestOpRef).find((row) => row.message_id === "edit-msg")).toMatchObject({
+		state: "done",
+		turn_role: "steer",
+		turn_state: "done",
+	});
+	expect(lines.filter((line) => line.startsWith("steer_skip "))).toHaveLength(0);
+	port.complete(latestOpRef, "done");
+});
+
+test("PR #337: after turn terminal and restart, an in-context message is never sent as trigger nor steered", async () => {
+	// Regression: in-context messages closed as steers during the turn should not be re-sent as triggers after restart.
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	await harness(port, { contextMessageIds: ["in-context-msg"] }, (line) => logs.push(line));
+	const now = Date.now();
+	expect(
+		database?.inboundEnqueue({
+			messageId: "trigger",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "Trigger",
+			receivedAt: new Date(now).toISOString(),
+		}),
+	).toBe(true);
+	expect(
+		database?.inboundEnqueue({
+			messageId: "in-context-msg",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "In context",
+			receivedAt: new Date(now + 50).toISOString(),
+		}),
+	).toBe(true);
+
+	await manager?.notifyInbound(KEY);
+	const triggerOpRef = latestOpRef;
+	const sendCount = port.sends.length;
+	const steerCount = port.steers.length;
+
+	// The in-context message is closed as a steer of this turn.
+	expect(database?.inboundTurnRows(triggerOpRef).find((row) => row.message_id === "in-context-msg")).toMatchObject({
+		state: "done",
+		turn_role: "steer",
+		turn_state: "done",
+	});
+
+	// Complete the turn.
+	port.complete(triggerOpRef, "reply");
+	await eventually(() => database?.inboundTurnRow(triggerOpRef)?.turn_state === "done", "turn did not terminal");
+
+	// Stop the manager.
+	await manager?.stop();
+
+	// Restart: fresh manager on the same database.
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+		}),
+	});
+
+	await manager.recover();
+	await manager.tick(KEY);
+
+	// After restart: no new sends or steers for the closed message.
+	expect(port.sends).toHaveLength(sendCount);
+	expect(port.steers).toHaveLength(steerCount);
+	// The inbound row is still done.
+	expect(database?.inboundTurnRow(triggerOpRef)).toMatchObject({ state: "done", turn_state: "done" });
+	const contextRow = database?.inboundTurnRows(triggerOpRef).find((row) => row.message_id === "in-context-msg");
+	expect(contextRow).toMatchObject({ state: "done", turn_role: "steer", turn_state: "done" });
 });
 
 test("recovery and stop never scan or delete unrelated shared broker sessions", async () => {

@@ -9,6 +9,7 @@ import {
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
+import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
 import type { GatewayDatabase } from "../store/db";
 
@@ -127,6 +128,8 @@ export interface RuntimeCycleSources {
 	readonly settledWorkOrigins: ReadonlySet<string>;
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
+	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
+	readonly gjcVersion: string | undefined;
 }
 
 export class RuntimeCycleProjector {
@@ -134,16 +137,22 @@ export class RuntimeCycleProjector {
 	readonly #memory: { readonly queueDepth: number };
 	readonly #maxLanes: number;
 	readonly #agentDir: string | undefined;
+	readonly #gjcVersion: () => string | undefined;
 
 	constructor(
 		database: GatewayDatabase,
 		memory: { readonly queueDepth: number },
-		options: { readonly maxLanes?: number; readonly agentDir?: string } = {},
+		options: {
+			readonly maxLanes?: number;
+			readonly agentDir?: string;
+			readonly gjcVersion?: () => string | undefined;
+		} = {},
 	) {
 		this.#database = database;
 		this.#memory = memory;
 		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
 		this.#agentDir = options.agentDir;
+		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
@@ -205,6 +214,7 @@ export class RuntimeCycleProjector {
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
+			gjcVersion: this.#gjcVersion(),
 		};
 	}
 }
@@ -287,6 +297,10 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	if (sources.oldestStarvedPendingMs !== null && sources.oldestStarvedPendingMs >= INBOUND_STARVATION_MS)
 		gates.add("inbound_starved");
 	if (sources.agentDisk && agentDiskLow(sources.agentDisk)) gates.add("agent_disk_headroom");
+	// The gateway classifies gjc envelopes by the contract of the gjc it was verified
+	// against; a newer minor may have renamed the codes recovery depends on.
+	if (sources.gjcVersion !== undefined && !isVerifiedGjcVersion(sources.gjcVersion))
+		gates.add("gjc_unverified_version");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);

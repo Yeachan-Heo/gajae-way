@@ -47,7 +47,7 @@
     },
     "packages/cli": {
       "name": "@gajae-gateway/cli",
-      "version": "0.1.0",
+      "version": "0.1.4",
       "bin": {
         "gajaeway": "./dist/main.js",
       },
@@ -81,11 +81,11 @@
     },
     "packages/protocol": {
       "name": "@gajae-gateway/protocol",
-      "version": "0.1.0",
+      "version": "0.1.4",
     },
     "packages/sdk": {
       "name": "@gajae-gateway/sdk",
-      "version": "0.1.0",
+      "version": "0.1.4",
       "dependencies": {
         "@gajae-gateway/protocol": "workspace:*",
       },

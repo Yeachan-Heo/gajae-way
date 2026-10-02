@@ -70,6 +70,9 @@ export function validateOriginRef(ref: OriginRef): OriginRef {
 	if (ref.kind === "thread" || ref.kind === "topic") {
 		if (!ref.parentId) throw new OriginRefError(`${ref.kind} origin requires parentId`);
 		requireSegment(ref.parentId, "parentId");
+	} else if (ref.kind === "eventtype" && ref.parentId !== undefined) {
+		// A monitor's executing session is scoped by its owning monitor id.
+		requireSegment(ref.parentId, "parentId");
 	} else if (ref.parentId !== undefined) {
 		throw new OriginRefError(`${ref.kind} origin must not carry parentId`);
 	}
@@ -140,6 +143,15 @@ export const LOOPBACK_ORIGIN: OriginRef = {
 /** Origin of the event-type session executing events of one declared type (P4). */
 export function eventTypeOrigin(eventType: string): OriginRef {
 	return { platform: "monitor", kind: "eventtype", conversationId: eventType };
+}
+
+/**
+ * Origin of ONE monitor's executing session for one event type. The monitor id
+ * is part of the key: two monitors that declare the same event type must never
+ * share a session, its history, its instruction, or its failure domain (#177).
+ */
+export function monitorSessionOrigin(monitorId: string, eventType: string): OriginRef {
+	return { ...eventTypeOrigin(eventType), parentId: monitorId };
 }
 
 /** The catch-all session origin for undeclared event types (spec fact 19). */

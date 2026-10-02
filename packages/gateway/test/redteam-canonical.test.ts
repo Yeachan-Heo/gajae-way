@@ -954,7 +954,7 @@ test("C6a: terminal recovery after a stop invokes the reconstructed lifecycle on
 	}
 });
 
-test("C6b: an unknown operation on a broker-disowned session is re-sent once with a new opRef", async () => {
+test("C6b: an accepted operation on a broker-disowned dead session is closed at recovery, never re-sent under a new opRef", async () => {
 	const port = new DisownedStatusPort();
 	const fixture = await directFixture({ port, instanceId: "canonical-recover-requeue" });
 	let recovered: PersonaSessionManager | undefined;
@@ -978,15 +978,23 @@ test("C6b: an unknown operation on a broker-disowned session is re-sent once wit
 			log: (line) => fixture.logs.push(line),
 		});
 		await recovered.recover();
-		await eventually(() => port.sends.length === 2, "disowned operation was not sent on a new session");
-		const replacement = required(port.sends[1], "replacement send missing");
-		expect(replacement.opRef).not.toBe(first.opRef);
-		expect(replacement.sessionId).not.toBe(first.sessionId);
-		expect(port.sendAttempts).toHaveLength(2);
-		port.complete(replacement.opRef, "replacement answer");
-		await eventually(() => fixture.terminals.length === 1, "replacement turn did not complete");
-		expect(fixture.terminals).toEqual([{ trigger: "recover-requeue", text: "replacement answer" }]);
-		expect(port.sends).toHaveLength(2);
+		// The model may already have run and acted: the accepted trigger is closed,
+		// not replayed into a fresh session.
+		await eventually(
+			() => fixture.database.inboundTurnRow(first.opRef)?.turn_state === "done",
+			"disowned accepted operation was not closed",
+		);
+		expect(fixture.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
+			true,
+		);
+		expect(fixture.logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+		expect(port.sendAttempts).toHaveLength(1);
+		expect(port.sends).toHaveLength(1);
+		// A genuinely new message after the close is sent on a fresh session.
+		enqueue(fixture, "after-close", "a new question");
+		await recovered.notifyInbound(DIRECT_ORIGIN_KEY);
+		await eventually(() => port.sends.length === 2, "new message was not sent after the close");
+		expect(port.sends[1]!.sessionId).not.toBe(first.sessionId);
 	} finally {
 		await recovered?.stop();
 		await fixture.close();
@@ -1088,6 +1096,8 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 	const fixture = await serverFixture({ port, dmPolicy: "open", channels: { "d7-chan": { engagement: "open" } } });
 	try {
 		const channel = { platform: "discord", kind: "channel", conversationId: "d7-chan" } as const;
+		// Follow-ups arrive only after every turn has started: a follow-up that is
+		// already in the trigger prompt's unread context is closed, not steered.
 		fixture.client.sendMany([
 			request("dm-trigger", "chat.send", {
 				origin: DM_ORIGIN,
@@ -1095,17 +1105,21 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 				text: "dm start",
 				engagement: DM_ENGAGEMENT,
 			}),
-			request("dm-steer", "chat.send", {
-				origin: DM_ORIGIN,
-				messageId: "dm-steer",
-				text: "dm follow-up",
-				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
-			}),
 			request("ch-trigger", "chat.send", {
 				origin: channel,
 				messageId: "ch-trigger",
 				text: "channel start",
 				engagement: { mentioned: true, group: true, authorId: "u1", authorName: "alice" },
+			}),
+			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
+		]);
+		await eventually(() => port.sends.length === 3, "not every trigger started a turn");
+		fixture.client.sendMany([
+			request("dm-steer", "chat.send", {
+				origin: DM_ORIGIN,
+				messageId: "dm-steer",
+				text: "dm follow-up",
+				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
 			}),
 			request("ch-steer", "chat.send", {
 				origin: channel,
@@ -1119,7 +1133,6 @@ test("D7: steers carry the same speaker/place/reply header as a trigger; a loopb
 					replyTo: { messageId: "ch-trigger", authorName: "alice", fromSelf: false, excerpt: "channel start" },
 				},
 			}),
-			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
 			request("lb-steer", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback follow-up" }),
 		]);
 		await eventually(() => port.steers.length === 3, "not every follow-up was steered");
@@ -1145,9 +1158,10 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-redteam-migrate-"));
 	const path = join(home, "gateway.db");
 	try {
-		(await GatewayDatabase.open(path)).close();
+		const latest = await GatewayDatabase.open(path);
+		expect(latest.schemaVersion).toBe(27);
+		latest.close();
 		const raw = new (await import("bun:sqlite")).Database(path);
-		// Remove v22-v24 additions before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -1165,9 +1179,12 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 		])
 			raw.exec(`DROP TABLE ${table}`);
 		raw.exec(`
+DROP TABLE lane_reports;
 DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
 CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL, batch_key TEXT, batch_role TEXT, batch_epoch INTEGER, batch_state TEXT, attributed_op_ref TEXT, accepted_at TEXT, bound_session_id TEXT, dispatched_at TEXT, terminal_delivery_id TEXT);
+DROP TRIGGER IF EXISTS deliveries_last_error_allowlist_insert;
+DROP TRIGGER IF EXISTS deliveries_last_error_allowlist_update;
 ALTER TABLE deliveries DROP COLUMN last_error;
 DELETE FROM schema_migrations WHERE version > 18;
 INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id) VALUES
@@ -1178,7 +1195,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(24);
+		expect(upgraded.schemaVersion).toBe(27);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;

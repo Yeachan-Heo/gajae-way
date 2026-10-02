@@ -20,6 +20,8 @@ export interface AdapterLockPorts {
 	readonly alive: (pid: number) => boolean;
 	/** Test-only seam for a slow critical section after election and before the pidfile write. */
 	readonly beforePidfileWrite?: () => void | Promise<void>;
+	/** Test-only seam to hold the contender before the retry wait, allowing the test to perform atomic operations. */
+	readonly beforeRetryWait?: () => void | Promise<void>;
 }
 
 export function defaultLockPorts(): AdapterLockPorts {
@@ -113,6 +115,7 @@ export class AdapterLock {
 					if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
 				}
 				if (attempt < RECLAIM_WAIT_ATTEMPTS) {
+					await ports.beforeRetryWait?.();
 					await new Promise((resolve) => setTimeout(resolve, RECLAIM_WAIT_STEP_MS));
 					continue;
 				}
@@ -154,7 +157,15 @@ export class AdapterLock {
 					.then((info) => info.ino)
 					.catch(() => undefined);
 				if (expectedInode !== undefined) {
-					await rename(path, previous);
+					try {
+						await rename(path, previous);
+					} catch (error) {
+						// The pidfile we just stat'ed vanished: a contender that displaced
+						// our election moved it first. Fail closed instead of surfacing ENOENT.
+						if ((error as NodeJS.ErrnoException).code === "ENOENT")
+							throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+						throw error;
+					}
 					previousMoved = true;
 					const movedInode = (await stat(previous)).ino;
 					if (movedInode !== expectedInode || (await readHolder(previous)) !== holder) {

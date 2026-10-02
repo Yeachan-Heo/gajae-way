@@ -3,7 +3,17 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export type FailedTurnEvidence = {
-	readonly reason: "unsupported_input_status" | "context_exhausted";
+	readonly reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted";
+};
+
+export type FailedTransportCause = {
+	readonly kind: string;
+	readonly nativeErrorCode?: string;
+	readonly http2RstCode?: number;
+	readonly status?: number;
+	readonly requestBytes?: number;
+	readonly retryMaxAttempts?: number;
+	readonly endpointClass?: string;
 };
 
 export type FailedTurnEvidenceInput = {
@@ -32,6 +42,10 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	if (message.role !== "assistant" || message.stopReason !== "error") return undefined;
 	const facts = record(message.transportFailure);
 	const status = message.errorStatus ?? facts?.status;
+	if (status === 402) {
+		if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== 402)) return undefined;
+		return "provider_quota_exhausted";
+	}
 	if (status !== 400 && status !== 413) return undefined;
 	if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== status)) return undefined;
 	const codes = [facts?.providerCode, facts?.openaiErrorCode, facts?.anthropicErrorType, message.errorCode];
@@ -71,11 +85,11 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	return undefined;
 }
 
-/** Private saved-transcript evidence only. Never returns provider text or filesystem errors. */
-export async function readFailedTurnEvidence(
+/** Internal: reads the failed assistant message from the session transcript with all guards. Returns the message or undefined. */
+async function readFailedAssistantMessage(
 	agentDir: string | undefined,
 	input: FailedTurnEvidenceInput,
-): Promise<FailedTurnEvidence | undefined> {
+): Promise<Row | undefined> {
 	try {
 		if (!agentDir || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.sessionId)) return undefined;
 		if (
@@ -228,8 +242,43 @@ export async function readFailedTurnEvidence(
 		)
 			return undefined;
 		if (ancestry.slice(ancestry.indexOf(failed) + 1).some((entry) => entry.message)) return undefined;
-		return { reason: failureReason };
+		return failed.message;
 	} catch {
 		return undefined;
 	}
+}
+
+/** Private saved-transcript evidence only. Never returns provider text or filesystem errors. */
+export async function readFailedTurnEvidence(
+	agentDir: string | undefined,
+	input: FailedTurnEvidenceInput,
+): Promise<FailedTurnEvidence | undefined> {
+	const message = await readFailedAssistantMessage(agentDir, input);
+	if (!message) return undefined;
+	const failureReason = reason(message);
+	if (!failureReason) return undefined;
+	return { reason: failureReason };
+}
+
+/** Extract transport failure cause from the same session transcript. Independent of reason classification. */
+export async function readFailedTransportCause(
+	agentDir: string | undefined,
+	input: FailedTurnEvidenceInput,
+): Promise<FailedTransportCause | undefined> {
+	const message = await readFailedAssistantMessage(agentDir, input);
+	if (!message) return undefined;
+	const facts = record(message.transportFailure);
+	if (!facts || facts.kind !== "transport") return undefined;
+	// Reject if status conflict: if both errorStatus and transport.status are defined, they must match
+	if (message.errorStatus !== undefined && facts.status !== undefined && message.errorStatus !== facts.status)
+		return undefined;
+	// Build allowlisted object
+	const fields: Record<string, unknown> = { kind: "transport" };
+	if (typeof facts.nativeErrorCode === "string") fields.nativeErrorCode = facts.nativeErrorCode;
+	if (typeof facts.http2RstCode === "number") fields.http2RstCode = facts.http2RstCode;
+	if (typeof facts.status === "number") fields.status = facts.status;
+	if (typeof facts.requestBytes === "number") fields.requestBytes = facts.requestBytes;
+	if (typeof facts.retryMaxAttempts === "number") fields.retryMaxAttempts = facts.retryMaxAttempts;
+	if (typeof facts.endpointClass === "string") fields.endpointClass = facts.endpointClass;
+	return Object.keys(fields).length > 1 ? (fields as FailedTransportCause) : undefined;
 }

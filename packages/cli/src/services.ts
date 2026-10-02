@@ -235,9 +235,19 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 	return unit.join("\n");
 }
 
-function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
+export function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
 	const base = env.XDG_CONFIG_HOME || join(userHome, ".config");
 	return join(base, "systemd", "user");
+}
+
+/** Gets the path where a service's LaunchAgent plist is stored on darwin. */
+export function launchAgentPlistPath(spec: ServiceSpec, launchAgentsDir: string): string {
+	return join(launchAgentsDir, `dev.gajaeway.${spec.id}.plist`);
+}
+
+/** Gets the path where a service's systemd unit file is stored on linux. */
+export function systemdUnitPath(spec: ServiceSpec, unitDir: string): string {
+	return join(unitDir, systemdUnitName(spec));
 }
 
 /**

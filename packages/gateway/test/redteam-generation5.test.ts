@@ -390,7 +390,7 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 	}
 });
 
-test("G5: accepted turns need positive death evidence, while bound turns release on an unknown liveness result", async () => {
+test("G5: accepted turns are closed (never re-sent) on positive death evidence, while bound turns release on an unknown liveness result", async () => {
 	const acceptedPort = new AcceptedLivenessPort();
 	const accepted = await directFixture({ port: acceptedPort });
 	try {
@@ -407,11 +407,17 @@ test("G5: accepted turns need positive death evidence, while bound turns release
 
 		acceptedPort.live = false;
 		await accepted.manager.tick(ORIGIN_KEY);
-		await eventually(() => acceptedPort.sends.length === 2, "positive dead evidence did not release the accepted turn");
-		const released = required(acceptedPort.sends[1], "released replacement missing");
-		expect(released.opRef).not.toBe(first.opRef);
+		// The model may already have run and acted: positive death evidence closes
+		// the accepted turn with a notice instead of re-sending it under a new opRef.
+		await eventually(
+			() => accepted.database.inboundTurnRow(first.opRef)?.turn_state === "done",
+			"positive dead evidence did not close the accepted turn",
+		);
+		expect(accepted.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
+			true,
+		);
 		await accepted.manager.tick(ORIGIN_KEY);
-		expect(acceptedPort.sends).toHaveLength(2);
+		expect(acceptedPort.sends).toHaveLength(1);
 	} finally {
 		await accepted.close();
 	}
@@ -443,7 +449,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		enqueue(fixture, "first", "first request");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
 		const goneAttempts = fixture.logs
-			.filter((line) => line.startsWith("persona_send_session_gone"))
+			.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
 			.map((line) => /attempt=(\d+)/.exec(line)?.[1]);
 		expect(goneAttempts).toEqual(["1", "2", "3"]);
 		expect(
@@ -468,7 +474,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		await eventually(() => port.sends.length === 2, "second request did not recover after one unavailable send");
 		expect(
 			fixture.logs
-				.filter((line) => line.startsWith("persona_send_session_gone"))
+				.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
 				.map((line) => /attempt=(\d+)/.exec(line)?.[1]),
 		).toEqual(["1", "2", "3", "1"]);
 		expect(
@@ -486,9 +492,10 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 	const path = join(home, "gateway.db");
 	let upgraded: GatewayDatabase | undefined;
 	try {
-		(await GatewayDatabase.open(path)).close();
+		const latest = await GatewayDatabase.open(path);
+		expect(latest.schemaVersion).toBe(27);
+		latest.close();
 		const raw = new Database(path);
-		// Remove v22-v24 additions before replaying historical DDL; missing objects are fixture errors.
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -506,6 +513,7 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 		])
 			raw.exec(`DROP TABLE ${table}`);
 		raw.exec(`
+DROP TABLE lane_reports;
 DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
 CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL);
@@ -519,6 +527,8 @@ ALTER TABLE inbound_messages ADD COLUMN accepted_at TEXT;
 ALTER TABLE inbound_messages ADD COLUMN bound_session_id TEXT;
 ALTER TABLE inbound_messages ADD COLUMN dispatched_at TEXT;
 ALTER TABLE inbound_messages ADD COLUMN terminal_delivery_id TEXT;
+DROP TRIGGER IF EXISTS deliveries_last_error_allowlist_insert;
+DROP TRIGGER IF EXISTS deliveries_last_error_allowlist_update;
 ALTER TABLE deliveries DROP COLUMN last_error;
 DELETE FROM schema_migrations WHERE version > 18;
 INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id) VALUES
@@ -528,7 +538,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(24);
+		expect(upgraded.schemaVersion).toBe(27);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],

@@ -4,9 +4,10 @@ import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
-	isSilenceToken,
+	isSilentOutput,
 	type OriginRef,
 	originKey,
+	parseOriginKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import {
@@ -15,6 +16,7 @@ import {
 	type PromptStatusBody,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
+import { buildDeliveryPayload } from "../delivery/delivery";
 
 export interface BrokerAuthority {
 	readonly canonicalAgentDir: string;
@@ -80,6 +82,7 @@ const BROKER_SNAPSHOT_TABLES = [
 	"conversation_model",
 	"session_tail_cursors",
 	"work_attempt_runtime",
+	"lane_reports",
 	"broker_owned_bindings",
 	"broker_tail_cursors",
 	"broker_retired_sessions",
@@ -92,7 +95,21 @@ const REPLAYABLE_MONITOR =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)";
 
 export type WorkAttemptMode = "start" | "run" | "historical";
-export type WorkAttemptDecision = "undecided" | "enqueued" | "suppressed" | "no_target";
+export type WorkAttemptDecision =
+	| "undecided"
+	| "reported"
+	| "fallback"
+	| "suppressed"
+	| "no_target"
+	| "wake_unaccepted";
+export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted";
+export interface WorkReportRoot {
+	readonly originKey: string;
+	readonly origin: OriginRef;
+}
+export type WorkParent =
+	| { readonly kind: "persona"; readonly originKey: string; readonly origin: OriginRef }
+	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
 export interface WorkAttemptOutputProof {
 	readonly opRef: string;
 	readonly sessionId: string;
@@ -117,6 +134,16 @@ export interface WorkAttemptOutput {
 	readonly proof: WorkAttemptOutputProof | null;
 	/** Proven original attempt-final silence survives output loss and ledger pruning. */
 	readonly knownSilence: WorkAttemptOutputProof | null;
+	/** Transport failure details for failed attempts with terminal_missing_receipt. */
+	readonly transportCause?: {
+		readonly kind: string;
+		readonly nativeErrorCode?: string;
+		readonly http2RstCode?: number;
+		readonly status?: number;
+		readonly requestBytes?: number;
+		readonly retryMaxAttempts?: number;
+		readonly endpointClass?: string;
+	};
 }
 export interface WorkAttemptTerminalEvidence {
 	readonly kind: "broker" | "local";
@@ -138,7 +165,10 @@ export interface WorkAttemptRuntime {
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
 	readonly terminal: WorkAttemptTerminalEvidence | null;
 	readonly output: WorkAttemptOutput;
-	readonly target: OriginRef | null;
+	readonly parent: WorkParent | null;
+	readonly reportId: string;
+	readonly wakeReportId: string | null;
+	readonly noticeHash: string | null;
 	readonly deliveryId: string;
 	readonly decision: WorkAttemptDecision;
 	readonly settledAt: string | null;
@@ -146,13 +176,68 @@ export interface WorkAttemptRuntime {
 }
 export type WorkAttemptPatch = Partial<Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "terminal" | "output">>;
 export interface WorkAttemptSettlement extends WorkAttemptPatch {
-	readonly decision: Exclude<WorkAttemptDecision, "undecided">;
+	readonly decision: WorkAttemptRequestedDecision;
 	readonly settledAt: string;
 }
+export interface WorkAttemptAdmissionPersona {
+	readonly kind: "persona";
+	readonly row: {
+		readonly messageId: string;
+		readonly originKey: string;
+		readonly originRefJson: string;
+		readonly body: string;
+		readonly receivedAt: string;
+	};
+	readonly fallbackPayload: ChatMessagePayload;
+	readonly holdReason?: string;
+}
+export interface WorkAttemptAdmissionLane {
+	readonly kind: "lane";
+	readonly report: {
+		readonly reportId: string;
+		readonly parentName: string;
+		readonly childName: string;
+		readonly childOpRef: string;
+		readonly body: string;
+		readonly root: WorkReportRoot | null;
+	};
+	readonly fallbackPayload: ChatMessagePayload | null;
+}
+export type WorkAttemptAdmission = WorkAttemptAdmissionPersona | WorkAttemptAdmissionLane;
+export interface WorkAttemptSettleResult {
+	readonly runtime: WorkAttemptRuntime;
+	readonly fallbackPayload?: ChatMessagePayload;
+	readonly childFallback?: ChatMessagePayload;
+	readonly requeuedParent?: string;
+}
+export type LaneReportState = "pending" | "claimed" | "consumed" | "fallback" | "held" | "undeliverable";
+export interface LaneReportRow {
+	readonly report_id: string;
+	readonly parent_name: string;
+	readonly child_name: string;
+	readonly child_op_ref: string;
+	readonly body: string;
+	readonly root_json: string | null;
+	readonly state: LaneReportState;
+	readonly claim_kind: "steer" | "wake" | null;
+	readonly claim_ref: string | null;
+	readonly claim_target_op_ref: string | null;
+	readonly claim_seq: number;
+	readonly hold_reason: string | null;
+	readonly consumed_op_ref: string | null;
+	readonly created_at: string;
+	readonly updated_at: string;
+}
 export class WorkAttemptStateError extends Error {
-	constructor() {
-		super("work lane state unavailable");
+	readonly opRef: string | undefined;
+	readonly assertion: string;
+	constructor(opRef?: string, assertion = "work attempt payload validation") {
+		super(
+			`work lane state unavailable${opRef === undefined ? "" : ` opRef=${JSON.stringify(opRef)}`} assertion=${assertion}`,
+		);
 		this.name = "WorkAttemptStateError";
+		this.opRef = opRef;
+		this.assertion = assertion;
 	}
 }
 
@@ -184,6 +269,21 @@ export function workAttemptDeliveryId(instanceId: string, jobId: string, opRef: 
 		.digest("hex")}`;
 }
 
+/** Stable report identity, using length-delimited UTF-8 components. */
+export function workAttemptReportId(instanceId: string, jobId: string, opRef: string): string {
+	const hash = createHash("sha256");
+	for (const value of [instanceId, jobId, opRef]) {
+		const length = Buffer.allocUnsafe(4);
+		length.writeUInt32BE(Buffer.byteLength(value, "utf8"));
+		hash.update(length).update(value, "utf8");
+	}
+	return `lane-report-${hash.digest("hex")}`;
+}
+
+function workAccepted(runtime: WorkAttemptRuntime): boolean {
+	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
+}
+
 const WORK_REASON_CODES = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -201,8 +301,8 @@ const WORK_REASON_CODES = new Set([
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
-function workAssert(condition: unknown): asserts condition {
-	if (!condition) throw new WorkAttemptStateError();
+function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {
+	if (!condition) throw new WorkAttemptStateError(undefined, assertion);
 }
 function workTime(value: unknown): boolean {
 	return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
@@ -213,6 +313,24 @@ function workString(value: unknown, max = 512): value is string {
 		if (value.charCodeAt(index) < 32) return false;
 	}
 	return true;
+}
+function validateWorkRoot(root: WorkReportRoot): void {
+	workAssert(root && typeof root === "object");
+	validateOriginRef(root.origin);
+	workAssert(originKey(root.origin) === root.originKey);
+	workAssert(["discord", "slack", "telegram", "loopback"].includes(root.origin.platform));
+}
+
+function validateWorkParent(parent: WorkParent, mode: WorkAttemptMode): void {
+	workAssert(mode === "start");
+	if (parent.kind === "persona") {
+		validateOriginRef(parent.origin);
+		workAssert(originKey(parent.origin) === parent.originKey);
+		workAssert(["discord", "slack", "telegram", "loopback"].includes(parent.origin.platform));
+		return;
+	}
+	workAssert(parent.kind === "lane" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(parent.name));
+	if (parent.root !== null) validateWorkRoot(parent.root);
 }
 function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): void {
 	workAssert(value && typeof value === "object");
@@ -228,10 +346,14 @@ function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): voi
 	workAssert(["prepared", "accepted", "uncertain"].includes(value.sendPhase));
 	workAssert(Number.isSafeInteger(value.version) && value.version >= 0);
 	workAssert(value.deliveryId === workAttemptDeliveryId(instanceId, value.jobId, value.opRef));
-	if (value.target !== null) {
-		workAssert(value.mode === "start");
-		validateOriginRef(value.target);
-	}
+	workAssert(!Object.hasOwn(value, "target"));
+	workAssert(value.parent === null || (value.parent && typeof value.parent === "object"));
+	if (value.parent !== null) validateWorkParent(value.parent, value.mode);
+	workAssert(value.mode !== "run" || value.parent === null);
+	workAssert(value.reportId === workAttemptReportId(instanceId, value.jobId, value.opRef));
+	workAssert(value.wakeReportId === null || /^lane-report-[0-9a-f]{64}$/.test(value.wakeReportId));
+	workAssert(value.wakeReportId === null || value.mode === "start");
+	workAssert(value.noticeHash === null || /^[0-9a-f]{64}$/.test(value.noticeHash));
 	if (value.sendEvidence !== null) {
 		workAssert(["receipt", "status"].includes(value.sendEvidence.source) && workTime(value.sendEvidence.observedAt));
 	}
@@ -286,20 +408,67 @@ function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): voi
 	}
 	workAssert(output.disposition !== "available" || (output.proof !== null && output.excerpt !== null));
 	workAssert(output.disposition !== "silent" || output.knownSilence !== null);
-	workAssert(["undecided", "enqueued", "suppressed", "no_target"].includes(value.decision));
+	workAssert(
+		["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.decision),
+	);
 	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
 	if (value.decision !== "undecided") {
 		workAssert(value.terminal !== null && output.disposition !== "pending");
 		workAssert(
-			value.decision !== "enqueued" ||
-				(value.mode === "start" && value.target !== null && output.knownSilence === null),
+			!["reported", "fallback"].includes(value.decision) || (value.parent !== null && output.knownSilence === null),
+		);
+		workAssert(
+			value.decision !== "fallback" ||
+				value.parent?.kind === "persona" ||
+				(value.parent?.kind === "lane" && value.parent.root !== null),
+		);
+		workAssert(
+			value.decision !== "no_target" ||
+				value.parent === null ||
+				(value.parent.kind === "lane" && value.parent.root === null),
 		);
 		workAssert(value.decision !== "suppressed" || output.knownSilence !== null);
-		workAssert(value.decision !== "no_target" || value.target === null);
+		workAssert(
+			value.decision !== "wake_unaccepted" ||
+				(value.wakeReportId !== null && value.mode === "start" && value.terminal !== null && !workAccepted(value)),
+		);
+		workAssert(value.wakeReportId === null || workAccepted(value) || value.decision === "wake_unaccepted");
 	}
 	workAssert(Buffer.byteLength(JSON.stringify(value), "utf8") <= 16384);
 }
 
+function laneJobDatabaseId(name: string): string {
+	return `lanejob-${Buffer.from(name, "utf8").toString("hex")}`;
+}
+
+function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
+	if (row.root_json === null) return null;
+	const root = JSON.parse(row.root_json) as WorkReportRoot;
+	validateWorkRoot(root);
+	return root;
+}
+
+function validateLaneReportRow(row: LaneReportRow): void {
+	workAssert(/^lane-report-[0-9a-f]{64}$/.test(row.report_id));
+	workAssert(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(row.parent_name));
+	workAssert(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(row.child_name));
+	assertValidOpRef(row.child_op_ref);
+	workAssert(typeof row.body === "string" && Buffer.byteLength(row.body, "utf8") <= 2048);
+	workAssert(["pending", "claimed", "consumed", "fallback", "held", "undeliverable"].includes(row.state));
+	workAssert(row.claim_kind === null || ["steer", "wake"].includes(row.claim_kind));
+	workAssert(Number.isSafeInteger(row.claim_seq) && row.claim_seq >= 0);
+	workAssert(row.claim_ref === null || workString(row.claim_ref, 128));
+	workAssert(row.claim_target_op_ref === null || workString(row.claim_target_op_ref, 128));
+	for (const ref of [row.claim_ref, row.claim_target_op_ref, row.consumed_op_ref])
+		if (ref !== null) assertValidOpRef(ref);
+	workAssert((row.state !== "claimed" && row.state !== "held") || (row.claim_kind !== null && row.claim_ref !== null));
+	workAssert(row.claim_kind !== "steer" || row.claim_target_op_ref !== null);
+	workAssert(row.claim_kind !== "wake" || row.claim_target_op_ref === null);
+	workAssert(row.hold_reason === null || workString(row.hold_reason, 128));
+	workAssert(row.state === "consumed" ? workString(row.consumed_op_ref, 128) : row.consumed_op_ref === null);
+	workAssert(workTime(row.created_at) && workTime(row.updated_at));
+	laneReportRoot(row);
+}
 /**
  * A gjc model selection: either an explicit selector string or a model profile
  * preset. Structurally identical to the config type; duplicated as a local
@@ -341,6 +510,7 @@ export type InboundTurnRole = (typeof INBOUND_TURN_ROLES)[number];
  */
 export interface InboundMessageRow {
 	readonly message_id: string;
+	readonly source: "platform" | "lane_report";
 	readonly origin_key: string;
 	readonly origin_ref_json: string;
 	readonly body: string;
@@ -405,7 +575,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 24;
+const LATEST_SCHEMA_VERSION = 27;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -476,7 +646,7 @@ export interface MonitorFailureRow {
 }
 
 export class DatabaseStartupError extends Error {
-	readonly code: "newer_schema" | "integrity_check_failed";
+	readonly code: "newer_schema" | "integrity_check_failed" | "migration_corrupt";
 	constructor(code: DatabaseStartupError["code"], message: string) {
 		super(message);
 		this.name = "DatabaseStartupError";
@@ -575,6 +745,10 @@ export class GatewayDatabase {
 			const runtime = this.workAttemptGet(row.op_ref)!;
 			if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
 		}
+		openWork +=
+			this.#database
+				.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')")
+				.get()?.n ?? 0;
 		const openInbound = this.#database
 			.query<{ n: number }, []>(
 				`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
@@ -618,6 +792,31 @@ export class GatewayDatabase {
 		const authority = { canonicalAgentDir: value[0], identity: value[1] };
 		if (brokerAuthorityKey(authority) !== stored.authority_key) throw new BrokerAuthorityError("invalid_authority");
 		return authority;
+	}
+
+	/** Resolves an untrusted GJC_SESSION_ID only when it has one unambiguous origin. */
+	originForSessionId(sessionId: string): string | undefined {
+		if (!/^[A-Za-z0-9-]{1,128}$/.test(sessionId)) return undefined;
+		const origins = new Set<string>();
+		const session = this.#database
+			.query<{ origin_key: string }, [string]>("SELECT origin_key FROM sessions WHERE gjc_session_id = ?")
+			.get(sessionId);
+		if (session) origins.add(session.origin_key);
+		let authority: BrokerAuthority | null;
+		try {
+			authority = this.#brokerAuthority();
+		} catch {
+			return undefined;
+		}
+		if (authority) {
+			for (const row of this.#database
+				.query<{ origin_key: string }, [string, string]>(
+					"SELECT origin_key FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ? AND NOT EXISTS (SELECT 1 FROM broker_retired_sessions r WHERE r.session_id = broker_owned_bindings.session_id)",
+				)
+				.all(brokerAuthorityKey(authority), sessionId))
+				origins.add(row.origin_key);
+		}
+		return origins.size === 1 ? origins.values().next().value : undefined;
 	}
 
 	/** Only a successful gateway session.create response may supply this provenance. */
@@ -816,25 +1015,52 @@ export class GatewayDatabase {
 		try {
 			const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 			validateWorkRuntime(runtime, this.instanceId);
-			workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key);
-			workAssert(runtime.sessionId === row.session_id && runtime.version === row.version);
-			workAssert(runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id);
+			workAssert(
+				runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key,
+				"runtime identity matches database columns",
+			);
+			workAssert(
+				runtime.sessionId === row.session_id && runtime.version === row.version,
+				"runtime session and version match database columns",
+			);
+			workAssert(
+				runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id,
+				"runtime settlement and delivery id match database columns",
+			);
 			this.#workHistory(runtime);
 			return runtime;
-		} catch {
-			throw new WorkAttemptStateError();
+		} catch (error) {
+			throw new WorkAttemptStateError(
+				opRef,
+				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
+			);
 		}
 	}
 
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
-	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
+	workAttemptOpen(
+		limit = 100,
+		afterOpRef = "",
+		onInvalid?: (error: WorkAttemptStateError) => void,
+	): readonly WorkAttemptRuntime[] {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
-		return this.#database
+		const rows = this.#database
 			.query<{ op_ref: string }, [string, number]>(
 				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref LIMIT ?",
 			)
-			.all(afterOpRef, limit)
-			.map((row) => this.workAttemptGet(row.op_ref)!);
+			.all(afterOpRef, limit);
+		if (!onInvalid) return rows.map((row) => this.workAttemptGet(row.op_ref)!);
+		const attempts: WorkAttemptRuntime[] = [];
+		for (const row of rows) {
+			try {
+				const runtime = this.workAttemptGet(row.op_ref);
+				if (runtime) attempts.push(runtime);
+			} catch (error) {
+				if (!(error instanceof WorkAttemptStateError)) throw error;
+				onInvalid(error);
+			}
+		}
+		return attempts;
 	}
 
 	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
@@ -844,6 +1070,180 @@ export class GatewayDatabase {
 			)
 			.get(laneKey);
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
+	}
+
+	#laneReportGetInside(reportId: string): LaneReportRow | undefined {
+		const row = this.#database
+			.query<LaneReportRow, [string]>("SELECT * FROM lane_reports WHERE report_id = ?")
+			.get(reportId);
+		if (!row) return undefined;
+		try {
+			validateLaneReportRow(row);
+			return row;
+		} catch {
+			throw new WorkAttemptStateError();
+		}
+	}
+
+	laneReportGet(reportId: string): LaneReportRow | undefined {
+		return this.#laneReportGetInside(reportId);
+	}
+
+	laneReportsByParent(parentName: string): readonly LaneReportRow[] {
+		return this.#database
+			.query<LaneReportRow, [string]>("SELECT * FROM lane_reports WHERE parent_name = ? ORDER BY created_at, rowid")
+			.all(parentName)
+			.map((row) => {
+				try {
+					validateLaneReportRow(row);
+					return row;
+				} catch {
+					throw new WorkAttemptStateError();
+				}
+			});
+	}
+
+	laneReportParentNames(): readonly string[] {
+		return this.#database
+			.query<{ parent_name: string }, []>(
+				"SELECT DISTINCT parent_name FROM lane_reports WHERE state IN ('pending','claimed','held') ORDER BY parent_name",
+			)
+			.all()
+			.map((row) => row.parent_name);
+	}
+
+	laneReportCounts(parentName: string): { pending: number; claimed: number; held: number; undeliverable: number } {
+		const row = this.#database
+			.query<{ pending: number; claimed: number; held: number; undeliverable: number }, [string]>(
+				"SELECT SUM(state = 'pending') AS pending, SUM(state = 'claimed') AS claimed, SUM(state = 'held') AS held, SUM(state = 'undeliverable') AS undeliverable FROM lane_reports WHERE parent_name = ?",
+			)
+			.get(parentName);
+		return {
+			pending: row?.pending ?? 0,
+			claimed: row?.claimed ?? 0,
+			held: row?.held ?? 0,
+			undeliverable: row?.undeliverable ?? 0,
+		};
+	}
+
+	laneReportClaim(
+		reportId: string,
+		kind: "steer" | "wake",
+		ref: string,
+		targetOpRef: string | null,
+	): LaneReportRow | undefined {
+		assertValidOpRef(ref);
+		workAssert(kind === "steer" ? targetOpRef !== null : targetOpRef === null);
+		if (targetOpRef !== null) assertValidOpRef(targetOpRef);
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || current.state !== "pending") return undefined;
+			const changed = this.#database
+				.query(
+					"UPDATE lane_reports SET state = 'claimed', claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, claim_seq = claim_seq + 1, hold_reason = NULL, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
+				)
+				.run(kind, ref, targetOpRef, new Date().toISOString(), reportId, current.claim_seq).changes;
+			return changed === 1 ? this.#laneReportGetInside(reportId) : undefined;
+		});
+	}
+
+	laneReportConsume(reportId: string, ref: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current) return false;
+			if (current.state === "consumed") return current.consumed_op_ref === ref;
+			if ((current.state !== "claimed" && current.state !== "held") || current.claim_ref !== ref) return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'consumed', consumed_op_ref = ?, hold_reason = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_seq = ? AND claim_ref = ?",
+					)
+					.run(ref, new Date().toISOString(), reportId, current.state, current.claim_seq, ref).changes === 1
+			);
+		});
+	}
+
+	laneReportRequeue(reportId: string, ref: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || (current.state !== "claimed" && current.state !== "held") || current.claim_ref !== ref)
+				return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'pending', claim_kind = NULL, claim_ref = NULL, claim_target_op_ref = NULL, hold_reason = NULL, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_seq = ? AND claim_ref = ?",
+					)
+					.run(new Date().toISOString(), reportId, current.state, current.claim_seq, ref).changes === 1
+			);
+		});
+	}
+
+	laneReportHold(reportId: string, reason: string): boolean {
+		if (!workString(reason, 128)) throw new WorkAttemptStateError();
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current) return false;
+			if (current.state === "held") return current.hold_reason === reason;
+			if (current.state !== "claimed") return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'held', hold_reason = ?, updated_at = ? WHERE report_id = ? AND state = 'claimed' AND claim_seq = ?",
+					)
+					.run(reason, new Date().toISOString(), reportId, current.claim_seq).changes === 1
+			);
+		});
+	}
+
+	laneReportFallback(reportId: string, payload: ChatMessagePayload): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || current.state !== "pending") return false;
+			const root = laneReportRoot(current);
+			workAssert(root !== null);
+			const deliveryId = workAttemptDeliveryId(
+				this.instanceId,
+				laneJobDatabaseId(current.child_name),
+				current.child_op_ref,
+			);
+			workAssert(
+				payload.deliveryId === deliveryId &&
+					payload.turnId === current.child_op_ref &&
+					originKey(payload.origin) === root.originKey &&
+					payload.text === current.body &&
+					payload.role === "assistant" &&
+					payload.final === true &&
+					!payload.reaction &&
+					!isSilentOutput(payload.text),
+			);
+			const changed = this.#database
+				.query(
+					"UPDATE lane_reports SET state = 'fallback', updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
+				)
+				.run(new Date().toISOString(), reportId, current.claim_seq).changes;
+			if (changed !== 1) return false;
+			this.deliveryCreateInTransaction({
+				id: deliveryId,
+				turnId: current.child_op_ref,
+				originKey: root.originKey,
+				payloadJson: JSON.stringify(payload),
+			});
+			return true;
+		});
+	}
+
+	laneReportUndeliverable(reportId: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.#laneReportGetInside(reportId);
+			if (!current || current.state !== "pending") return false;
+			return (
+				this.#database
+					.query(
+						"UPDATE lane_reports SET state = 'undeliverable', updated_at = ? WHERE report_id = ? AND state = 'pending' AND claim_seq = ?",
+					)
+					.run(new Date().toISOString(), reportId, current.claim_seq).changes === 1
+			);
+		});
 	}
 
 	/** Atomically append history, freeze notification intent and refresh activity before send. */
@@ -862,6 +1262,10 @@ export class GatewayDatabase {
 			workAssert(runtime.sendEvidence === null);
 			workAssert(runtime.sendPhase === (runtime.mode === "historical" ? "uncertain" : "prepared"));
 			this.#workValidateHistory(runtime, record);
+			if (runtime.wakeReportId !== null) {
+				const report = this.#laneReportGetInside(runtime.wakeReportId);
+				workAssert(report?.state === "claimed" && report.claim_kind === "wake" && report.claim_ref === runtime.opRef);
+			}
 			const previousJson = this.laneJobJson(runtime.jobId);
 			const previous = previousJson === undefined ? undefined : parseLaneJobRecord(previousJson);
 			if (runtime.mode === "historical") {
@@ -892,7 +1296,7 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** CAS staging, including output-read claims and proof-before-checkpoint commits. */
+	/** CAS staging, including output-read claims, acceptance proof, and notice receipt. */
 	workAttemptUpdate(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
@@ -900,52 +1304,262 @@ export class GatewayDatabase {
 			this.#assertNotQuarantined("work", current.jobId);
 			const next = this.#workPatched(current, patch);
 			workAssert(next.decision === "undecided" && next.settledAt === null);
+			const acceptanceEstablished = !workAccepted(current) && workAccepted(next);
 			if (!this.#workCas(current, next)) return undefined;
+			if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(next);
+			if (acceptanceEstablished && next.noticeHash !== null)
+				this.metaSet(`lane-notice:${next.sessionKey}`, JSON.stringify({ epoch: next.epoch, hash: next.noticeHash }));
 			return next;
 		});
 	}
 
-	/** Winning settlement is the only notification admission; retained runtime is its tombstone. */
+	/** Atomically settle the attempt and admit its report (or refusal decision). */
 	workAttemptSettle(
 		opRef: string,
 		expectedVersion: number,
 		record: LaneJobRecord,
 		patch: WorkAttemptSettlement,
-		payload?: ChatMessagePayload,
-	): WorkAttemptRuntime | undefined {
+		admission?: WorkAttemptAdmission,
+	): WorkAttemptSettleResult | undefined {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 			this.#assertNotQuarantined("work", current.jobId);
-			const next = this.#workPatched(current, patch);
-			workAssert(next.decision !== "undecided" && next.settledAt !== null);
+			const { decision: requested, settledAt, ...attemptPatch } = patch;
+			const staged = this.#workPatched(current, attemptPatch);
+			const draft = { ...staged, settledAt };
+			let decision: WorkAttemptDecision;
+			let fallbackPayload: ChatMessagePayload | undefined;
+			let childFallback: ChatMessagePayload | undefined;
+			let requeuedParent: string | undefined;
+			let linkedReport: LaneReportRow | undefined;
+
+			if (current.wakeReportId !== null && !workAccepted(draft)) {
+				workAssert(requested === "wake_unaccepted" && admission === undefined);
+				decision = "wake_unaccepted";
+				linkedReport = this.#laneReportGetInside(current.wakeReportId);
+				workAssert(
+					linkedReport?.state === "claimed" &&
+						linkedReport.claim_kind === "wake" &&
+						linkedReport.claim_ref === current.opRef,
+				);
+			} else {
+				workAssert(requested !== "wake_unaccepted");
+				if (requested === "report") {
+					workAssert(admission !== undefined && draft.parent !== null && draft.output.knownSilence === null);
+					if (admission.kind === "persona") {
+						workAssert(draft.parent.kind === "persona");
+						workAssert(
+							admission.row.messageId === draft.reportId &&
+								admission.row.originKey === draft.parent.originKey &&
+								originKey(draft.parent.origin) === draft.parent.originKey &&
+								Buffer.byteLength(admission.row.body, "utf8") <= 2048 &&
+								admission.fallbackPayload.turnId === opRef &&
+								admission.fallbackPayload.deliveryId === draft.deliveryId &&
+								originKey(admission.fallbackPayload.origin) === draft.parent.originKey &&
+								admission.fallbackPayload.text === admission.row.body,
+						);
+						const sessionExists = this.#database
+							.query("SELECT 1 FROM sessions WHERE origin_key = ?")
+							.get(draft.parent.originKey);
+						const idExists = this.#database
+							.query("SELECT 1 FROM inbound_messages WHERE message_id = ?")
+							.get(draft.reportId);
+						const refused = Boolean(admission.holdReason) || !sessionExists || Boolean(idExists);
+						decision = refused ? "fallback" : "reported";
+						if (refused) fallbackPayload = admission.fallbackPayload;
+					} else {
+						workAssert(draft.parent.kind === "lane");
+						const report = admission.report;
+						workAssert(
+							report.reportId === draft.reportId &&
+								report.parentName === draft.parent.name &&
+								report.childOpRef === opRef &&
+								report.childName === draft.sessionKey.slice("work/task/".length) &&
+								Buffer.byteLength(report.body, "utf8") <= 2048 &&
+								JSON.stringify(report.root) === JSON.stringify(draft.parent.root),
+						);
+						if (report.root === null) workAssert(admission.fallbackPayload === null);
+						else
+							workAssert(
+								admission.fallbackPayload !== null &&
+									admission.fallbackPayload.turnId === opRef &&
+									admission.fallbackPayload.deliveryId === draft.deliveryId &&
+									originKey(admission.fallbackPayload.origin) === report.root.originKey &&
+									admission.fallbackPayload.text === report.body,
+							);
+						decision = this.#laneParentAvailable(report.parentName)
+							? "reported"
+							: report.root
+								? "fallback"
+								: "no_target";
+						if (decision === "fallback") fallbackPayload = admission.fallbackPayload!;
+					}
+				} else {
+					workAssert(admission === undefined);
+					decision = requested;
+				}
+			}
+
+			const next: WorkAttemptRuntime = { ...draft, decision };
+			validateWorkRuntime(next, this.instanceId);
 			this.#workValidateHistory(next, record);
 			const previous = this.#workHistory(current);
 			workAssert(record.attempts.length === previous.attempts.length);
 			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous.attempts.slice(0, -1)));
-			if (next.decision === "enqueued") {
-				workAssert(payload && payload.deliveryId === next.deliveryId && payload.turnId === opRef);
-				workAssert(next.target && originKey(payload.origin) === originKey(next.target));
-				workAssert(
-					payload.role === "assistant" && payload.final === true && !payload.reaction && !isSilenceToken(payload.text),
-				);
-			} else workAssert(payload === undefined);
 			if (!this.#workCas(current, next)) return undefined;
 			this.#workPutHistory(next, record);
 			this.#workActivity(next, next.settledAt!);
-			if (payload)
+
+			if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(next);
+			if (next.decision === "reported" && admission?.kind === "persona") {
+				workAssert(
+					this.inboundEnqueueInTransaction({
+						messageId: admission.row.messageId,
+						originKey: admission.row.originKey,
+						originRefJson: admission.row.originRefJson,
+						body: admission.row.body,
+						receivedAt: next.settledAt!,
+						source: "lane_report",
+					}),
+				);
+			}
+			if (next.decision === "reported" && admission?.kind === "lane") {
+				const report = admission.report;
+				const createdAt = next.settledAt!;
+				this.#database
+					.query(
+						"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
+					)
+					.run(
+						report.reportId,
+						report.parentName,
+						report.childName,
+						report.childOpRef,
+						report.body,
+						report.root === null ? null : JSON.stringify(report.root),
+						createdAt,
+						createdAt,
+					);
+			}
+			if (fallbackPayload) {
+				const expectedOrigin =
+					admission?.kind === "persona"
+						? admission.row.originKey
+						: admission?.kind === "lane"
+							? admission.report.root?.originKey
+							: undefined;
+				workAssert(
+					fallbackPayload.deliveryId === next.deliveryId &&
+						fallbackPayload.turnId === opRef &&
+						expectedOrigin !== undefined &&
+						originKey(fallbackPayload.origin) === expectedOrigin &&
+						fallbackPayload.role === "assistant" &&
+						fallbackPayload.final === true &&
+						!fallbackPayload.reaction &&
+						!isSilentOutput(fallbackPayload.text),
+				);
 				this.deliveryCreateInTransaction({
 					id: next.deliveryId,
 					turnId: opRef,
-					originKey: originKey(payload.origin),
-					payloadJson: JSON.stringify(payload),
+					originKey: expectedOrigin!,
+					payloadJson: JSON.stringify(fallbackPayload),
 				});
-			return next;
+			}
+			if (next.decision === "wake_unaccepted") {
+				const row = linkedReport!;
+				const definitiveRefusal = draft.terminal?.reasonCode === "send_rejected";
+				const isHeld = record.state === "awaiting_operator" || record.state === "stalled";
+				let state: LaneReportState;
+				let holdReason: string | null = null;
+				let childDelivery: ChatMessagePayload | undefined;
+				let clearClaim = false;
+				if (!definitiveRefusal) {
+					state = "held";
+					holdReason = "wake_acceptance_uncertain";
+				} else if (!isHeld) {
+					state = "pending";
+					clearClaim = true;
+					requeuedParent = row.parent_name;
+				} else if (row.root_json !== null) {
+					state = "fallback";
+					const root = laneReportRoot(row)!;
+					const deliveryId = workAttemptDeliveryId(
+						this.instanceId,
+						laneJobDatabaseId(row.child_name),
+						row.child_op_ref,
+					);
+					childDelivery = buildDeliveryPayload(row.child_op_ref, root.origin, row.body, deliveryId)!;
+				} else {
+					state = "undeliverable";
+				}
+				const changed = this.#database
+					.query(
+						"UPDATE lane_reports SET state = ?, claim_kind = ?, claim_ref = ?, claim_target_op_ref = ?, hold_reason = ?, consumed_op_ref = NULL, updated_at = ? WHERE report_id = ? AND state = 'claimed' AND claim_kind = 'wake' AND claim_ref = ? AND claim_seq = ?",
+					)
+					.run(
+						state,
+						clearClaim ? null : row.claim_kind,
+						clearClaim ? null : row.claim_ref,
+						clearClaim ? null : row.claim_target_op_ref,
+						holdReason,
+						next.settledAt,
+						row.report_id,
+						opRef,
+						row.claim_seq,
+					).changes;
+				workAssert(changed === 1);
+				if (childDelivery) {
+					this.deliveryCreateInTransaction({
+						id: childDelivery.deliveryId!,
+						turnId: childDelivery.turnId,
+						originKey: originKey(childDelivery.origin),
+						payloadJson: JSON.stringify(childDelivery),
+					});
+					childFallback = childDelivery;
+				}
+			}
+			return {
+				runtime: next,
+				...(fallbackPayload ? { fallbackPayload } : {}),
+				...(childFallback ? { childFallback } : {}),
+				...(requeuedParent ? { requeuedParent } : {}),
+			};
 		});
 	}
 
-	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch | WorkAttemptSettlement): WorkAttemptRuntime {
-		const allowed = new Set(["sendPhase", "sendEvidence", "terminal", "output", "decision", "settledAt"]);
+	#laneParentAvailable(name: string): boolean {
+		const jobId = laneJobDatabaseId(name);
+		if (this.isBrokerQuarantined("work", jobId)) return false;
+		const json = this.laneJobJsonByLaneKey(`work-${name}`);
+		if (json === undefined) return false;
+		try {
+			return parseLaneJobRecord(json).jobId === jobId;
+		} catch {
+			return false;
+		}
+	}
+
+	#consumeWakeReport(runtime: WorkAttemptRuntime): void {
+		const reportId = runtime.wakeReportId;
+		if (reportId === null) return;
+		const row = this.#laneReportGetInside(reportId);
+		workAssert(row !== undefined && row.claim_kind === "wake" && row.claim_ref === runtime.opRef);
+		if (row.state === "consumed") {
+			workAssert(row.consumed_op_ref === runtime.opRef);
+			return;
+		}
+		workAssert(row.state === "claimed" || row.state === "held");
+		const changed = this.#database
+			.query(
+				"UPDATE lane_reports SET state = 'consumed', consumed_op_ref = ?, hold_reason = NULL, updated_at = ? WHERE report_id = ? AND state = ? AND claim_kind = 'wake' AND claim_ref = ? AND claim_seq = ?",
+			)
+			.run(runtime.opRef, new Date().toISOString(), reportId, row.state, runtime.opRef, row.claim_seq).changes;
+		workAssert(changed === 1);
+	}
+
+	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch): WorkAttemptRuntime {
+		const allowed = new Set(["sendPhase", "sendEvidence", "terminal", "output"]);
 		workAssert(Object.keys(patch).every((key) => allowed.has(key)));
 		const next = { ...current, ...patch, version: current.version + 1 };
 		validateWorkRuntime(next, this.instanceId);
@@ -977,16 +1591,29 @@ export class GatewayDatabase {
 
 	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
 		const record = parseLaneJobRecord(JSON.stringify(input));
-		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd);
+		workAssert(
+			record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd,
+			"history job identity matches runtime",
+		);
 		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt);
-		workAssert(runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt);
-		if (runtime.settledAt === null) workAssert(record.attempts.at(-1)?.opRef === runtime.opRef);
+		workAssert(
+			attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt,
+			"history attempt identity matches runtime",
+		);
+		workAssert(
+			runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt,
+			"attempt.endedAt matches runtime.settledAt",
+		);
+		if (runtime.settledAt === null)
+			workAssert(record.attempts.at(-1)?.opRef === runtime.opRef, "open runtime belongs to latest history attempt");
 	}
 
 	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
 		const json = this.laneJobJson(runtime.jobId);
-		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+		workAssert(
+			json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json,
+			"lane history rows share one serialized record",
+		);
 		const record = parseLaneJobRecord(json);
 		this.#workValidateHistory(runtime, record);
 		return record;
@@ -1080,6 +1707,8 @@ export class GatewayDatabase {
 		| {
 				epoch: number;
 				lastBootstrappedEpoch: number;
+				agentsMdEpoch: number;
+				agentsMdDigest: string | null;
 				appliedAt: string | null;
 				includedSections: readonly string[];
 				byteCount: number;
@@ -1092,6 +1721,8 @@ export class GatewayDatabase {
 				{
 					epoch: number;
 					last_bootstrapped_epoch: number;
+					agents_md_epoch: number;
+					agents_md_digest: string | null;
 					bootstrap_applied_at: string | null;
 					bootstrap_sections_json: string;
 					bootstrap_byte_count: number;
@@ -1100,19 +1731,32 @@ export class GatewayDatabase {
 				},
 				[string]
 			>(
-				"SELECT epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
+				"SELECT epoch, last_bootstrapped_epoch, agents_md_epoch, agents_md_digest, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
 			)
 			.get(originKey);
 		if (!row) return undefined;
 		return {
 			epoch: row.epoch,
 			lastBootstrappedEpoch: row.last_bootstrapped_epoch,
+			agentsMdEpoch: row.agents_md_epoch,
+			agentsMdDigest: row.agents_md_digest,
 			appliedAt: row.bootstrap_applied_at,
 			includedSections: parseStringList(row.bootstrap_sections_json),
 			byteCount: row.bootstrap_byte_count,
 			truncated: row.bootstrap_truncated === 1,
 			diagnostics: parseStringList(row.bootstrap_diagnostics_json),
 		};
+	}
+
+	/** Records the current AGENTS.md digest for a session epoch when it changes. */
+	recordSessionAgentsBaseline(originKey: string, epoch: number, digest: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET agents_md_epoch = ?, agents_md_digest = ? WHERE origin_key = ? AND epoch = ? AND (agents_md_epoch < ? OR (agents_md_epoch = ? AND agents_md_digest IS NOT ?))",
+				)
+				.run(epoch, digest, originKey, epoch, epoch, epoch, digest).changes === 1
+		);
 	}
 
 	markSessionBootstrapped(
@@ -1508,21 +2152,39 @@ export class GatewayDatabase {
 		originKey: string;
 		originRefJson: string;
 		body: string;
-		engagementJson?: string;
+		engagementJson?: string | null;
 		receivedAt?: string;
+		source?: "platform" | "lane_report";
 	}): boolean {
+		const enqueue = () => this.inboundEnqueueInTransaction(row);
+		return this.#inTransaction ? enqueue() : this.withTransaction(enqueue);
+	}
+
+	inboundEnqueueInTransaction(row: {
+		messageId: string;
+		originKey: string;
+		originRefJson: string;
+		body: string;
+		engagementJson?: string | null;
+		receivedAt?: string;
+		source?: "platform" | "lane_report";
+	}): boolean {
+		this.requireTransaction();
 		const receivedAt = row.receivedAt ?? new Date().toISOString();
 		if (!Number.isFinite(Date.parse(receivedAt))) throw new Error("inbound receivedAt must be an ISO timestamp");
+		const source = row.source ?? "platform";
+		if (source === "lane_report" && row.engagementJson !== undefined && row.engagementJson !== null)
+			throw new Error("lane report inbound rows cannot carry engagement metadata");
 		const changes = this.#database
 			.query(
-				"INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
+				"INSERT INTO inbound_messages (message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
 			)
-			.run(row.messageId, row.originKey, row.originRefJson, row.body, row.engagementJson ?? null, receivedAt);
+			.run(row.messageId, source, row.originKey, row.originRefJson, row.body, row.engagementJson ?? null, receivedAt);
 		return changes.changes > 0;
 	}
 
 	inboundColumns(): string {
-		return "message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
+		return "message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
 	}
 
 	/**
@@ -1774,6 +2436,11 @@ export class GatewayDatabase {
 		this.metaSet(failedTurnResetCapKey(originKey), "0");
 	}
 
+	failedTurnResetCapped(originKey: string): boolean {
+		const cap = this.metaGet(failedTurnResetCapKey(originKey));
+		return cap !== undefined && cap !== "0";
+	}
+
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
 		const value = Number.parseInt(this.metaGet(freshTurnMetaKey(originKey, epoch, triggerMessageId)) ?? "0", 10);
 		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -1828,6 +2495,30 @@ export class GatewayDatabase {
 				)
 				.run(messageId, opRef).changes === 1
 		);
+	}
+
+	/**
+	 * A held steer whose turn is over and whose session is gone: whether the model
+	 * saw it is unknowable and nothing will ever answer the clientRef replay. It is
+	 * closed as done input of that turn - never re-dispatched, which could deliver
+	 * a message the model already answered a second time - and, in the SAME
+	 * transaction, its platform message leaves the unread context window, exactly
+	 * like an accepted steer, so the next turn does not present it as unread.
+	 */
+	inboundSteerAbandoned(messageId: string, opRef: string, contextMessageId?: string): boolean {
+		return this.withTransaction(() => {
+			const closed =
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE message_id = ? AND state = 'pending' AND turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?",
+					)
+					.run(messageId, opRef).changes === 1;
+			if (closed && contextMessageId)
+				this.#database
+					.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ? AND consumed_at IS NULL")
+					.run(new Date().toISOString(), contextMessageId);
+			return closed;
+		});
 	}
 
 	/** Held steers of this origin whose turn is already terminal: unresolvable by the turn, only by a clientRef replay. */
@@ -1911,6 +2602,16 @@ export class GatewayDatabase {
 			.all()
 			.map((row) => row.origin_key);
 	}
+	/** A nonterminal trigger hidden from execution because its inbound row was quarantined. */
+	inboundHasQuarantinedNonterminalTurn(originKey: string): boolean {
+		return (
+			this.#database
+				.query<{ n: number }, [string]>(
+					"SELECT 1 AS n FROM inbound_messages i JOIN broker_quarantine q ON q.kind = 'inbound' AND q.subject_id = i.message_id WHERE i.origin_key = ? AND i.turn_role = 'trigger' AND i.turn_state IN ('bound','accepted') LIMIT 1",
+				)
+				.get(originKey) !== null
+		);
+	}
 
 	/** Origins with bound/accepted turns that need actor reconstruction after boot. */
 	inboundNonterminalOrigins(): readonly string[] {
@@ -1951,13 +2652,13 @@ export class GatewayDatabase {
 		const discard = () => {
 			const ids = this.#database
 				.query<{ message_id: string }, [string, string]>(
-					`SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
+					`SELECT message_id FROM inbound_messages WHERE origin_key = ? AND source = 'platform' AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
 				)
 				.all(originKey, floorAt)
 				.map((row) => row.message_id);
 			this.#database
 				.query(
-					`UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
+					`UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND source = 'platform' AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
 				)
 				.run(originKey, floorAt);
 			return ids;
@@ -2492,6 +3193,23 @@ export class GatewayDatabase {
 				"SELECT origin_key, gjc_session_id, last_activity_at FROM sessions WHERE origin_key LIKE 'work/task/%' AND gjc_session_id <> '' ORDER BY last_activity_at",
 			)
 			.all();
+	}
+
+	/** Check if this gateway is in broker mode (has an active broker authority). */
+	isBrokerMode(): boolean {
+		return this.#brokerAuthority() !== null;
+	}
+
+	/** Get the repo for a work lane by session ID from the owned binding, or undefined if not found. */
+	workLaneRepoBySessionId(sessionId: string): string | undefined {
+		const authority = this.#brokerAuthority();
+		if (!authority) return undefined;
+		const row = this.#database
+			.query<{ repo: string }, [string, string]>(
+				"SELECT repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
+			)
+			.get(brokerAuthorityKey(authority), sessionId);
+		return row?.repo;
 	}
 
 	putSession(originKey: string, sessionId: string): void {
@@ -3746,16 +4464,154 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		}
 		if (current < 24) {
 			this.withTransaction(() => {
-				// Persist only bounded delivery failure evidence. Existing rows remain NULL.
-				// Persisted delivery states are pending, inflight, confirmed, failed_ambiguous,
-				// and expired; adding a new state requires a data-preserving migration that
-				// updates the deliveries.state CHECK constraint.
-				this.#database.exec(
-					"ALTER TABLE deliveries ADD COLUMN last_error TEXT CHECK(last_error IS NULL OR last_error IN ('adapter_error','rate_limited','permission_denied','target_unavailable','transport_error'))",
+				this.#database.exec(`
+					ALTER TABLE inbound_messages ADD COLUMN source TEXT NOT NULL DEFAULT 'platform' CHECK(source IN ('platform','lane_report'));
+					CREATE TABLE lane_reports (
+						report_id TEXT PRIMARY KEY,
+						parent_name TEXT NOT NULL,
+						child_name TEXT NOT NULL,
+						child_op_ref TEXT NOT NULL UNIQUE,
+						body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 2048),
+						root_json TEXT,
+						state TEXT NOT NULL CHECK(state IN ('pending','claimed','consumed','fallback','held','undeliverable')),
+						claim_kind TEXT CHECK(claim_kind IS NULL OR claim_kind IN ('steer','wake')),
+						claim_ref TEXT,
+						claim_target_op_ref TEXT,
+						claim_seq INTEGER NOT NULL DEFAULT 0 CHECK(claim_seq >= 0),
+						hold_reason TEXT,
+						consumed_op_ref TEXT,
+						created_at TEXT NOT NULL,
+						updated_at TEXT NOT NULL,
+						CHECK(state NOT IN ('claimed','held') OR (claim_kind IS NOT NULL AND claim_ref IS NOT NULL)),
+						CHECK(state <> 'pending' OR (claim_kind IS NULL AND claim_ref IS NULL AND claim_target_op_ref IS NULL)),
+						CHECK(claim_kind IS NULL OR claim_seq > 0),
+						CHECK(claim_kind IS NULL OR claim_kind <> 'steer' OR claim_target_op_ref IS NOT NULL),
+						CHECK(claim_kind IS NULL OR claim_kind <> 'wake' OR claim_target_op_ref IS NULL),
+						CHECK((state = 'consumed' AND consumed_op_ref IS NOT NULL) OR (state <> 'consumed' AND consumed_op_ref IS NULL))
+					);
+					CREATE INDEX lane_reports_parent_state ON lane_reports(parent_name, state, created_at);
+					DROP TRIGGER IF EXISTS work_attempt_runtime_quarantine_update;
+					DROP TRIGGER IF EXISTS work_attempt_runtime_quarantine_delete;
+				`);
+				for (const row of this.#database
+					.query<{ op_ref: string; job_id: string; record_json: string }, []>(
+						"SELECT op_ref, job_id, record_json FROM work_attempt_runtime",
+					)
+					.all()) {
+					try {
+						const legacy = JSON.parse(row.record_json) as Record<string, unknown>;
+						workAssert(legacy && typeof legacy === "object" && !Array.isArray(legacy));
+						const target = legacy.target;
+						let parent: WorkParent | null = null;
+						if (target !== null) {
+							validateOriginRef(target as OriginRef);
+							const origin = structuredClone(target as OriginRef);
+							parent = { kind: "persona", originKey: originKey(origin), origin };
+						}
+						delete legacy.target;
+						legacy.parent = parent;
+						legacy.reportId = workAttemptReportId(this.instanceId, row.job_id, row.op_ref);
+						legacy.wakeReportId = null;
+						legacy.noticeHash = null;
+						if (legacy.decision === "enqueued") legacy.decision = "fallback";
+						const runtime = legacy as unknown as WorkAttemptRuntime;
+						validateWorkRuntime(runtime, this.instanceId);
+						workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id);
+						this.#database
+							.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+							.run(JSON.stringify(runtime), row.op_ref);
+					} catch {
+						throw new DatabaseStartupError(
+							"migration_corrupt",
+							`schema v24 could not migrate work attempt ${row.op_ref}`,
+						);
+					}
+				}
+				this.#database.exec(`
+					CREATE TRIGGER work_attempt_runtime_quarantine_update BEFORE UPDATE ON work_attempt_runtime
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+					CREATE TRIGGER work_attempt_runtime_quarantine_delete BEFORE DELETE ON work_attempt_runtime
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+				`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(24, new Date().toISOString());
+			});
+		}
+		if (current < 25) {
+			this.withTransaction(() => {
+				// Track each epoch's AGENTS.md baseline. Only the digest is persisted;
+				// prompt content remains in the workspace and is re-read on each turn.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
 				);
+				if (!columns.has("agents_md_epoch"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_epoch INTEGER NOT NULL DEFAULT -1");
+				if (!columns.has("agents_md_digest"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_digest TEXT");
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-					.run(24, new Date().toISOString());
+					.run(25, new Date().toISOString());
+			});
+		}
+		if (current < 26) {
+			this.withTransaction(() => {
+				// PR #293 owns schema 26; reserve it as an empty step on this standalone branch.
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(26, new Date().toISOString());
+			});
+		}
+		if (current < 27) {
+			this.withTransaction(() => {
+				// Persist only bounded delivery failure evidence. Existing rows remain NULL.
+				// A prior migration may have added an unconstrained column; normalize its
+				// classification values before enforcing this branch's narrower allowlist.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(deliveries)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("last_error")) {
+					this.#database.exec(
+						"ALTER TABLE deliveries ADD COLUMN last_error TEXT CHECK(last_error IS NULL OR last_error IN ('adapter_error','rate_limited','permission_denied','target_unavailable','transport_error'))",
+					);
+				} else {
+					this.#database.exec(`
+						UPDATE deliveries SET last_error = CASE last_error
+							WHEN 'rate_limited' THEN 'rate_limited'
+							WHEN 'permission_denied' THEN 'permission_denied'
+							WHEN 'target_unavailable' THEN 'target_unavailable'
+							WHEN 'transport_error' THEN 'transport_error'
+							WHEN 'timeout' THEN 'transport_error'
+							WHEN 'network' THEN 'transport_error'
+							WHEN 'not_found' THEN 'target_unavailable'
+							WHEN 'forbidden' THEN 'permission_denied'
+							ELSE 'adapter_error'
+						END
+						WHERE last_error IS NOT NULL
+							AND last_error NOT IN ('adapter_error','rate_limited','permission_denied','target_unavailable','transport_error');
+					`);
+				}
+				this.#database.exec(`
+					CREATE TRIGGER IF NOT EXISTS deliveries_last_error_allowlist_insert
+					BEFORE INSERT ON deliveries
+					WHEN NEW.last_error IS NOT NULL AND NEW.last_error NOT IN ('adapter_error','rate_limited','permission_denied','target_unavailable','transport_error')
+					BEGIN SELECT RAISE(ABORT, 'invalid delivery failure reason'); END;
+					CREATE TRIGGER IF NOT EXISTS deliveries_last_error_allowlist_update
+					BEFORE UPDATE OF last_error ON deliveries
+					WHEN NEW.last_error IS NOT NULL AND NEW.last_error NOT IN ('adapter_error','rate_limited','permission_denied','target_unavailable','transport_error')
+					BEGIN SELECT RAISE(ABORT, 'invalid delivery failure reason'); END;
+				`);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(27, new Date().toISOString());
 			});
 		}
 	}

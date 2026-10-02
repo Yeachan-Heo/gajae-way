@@ -23,7 +23,14 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
-import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
+import {
+	type FailedTransportCause,
+	type FailedTurnEvidence,
+	type FailedTurnEvidenceInput,
+	readFailedTransportCause,
+	readFailedTurnEvidence,
+} from "./failed-turn-evidence";
+import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
@@ -62,6 +69,8 @@ export interface SessionPort {
 	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
+	/** Transport failure cause from the same session transcript. */
+	failedTransportCause?(input: FailedTurnEvidenceInput): Promise<FailedTransportCause | undefined>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
@@ -347,7 +356,7 @@ export class BrokerSessionPort implements SessionPort {
 					result?: { session?: { live?: unknown; deleted?: unknown } };
 					error?: { code?: unknown };
 				};
-				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
+				if (envelope.ok === false) indexed = !isSessionGoneCode(envelope.error?.code);
 				if (envelope.ok === true && envelope.result?.session?.live === false) {
 					if (envelope.result.session.deleted !== true) {
 						try {
@@ -384,7 +393,8 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			if (input.epochRecovery === false || !isRebindableCode(sdkErrorCode(error))) throw error;
+			const poisonedCode = poisonedCreateKeyCode(error, idempotencyKey);
+			if (input.epochRecovery === false || poisonedCode === undefined) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
 				console.error(
@@ -395,7 +405,7 @@ export class BrokerSessionPort implements SessionPort {
 			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
 			console.error(
-				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
+				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key code=${poisonedCode}`,
 			);
 			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
 		}
@@ -461,7 +471,7 @@ export class BrokerSessionPort implements SessionPort {
 				// Only a broker that explicitly reports the id as not indexed / not
 				// live keeps us waiting; anything else is treated as ready (the send
 				// path still has its own recovery if that turns out to be wrong).
-				const disowned = envelope.ok === false && envelope.error?.code === "session_unavailable";
+				const disowned = envelope.ok === false && isSessionGoneCode(envelope.error?.code);
 				const notLive =
 					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
 				if (!disowned && !notLive) return;
@@ -469,7 +479,7 @@ export class BrokerSessionPort implements SessionPort {
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
 				const code = sdkErrorCode(error);
-				if (code !== "session_unavailable") return;
+				if (!isSessionGoneCode(code)) return;
 				lastCode = code;
 			}
 			if (Date.now() >= deadline)
@@ -551,12 +561,12 @@ export class BrokerSessionPort implements SessionPort {
 				result?: { session?: { live?: unknown } };
 				error?: { code?: unknown };
 			};
-			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
+			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
 			const live = envelope.result?.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			return { live: undefined, disowned: sdkErrorCode(error) === "session_unavailable" };
+			return { live: undefined, disowned: isSessionGoneCode(sdkErrorCode(error)) };
 		}
 	}
 
@@ -597,7 +607,7 @@ export class BrokerSessionPort implements SessionPort {
 			live = typeof session?.live === "boolean" ? session.live : undefined;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			return sdkErrorCode(error) === "session_unavailable"
+			return isSessionGoneCode(sdkErrorCode(error))
 				? { outcome: "already_gone" }
 				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
 		}
@@ -1196,17 +1206,17 @@ export function parseWorkerOutputResponse(
 		const code = workerRecord(envelope.error)?.code;
 		if (
 			typeof code === "string" &&
-			[
-				"session_unavailable",
-				"resource_gone",
-				"unavailable",
-				"unsupported_operation",
-				"unknown_operation",
-				"unknown_query",
-				"unsupported_query",
-				"not_supported",
-				"operation_not_session_owned",
-			].includes(code)
+			(isSessionGoneCode(code) ||
+				[
+					"resource_gone",
+					"unavailable",
+					"unsupported_operation",
+					"unknown_operation",
+					"unknown_query",
+					"unsupported_query",
+					"not_supported",
+					"operation_not_session_owned",
+				].includes(code))
 		)
 			return { status: "unavailable", code: "output_unavailable" };
 		return { status: "absent", code: "transport_error" };
@@ -1407,13 +1417,56 @@ function stableErrorCode(value: unknown): string | undefined {
 	return value;
 }
 
+/**
+ * The rebindable code of a session.create failure whose idempotency key can
+ * never succeed, or undefined when the same key must be retried.
+ *
+ * gjc <= 0.17 reported a condemned key by its internal code (`terminal_uncertain`,
+ * `spawn_failed`, ...). gjc 0.18's public error contract collapses every
+ * internal code to `operation_failed`; the only remaining evidence that the key
+ * itself is undecidable is `outcomeCertainty: "unknown"` with that exact key
+ * named as a reference. Measured on gaebal-gajae 2026-09-30: 32 creates left
+ * `terminal_uncertain` by a broker kill loop answered exactly that envelope,
+ * deterministically, on every replay, and six channels stayed mute for hours.
+ * A bare `operation_failed` without the key reference stays a same-key retry.
+ */
+function poisonedCreateKeyCode(error: unknown, idempotencyKey: string): string | undefined {
+	const code = sdkErrorCode(error);
+	if (isRebindableCode(code)) return code;
+	if (code !== "operation_failed" || !(error instanceof GjcCliError)) return undefined;
+	const details = recordOf(error.details);
+	if (details?.outcomeCertainty !== "unknown") return undefined;
+	const references = Array.isArray(details.references) ? details.references : [];
+	const namesKey = references.some((reference) => {
+		const ref = recordOf(reference);
+		return ref?.kind === "idempotencyKey" && ref.value === idempotencyKey;
+	});
+	return namesKey ? code : undefined;
+}
+
+const OUTCOME_CERTAINTIES = new Set(["applied", "not-applied", "unknown"]);
+
 function sanitizedDetails(details: unknown): unknown {
 	const code = stableErrorCode(envelopeErrorCode(details));
-	const message =
-		typeof details === "object" && details !== null && typeof (details as { message?: unknown }).message === "string"
-			? sanitizeDiagnostic((details as { message: string }).message)
+	const record = recordOf(details);
+	const message = typeof record?.message === "string" ? sanitizeDiagnostic(record.message) : undefined;
+	const outcomeCertainty =
+		typeof record?.outcomeCertainty === "string" && OUTCOME_CERTAINTIES.has(record.outcomeCertainty)
+			? record.outcomeCertainty
 			: undefined;
-	return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
+	// Only idempotency-key references survive: the gateway minted them, and
+	// poisonedCreateKeyCode matches them exactly against the key it sent.
+	const references = (Array.isArray(record?.references) ? record.references : []).flatMap((reference) => {
+		const ref = recordOf(reference);
+		const value = stableErrorCode(ref?.value);
+		return ref?.kind === "idempotencyKey" && value ? [{ kind: "idempotencyKey", value }] : [];
+	});
+	return {
+		...(code ? { code } : {}),
+		...(message ? { message } : {}),
+		...(outcomeCertainty ? { outcomeCertainty } : {}),
+		...(references.length > 0 ? { references } : {}),
+	};
 }
 
 function sanitizeSdkFailure(error: unknown): Error {

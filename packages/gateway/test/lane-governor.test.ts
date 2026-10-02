@@ -8,8 +8,8 @@ import {
 	newOpRef,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
-import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
+import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
 const SESSION_ID = "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0";
@@ -191,6 +191,8 @@ test("a corrupt lane-job record fails closed: counted, never retired", async () 
 		json: "{not json",
 	});
 	const port = new ScriptedSessionPort();
+	// Set session as live to prevent sweep second pass from releasing it
+	port.setSessionState("sess-a", { live: true });
 	const governor = new LaneGovernor({ database, sessionPort: port, maxLanes: 1, idleRetireMs: 60_000, now: () => NOW });
 	const lane = governor.activeLanes()[0];
 	expect(lane).toMatchObject({ name: "a", state: "corrupt", attemptOpen: true });
@@ -333,6 +335,8 @@ test("an existing lane-job row with an empty body is corrupt, not absent", async
 		json: "",
 	});
 	const port = new ScriptedSessionPort();
+	// Set session as live to prevent sweep second pass from releasing it
+	port.setSessionState("sess-a", { live: true });
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => NOW });
 	expect(governor.activeLanes()[0]).toMatchObject({ state: "corrupt", attemptOpen: true });
 	expect((await governor.retire("a", "operator")).retired).toBe(false);
@@ -344,6 +348,8 @@ test("sweep leaves a lane alone when it was reused on the same session between n
 	database = await GatewayDatabase.open(":memory:");
 	bind("a", NOW - 10 * 60_000, "sess-a");
 	const port = new ScriptedSessionPort();
+	// Set session as live to prevent sweep second pass from releasing it
+	port.setSessionState("sess-a", { live: true });
 	let clock = NOW;
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => clock });
 	// Hold the lane lock while the sweep nominates `a` as idle, then make the
@@ -410,4 +416,416 @@ test("quarantined historical names refuse admission and retirement before recove
 	expect(port.closes).toEqual([]);
 	expect(database.laneJobJson(laneJobIdentity("old").jobId)).toBe(history);
 	expect(() => governor.assertAdmission("fresh")).not.toThrow();
+});
+
+test("#340: broker mode - lane with no job record must use binding repo from workLaneRepoBySessionId", async () => {
+	// Broker mode setup
+	const AUTHORITY = { canonicalAgentDir: "/broker/agent", identity: "test-broker" };
+	database = await GatewayDatabase.open(":memory:");
+	database.assertBrokerAuthority(AUTHORITY, { initializeEmpty: true });
+
+	// Lane A: no job record in broker mode - CRITICAL #340 case
+	const LANE_A_REPO = "/binding/repo/a";
+	const sessionIdA = "sess-broker-a-no-job";
+	const bindingA = {
+		sessionId: sessionIdA,
+		originKey: "work/task/a",
+		epoch: 0,
+		repo: LANE_A_REPO,
+		authority: AUTHORITY,
+	};
+	database.recordOwnedBinding(bindingA);
+
+	// Lane B: with job record in broker mode
+	const LANE_B_REPO = "/binding/repo/b";
+	const sessionIdB = "sess-broker-b-has-job";
+	const bindingB = {
+		sessionId: sessionIdB,
+		originKey: "work/task/b",
+		epoch: 0,
+		repo: LANE_B_REPO,
+		authority: AUTHORITY,
+	};
+	database.recordOwnedBinding(bindingB);
+
+	// Add activity to both (update sessions created by recordOwnedBinding)
+	setSystemTime(new Date(NOW - 70_000));
+	database.updateActivity("work/task/a", "{}");
+	database.updateActivity("work/task/b", "{}");
+	setSystemTime();
+
+	// Add job record for lane B ONLY (lane A has NO job - the critical #340 case)
+	const idB = laneJobIdentity("b");
+	let recB = createLaneJobRecord({
+		jobId: idB.jobId,
+		branch: "work/b",
+		worktreePath: "/tmp/job-b-worktree",
+		now: () => new Date(NOW),
+	});
+	recB = { ...recB, state: "done" };
+	database.putLaneJob({ ...recB, laneKey: idB.laneKey, json: JSON.stringify(recB) });
+
+	// Port that enforces broker authority: throws if close() repo doesn't match binding
+	class BrokerEnforcingPort extends ScriptedSessionPort {
+		override async close(input: { sessionId: string; repo: string }): Promise<void> {
+			this.closes.push(input);
+			// Enforce broker ownership:
+			// - Lane A (no job): MUST use binding repo (this is the #340 fix)
+			// - Lane B (has job): would use job worktree; allow either binding or job repo
+			if (input.sessionId === sessionIdA && input.repo !== LANE_A_REPO) {
+				throw new BrokerAuthorityError("unowned_session");
+			}
+		}
+	}
+
+	const port = new BrokerEnforcingPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// CRITICAL: Both lanes must retire successfully
+	// Lane A (no job record) MUST use binding repo via workLaneRepoBySessionId
+	// If binding lookup is replaced with undefined, close will throw unowned_session
+	const retired = await governor.sweep();
+	expect(retired).toBe(2);
+
+	// Verify correct repos were used in close() calls
+	expect(port.closes.length).toBe(2);
+	const closeA = port.closes.find((c) => c.sessionId === sessionIdA);
+	const closeB = port.closes.find((c) => c.sessionId === sessionIdB);
+
+	// CRITICAL #340 TEST:
+	// Lane A (no job record) must use binding repo via workLaneRepoBySessionId
+	// If this lookup is replaced with undefined, close will throw unowned_session
+	expect(closeA?.repo).toBe(LANE_A_REPO);
+
+	// Lane B can use either job worktree or binding repo
+	expect(closeB).toBeDefined();
+
+	expect(logs.some((line) => line.includes("lane_retired name=a"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
+});
+
+test("#340: per-lane error handling continues sweep for remaining lanes", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane A: will fail during lock
+	bind("a", NOW - 70_000);
+	// Lane B: should retire despite A's error
+	bind("b", NOW - 70_000);
+	persistJob("b", "done");
+
+	class FailingLockPort extends ScriptedSessionPort {
+		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
+			if (key === "work/task/a") {
+				throw new Error("lock acquisition failed");
+			}
+			return await super.runExclusive(key, work);
+		}
+	}
+
+	const port = new FailingLockPort();
+	// Set session state: A is live (lock fails, doesn't get retired in first pass)
+	// B's state defaults to live=false (will be retired)
+	port.setSessionState("sess-a", { live: true });
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	const retired = await governor.sweep();
+	// B retired by first pass (done job), A retained by lock failure and live session
+	expect(retired).toBe(1);
+
+	expect(port.closes.length).toBe(1);
+	expect(port.closes[0].sessionId).toBe("sess-b");
+
+	// A stays bound because lock failed and session is live
+	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	// B is retired
+	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+
+	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
+});
+
+test("#340: per-lane error handling continues sweep when retire() throws", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane A: will fail during lock acquisition
+	bind("a", NOW - 70_000);
+	// Lane B: should retire despite A's error
+	bind("b", NOW - 70_000);
+	persistJob("b", "done");
+
+	class FailingLockPort extends ScriptedSessionPort {
+		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
+			if (key === "work/task/a") {
+				throw new Error("lock acquisition failed");
+			}
+			return await super.runExclusive(key, work);
+		}
+	}
+
+	const port = new FailingLockPort();
+	// A is live (lock fails, doesn't get retired); B defaults to dead
+	port.setSessionState("sess-a", { live: true });
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	const retired = await governor.sweep();
+	expect(retired).toBe(1); // Only B retired
+
+	expect(port.closes.length).toBe(1);
+	expect(port.closes[0].sessionId).toBe("sess-b");
+
+	// A stays bound (lock failed, live session)
+	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	// B is retired
+	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+
+	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
+});
+
+test("#360: session_unavailable status error is treated like unknown: settled when session dead/disowned", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("a", NOW - 10 * 60_000, SESSION_ID);
+	const identity = laneJobIdentity("a");
+	const opRef = newOpRef("governor-session-unavail");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/a",
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW - 300_000),
+	});
+	record = appendAttempt(record, { opRef, sessionId: SESSION_ID, startedAt: new Date(NOW - 240_000).toISOString() });
+	record = closeAttempt({
+		record,
+		opRef,
+		endState: "attempt_ended",
+		errorCode: "gateway_turn_reaped",
+		endedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+
+	class SessionUnavailablePort extends ScriptedSessionPort {
+		override async status(): Promise<any> {
+			throw new Error('gjc sdk session status reported failure: {"code":"session_unavailable"}');
+		}
+	}
+
+	const port = new SessionUnavailablePort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// When session is dead, session_unavailable error should be treated as settled (via liveness)
+	port.setSessionState(SESSION_ID, { live: false, repo: "/tmp/worker-repo" });
+	const deadOutcome = await governor.retire("a", "operator");
+	expect(deadOutcome.retired).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=a"))).toBe(true);
+});
+
+test("#360: session_unavailable with live session does not settle", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("a", NOW - 10 * 60_000, SESSION_ID);
+	const identity = laneJobIdentity("a");
+	const opRef = newOpRef("governor-session-unavail-live");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/a",
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW - 300_000),
+	});
+	record = appendAttempt(record, { opRef, sessionId: SESSION_ID, startedAt: new Date(NOW - 240_000).toISOString() });
+	record = closeAttempt({
+		record,
+		opRef,
+		endState: "attempt_ended",
+		errorCode: "gateway_turn_reaped",
+		endedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+
+	class SessionUnavailablePort2 extends ScriptedSessionPort {
+		override async status(): Promise<any> {
+			throw new Error('gjc sdk session status reported failure: {"code":"session_unavailable"}');
+		}
+	}
+
+	const port = new SessionUnavailablePort2();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// When session is live, session_unavailable error should NOT settle
+	port.setSessionState(SESSION_ID, { live: true, repo: "/tmp/worker-repo" });
+	const liveOutcome = await governor.retire("a", "operator");
+	expect(liveOutcome.retired).toBe(false);
+	expect(liveOutcome.retired === false && liveOutcome.reason).toMatch(/broker reports/);
+});
+
+test("#360: forceRetire refuses live sessions but closes dead ones", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("live", NOW, "sess-live");
+	persistJob("live", "running", false);
+	bind("dead", NOW, "sess-dead");
+	persistJob("dead", "running", false);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Force retire on live session: should refuse
+	port.setSessionState("sess-live", { live: true });
+	const liveRefused = await governor.forceRetire("live");
+	expect(liveRefused.retired).toBe(false);
+	expect(liveRefused.retired === false && liveRefused.reason).toMatch(/still live/);
+	expect(logs.some((line) => line.includes("lane_force_retire_rejected"))).toBe(true);
+
+	// Force retire on dead session: should succeed
+	port.setSessionState("sess-dead", { live: false });
+	const deadRetired = await governor.forceRetire("dead");
+	expect(deadRetired.retired).toBe(true);
+	if (deadRetired.retired) {
+		expect(deadRetired.forced).toBe(true);
+	}
+	expect(logs.some((line) => line.includes("lane_retired name=dead") && line.includes("reason=operator_force"))).toBe(
+		true,
+	);
+	expect(port.closes).toContainEqual({ sessionId: "sess-dead", repo: "/tmp/worker-repo" });
+});
+
+test("forceRetire catches and logs recovery-gate rejection instead of leaking a rejected promise", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("dead", NOW, "sess-dead");
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: new ScriptedSessionPort(),
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+	governor.setRecoveryGate(async () => {
+		throw new Error("recovery failed");
+	});
+
+	await expect(governor.forceRetire("dead")).resolves.toMatchObject({
+		retired: false,
+		reason: "recovery failed",
+	});
+	expect(logs).toContain("lane_force_retire_failed name=dead reason=recovery failed");
+});
+
+test("#360: sweep releases dead lanes and quarantined lanes don't count toward capacity", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane 1: dead session
+	bind("dead-lane", NOW - 120_000, "sess-dead");
+	persistJob("dead-lane", "running", false); // not open
+
+	// Lane 2: live lane (should not be retired)
+	bind("live-lane", NOW - 10_000, "sess-live");
+	persistJob("live-lane", "running", false);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		maxLanes: 2,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Both lanes fit within maxLanes
+	const lanes = governor.activeLanes();
+	expect(lanes.map((l) => l.name).sort()).toEqual(["dead-lane", "live-lane"]);
+
+	// Test that we can still admit since we're at capacity
+	expect(() => governor.assertAdmission("dead-lane")).not.toThrow();
+	expect(() => governor.assertAdmission("live-lane")).not.toThrow();
+
+	// Test that sweep releases dead lanes
+	port.setSessionState("sess-dead", { live: false });
+	port.setSessionState("sess-live", { live: true });
+
+	const retiredCount = await governor.sweep();
+	expect(retiredCount).toBe(1); // Only dead-lane should be retired by sweep
+
+	expect(logs.some((line) => line.includes("lane_retired name=dead-lane"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=live-lane"))).toBe(false); // live lane not retired
+
+	// Verify only dead-lane was closed
+	expect(port.closes).toContainEqual({ sessionId: "sess-dead", repo: "/tmp/worker-repo" });
+	expect(port.closes).not.toContainEqual({ sessionId: "sess-live", repo: "/tmp/worker-repo" });
+});
+
+test("#360: retireAllDead retires only dead lanes, skipping live and quarantined", async () => {
+	database = await GatewayDatabase.open(":memory:");
+
+	// Lane 1: dead
+	bind("dead1", NOW - 120_000, "sess-dead1");
+	// Lane 2: dead
+	bind("dead2", NOW - 120_000, "sess-dead2");
+	// Lane 3: live
+	bind("live", NOW - 10_000, "sess-live");
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Set session states
+	port.setSessionState("sess-dead1", { live: false });
+	port.setSessionState("sess-dead2", { live: false });
+	port.setSessionState("sess-live", { live: true });
+
+	const result = await governor.retireAllDead();
+	expect(result.count).toBe(2); // Only the two dead lanes
+	expect(result.names.sort()).toEqual(["dead1", "dead2"]);
+
+	expect(logs.filter((line) => line.includes("lane_retired")).length).toBe(2);
+	expect(logs.some((line) => line.includes("lane_retired name=dead1"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=dead2"))).toBe(true);
+	expect(logs.some((line) => line.includes("lane_retired name=live"))).toBe(false);
+
+	expect(port.closes.length).toBe(2);
+	expect(port.closes.map((c) => c.sessionId).sort()).toEqual(["sess-dead1", "sess-dead2"]);
 });

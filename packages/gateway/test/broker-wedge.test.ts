@@ -240,7 +240,7 @@ class FailingBindPort extends ScriptedSessionPort {
 	}
 }
 
-test("persona holds a pending trigger with the broker wedge cause after five identical bind failures", async () => {
+test("admissionHold is broker_wedged after BIND_WEDGE_PROBE_STRIKES and clears after a successful bind", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-persona-"));
 	directories.push(home);
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -293,6 +293,57 @@ test("persona holds a pending trigger with the broker wedge cause after five ide
 		expect(holds[0]).toContain("sdk unavailable / broker wedged since");
 		expect(holds[0]).toContain("stopped heartbeating");
 		expect(holds[0]).not.toContain("Prompt submission failed");
+		expect(manager.admissionHold(ORIGIN)).toBe("broker_wedged");
+		port.failure = false;
+		timers.at(-1)?.work();
+		await eventually(() => port.bindAttempts === BIND_WEDGE_PROBE_STRIKES + 1, "successful bind did not retry");
+		expect(manager.admissionHold(ORIGIN)).toBeUndefined();
+	} finally {
+		await manager.stop();
+	}
+});
+
+test("admissionHold reflects an emitted non-wedged bind hold reason", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-hold-reason-"));
+	directories.push(home);
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	databases.push(database);
+	const port = new FailingBindPort();
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	const holds: string[] = [];
+	const manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "broker-hold-reason",
+		repo: REPO,
+		setTimeout: (work, delayMs) => {
+			const timer = { work, delayMs };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: () => {},
+		brokerLiveness: async () => ({ state: "live", pid: 999, heartbeatAt: NOW }),
+		onBindHold: ({ reason }) => {
+			holds.push(reason);
+		},
+		log: () => {},
+	});
+	database.inboundEnqueue({
+		messageId: "m-sdk-hold",
+		originKey: ORIGIN,
+		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
+		body: "hello",
+		receivedAt: new Date(NOW).toISOString(),
+	});
+	try {
+		await manager.notifyInbound(ORIGIN);
+		await eventually(() => port.bindAttempts === 1, "first bind did not run");
+		for (let index = 1; index < BIND_WEDGE_PROBE_STRIKES; index++) {
+			timers.at(-1)?.work();
+			await eventually(() => port.bindAttempts === index + 1, `bind ${index + 1} did not run`);
+		}
+		expect(holds).toEqual(["sdk_unavailable"]);
+		expect(manager.admissionHold(ORIGIN)).toBe("sdk_unavailable");
 	} finally {
 		await manager.stop();
 	}

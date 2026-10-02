@@ -95,3 +95,13 @@ test("Slack rejects malformed channel policies and gateway socket", async () => 
 		await expect(loadSlackAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toThrow("gatewaySocket must be a string");
 	});
 });
+
+test("Slack liveReplies must be a boolean and passes through when set", async () => {
+	await fixture(async (home, save) => {
+		await save({ ...valid, liveReplies: "yes" });
+		await expect(loadSlackAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toThrow("liveReplies must be a boolean");
+		await save({ ...valid, liveReplies: true });
+		const config = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(config.liveReplies).toBe(true);
+	});
+});

@@ -1,0 +1,8 @@
+{
+  "kind": "black-box-api-receipt",
+  "deployedCommit": "7aedc81",
+  "audits": [
+    { "host": "gaebal-gajae", "at": "2026-09-25T21:42:02Z", "openTurns": 0, "heldSteers": 0, "unknownRuntimeEventSinceDeploy": 0 },
+    { "host": "jip-gajae", "at": "2026-09-25T21:43Z", "openTurns": 0, "heldSteers": 0, "note": "two wedged turns (11.6h, 4.4h) reset with /new and closed as retired, never re-sent" }
+  ]
+}

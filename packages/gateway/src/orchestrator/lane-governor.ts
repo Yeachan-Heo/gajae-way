@@ -50,7 +50,13 @@ export interface ActiveLane {
 }
 
 export type LaneRetireOutcome =
-	| { readonly retired: true; readonly sessionKey: string; readonly sessionId: string; readonly closed: boolean }
+	| {
+			readonly retired: true;
+			readonly sessionKey: string;
+			readonly sessionId: string;
+			readonly closed: boolean;
+			readonly forced?: boolean;
+	  }
 	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
 
 export type SweepReason = "idle" | "job_done" | "job_aborted";
@@ -62,6 +68,9 @@ export interface SweepNomination {
 	/** The sweep's clock; the locked recheck evaluates fresh state at this time or later. */
 	readonly now: number;
 }
+
+export type LaneForceRetireReason = "session_dead" | "session_disowned";
+type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
 export interface LaneGovernorOptions {
 	readonly database: GatewayDatabase;
@@ -89,6 +98,7 @@ export class LaneGovernor {
 	readonly #now: () => number;
 	readonly #log: (line: string) => void;
 	#recoveryGate?: () => Promise<void>;
+	#forceRetireSettlement?: ForceRetireSettlement;
 	#stopped = false;
 	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
 
@@ -105,6 +115,11 @@ export class LaneGovernor {
 	setRecoveryGate(gate: () => Promise<void>): void {
 		this.#recoveryGate = gate;
 		this.#stopped = false;
+	}
+
+	/** Installed by the attempt owner so forced retirement settles history and runtime atomically. */
+	setForceRetireSettlement(settle: ForceRetireSettlement): void {
+		this.#forceRetireSettlement = settle;
 	}
 
 	async stop(): Promise<void> {
@@ -133,6 +148,7 @@ export class LaneGovernor {
 	 * A name that already owns a bound lane is always admitted (it resumes its
 	 * own session). A new name past the cap is refused with the idlest lanes as
 	 * retirement candidates, so the caller frees a slot deliberately.
+	 * Quarantined lanes do not count against maxLanes.
 	 */
 	assertAdmission(name: string): void {
 		const { jobId } = laneJobIdentity(name);
@@ -142,7 +158,11 @@ export class LaneGovernor {
 				jobId,
 				name,
 			});
-		const lanes = this.activeLanes();
+		const allLanes = this.activeLanes();
+		// Filter out quarantined lanes from capacity count
+		const lanes = allLanes.filter(
+			(lane) => !this.#database.isBrokerQuarantined("work", laneJobIdentity(lane.name).jobId),
+		);
 		if (lanes.some((lane) => lane.name === name)) return;
 		if (lanes.length < this.maxLanes) return;
 		const detail: LaneCapacityDetail = {
@@ -221,7 +241,25 @@ export class LaneGovernor {
 				return { retired: false, sessionKey, reason: `lane no longer qualifies for ${expected.reason} retirement` };
 			const job = this.#job(name);
 			const record = job === "corrupt" ? undefined : job;
-			const repo = record?.lane.worktreePath ?? process.cwd();
+			// Try job record repo first, then owned binding repo, then process.cwd() fallback.
+			// In broker mode: if there's no job record and no owned binding, the lane is an orphan.
+			// In singleton mode: process.cwd() is safe (no broker enforcing repo matching).
+			let repo = record?.lane.worktreePath;
+			if (!repo) {
+				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+			}
+			if (!repo) {
+				// No job record and no owned binding repo.
+				// Check if we're in broker mode: if so, this is an orphan.
+				// If not, fall back to process.cwd() (safe in singleton mode).
+				if (this.#database.isBrokerMode()) {
+					// Broker mode: cannot close safely without knowing the repo.
+					this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
+					return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
+				}
+				// Singleton mode: safe to use process.cwd().
+				repo = process.cwd();
+			}
 			// The ledger's last attempt ended, but only the broker knows whether
 			// its operation actually reached a terminal state: a timed-out wait
 			// or a crash-left attempt may still be running.
@@ -237,7 +275,7 @@ export class LaneGovernor {
 				// this governor exists to prevent. Only broker liveness proving the
 				// session gone lets the binding clear.
 				const detail = sanitizeDiagnostic(diagnostic(error));
-				const liveness = await this.#liveness(lane.sessionId, repo);
+				const liveness = await this.#safeLiveness(lane.sessionId, repo);
 				if (liveness.live !== false && !liveness.disowned) {
 					this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=retained`);
 					return {
@@ -258,6 +296,8 @@ export class LaneGovernor {
 	 * Retires lanes whose job is terminal or that have been quiet past the idle
 	 * ceiling. The snapshot only nominates; `retire` re-proves the binding
 	 * identity and eligibility under the lane lock before closing anything.
+	 * Per-lane errors are caught and logged; one lane's failure does not abort the sweep.
+	 * Dead/disowned lane reconciliation is handled separately via retireAllDead().
 	 */
 	async sweep(now = this.#now()): Promise<number> {
 		if (this.#stopped) return 0;
@@ -265,10 +305,149 @@ export class LaneGovernor {
 		for (const lane of this.activeLanes(now)) {
 			const reason = this.#sweepReason(lane);
 			if (!reason) continue;
-			const outcome = await this.retire(lane.name, reason, { sessionId: lane.sessionId, reason, now });
-			if (outcome.retired) retired++;
+			try {
+				const outcome = await this.retire(lane.name, reason, { sessionId: lane.sessionId, reason, now });
+				if (outcome.retired) retired++;
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_retire_failed name=${lane.name} session=${lane.sessionId} reason=${detail}`);
+			}
 		}
 		return retired;
+	}
+
+	/**
+	 * Force-retire a lane whose session is provably dead or disowned by the broker.
+	 * Unlike normal retire, this skips attempt-state checks and requires liveness
+	 * proof that the session is gone. If successful, closes as host_lost and rebinds
+	 * the epoch with reason operator_force.
+	 */
+	forceRetire(name: string): Promise<LaneRetireOutcome> {
+		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+			return Promise.resolve({
+				retired: false,
+				sessionKey: workSessionKey(name),
+				reason: "broker_authority_quarantined",
+			});
+		if (this.#stopped)
+			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "gateway is stopping" });
+		const task = (async () => {
+			try {
+				await this.#recoveryGate?.();
+				if (this.#stopped)
+					return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
+				return await this.#forceRetire(name);
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_force_retire_failed name=${name} reason=${detail}`);
+				return { retired: false as const, sessionKey: workSessionKey(name), reason: detail };
+			}
+		})();
+		this.#mutations.add(task);
+		void task.then(
+			() => this.#mutations.delete(task),
+			() => this.#mutations.delete(task),
+		);
+		return task;
+	}
+
+	#forceRetire(name: string): Promise<LaneRetireOutcome> {
+		const sessionKey = workSessionKey(name);
+		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
+		// Unlike normal retire, we check the lane exists but do NOT check if an attempt is open.
+		// We will only close if liveness proves the session is dead/disowned.
+		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
+		if (!preflight) return Promise.resolve({ retired: false, sessionKey, reason: "no bound lane for that name" });
+		return this.#port.runExclusive(sessionKey, async () => {
+			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
+			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
+			const lane = this.activeLanes().find((candidate) => candidate.name === name);
+			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
+			const job = this.#job(name);
+			const record = job === "corrupt" ? undefined : job;
+			let repo = record?.lane.worktreePath;
+			if (!repo) {
+				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+			}
+			if (!repo) {
+				if (this.#database.isBrokerMode()) {
+					this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
+					return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
+				}
+				repo = process.cwd();
+			}
+			// For force retire, we must have broker liveness proof that the session is dead or disowned.
+			const liveness = await this.#safeLiveness(lane.sessionId, repo);
+			if (liveness.live !== false && !liveness.disowned) {
+				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
+				return {
+					retired: false,
+					sessionKey,
+					reason: "session is still live; cannot force retire",
+				};
+			}
+			// Session is confirmed dead or disowned; the attempt owner closes the
+			// history and runtime row together before we retire the binding.
+			const lastAttempt = record?.attempts.at(-1);
+			if (lastAttempt && !lastAttempt.endedAt) {
+				const reason: LaneForceRetireReason = liveness.disowned ? "session_disowned" : "session_dead";
+				const endedAt = new Date(this.#now()).toISOString();
+				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, reason, endedAt)) {
+					const detail = "work attempt could not be settled";
+					this.#log(`lane_force_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+					return { retired: false, sessionKey, reason: detail };
+				}
+			}
+			// Close the session and rebind the epoch.
+			let closed = false;
+			try {
+				await this.#port.close({ sessionId: lane.sessionId, repo });
+				closed = true;
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
+				// For force retire, we proceed even if close fails since we have liveness proof.
+			}
+			this.#database.rebindEpoch(sessionKey);
+			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=operator_force closed=${closed}`);
+			return { retired: true, sessionKey, sessionId: lane.sessionId, closed, forced: true };
+		});
+	}
+
+	/**
+	 * Retire all lanes whose sessions are provably dead or disowned.
+	 * Returns count and names of lanes successfully retired.
+	 */
+	async retireAllDead(now = this.#now()): Promise<{ count: number; names: string[] }> {
+		if (this.#stopped) return { count: 0, names: [] };
+		const retired: string[] = [];
+		for (const lane of this.activeLanes(now)) {
+			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(lane.name).jobId)) continue;
+			const job = this.#job(lane.name);
+			const record = job === "corrupt" ? undefined : job;
+			let repo = record?.lane.worktreePath;
+			if (!repo) {
+				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+			}
+			if (!repo) {
+				if (this.#database.isBrokerMode()) {
+					continue; // Skip orphan lanes
+				}
+				repo = process.cwd();
+			}
+			const liveness = await this.#safeLiveness(lane.sessionId, repo);
+			if (liveness.live !== false && !liveness.disowned) continue; // Session is still live
+			try {
+				const outcome = await this.forceRetire(lane.name);
+				if (outcome.retired) retired.push(lane.name);
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_retire_failed name=${lane.name} session=${lane.sessionId} reason=${detail}`);
+			}
+		}
+		return { count: retired.length, names: retired };
 	}
 
 	/** The sweep predicate, evaluated on a fresh lane view; undefined when the lane must stay. */
@@ -284,6 +463,8 @@ export class LaneGovernor {
 	 * and `terminal_uncertain` (crash-left) attempts may still be running. They
 	 * are settled only when `status` reports a terminal op, or reports an
 	 * unknown op on a session the broker says is dead (nothing can be running).
+	 * Status errors (e.g. session_unavailable) are also treated as proof the
+	 * session is gone: consult liveness and settle if dead/disowned.
 	 */
 	async #runtimeSettled(
 		job: LaneJobRecord | undefined,
@@ -294,28 +475,45 @@ export class LaneGovernor {
 		if (!last || last.sessionId !== sessionId || !UNPROVEN_END_STATES.has(last.endState ?? ""))
 			return { settled: true };
 		let status: string;
+		let statusError: string | undefined;
 		try {
 			status = (await this.#port.status({ sessionId, repo, opRef: last.opRef })).status.status;
 		} catch (error) {
-			return {
-				settled: false,
-				reason: `attempt ${last.opRef} status unavailable: ${sanitizeDiagnostic(diagnostic(error))}`,
-			};
+			// Status unavailable (e.g., session_unavailable) means the broker says
+			// the session is gone. Treat it the same as unknown: check liveness.
+			statusError = sanitizeDiagnostic(diagnostic(error));
+			status = "unknown";
 		}
 		if (status === "terminal_ok" || status === "failed") return { settled: true };
 		if (status === "unknown") {
 			const liveness = await this.#liveness(sessionId, repo);
 			if (liveness.live === false || liveness.disowned) return { settled: true };
 		}
+		const detail = statusError ? `status error: ${statusError}` : status;
 		return {
 			settled: false,
-			reason: `attempt ${last.opRef} ended ${last.endState} in the ledger but the broker reports ${status}`,
+			reason: `attempt ${last.opRef} ended ${last.endState} in the ledger but the broker reports ${detail}`,
 		};
 	}
 
 	async #liveness(sessionId: string, repo: string): Promise<{ live: boolean | undefined; disowned: boolean }> {
 		if (!this.#port.liveness) return { live: undefined, disowned: false };
 		return await this.#port.liveness({ sessionId, repo });
+	}
+
+	/**
+	 * Safe liveness probe: catches errors and logs them instead of throwing.
+	 * Errors are conservative: assume session is still alive (live: undefined).
+	 */
+	async #safeLiveness(sessionId: string, repo: string): Promise<{ live: boolean | undefined; disowned: boolean }> {
+		try {
+			return await this.#liveness(sessionId, repo);
+		} catch (error) {
+			const detail = sanitizeDiagnostic(diagnostic(error));
+			this.#log(`liveness_probe_failed session=${sessionId} repo=${repo} reason=${detail}`);
+			// Conservative: assume session still alive if we can't probe.
+			return { live: undefined, disowned: false };
+		}
 	}
 
 	/** `undefined` when no job row exists; `"corrupt"` when one exists but cannot be trusted. */

@@ -8,6 +8,12 @@ export interface SlackAdapterConfig {
 	readonly appTokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly channels?: Readonly<Record<string, ChannelEngagementPolicy>>;
+	/**
+	 * Fold a turn's streaming parts into one live-edited message (chat.update)
+	 * instead of posting each part separately. Opt-in: the default keeps one
+	 * message per part, matching the reaction-gradient presence design.
+	 */
+	readonly liveReplies?: boolean;
 }
 
 export interface LoadedSlackAdapterConfig extends SlackAdapterConfig {
@@ -47,6 +53,9 @@ export async function loadSlackAdapterConfig(env: NodeJS.ProcessEnv = process.en
 	const config = raw as Record<string, unknown>;
 	if (config.gatewaySocket !== undefined && typeof config.gatewaySocket !== "string") {
 		throw new SlackAdapterStartupError("Slack adapter gatewaySocket must be a string when set.");
+	}
+	if (config.liveReplies !== undefined && typeof config.liveReplies !== "boolean") {
+		throw new SlackAdapterStartupError("Slack adapter liveReplies must be a boolean when set.");
 	}
 	if (config.channels !== undefined && !validChannels(config.channels)) {
 		throw new SlackAdapterStartupError(

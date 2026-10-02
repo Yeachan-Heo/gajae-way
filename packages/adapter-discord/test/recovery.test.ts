@@ -1340,7 +1340,7 @@ test("a live chat.send the gateway rejects is logged with its message and channe
 test("typing begins only for addressed turns: an overheard public-channel turn stays invisible until it replies", async () => {
 	const cursorPath = join(home, "typing-addressed", "recovery-cursor.json");
 	const began: string[] = [];
-	const typing = { begin: (id: string) => void began.push(id), end: () => {} };
+	const typing = { begin: (id: string) => void began.push(id), refresh: () => {}, end: () => {} };
 	const client = { request: async () => ({ engaged: true }) };
 	const gateway = new ReconnectingGateway(
 		"socket",

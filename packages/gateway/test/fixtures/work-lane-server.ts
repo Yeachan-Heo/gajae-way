@@ -12,7 +12,7 @@ import type {
 } from "../../src/orchestrator/session-port";
 import type { TailAttachInput } from "../../src/orchestrator/tail-runner";
 import { startUnixServer } from "../../src/server/server";
-import { GatewayDatabase } from "../../src/store/db";
+import { type BrokerAuthority, GatewayDatabase } from "../../src/store/db";
 import { ScriptedSessionPort, steerRefused } from "../session-port.fake";
 
 export const repository = resolve(import.meta.dir, "../../../..");
@@ -39,7 +39,10 @@ export type Barrier =
 	| "settle-history"
 	| "settle-activity"
 	| "settle-ledger"
-	| "settle-commit";
+	| "settle-report"
+	| "settle-commit"
+	| "report-claim"
+	| "report-consume";
 
 function json<T>(path: string, fallback: T): T {
 	return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as T) : fallback;
@@ -51,6 +54,7 @@ class PersistentPort extends ScriptedSessionPort {
 		readonly home: string,
 		readonly hit: (point: Barrier) => void,
 		readonly database: GatewayDatabase,
+		readonly authority: BrokerAuthority,
 	) {
 		super({
 			sessionIdForBind: (input) => database.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID(),
@@ -79,7 +83,8 @@ class PersistentPort extends ScriptedSessionPort {
 	override async bind(input: SessionBindInput) {
 		this.record("bind", input);
 		const binding = await super.bind(input);
-		this.database.putSession(input.originKey, binding.sessionId);
+		if (!this.database.recordOwnedBinding({ ...binding, authority: this.authority }))
+			throw new Error("fixture session bind lost its epoch");
 		writeFileSync(join(this.home, `${binding.sessionId}.session.json`), JSON.stringify(binding));
 		return binding;
 	}
@@ -171,14 +176,30 @@ export function readCalls(home: string): Call[] {
 
 async function serve(home: string, barrier?: Barrier) {
 	const hit = (point: Barrier) => {
-		if (barrier !== point) return;
+		const armed = json<{ readonly point?: Barrier | null }>(join(home, "barrier-arm.json"), {}).point;
+		if (barrier !== point && armed !== point) return;
 		writeFileSync(join(home, "barrier-hit.json"), JSON.stringify({ point, pid: process.pid }));
+		if (armed === point) writeFileSync(join(home, "barrier-arm.json"), JSON.stringify({ point: null }));
 		// A synchronous fixture-only barrier can stop inside a real SQLite transaction.
 		// The parent SIGKILLs precisely this child; no production fault flag exists.
 		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
 		throw new Error(`fixture barrier ${point} was not killed within 30 seconds`);
 	};
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const agentDir = resolve(join(home, "agent"));
+	const authority = { canonicalAgentDir: agentDir, identity: `gjc:${agentDir}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	let acceptanceBarrierPending = false;
+	const withTransaction = database.withTransaction.bind(database);
+	database.withTransaction = <T>(operation: () => T): T =>
+		withTransaction(() => {
+			const result = operation();
+			if (acceptanceBarrierPending) {
+				acceptanceBarrierPending = false;
+				hit("report-consume");
+			}
+			return result;
+		});
 	const prepare = database.workAttemptPrepare.bind(database);
 	database.workAttemptPrepare = (...args) => {
 		prepare(...args);
@@ -187,7 +208,15 @@ async function serve(home: string, barrier?: Barrier) {
 	const update = database.workAttemptUpdate.bind(database);
 	database.workAttemptUpdate = (...args) => {
 		if (args[2].terminal) hit("terminal-before");
-		const previousReads = database.workAttemptGet(args[0])?.output.reads ?? 0;
+		const prior = database.workAttemptGet(args[0]);
+		if (
+			prior?.wakeReportId &&
+			(args[2].sendPhase === "accepted" ||
+				args[2].output?.proof !== undefined ||
+				args[2].output?.knownSilence !== undefined)
+		)
+			acceptanceBarrierPending = true;
+		const previousReads = prior?.output.reads ?? 0;
 		const result = update(...args);
 		if (result && args[2].terminal) hit("terminal-after");
 		if (result && result.output.reads > previousReads) hit("output-claim");
@@ -207,6 +236,18 @@ async function serve(home: string, barrier?: Barrier) {
 			settling = false;
 		}
 	};
+	const enqueue = database.inboundEnqueueInTransaction.bind(database);
+	database.inboundEnqueueInTransaction = (...args) => {
+		const result = enqueue(...args);
+		if (settling && args[0].source === "lane_report") hit("settle-report");
+		return result;
+	};
+	const claimReport = database.laneReportClaim.bind(database);
+	database.laneReportClaim = (...args) => {
+		const result = claimReport(...args);
+		if (result) hit("report-claim");
+		return result;
+	};
 	const history = database.putLaneJob.bind(database);
 	database.putLaneJob = (...args) => {
 		if (settling) hit("settle-cas");
@@ -220,6 +261,7 @@ async function serve(home: string, barrier?: Barrier) {
 		if (settling) hit("settle-ledger");
 		return result;
 	};
+	const storedConfig = json<{ readonly work?: { readonly allowNested?: boolean } }>(join(home, "config.json"), {});
 	const config = {
 		schemaVersion: 1 as const,
 		home,
@@ -227,11 +269,13 @@ async function serve(home: string, barrier?: Barrier) {
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		ownerTarget: { origin: noticeOrigin },
+		channels: { fixture: { engagement: "open" as const, audience: "all" as const } },
+		work: { maxLanes: 2, ...storedConfig.work },
 	};
 	const server = await startUnixServer({
 		config,
 		database,
-		sessionPort: new PersistentPort(home, hit, database),
+		sessionPort: new PersistentPort(home, hit, database, authority),
 		onStop: () => database.close(),
 	});
 	process.once("SIGTERM", () => void server.stop());
@@ -299,11 +343,15 @@ export class WorkFixture {
 	get socket() {
 		return join(this.home, "gateway.sock");
 	}
-	static async create() {
+	static async create(options: { readonly allowNested?: boolean } = {}) {
 		const fixture = new WorkFixture(await mkdtemp(join(tmpdir(), "work-crash-")));
 		await Bun.write(
 			join(fixture.home, "config.json"),
-			JSON.stringify({ schemaVersion: 1, ownerTarget: { origin: noticeOrigin } }),
+			JSON.stringify({
+				schemaVersion: 1,
+				ownerTarget: { origin: noticeOrigin },
+				...(options.allowNested === undefined ? {} : { work: { allowNested: options.allowNested } }),
+			}),
 		);
 		return fixture;
 	}
@@ -341,6 +389,26 @@ export class WorkFixture {
 			"fixture socket readiness",
 		);
 	}
+	async seedPersonaSession(): Promise<string> {
+		const sessionId = crypto.randomUUID();
+		const database = await GatewayDatabase.open(join(this.home, "gateway.db"));
+		try {
+			const authority = database.inspectBrokerAuthority().authority;
+			if (!authority) throw new Error("fixture broker authority missing");
+			const binding = {
+				sessionId,
+				originKey: `${noticeOrigin.platform}/${noticeOrigin.kind}/${noticeOrigin.conversationId}`,
+				epoch: 0,
+				repo: join(this.home, "workspace"),
+				authority,
+			};
+			if (!database.recordOwnedBinding(binding)) throw new Error("persona fixture binding lost its epoch");
+			writeFileSync(join(this.home, `${sessionId}.session.json`), JSON.stringify(binding));
+		} finally {
+			database.close();
+		}
+		return sessionId;
+	}
 	async connect() {
 		const client = await wire(this.socket);
 		this.clients.push(client);
@@ -358,6 +426,15 @@ export class WorkFixture {
 	async cleanup() {
 		await this.kill();
 		await rm(this.home, { recursive: true, force: true });
+	}
+	async armBarrier(point: Barrier): Promise<void> {
+		await Bun.write(join(this.home, "barrier-arm.json"), JSON.stringify({ point }));
+		await rm(join(this.home, "barrier-hit.json"), { force: true });
+	}
+	async persistAcceptedSend(opRef: string): Promise<void> {
+		const call = this.calls("send").find((entry) => entry.input.opRef === opRef);
+		if (!call) throw new Error(`missing send call for ${opRef}`);
+		await Bun.write(join(this.home, `${opRef}.send.json`), JSON.stringify({ ...call.input, startedAt: Date.now() }));
 	}
 	async control(opRef: string, control: Control) {
 		this.controls[opRef] = {
@@ -399,6 +476,38 @@ export class WorkFixture {
 				sessions: database
 					.query<{ origin_key: string; last_activity_at: string | null }, []>(
 						"SELECT origin_key, last_activity_at FROM sessions WHERE origin_key LIKE 'work/task/%'",
+					)
+					.all(),
+				inbound: database
+					.query<
+						{
+							message_id: string;
+							origin_key: string;
+							source: string;
+							state: string;
+							turn_role: string | null;
+							turn_state: string | null;
+							turn_op_ref: string | null;
+						},
+						[]
+					>(
+						"SELECT message_id, origin_key, source, state, turn_role, turn_state, turn_op_ref FROM inbound_messages ORDER BY rowid",
+					)
+					.all(),
+				laneReports: database
+					.query<
+						{
+							report_id: string;
+							parent_name: string;
+							child_op_ref: string;
+							state: string;
+							claim_ref: string | null;
+							consumed_op_ref: string | null;
+							hold_reason: string | null;
+						},
+						[]
+					>(
+						"SELECT report_id, parent_name, child_op_ref, state, claim_ref, consumed_op_ref, hold_reason FROM lane_reports ORDER BY created_at",
 					)
 					.all(),
 			};

@@ -242,6 +242,41 @@ test("#247: every done trigger names the delivery that closed it or why none did
 	client.close();
 });
 
+test("an answer that quotes [SILENT] in markdown code is delivered, not settled as silent", async () => {
+	// Live pilot 2026-09-29: two written answers explaining the gateway listed
+	// "`[SILENT]`(답하지 않기)" as a protocol marker; the embedded-marker check
+	// dropped the whole reply and the trigger closed as {"none":"silent"}.
+	const answer = [
+		"게이트웨이는 디스코드와 저 사이의 중계 서버예요.",
+		"```\n디스코드 ⇄ adapter-discord ⇄ 게이트웨이 ⇄ [SILENT] ⇄ 제 세션\n```",
+		"- **답장 표시**: 👀 리액션, 답글 지정, `[SILENT]`(답하지 않기) 같은 표시를 해석해요.",
+	].join("\n");
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => (text.includes("quoted marker") ? answer : "answer then [SILENT]"),
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "quoted-silent", "quoted marker please");
+	await waitUntil(() => sessionPort.sends.length === 1);
+	const opRef = sessionPort.sends[0]?.opRef ?? "";
+	await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+	const delivered = client.frames.filter((frame) => frame.event === "chat.message");
+	expect(delivered.map((frame) => frame.payload.text)).toEqual([answer]);
+	expect(JSON.parse(database.inboundTurnRow(opRef)?.terminal_delivery_id ?? "null")).toEqual({
+		0: delivered[0]?.payload.deliveryId,
+	});
+	// A bare marker outside code still silences the part.
+	send(client, "bare-silent", "bare marker");
+	await waitUntil(() => sessionPort.sends.length === 2);
+	const bareOpRef = sessionPort.sends[1]?.opRef ?? "";
+	await waitUntil(() => database.inboundTurnRow(bareOpRef)?.turn_state === "done");
+	expect(JSON.parse(database.inboundTurnRow(bareOpRef)?.terminal_delivery_id ?? "null")).toEqual({ none: "silent" });
+	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(1);
+	client.close();
+});
+
 test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);

@@ -4,7 +4,6 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajae-gateway/protocol";
-import { originKey, parseOriginKey } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	CLI_USAGE,
@@ -900,7 +899,10 @@ describe("usage exits the process instead of blocking", () => {
 });
 
 describe("work operator commands", () => {
-	async function run(args: string[], result: unknown) {
+	async function run(args: string[], result: unknown, sessionId?: string) {
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		if (sessionId === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = sessionId;
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const lines: string[] = [];
 		const errors: string[] = [];
@@ -937,7 +939,9 @@ describe("work operator commands", () => {
 			connect.mockRestore();
 			log.mockRestore();
 			error.mockRestore();
-			process.exitCode = previousExit;
+			process.exitCode = previousExit ?? 0;
+			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
 	}
 
@@ -966,40 +970,18 @@ describe("work operator commands", () => {
 		["--preset", "reliable", { preset: "reliable" }],
 		["--model", "openai/gpt-5.2", "openai/gpt-5.2"],
 	] as const) {
-		test(`work start forwards ${flag} and canonical notification target`, async () => {
-			const output = await run(
-				[
-					"start",
-					"fix",
-					"--cwd",
-					"/repo",
-					"--resume",
-					flag,
-					value,
-					"--notify",
-					"telegram/topic/-100/parent=-200",
-					"fix",
-					"tests",
-				],
-				{
-					started: true,
-					jobId: "job-1",
-					opRef: "op-1",
-					sessionKey: "work/task/fix",
-					sessionId: "session-1",
-				},
-			);
+		test(`work start forwards ${flag} with cwd and resume`, async () => {
+			const output = await run(["start", "fix", "--cwd", "/repo", "--resume", flag, value, "fix", "tests"], {
+				started: true,
+				jobId: "job-1",
+				opRef: "op-1",
+				sessionKey: "work/task/fix",
+				sessionId: "session-1",
+			});
 			expect(output.requests).toEqual([
 				{
 					verb: "work.start",
-					params: {
-						name: "fix",
-						cwd: "/repo",
-						resume: true,
-						model,
-						text: "fix tests",
-						notify: { platform: "telegram", kind: "topic", conversationId: "-100", parentId: "-200" },
-					},
+					params: { name: "fix", cwd: "/repo", resume: true, model, text: "fix tests" },
 				},
 			]);
 			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
@@ -1008,28 +990,32 @@ describe("work operator commands", () => {
 		});
 	}
 
-	for (const key of [
-		"loopback/loopback/loopback",
-		"discord/channel/123",
-		"discord/dm/123/peer=456",
-		"discord/thread/123/parent=456",
-		"monitor/eventtype/build.done",
-	]) {
-		test(`work start accepts canonical origin ${key}`, async () => {
-			expect(originKey(parseOriginKey(key))).toBe(key);
-			const output = await run(["start", "fix", "--notify", key, "task"], {
-				started: true,
-				jobId: "job-1",
-				opRef: "op-1",
-				sessionKey: "work/task/fix",
-				sessionId: "session-1",
-			});
-			expect(output.errors).toEqual([]);
-			expect(output.requests).toHaveLength(1);
+	for (const command of ["run", "start"] as const) {
+		test(`work ${command} forwards GJC_SESSION_ID as callerSessionId`, async () => {
+			const result =
+				command === "start"
+					? { started: true, jobId: "job-1", opRef: "op-1", sessionKey: "work/task/fix", sessionId: "session-1" }
+					: { held: false, text: "answer" };
+			const output = await run([command, "fix", "task"], result, "caller-session-1");
+			expect(output.requests).toEqual([
+				{
+					verb: `work.${command}`,
+					params: { name: "fix", text: "task", callerSessionId: "caller-session-1" },
+				},
+			]);
+		});
+
+		test(`work ${command} omits blank GJC_SESSION_ID`, async () => {
+			const result =
+				command === "start"
+					? { started: true, jobId: "job-1", opRef: "op-1", sessionKey: "work/task/fix", sessionId: "session-1" }
+					: { held: false, text: "answer" };
+			const output = await run([command, "fix", "task"], result, " \t ");
+			expect(output.requests).toEqual([{ verb: `work.${command}`, params: { name: "fix", text: "task" } }]);
 		});
 	}
 
-	test("work start without notify leaves target selection to the gateway", async () => {
+	test("work start leaves parent selection to the gateway", async () => {
 		const output = await run(["start", "fix", "task"], {
 			started: true,
 			jobId: "j",
@@ -1139,13 +1125,21 @@ describe("work operator commands", () => {
 					session_id: "session-1",
 					last_activity_at: "2026-09-07T00:00:00Z",
 					worktree_path: "/repo/fix",
+					reports: { pending: 2, claimed: 1, held: 3, undeliverable: 4 },
 				},
-				{ lane_key: "done", state: "done", session_id: "", last_activity_at: null, worktree_path: "/repo/done" },
+				{
+					lane_key: "done",
+					state: "done",
+					session_id: "",
+					last_activity_at: null,
+					worktree_path: "/repo/done",
+					reports: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },
+				},
 			],
 		});
 		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
 		expect(output.lines).toEqual([
-			"fix running session=session-1 accepted=- op=- last=2026-09-07T00:00:00Z head=- /repo/fix",
+			"fix running session=session-1 accepted=- op=- last=2026-09-07T00:00:00Z head=- /repo/fix reports=p:2 c:1 h:3 u:4",
 			"done done session=- accepted=- op=- last=- head=- /repo/done",
 		]);
 		expect(output.closed).toBe(true);
@@ -1205,29 +1199,16 @@ describe("work operator commands", () => {
 		expect(output.errors).toEqual([]);
 		expect(output.closed).toBe(true);
 	});
+	test("--notify is a usage error on start and run", async () => {
+		for (const command of ["start", "run"] as const) {
+			const output = await run([command, "fix", "--notify", "discord/channel/c", "task"], {});
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.errors[0]).toContain("usage: gajaeway work");
+		}
+	});
 
 	for (const args of [
-		...[
-			"discord/dm/c",
-			"discord/channel/c/peer=p",
-			"discord/thread/t",
-			"discord/thread/t/peer=p",
-			"discord/dm/c/peer=p/peer=q",
-			"discord/dm/c/peer=",
-			"discord/channel/c/",
-			"discord/channel/c/extra",
-			"discord/channel/a%2Fb",
-			" discord/channel/c",
-			"discord/channel/c ",
-			"unknown/channel/c",
-			"discord/channel/c//",
-			"loopback/channel/c",
-			"monitor/channel/c",
-			"discord/dm/c/peer=p=extra",
-		].map((key) => ["start", "fix", "--notify", key, "task"]),
-		["run", "fix", "--notify", "discord/channel/c", "task"],
-		["start", "fix", "--notify"],
-		["start", "fix", "--notify", "discord/channel/c", "--notify", "discord/channel/d", "task"],
 		["start", "fix", "--model", "model", "--preset", "preset", "task"],
 		["start", "fix", "--preset", "preset", "--model", "model", "task"],
 		["start", "fix", "--model"],
