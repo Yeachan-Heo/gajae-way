@@ -13,7 +13,13 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
-import { type GatewayDatabase, type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/db";
+import {
+	BrokerAuthorityError,
+	type GatewayDatabase,
+	type InboundMessageRow,
+	type InboundTurn,
+	terminalDeliveryIds,
+} from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
@@ -1101,16 +1107,16 @@ class OriginActor {
 				sessionId: binding.sessionId,
 				turn,
 			});
-			// The relay refusing to attach because the broker no longer serves the
-			// session (`endpoint_stale`) is the same proof as a disowning send: the
-			// prompt never landed. Release the bound row and rebind, never hold.
-			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
+			// No send was attempted. A broker disown code or positive liveness
+			// proof can therefore release this row without replaying accepted work.
+			// A generic failure alone is not authority to replace the session.
+			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
 			this.#manager.database.inboundTurnRequeue(opRef);
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 			this.#bindFailures += 1;
 			const attempts = this.#bindFailures;
 			this.#manager.log(
-				`persona_attach_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
+				`send_session_disowned action=inline_rebind stage=attach origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
 			);
 			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
 			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
@@ -1216,12 +1222,9 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
-			// The Router disowning the session id is NOT ambiguous: it is proof the
-			// send never landed, so there is nothing to protect by holding. gjc is
-			// allowed to be unreliable here - surviving that is this gateway's job.
-			// Holding instead left the conversation dead with one message pending,
-			// an empty gjc_session_id and no retry, until a human restarted the
-			// daemon (live: epoch 41, session_unavailable, 2026-09-03).
+			// Only the established session_unavailable status proves this send did
+			// not land. A session_not_found returned after port.send is ambiguous:
+			// the broker may have accepted the operation before the CLI failed.
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
 				await tail.close();
 				this.#manager.database.inboundTurnRequeue(opRef);
@@ -1239,7 +1242,7 @@ class OriginActor {
 				this.#bindFailures += 1;
 				const attempts = this.#bindFailures;
 				this.#manager.log(
-					`persona_send_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
+					`send_session_disowned action=inline_rebind stage=send origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
 				);
 				// The broker disowned it, but the host process may still be running
 				// (observed: fc41da9b, disowned yet live for hours). End it.
@@ -1248,7 +1251,7 @@ class OriginActor {
 				else {
 					if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 						this.#manager.log(
-							`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempts} reason=session_unavailable`,
+							`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempts} reason=${sdkStatusErrorCode(error)}`,
 						);
 					this.#scheduleDispatchRetry(
 						Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
@@ -1361,17 +1364,19 @@ class OriginActor {
 
 	/**
 	 * Positive evidence that a session can no longer run anything: the SDK
-	 * disowned it (`session_unavailable`, incl. `endpoint_stale`), or the relay
-	 * failed and the broker's own liveness reports it not live / disowned. An
-	 * unanswerable probe is not evidence.
+	 * reported `session_unavailable`, or the relay failed and the broker's own
+	 * liveness reports it not live / disowned. An unanswerable probe is not
+	 * evidence.
 	 */
 	async #sessionProvablyGone(sessionId: string, error: unknown): Promise<boolean> {
+		if (error instanceof BrokerAuthorityError) throw error;
 		if (sdkStatusErrorCode(error) === "session_unavailable") return true;
 		if (!this.#manager.port.liveness) return false;
 		try {
 			const raw = await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo });
 			return raw.live === false || raw.disowned === true;
-		} catch {
+		} catch (probeError) {
+			if (probeError instanceof BrokerAuthorityError) throw probeError;
 			return false;
 		}
 	}

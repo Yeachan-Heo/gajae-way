@@ -449,7 +449,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		enqueue(fixture, "first", "first request");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
 		const goneAttempts = fixture.logs
-			.filter((line) => line.startsWith("persona_send_session_gone"))
+			.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
 			.map((line) => /attempt=(\d+)/.exec(line)?.[1]);
 		expect(goneAttempts).toEqual(["1", "2", "3"]);
 		expect(
@@ -474,7 +474,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		await eventually(() => port.sends.length === 2, "second request did not recover after one unavailable send");
 		expect(
 			fixture.logs
-				.filter((line) => line.startsWith("persona_send_session_gone"))
+				.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
 				.map((line) => /attempt=(\d+)/.exec(line)?.[1]),
 		).toEqual(["1", "2", "3", "1"]);
 		expect(
