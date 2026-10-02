@@ -853,6 +853,30 @@ class OriginActor {
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+			// The usual cause on a live binding is a host that closed itself after
+			// 30 idle minutes (`host hello did not arrive`). Its saved session is
+			// intact: resume it once and re-send this never-run turn under the same
+			// session and epoch, so the conversation keeps its memory. A deleted or
+			// disowned session, or a second failure of the same turn, rebinds below.
+			if (!retired && attempt === 1 && raw?.deleted !== true && raw?.disowned !== true) {
+				try {
+					await this.#manager.port.resume({
+						sessionId,
+						repo: this.#manager.repo,
+						originKey: this.originKey,
+						epoch: turn.epoch,
+					});
+					this.#manager.log(
+						`session_resumed origin=${this.originKey} epoch=${turn.epoch} session=${sessionId} opRef=${turn.opRef} reason=host_idle_closed`,
+					);
+					return;
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw error;
+					this.#manager.log(
+						`session_resume_failed origin=${this.originKey} epoch=${turn.epoch} session=${sessionId} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+					);
+				}
+			}
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next dispatch binds a fresh live session.
 			// A retired turn's epoch was already rotated away from; it simply
@@ -1092,6 +1116,28 @@ class OriginActor {
 		}
 	}
 
+	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
+	async #bindingState(sessionId: string): Promise<{
+		readonly live: boolean | undefined;
+		readonly deleted?: boolean;
+		readonly workspace?: string;
+		readonly disowned?: boolean;
+	}> {
+		const port = this.#manager.port;
+		if (port.liveness) {
+			try {
+				return await port.liveness({ sessionId, repo: this.#manager.repo });
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
+				return { live: undefined };
+			}
+		}
+		const { session } = await this.#inspectForRecovery(sessionId);
+		return session === undefined
+			? { live: undefined }
+			: { live: session.live, deleted: session.deleted, workspace: session.repo };
+	}
+
 	async #inspectForRecovery(
 		sessionId: string,
 	): Promise<{ readonly session: BrokerSession | undefined; readonly failed: boolean }> {
@@ -1186,8 +1232,11 @@ class OriginActor {
 		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
 		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
 		let binding: SessionBinding;
+		// Outside the bind retry: the stored binding's liveness probe throws only
+		// on lost broker authority, which fails closed as on the attach-failure probe.
+		const stored = await this.#reuseStoredBinding(epoch);
 		try {
-			binding = await this.#ensureSession(epoch);
+			binding = stored ?? (await this.#bindSession(epoch));
 			this.#clearBindWedgeProbe();
 		} catch (error) {
 			await this.#noteBindFailure(trigger, epoch, error);
@@ -1768,16 +1817,24 @@ class OriginActor {
 	}
 
 	async #ensureSession(epoch: number): Promise<SessionBinding> {
+		return (await this.#reuseStoredBinding(epoch)) ?? (await this.#bindSession(epoch));
+	}
+
+	/** The stored binding when its session is live or was resumed; undefined when a bind must replace it. */
+	async #reuseStoredBinding(epoch: number): Promise<SessionBinding | undefined> {
 		const existing = this.#manager.database.getSessionRecord(this.originKey);
 		if (existing?.epoch === epoch && existing.sessionId) {
 			const binding = { sessionId: existing.sessionId, originKey: this.originKey, epoch, repo: this.#manager.repo };
 			// An idle binding may point at a session the broker no longer hosts
-			// (broker restart while idle). Dead + saved authority is resumed through
-			// the unchanged decision table's `session.resume` branch BEFORE any send;
-			// a dead binding is never handed to a send as if it were live.
-			const { session, failed } = await this.#inspectForRecovery(existing.sessionId);
-			if (failed || session === undefined || session.live) return binding;
-			if (!session.deleted && session.repo === this.#manager.repo) {
+			// (broker restart while idle, or a host that closed itself after 30
+			// idle minutes). Dead + saved authority is resumed through the
+			// unchanged decision table's `session.resume` branch BEFORE any send;
+			// a dead binding is never handed to a send as if it were live. Read
+			// from the raw envelope: the normalized inspect is undefined for every
+			// session gjc >= 0.16.0 reports, which handed dead bindings to sends.
+			const state = await this.#bindingState(existing.sessionId);
+			if (state.live !== false) return binding;
+			if (state.deleted !== true && (state.workspace === undefined || state.workspace === this.#manager.repo)) {
 				try {
 					await this.#manager.port.resume({
 						sessionId: existing.sessionId,
@@ -1796,9 +1853,13 @@ class OriginActor {
 					);
 				}
 			}
-			// Deleted or unresumable: fall through to the epoch-scoped idempotent bind,
+			// Deleted or unresumable: the epoch-scoped idempotent bind replaces it,
 			// whose rebind policy owns condemnation (SessionRebinder), not this actor.
 		}
+		return undefined;
+	}
+
+	async #bindSession(epoch: number): Promise<SessionBinding> {
 		const binding = await this.#manager.port.bind({
 			originKey: this.originKey,
 			epoch,

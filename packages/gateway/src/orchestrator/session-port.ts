@@ -78,6 +78,10 @@ export interface SessionLiveness {
 	readonly live: boolean | undefined;
 	readonly disowned: boolean;
 	readonly activity?: SessionActivity;
+	/** The broker still holds the saved session but marks it deleted. */
+	readonly deleted?: boolean;
+	/** `locator.repo`, or the `locator.cwd` gjc >= 0.16.0 reports in its place. */
+	readonly workspace?: string;
 }
 
 /**
@@ -675,7 +679,14 @@ export class BrokerSessionPort implements SessionPort {
 			});
 			const envelope = JSON.parse(result.stdout) as {
 				ok?: unknown;
-				result?: { session?: { live?: unknown; activity?: { state?: unknown; at?: unknown } } };
+				result?: {
+					session?: {
+						live?: unknown;
+						deleted?: unknown;
+						locator?: { repo?: unknown; cwd?: unknown };
+						activity?: { state?: unknown; at?: unknown };
+					};
+				};
 				error?: { code?: unknown };
 			};
 			if (envelope.ok === false) return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
@@ -683,9 +694,12 @@ export class BrokerSessionPort implements SessionPort {
 			const live = session?.live;
 			const state = session?.activity?.state;
 			const at = session?.activity?.at;
+			const workspace = session?.locator?.repo ?? session?.locator?.cwd;
 			return {
 				live: typeof live === "boolean" ? live : undefined,
 				disowned: false,
+				...(session?.deleted === true ? { deleted: true } : {}),
+				...(typeof workspace === "string" ? { workspace } : {}),
 				...(typeof state === "string" && typeof at === "number" && Number.isFinite(at) && at > 0
 					? { activity: { state, at } }
 					: {}),
@@ -753,10 +767,20 @@ export class BrokerSessionPort implements SessionPort {
 		return { outcome: "terminated", pid };
 	}
 
+	/**
+	 * Judged on the raw envelope (`liveness`), like every other liveness read:
+	 * the normalized `inspect` is undefined for any session gjc >= 0.16.0
+	 * reports, which made every resume fail as "saved authority unavailable".
+	 */
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
 		this.#assertOwned(input);
-		const existing = await this.inspect(input);
-		if (!existing || existing.deleted || existing.repo !== input.repo)
+		const resumable = (state: SessionLiveness) =>
+			!state.disowned &&
+			state.live !== undefined &&
+			state.deleted !== true &&
+			(state.workspace === undefined || state.workspace === input.repo);
+		const existing = await this.liveness(input);
+		if (!resumable(existing))
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
 		if (!existing.live) {
 			parseEnvelope(
@@ -773,8 +797,8 @@ export class BrokerSessionPort implements SessionPort {
 				]),
 				"session.resume",
 			);
-			const resumed = await this.inspect(input);
-			if (!resumed || resumed.deleted || !resumed.live || resumed.repo !== input.repo)
+			const resumed = await this.liveness(input);
+			if (!resumable(resumed) || resumed.live !== true)
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
 		}
 		this.#resetCreateRotations(input.originKey);

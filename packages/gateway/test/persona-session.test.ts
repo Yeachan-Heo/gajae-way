@@ -2383,6 +2383,157 @@ test("a tail attach that fails before any send releases the lifecycle it created
 	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
 });
 
+/**
+ * 가8: a gjc session host closes itself after 30 idle minutes. The broker keeps
+ * the saved session (inspect: live=false, deleted=false, and since gjc 0.16 no
+ * `locator.repo`, so the normalized inspect is undefined). `staleLive` models a
+ * broker that still reports the closed host live, so the send reaches the dead
+ * host and fails with `host hello did not arrive`.
+ */
+class IdleClosedHostPort extends ScriptedSessionPort {
+	closed = new Set<string>();
+	staleLive = false;
+	deleted = false;
+	resumeCalls = 0;
+
+	override async inspect(input: { sessionId: string; repo: string }) {
+		if (this.closed.has(input.sessionId)) {
+			this.inspections.push(input);
+			return undefined;
+		}
+		return await super.inspect(input);
+	}
+
+	override async liveness(input: { sessionId: string; repo: string }) {
+		if (!this.closed.has(input.sessionId)) return await super.liveness(input);
+		return {
+			live: this.staleLive,
+			disowned: false,
+			workspace: input.repo,
+			...(this.deleted ? { deleted: true } : {}),
+		};
+	}
+
+	override async attachTail(input: TailAttachInput) {
+		if (this.closed.has(input.sessionId)) throw new Error("host hello did not arrive");
+		return await super.attachTail(input);
+	}
+
+	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+		if (this.closed.has(input.sessionId))
+			throw Object.assign(new Error("session_unavailable"), { code: "session_unavailable" });
+		return await super.status(input);
+	}
+
+	override async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }) {
+		this.resumeCalls += 1;
+		const binding = await super.resume(input);
+		this.closed.delete(input.sessionId);
+		return binding;
+	}
+}
+
+async function idleClosedHarness() {
+	const port = new IdleClosedHostPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
+	enqueue("before-idle", "earlier conversation");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "first turn did not start");
+	const first = port.sends[0]!;
+	port.complete(first.opRef, "earlier answer");
+	await eventually(() => terminal.length === 1, "first turn did not finish");
+	// Thirty idle minutes later the host is gone.
+	port.closed.add(first.sessionId);
+	return { port, logs, terminal, sessionId: first.sessionId };
+}
+
+test("가8: the first message after the host closed itself resumes the same session before sending", async () => {
+	const { port, logs, terminal, sessionId } = await idleClosedHarness();
+	enqueue("after-idle", "결론?");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2, "message after idle was not sent");
+	expect(port.resumeCalls).toBe(1);
+	expect(port.sends[1]).toMatchObject({ sessionId, text: "결론?" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("session_resumed") && line.includes(`session=${sessionId}`))).toBe(true);
+	port.complete(port.sends[1]!.opRef, "이어서 답");
+	await eventually(() => terminal.length === 2, "resumed turn did not deliver");
+	expect(terminal).toEqual(["earlier answer", "이어서 답"]);
+});
+
+test("가8: a send that hits the closed host is recovered by resume on the same session and epoch, sent once", async () => {
+	const { port, logs, terminal, sessionId } = await idleClosedHarness();
+	port.staleLive = true;
+	enqueue("after-idle", "작업다됨?");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	expect(port.sends).toHaveLength(1);
+	const opRef = latestOpRef;
+	expect(database!.inboundTurnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+
+	await manager!.recover();
+	await eventually(() => port.sends.length === 2, "recovered turn was not re-sent");
+	expect(port.resumeCalls).toBe(1);
+	expect(port.sends[1]).toMatchObject({ sessionId, text: "작업다됨?" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith(`session_resumed origin=${KEY} epoch=0 session=${sessionId}`) &&
+				line.includes("reason=host_idle_closed"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+	port.complete(port.sends[1]!.opRef, "응 다 됐어");
+	await eventually(() => terminal.length === 2, "recovered turn did not deliver");
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(port.sends).toHaveLength(2);
+	expect(terminal).toEqual(["earlier answer", "응 다 됐어"]);
+	expect(database!.inboundPendingCount(KEY)).toBe(0);
+});
+
+test("가8: a failed resume falls back to the existing rebind onto a new epoch", async () => {
+	const { port, logs, sessionId } = await idleClosedHarness();
+	port.staleLive = true;
+	port.failResume(sessionId);
+	enqueue("after-idle", "결론");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	await manager!.recover();
+	await eventually(() => port.sends.length === 2, "rebound turn was not sent");
+	expect(port.resumeCalls).toBe(1);
+	expect(logs.some((line) => line.startsWith("session_resume_failed") && line.includes(`session=${sessionId}`))).toBe(
+		true,
+	);
+	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted") && line.includes("nextEpoch=1"))).toBe(
+		true,
+	);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(port.sends[1]).toMatchObject({ sessionId: "session-e1", text: "결론" });
+});
+
+test("가8: a deleted saved session is never resumed", async () => {
+	const { port, sessionId } = await idleClosedHarness();
+	port.staleLive = true;
+	port.deleted = true;
+	enqueue("after-idle", "로컬에놔둬");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	await manager!.recover();
+	await eventually(() => port.sends.length === 2, "rebound turn was not sent");
+	expect(port.resumeCalls).toBe(0);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(port.sends[1]!.sessionId).not.toBe(sessionId);
+});
+
+test("가8: a deleted closed binding is not resumed before the send either", async () => {
+	const { port } = await idleClosedHarness();
+	port.deleted = true;
+	enqueue("after-idle", "다음");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	expect(port.resumeCalls).toBe(0);
+});
+
 test("startup recovery reconstructs an accepted durable turn and reconciles status plus turn.result", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);

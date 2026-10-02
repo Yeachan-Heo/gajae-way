@@ -452,6 +452,71 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 	);
 });
 
+test("가8: broker SessionPort resumes a gjc >= 0.16 session whose locator has only cwd, and refuses deleted or foreign ones", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const state = { live: false, deleted: false, cwd: repo };
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						version: 2,
+						source: "broker",
+						session: {
+							sessionId: "saved-1",
+							locator: { cwd: state.cwd, worktreeRoot: null, stateRoot: join(state.cwd, ".gjc/state") },
+							live: state.live,
+							deleted: state.deleted,
+						},
+					},
+				}),
+				stderr: "",
+			};
+		if (args.includes("session.resume")) {
+			state.live = true;
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { resumed: true } }), stderr: "" };
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "discord/channel/c",
+		epoch: 3,
+	});
+	const target = { sessionId: "saved-1", repo, originKey: "discord/channel/c", epoch: 3 };
+	expect(await port.liveness(target)).toMatchObject({ live: false, disowned: false, workspace: repo });
+	await expect(port.resume(target)).resolves.toEqual({
+		sessionId: "saved-1",
+		repo,
+		originKey: "discord/channel/c",
+		epoch: 3,
+	});
+	expect(calls.filter((args) => args.includes("session.resume"))).toHaveLength(1);
+
+	state.live = false;
+	state.deleted = true;
+	await expect(port.resume(target)).rejects.toThrow("saved authority is unavailable");
+	state.deleted = false;
+	state.cwd = join(home, "elsewhere");
+	await expect(port.resume(target)).rejects.toThrow("saved authority is unavailable");
+	expect(calls.filter((args) => args.includes("session.resume"))).toHaveLength(1);
+});
+
 test("broker SessionPort preserves a structured client-ref conflict emitted with a non-zero CLI status", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
