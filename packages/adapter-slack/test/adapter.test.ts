@@ -759,7 +759,7 @@ test("Slack adapter stop clears monitor and reconnect timers", async () => {
 		// (10ms interval * 3 strikes = 30ms, plus time for reconnect to trigger)
 		await Bun.sleep(40);
 		// Verify timer is actually running by confirming at least one reconnect message
-		const beforeStop = logs.filter((line) => line.includes("reconnecting")).length;
+		const beforeStop = logs.filter((line) => line.includes("Slack adapter gateway reconnecting")).length;
 		expect(beforeStop).toBeGreaterThan(0);
 		// Now stop the gateway (should clear timers)
 		gateway.stop();
@@ -767,7 +767,7 @@ test("Slack adapter stop clears monitor and reconnect timers", async () => {
 		// (10ms reconnect delay, so 50ms gives time for ~5+ reconnect cycles if timer continues)
 		await Bun.sleep(50);
 		// Verify no additional reconnecting messages after stop
-		const afterStop = logs.filter((line) => line.includes("reconnecting")).length;
+		const afterStop = logs.filter((line) => line.includes("Slack adapter gateway reconnecting")).length;
 		// Confirm no new reconnecting messages appeared after stop
 		expect(afterStop).toBe(beforeStop);
 	} finally {
