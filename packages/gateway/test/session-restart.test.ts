@@ -442,8 +442,12 @@ test("a bound turn whose id the Router disowns is released and re-fired even whe
 		opRef,
 		sessionId: staleId,
 	});
+	// The Router disowns the id, so `session.resume` cannot restore it either
+	// (a resumable closed host keeps its epoch instead; see persona-session 가8).
+	port.failResume(staleId, "session_unavailable");
 	manager = makeManager(port, logs);
 	await manager.recover();
+	expect(logs.some((line) => line.startsWith(`session_resume_failed origin=${KEY}`))).toBe(true);
 	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
 	await eventually(() => port.sends.length === 1, "disowned turn was not re-fired");
 	// The origin was rebound (epoch bumped) and the release re-fired under a fresh ref.
