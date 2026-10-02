@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
@@ -403,13 +403,25 @@ test("structured nonzero session failures survive normalization at the global li
 	expect(calls[0]).toEqual(expect.arrayContaining(["raw", "global", "--op", "session.close"]));
 });
 
-test("broker SessionPort resumes saved dead authority through the SDK control before returning the same binding", async () => {
+/** A closed saved session under a broker port whose fake CLI answers resume with `onResume`. */
+async function resumeHarness(options: {
+	onResume: (args: string[]) => { exitCode: number; stdout: string };
+	transcript?: boolean;
+}) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
-	const calls: string[][] = [];
-	let live = false;
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
 	const repo = join(home, "workspace");
+	const state = { live: false, host: "darwin:1790891855:142007" };
+	let transcript: string | undefined;
+	if (options.transcript !== false) {
+		const bucket = join(agentDir, "sessions", "v2-scope");
+		await mkdir(bucket, { recursive: true });
+		await writeFile(join(bucket, "2026-10-01T18-53-35-512Z_saved-1.jsonl"), "{}\n");
+		transcript = join(await realpath(bucket), "2026-10-01T18-53-35-512Z_saved-1.jsonl");
+	}
+	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
 		if (args.includes("inspect"))
@@ -417,14 +429,19 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId: "saved-1", locator: { repo }, live, deleted: false } },
+					result: {
+						session: {
+							sessionId: "saved-1",
+							locator: { cwd: repo, worktreeRoot: null, stateRoot: join(repo, ".gjc/state") },
+							live: state.live,
+							deleted: false,
+							hostIncarnation: state.host,
+						},
+					},
 				}),
 				stderr: "",
 			};
-		if (args.includes("session.resume")) {
-			live = true;
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { resumed: true } }), stderr: "" };
-		}
+		if (args.includes("session.resume")) return { ...options.onResume([...args]), stderr: "" };
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
@@ -440,16 +457,98 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 		originKey: "discord/channel/c",
 		epoch: 3,
 	});
-	await expect(port.resume({ sessionId: "saved-1", repo, originKey: "discord/channel/c", epoch: 3 })).resolves.toEqual({
-		sessionId: "saved-1",
+	return {
+		port,
+		calls,
+		state,
 		repo,
-		originKey: "discord/channel/c",
-		epoch: 3,
+		transcript,
+		target: { sessionId: "saved-1", repo, originKey: "discord/channel/c", epoch: 3 },
+		resumeCalls: () => calls.filter((args) => args.includes("session.resume")),
+	};
+}
+
+const OUTCOME_UNKNOWN = {
+	exitCode: 1,
+	stdout: JSON.stringify({
+		schema: "gjc.command-error",
+		version: 1,
+		ok: false,
+		error: { code: "operation_failed", message: "The operation failed. Its outcome could not be established." },
+	}),
+};
+
+test("가8: resume is the global lifecycle op with the saved transcript, the binding's workspace and a per-host idempotency key", async () => {
+	const h = await resumeHarness({
+		onResume: () => {
+			h.state.live = true;
+			h.state.host = "darwin:1790901511:239036";
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, operation: "session.resume", result: {} }) };
+		},
 	});
-	expect(calls.filter((args) => args.includes("inspect"))).toHaveLength(2);
-	expect(calls.find((args) => args.includes("session.resume"))).toEqual(
-		expect.arrayContaining(["sdk", "session", "raw", "control", "saved-1", "--op", "session.resume"]),
-	);
+	await expect(h.port.resume(h.target)).resolves.toEqual(h.target);
+	expect(h.resumeCalls()).toHaveLength(1);
+	const args = h.resumeCalls()[0]!;
+	expect(args.slice(0, 8)).toEqual([
+		"sdk",
+		"session",
+		"raw",
+		"global",
+		"--op",
+		"session.resume",
+		"--idempotency-key",
+		"gw-resume-saved-1-3-darwin:1790891855:142007",
+	]);
+	expect(args[8]).toBe("--json-input");
+	expect(JSON.parse(args[9]!)).toEqual({
+		sessionId: "saved-1",
+		sessionPath: h.transcript,
+		cwd: h.repo,
+		readinessTimeoutMs: 60_000,
+	});
+	expect(args).not.toContain("control");
+
+	// That host closes too: the next resume is a new attempt under a new key.
+	h.state.live = false;
+	await expect(h.port.resume(h.target)).resolves.toEqual(h.target);
+	expect(h.resumeCalls()[1]).toContain("gw-resume-saved-1-3-darwin:1790901511:239036");
+});
+
+test("가8: a broker invalid_input refusal fails resume (caller rebinds) without trusting inspect", async () => {
+	const h = await resumeHarness({
+		onResume: () => ({
+			exitCode: 1,
+			stdout: JSON.stringify({
+				ok: false,
+				error: { code: "invalid_input", message: "Saved saved session does not match the requested workspace." },
+			}),
+		}),
+	});
+	await expect(h.port.resume(h.target)).rejects.toThrow("invalid_input");
+	expect(h.calls.filter((args) => args.includes("inspect"))).toHaveLength(1);
+});
+
+test("가8: an outcome-unknown resume is settled by inspect - still closed fails, live counts as resumed", async () => {
+	const closed = await resumeHarness({ onResume: () => OUTCOME_UNKNOWN });
+	await expect(closed.port.resume(closed.target)).rejects.toThrow("operation_failed");
+	expect(closed.calls.filter((args) => args.includes("inspect"))).toHaveLength(2);
+	database?.close();
+	database = undefined;
+	await rm(home, { recursive: true, force: true });
+
+	const restored = await resumeHarness({
+		onResume: () => {
+			restored.state.live = true;
+			return OUTCOME_UNKNOWN;
+		},
+	});
+	await expect(restored.port.resume(restored.target)).resolves.toEqual(restored.target);
+});
+
+test("가8: no unique saved transcript means no resume request at all", async () => {
+	const h = await resumeHarness({ transcript: false, onResume: () => OUTCOME_UNKNOWN });
+	await expect(h.port.resume(h.target)).rejects.toThrow("no unique saved transcript");
+	expect(h.resumeCalls()).toHaveLength(0);
 });
 
 test("가8: broker SessionPort resumes a gjc >= 0.16 session whose locator has only cwd, and refuses deleted or foreign ones", async () => {
@@ -457,6 +556,8 @@ test("가8: broker SessionPort resumes a gjc >= 0.16 session whose locator has o
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
+	await mkdir(join(home, "agent", "sessions", "v2-scope"), { recursive: true });
+	await writeFile(join(home, "agent", "sessions", "v2-scope", "2026-10-01T00-00-00-000Z_saved-1.jsonl"), "{}\n");
 	const state = { live: false, deleted: false, cwd: repo };
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {

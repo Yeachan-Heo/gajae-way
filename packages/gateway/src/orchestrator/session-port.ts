@@ -40,6 +40,7 @@ import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
 	type FailedTurnEvidenceInput,
+	locateSavedTranscript,
 	readFailedTransportCause,
 	readFailedTurnEvidence,
 } from "./failed-turn-evidence";
@@ -82,6 +83,8 @@ export interface SessionLiveness {
 	readonly deleted?: boolean;
 	/** `locator.repo`, or the `locator.cwd` gjc >= 0.16.0 reports in its place. */
 	readonly workspace?: string;
+	/** The (last) host process identity; a closed session keeps its dead host's. */
+	readonly hostIncarnation?: string;
 }
 
 /**
@@ -479,6 +482,9 @@ export class BrokerSessionPort implements SessionPort {
 						} catch (error) {
 							if (error instanceof BrokerAuthorityError) throw error;
 							// Saved authority cannot be resumed: replace it below.
+							console.error(
+								`session_resume_failed origin=${input.originKey} epoch=${input.epoch} session=${existing.sessionId} path=bind detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+							);
 						}
 					}
 					indexed = false;
@@ -685,6 +691,7 @@ export class BrokerSessionPort implements SessionPort {
 						deleted?: unknown;
 						locator?: { repo?: unknown; cwd?: unknown };
 						activity?: { state?: unknown; at?: unknown };
+						hostIncarnation?: unknown;
 					};
 				};
 				error?: { code?: unknown };
@@ -695,11 +702,13 @@ export class BrokerSessionPort implements SessionPort {
 			const state = session?.activity?.state;
 			const at = session?.activity?.at;
 			const workspace = session?.locator?.repo ?? session?.locator?.cwd;
+			const host = session?.hostIncarnation;
 			return {
 				live: typeof live === "boolean" ? live : undefined,
 				disowned: false,
 				...(session?.deleted === true ? { deleted: true } : {}),
 				...(typeof workspace === "string" ? { workspace } : {}),
+				...(typeof host === "string" && /^[A-Za-z0-9:._-]{1,128}$/.test(host) ? { hostIncarnation: host } : {}),
 				...(typeof state === "string" && typeof at === "number" && Number.isFinite(at) && at > 0
 					? { activity: { state, at } }
 					: {}),
@@ -783,23 +792,50 @@ export class BrokerSessionPort implements SessionPort {
 		if (!resumable(existing))
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
 		if (!existing.live) {
-			parseEnvelope(
-				await this.#cli([
-					"sdk",
-					"session",
-					"raw",
-					"control",
-					input.sessionId,
-					"--op",
+			// `session.resume` is a global lifecycle op, not a session control
+			// (gjc broker/lifecycle.ts launchInput): it needs the workspace `cwd`
+			// and the saved transcript `sessionPath`, which gjc itself verifies
+			// belongs to that cwd and session id.
+			const sessionPath = await locateSavedTranscript(this.#authority.canonicalAgentDir, input.sessionId);
+			if (sessionPath === undefined)
+				throw new Error(`cannot resume session ${input.sessionId}: no unique saved transcript`);
+			this.#assertOwned(input);
+			let failure: unknown;
+			try {
+				parseEnvelope(
+					await this.#cli([
+						"sdk",
+						"session",
+						"raw",
+						"global",
+						"--op",
+						"session.resume",
+						"--idempotency-key",
+						sessionResumeKey(input.sessionId, input.epoch, existing.hostIncarnation),
+						"--json-input",
+						JSON.stringify({
+							sessionId: input.sessionId,
+							sessionPath,
+							cwd: input.repo,
+							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+						}),
+					]),
 					"session.resume",
-					"--json-input",
-					"{}",
-				]),
-				"session.resume",
-			);
+				);
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
+				// A refused request never restored anything. Every other failure -
+				// including the CLI's `operation_failed` (outcome unknown), which is
+				// also how it reports a broker invalid_input - is settled by inspect.
+				if (sdkErrorCode(error) === "invalid_input" || sdkErrorCode(error) === "idempotency_conflict")
+					throw sanitizeSdkFailure(error);
+				failure = error;
+			}
 			const resumed = await this.liveness(input);
-			if (!resumable(resumed) || resumed.live !== true)
+			if (!resumable(resumed) || resumed.live !== true) {
+				if (failure !== undefined) throw sanitizeSdkFailure(failure);
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
+			}
 		}
 		this.#resetCreateRotations(input.originKey);
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
@@ -1793,6 +1829,17 @@ function isTransientCreateFailure(error: unknown): boolean {
 	if (!(error instanceof GjcCliError)) return false;
 	const code = envelopeErrorCode(error.details);
 	return code === "terminal_uncertain" || code === "uncertain_after_send" || code === "spawn_failed";
+}
+
+/**
+ * One resume attempt per dead host: the closed session keeps its last host's
+ * incarnation, and a successful resume replaces it. So a resend of the same
+ * attempt (gateway restart mid-resume) reuses the key and gets gjc's ledger
+ * replay, while resuming again after that host closes too is a new key - the
+ * old one would replay a success whose endpoint is gone.
+ */
+export function sessionResumeKey(sessionId: string, epoch: number, hostIncarnation: string | undefined): string {
+	return `gw-resume-${sessionId}-${epoch}-${hostIncarnation ?? "nohost"}`;
 }
 
 function sessionCreateRef(instanceId: string, originKey: string, epoch: number, repo: string): string {
