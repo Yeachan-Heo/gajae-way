@@ -48,6 +48,7 @@ const server = startAdminServer({
 		const offs = ["chat.message", "chat.progress", "monitor.event", "gateway.stopping"].map((event) =>
 			client.on(event, (payload) => handler(event, payload)),
 		);
+		offs.push(client.onConnectionChange((connected) => handler("gateway.connection", { connected })));
 		return () => {
 			for (const off of offs) off();
 		};
