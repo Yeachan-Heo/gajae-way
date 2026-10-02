@@ -7,9 +7,9 @@
  * its events out to browser clients, and binds loopback only.
  */
 
-import { GajaewayClient } from "@gajae-gateway/sdk";
 import { jsonlAuditLog } from "./audit";
 import { ADMIN_USAGE, USAGE_EXIT_CODE, usageFor } from "./cli";
+import { AdminGateway } from "./gateway";
 import { startAdminServer } from "./server";
 
 function gajaewayHome(): string {
@@ -40,12 +40,7 @@ if (usageFor(process.argv.slice(2)) !== undefined) {
 const socket = socketPath();
 const port = adminPort();
 
-const client = await GajaewayClient.connectSocketWithBackoff(socket, {
-	onRetry: (attempt, delayMs, error) =>
-		console.error(
-			`Gateway socket ${socket} unavailable; retry ${attempt} in ${delayMs}ms: ${error instanceof Error ? error.message : String(error)}`,
-		),
-});
+const client = await AdminGateway.connect(socket);
 
 const server = startAdminServer({
 	request: (method, params) => client.request(method, params),
