@@ -247,6 +247,9 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
 	database.metaSet(`create_rotation:${ORIGIN}`, String(MAX_POISONED_CREATE_ROTATIONS));
 	live = false;
+	// resume needs the saved transcript gjc kept for the session.
+	await mkdir(join(home, "agent", "sessions", "v2-scope"), { recursive: true });
+	await writeFile(join(home, "agent", "sessions", "v2-scope", "2026-10-01T00-00-00-000Z_recovered.jsonl"), "{}\n");
 	await expect(
 		port.resume({ sessionId: "recovered", repo: REPO, originKey: ORIGIN, epoch: recoveredEpoch }),
 	).resolves.toMatchObject({ sessionId: "recovered" });
