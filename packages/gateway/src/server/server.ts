@@ -2497,6 +2497,32 @@ async function createInboundTurnLifecycle(
 		}
 	};
 
+	const onModelRefusal = ({ error }: PersonaFailureInput) => {
+		const notice = `${formatFailureNotice(error)} Send /model <id> or /new`;
+		console.error(notice);
+		if (nonLoopback) {
+			// A refused prompt is still pending. Its diagnostic must not occupy
+			// the eventual answer's delivery identity or terminal reply slot.
+			const deliveryId = `gw-m-${createHash("sha256")
+				.update(JSON.stringify([key, input.turn.triggerMessageId, "model_not_selected"]))
+				.digest("hex")
+				.slice(0, 32)}`;
+			const payload = runtime.delivery.prepare(turnId, origin, notice, undefined, deliveryId);
+			if (payload) {
+				runtime.delivery.markInflight(deliveryId);
+				broadcastDelivery(runtime, payload);
+			}
+		} else if (connection) {
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "event",
+				event: "chat.message",
+				...(context ? { id: context.requestId } : {}),
+				payload: { turnId, origin, role: "assistant", text: notice, final: true },
+			});
+		}
+	};
+
 	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
 		try {
 			const failureNotice = formatFailureNotice(error);
@@ -2562,6 +2588,7 @@ async function createInboundTurnLifecycle(
 		onSteerAccepted,
 		onFrame,
 		onTerminal,
+		onModelRefusal,
 		onFailure,
 		onSettled,
 		// Neither path ever reaches onTerminal/onFailure for THIS lifecycle: a
