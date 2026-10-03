@@ -55,7 +55,10 @@ function fakeSlackApi(): {
 	};
 }
 
-async function gateway(respond: (text: string) => string): Promise<{
+async function gateway(
+	respond: (text: string) => string | Promise<string>,
+	engagement: "open" | "mention-open" = "open",
+): Promise<{
 	readonly config: GatewayConfig;
 	readonly database: GatewayDatabase;
 	readonly turns: string[];
@@ -68,7 +71,7 @@ async function gateway(respond: (text: string) => string): Promise<{
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "slack:C1": { engagement: "open" } },
+		channels: { "slack:C1": { engagement } },
 		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
@@ -302,4 +305,68 @@ test("an edited channel message is answered in the ORIGINAL message's thread, ne
 	await settle();
 	expect(slack.posts).toEqual([{ channel: "C1", text: "answer to the edit", threadTs: "1726543210.000800" }]);
 	expect(database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+});
+
+test("a mention steered into a busy turn still opens its thread for unmentioned follow-ups", async () => {
+	// Live, 2026-10-03: a mention that lands while the persona is still answering
+	// is folded into that turn as a steer, not a trigger. Thread follow-up only
+	// counted triggers, so the user's first reply in their own thread was refused.
+	let release!: () => void;
+	const busy = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let calls = 0;
+	const { config, turns } = await gateway(async () => {
+		calls += 1;
+		if (calls === 1) await busy;
+		return `answer ${calls}`;
+	}, "mention-open");
+	const slack = fakeSlackApi();
+	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	await adapter.connect();
+	const earlier = "1726543210.000900";
+	await adapter.requestInbound(
+		slackMessageId("C1", earlier),
+		slackMessageOrigin({ channel: "C1", user: "U2", ts: earlier }),
+		"earlier question",
+		{ mentioned: true, group: true, authorId: "U2" },
+	);
+	await settle();
+	const root = "1726543210.001000";
+	const steered = await adapter.requestInbound(
+		slackMessageId("C1", root),
+		slackMessageOrigin({ channel: "C1", user: "U1", ts: root }),
+		"my question",
+		{ mentioned: true, group: true, authorId: "U1" },
+	);
+	expect(steered?.engaged).toBe(true);
+	// An unaddressed line during the same busy turn must not open its thread.
+	const chatter = "1726543210.001100";
+	await adapter.requestInbound(
+		slackMessageId("C1", chatter),
+		slackMessageOrigin({ channel: "C1", user: "U3", ts: chatter }),
+		"unrelated chatter",
+		{ mentioned: false, group: true, authorId: "U3" },
+	);
+	await settle();
+	release();
+	await settle();
+	expect(turns).toHaveLength(1);
+	const followUp = await adapter.requestInbound(
+		slackMessageId("C1", "1726543210.001200"),
+		slackMessageOrigin({ channel: "C1", user: "U1", ts: "1726543210.001200", thread_ts: root }),
+		"follow-up without a mention",
+		{ mentioned: false, group: true, authorId: "U1" },
+	);
+	expect(followUp?.engaged).toBe(true);
+	const ignored = await adapter.requestInbound(
+		slackMessageId("C1", "1726543210.001300"),
+		slackMessageOrigin({ channel: "C1", user: "U3", ts: "1726543210.001300", thread_ts: chatter }),
+		"reply under chatter",
+		{ mentioned: false, group: true, authorId: "U3" },
+	);
+	expect(ignored?.engaged).toBe(false);
+	await settle();
+	expect(turns).toHaveLength(2);
+	expect(slack.posts).toContainEqual({ channel: "C1", text: "answer 2", threadTs: root });
 });
