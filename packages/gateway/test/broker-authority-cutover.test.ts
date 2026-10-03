@@ -394,14 +394,14 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		);
 		legacy.exec("DELETE FROM schema_migrations WHERE version = 23");
 		legacy.exec("DELETE FROM schema_migrations WHERE version = 22");
-		legacy.exec("DELETE FROM schema_migrations WHERE version = 24");
+		legacy.exec("DELETE FROM schema_migrations WHERE version IN (24, 25)");
 		legacy.close();
 		const report = await main(f.apply);
 		expect(report.mode).toBe("apply");
 		if (report.mode !== "apply") throw new Error("wrong mode");
 		expect(report.census.schema).toBe(21);
 		expect(report.backup.schema).toBe(21);
-		expect(report.targetSchema).toBe(24);
+		expect(report.targetSchema).toBe(25);
 		const backup = new Database(f.backup, { readonly: true });
 		try {
 			expect(backup.query("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 21 });
@@ -411,7 +411,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		}
 		const database = await GatewayDatabase.open(f.path);
 		try {
-			expect(database.schemaVersion).toBe(24);
+			expect(database.schemaVersion).toBe(25);
 			expect(database.inspectBrokerAuthority().authority).toEqual(report.targetAuthority);
 		} finally {
 			database.close();

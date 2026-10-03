@@ -91,6 +91,31 @@ Before an outbound reply is emitted, the gateway creates a durable ledger item. 
 
 At negotiated connection time and every 15 seconds while an adapter is connected, adapters receive due unsettled deliveries. This is deliberately at-least-once delivery: an `inflight` or `failed_ambiguous` item is reissued with `redelivered: true` and `duplicateWarning: true`. Platform adapters must display the duplicate warning. Confirmed or expired records are not replayed automatically; expired counts and the five most recent identifiers/origins are exposed by `gateway.status`, and the admin console raises attention. Expiry is logged and an owner-target notice is sent once per delivery when configured. Operators can requeue eligible rows with `gajaeway ops redeliver <deliveryId>` or `gajaeway ops redeliver --since <iso>` (selecting rows updated since that timestamp). Confirmed records are never requeued; old confirmed records are pruned after seven days.
 
+## History retention
+
+The gateway garbage-collects its own SQLite history; nothing requires an operator to prune `gateway.db` by hand. Thirty seconds after boot and every 15 minutes after, a sweep deletes terminal rows in batches of 500 per table, yielding the event loop 50 ms between batches, until nothing is left to delete:
+
+- `inbound_messages`: `done` rows older than 30 days, unless a non-`done` row shares the turn op-ref.
+- `monitor_events`: `delivered`, `authored_no_delivery` and `failed_no_retry` events older than 30 days, together with their `authored_outputs`, `monitor_failures` and `dispatch_leases`.
+- `deliveries`: `confirmed` rows older than 7 days and `expired` rows older than 30 days. Unsettled rows are never touched.
+- `lane_reports`: `consumed`, `fallback` and `undeliverable` rows older than 30 days. `pending`, `claimed` and `held` are kept.
+- `monitor_slots`: slots older than 30 days, except each monitor's newest slot, which is its cron schedule boundary.
+
+Rows named in `broker_quarantine` are never deleted. The existing hourly `conversation_context` maintenance is unchanged. After each sweep the gateway runs `PRAGMA wal_checkpoint(PASSIVE)` and `PRAGMA optimize`, and `journal_size_limit` caps the WAL file at 64 MiB. Schema 25 adds partial indexes on the age columns so the sweep never full-scans a large table. Deleted pages are reused by SQLite rather than returned to the filesystem, so the file stops growing instead of shrinking; reclaim disk with an offline `VACUUM` only when needed. Each sweep that deletes rows logs one `{"retention": {...}}` line to stderr.
+
+## Hot-path query cost
+
+`bun:sqlite` is synchronous, so any query that loads a table into JavaScript blocks the single event loop (and with it sockets, relays and turns) for as long as it takes. Making the call `async` does not help; the work has to touch fewer rows. Hot paths therefore never materialize `deliveries`, `monitor_events` or `memory_intents`:
+
+- Ledger `get`, `markInflight`, `confirm` and `fail` are primary-key lookups. `listUndelivered` and the 15-second sweep read only `pending`, `inflight` and `failed_ambiguous` rows. `counts` (used by `gateway.status`) is SQL aggregates plus the five newest expired rows.
+- `delivery.confirm` and monitor batch settlement look up one delivery and its batch through `deliveries(turn_id)` and `monitor_events(batch_id)`.
+- The 60-second `monitors.reconcile()` is driven from the stranded set: `monitorDeliveriesAwaitingSettlement()` joins `authored` events to settled deliveries, and `monitorEventsOpen()` reads only non-terminal events through a partial index. Cost follows open work, not history.
+- `memoryIntentCoversEvent` is a primary-key probe on the deterministic intent id; the payload scan runs only for legacy intents. Boot recovery reads only non-receipted intents.
+
+Schema 25 adds the supporting indexes (`deliveries(turn_id)`, `monitor_events(batch_id)`, partial `monitor_events` indexes on `authored` and open stages, `monitor_events(monitor_id, fired_at)`, partial `memory_intents` on non-receipted) together with the age indexes the retention sweep uses. `deliveryRows()`, `monitorEventRows()` and `memoryIntentRows()` remain for tests and cold diagnostics; do not call them from a timer or request path.
+
+GJC-owned session, blob and recovery-snapshot storage under the agent directory is outside this sweep; the gateway does not scan or delete it (see the agent-disk headroom gate).
+
 ## Engagement and safety floors
 
 Loopback is trusted locally, while DMs use `dmPolicy`. Group traffic uses one gateway-owned channel policy: `engagement` is exactly `open`, `mention-open`, or `closed`, and `audience` is independently `all`, `human-only`, or `bot-only`. `open` admits matching-audience chatter; `mention-open` requires a real mention or native reply to this bot; `closed` ignores audience and requires both addressing and the existing owner/allowlist authorization. Omitted engagement remains closed. Omitted audience remains `human-only`, preserving historical `engagement: "open"` behavior: humans are open while bots fall back to the closed gate. Discord threads inherit a configured parent channel policy unless the thread has its own entry.

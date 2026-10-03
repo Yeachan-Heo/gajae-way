@@ -65,7 +65,7 @@ export class MemoryClosureQueue {
 
 	async #initialize(): Promise<RecoveryReport> {
 		await initializeMemory(this.#home);
-		for (const intent of this.#database.memoryIntentRows()) {
+		for (const intent of this.#database.memoryIntentOpenRows()) {
 			if (intent.state === "receipted") continue;
 			if (intent.state === "quarantined") {
 				const reason = intent.quarantine_reason ?? "reason unavailable (legacy quarantined intent)";
@@ -121,7 +121,7 @@ export class MemoryClosureQueue {
 		this.#tail = this.#tail.then(async () => {
 			try {
 				await this.initialize();
-				const intent = this.#database.memoryIntentRows().find((row) => row.id === id);
+				const intent = this.#database.memoryIntentGet(id);
 				if (intent && intent.state !== "receipted" && intent.state !== "quarantined") await this.#process(intent);
 			} catch (error) {
 				this.failures++;

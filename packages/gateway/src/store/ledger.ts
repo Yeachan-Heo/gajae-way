@@ -1,4 +1,4 @@
-import type { GatewayDatabase } from "./db";
+import type { DeliveryDbRow, GatewayDatabase } from "./db";
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
 /** Outcome of a settlement attempt against the ledger. */
@@ -103,9 +103,8 @@ export class DeliveryLedger {
 	 * This prevents re-broadcasting inflight rows that are still pending confirmation.
 	 */
 	listUndelivered(freshnessMs: number, now = Date.now(), ignoreBackoff = false): DeliveryRow[] {
-		return this.rows().filter(
+		return this.unsettledRows().filter(
 			(row) =>
-				!["confirmed", "expired"].includes(row.state) &&
 				now - Date.parse(row.createdAt) <= freshnessMs &&
 				(ignoreBackoff || row.attempts === 0 || now - Date.parse(row.updatedAt) >= retryBackoffMs(row.attempts)) &&
 				(row.state !== "inflight" || ignoreBackoff || now - Date.parse(row.updatedAt) >= ACK_TIMEOUT_MS),
@@ -133,8 +132,7 @@ export class DeliveryLedger {
 		return this.#database.withTransaction(() => this.#database.deliveryRequeueSince(normalizedSince));
 	}
 	getMany(deliveryIds: readonly string[]): DeliveryRow[] {
-		const wanted = new Set(deliveryIds);
-		return this.rows().filter((row) => wanted.has(row.deliveryId));
+		return this.#database.deliveryGetMany(deliveryIds).map(toDeliveryRow);
 	}
 	prune(deliveredOlderThanMs: number, now = Date.now()): number {
 		return this.#database.withTransaction(() =>
@@ -147,41 +145,39 @@ export class DeliveryLedger {
 		expired: number;
 		recentExpired: readonly ExpiredDeliveryRow[];
 	} {
-		const allRows = this.rows();
-		const rows = allRows.filter((row) => !["confirmed", "expired"].includes(row.state));
-		const expiredRows = allRows
-			.filter((row) => row.state === "expired")
-			.sort(
-				(left, right) =>
-					right.updatedAt.localeCompare(left.updatedAt) || left.deliveryId.localeCompare(right.deliveryId),
-			);
+		const counts = this.#database.deliveryLedgerCounts();
 		return {
-			pending: rows.length,
-			oldestPendingAgeMs: rows.length ? Math.max(...rows.map((row) => now - Date.parse(row.createdAt))) : null,
-			expired: expiredRows.length,
-			recentExpired: expiredRows.slice(0, 5).map((row) => ({
-				deliveryId: row.deliveryId,
-				originKey: row.originKey,
+			pending: counts.pending,
+			oldestPendingAgeMs: counts.oldestCreatedAt === null ? null : now - Date.parse(counts.oldestCreatedAt),
+			expired: counts.expired,
+			recentExpired: counts.recentExpired.map((row) => ({
+				deliveryId: row.delivery_id,
+				originKey: row.origin_key,
 				attempts: row.attempts,
-				expiredAt: row.updatedAt,
+				expiredAt: row.updated_at,
 			})),
 		};
 	}
 	get(deliveryId: string): DeliveryRow | undefined {
-		return this.rows().find((row) => row.deliveryId === deliveryId);
+		const row = this.#database.deliveryGet(deliveryId);
+		return row ? toDeliveryRow(row) : undefined;
 	}
-	private rows(): DeliveryRow[] {
-		return this.#database.deliveryRows().map((row) => ({
-			deliveryId: row.delivery_id,
-			turnId: row.turn_id,
-			originKey: row.origin_key,
-			payloadJson: row.payload_json,
-			state: row.state as DeliveryState,
-			attempts: row.attempts,
-			createdAt: row.created_at,
-			updatedAt: row.updated_at,
-		}));
+	private unsettledRows(): DeliveryRow[] {
+		return this.#database.deliveryUnsettledRows().map(toDeliveryRow);
 	}
+}
+
+function toDeliveryRow(row: DeliveryDbRow): DeliveryRow {
+	return {
+		deliveryId: row.delivery_id,
+		turnId: row.turn_id,
+		originKey: row.origin_key,
+		payloadJson: row.payload_json,
+		state: row.state as DeliveryState,
+		attempts: row.attempts,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
 }
 
 function retryBackoffMs(attempts: number): number {

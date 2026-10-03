@@ -569,13 +569,25 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 24;
+const LATEST_SCHEMA_VERSION = 25;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 /** Consumed context bodies older than this are deleted after aggregate evidence is retained. */
 export const CONVERSATION_CONTEXT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Terminal history (finished inbound turns, settled monitor events, spent lane reports, old slots) is deleted after this. */
+export const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** Confirmed deliveries are only needed for recent-chat context and dedupe. */
+export const CONFIRMED_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Rows deleted per table per retention batch; keeps each synchronous transaction short. */
+export const RETENTION_BATCH_ROWS = 500;
+
+export interface RetentionSweepResult {
+	readonly deleted: Readonly<Record<string, number>>;
+	/** True when any table hit the batch limit, so another batch may find more. */
+	readonly more: boolean;
+}
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
@@ -684,6 +696,42 @@ export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "batched", "dispatched", "failed"];
 /** Terminal stages: no further transition will ever happen without operator action. */
 export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
+
+export interface DeliveryDbRow {
+	readonly delivery_id: string;
+	readonly turn_id: string;
+	readonly origin_key: string;
+	readonly payload_json: string;
+	readonly state: string;
+	readonly attempts: number;
+	readonly created_at: string;
+	readonly updated_at: string;
+}
+
+export interface MonitorEventDbRow {
+	readonly event_id: string;
+	readonly monitor_id: string;
+	readonly event_type: string;
+	readonly payload_json: string;
+	readonly fired_at: string;
+	readonly stage: string;
+	readonly batch_id: string | null;
+	readonly dispatch_attempts: number;
+	readonly updated_at: string;
+}
+
+export interface MemoryIntentDbRow {
+	readonly id: string;
+	readonly kind: string;
+	readonly payload_json: string;
+	readonly state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+	readonly attempts: number;
+	readonly quarantine_reason: string | null;
+}
+
+const DELIVERY_COLUMNS = "delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at";
+/** Matches the partial index `monitor_events_open`; keep the two spellings identical. */
+const OPEN_MONITOR_EVENT = "stage NOT IN ('delivered','authored_no_delivery','failed_no_retry')";
 
 /**
  * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
@@ -1622,7 +1670,9 @@ export class GatewayDatabase {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
 		try {
-			database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
+			database.exec(
+				"PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;",
+			);
 			const instance = new GatewayDatabase(database);
 			instance.migrate();
 			instance.integrityCheck();
@@ -2081,6 +2131,41 @@ export class GatewayDatabase {
 			attempts: number;
 			quarantine_reason: string | null;
 		}>;
+	}
+
+	/** Every row not yet receipted, in admission order; boot recovery never needs the receipted history. */
+	memoryIntentOpenRows(): MemoryIntentDbRow[] {
+		return this.#database
+			.query<MemoryIntentDbRow, []>(
+				"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents WHERE state <> 'receipted' ORDER BY created_at, id",
+			)
+			.all();
+	}
+
+	memoryIntentGet(id: string): MemoryIntentDbRow | undefined {
+		return (
+			this.#database
+				.query<MemoryIntentDbRow, [string]>(
+					"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents WHERE id = ?",
+				)
+				.get(id) ?? undefined
+		);
+	}
+
+	/**
+	 * Whether a monitor-event memory intent already covers this event. The
+	 * deterministic id is a primary-key probe; the payload scan only runs for
+	 * legacy intents written before ids were deterministic.
+	 */
+	memoryIntentCoversEvent(eventId: string): boolean {
+		if (this.memoryIntentGet(`monitor-event-intent:${eventId}`)) return true;
+		return (
+			this.#database
+				.query<{ one: number }, [string]>(
+					"SELECT 1 AS one FROM memory_intents WHERE kind = 'monitor-event' AND instr(payload_json, ?) > 0 LIMIT 1",
+				)
+				.get(eventId) !== null
+		);
 	}
 
 	/** The insert is the acceptance boundary: dispatch may only start once the row is durable. */
@@ -3259,6 +3344,55 @@ export class GatewayDatabase {
 		}>;
 	}
 
+	deliveryGet(deliveryId: string): DeliveryDbRow | undefined {
+		return (
+			this.#database
+				.query<DeliveryDbRow, [string]>(`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE delivery_id = ?`)
+				.get(deliveryId) ?? undefined
+		);
+	}
+
+	deliveryGetMany(deliveryIds: readonly string[]): DeliveryDbRow[] {
+		const rows: DeliveryDbRow[] = [];
+		for (const id of new Set(deliveryIds)) {
+			const row = this.deliveryGet(id);
+			if (row) rows.push(row);
+		}
+		return rows;
+	}
+
+	/** Rows still owed to an adapter. Bounded by open work, never by delivery history. */
+	deliveryUnsettledRows(): DeliveryDbRow[] {
+		return this.#database
+			.query<DeliveryDbRow, []>(
+				`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') ORDER BY created_at`,
+			)
+			.all();
+	}
+
+	/** Ledger status without materializing history: unsettled count and age, expired count and the five newest. */
+	deliveryLedgerCounts(): {
+		pending: number;
+		oldestCreatedAt: string | null;
+		expired: number;
+		recentExpired: Array<{ delivery_id: string; origin_key: string; attempts: number; updated_at: string }>;
+	} {
+		const open = this.#database
+			.query<{ n: number; oldest: string | null }, []>(
+				"SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous')",
+			)
+			.get();
+		const expired = this.#database
+			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'expired'")
+			.get();
+		const recentExpired = this.#database
+			.query<{ delivery_id: string; origin_key: string; attempts: number; updated_at: string }, []>(
+				"SELECT delivery_id, origin_key, attempts, updated_at FROM deliveries WHERE state = 'expired' ORDER BY updated_at DESC, delivery_id LIMIT 5",
+			)
+			.all();
+		return { pending: open?.n ?? 0, oldestCreatedAt: open?.oldest ?? null, expired: expired?.n ?? 0, recentExpired };
+	}
+
 	monitorCreate(row: {
 		id: string;
 		name: string;
@@ -3788,35 +3922,84 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		monitorId?: string,
 		order: "newest" | "oldest" = "newest",
 		includeQuarantined = false,
-	): Array<{
-		event_id: string;
-		monitor_id: string;
-		event_type: string;
-		payload_json: string;
-		fired_at: string;
-		stage: string;
-		batch_id: string | null;
-		dispatch_attempts: number;
-		updated_at: string;
-	}> {
+		limit?: number,
+	): MonitorEventDbRow[] {
 		const direction = order === "oldest" ? "ASC" : "DESC";
+		const terms = [
+			monitorId === undefined ? undefined : "monitor_id = ?",
+			includeQuarantined ? undefined : REPLAYABLE_MONITOR,
+		];
+		const where = terms.filter((term) => term !== undefined).join(" AND ") || "1=1";
+		const params: Array<string | number> = monitorId === undefined ? [] : [monitorId];
+		if (limit !== undefined) params.push(limit);
 		return this.#database
-			.query(
-				monitorId
-					? `SELECT * FROM monitor_events WHERE monitor_id = ? AND ${includeQuarantined ? "1=1" : REPLAYABLE_MONITOR} ORDER BY fired_at ${direction}, rowid ${direction}`
-					: `SELECT * FROM monitor_events WHERE ${includeQuarantined ? "1=1" : REPLAYABLE_MONITOR} ORDER BY fired_at ${direction}, rowid ${direction}`,
+			.query<MonitorEventDbRow, Array<string | number>>(
+				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ?"}`,
 			)
-			.all(...(monitorId ? [monitorId] : [])) as Array<{
-			event_id: string;
-			monitor_id: string;
-			event_type: string;
-			payload_json: string;
-			fired_at: string;
-			stage: string;
-			batch_id: string | null;
-			dispatch_attempts: number;
-			updated_at: string;
-		}>;
+			.all(...params);
+	}
+
+	monitorEventGet(eventId: string, includeQuarantined = false): MonitorEventDbRow | undefined {
+		return (
+			this.#database
+				.query<MonitorEventDbRow, [string]>(
+					`SELECT * FROM monitor_events WHERE event_id = ?${includeQuarantined ? "" : ` AND ${REPLAYABLE_MONITOR}`}`,
+				)
+				.get(eventId) ?? undefined
+		);
+	}
+
+	/** The named replayable events, newest first (the order `monitorEventRows()` yields). */
+	monitorEventsByIds(eventIds: readonly string[]): MonitorEventDbRow[] {
+		if (eventIds.length === 0) return [];
+		return this.#database
+			.query<MonitorEventDbRow, [string]>(
+				`SELECT * FROM monitor_events WHERE event_id IN (SELECT value FROM json_each(?)) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+			)
+			.all(JSON.stringify(eventIds));
+	}
+
+	/** One delivery's replayable events, newest first. */
+	monitorEventsByBatch(batchId: string): MonitorEventDbRow[] {
+		return this.#database
+			.query<MonitorEventDbRow, [string]>(
+				`SELECT * FROM monitor_events WHERE batch_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+			)
+			.all(batchId);
+	}
+
+	/** Replayable events that have not reached a terminal stage, oldest first: the only rows reconcile can act on. */
+	monitorEventsOpen(): MonitorEventDbRow[] {
+		return this.#database
+			.query<MonitorEventDbRow, []>(
+				`SELECT * FROM monitor_events WHERE ${OPEN_MONITOR_EVENT} AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid`,
+			)
+			.all();
+	}
+
+	/**
+	 * Deliveries that settled (confirmed or expired) while one of their events is
+	 * still `authored`: the split state reconcile repairs. Driven from the
+	 * `authored` rows, so cost follows the stranded set, not delivery history.
+	 */
+	monitorDeliveriesAwaitingSettlement(): Array<{ delivery_id: string; turn_id: string; state: string }> {
+		return this.#database
+			.query<{ delivery_id: string; turn_id: string; state: string }, []>(
+				`SELECT DISTINCT d.delivery_id, d.turn_id, d.state FROM monitor_events JOIN deliveries d ON d.turn_id = monitor_events.batch_id WHERE monitor_events.stage = 'authored' AND d.state IN ('confirmed','expired') AND ${REPLAYABLE_MONITOR}`,
+			)
+			.all();
+	}
+
+	/** Newest authored notes for one monitor, newest first. */
+	monitorRecentAuthoredNotes(
+		monitorId: string,
+		limit: number,
+	): Array<{ event_type: string; fired_at: string; note: string }> {
+		return this.#database
+			.query<{ event_type: string; fired_at: string; note: string }, [string, number]>(
+				`SELECT monitor_events.event_type AS event_type, monitor_events.fired_at AS fired_at, authored_outputs.output_text AS note FROM monitor_events JOIN authored_outputs ON authored_outputs.event_id = monitor_events.event_id WHERE monitor_events.monitor_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY monitor_events.fired_at DESC, monitor_events.rowid DESC LIMIT ?`,
+			)
+			.all(monitorId, limit);
 	}
 	authoredOutputCreate(eventId: string, outputText: string): void {
 		this.#assertNotQuarantined("monitor", eventId);
@@ -3921,10 +4104,77 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				.get(monitorId)?.slot_at ?? undefined
 		);
 	}
-	/** Drops slot ledger entries older than the retention window (bounded table). */
-	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
-		const cutoff = new Date(now - olderThanMs).toISOString();
-		return this.#database.query("DELETE FROM monitor_slots WHERE slot_at < ?").run(cutoff).changes;
+	/**
+	 * One bounded batch of history retention. Only terminal rows are touched;
+	 * quarantined subjects are skipped (their triggers abort deletes), pending
+	 * steers keep their trigger row, and each monitor keeps its newest slot
+	 * because `monitorLastSlotAt` is the cron schedule boundary.
+	 */
+	retentionSweep(now = new Date(), batch = RETENTION_BATCH_ROWS): RetentionSweepResult {
+		const historyCutoff = new Date(now.getTime() - HISTORY_RETENTION_MS).toISOString();
+		const deliveryCutoff = new Date(now.getTime() - CONFIRMED_DELIVERY_RETENTION_MS).toISOString();
+		return this.withTransaction(() => {
+			const deleted: Record<string, number> = {};
+			let more = false;
+			const note = (table: string, count: number) => {
+				deleted[table] = count;
+				if (count >= batch) more = true;
+			};
+			note(
+				"inbound_messages",
+				this.#database
+					.query(
+						`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') LIMIT ?)`,
+					)
+					.run(historyCutoff, batch).changes,
+			);
+			const events = this.#database
+				.query<{ event_id: string }, [string, number]>(
+					`SELECT event_id FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND updated_at < ? AND ${REPLAYABLE_MONITOR} ORDER BY updated_at LIMIT ?`,
+				)
+				.all(historyCutoff, batch);
+			const dropOutput = this.#database.query("DELETE FROM authored_outputs WHERE event_id = ?");
+			const dropFailures = this.#database.query("DELETE FROM monitor_failures WHERE event_id = ?");
+			const dropLease = this.#database.query("DELETE FROM dispatch_leases WHERE event_id = ?");
+			const dropEvent = this.#database.query("DELETE FROM monitor_events WHERE event_id = ?");
+			for (const { event_id } of events) {
+				dropOutput.run(event_id);
+				dropFailures.run(event_id);
+				dropLease.run(event_id);
+				dropEvent.run(event_id);
+			}
+			note("monitor_events", events.length);
+			note(
+				"deliveries",
+				this.#database
+					.query(
+						"DELETE FROM deliveries WHERE rowid IN (SELECT rowid FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) LIMIT ?)",
+					)
+					.run(deliveryCutoff, historyCutoff, batch).changes,
+			);
+			note(
+				"lane_reports",
+				this.#database
+					.query(
+						"DELETE FROM lane_reports WHERE rowid IN (SELECT rowid FROM lane_reports WHERE state IN ('consumed','fallback','undeliverable') AND updated_at < ? LIMIT ?)",
+					)
+					.run(historyCutoff, batch).changes,
+			);
+			note(
+				"monitor_slots",
+				this.#database
+					.query(
+						"DELETE FROM monitor_slots WHERE rowid IN (SELECT t.rowid FROM monitor_slots t WHERE t.slot_at < ? AND t.slot_at < (SELECT MAX(m.slot_at) FROM monitor_slots m WHERE m.monitor_id = t.monitor_id) LIMIT ?)",
+					)
+					.run(historyCutoff, batch).changes,
+			);
+			return { deleted, more };
+		}) as RetentionSweepResult;
+	}
+
+	/** Post-sweep upkeep: fold the WAL back (PASSIVE never blocks writers) and refresh planner stats. */
+	maintain(): void {
+		this.#database.exec("PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;");
 	}
 
 	deliveryPrune(before: string): number {
@@ -4466,6 +4716,28 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(24, new Date().toISOString());
+			});
+		}
+		if (current < 25) {
+			// Age-column indexes so the retention sweep never full-scans a large history.
+			this.withTransaction(() => {
+				this.#database.exec(`
+					CREATE INDEX IF NOT EXISTS inbound_messages_gc ON inbound_messages(received_at) WHERE state = 'done';
+					CREATE INDEX IF NOT EXISTS deliveries_gc ON deliveries(state, updated_at);
+					CREATE INDEX IF NOT EXISTS monitor_events_gc ON monitor_events(updated_at) WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry');
+					CREATE INDEX IF NOT EXISTS lane_reports_gc ON lane_reports(updated_at) WHERE state IN ('consumed','fallback','undeliverable');
+					CREATE INDEX IF NOT EXISTS monitor_slots_gc ON monitor_slots(slot_at);
+					CREATE INDEX IF NOT EXISTS deliveries_turn ON deliveries(turn_id);
+					CREATE INDEX IF NOT EXISTS monitor_events_batch ON monitor_events(batch_id);
+					CREATE INDEX IF NOT EXISTS monitor_events_authored ON monitor_events(batch_id) WHERE stage = 'authored';
+					CREATE INDEX IF NOT EXISTS monitor_events_open ON monitor_events(fired_at) WHERE ${OPEN_MONITOR_EVENT};
+					CREATE INDEX IF NOT EXISTS monitor_events_monitor ON monitor_events(monitor_id, fired_at);
+					CREATE INDEX IF NOT EXISTS monitor_events_stage ON monitor_events(stage);
+					CREATE INDEX IF NOT EXISTS memory_intents_open ON memory_intents(created_at) WHERE state <> 'receipted';
+				`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(25, new Date().toISOString());
 			});
 		}
 	}

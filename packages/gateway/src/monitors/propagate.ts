@@ -361,9 +361,7 @@ export class MonitorPropagator {
 			if (monitor.burstPolicy === "drop") previous.eventIds.splice(0, previous.eventIds.length, eventId);
 			else if (monitor.burstPolicy === "dedupe") {
 				const seen = previous.eventIds.some(
-					(id) =>
-						this.#database.monitorEventRows().find((row) => row.event_id === id)?.payload_json ===
-						JSON.stringify(payload ?? null),
+					(id) => this.#database.monitorEventGet(id)?.payload_json === JSON.stringify(payload ?? null),
 				);
 				if (!seen) previous.eventIds.push(eventId);
 				else this.#database.monitorEventUpdate(eventId, "batched", "deduped");
@@ -480,34 +478,32 @@ export class MonitorPropagator {
 			// Legacy split-state repair: a crash between ledger confirm and batch
 			// settlement (pre-atomic path) can leave confirmed deliveries with
 			// authored events. Repair them deterministically on startup.
-			for (const delivery of this.#database.deliveryRows()) {
+			// Driven from the stranded `authored` rows, so the pass costs the size of
+			// the stranded set rather than the whole delivery history.
+			for (const delivery of this.#database.monitorDeliveriesAwaitingSettlement()) {
 				// Events stranded `authored` behind a delivery that expired before #94
-				// settle terminally with evidence (no-op once none remain `authored`).
+				// settle terminally with evidence.
 				if (delivery.state === "expired") {
 					this.#database.withTransaction(() =>
 						this.#database.monitorEventsFailExpiredDelivery(delivery.delivery_id, "expired_before_settlement"),
 					);
 					continue;
 				}
-				if (delivery.state !== "confirmed") continue;
-				const batch = this.#database.monitorEventRows().filter((row) => row.batch_id === delivery.turn_id);
-				const needsRepair = batch.some((row) => row.stage === "authored");
-				if (!needsRepair) continue;
+				const batch = this.#database.monitorEventsByBatch(delivery.turn_id);
+				if (!batch.some((row) => row.stage === "authored")) continue;
 				this.#database.withTransaction(() => {
 					for (const row of batch)
 						if (row.stage === "authored") this.#database.monitorEventUpdate(row.event_id, "delivered");
 				});
 			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
-			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
+			for (const row of this.#database.monitorEventsOpen()) {
 				// A closing propagator starts no new dispatch: the rows stay recoverable
 				// for the next boot's sweep instead of being claimed by a dying process.
 				if (this.#closing) break;
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
 				const output = this.#database.authoredOutput(row.event_id);
-				const hasMemory = this.#database
-					.memoryIntentRows()
-					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
+				const hasMemory = this.#database.memoryIntentCoversEvent(row.event_id);
 				// A silent note is never delivered, so `authored` would wait forever for a
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
 				if (output && !hasMemory)
@@ -522,9 +518,7 @@ export class MonitorPropagator {
 					if (this.#database.monitorEventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
 						const failedRow = this.#database.withTransaction(() => {
-							const current = this.#database
-								.monitorEventRows(undefined, "newest", true)
-								.find((candidate) => candidate.event_id === row.event_id);
+							const current = this.#database.monitorEventGet(row.event_id, true);
 							if (!current) return undefined;
 							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null);
 							return current.stage === "failed_no_retry" ? undefined : current;
@@ -575,7 +569,7 @@ export class MonitorPropagator {
 		await promise;
 	}
 	async #dispatchBatch(eventIds: string[]): Promise<void> {
-		const rows = this.#database.monitorEventRows().filter((row) => eventIds.includes(row.event_id));
+		const rows = this.#database.monitorEventsByIds(eventIds);
 		if (!rows.length) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
@@ -820,7 +814,7 @@ export class MonitorPropagator {
 						fenced.some((row) => row.event_id === entry.eventId) &&
 						typeof entry.note === "string"
 					) {
-						const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === entry.eventId);
+						const row = this.#database.monitorEventGet(entry.eventId);
 						if (!row) continue;
 						const intentId = `monitor-event-intent:${entry.eventId}`;
 						const authoredOk = this.#database.monitorEventFencedAuthorWithIntent(
@@ -1175,12 +1169,8 @@ export class MonitorPropagator {
 	/** Newest authored notes for one monitor, newest first, bounded by the digest budget. */
 	#recentAuthoredNotes(monitorId: string): MonitorDigestNote[] {
 		const notes: MonitorDigestNote[] = [];
-		for (const row of this.#database.monitorEventRows(monitorId)) {
-			if (notes.length >= MONITOR_DIGEST_MAX_NOTES) break;
-			const note = this.#database.authoredOutput(row.event_id);
-			if (note === undefined) continue;
-			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note });
-		}
+		for (const row of this.#database.monitorRecentAuthoredNotes(monitorId, MONITOR_DIGEST_MAX_NOTES))
+			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note: row.note });
 		return notes;
 	}
 	/**
@@ -1204,7 +1194,7 @@ export class MonitorPropagator {
 		noDelivery = false,
 		row?: { event_id: string; monitor_id: string; event_type: string; fired_at: string },
 	): void {
-		const eventRow = row ?? this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);
+		const eventRow = row ?? this.#database.monitorEventGet(eventId);
 		if (!eventRow) return;
 		// Atomic output+intent with a DETERMINISTIC intent id: reconcile and a
 		// concurrent dispatch can never create two intents for one event.
