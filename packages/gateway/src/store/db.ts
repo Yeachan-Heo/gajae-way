@@ -4193,7 +4193,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	monitorDeliveriesAwaitingSettlement(): Array<{ delivery_id: string; turn_id: string; state: string }> {
 		return this.#database
 			.query<{ delivery_id: string; turn_id: string; state: string }, []>(
-				`SELECT DISTINCT d.delivery_id, d.turn_id, d.state FROM monitor_events JOIN deliveries d ON d.turn_id = monitor_events.batch_id WHERE monitor_events.stage = 'authored' AND d.state IN ('confirmed','expired') AND ${REPLAYABLE_MONITOR}`,
+				// CROSS JOIN pins the order: start from the (tiny) stranded `authored` batches, never from delivery history.
+				`SELECT d.delivery_id, d.turn_id, d.state FROM (SELECT DISTINCT batch_id FROM monitor_events WHERE stage = 'authored' AND ${REPLAYABLE_MONITOR}) b CROSS JOIN deliveries d ON d.turn_id = b.batch_id WHERE d.state IN ('confirmed','expired')`,
 			)
 			.all();
 	}
