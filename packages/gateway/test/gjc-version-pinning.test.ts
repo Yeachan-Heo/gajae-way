@@ -10,6 +10,16 @@ describe("GJC version pinning", () => {
 		expect(version.length).toBeGreaterThan(0);
 	});
 
+	it("resolves the pin from the bundled package, never from a path on disk", () => {
+		// The regression this guards: the pin used to be read with
+		// readFileSync(dirname^3(__filename)/package.json), so a host that installs
+		// release binaries — or moved its checkout — crash-looped on
+		// "Failed to read pinned GJC version: ENOENT" against a build-machine path.
+		expect(readPinnedGjcVersion({ gjc: { version: "9.9.9" } })).toBe("9.9.9");
+		expect(() => readPinnedGjcVersion({})).toThrow("gjc.version not found in gateway package.json");
+		expect(() => readPinnedGjcVersion(undefined)).not.toThrow();
+	});
+
 	it("validates exact version match with pinnedVersion option", async () => {
 		const pinnedVersion = readPinnedGjcVersion();
 		const mockRun: CliRunner = async (args) => {

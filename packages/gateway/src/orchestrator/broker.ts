@@ -2,6 +2,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
+import gatewayPackageJson from "../../package.json" with { type: "json" };
 import {
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
@@ -24,20 +25,20 @@ export {
 } from "./broker-liveness";
 
 /**
- * Read the pinned GJC version from the gateway package.json.
- * Throws if the file cannot be read or is malformed.
+ * The pinned GJC version, compiled into the bundle.
+ *
+ * It must never be read from disk at runtime: `dirname(__filename)` inside a
+ * compiled binary points at the checkout the binary was built from, so a host
+ * that installs release binaries — or moved/renamed its checkout — refused to
+ * boot with `Failed to read pinned GJC version: ENOENT` on a path it never had.
+ * The pin travels with the binary, which is what "pin GJC per release" means.
+ * Throws when the bundle carries no usable pin.
  */
-export function readPinnedGjcVersion(): string {
-	try {
-		const pkg = JSON.parse(readFileSync(join(dirname(dirname(dirname(__filename))), "package.json"), "utf-8"));
-		const version = pkg.gjc?.version;
-		if (!version || typeof version !== "string") {
-			throw new Error("gjc.version not found in gateway package.json");
-		}
-		return version;
-	} catch (error) {
-		throw new Error(`Failed to read pinned GJC version: ${error instanceof Error ? error.message : String(error)}`);
-	}
+export function readPinnedGjcVersion(bundled: unknown = gatewayPackageJson): string {
+	const version = (bundled as { gjc?: { version?: unknown } } | undefined)?.gjc?.version;
+	if (typeof version !== "string" || version.length === 0)
+		throw new Error("Failed to read pinned GJC version: gjc.version not found in gateway package.json");
+	return version;
 }
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
