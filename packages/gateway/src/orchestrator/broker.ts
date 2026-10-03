@@ -250,12 +250,19 @@ export async function preflightGjcRuntime(
 
 	const detectedVersion = version.slice(1, 4).join(".");
 
-	// If a pinned version is required, check for exact match
+	// The pin is a floor, not an exact match: gjc is the user's global runtime and is
+	// upgraded underneath the gateway (gjc-autoupdate), so an exact pin turns every gjc
+	// release into a boot failure. Newer releases run; one past VERIFIED_GJC_THROUGH is
+	// still flagged by `gjc_unverified_version`.
 	if (options?.pinnedVersion) {
-		if (detectedVersion !== options.pinnedVersion) {
-			throw new Error(
-				`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
-			);
+		const pinned = options.pinnedVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+		if (!pinned) throw new Error("gjc runtime preflight failed: invalid pinned version spec");
+		for (let i = 1; i <= 3; i++) {
+			if (Number(version[i]) < Number(pinned[i]))
+				throw new Error(
+					`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires >= ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
+				);
+			if (Number(version[i]) > Number(pinned[i])) break;
 		}
 	} else {
 		// Otherwise check minimum version

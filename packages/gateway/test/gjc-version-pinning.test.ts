@@ -45,6 +45,25 @@ describe("GJC version pinning", () => {
 		).rejects.toThrow("version mismatch");
 	});
 
+	it("treats the pin as a floor so a gjc upgraded underneath the gateway still boots", async () => {
+		const runVersion =
+			(version: string): CliRunner =>
+			async (args) =>
+				args[0] === "--version"
+					? { exitCode: 0, stdout: `gjc/${version}\n`, stderr: "" }
+					: { exitCode: 1, stdout: "", stderr: "unknown command" };
+		const pinned = { pinnedVersion: "0.18.6" };
+		for (const newer of ["0.18.7", "0.19.0", "1.0.0"])
+			expect((await preflightGjcRuntime(runVersion(newer), "0.16.0", undefined, pinned)).version).toBe(newer);
+		for (const older of ["0.18.5", "0.17.9"])
+			await expect(preflightGjcRuntime(runVersion(older), "0.16.0", undefined, pinned)).rejects.toThrow(
+				"requires >= 0.18.6",
+			);
+		await expect(
+			preflightGjcRuntime(runVersion("0.18.6"), "0.16.0", undefined, { pinnedVersion: "0.18" }),
+		).rejects.toThrow("invalid pinned version spec");
+	});
+
 	it("falls back to minimum version check when pinnedVersion is not set", async () => {
 		const mockRun: CliRunner = async (args) => {
 			if (args[0] === "--version") {
