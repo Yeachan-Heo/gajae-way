@@ -1934,12 +1934,17 @@ export class GatewayDatabase {
 		);
 	}
 
-	/** True when one specific message drove a turn in that origin. */
-	messageTriggeredTurn(originKey: string, messageId: string): boolean {
+	/**
+	 * True when one specific message was taken into a turn in that origin, either
+	 * as its trigger or as a steer folded into a turn already running. A mention
+	 * that lands while the persona is busy becomes a steer, and it is just as
+	 * engaged as a trigger.
+	 */
+	messageJoinedTurn(originKey: string, messageId: string): boolean {
 		return (
 			this.#database
 				.query<{ n: number }, [string, string]>(
-					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role = 'trigger' LIMIT 1",
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
 				)
 				.get(originKey, messageId) !== null
 		);
