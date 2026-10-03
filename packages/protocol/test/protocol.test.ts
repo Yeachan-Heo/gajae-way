@@ -128,6 +128,17 @@ describe("origin normalization", () => {
 		expect(() => originKey(monitorSessionOrigin("bad/id", "backlog.watch"))).toThrow();
 	});
 
+	test("work lane origins are valid and round-trip", () => {
+		// The gateway stores its own lane sessions as `work/task/<name>`
+		// (WORK_LANE_PREFIX) and writes that ref into sessions.origin_ref_json, so
+		// omitting the pair here made `gajaeway sessions list` fail on a gateway
+		// that has any lane history: "unknown platform: work".
+		const origin = { platform: "work", kind: "task", conversationId: "gw-smoke" } as const;
+		expect(validateOriginRef(origin)).toEqual(origin);
+		expect(originKey(origin)).toBe("work/task/gw-smoke");
+		expect(parseOriginKey("work/task/gw-smoke")).toEqual(origin);
+	});
+
 	test("thread requires parentId", () => {
 		expect(() => validateOriginRef({ platform: "telegram", kind: "topic", conversationId: "c1" })).toThrow();
 	});

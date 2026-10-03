@@ -7,7 +7,7 @@
  * One conversational origin == one strictly isolated session (spec fact 9).
  */
 
-export const ORIGIN_PLATFORMS = ["loopback", "discord", "telegram", "slack", "monitor"] as const;
+export const ORIGIN_PLATFORMS = ["loopback", "discord", "telegram", "slack", "monitor", "work"] as const;
 export type OriginPlatform = (typeof ORIGIN_PLATFORMS)[number];
 
 /**
@@ -28,7 +28,7 @@ export function describeChatPlatforms(): string {
 	return `${rest.reverse().join(", ")} or ${last}`;
 }
 
-export const ORIGIN_KINDS = ["dm", "channel", "thread", "topic", "loopback", "eventtype"] as const;
+export const ORIGIN_KINDS = ["dm", "channel", "thread", "topic", "loopback", "eventtype", "task"] as const;
 export type OriginKind = (typeof ORIGIN_KINDS)[number];
 
 export interface OriginRef {
