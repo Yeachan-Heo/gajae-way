@@ -720,6 +720,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"monitorCatchUp",
 	"work",
 	"interimSpeech",
+	"gjc",
 ] as const;
 
 /**

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { parseConfigFile } from "../src/config";
 import { GatewayDatabase } from "../src/store/db";
 
 const directories: string[] = [];
@@ -24,7 +25,8 @@ describe("agent directory resolution in boot", () => {
 
 		const database = await GatewayDatabase.open(dbPath, { canonicalAgentDir: defaultAgentDir });
 		const authority = database.inspectBrokerAuthority();
-		expect(authority.authority.canonicalAgentDir).toBe(defaultAgentDir);
+		expect(authority.authority).not.toBeNull();
+		expect(authority.authority?.canonicalAgentDir).toBe(defaultAgentDir);
 		database.close();
 	});
 
@@ -36,7 +38,8 @@ describe("agent directory resolution in boot", () => {
 		const dbPath = join(home, "gateway.db");
 		const database = await GatewayDatabase.open(dbPath, { canonicalAgentDir: customAgentDir });
 		const authority = database.inspectBrokerAuthority();
-		expect(authority.authority.canonicalAgentDir).toBe(customAgentDir);
+		expect(authority.authority).not.toBeNull();
+		expect(authority.authority?.canonicalAgentDir).toBe(customAgentDir);
 		database.close();
 	});
 
@@ -48,7 +51,8 @@ describe("agent directory resolution in boot", () => {
 		// First boot with original agent directory
 		const database1 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: originalAgentDir });
 		const authority1 = database1.inspectBrokerAuthority();
-		expect(authority1.authority.canonicalAgentDir).toBe(originalAgentDir);
+		expect(authority1.authority).not.toBeNull();
+		expect(authority1.authority?.canonicalAgentDir).toBe(originalAgentDir);
 		database1.close();
 
 		// Second boot with different agent directory should fail during open
@@ -87,5 +91,27 @@ describe("agent directory resolution in boot", () => {
 		const database3 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: originalAgentDir });
 		expect(database3.schemaVersion).toBe(schemaVersion1);
 		database3.close();
+	});
+
+	test("config.json gjc.agentDir with absolute path is accepted", () => {
+		const config = parseConfigFile({
+			schemaVersion: 1,
+			gjc: { agentDir: "/home/user/.gjc/agent" },
+		});
+		expect(config.gjc?.agentDir).toBe("/home/user/.gjc/agent");
+	});
+
+	test("config.json gjc.agentDir with relative path is rejected", () => {
+		expect(() =>
+			parseConfigFile({
+				schemaVersion: 1,
+				gjc: { agentDir: "relative/path" },
+			}),
+		).toThrow("gjc.agentDir must be an absolute path");
+	});
+
+	test("config.json without gjc field is valid", () => {
+		const config = parseConfigFile({ schemaVersion: 1 });
+		expect(config.gjc).toBeUndefined();
 	});
 });

@@ -825,13 +825,13 @@ export class GatewayDatabase {
 				if (this.#database.query(`SELECT 1 FROM ${table}${where} LIMIT 1`).get()) populated = true;
 			} catch (error) {
 				// Table doesn't exist yet (called before migrations complete); ignore and continue.
-				if (!((error as Error).message.includes("no such table"))) throw error;
+				if (!(error as Error).message.includes("no such table")) throw error;
 			}
 		}
 		try {
 			if (this.#database.query("SELECT 1 FROM broker_cutovers LIMIT 1").get()) populated = true;
 		} catch (error) {
-			if (!((error as Error).message.includes("no such table"))) throw error;
+			if (!(error as Error).message.includes("no such table")) throw error;
 		}
 		try {
 			for (const row of this.#database.query<{ epoch: number }, []>("SELECT epoch FROM sessions").all()) {
@@ -839,7 +839,7 @@ export class GatewayDatabase {
 					throw new Error("invalid session epoch");
 			}
 		} catch (error) {
-			if (!((error as Error).message.includes("no such table"))) throw error;
+			if (!(error as Error).message.includes("no such table")) throw error;
 		}
 		let openWork = 0;
 		try {
@@ -863,7 +863,7 @@ export class GatewayDatabase {
 					.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')")
 					.get()?.n ?? 0;
 		} catch (error) {
-			if (!((error as Error).message.includes("no such table"))) throw error;
+			if (!(error as Error).message.includes("no such table")) throw error;
 		}
 		let openInbound = 0;
 		try {
@@ -873,7 +873,7 @@ export class GatewayDatabase {
 				)
 				.get()!.n;
 		} catch (error) {
-			if (!((error as Error).message.includes("no such table"))) throw error;
+			if (!(error as Error).message.includes("no such table")) throw error;
 		}
 		let openMonitors = 0;
 		try {
@@ -883,7 +883,7 @@ export class GatewayDatabase {
 				)
 				.get()!.n;
 		} catch (error) {
-			if (!((error as Error).message.includes("no such table"))) throw error;
+			if (!(error as Error).message.includes("no such table")) throw error;
 		}
 		return { authority, populated, openInbound, openWork, openMonitors };
 	}
@@ -1823,7 +1823,10 @@ export class GatewayDatabase {
 			const instance = new GatewayDatabase(database);
 			// Check broker authority before running other migrations (same transaction for atomicity).
 			if (options.canonicalAgentDir !== undefined) {
-				const authority = { canonicalAgentDir: options.canonicalAgentDir, identity: `gjc:${options.canonicalAgentDir}` };
+				const authority = {
+					canonicalAgentDir: options.canonicalAgentDir,
+					identity: `gjc:${options.canonicalAgentDir}`,
+				};
 				// This check runs before migrate(), so authority_mismatch leaves schema_migrations unchanged.
 				instance.assertBrokerAuthority(authority, { initializeEmpty: true });
 			}
