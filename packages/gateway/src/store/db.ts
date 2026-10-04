@@ -841,14 +841,8 @@ export class GatewayDatabase {
 				openWork++;
 		}
 		for (const row of this.#database.query<{ op_ref: string }, []>("SELECT op_ref FROM work_attempt_runtime").all()) {
-			try {
-				const runtime = this.workAttemptGet(row.op_ref)!;
-				if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
-			} catch (error) {
-				// Broken attempt; attempt repair
-				const repaired = this.workAttemptRepair(row.op_ref);
-				if (repaired && repaired.settledAt === null && !this.isBrokerQuarantined("work", repaired.jobId)) openWork++;
-			}
+			const runtime = this.workAttemptGet(row.op_ref)!;
+			if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
 		}
 		openWork +=
 			this.#database
@@ -1162,13 +1156,7 @@ export class GatewayDatabase {
 				if (runtime) attempts.push(runtime);
 			} catch (error) {
 				if (!(error instanceof WorkAttemptStateError)) throw error;
-				// Try to repair broken attempt before calling onInvalid (#401)
-				const repaired = this.workAttemptRepair(row.op_ref);
-				if (repaired) {
-					attempts.push(repaired);
-				} else {
-					onInvalid(error);
-				}
+				onInvalid(error);
 			}
 		}
 		return attempts;
@@ -1180,22 +1168,7 @@ export class GatewayDatabase {
 				"SELECT op_ref FROM work_attempt_runtime WHERE lane_key = ? AND settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id)",
 			)
 			.get(laneKey);
-		if (!row) return undefined;
-		try {
-			return this.workAttemptGet(row.op_ref);
-		} catch (error) {
-			if (!(error instanceof WorkAttemptStateError)) throw error;
-			// Try to repair the broken attempt (ended but not settled, #401)
-			const repaired = this.workAttemptRepair(row.op_ref);
-			if (repaired) {
-				console.error(
-					`work_attempt_repaired opRef=${JSON.stringify(row.op_ref)} laneKey=${JSON.stringify(laneKey)} assertion=${error.assertion}`,
-				);
-				return repaired;
-			}
-			// Repair failed, re-throw original error
-			throw error;
-		}
+		return row ? this.workAttemptGet(row.op_ref) : undefined;
 	}
 
 	/**

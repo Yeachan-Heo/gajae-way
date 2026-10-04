@@ -482,13 +482,7 @@ export class WorkLaneManager {
 	}
 	#latestRuntime(name: string): WorkAttemptRuntime | undefined {
 		const opRef = this.#job(name)?.attempts.at(-1)?.opRef;
-		if (!opRef) return undefined;
-		try {
-			return this.#db.workAttemptGet(opRef);
-		} catch {
-			// Attempt may be broken; recovery will handle repair
-			return undefined;
-		}
+		return opRef ? this.#db.workAttemptGet(opRef) : undefined;
 	}
 	#rootForLane(name: string): WorkReportRoot | null {
 		const parent = this.#latestRuntime(name)?.parent;
@@ -1606,6 +1600,15 @@ export class WorkLaneManager {
 				console.error(
 					`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
 				);
+				// Attempt to repair pre-broken rows (ended attempt + unsettled runtime) (#401)
+				if (error.opRef && error.assertion === "attempt.endedAt matches runtime.settledAt") {
+					const repaired = this.#db.workAttemptRepair(error.opRef);
+					if (repaired) {
+						console.error(
+							`work_attempt_repaired opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
+						);
+					}
+				}
 			});
 			const lastValid = rows.at(-1)?.opRef ?? after;
 			const nextAfter = invalidAfter > lastValid ? invalidAfter : lastValid;
@@ -1677,15 +1680,8 @@ export class WorkLaneManager {
 						// Settle host_lost attempts directly to avoid leaving runtime unsettled (#401)
 						const name = runtime.sessionKey.slice("work/task/".length);
 						const endedAt = this.#at();
-						try {
-							const current = this.#db.workAttemptGet(runtime.opRef);
-							if (current && current.settledAt === null) {
-								this.settleHostLostAttempt(name, current, endedAt);
-							}
-						} catch (error) {
-							// workAttemptGet may throw if the row is already broken, but we've already
-							// retrieved runtime from workAttemptOpen which handles repair
-							console.error(`work_host_lost_settle_failed opRef=${runtime.opRef} reason=${failureReason(error)}`);
+						if (runtime.settledAt === null) {
+							this.settleHostLostAttempt(name, runtime, endedAt);
 						}
 					} else {
 						// For non-host_lost terminal states, set terminal and schedule observer to settle
