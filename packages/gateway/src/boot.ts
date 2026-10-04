@@ -1,4 +1,4 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { type ConfigOverrides, loadConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
@@ -50,6 +50,26 @@ export interface BrokerWaitOptions {
 }
 
 export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
+
+/**
+ * The persona workspace, created if missing and resolved through any symlink.
+ *
+ * The persona lives in its own dedicated directory, never in the gateway's
+ * process cwd (which is typically the product source checkout): a session bound
+ * to the app repo reports that repo's git state as its own. A deployment may
+ * point that directory at another checkout through a symlink (live on
+ * jip-gajae: `workspace -> ~/clawd`). gjc's `session.create` refuses the link
+ * form and reports it as an unknown-outcome operation, which the gateway then
+ * mistakes for a poisoned idempotency key and rotates the origin's epoch until
+ * it caps — every persona turn in that chat fails. Resolving the link here
+ * keeps the canonical directory in the cwd the broker client, the relays, and
+ * every `session.create` use.
+ */
+export async function resolvePersonaWorkspace(home: string): Promise<string> {
+	const workspaceDir = join(home, "workspace");
+	await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
+	return await realpath(workspaceDir);
+}
 
 /**
  * Runs one broker boot step, waiting out a broker that is not up yet.
@@ -108,11 +128,11 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		const database = await GatewayDatabase.open(config.dbPath);
 		let broker: GlobalGjcClient | undefined;
 		try {
-			await mkdir(join(config.home, "workspace"), { recursive: true, mode: 0o700 });
+			const personaWorkspace = await resolvePersonaWorkspace(config.home);
 			const pinnedVersion = readPinnedGjcVersion();
 			broker = new GlobalGjcClient({
 				...options.broker,
-				cwd: join(config.home, "workspace"),
+				cwd: personaWorkspace,
 				agentDir: options.broker?.agentDir ?? join(config.home, "gjc-agent"),
 				pinnedVersion,
 			});
@@ -129,10 +149,6 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			const ledger = new DeliveryLedger(database);
 			const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
 			const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;
-			// The persona lives in its own dedicated workspace, never in the gateway's
-			// process cwd (which is typically the product source checkout): a session
-			// bound to the app repo reports that repo's git state as its own.
-			const personaWorkspace = join(config.home, "workspace");
 			// The process start, not this line: preflight and database open take
 			// seconds, and an adapter the service manager started alongside this
 			// gateway reports a start inside that window. Measured on jip-gajae

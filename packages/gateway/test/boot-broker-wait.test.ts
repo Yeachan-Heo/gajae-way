@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
-import { bootGateway, waitForBroker } from "../src/boot";
+import { bootGateway, resolvePersonaWorkspace, waitForBroker } from "../src/boot";
 import { GjcCliUnavailableError, readPinnedGjcVersion } from "../src/orchestrator/broker";
 
 const directories: string[] = [];
@@ -102,4 +102,20 @@ test("failures that will not heal are not waited on", async () => {
 		),
 	).rejects.toBe(wrongVersion);
 	expect(sleeps).toEqual([]);
+});
+
+test("the persona workspace is resolved through a symlink so gjc accepts it as a session cwd", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-workspace-"));
+	const target = await mkdtemp(join(tmpdir(), "gajaeway-workspace-real-"));
+	directories.push(home, target);
+	await symlink(target, join(home, "workspace"));
+
+	// A symlinked workspace must reach the session as its canonical directory:
+	// gjc refuses the link form and the failure reads as a poisoned create key.
+	expect(await resolvePersonaWorkspace(home)).toBe(await realpath(target));
+
+	// A workspace that does not exist yet is created rather than fatal.
+	const fresh = await mkdtemp(join(tmpdir(), "gajaeway-workspace-fresh-"));
+	directories.push(fresh);
+	expect(await resolvePersonaWorkspace(fresh)).toBe(await realpath(join(fresh, "workspace")));
 });
