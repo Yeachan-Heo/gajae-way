@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -223,6 +224,8 @@ export interface GatewayServerOptions {
 	readonly database: GatewayDatabase;
 	/** Production and tests both inject the sole broker-backed turn transport. */
 	readonly sessionPort: SessionPort;
+	/** Canonical persona workspace (symlinks resolved); defaults to `<home>/workspace`. */
+	readonly workspace?: string;
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
@@ -537,11 +540,18 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
 	let runtime!: Runtime;
+	const workspacePath = options.workspace ?? join(options.config.home, "workspace");
+	// gjc rejects a session cwd that is a symlink: `session.create` comes back
+	// `operation_failed` and every persona bind fails, while the same directory
+	// reached by its real path works. An operator may legitimately point the
+	// gateway's workspace at the SSOT directory with a symlink, so resolve it
+	// before it reaches gjc.
+	const workspace = existsSync(workspacePath) ? realpathSync(workspacePath) : workspacePath;
 	const personaSessions = new PersonaSessionManager({
 		database: options.database,
 		port: sessionPort,
 		instanceId: options.database.instanceId,
-		repo: join(options.config.home, "workspace"),
+		repo: workspace,
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
@@ -600,7 +610,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
-		repo: join(options.config.home, "workspace"),
+		repo: workspace,
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only
 		// affirmative compaction observation (logged by the TailRunner); the monitor
@@ -609,7 +619,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			run: async (sessionId) =>
 				await sessionPort.runCompaction({
 					sessionId,
-					repo: join(options.config.home, "workspace"),
+					repo: workspace,
 					originKey: `monitor/session/${sessionId}`,
 				}),
 		},
