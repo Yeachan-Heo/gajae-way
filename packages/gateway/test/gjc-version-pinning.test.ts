@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
-import { preflightGjcRuntime, readPinnedGjcVersion } from "../src/orchestrator/broker";
+import { pinnedGjcCandidatePaths, preflightGjcRuntime, readPinnedGjcVersion } from "../src/orchestrator/broker";
 
 describe("GJC version pinning", () => {
 	it("reads pinned gjc version from gateway package.json", () => {
@@ -64,5 +67,24 @@ describe("GJC version pinning", () => {
 		};
 
 		await expect(preflightGjcRuntime(mockRun, "0.16.0")).rejects.toThrow("requires gjc >= 0.16.0");
+	});
+
+	it("reads the pin beside an installed binary when the build-time checkout is gone", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-gjc-pin-"));
+		try {
+			const beside = join(directory, "package.json");
+			await writeFile(beside, JSON.stringify({ name: "@gajae-gateway/gateway", gjc: { version: "9.9.9" } }));
+			expect(readPinnedGjcVersion([join(directory, "absent", "package.json"), beside])).toBe("9.9.9");
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("names every candidate it tried when none carries a gjc pin", () => {
+		expect(() => readPinnedGjcVersion(["/nonexistent/package.json"])).toThrow("/nonexistent/package.json");
+	});
+
+	it("offers the running binary's own directory as a pin location", () => {
+		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway")).toContain("/opt/gajaeway/bin/package.json");
 	});
 });

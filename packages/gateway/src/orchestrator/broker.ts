@@ -24,20 +24,29 @@ export {
 } from "./broker-liveness";
 
 /**
- * Read the pinned GJC version from the gateway package.json.
- * Throws if the file cannot be read or is malformed.
+ * Candidate locations for the pinned GJC version, in priority order.
+ *
+ * A compiled binary keeps the *build-time* source path in `__filename`, so the
+ * checkout candidate only resolves on the machine that built it. An installed
+ * binary carries the pin beside itself instead; without that second candidate a
+ * binary shipped to another host exits at boot naming a path from the build
+ * machine, which no operator can act on (found deploying dev to jip-gajae).
  */
-export function readPinnedGjcVersion(): string {
-	try {
-		const pkg = JSON.parse(readFileSync(join(dirname(dirname(dirname(__filename))), "package.json"), "utf-8"));
-		const version = pkg.gjc?.version;
-		if (!version || typeof version !== "string") {
-			throw new Error("gjc.version not found in gateway package.json");
+export function pinnedGjcCandidatePaths(execPath: string = process.execPath): readonly string[] {
+	return [join(dirname(dirname(dirname(__filename))), "package.json"), join(dirname(execPath), "package.json")];
+}
+
+/** Read the pinned GJC version this build runs against, or throw naming every candidate tried. */
+export function readPinnedGjcVersion(candidates: readonly string[] = pinnedGjcCandidatePaths()): string {
+	for (const path of candidates) {
+		try {
+			const version = (JSON.parse(readFileSync(path, "utf-8")) as { gjc?: { version?: unknown } }).gjc?.version;
+			if (typeof version === "string" && version.length > 0) return version;
+		} catch {
+			// A missing or malformed candidate is not fatal: a later one may carry the pin.
 		}
-		return version;
-	} catch (error) {
-		throw new Error(`Failed to read pinned GJC version: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	throw new Error(`Failed to read pinned GJC version from any of ${candidates.join(", ")}`);
 }
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;

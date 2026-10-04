@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /**
  * `gajaeway ops upgrade [--gjc X.Y.Z]`
@@ -28,22 +28,28 @@ export interface UpgradeOptions {
 	readonly readPinnedVersion?: (home: string) => Promise<string>;
 }
 
-/** Read the pinned gjc version from the gateway's package.json */
+/**
+ * Read the pinned gjc version the installed gateway runs against.
+ *
+ * The checkout layout is tried first (a source deployment keeps the pin in
+ * `packages/gateway/package.json`); an installed binary carries the same file
+ * beside itself, which is the only candidate that exists on a host that never
+ * had the checkout.
+ */
 export async function readGatewayPinnedGjcVersion(home: string): Promise<string> {
-	try {
-		// The gateway package.json should be in the same location as the gateway binary
-		// For now, we'll look in the gajaeway installation
-		const packageJsonPath = join(home, "..", "..", "packages", "gateway", "package.json");
-		const content = await readFile(packageJsonPath, "utf-8");
-		const pkg = JSON.parse(content);
-		const version = pkg.gjc?.version;
-		if (!version || typeof version !== "string") {
-			throw new Error("gjc.version not found in gateway package.json");
+	const candidates = [
+		join(home, "..", "..", "packages", "gateway", "package.json"),
+		join(dirname(process.execPath), "package.json"),
+	];
+	for (const path of candidates) {
+		try {
+			const version = (JSON.parse(await readFile(path, "utf-8")) as { gjc?: { version?: unknown } }).gjc?.version;
+			if (typeof version === "string" && version.length > 0) return version;
+		} catch {
+			// A missing or malformed candidate is not fatal: a later one may carry the pin.
 		}
-		return version;
-	} catch (error) {
-		throw new Error(`Failed to read pinned GJC version: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	throw new Error(`Failed to read pinned GJC version from any of ${candidates.join(", ")}`);
 }
 
 export interface UpgradeResult {
