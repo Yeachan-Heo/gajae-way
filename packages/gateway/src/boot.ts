@@ -190,6 +190,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						onStop: close,
 						overrides: options.overrides,
 						interimSpeech: config.interimSpeech,
+						workspace: personaWorkspace,
 					})
 				: await startUnixServer({
 						config,
@@ -201,6 +202,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						onStop: close,
 						overrides: options.overrides,
 						interimSpeech: config.interimSpeech,
+						workspace: personaWorkspace,
 					});
 			console.info(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 			return { stop: (reason) => server.stop(reason), broker: supervisor };
