@@ -1839,6 +1839,10 @@ function sessionUnavailable(): GjcCliError {
 	return new GjcCliError("gjc sdk request failed: session_unavailable", 1, "", { code: "session_unavailable" });
 }
 
+function endpointStale(): GjcCliError {
+	return new GjcCliError("gjc sdk request failed: endpoint_stale", 1, "", { code: "endpoint_stale" });
+}
+
 test("#308 host loss settles the open attempt as host_lost; resume and retire then work", async () => {
 	const f = await fixture({ hostLostGraceMs: 20 });
 	const result = await started(f, "a", origin);
@@ -2080,4 +2084,30 @@ test("#401 recovery rethrows unrelated WorkAttemptStateError assertions", async 
 		return typeof msg === "string" && msg.includes("work_recovery_invalid_attempt");
 	});
 	expect(errorCalls.length).toBeGreaterThan(0);
+});
+
+test("#401 reconciliation settles host_lost attempts to avoid inconsistency", async () => {
+	// This test verifies that when reconciliation detects host_lost,
+	// both the lane_jobs attempt and work_attempt_runtime are settled atomically.
+	// On origin/dev without the fix, recovery only sets terminal and schedules observer,
+	// which can leave the attempt in an inconsistent state if interrupted.
+	const f = await fixture({ hostLostGraceMs: 20 });
+	const result = await started(f, "a", origin);
+	const opRef = result.opRef;
+	// Stop manager before observer settles
+	await f.manager.stop();
+	// Make recovery detect host_lost
+	f.port.status = async () => {
+		throw endpointStale();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	// Restart and let recovery run
+	await f.restart();
+	await until(() => f.db.workAttemptOpen().length === 0);
+	// Both should be set
+	const runtime = f.db.workAttemptGet(opRef);
+	const attempt = f.job().attempts[0]!;
+	expect(runtime?.settledAt).toBeTruthy();
+	expect(attempt.endedAt).toBeTruthy();
+	expect(runtime?.settledAt).toBe(attempt.endedAt);
 });
