@@ -115,7 +115,7 @@ export interface PersonaTurnLifecycle {
 	onFrame?(input: PersonaTailFrameInput): boolean | void | Promise<boolean | void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
-	/** Persists one safe notice for an authenticated prompt refusal before its trigger is requeued. */
+	/** Persists one safe notice for an authenticated prompt refusal after its trigger is requeued. */
 	onModelRefusal?(input: PersonaFailureInput): void | Promise<void>;
 	onSettled?(input: PersonaTurnSettledInput): void | Promise<void>;
 	onRetired?(input: PersonaTurnIdentity): void | Promise<void>;
@@ -1115,7 +1115,16 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#state !== "idle" || this.#current || this.#dispatchRetry || this.#modelRefusalPaused) return;
+		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#modelRefusalPaused) {
+			const pending = this.#manager.database.inboundPendingOldest(this.originKey);
+			if (pending) {
+				this.#manager.log(
+					`persona_dispatch_blocked origin=${this.originKey} message=${pending.message_id} reason=model_not_selected`,
+				);
+			}
+			return;
+		}
 		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
@@ -1291,24 +1300,26 @@ class OriginActor {
 						message: "request was not admitted because no model is selected",
 					},
 				);
-				this.#modelRefusalPaused = true;
-				let noticeFailure: unknown;
-				let noticeFailed = false;
-				try {
-					await current.lifecycle.onModelRefusal?.({ ...current, error: refusal });
-				} catch (callbackError) {
-					noticeFailure = callbackError;
-					noticeFailed = true;
-				}
-				await tail.close();
 				const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+				this.#modelRefusalPaused = true;
 				this.#current = undefined;
 				this.#state = "idle";
+				let cleanupFailure: unknown;
+				try {
+					await tail.close();
+				} catch (closeError) {
+					cleanupFailure = closeError;
+				}
+				try {
+					await current.lifecycle.onModelRefusal?.({ ...current, error: refusal });
+				} catch (noticeError) {
+					cleanupFailure ??= noticeError;
+				}
 				await this.#notifyReleased(current);
 				this.#manager.log(
 					`persona_send_refused origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} opRef=${opRef} message=${trigger.message_id} attempt=${attempt} reason=model_not_selected`,
 				);
-				if (noticeFailed) throw noticeFailure;
+				if (cleanupFailure) throw cleanupFailure;
 				return;
 			}
 			// Only the established session_unavailable status proves this send did

@@ -1875,7 +1875,7 @@ test("authenticated model_not_selected refusal requeues plain pending, notices o
 		{
 			modelRefusal: (input) => {
 				notices.push(input);
-				noticeStates.push(database!.inboundTurnRow(input.turn.opRef)?.turn_state);
+				noticeStates.push(database!.inboundPendingOldest(KEY)?.state);
 			},
 		},
 		(line) => logs.push(line),
@@ -1901,7 +1901,7 @@ test("authenticated model_not_selected refusal requeues plain pending, notices o
 	expect(database!.inboundNonterminalTurns(KEY)).toEqual([]);
 	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
 	expect(notices).toHaveLength(1);
-	expect(noticeStates).toEqual(["bound"]);
+	expect(noticeStates).toEqual(["pending"]);
 	expect(notices[0]?.error).toMatchObject({
 		code: "model_not_selected",
 		runtimeMessage: "request was not admitted because no model is selected",
@@ -1924,17 +1924,27 @@ test("authenticated model_not_selected refusal requeues plain pending, notices o
 	expect(
 		logs.some((line) => line.includes(`opRef=${refusedOpRef}`) && line.includes("reason=model_not_selected")),
 	).toBe(true);
+	const blockedDispatches = logs.filter(
+		(line) => line.includes("persona_dispatch_blocked") && line.includes("reason=model_not_selected"),
+	);
+	expect(blockedDispatches.length).toBeGreaterThan(0);
+	expect(blockedDispatches.every((line) => line.includes("message=model-not-selected"))).toBe(true);
+	expect(blockedDispatches[0]).toContain("message=model-not-selected");
+	expect(blockedDispatches[0]).not.toContain("keep this trigger pending");
 });
 
 test("failed refusal-notice persistence propagates while the pause prevents retries", async () => {
 	const port = new ModelNotSelectedPort();
 	let noticeAttempts = 0;
+	const released: string[] = [];
 	const logs: string[] = [];
 	await harness(
 		port,
 		{
+			released: (opRef) => released.push(opRef),
 			modelRefusal: () => {
 				noticeAttempts++;
+				expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("notice-persist-failure");
 				throw new Error("notice persistence failed");
 			},
 		},
@@ -1954,7 +1964,54 @@ test("failed refusal-notice persistence propagates while the pause prevents retr
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
 	expect(noticeAttempts).toBe(1);
+	expect(released).toEqual([refusedOpRef]);
 	expect(logs.some((line) => line.includes("notice persistence failed"))).toBe(true);
+	expect(
+		logs.filter((line) => line.includes("persona_dispatch_blocked") && line.includes("reason=model_not_selected")),
+	).toHaveLength(3);
+});
+
+test("tail-close failure keeps the refusal pending and still persists its notice", async () => {
+	const port = new ModelNotSelectedPort();
+	const attach = port.attachTail.bind(port);
+	let failCloseOnce = true;
+	port.attachTail = async (input) => {
+		const tail = await attach(input);
+		const close = tail.close.bind(tail);
+		tail.close = async () => {
+			if (failCloseOnce) {
+				failCloseOnce = false;
+				throw new Error("tail close failed");
+			}
+			await close();
+		};
+		return tail;
+	};
+	const notices: PersonaFailureInput[] = [];
+	const released: string[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			released: (opRef) => released.push(opRef),
+			modelRefusal: (input) => {
+				notices.push(input);
+				expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("tail-close-failure");
+			},
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("tail-close-failure", "keep the refusal trigger pending");
+	await expect(manager!.notifyInbound(KEY)).rejects.toThrow("tail close failed");
+	const refusedOpRef = latestOpRef;
+	expect(database!.inboundPendingOldest(KEY)).toMatchObject({ message_id: "tail-close-failure", state: "pending" });
+	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(manager!.state(KEY)).toBe("idle");
+	expect(notices).toHaveLength(1);
+	expect(released).toEqual([refusedOpRef]);
+	expect(
+		logs.some((line) => line.includes(`opRef=${refusedOpRef}`) && line.includes("reason=model_not_selected")),
+	).toBe(true);
 });
 
 test("successful /model resumes the refused trigger on its existing session", async () => {
