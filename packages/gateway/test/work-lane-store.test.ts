@@ -671,12 +671,12 @@ describe("work attempt durable transactions", () => {
 			BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
 		`);
 		f.raw.exec(
-			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version = 30; DELETE FROM schema_migrations WHERE version = 29; DELETE FROM schema_migrations WHERE version = 28; DELETE FROM schema_migrations WHERE version = 27; DELETE FROM schema_migrations WHERE version = 26; DELETE FROM schema_migrations WHERE version = 25; DELETE FROM schema_migrations WHERE version = 24",
+			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
 		);
 
 		const migrated = await GatewayDatabase.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(30);
+		expect(migrated.schemaVersion).toBe(31);
 		expect(migrated.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -701,7 +701,7 @@ describe("work attempt durable transactions", () => {
 		const f = await fixture();
 		f.database.workAttemptPrepare(f.runtime, f.record);
 		f.raw.exec(
-			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version = 30; DELETE FROM schema_migrations WHERE version = 29; DELETE FROM schema_migrations WHERE version = 28; DELETE FROM schema_migrations WHERE version = 27; DELETE FROM schema_migrations WHERE version = 26; DELETE FROM schema_migrations WHERE version = 25; DELETE FROM schema_migrations WHERE version = 24",
+			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
 		);
 		f.raw.query("UPDATE work_attempt_runtime SET record_json = '{' WHERE op_ref = ?").run(f.runtime.opRef);
 		await expect(GatewayDatabase.open(f.path)).rejects.toBeInstanceOf(DatabaseStartupError);
@@ -753,7 +753,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(30);
+		expect(migrated.schemaVersion).toBe(31);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.workAttemptPrepare(historical, f.record);

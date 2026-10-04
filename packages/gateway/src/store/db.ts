@@ -596,7 +596,8 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 30;
+const LATEST_SCHEMA_VERSION = 31;
+
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -5185,6 +5186,27 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(30, new Date().toISOString());
+			});
+		}
+		if (current < 31) {
+			// Migration 25 was edited after it shipped to add the AGENTS.md baseline
+			// columns, so every database that recorded 25 before that edit is at a
+			// version that claims the columns exist while they do not. Backfill them
+			// here instead of re-running 25, which is already recorded.
+			this.withTransaction(() => {
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("agents_md_epoch"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_epoch INTEGER NOT NULL DEFAULT -1");
+				if (!columns.has("agents_md_digest"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_digest TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(31, new Date().toISOString());
 			});
 		}
 	}

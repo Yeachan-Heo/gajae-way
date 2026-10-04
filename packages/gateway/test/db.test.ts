@@ -11,7 +11,8 @@ test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(30);
+		expect(database.schemaVersion).toBe(31);
+
 		database.memoryIntentCreate({ id: "memory-schema", kind: "daily_capture", payloadJson: "{}" });
 		expect(database.memoryIntentRows()[0]).toMatchObject({
 			state: "queued",
@@ -93,7 +94,7 @@ test("adds quarantine diagnostics to existing memory intents", async () => {
 		legacy.close();
 
 		const migrated = await GatewayDatabase.open(path);
-		expect(migrated.schemaVersion).toBe(30);
+		expect(migrated.schemaVersion).toBe(31);
 		expect(migrated.memoryIntentRows()[0]).toMatchObject({
 			id: "legacy-intent",
 			state: "queued",
