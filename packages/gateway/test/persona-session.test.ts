@@ -377,6 +377,8 @@ test("a message admitted while a persistent turn is running becomes an operator-
 // gajae-code redacts a post-start failure's message to one fixed sentence, so
 // the runtime code is the entire diagnosis. Six lost turns on one host produced
 // six identical code-free lines (#244); the code is what tells them apart.
+// NOTE: post_start agent_runtime failures (agent_error, prompt_failed) are now retried.
+// This test verifies that exhausted retries deliver the failure with proper codes.
 test("a post-start prompt failure delivers the runtime's code and logs its bounded classifiers", async () => {
 	const port = new ScriptedSessionPort();
 	const notices: string[] = [];
@@ -389,7 +391,21 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 		code: "prompt_failed",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
-	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle");
+
+	// With the new retry logic, a retry should be scheduled after a delay
+	await new Promise((resolve) => setTimeout(resolve, 1500));
+	await manager!.tick(KEY);
+	await eventually(() => logs.some((l) => l.startsWith("agent_error_retry ")), "retry not scheduled");
+	const retry = port.sends[1];
+	expect(retry).toBeDefined();
+
+	// Fail the retry too (to exhaust retries and get the failure notice)
+	port.fail(retry!.opRef, "Agent run failed after execution started.", {
+		code: "prompt_failed",
+		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
+	});
+	await manager!.tick(KEY);
+	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle after retries exhausted");
 	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
 	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
 	expect(notices[0]).not.toContain("/new");
