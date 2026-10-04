@@ -62,6 +62,26 @@ export interface DiscordChannelPolicy extends ChannelEngagementPolicy {
 	readonly threadOnMention?: boolean;
 }
 
+/**
+ * Says so in a channel when the gateway stays unreachable.
+ *
+ * The adapter keeps its Discord session while the gateway is down, so it is the
+ * one process that can still speak. Without this a gateway that crash-looped on
+ * boot for 4.5 hours left only reconnect lines in a log nobody reads, and the
+ * delivery ledger later recorded the backlog as received on recovery — the
+ * outage was invisible until the owner noticed the silence himself.
+ */
+export interface GatewayDownAlertConfig {
+	/** Channel that gets one line when the link has been down `afterMs`, and one when it returns. */
+	readonly channelId: string;
+	/** User pinged in the down line, so whoever can restart the gateway actually hears it. */
+	readonly mentionUserId?: string;
+	/** Down time before the line goes out. Defaults to 5 minutes: longer than any routine restart. */
+	readonly afterMs?: number;
+	/** Gateway stderr log whose last line is quoted as the last error; relative to the config file. */
+	readonly logFile?: string;
+}
+
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
@@ -83,6 +103,7 @@ export interface DiscordAdapterConfig {
 	 * A per-channel `channels[id].threadOnMention` overrides it.
 	 */
 	readonly threadOnMention?: boolean;
+	readonly gatewayDownAlert?: GatewayDownAlertConfig;
 }
 
 export interface LoadedDiscordAdapterConfig extends DiscordAdapterConfig {
@@ -141,6 +162,7 @@ export async function loadDiscordAdapterConfig(
 	if (raw.threadOnMention !== undefined && typeof raw.threadOnMention !== "boolean") {
 		throw new DiscordAdapterStartupError("Discord adapter threadOnMention must be a boolean when set.");
 	}
+	const gatewayDownAlert = loadGatewayDownAlert(raw.gatewayDownAlert, configPath);
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
 	let token: string;
 	try {
@@ -154,7 +176,42 @@ export async function loadDiscordAdapterConfig(
 		throw new DiscordAdapterStartupError(`Discord token credential file ${tokenFile} is empty.`);
 	}
 	const voice = await loadVoiceConfig(raw.voice, configPath);
-	return { ...raw, tokenFile, token, configPath, ...(voice ? { voice } : {}) } as LoadedDiscordAdapterConfig;
+	return {
+		...raw,
+		tokenFile,
+		token,
+		configPath,
+		...(voice ? { voice } : {}),
+		...(gatewayDownAlert ? { gatewayDownAlert } : {}),
+	} as LoadedDiscordAdapterConfig;
+}
+
+/** A present but malformed section is a startup error: a silently disabled alarm is the failure it exists to prevent. */
+function loadGatewayDownAlert(raw: unknown, configPath: string): GatewayDownAlertConfig | undefined {
+	if (raw === undefined) return undefined;
+	if (!isObject(raw) || typeof raw.channelId !== "string" || raw.channelId.trim() === "") {
+		throw new DiscordAdapterStartupError("Discord adapter gatewayDownAlert requires a non-empty channelId.");
+	}
+	for (const field of ["mentionUserId", "logFile"] as const) {
+		if (raw[field] !== undefined && (typeof raw[field] !== "string" || raw[field].trim() === ""))
+			throw new DiscordAdapterStartupError(
+				`Discord adapter gatewayDownAlert ${field} must be a non-empty string when set.`,
+			);
+	}
+	if (raw.afterMs !== undefined && (!Number.isInteger(raw.afterMs) || (raw.afterMs as number) <= 0)) {
+		throw new DiscordAdapterStartupError(
+			"Discord adapter gatewayDownAlert afterMs must be a positive integer when set.",
+		);
+	}
+	const logFile = raw.logFile as string | undefined;
+	return {
+		channelId: raw.channelId,
+		...(raw.mentionUserId !== undefined ? { mentionUserId: raw.mentionUserId as string } : {}),
+		...(raw.afterMs !== undefined ? { afterMs: raw.afterMs as number } : {}),
+		...(logFile !== undefined
+			? { logFile: isAbsolute(logFile) ? logFile : resolve(dirname(configPath), logFile) }
+			: {}),
+	};
 }
 
 /**
