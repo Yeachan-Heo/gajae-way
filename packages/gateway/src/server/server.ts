@@ -111,6 +111,7 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_DELIVERY_SWEEP_INTERVAL_MS = 15_000;
+const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
@@ -306,6 +307,7 @@ interface Runtime {
 	readonly deliverySweepTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
+	readonly stopRetention: () => void;
 	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
@@ -355,6 +357,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			clearInterval(runtime.deliverySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			runtime.stopRetention();
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
@@ -465,6 +468,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.deliverySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			runtime.stopRetention();
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.work.stop();
@@ -687,6 +691,35 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		60 * 60 * 1000,
 	);
+	// History GC: bounded batches with a macrotask yield between them so a large
+	// backlog never holds the event loop (and the single writer) for long.
+	let retentionRunning = false;
+	let retentionStopped = false;
+	const runRetention = async (): Promise<void> => {
+		if (retentionRunning || retentionStopped) return;
+		retentionRunning = true;
+		try {
+			for (let pass = 0; pass < 200 && !retentionStopped; pass++) {
+				const result = options.database.retentionSweep();
+				const total = Object.values(result.deleted).reduce((sum, n) => sum + n, 0);
+				if (total > 0) console.error(JSON.stringify({ retention: result.deleted }));
+				if (!result.more) break;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			if (!retentionStopped) options.database.maintain();
+		} catch (error) {
+			if (!retentionStopped) console.error(`gateway retention sweep failed: ${diagnostic(error)}`);
+		} finally {
+			retentionRunning = false;
+		}
+	};
+	const retentionTimer = setInterval(() => void runRetention(), RETENTION_SWEEP_INTERVAL_MS);
+	const retentionBootTimer = setTimeout(() => void runRetention(), 30_000);
+	const stopRetention = (): void => {
+		retentionStopped = true;
+		clearInterval(retentionTimer);
+		clearTimeout(retentionBootTimer);
+	};
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
 		| undefined;
@@ -731,6 +764,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		deliverySweepTimer,
 		stallTimer,
 		contextMaintenanceTimer,
+		stopRetention,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
 		botAudienceTurns,
@@ -761,10 +795,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
  * while the ledger row itself records failed/ambiguous.
  */
 function settleMonitorBatch(database: GatewayDatabase, deliveryId: string, stage: MonitorEventStage): void {
-	const delivery = database.deliveryRows().find((row) => row.delivery_id === deliveryId);
+	const delivery = database.deliveryGet(deliveryId);
 	if (!delivery) return;
 	const batchId = delivery.turn_id;
-	const events = database.monitorEventRows().filter((row) => row.batch_id === batchId);
+	const events = database.monitorEventsByBatch(batchId);
 	if (!events.length) return;
 	database.withTransaction(() => {
 		for (const event of events) database.monitorEventSettle(event.event_id, stage as "delivered" | "authored");
@@ -905,18 +939,18 @@ async function handleRequest(
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
-			const delivery = options.database.deliveryRows().find((row) => row.delivery_id === id);
+			const delivery = options.database.deliveryGet(id);
 			const authoredEvents = delivery
 				? options.database
-						.monitorEventRows()
-						.filter((row) => row.batch_id === delivery.turn_id && row.stage === "authored")
+						.monitorEventsByBatch(delivery.turn_id)
+						.filter((row) => row.stage === "authored")
 						.map((row) => row.event_id)
 				: [];
 			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
 				const authoredEventIds = new Set(authoredEvents);
-				for (const row of options.database.monitorEventRows()) {
+				for (const row of options.database.monitorEventsByIds(authoredEvents)) {
 					if (authoredEventIds.has(row.event_id) && row.stage === "delivered") {
 						broadcastMonitorEvent(runtime, {
 							eventId: row.event_id,
@@ -1255,25 +1289,22 @@ async function handleRequest(
 			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
 			const monitor = runtime.registry.get(monitorId);
 			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
-			const recentEvents = options.database
-				.monitorEventRows(monitorId, "newest", true)
-				.slice(0, 100)
-				.map((row) => {
-					const recovery = options.database.monitorEventRecovery(row.event_id);
-					return {
-						eventId: row.event_id,
-						monitorId: row.monitor_id,
-						eventType: row.event_type,
-						firedAt: row.fired_at,
-						stage: row.stage,
-						...(recovery ? { recovery } : {}),
-						...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
-						...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
-						...(options.database.isBrokerQuarantined("monitor", row.event_id)
-							? { quarantined: true, reason: "broker_authority_quarantined" }
-							: {}),
-					};
-				});
+			const recentEvents = options.database.monitorEventRows(monitorId, "newest", true, 100).map((row) => {
+				const recovery = options.database.monitorEventRecovery(row.event_id);
+				return {
+					eventId: row.event_id,
+					monitorId: row.monitor_id,
+					eventType: row.event_type,
+					firedAt: row.fired_at,
+					stage: row.stage,
+					...(recovery ? { recovery } : {}),
+					...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
+					...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
+					...(options.database.isBrokerQuarantined("monitor", row.event_id)
+						? { quarantined: true, reason: "broker_authority_quarantined" }
+						: {}),
+				};
+			});
 			const catchUp = options.database.monitorCronState(monitorId);
 			connection.write({
 				v: PROFILE_VERSION,
