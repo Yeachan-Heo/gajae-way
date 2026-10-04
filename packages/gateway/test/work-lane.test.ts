@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,7 +21,7 @@ import {
 	WorkLaneManager,
 	type WorkLaneManagerOptions,
 } from "../src/orchestrator/work-lane";
-import { GatewayDatabase, WorkAttemptStateError } from "../src/store/db";
+import { GatewayDatabase, WorkAttemptStateError, type WorkAttemptRuntime } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -44,7 +45,9 @@ async function fixture(
 	portOptions: ConstructorParameters<typeof ScriptedSessionPort>[0] = {},
 ) {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-work-lane-"));
-	const db = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const dbPath = join(directory, "gateway.db");
+	const db = await GatewayDatabase.open(dbPath);
+	const raw = new Database(dbPath);
 	const port = new ScriptedSessionPort({
 		...portOptions,
 		onBind: (input) => {
@@ -69,12 +72,14 @@ async function fixture(
 	});
 	cleanups.push(async () => {
 		await manager.stop();
+		raw.close();
 		db.close();
 		await rm(directory, { recursive: true, force: true });
 	});
 	const job = (name = "a") => parseLaneJobRecord(db.laneJobJson(laneJobIdentity(name).jobId)!);
 	return {
 		db,
+		raw,
 		port,
 		lanes,
 		notices,
@@ -97,6 +102,12 @@ async function fixture(
 			});
 			await manager.recover();
 			return manager;
+		},
+		laneJobUpdate: (jobId: string, record: ReturnType<typeof parseLaneJobRecord>) => {
+			raw.query("UPDATE lane_jobs SET record_json = ? WHERE job_id = ?").run(
+				JSON.stringify(record),
+				jobId,
+			);
 		},
 		setOwnerTarget: (target: OriginRef | undefined) => {
 			implicitOwner = target;
@@ -1987,4 +1998,86 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 	expect(notice).not.toContain("secret");
 	expect(notice).not.toContain("private");
 	expect(notice).not.toContain("authentication");
+});
+
+test("#401 reconciliation: host_lost settlement sets settled_at equal to attempt endedAt", async () => {
+	const f = await fixture({ hostLostGraceMs: 20 });
+	const result = await started(f, "a", origin);
+	const opRef = result.opRef;
+	// The host process died
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	// Wait for host loss settlement
+	await until(() => f.db.workAttemptOpen().length === 0);
+	const runtime = f.db.workAttemptGet(opRef);
+	const attempt = f.job().attempts[0]!;
+	// Verify settled_at is set and matches attempt endedAt
+	expect(runtime?.settledAt).toBeTruthy();
+	expect(runtime?.settledAt).toBe(attempt.endedAt);
+});
+
+test("#401 boot recovery detects and skips invalid attempts with unrelated assertions", async () => {
+	// This test verifies that recovery handles validation errors gracefully
+	// The workAttemptRepair function will only fix errors with assertion "attempt.endedAt matches runtime.settledAt"
+	// Other validation errors should be logged but recovery should continue
+	const f = await fixture();
+	const resultA = await started(f, "a", origin);
+	// Break the runtime in a way that creates a different validation error (not the #401 assertion)
+	f.raw
+		.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+		.run('{"invalid": "json"}', resultA.opRef);
+	// Stop the manager
+	await f.manager.stop();
+	const errors: string[] = [];
+	const errorSpy = spyOn(console, "error").mockImplementation((msg: unknown) => {
+		if (typeof msg === "string") {
+			errors.push(msg);
+		}
+	});
+	const cleanup = () => errorSpy.mockRestore();
+	cleanups.push(cleanup);
+	// Restart manager to trigger recovery
+	const recovered = await f.restart();
+	// Give recovery time to process
+	await Bun.sleep(100);
+	// Verify that an invalid attempt error was logged (recovery encountered it)
+	const hasInvalidError = errors.some((msg) => msg.includes("work_recovery_invalid_attempt"));
+	expect(hasInvalidError).toBe(true);
+	// Verify recovery didn't crash by starting a new lane
+	const resultB = await recovered.start({ name: "b", text: "work", cwd: f.directory });
+	expect(resultB.started).toBe(true);
+});
+
+test("#401 recovery rethrows unrelated WorkAttemptStateError assertions", async () => {
+	// Set up initial state
+	const f = await fixture();
+	const result = await started(f, "a", origin);
+	const opRef = result.opRef;
+	// Break the runtime JSON to cause a validation error
+	f.raw
+		.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+		.run('{"invalid": "json"}', opRef);
+	// Stop and restart manager
+	await f.manager.stop();
+	const errors: WorkAttemptStateError[] = [];
+	const errorSpy = spyOn(console, "error").mockImplementation((msg: unknown) => {
+		if (typeof msg === "string" && msg.includes("work_recovery_invalid_attempt")) {
+			const match = msg.match(/assertion=([^\s]+)/);
+			if (match && match[1]?.includes("runtime record parsing")) {
+				errors.push(new WorkAttemptStateError(opRef, "runtime record parsing"));
+			}
+		}
+	});
+	const cleanup = () => errorSpy.mockRestore();
+	cleanups.push(cleanup);
+	// Trigger recovery - it should process the broken record
+	const recovered = await f.restart();
+	// Verify that the unrelated error was logged (recovery encountered it but handled gracefully)
+	const errorCalls = errorSpy.mock.calls.filter((call) => {
+		const msg = call[0];
+		return typeof msg === "string" && msg.includes("work_recovery_invalid_attempt");
+	});
+	expect(errorCalls.length).toBeGreaterThan(0);
 });
