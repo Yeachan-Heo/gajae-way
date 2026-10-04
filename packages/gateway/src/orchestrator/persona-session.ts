@@ -2814,9 +2814,17 @@ function safeDiagnostic(error: unknown): string {
  * A steer is injected into a turn that is already reasoning about the trigger.
  * Without framing the model treats the newest text as the whole task and drops
  * the original request (live: answered "답하셈", ignored the question).
+ *
+ * The header also has to keep the model from FOLDING the steered message into
+ * the turn's single final answer: batched messages then all got one late reply
+ * instead of an answer to each as it arrived. It therefore asks for the
+ * steered message to be answered in its own (mid-work) reply first, and only
+ * then to resume the original request. #167 still closes the steer window the
+ * moment that reply is consumer-visible, so the next message starts its own
+ * turn instead of piling onto this one.
  */
 export function renderSteer(body: string): string {
-	return `[Additional message from the user, received while you were still working on their previous request. Finish that request, then also address this. Do not restart or repeat what you already said.]\n${body}`;
+	return `[Additional message from the user, received while you were still working on their previous request. Answer this message now, in its own reply, then continue the previous request from where you left off. Do not wait until the end and do not fold it into your final answer. Do not restart or repeat what you already said.]\n${body}`;
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {

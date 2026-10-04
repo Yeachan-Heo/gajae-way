@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, renderSteer } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
@@ -123,6 +123,61 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 			database?.inboundTurnRows(batch.opRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"running batch did not complete after its tail terminal event",
 	);
+});
+
+test("the steer header asks for the steered message's own reply instead of folding it into the final answer", () => {
+	const framed = renderSteer("mention the rollback caveat");
+	// The window-closing header contract (#167) must survive: one bracketed line, then the body.
+	expect(framed).toMatch(/^\[Additional message[^\n]*\]\nmention the rollback caveat$/);
+	expect(framed).toContain("Answer this message now, in its own reply");
+	expect(framed).toContain("Do not wait until the end");
+});
+
+test("a steered message is answered in its own mid-work reply, which closes the turn's steer window", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-reply-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({
+			onBind: (input) => `session-${input.originKey}-${input.epoch}`,
+		}),
+		join(home, "agent"),
+	);
+	const visible: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steer-reply-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFrame: ({ frame }) => {
+				if (!frame.assistantText) return false;
+				visible.push(frame.assistantText);
+				return true;
+			},
+		}),
+	});
+
+	enqueue("first", "first request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "first turn did not start");
+	const first = port.sends[0]!;
+
+	enqueue("second", "second request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.steers.length === 1, "second message was not steered into the running turn");
+
+	// The persona answers the steered message in its own mid-work reply.
+	port.emitAssistant(first.sessionId, "answering the second request", "reply-second", first.opRef);
+	await eventually(() => visible.length === 1, "the steer reply did not become consumer-visible");
+
+	// That reply closes the steer window, so the next message starts its own turn
+	// instead of being folded into the same batch.
+	enqueue("third", "third request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	expect(port.steers).toHaveLength(1);
+	expect(database.inboundPendingOldest(ORIGIN_KEY)?.message_id).toBe("third");
 });
 
 test("a message arriving after a consumer-visible reply waits for the next turn instead of steering the answered turn", async () => {
