@@ -4,6 +4,7 @@ type GatewayEventHandler = (payload: unknown) => void;
 
 const INITIAL_RETRY_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
+const STABLE_CONNECTION_MS = 30_000;
 
 export type AdminGatewayRetryOptions = {
 	readonly random?: () => number;
@@ -24,6 +25,7 @@ export class AdminGateway {
 	#connecting?: Promise<void>;
 	#connectionAbort?: AbortController;
 	#retryTimer?: ReturnType<typeof setTimeout>;
+	#stabilityTimer?: ReturnType<typeof setTimeout>;
 	#retryAttempt = 0;
 	#reconnectNeeded = false;
 	#disconnectOff?: () => void;
@@ -79,6 +81,8 @@ export class AdminGateway {
 		this.#closed = true;
 		if (this.#retryTimer !== undefined) this.#clearTimeout(this.#retryTimer);
 		this.#retryTimer = undefined;
+		if (this.#stabilityTimer !== undefined) this.#clearTimeout(this.#stabilityTimer);
+		this.#stabilityTimer = undefined;
 		this.#connectionAbort?.abort();
 		const connecting = this.#connecting;
 		const client = this.#client;
@@ -102,7 +106,12 @@ export class AdminGateway {
 		if (this.#client !== client) return;
 		for (const [event, handlers] of this.#handlers)
 			for (const handler of handlers) this.#subscribe(client, event, handler);
-		this.#retryAttempt = 0;
+		if (this.#stabilityTimer !== undefined) this.#clearTimeout(this.#stabilityTimer);
+		this.#stabilityTimer = this.#setTimeout(() => {
+			this.#stabilityTimer = undefined;
+			if (!this.#closed && this.#client === client) this.#retryAttempt = 0;
+		}, STABLE_CONNECTION_MS);
+		this.#stabilityTimer.unref?.();
 		this.#reconnectNeeded = false;
 		if (recovered) console.error("Admin gateway reconnected.");
 		this.#notifyConnection();
@@ -130,6 +139,8 @@ export class AdminGateway {
 	#disconnected(client: GajaewayClient): void {
 		if (this.#client !== client) return;
 		this.#client = undefined;
+		if (this.#stabilityTimer !== undefined) this.#clearTimeout(this.#stabilityTimer);
+		this.#stabilityTimer = undefined;
 		this.#disconnectOff?.();
 		this.#disconnectOff = undefined;
 		this.#detachEvents();
