@@ -841,8 +841,14 @@ export class GatewayDatabase {
 				openWork++;
 		}
 		for (const row of this.#database.query<{ op_ref: string }, []>("SELECT op_ref FROM work_attempt_runtime").all()) {
-			const runtime = this.workAttemptGet(row.op_ref)!;
-			if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
+			try {
+				const runtime = this.workAttemptGet(row.op_ref)!;
+				if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
+			} catch (error) {
+				// Broken attempt; attempt repair
+				const repaired = this.workAttemptRepair(row.op_ref);
+				if (repaired && repaired.settledAt === null && !this.isBrokerQuarantined("work", repaired.jobId)) openWork++;
+			}
 		}
 		openWork +=
 			this.#database
@@ -1156,7 +1162,13 @@ export class GatewayDatabase {
 				if (runtime) attempts.push(runtime);
 			} catch (error) {
 				if (!(error instanceof WorkAttemptStateError)) throw error;
-				onInvalid(error);
+				// Try to repair broken attempt before calling onInvalid (#401)
+				const repaired = this.workAttemptRepair(row.op_ref);
+				if (repaired) {
+					attempts.push(repaired);
+				} else {
+					onInvalid(error);
+				}
 			}
 		}
 		return attempts;
@@ -1168,7 +1180,84 @@ export class GatewayDatabase {
 				"SELECT op_ref FROM work_attempt_runtime WHERE lane_key = ? AND settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id)",
 			)
 			.get(laneKey);
-		return row ? this.workAttemptGet(row.op_ref) : undefined;
+		if (!row) return undefined;
+		try {
+			return this.workAttemptGet(row.op_ref);
+		} catch (error) {
+			if (!(error instanceof WorkAttemptStateError)) throw error;
+			// Try to repair the broken attempt (ended but not settled, #401)
+			const repaired = this.workAttemptRepair(row.op_ref);
+			if (repaired) {
+				console.error(
+					`work_attempt_repaired opRef=${JSON.stringify(row.op_ref)} laneKey=${JSON.stringify(laneKey)} assertion=${error.assertion}`,
+				);
+				return repaired;
+			}
+			// Repair failed, re-throw original error
+			throw error;
+		}
+	}
+
+	/**
+	 * Repairs a pre-broken attempt row where the attempt ended but the runtime
+	 * was never settled. Sets the runtime's settled_at to match attempt.endedAt.
+	 * Returns the repaired runtime if successful, undefined if the row cannot be repaired.
+	 */
+	workAttemptRepair(opRef: string): WorkAttemptRuntime | undefined {
+		const row = this.#database
+			.query<
+				{
+					op_ref: string;
+					job_id: string;
+					lane_key: string;
+					session_id: string;
+					version: number;
+					settled_at: string | null;
+					delivery_id: string;
+					record_json: string;
+				},
+				[string]
+			>("SELECT * FROM work_attempt_runtime WHERE op_ref = ?")
+			.get(opRef);
+		if (!row || row.settled_at !== null) return undefined;
+
+		// Parse runtime and get history
+		let runtime: WorkAttemptRuntime;
+		try {
+			runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
+			validateWorkRuntime(runtime, this.instanceId);
+		} catch {
+			return undefined;
+		}
+
+		// Get history record
+		const json = this.laneJobJson(runtime.jobId);
+		if (!json) return undefined;
+		let record: LaneJobRecord;
+		try {
+			record = parseLaneJobRecord(json);
+		} catch {
+			return undefined;
+		}
+
+		// Find the matching attempt in history
+		const attempt = record.attempts.find((a) => a.opRef === opRef);
+		if (!attempt || attempt.endedAt === undefined) return undefined; // Can't repair if attempt isn't ended
+
+		// Update the runtime with the settled_at value from the history
+		const updated: WorkAttemptRuntime = { ...runtime, settledAt: attempt.endedAt };
+		try {
+			validateWorkRuntime(updated, this.instanceId);
+		} catch {
+			return undefined; // Can't repair if updated runtime doesn't validate
+		}
+		const changes = this.#database
+			.query(
+				"UPDATE work_attempt_runtime SET settled_at = ?, record_json = ? WHERE op_ref = ? AND settled_at IS NULL",
+			)
+			.run(attempt.endedAt, JSON.stringify(updated), opRef).changes;
+
+		return changes === 1 ? updated : undefined;
 	}
 
 	#laneReportGetInside(reportId: string): LaneReportRow | undefined {
