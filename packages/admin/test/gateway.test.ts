@@ -123,6 +123,20 @@ function retryScheduler() {
 	return {
 		options,
 		pending: () => tasks.filter((task) => !task.cancelled && !task.ran),
+		firstPending: () => {
+			const task = tasks.find((item) => !item.cancelled && !item.ran);
+			if (!task) throw new Error("no pending retry task");
+			return task;
+		},
+		lastPending: () => {
+			const task = tasks.filter((item) => !item.cancelled && !item.ran).at(-1);
+			if (!task) throw new Error("no pending retry task");
+			return task;
+		},
+		run(task: RetryTask) {
+			task.ran = true;
+			task.callback();
+		},
 		runNext: () => {
 			const task = tasks.find((item) => !item.cancelled && !item.ran);
 			if (!task) throw new Error("no scheduled retry");
@@ -205,7 +219,7 @@ test("the admin gateway reconnects without replaying work and reattaches events 
 	}
 });
 
-test("reconnect backoff is jittered, capped, reset after recovery, and logged only on transitions", async () => {
+test("reconnect backoff escalates through crash loops and resets only after stable uptime", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-admin-retry-backoff-"));
 	const path = join(directory, "gateway.sock");
 	let initial: ReturnType<typeof listenGateway> | undefined;
@@ -224,7 +238,7 @@ test("reconnect backoff is jittered, capped, reset after recovery, and logged on
 		const baseDelays = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
 		for (const baseDelay of baseDelays) {
 			await until(() => retries.pending().length === 1);
-			const retry = retries.pending()[0]!;
+			const retry = retries.firstPending();
 			const jitter = Math.floor(random * Math.max(1, baseDelay / 4));
 			expect(retry.delayMs).toBe(Math.min(30_000, baseDelay + jitter));
 			expect(retry.delayMs).toBeLessThanOrEqual(30_000);
@@ -240,6 +254,17 @@ test("reconnect backoff is jittered, capped, reset after recovery, and logged on
 		await until(() => gateway?.connected === true);
 		expect(logs).toEqual(["Admin gateway disconnected; reconnecting.", "Admin gateway reconnected."]);
 
+		replacement.stop();
+		await until(() => gateway?.connected === false);
+		await until(() => retries.pending().length === 1);
+		expect(retries.pending()[0]?.delayMs).toBe(30_000);
+
+		replacement = listenGateway(path);
+		retries.runNext();
+		await until(() => gateway?.connected === true);
+		const stabilityTimer = retries.lastPending();
+		expect(stabilityTimer.delayMs).toBe(30_000);
+		retries.run(stabilityTimer);
 		random = 0;
 		replacement.stop();
 		await until(() => gateway?.connected === false);
@@ -249,12 +274,51 @@ test("reconnect backoff is jittered, capped, reset after recovery, and logged on
 			"Admin gateway disconnected; reconnecting.",
 			"Admin gateway reconnected.",
 			"Admin gateway disconnected; reconnecting.",
+			"Admin gateway reconnected.",
+			"Admin gateway disconnected; reconnecting.",
 		]);
 	} finally {
 		errorSpy.mockRestore();
 		await gateway?.close();
 		initial?.stop();
 		replacement?.stop();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("disconnect and shutdown cancel stability timers and stale callbacks cannot reset backoff", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-admin-stability-fence-"));
+	const path = join(directory, "gateway.sock");
+	let initial: ReturnType<typeof listenGateway> | undefined;
+	let gateway: AdminGateway | undefined;
+	const retries = retryScheduler();
+	try {
+		initial = listenGateway(path);
+		gateway = await AdminGateway.connect(path, { ...retries.options, random: () => 0 });
+		initial.stop();
+		await until(() => gateway?.connected === false);
+		retries.runNext();
+		await until(() => retries.pending().length === 1);
+		expect(retries.pending()[0]?.delayMs).toBe(1_000);
+		const replacement = listenGateway(path);
+		retries.runNext();
+		await until(() => gateway?.connected === true);
+		const stability = retries.firstPending();
+		expect(stability.delayMs).toBe(30_000);
+		replacement.stop();
+		await until(() => gateway?.connected === false);
+		expect(stability.cancelled).toBe(true);
+		// Simulate a timer callback already dequeued when cancellation occurred.
+		retries.run(stability);
+		await until(() => retries.pending().length === 1);
+		expect(retries.pending()[0]?.delayMs).toBe(2_000);
+		const retry = retries.firstPending();
+		await gateway.close();
+		expect(retry.cancelled).toBe(true);
+		replacement.stop();
+	} finally {
+		await gateway?.close();
+		initial?.stop();
 		await rm(directory, { recursive: true, force: true });
 	}
 });
@@ -272,7 +336,7 @@ test("shutdown clears a scheduled retry", async () => {
 		initial.stop();
 		await until(() => gateway?.connected === false);
 		await until(() => retries.pending().length === 1);
-		const retry = retries.pending()[0]!;
+		const retry = retries.firstPending();
 		await gateway.close();
 		replacement = listenGateway(path);
 		expect(retry.cancelled).toBe(true);
@@ -282,6 +346,27 @@ test("shutdown clears a scheduled retry", async () => {
 		await gateway?.close();
 		initial?.stop();
 		replacement?.stop();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("shutdown clears the stability timer for an attached gateway", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-admin-stability-close-"));
+	const path = join(directory, "gateway.sock");
+	let server: ReturnType<typeof listenGateway> | undefined;
+	let gateway: AdminGateway | undefined;
+	const retries = retryScheduler();
+	try {
+		server = listenGateway(path);
+		gateway = await AdminGateway.connect(path, retries.options);
+		const stability = retries.firstPending();
+		await gateway.close();
+		expect(stability.cancelled).toBe(true);
+		retries.run(stability);
+		expect(retries.pending()).toHaveLength(0);
+	} finally {
+		await gateway?.close();
+		server?.stop();
 		await rm(directory, { recursive: true, force: true });
 	}
 });

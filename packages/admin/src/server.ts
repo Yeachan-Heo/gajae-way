@@ -136,21 +136,10 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 	// Gateway reachability is tracked from real read outcomes and the local
 	// connection lifecycle, so the console can distinguish gateway loss from a
 	// browser losing the admin process.
-	let gatewayReachable = true;
 	let gatewayConnection: boolean | undefined;
 	let connectionEpoch = 0;
 	let latestSnapshot: { readonly epoch: number; readonly state: ConsoleSnapshot } | undefined;
-	const request: GatewayRequest = async (method, params) => {
-		const epoch = connectionEpoch;
-		try {
-			const result = await options.request(method, params);
-			if (epoch === connectionEpoch && gatewayConnection === undefined) gatewayReachable = true;
-			return result;
-		} catch (error) {
-			if (epoch === connectionEpoch) gatewayReachable = false;
-			throw error;
-		}
-	};
+	const request: GatewayRequest = options.request;
 
 	const snapshot = async (): Promise<ConsoleSnapshot> => {
 		const epoch = connectionEpoch;
@@ -169,18 +158,16 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 		}
 
 		const current = gatewayConnection === false ? disconnectedSnapshot(state) : state;
-		gatewayReachable = current.gateway.reachable;
 		latestSnapshot = { epoch, state: current };
 		return current;
 	};
 
 	const stream = new StreamHub({
-		snapshot: async () => {
-			const state = await snapshot();
-			gatewayReachable = state.gateway.reachable;
-			return state;
-		},
-		gatewayReachable: () => gatewayReachable,
+		snapshot,
+		gatewayReachable: () =>
+			gatewayConnection !== false &&
+			(latestSnapshot === undefined ||
+				(latestSnapshot.epoch === connectionEpoch && latestSnapshot.state.gateway.reachable)),
 	});
 
 	const pushSnapshot = (): void => {
@@ -200,7 +187,6 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 				pushSnapshot();
 				return;
 			case "gateway.stopping":
-				gatewayReachable = false;
 				turns.clear();
 				stream.broadcast("gateway.stopping", payload);
 				pushSnapshot();
@@ -210,10 +196,8 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 				const connection = payload as { connected?: unknown };
 				if (typeof connection.connected !== "boolean") return;
 				const connected = connection.connected;
-				const wasDisconnected = gatewayConnection === false;
 				gatewayConnection = connected;
 				connectionEpoch += 1;
-				if (!connected || wasDisconnected) gatewayReachable = false;
 				if (!connected) turns.clear();
 				stream.broadcast("gateway.connection", { connected });
 				if (connected) pushSnapshot();
