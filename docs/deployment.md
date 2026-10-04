@@ -98,14 +98,15 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 
 The gateway communicates with the operator's shared GJC broker through its agent directory. The agent directory is resolved in this order:
 
-1. `config.json` `gjc.agentDir` (must be an absolute path; optional).
-2. `GJC_CODING_AGENT_DIR` or `PI_CODING_AGENT_DIR` environment variable (if set).
-3. Established home authority: existing databases keep the agent directory they were created with.
-4. Default: `$GAJAEWAY_HOME/gjc-agent` for fresh deployments.
+1. Deployment seam: `options.broker.agentDir` (test/deployment override only).
+2. `config.json` `gjc.agentDir` (must be an absolute path; optional).
+3. `GJC_CODING_AGENT_DIR` or `PI_CODING_AGENT_DIR` environment variable (if set).
+4. Established home authority: existing databases keep the agent directory they were created with (read from `broker_authority` table).
+5. Default: `$GAJAEWAY_HOME/gjc-agent` for fresh deployments.
 
 The gateway checks broker authority (based on the resolved agent directory) before running schema migrations. If the authority does not match an existing home's recorded authority, the boot fails with `authority_mismatch` and leaves the database schema unchanged, allowing offline corrective action.
 
-**Existing homes and pre-#321 upgrade paths:** Deployments using the shared global user's ~/.gjc/agent directory should configure it explicitly in `config.json` or set `GJC_CODING_AGENT_DIR` before upgrading to this version. This prevents the gateway from defaulting to a private `$GAJAEWAY_HOME/gjc-agent` directory and triggering a cutover requirement. The operator runbook documents the `gjc-authority-cutover` script for explicit migration between agent directories, including quarantine disposition for durable history.
+**Existing homes and pre-#321 upgrade paths:** A home established against the shared `~/.gjc/agent` keeps that directory automatically on upgrade (step 4), with its sessions and lanes intact; setting `gjc.agentDir` or `GJC_CODING_AGENT_DIR` makes that choice explicit. Keeping the shared directory gives up the isolation #321 added: an interactive gjc upgrade can affect the gateway. To move an established home onto the isolated `$GAJAEWAY_HOME/gjc-agent`, use a deliberate cutover instead (copy provider auth and model presets into the new directory first). The operator runbook documents the `gjc-authority-cutover` script for explicit migration between agent directories, including quarantine disposition for durable history.
 
 ## Slack adapter
 

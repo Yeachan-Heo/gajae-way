@@ -1809,6 +1809,33 @@ export class GatewayDatabase {
 		this.#database = database;
 	}
 
+	/**
+	 * Peek at the recorded broker authority without full database initialization.
+	 * Returns the canonicalAgentDir from broker_authority if it exists, or null if the
+	 * database doesn't exist or the table/record is absent. Used during boot to resolve
+	 * the agent directory before full database initialization.
+	 */
+	static peekRecordedAuthority(path: string): string | null {
+		try {
+			const database = new Database(path, { readonly: true });
+			try {
+				const stored = database
+					.query<{ authority_key: string }, []>("SELECT authority_key FROM broker_authority WHERE singleton = 1")
+					.get();
+				if (!stored) return null;
+				const value: unknown = JSON.parse(stored.authority_key);
+				if (!Array.isArray(value) || value.length !== 2) return null;
+				const canonicalAgentDir = value[0];
+				return typeof canonicalAgentDir === "string" ? canonicalAgentDir : null;
+			} finally {
+				database.close();
+			}
+		} catch {
+			// Database doesn't exist, table doesn't exist, or read failed; treat as no recorded authority
+			return null;
+		}
+	}
+
 	static async open(path: string, options: { readonly canonicalAgentDir?: string } = {}): Promise<GatewayDatabase> {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);

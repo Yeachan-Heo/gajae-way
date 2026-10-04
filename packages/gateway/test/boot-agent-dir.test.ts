@@ -1,7 +1,9 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveGatewayAgentDir } from "../src/boot";
 import { parseConfigFile } from "../src/config";
 import { GatewayDatabase } from "../src/store/db";
 
@@ -17,82 +19,183 @@ async function tempDir(): Promise<string> {
 	return directory;
 }
 
-describe("agent directory resolution in boot", () => {
-	test("fresh home defaults to $GAJAEWAY_HOME/gjc-agent", async () => {
+describe("resolveGatewayAgentDir precedence", () => {
+	test("explicit override beats all other sources", () => {
+		const result = resolveGatewayAgentDir({
+			explicit: "/explicit/agent",
+			configAgentDir: "/config/agent",
+			env: { GJC_CODING_AGENT_DIR: "/env/agent" },
+			recordedAgentDir: "/recorded/agent",
+			home: "/home",
+		});
+		expect(result).toBe("/explicit/agent");
+	});
+
+	test("config beats env, recorded, and default", () => {
+		const result = resolveGatewayAgentDir({
+			configAgentDir: "/config/agent",
+			env: { GJC_CODING_AGENT_DIR: "/env/agent" },
+			recordedAgentDir: "/recorded/agent",
+			home: "/home",
+		});
+		expect(result).toBe("/config/agent");
+	});
+
+	test("GJC_CODING_AGENT_DIR env beats recorded and default", () => {
+		const result = resolveGatewayAgentDir({
+			env: { GJC_CODING_AGENT_DIR: "/env/agent" },
+			recordedAgentDir: "/recorded/agent",
+			home: "/home",
+		});
+		expect(result).toBe("/env/agent");
+	});
+
+	test("PI_CODING_AGENT_DIR env works when GJC_CODING_AGENT_DIR is not set", () => {
+		const result = resolveGatewayAgentDir({
+			env: { PI_CODING_AGENT_DIR: "/pi/agent" },
+			recordedAgentDir: "/recorded/agent",
+			home: "/home",
+		});
+		expect(result).toBe("/pi/agent");
+	});
+
+	test("recorded agent directory beats default", () => {
+		const result = resolveGatewayAgentDir({
+			env: {},
+			recordedAgentDir: "/recorded/agent",
+			home: "/home",
+		});
+		expect(result).toBe("/recorded/agent");
+	});
+
+	test("default is used when nothing else is specified", () => {
+		const result = resolveGatewayAgentDir({
+			env: {},
+			recordedAgentDir: null,
+			home: "/home",
+		});
+		expect(result).toBe("/home/gjc-agent");
+	});
+
+	test("config beats env (env is ignored when config is set)", () => {
+		const result = resolveGatewayAgentDir({
+			configAgentDir: "/config/agent",
+			env: { GJC_CODING_AGENT_DIR: "/env/agent" },
+			recordedAgentDir: null,
+			home: "/home",
+		});
+		expect(result).toBe("/config/agent");
+	});
+});
+
+describe("agent directory in practice", () => {
+	test("fresh home gets default agent directory", async () => {
 		const home = await tempDir();
 		const dbPath = join(home, "gateway.db");
-		const defaultAgentDir = join(home, "gjc-agent");
 
-		const database = await GatewayDatabase.open(dbPath, { canonicalAgentDir: defaultAgentDir });
+		const database = await GatewayDatabase.open(dbPath, { canonicalAgentDir: join(home, "gjc-agent") });
 		const authority = database.inspectBrokerAuthority();
 		expect(authority.authority).not.toBeNull();
-		expect(authority.authority?.canonicalAgentDir).toBe(defaultAgentDir);
+		expect(authority.authority?.canonicalAgentDir).toBe(join(home, "gjc-agent"));
 		database.close();
 	});
 
-	test("config.json gjc.agentDir overrides default", async () => {
+	test("established home with broker_authority keeps recorded agent directory on subsequent boots", async () => {
 		const home = await tempDir();
-		const customAgentDir = join(home, "custom-agent");
-		await mkdir(customAgentDir);
-
 		const dbPath = join(home, "gateway.db");
-		const database = await GatewayDatabase.open(dbPath, { canonicalAgentDir: customAgentDir });
-		const authority = database.inspectBrokerAuthority();
-		expect(authority.authority).not.toBeNull();
-		expect(authority.authority?.canonicalAgentDir).toBe(customAgentDir);
-		database.close();
+		const recordedDir = join(home, "custom-agent");
+
+		// First boot: establish with custom agent dir
+		const db1 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: recordedDir });
+		expect(db1.inspectBrokerAuthority().authority?.canonicalAgentDir).toBe(recordedDir);
+		db1.close();
+
+		// Second boot: peek recorded authority without full init
+		const peeked = GatewayDatabase.peekRecordedAuthority(dbPath);
+		expect(peeked).toBe(recordedDir);
+
+		// Third boot: using resolved directory (from peeked authority)
+		const resolved = resolveGatewayAgentDir({
+			env: {},
+			recordedAgentDir: peeked,
+			home,
+		});
+		expect(resolved).toBe(recordedDir);
+
+		// Fourth boot: full DB open succeeds with resolved directory
+		const db2 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: resolved });
+		expect(db2.inspectBrokerAuthority().authority?.canonicalAgentDir).toBe(recordedDir);
+		db2.close();
 	});
 
-	test("established home keeps its recorded agent directory", async () => {
+	test("peekRecordedAuthority returns null for fresh database", async () => {
 		const home = await tempDir();
-		const originalAgentDir = join(home, "original-agent");
 		const dbPath = join(home, "gateway.db");
 
-		// First boot with original agent directory
-		const database1 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: originalAgentDir });
-		const authority1 = database1.inspectBrokerAuthority();
-		expect(authority1.authority).not.toBeNull();
-		expect(authority1.authority?.canonicalAgentDir).toBe(originalAgentDir);
-		database1.close();
+		// Fresh DB path (doesn't exist yet)
+		const peeked = GatewayDatabase.peekRecordedAuthority(dbPath);
+		expect(peeked).toBeNull();
+	});
 
-		// Second boot with different agent directory should fail during open
-		const differentAgentDir = join(home, "different-agent");
-		try {
-			await GatewayDatabase.open(dbPath, { canonicalAgentDir: differentAgentDir });
-			throw new Error("Expected authority_mismatch error");
-		} catch (error) {
-			if (error instanceof Error && error.message.includes("authority_mismatch")) {
-				// Expected error
-			} else {
-				throw error;
+	test("authority_mismatch on boot leaves schema_migrations unchanged", async () => {
+		const home = await tempDir();
+		const dbPath = join(home, "gateway.db");
+		const dir1 = join(home, "agent1");
+		const dir2 = join(home, "agent2");
+
+		// First boot with dir1 creates a fully-initialized DB
+		const db1 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: dir1 });
+		const schemaAfterFirstBoot = db1.schemaVersion;
+		db1.close();
+
+		// Record the migration count and table checksum
+		const readMigrations = (): { count: number; rows: string } => {
+			const db = new Database(dbPath, { readonly: true });
+			try {
+				const count =
+					db.query<{ count: number }, []>("SELECT COUNT(*) as count FROM schema_migrations").get()?.count ?? 0;
+				const rows = db
+					.query<{ version: number; applied_at: string }, []>(
+						"SELECT version, applied_at FROM schema_migrations ORDER BY version",
+					)
+					.all()
+					.map((r) => `${r.version}:${r.applied_at}`)
+					.join(",");
+				return { count, rows };
+			} finally {
+				db.close();
 			}
-		}
-	});
+		};
 
-	test("authority_mismatch boot leaves schema_migrations unchanged", async () => {
-		const home = await tempDir();
-		const originalAgentDir = join(home, "agent1");
-		const wrongAgentDir = join(home, "agent2");
-		const dbPath = join(home, "gateway.db");
+		// Simulate an upgrade: the newest migration is pending, as on a host booting a newer build.
+		const raw = new Database(dbPath);
+		raw.run("DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)");
+		raw.close();
 
-		// First boot establishes authority
-		const database1 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: originalAgentDir });
-		const schemaVersion1 = database1.schemaVersion;
-		database1.close();
+		const migrationsBefore = readMigrations();
+		expect(migrationsBefore.count).toBeGreaterThan(0);
 
-		// Second boot with wrong authority should fail
+		// Boot with dir2 should fail at authority check (before any new migrations)
 		try {
-			await GatewayDatabase.open(dbPath, { canonicalAgentDir: wrongAgentDir });
+			await GatewayDatabase.open(dbPath, { canonicalAgentDir: dir2 });
+			throw new Error("Expected authority_mismatch");
 		} catch (e) {
-			expect(e).toBeInstanceOf(Error);
+			if (!(e instanceof Error) || !e.message.includes("authority_mismatch")) throw e;
 		}
 
-		// Verify schema version hasn't changed (no migrations applied after authority mismatch)
-		const database3 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: originalAgentDir });
-		expect(database3.schemaVersion).toBe(schemaVersion1);
-		database3.close();
-	});
+		// Verify schema_migrations table is byte-identical
+		const migrationsAfter = readMigrations();
+		expect(migrationsAfter.count).toBe(migrationsBefore.count);
+		expect(migrationsAfter.rows).toBe(migrationsBefore.rows);
 
+		// Boot with original dir1 still works and applies the pending migration
+		const db3 = await GatewayDatabase.open(dbPath, { canonicalAgentDir: dir1 });
+		expect(db3.schemaVersion).toBe(schemaAfterFirstBoot);
+		db3.close();
+	});
+});
+
+describe("config parsing", () => {
 	test("config.json gjc.agentDir with absolute path is accepted", () => {
 		const config = parseConfigFile({
 			schemaVersion: 1,
