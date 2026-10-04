@@ -1531,6 +1531,70 @@ class OriginActor {
 	}
 
 	/**
+	 * Schedules a continuation retry for a post_start agent_runtime error.
+	 * Sends a recovery message directly to the same session without replaying the original inbound,
+	 * to avoid re-running any side-effecting tools that may have already executed.
+	 */
+	#scheduleAgentRuntimeErrorRetry(bound: BoundTurn, delayMs: number): void {
+		const timer = this.#manager.schedule(() => {
+			this.#graceTimers.delete(timer);
+			if (this.#stopped || this.#manager.stopped) return;
+			if (this.#current !== bound) return; // Turn has been replaced
+			void this.enqueue(async () => {
+				const oldOpRef = bound.turn.opRef;
+				try {
+					// Get the text that was already delivered (if any)
+					const recoveredText = await this.#recoverFailedTurnAnswer(bound);
+					const nextAttempt = bound.retryAttempt + 1;
+					
+					// Build continuation prompt that doesn't replay the original message
+					// This prevents re-execution of side-effecting tools (git push, posts, merges, etc.)
+					let continuationPrompt: string;
+					if (recoveredText) {
+						// Text was delivered: ask to continue from there without re-running tools
+						continuationPrompt = `Your previous response was interrupted due to an error after execution started:\n\n${recoveredText}\n\nPlease continue or complete this response. Do NOT repeat any tool actions that may have already been executed (git push, API posts, database writes, etc.). Only continue typing if more content is needed.`;
+					} else {
+						// No text delivered: ask agent to try the original task again from scratch
+						continuationPrompt = "Your previous attempt encountered an error after it started executing. Please try again, being careful not to duplicate any tool actions that may have already executed.";
+					}
+
+					const newOpRef = personaTurnOpRef(
+						this.#manager.instanceId,
+						this.originKey,
+						bound.epoch,
+						bound.turn.triggerMessageId,
+						nextAttempt,
+					);
+
+					this.#manager.log(
+						`agent_runtime_continuation_retry origin=${this.originKey} epoch=${bound.epoch} oldOpRef=${oldOpRef} newOpRef=${newOpRef} attempt=${nextAttempt}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} hasRecoveredText=${!!recoveredText}`,
+						"warn",
+					);
+
+					// Send continuation prompt directly to the same session
+					const receipt = await this.#manager.port.send({
+						sessionId: bound.sessionId,
+						repo: this.#manager.repo,
+						text: continuationPrompt,
+						opRef: newOpRef,
+						relay: bound.tail,
+					});
+
+					// Update bound turn tracking and correlate new opRef
+					bound.retryAttempt = nextAttempt;
+					bound.tail?.correlate(newOpRef, receipt);
+				} catch (error) {
+					this.#manager.log(
+						`agent_runtime_continuation_retry_failed origin=${this.originKey} opRef=${oldOpRef} detail=${safeDiagnostic(error)}`,
+						"error",
+					);
+				}
+			}).catch(() => {});
+		}, delayMs);
+		this.#graceTimers.add(timer);
+	}
+
+	/**
 	 * Schedules a retry of a failed turn due to a transient agent error.
 	 * Increments the retry attempt counter and re-dispatches the turn with a new opRef.
 	 */
@@ -2277,6 +2341,9 @@ class OriginActor {
 					!bound.retired &&
 					this.#current === bound
 				) {
+					const category = report.status.outcome?.category;
+					const code = report.status.outcome?.code ?? report.status.error?.code;
+					const isAgentRuntimeError = category === "agent_runtime" && (code === "agent_error" || code === "prompt_failed");
 					const retryDelayMs = Math.min(
 						AGENT_ERROR_RETRY_MAX_MS,
 						AGENT_ERROR_RETRY_INITIAL_MS * Math.pow(2, bound.retryAttempt),
@@ -2285,9 +2352,13 @@ class OriginActor {
 						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.retryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=${isAgentRuntimeError ? "continuation" : "requeue"} error=${terminalFailureDiagnosis(report)}`,
 						"warn",
 					);
-					// Both provider_transport and agent_runtime post_start errors use the same requeue logic
-					// The SDK handles tool caching/deduplication to avoid re-running tools
-					this.#scheduleAgentErrorRetry(bound, retryDelayMs);
+					if (isAgentRuntimeError) {
+						// Send continuation prompt into same session to avoid re-running side-effecting tools
+						this.#scheduleAgentRuntimeErrorRetry(bound, retryDelayMs);
+					} else {
+						// Requeue provider_transport errors (transient network failures)
+						this.#scheduleAgentErrorRetry(bound, retryDelayMs);
+					}
 					return;
 				}
 				// Not retryable or retries exhausted: deliver the failure

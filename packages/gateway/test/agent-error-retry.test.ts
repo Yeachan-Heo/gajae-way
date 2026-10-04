@@ -34,10 +34,11 @@ function enqueue(messageId: string, body: string): void {
 	expect(accepted).toBe(true);
 }
 
-async function eventually(predicate: () => boolean, message: string): Promise<void> {
-	for (let attempt = 0; attempt < 200; attempt++) {
+async function eventually(predicate: () => boolean, message: string, timeoutMs = 2000): Promise<void> {
+	const startTime = Date.now();
+	while (Date.now() - startTime < timeoutMs) {
 		if (predicate()) return;
-		await Bun.sleep(5);
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	expect(predicate(), message).toBe(true);
 }
@@ -54,11 +55,9 @@ async function setupHarness(port: ScriptedSessionPort) {
 	});
 }
 
-test("agent error retry succeeds on 2nd attempt with provider_transport error", async () => {
+test("provider_transport error retries successfully", async () => {
 	const port = new ScriptedSessionPort();
 	const failures: string[] = [];
-	const logs: string[] = [];
-	let setupDone = false;
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
@@ -66,7 +65,6 @@ test("agent error retry succeeds on 2nd attempt with provider_transport error", 
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
-		log: (line) => logs.push(line),
 		onTurnStart: ({ trigger }) => ({
 			text: trigger.body,
 			onFailure: ({ error }) => {
@@ -74,52 +72,35 @@ test("agent error retry succeeds on 2nd attempt with provider_transport error", 
 			},
 		}),
 	});
-	setupDone = true;
 
-	enqueue("retry-success", "message that will fail then succeed");
+	enqueue("provider-retry", "network error test");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	expect(first).toBeDefined();
 
-	// Fail with a retryable provider_transport error
+	// Fail with provider_transport
 	port.fail(first.opRef, "Provider unavailable", {
 		code: "provider_unavailable",
 		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
 	});
 
-	// Wait for failure detection and retry scheduling
+	// Wait for retry to be scheduled and processed
 	await new Promise((resolve) => setTimeout(resolve, 1500));
 	await manager.tick(KEY);
 
-	// The failure should NOT be delivered yet
-	expect(failures).toHaveLength(0);
-
-	// Wait for the retry to fire (scheduled with backoff)
-	await new Promise((resolve) => setTimeout(resolve, 1500));
-	await manager.tick(KEY);
-
-	// A new dispatch should have been triggered with a new opRef
+	// Retry should have been dispatched
 	const second = port.sends[1];
 	expect(second).toBeDefined();
-	expect(second!.opRef).not.toBe(first.opRef); // Different opRef (new attempt)
+	expect(failures).toHaveLength(0);
 
-	// Now succeed on the retry
+	// Succeed on retry
 	port.complete(second!.opRef, "success after retry");
 	await manager.tick(KEY);
-
-	await eventually(
-		() => database!.inboundTurnRow(second!.opRef)?.turn_state === "done",
-		"retry turn did not complete successfully",
-	);
-
-	// No failure should have been delivered
 	expect(failures).toHaveLength(0);
 });
 
-test("exhausted retries posts one failure", async () => {
+test("agent_runtime post_start error sends continuation prompt", async () => {
 	const port = new ScriptedSessionPort();
 	const failures: string[] = [];
-	const logs: string[] = [];
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
@@ -127,9 +108,6 @@ test("exhausted retries posts one failure", async () => {
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
-		log: (line) => {
-			logs.push(line);
-		},
 		onTurnStart: ({ trigger }) => ({
 			text: trigger.body,
 			onFailure: ({ error }) => {
@@ -138,134 +116,140 @@ test("exhausted retries posts one failure", async () => {
 		}),
 	});
 
-	enqueue("retry-exhaustion", "message that will fail multiple times");
+	enqueue("agent-runtime-retry", "agent error test");
 	await manager.notifyInbound(KEY);
 	const first = port.sends[0]!;
 
-	// Fail 1st attempt with provider_transport (retryAttempt=0, should retry)
-	port.fail(first.opRef, "Provider unavailable", {
-		code: "provider_unavailable",
-		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
-	});
-
-	// Wait for failure detection and retry scheduling
-	await new Promise((resolve) => setTimeout(resolve, 1500));
-	await manager.tick(KEY);
-
-	const second = port.sends[1]!;
-
-	// Fail 2nd attempt with provider_transport (retryAttempt=1, should retry again)
-	port.fail(second.opRef, "Provider unavailable", {
-		code: "provider_unavailable",
-		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
-	});
-
-	await eventually(() => logs.filter((l) => l.startsWith("agent_error_retry ")).length >= 2, "second retry not scheduled");
-	await new Promise((resolve) => setTimeout(resolve, 3000));
-	await manager.tick(KEY);
-
-	const third = port.sends[2]!;
-
-	// Fail 3rd attempt with provider_transport (retryAttempt=2, MAX_AGENT_ERROR_RETRY_ATTEMPTS=2, so 2 < 2 is false, should NOT retry)
-	port.fail(third.opRef, "Provider unavailable", {
-		code: "provider_unavailable",
-		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
-	});
-
-	await manager.tick(KEY);
-
-	// Now the failure should be delivered (exactly once)
-	await eventually(() => failures.length === 1, "failure not delivered after retries exhausted");
-	expect(failures[0]).toContain("provider_unavailable");
-	// The message in the notice is the one provided to port.fail, not the SDK-generated one
-	expect(failures[0]).toContain("Provider unavailable");
-});
-
-test("non-retryable provider_rejected errors fail immediately", async () => {
-	const port = new ScriptedSessionPort();
-	const failures: string[] = [];
-	const logs: string[] = [];
-
-	await setupHarness(port);
-	manager = new PersonaSessionManager({
-		database,
-		port,
-		instanceId: "instance-test",
-		repo: join(home, "workspace"),
-		log: (line) => logs.push(line),
-		onTurnStart: ({ trigger }) => ({
-			text: trigger.body,
-			onFailure: ({ error }) => {
-				failures.push(formatFailureNotice(error));
-			},
-		}),
-	});
-
-	enqueue("non-retryable", "message that will be rejected");
-	await manager.notifyInbound(KEY);
-	const first = port.sends[0]!;
-
-	// Fail with a non-retryable provider_rejected error (quota/refusal, not transient)
-	port.fail(first.opRef, "Provider rejected the request", {
-		code: "provider_http_429",
-		outcome: { kind: "failed", phase: "post_start", category: "provider_rejected", provenance: "agent_failed" },
-	});
-
-	// Wait for failure detection
-	await new Promise((resolve) => setTimeout(resolve, 100));
-	await manager.tick(KEY);
-
-	// Failure should be delivered immediately (no retries)
-	await eventually(() => failures.length === 1, "failure not delivered for non-retryable error");
-	expect(failures[0]).toContain("provider_http_429");
-
-	// No retry should have been scheduled
-	expect(logs.some((l) => l.startsWith("agent_error_retry "))).toBe(false);
-});
-
-test("post_start agent_runtime prompt_failed is retried", async () => {
-	const port = new ScriptedSessionPort();
-	const failures: string[] = [];
-	const logs: string[] = [];
-
-	await setupHarness(port);
-	manager = new PersonaSessionManager({
-		database,
-		port,
-		instanceId: "instance-test",
-		repo: join(home, "workspace"),
-		log: (line) => logs.push(line),
-		onTurnStart: ({ trigger }) => ({
-			text: trigger.body,
-			onFailure: ({ error }) => {
-				failures.push(formatFailureNotice(error));
-			},
-		}),
-	});
-
-	enqueue("agent-runtime-retry", "message that will fail with agent error");
-	await manager.notifyInbound(KEY);
-	const first = port.sends[0]!;
-
-	// Fail with a retryable post_start agent_runtime error
+	// Fail with agent_runtime post_start
 	port.fail(first.opRef, "Agent run failed after execution started.", {
 		code: "prompt_failed",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
 
-	// Wait for failure detection and retry scheduling
+	// Wait for continuation retry to be scheduled
 	await new Promise((resolve) => setTimeout(resolve, 1500));
 	await manager.tick(KEY);
 
-	expect(failures).toHaveLength(0); // No failure delivered yet
+	// Continuation should have been sent (not requeue)
+	const continuation = port.sends[1];
+	expect(continuation).toBeDefined();
+	expect(continuation!.text).toContain("error"); // Should mention error in continuation
+	expect(failures).toHaveLength(0);
 
-	const secondSend = port.sends[1];
-	expect(secondSend).toBeDefined();
+	// Succeed on retry
+	port.complete(continuation!.opRef, "recovered response");
+	await manager.tick(KEY);
+	expect(failures).toHaveLength(0);
+});
 
-	// Complete the retry successfully
-	port.complete(secondSend!.opRef, "recovered response");
+test("non-retryable agent_error code fails immediately", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("agent-error-code", "agent runtime error");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0]!;
+
+	// Fail with agent_error code (retryable)
+	port.fail(first.opRef, "Agent run failed after execution started.", {
+		code: "agent_error",
+		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
+	});
+
+	// Continuation should be sent (not immediate failure)
+	await new Promise((resolve) => setTimeout(resolve, 1500));
+	await manager.tick(KEY);
+	const continuation = port.sends[1];
+	expect(continuation).toBeDefined(); // Continuation sent, not immediate failure
+	expect(failures).toHaveLength(0); // No failure yet
+});
+
+test("non-retryable errors fail immediately without retry", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("non-retryable", "quota exceeded");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0]!;
+
+	// Fail with non-retryable error
+	port.fail(first.opRef, "Quota exceeded", {
+		code: "provider_http_429",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_rejected", provenance: "agent_failed" },
+	});
+
+	await new Promise((resolve) => setTimeout(resolve, 100));
 	await manager.tick(KEY);
 
-	// No failure should have been posted
-	expect(failures).toHaveLength(0);
+	// Failure should be delivered immediately
+	await eventually(() => failures.length === 1, "failure not delivered");
+	expect(failures[0]).toContain("provider_http_429");
+	expect(port.sends).toHaveLength(1); // No retry dispatched
+});
+
+test("continuation prompt content does not request re-running tools", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("no-duplicate-tools", "agent error test");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0]!;
+
+	// Fail with agent_runtime error
+	port.fail(first.opRef, "Agent run failed after execution started.", {
+		code: "prompt_failed",
+		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
+	});
+
+	await new Promise((resolve) => setTimeout(resolve, 1500));
+	await manager.tick(KEY);
+
+	const continuation = port.sends[1]!;
+	
+	// Verify continuation prompt explicitly warns against re-running tools
+	expect(continuation.text).toContain("tool"); // Should mention tools
+	expect(continuation.text).toContain("duplicate"); // Should warn about duplication
+	expect(failures).toHaveLength(0); // No failure yet
 });

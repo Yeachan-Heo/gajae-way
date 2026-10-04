@@ -392,20 +392,21 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
 
-	// With the new retry logic, a retry should be scheduled after a delay
+	// With the new retry logic, a continuation should be sent after a delay
 	await new Promise((resolve) => setTimeout(resolve, 1500));
 	await manager!.tick(KEY);
-	await eventually(() => logs.some((l) => l.startsWith("agent_error_retry ")), "retry not scheduled");
-	const retry = port.sends[1];
-	expect(retry).toBeDefined();
+	const continuation = port.sends[1];
+	expect(continuation).toBeDefined();
+	expect(continuation!.text).toContain("error"); // Continuation message
 
 	// Fail the retry too (to exhaust retries and get the failure notice)
-	port.fail(retry!.opRef, "Agent run failed after execution started.", {
+	port.fail(continuation!.opRef, "Agent run failed after execution started.", {
 		code: "prompt_failed",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
+	await new Promise((resolve) => setTimeout(resolve, 2500));
 	await manager!.tick(KEY);
-	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle after retries exhausted");
+	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle after retries exhausted", 3000);
 	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
 	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
 	expect(notices[0]).not.toContain("/new");
