@@ -1,6 +1,6 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
 	type ChannelEngagementPolicy,
 	describeChatPlatforms,
@@ -104,6 +104,8 @@ export interface GatewayConfigFile {
 	readonly interimSpeech?: InterimSpeechConfig;
 	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
+	/** Absolute path to gjc agent directory; overrides GJC_CODING_AGENT_DIR. Defaults to $GAJAEWAY_HOME/gjc-agent for fresh homes; existing homes keep their established directory. */
+	readonly gjc?: { readonly agentDir?: string } | undefined;
 }
 
 export interface MonitorCatchUpConfig {
@@ -521,6 +523,20 @@ function parseDmPolicy(value: unknown): DmPolicy {
 	return value as DmPolicy;
 }
 
+function parseGjcConfig(value: unknown): { readonly agentDir?: string } | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "gjc");
+	if (Object.keys(input).some((key) => key !== "agentDir"))
+		throw new ConfigError("config_invalid", "gjc may only contain agentDir");
+	if (input.agentDir !== undefined) {
+		const agentDir = optionalString(input.agentDir, "gjc.agentDir");
+		if (agentDir && !isAbsolute(agentDir))
+			throw new ConfigError("config_invalid", "gjc.agentDir must be an absolute path");
+		return agentDir ? { agentDir } : undefined;
+	}
+	return undefined;
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -578,6 +594,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 				}),
 		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
+		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
 	};
 }
 

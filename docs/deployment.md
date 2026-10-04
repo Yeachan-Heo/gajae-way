@@ -94,6 +94,19 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 
 `monitorCatchUp` bounds cron replay after downtime: `maxSlots` is the newest due slots to admit (1–1000, default 24), and `maxAgeMs` excludes slots older than the lookback (60000–604800000 ms, default 86400000 / 24 hours). Refused slots advance the durable monitor cursor, are counted and logged, and appear in `gajaeway monitors inspect <id>` as `catchUp`; the setting is restart-required.
 
+### GJC agent directory
+
+The gateway communicates with the operator's shared GJC broker through its agent directory. The agent directory is resolved in this order:
+
+1. `config.json` `gjc.agentDir` (must be an absolute path; optional).
+2. `GJC_CODING_AGENT_DIR` or `PI_CODING_AGENT_DIR` environment variable (if set).
+3. Established home authority: existing databases keep the agent directory they were created with.
+4. Default: `$GAJAEWAY_HOME/gjc-agent` for fresh deployments.
+
+The gateway checks broker authority (based on the resolved agent directory) before running schema migrations. If the authority does not match an existing home's recorded authority, the boot fails with `authority_mismatch` and leaves the database schema unchanged, allowing offline corrective action.
+
+**Existing homes and pre-#321 upgrade paths:** Deployments using the shared global user's ~/.gjc/agent directory should configure it explicitly in `config.json` or set `GJC_CODING_AGENT_DIR` before upgrading to this version. This prevents the gateway from defaulting to a private `$GAJAEWAY_HOME/gjc-agent` directory and triggering a cutover requirement. The operator runbook documents the `gjc-authority-cutover` script for explicit migration between agent directories, including quarantine disposition for durable history.
+
 ## Slack adapter
 
 `gajaeway-slack` connects over **Socket Mode**, so the host needs no public URL and no inbound firewall rule. It reads `$GAJAEWAY_HOME/adapter-slack.json`:

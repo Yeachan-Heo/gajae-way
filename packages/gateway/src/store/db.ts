@@ -821,43 +821,70 @@ export class GatewayDatabase {
 		let populated = false;
 		for (const table of BROKER_SNAPSHOT_TABLES) {
 			const where = table === "meta" ? " WHERE key <> 'instance_id'" : "";
-			if (this.#database.query(`SELECT 1 FROM ${table}${where} LIMIT 1`).get()) populated = true;
+			try {
+				if (this.#database.query(`SELECT 1 FROM ${table}${where} LIMIT 1`).get()) populated = true;
+			} catch (error) {
+				// Table doesn't exist yet (called before migrations complete); ignore and continue.
+				if (!((error as Error).message.includes("no such table"))) throw error;
+			}
 		}
-		if (this.#database.query("SELECT 1 FROM broker_cutovers LIMIT 1").get()) populated = true;
-		for (const row of this.#database.query<{ epoch: number }, []>("SELECT epoch FROM sessions").all()) {
-			if (!Number.isSafeInteger(row.epoch) || row.epoch < 0 || row.epoch >= Number.MAX_SAFE_INTEGER)
-				throw new Error("invalid session epoch");
+		try {
+			if (this.#database.query("SELECT 1 FROM broker_cutovers LIMIT 1").get()) populated = true;
+		} catch (error) {
+			if (!((error as Error).message.includes("no such table"))) throw error;
+		}
+		try {
+			for (const row of this.#database.query<{ epoch: number }, []>("SELECT epoch FROM sessions").all()) {
+				if (!Number.isSafeInteger(row.epoch) || row.epoch < 0 || row.epoch >= Number.MAX_SAFE_INTEGER)
+					throw new Error("invalid session epoch");
+			}
+		} catch (error) {
+			if (!((error as Error).message.includes("no such table"))) throw error;
 		}
 		let openWork = 0;
-		for (const row of this.#database
-			.query<{ job_id: string; record_json: string }, []>("SELECT job_id, record_json FROM lane_jobs")
-			.all()) {
-			const job = parseLaneJobRecord(row.record_json);
-			if (job.jobId !== row.job_id) throw new WorkAttemptStateError();
-			if (
-				!this.isBrokerQuarantined("work", job.jobId) &&
-				(job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state))
-			)
-				openWork++;
+		try {
+			for (const row of this.#database
+				.query<{ job_id: string; record_json: string }, []>("SELECT job_id, record_json FROM lane_jobs")
+				.all()) {
+				const job = parseLaneJobRecord(row.record_json);
+				if (job.jobId !== row.job_id) throw new WorkAttemptStateError();
+				if (
+					!this.isBrokerQuarantined("work", job.jobId) &&
+					(job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state))
+				)
+					openWork++;
+			}
+			for (const row of this.#database.query<{ op_ref: string }, []>("SELECT op_ref FROM work_attempt_runtime").all()) {
+				const runtime = this.workAttemptGet(row.op_ref)!;
+				if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
+			}
+			openWork +=
+				this.#database
+					.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')")
+					.get()?.n ?? 0;
+		} catch (error) {
+			if (!((error as Error).message.includes("no such table"))) throw error;
 		}
-		for (const row of this.#database.query<{ op_ref: string }, []>("SELECT op_ref FROM work_attempt_runtime").all()) {
-			const runtime = this.workAttemptGet(row.op_ref)!;
-			if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
+		let openInbound = 0;
+		try {
+			openInbound = this.#database
+				.query<{ n: number }, []>(
+					`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
+				)
+				.get()!.n;
+		} catch (error) {
+			if (!((error as Error).message.includes("no such table"))) throw error;
 		}
-		openWork +=
-			this.#database
-				.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')")
-				.get()?.n ?? 0;
-		const openInbound = this.#database
-			.query<{ n: number }, []>(
-				`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
-			)
-			.get()!.n;
-		const openMonitors = this.#database
-			.query<{ n: number }, []>(
-				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
-			)
-			.get()!.n;
+		let openMonitors = 0;
+		try {
+			openMonitors = this.#database
+				.query<{ n: number }, []>(
+					"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+				)
+				.get()!.n;
+		} catch (error) {
+			if (!((error as Error).message.includes("no such table"))) throw error;
+		}
 		return { authority, populated, openInbound, openWork, openMonitors };
 	}
 
@@ -1782,14 +1809,24 @@ export class GatewayDatabase {
 		this.#database = database;
 	}
 
-	static async open(path: string): Promise<GatewayDatabase> {
+	static async open(path: string, options: { readonly canonicalAgentDir?: string } = {}): Promise<GatewayDatabase> {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
 		try {
 			database.exec(
 				"PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;",
 			);
+			// Create schema_migrations and broker_authority tables early so they can be used before full migration.
+			database.exec(
+				"CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS broker_authority (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), authority_key TEXT NOT NULL);",
+			);
 			const instance = new GatewayDatabase(database);
+			// Check broker authority before running other migrations (same transaction for atomicity).
+			if (options.canonicalAgentDir !== undefined) {
+				const authority = { canonicalAgentDir: options.canonicalAgentDir, identity: `gjc:${options.canonicalAgentDir}` };
+				// This check runs before migrate(), so authority_mismatch leaves schema_migrations unchanged.
+				instance.assertBrokerAuthority(authority, { initializeEmpty: true });
+			}
 			instance.migrate();
 			instance.integrityCheck();
 			return instance;
@@ -4556,9 +4593,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	}
 
 	private migrate(): void {
-		this.#database.exec(
-			"CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
-		);
+		// schema_migrations and broker_authority tables are created in open() before this method is called.
 		const current = this.schemaVersion;
 		if (current > LATEST_SCHEMA_VERSION) {
 			throw new DatabaseStartupError(
@@ -4923,7 +4958,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		}
 		if (current < 22) {
 			this.withTransaction(() => {
-				this.#database.exec(`CREATE TABLE broker_authority (
+				this.#database.exec(`CREATE TABLE IF NOT EXISTS broker_authority (
 					singleton INTEGER PRIMARY KEY CHECK(singleton = 1), authority_key TEXT NOT NULL);
 					CREATE TABLE broker_owned_bindings (
 						authority_key TEXT NOT NULL, session_id TEXT NOT NULL, origin_key TEXT NOT NULL,

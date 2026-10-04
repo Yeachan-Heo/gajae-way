@@ -125,19 +125,24 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			options.takeover ?? defaultTakeoverPorts(),
 		);
 		claimed = true;
-		const database = await GatewayDatabase.open(config.dbPath);
-		let broker: GlobalGjcClient | undefined;
+		const personaWorkspace = await resolvePersonaWorkspace(config.home);
+		const pinnedVersion = readPinnedGjcVersion();
+		const configAgentDir = config.gjc?.agentDir;
+		const brokerAgentDir = options.broker?.agentDir ?? configAgentDir ?? join(config.home, "gjc-agent");
+		// Resolve the broker agent directory (symlinks followed) and check authority before migrations.
+		const broker = new GlobalGjcClient({
+			...options.broker,
+			cwd: personaWorkspace,
+			agentDir: brokerAgentDir,
+			pinnedVersion,
+		});
+		const database = await GatewayDatabase.open(config.dbPath, {
+			canonicalAgentDir: broker.agentDir,
+		});
 		try {
-			const personaWorkspace = await resolvePersonaWorkspace(config.home);
-			const pinnedVersion = readPinnedGjcVersion();
-			broker = new GlobalGjcClient({
-				...options.broker,
-				cwd: personaWorkspace,
-				agentDir: options.broker?.agentDir ?? join(config.home, "gjc-agent"),
-				pinnedVersion,
-			});
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
-			database.assertBrokerAuthority(authority, { initializeEmpty: true });
+			// Authority already checked in GatewayDatabase.open(); this assertion confirms immutability.
+			database.assertBrokerAuthority(authority, { initializeEmpty: false });
 			// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 			const client = broker;
 			await waitForBroker("preflight", () => client.preflight(), options.brokerWait);
