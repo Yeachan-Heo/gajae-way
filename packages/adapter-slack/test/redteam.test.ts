@@ -17,7 +17,6 @@ import { AdapterAlreadyRunningError, AdapterLock } from "../src/lock";
 import {
 	engagementForMessage,
 	type GatewayClientLike,
-	ReconnectingGateway,
 	replyThreadTs,
 	SKIPPED_SUBTYPES,
 	settleSlackDelivery,
@@ -36,6 +35,9 @@ import {
 import { SlackSocketMode, type WebSocketLike } from "../src/socket";
 import { WorkingStatus } from "../src/status";
 import { normalizeSlackText } from "../src/text";
+import { liveGateway, stopLiveGatewaysAfterEach } from "./live-gateways";
+
+stopLiveGatewaysAfterEach();
 
 // The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
 // be able to reach a real operator home, whatever a fixture forgets to pass.
@@ -386,7 +388,7 @@ test("RT-SLACK-11 malformed and unknown reactions fail without API; already_reac
 test("RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered", async () => {
 	const log = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(() => log.mockRestore());
-	const adapter = new ReconnectingGateway("/tmp/no-redteam.sock", new Api());
+	const adapter = liveGateway("/tmp/no-redteam.sock", new Api());
 	for (let i = 0; i < 300; i++) adapter.sendEdit(`C1:${i}.0`, origin, `edit-${i}`, engagement);
 	await flush();
 	expect(adapter.pendingEdits).toHaveLength(256);
@@ -404,7 +406,7 @@ test("RT-SLACK-12 disconnected edit overflow retains newest 256 and replays orde
 test("RT-SLACK-13 failed edit remains queued and reconnects for replay", async () => {
 	const client = new Client();
 	client.failure = new Error("offline");
-	const adapter = new ReconnectingGateway("/tmp/no-redteam.sock", new Api(), client);
+	const adapter = liveGateway("/tmp/no-redteam.sock", new Api(), client);
 	adapter.sendEdit("C1:1.0", origin, "edit", engagement);
 	await flush();
 	expect(adapter.connected).toBe(false);
@@ -418,7 +420,7 @@ test("RT-SLACK-13 failed edit remains queued and reconnects for replay", async (
 
 test("RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten", async () => {
 	const client = new Client();
-	const adapter = new ReconnectingGateway("/tmp/no-redteam.sock", new Api(), client);
+	const adapter = liveGateway("/tmp/no-redteam.sock", new Api(), client);
 	expect((await adapter.requestRecovered("C1:1.0", origin, "x", engagement)).verdict).toBe("acked");
 	expect((await adapter.requestRecovered("C1:1.0", origin, "x", engagement)).verdict).toBe("duplicate");
 	expect(client.calls).toHaveLength(1);
@@ -588,7 +590,7 @@ test("RT-SLACK-30 pending sends share failure and survive client adoption", asyn
 			expect(verb).toBe("chat.send");
 			return gate;
 		};
-		const adapter = new ReconnectingGateway("/tmp/no-redteam.sock", new Api(), client);
+		const adapter = liveGateway("/tmp/no-redteam.sock", new Api(), client);
 		const live = adapter.requestInbound("C1:1.0", origin, "body", engagement);
 		const recovered = adapter.requestRecovered("C1:1.0", origin, "body", engagement);
 		const healthy = new Client();
@@ -803,7 +805,7 @@ test("RT-SLACK-40 every engaged turn gets a presence reaction on the triggering 
 	const api = new Api();
 	const client = new Client();
 	const status = new WorkingStatus(api);
-	const gateway = new ReconnectingGateway("/tmp/no-redteam.sock", api, client, status);
+	const gateway = liveGateway("/tmp/no-redteam.sock", api, client, status);
 	// Not engaged (the gateway declined it): no presence, whatever the mention says.
 	client.engaged = false;
 	await gateway.requestInbound("C1:1.0", origin, "overheard", { ...engagement, mentioned: true });

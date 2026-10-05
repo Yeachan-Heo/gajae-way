@@ -11,7 +11,6 @@ import {
 	LruSet,
 	monitorFailureDecision,
 	OrderedIngress,
-	ReconnectingGateway,
 	renderInboundText,
 	replyThreadTs,
 	SKIPPED_SUBTYPES,
@@ -24,6 +23,9 @@ import {
 import { slackMessageOrigin } from "../src/origin";
 import { loadRecoveryCursors } from "../src/recovery";
 import type { WebSocketLike } from "../src/socket";
+import { liveGateway, stopLiveGatewaysAfterEach } from "./live-gateways";
+
+stopLiveGatewaysAfterEach();
 
 // The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
 // be able to reach a real operator home, whatever a fixture forgets to pass.
@@ -373,7 +375,7 @@ test("Slack edit outbox replays oldest first, supersedes live edits, and caps at
 	const log = spyOn(console, "error").mockImplementation(() => {});
 	try {
 		const api = new Api();
-		const gateway = new ReconnectingGateway("/tmp/slack-not-connected.sock", api);
+		const gateway = liveGateway("/tmp/slack-not-connected.sock", api);
 		for (let i = 0; i < 257; ++i) gateway.sendEdit(`C1:${i}.000`, origin, String(i), engagement);
 		expect(gateway.pendingEdits).toHaveLength(256);
 		expect(gateway.pendingEdits[0]?.messageId).toBe("C1:1.000");
@@ -417,7 +419,7 @@ test("Slack failed edit stays queued until a fresh client acknowledges it", asyn
 	try {
 		const bad = new Gateway();
 		bad.failure = new Error("Slack offline");
-		const gateway = new ReconnectingGateway("/tmp/slack-not-connected.sock", new Api(), bad);
+		const gateway = liveGateway("/tmp/slack-not-connected.sock", new Api(), bad);
 		gateway.sendEdit("C1:1.000", origin, "edit", engagement);
 		await flush();
 		expect(gateway.pendingEdits).toHaveLength(1);
@@ -440,7 +442,7 @@ test("Slack LRU refreshes duplicates and gateway never re-sends a duplicate mess
 	lru.addIfAbsent("c");
 	expect(lru.addIfAbsent("b")).toBe(true);
 	const client = new Gateway();
-	const gateway = new ReconnectingGateway("unused", new Api(), client);
+	const gateway = liveGateway("unused", new Api(), client);
 	await gateway.requestInbound("C1:1.000", origin, "hi", engagement);
 	expect(await gateway.requestInbound("C1:1.000", origin, "hi", engagement)).toBeUndefined();
 	expect(client.requests).toHaveLength(1);
@@ -693,7 +695,7 @@ test("Slack reaction request rejection does not reconnect the healthy client", a
 	const log = spyOn(console, "error").mockImplementation(() => {});
 	try {
 		const client = new Gateway();
-		const gateway = new ReconnectingGateway("unused", new Api(), client);
+		const gateway = liveGateway("unused", new Api(), client);
 		client.failure = new Error("Slack metadata rejected");
 		gateway.sendReaction({ origin, targetMessageId: "C1:1.000", emoji: "👍", action: "add", engagement });
 		await flush();
@@ -714,7 +716,7 @@ test("Slack subscription and adopted client handlers unsubscribe cleanly", async
 	expect(api.posts).toHaveLength(1);
 	off();
 	expect(client.handlers.size).toBe(0);
-	const gateway = new ReconnectingGateway("unused", api, client);
+	const gateway = liveGateway("unused", api, client);
 	const seen: ChatMessagePayload[] = [];
 	const unlisten = gateway.onChatMessage((message) => seen.push(message));
 	for (const handler of client.handlers) handler(delivery({ deliveryId: undefined }));
@@ -732,46 +734,38 @@ test("Slack monitor tolerates two strikes and reconnects on the third", () => {
 });
 
 test("Slack adapter stop clears monitor and reconnect timers", async () => {
-	const logs: string[] = [];
-	const originalLog = console.log;
-	console.log = (message: unknown) => {
-		logs.push(String(message));
-		originalLog.call(console, message);
-	};
+	// Observe this gateway's own reconnect attempts. Earlier tests leave adapters
+	// whose default-backoff reconnect logs land in this window on a slow runner, so
+	// a shared console.log count is not evidence about this instance.
+	const log = spyOn(console, "log").mockImplementation(() => {});
 	try {
-		// Create a gateway with short monitor intervals and reconnect delay for testing
-		const api = new Api();
-		const gateway = new ReconnectingGateway(
+		const gateway = liveGateway(
 			"/tmp/unused.sock",
-			api,
+			new Api(),
 			undefined,
 			undefined,
 			undefined,
-			{ healthy: 10, degraded: 5 }, // Short monitor intervals for testing
-			10, // 10ms base reconnect delay (fast enough to fire during test)
+			{ healthy: 10, degraded: 5 },
+			10,
 		);
-		const testClient = new Gateway();
-		// Make status requests fail to trigger reconnect after 3 strikes
-		testClient.failure = new Error("status failed");
-		// Adopt client to start monitor
-		gateway.adoptClient(testClient);
-		// Wait long enough for monitor to fire multiple times and trigger first reconnect
-		// (10ms interval * 3 strikes = 30ms, plus time for reconnect to trigger)
-		await Bun.sleep(40);
-		// Verify timer is actually running by confirming at least one reconnect message
-		const beforeStop = logs.filter((line) => line.includes("Slack adapter gateway reconnecting")).length;
-		expect(beforeStop).toBeGreaterThan(0);
-		// Now stop the gateway (should clear timers)
+		const connect = spyOn(gateway, "connect");
+		const client = new Gateway();
+		client.failure = new Error("status failed");
+		gateway.adoptClient(client);
+		// Three failed status probes schedule a reconnect; its timer firing proves
+		// both timers ran before stop.
+		const deadline = Date.now() + 5_000;
+		while (connect.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(1);
+		expect(connect.mock.calls.length).toBeGreaterThan(0);
 		gateway.stop();
-		// Wait long enough for timers to have fired multiple times if not stopped
-		// (10ms reconnect delay, so 50ms gives time for ~5+ reconnect cycles if timer continues)
-		await Bun.sleep(50);
-		// Verify no additional reconnecting messages after stop
-		const afterStop = logs.filter((line) => line.includes("Slack adapter gateway reconnecting")).length;
-		// Confirm no new reconnecting messages appeared after stop
-		expect(afterStop).toBe(beforeStop);
+		const connects = connect.mock.calls.length;
+		const probes = client.requests.length;
+		// Several reconnect (10-20ms) and monitor (5-10ms) periods.
+		await Bun.sleep(100);
+		expect(connect.mock.calls.length).toBe(connects);
+		expect(client.requests.length).toBe(probes);
 	} finally {
-		console.log = originalLog;
+		log.mockRestore();
 	}
 });
 
