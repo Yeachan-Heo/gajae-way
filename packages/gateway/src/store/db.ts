@@ -580,6 +580,11 @@ export interface InboundMessageRow {
 /** Why a closed turn has no terminal delivery; recorded as `{"none": reason}`. */
 export type TerminalUnlinkedReason = "silent" | "loopback" | "turn_failed" | "retired" | "no_delivery";
 
+/** Meta key prefix of the per-origin failed-turn markers that `/new` carries over (#409). */
+function failedTurnKeyPrefix(originKey: string): string {
+	return `turn-failed:${originKey}:`;
+}
+
 /** Delivery ids that answered a turn, from its `terminal_delivery_id` JSON; empty for a sentinel or NULL. */
 export function terminalDeliveryIds(json: string | null): string[] {
 	if (!json) return [];
@@ -2534,22 +2539,6 @@ export class GatewayDatabase {
 	}
 
 	/**
-	 * The timestamp of the most recent trigger message whose turn was successfully answered
-	 * (has a terminal_delivery_id and turn_state = 'done'). Used to determine the floor when resetting a session,
-	 * so that unanswered messages (whose turns failed) remain visible to the next epoch.
-	 * Returns undefined if no successfully answered message exists.
-	 */
-	inboundLastSuccessfulAnswerAt(originKey: string): string | undefined {
-		return (
-			this.#database
-				.query<{ received_at: string | null }, [string]>(
-					"SELECT received_at FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' AND turn_state = 'done' AND terminal_delivery_id IS NOT NULL ORDER BY received_at DESC LIMIT 1",
-				)
-				.get(originKey)?.received_at ?? undefined
-		);
-	}
-
-	/**
 	 * Claims one terminal reply slot (`part`) of a turn for `deliveryId`. The
 	 * trigger row stores the claims as a JSON map of part -> delivery id.
 	 * Returns the id that owns the slot after the call: the claimant's when the
@@ -3226,56 +3215,90 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** Establishes a durable reset floor and expires every pre-floor unread row. */
-	contextSetFloor(originKey: string, floorAt = new Date().toISOString()): void {
-		const floorRowId =
-			this.#database
-				.query<{ row_id: number }, [string]>(
-					"SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?",
-				)
-				.get(originKey)?.row_id ?? 0;
-		const expired = this.#contextAggregate(
-			"origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)",
-			[originKey, floorAt, floorRowId],
-		);
-		if (expired.count > 0)
-			this.#database
-				.query(
-					"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)",
-				)
-				.run(floorAt, originKey, floorAt, floorRowId);
-		this.#database
-			.query(
-				"INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at, floor_row_id = excluded.floor_row_id",
-			)
-			.run(originKey, floorAt, floorRowId);
-		this.#recordContextOmissions(originKey, expired, { count: 0, oldest: null, newest: null }, floorAt);
+	/** Records that a turn ended in failure, so a later `/new` can carry its unanswered messages (#409). */
+	markTurnFailed(originKey: string, opRef: string, at = new Date().toISOString()): void {
+		this.metaSet(`${failedTurnKeyPrefix(originKey)}${opRef}`, at);
 	}
 
 	/**
-	 * Sets the floor based on the last successfully answered message.
-	 * This preserves unanswered messages (whose turns failed) in the next epoch
-	 * while excluding messages that were already successfully answered.
+	 * Establishes a durable reset floor and expires every pre-floor unread row,
+	 * except the unanswered tail: the messages of turns that failed after the
+	 * origin's last answered turn (each trigger plus the messages steered into
+	 * it), within the unread relevance window. A `/new` issued because turns kept
+	 * failing must not erase the asks those turns never answered (#409). Carried
+	 * rows are made unread again (a `[turn failed]` notice is not an answer), the
+	 * floor sits just below the oldest of them, and every other pre-floor row is
+	 * still expired. Failure markers for the origin are consumed here.
 	 */
-	contextSetFloorPreservingUnanswered(originKey: string, fallbackFloor = new Date().toISOString()): void {
-		const floorRowId =
+	contextSetFloor(originKey: string, floorAt = new Date().toISOString()): void {
+		const maxRowId =
 			this.#database
 				.query<{ row_id: number }, [string]>(
 					"SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?",
 				)
 				.get(originKey)?.row_id ?? 0;
-
-		// Find the last message whose turn was successfully answered (has terminal_delivery_id)
-		const lastAnswered = this.inboundLastSuccessfulAnswerAt(originKey);
-
-		// Set floor to the last answered message's received_at time, or fallback to current time
-		const floorAt = lastAnswered ?? fallbackFloor;
-
+		const carriedIds = this.#unansweredTailRowIds(originKey, floorAt);
+		const keep = carriedIds.length > 0 ? ` AND rowid NOT IN (${carriedIds.map(() => "?").join(",")})` : "";
+		const expireWhere = `origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)${keep}`;
+		const expireParams = [originKey, floorAt, maxRowId, ...carriedIds];
+		const expired = this.#contextAggregate(expireWhere, expireParams);
+		if (expired.count > 0)
+			this.#database
+				.query(`UPDATE conversation_context SET consumed_at = ? WHERE ${expireWhere}`)
+				.run(floorAt, ...expireParams);
+		const oldestCarried = carriedIds[0];
+		let stateFloorAt = floorAt;
+		let stateFloorRowId = maxRowId;
+		if (oldestCarried !== undefined) {
+			this.#database
+				.query(
+					`UPDATE conversation_context SET consumed_at = NULL WHERE rowid IN (${carriedIds.map(() => "?").join(",")})`,
+				)
+				.run(...carriedIds);
+			stateFloorAt =
+				this.#database
+					.query<{ received_at: string }, [number]>("SELECT received_at FROM conversation_context WHERE rowid = ?")
+					.get(oldestCarried)?.received_at ?? floorAt;
+			stateFloorRowId = oldestCarried - 1;
+		}
+		const prefix = failedTurnKeyPrefix(originKey);
+		this.#database.query("DELETE FROM meta WHERE key >= ? AND key < ?").run(prefix, `${prefix}\uffff`);
 		this.#database
 			.query(
 				"INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at, floor_row_id = excluded.floor_row_id",
 			)
-			.run(originKey, floorAt, floorRowId);
+			.run(originKey, stateFloorAt, stateFloorRowId);
+		this.#recordContextOmissions(originKey, expired, { count: 0, oldest: null, newest: null }, floorAt);
+	}
+
+	/** Context rowids (ascending) of failed turns after the last answered turn, inside the relevance window. */
+	#unansweredTailRowIds(originKey: string, floorAt: string): number[] {
+		const prefix = failedTurnKeyPrefix(originKey);
+		const failedOps = new Set(
+			this.#database
+				.query<{ key: string }, [string, string]>("SELECT key FROM meta WHERE key >= ? AND key < ?")
+				.all(prefix, `${prefix}\uffff`)
+				.map((row) => row.key.slice(prefix.length)),
+		);
+		if (failedOps.size === 0) return [];
+		const relevanceCutoff = new Date(Date.parse(floorAt) - CONVERSATION_DIFF_MAX_AGE_MS).toISOString();
+		const triggers = this.#database
+			.query<{ turn_op_ref: string }, [string, string, string]>(
+				"SELECT turn_op_ref FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' AND state = 'done' AND turn_op_ref IS NOT NULL AND received_at >= ? AND received_at < ? ORDER BY received_at, rowid",
+			)
+			.all(originKey, relevanceCutoff, floorAt);
+		const carryOps: string[] = [];
+		for (const { turn_op_ref: opRef } of triggers) {
+			if (failedOps.has(opRef)) carryOps.push(opRef);
+			else carryOps.length = 0;
+		}
+		if (carryOps.length === 0) return [];
+		return this.#database
+			.query<{ row_id: number }, (string | number)[]>(
+				`SELECT c.rowid AS row_id FROM conversation_context c WHERE c.origin_key = ? AND c.received_at >= ? AND c.received_at < ? AND c.message_id IN (SELECT message_id FROM inbound_messages WHERE origin_key = ? AND turn_op_ref IN (${carryOps.map(() => "?").join(",")})) ORDER BY c.rowid`,
+			)
+			.all(originKey, relevanceCutoff, floorAt, originKey, ...carryOps)
+			.map((row) => row.row_id);
 	}
 
 	/** Commits a successful/duplicate-safe turn cursor and acknowledges its omission notice atomically. */

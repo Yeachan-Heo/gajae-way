@@ -310,7 +310,6 @@ export class PersonaSessionManager {
 	 * `/new` is a mailbox transition: idle work bumps immediately; a running turn
 	 * is first accepted, then retired and permanently fenced. The new epoch
 	 * returns to idle while the old turn remains a terminal-only hold.
-	 * The floor is set to preserve unanswered messages (whose turns failed).
 	 */
 	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
@@ -613,8 +612,7 @@ class OriginActor {
 		let discarded: string[] = [];
 		this.#manager.database.withTransaction(() => {
 			nextEpoch = this.#manager.database.bumpEpoch(this.originKey, originRefJson);
-			// Set floor to preserve unanswered messages whose turns failed
-			this.#manager.database.contextSetFloorPreservingUnanswered(this.originKey, floorAt);
+			this.#manager.database.contextSetFloor(this.originKey, floorAt);
 			discarded = this.#manager.database.inboundDiscardBefore(this.originKey, floorAt);
 			this.#manager.database.clearFailedTurnResetCap(this.originKey);
 		});

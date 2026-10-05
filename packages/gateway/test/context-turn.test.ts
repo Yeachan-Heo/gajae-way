@@ -535,71 +535,68 @@ test("gateway startup prunes old consumed context even when the database was qui
 	client.close();
 });
 
-test("issue #409: unanswered messages whose turns failed remain visible after /new reset", async () => {
+function unreadBlock(text: string): string {
+	const start = text.indexOf("[Unread messages in this conversation since your last reply]");
+	if (start < 0) return "";
+	const end = text.indexOf("\n\n", start);
+	return text.slice(start, end < 0 ? undefined : end);
+}
+
+test("issue #409: /new carries the messages of turns that failed after the last answer", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	const preambles: string[] = [];
+	const texts: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
-		respond: async (_session, text, preamble) => {
-			preambles.push(preamble ?? "");
-			// Fail turns that contain "fail" in the text
-			if (text.includes("fail")) throw new Error("intentional failure");
+		respond: async (_session, text) => {
+			texts.push(text);
+			if (text.includes("will fail")) throw new Error("intentional failure");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const reset = async (id: string) => {
+		send(client, id, "/new");
+		await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === id));
+	};
+
+	send(client, "msg1", "message one - answered");
+	await waitUntil(() => texts.length === 1);
+	await reset("reset-1");
+	send(client, "msg2", "message two - will fail");
+	await waitUntil(() => texts.length === 2);
+	await waitUntil(() => client.frames.some((frame) => JSON.stringify(frame).includes("[turn failed]")));
+	await reset("reset-2");
+	send(client, "msg3", "message three - after reset");
+	await waitUntil(() => texts.length === 3);
+
+	const unread = unreadBlock(texts[2]!);
+	expect(unread).toContain("message two - will fail");
+	expect(unread).not.toContain("message one - answered");
+	expect(texts[2]).not.toContain("expired outside floor");
+	client.close();
+});
+
+test("issue #409: /new after every turn was answered carries nothing", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
 			return "ok";
 		},
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 
-	// Send a successful turn
-	send(client, "msg1", "message one - will succeed");
-	await waitUntil(() => preambles.length === 1);
-
-	// Send a turn that will fail
-	send(client, "msg2", "message two - will fail");
-	await waitUntil(() => preambles.length === 2);
-
-	// Reset the session
-	send(client, "reset-command", "/new");
-	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
-
-	// Send a new turn in the new epoch
-	send(client, "msg3", "message three - after reset");
-	await waitUntil(() => preambles.length === 3);
-
-	// The third preamble should contain msg2 (unanswered) but not msg1 (already answered)
-	const thirdPreamble = preambles[2];
-	expect(thirdPreamble).toContain("msg2");
-	expect(thirdPreamble).not.toContain("msg1");
-	client.close();
-});
-
-test("issue #409: reset after everything was answered excludes all previous messages", async () => {
-	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	const preambles: string[] = [];
-	const sessionPort = sessionPortFromScript({
-		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
-		respond: async (_session, _text, preamble) => {
-			preambles.push(preamble ?? "");
-			return "ok"; // All turns succeed
-		},
-	});
-	const { client } = await start(gatewayConfig, database, sessionPort);
-
-	// Send a successful turn
 	send(client, "msg1", "message one");
-	await waitUntil(() => preambles.length === 1);
-
-	// Reset the session
+	await waitUntil(() => texts.length === 1);
 	send(client, "reset-command", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
-
-	// Send a new turn in the new epoch
 	send(client, "msg2", "message two - after reset");
-	await waitUntil(() => preambles.length === 2);
+	await waitUntil(() => texts.length === 2);
 
-	// The second preamble should NOT contain msg1 (it was already answered)
-	const secondPreamble = preambles[1];
-	expect(secondPreamble).not.toContain("msg1");
+	expect(unreadBlock(texts[1]!)).toBe("");
 	client.close();
 });
