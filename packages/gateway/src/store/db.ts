@@ -612,7 +612,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 31;
+const LATEST_SCHEMA_VERSION = 32;
 
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
@@ -2946,7 +2946,6 @@ export class GatewayDatabase {
 				row.body,
 				row.receivedAt ?? new Date().toISOString(),
 			);
-		if (inserted.changes > 0) this.contextMaintain();
 	}
 
 	/**
@@ -2985,9 +2984,16 @@ export class GatewayDatabase {
 				expired += group.count;
 			}
 			const deleteCutoff = new Date(now.getTime() - retentionMs).toISOString();
-			const deleted = this.#database
-				.query("DELETE FROM conversation_context WHERE consumed_at IS NOT NULL AND received_at < ?")
-				.run(deleteCutoff).changes;
+			let deleted = 0;
+			while (true) {
+				const batch = this.#database
+					.query(
+						"DELETE FROM conversation_context WHERE rowid IN (SELECT rowid FROM conversation_context WHERE consumed_at IS NOT NULL AND received_at < ? LIMIT ?)",
+					)
+					.run(deleteCutoff, RETENTION_BATCH_ROWS).changes;
+				deleted += batch;
+				if (batch < RETENTION_BATCH_ROWS) break;
+			}
 			return { expired, deleted };
 		});
 	}
@@ -5288,6 +5294,18 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(31, new Date().toISOString());
+			});
+		}
+		if (current < 32) {
+			// Issue #367: Add index to conversation_context (consumed_at, received_at) to support
+			// efficient batched retention DELETE and unconsumed GROUP BY scan in contextMaintain().
+			this.withTransaction(() => {
+				this.#database.exec(
+					"CREATE INDEX IF NOT EXISTS conversation_context_retention ON conversation_context (consumed_at, received_at)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(32, new Date().toISOString());
 			});
 		}
 	}

@@ -399,7 +399,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		if (report.mode !== "apply") throw new Error("wrong mode");
 		expect(report.census.schema).toBe(21);
 		expect(report.backup.schema).toBe(21);
-		expect(report.targetSchema).toBe(31);
+		expect(report.targetSchema).toBe(32);
 		const backup = new Database(f.backup, { readonly: true });
 		try {
 			expect(backup.query("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 21 });
@@ -409,7 +409,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		}
 		const database = await GatewayDatabase.open(f.path);
 		try {
-			expect(database.schemaVersion).toBe(31);
+			expect(database.schemaVersion).toBe(32);
 			expect(database.inspectBrokerAuthority().authority).toEqual(report.targetAuthority);
 		} finally {
 			database.close();

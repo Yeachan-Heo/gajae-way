@@ -36,7 +36,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(31);
+		expect(database.schemaVersion).toBe(32);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -99,7 +99,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(31);
+		expect(upgraded.schemaVersion).toBe(32);
 
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
@@ -147,7 +147,7 @@ DELETE FROM schema_migrations WHERE version > 12;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(31);
+		expect(upgraded.schemaVersion).toBe(32);
 
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
@@ -194,7 +194,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(31);
+		expect(upgraded.schemaVersion).toBe(32);
 
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
@@ -250,7 +250,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(31);
+	expect(upgraded.schemaVersion).toBe(32);
 
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
@@ -262,7 +262,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await GatewayDatabase.open(path);
-		expect(latest.schemaVersion).toBe(31);
+		expect(latest.schemaVersion).toBe(32);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
 		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
@@ -301,7 +301,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(31);
+		expect(upgraded.schemaVersion).toBe(32);
 
 		const after = new Database(path, { readonly: true });
 		const columns = after
@@ -421,7 +421,7 @@ DELETE FROM schema_migrations WHERE version > 23;
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(31);
+		expect(upgraded.schemaVersion).toBe(32);
 
 		expect(upgraded.monitorRows()[0]).toMatchObject({ monitor_id: "m1", overlap: "queue" });
 		expect(upgraded.monitorEventRows("m1")[0]).toMatchObject({
@@ -464,7 +464,7 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(31);
+		expect(upgraded.schemaVersion).toBe(32);
 		upgraded.close();
 
 		const after = new Database(path, { readonly: true });
