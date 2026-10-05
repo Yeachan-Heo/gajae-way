@@ -14,6 +14,7 @@ import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import {
+	laneLastCommits,
 	laneSystemNotice,
 	reportText,
 	utf8Prefix,
@@ -715,28 +716,78 @@ test("one inconsistent runtime is logged with its opRef and does not block other
 
 	await expect(f.restart()).resolves.toBeDefined();
 	await until(() => recoveredOther);
-	let failure: unknown;
-	try {
-		f.db.workAttemptGet(bad.opRef);
-	} catch (error) {
-		failure = error;
-	}
-	expect(failure).toBeInstanceOf(WorkAttemptStateError);
-	expect(failure).toMatchObject({
-		opRef: bad.opRef,
-		assertion: "attempt.endedAt matches runtime.settledAt",
+
+	// Verify that the invalid attempt was logged and then quarantined
+	const errorLogged = errors.mock.calls.some((call) => {
+		const line = String(call[0]);
+		return (
+			line.includes("work_recovery_invalid_attempt") &&
+			line.includes(bad.opRef) &&
+			line.includes("attempt.endedAt matches runtime.settledAt")
+		);
 	});
-	expect((failure as Error).message).toContain(`opRef=${JSON.stringify(bad.opRef)}`);
-	expect(
-		errors.mock.calls.some((call) => {
-			const line = String(call[0]);
-			return (
-				line.includes("work_recovery_invalid_attempt") &&
-				line.includes(bad.opRef) &&
-				line.includes("attempt.endedAt matches runtime.settledAt")
-			);
-		}),
-	).toBe(true);
+	expect(errorLogged).toBe(true);
+
+	// Verify that the attempt is quarantined: it should not be queried in recovery
+	const isQuarantined = f.db.isBrokerQuarantined("work", f.db.workAttemptJobId(bad.opRef)!);
+	expect(isQuarantined).toBe(true);
+	f.port.complete(good.opRef, "recovered other lane");
+	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt !== null);
+});
+
+test("an inconsistent runtime is quarantined and not re-logged on subsequent recovery calls (issue #407)", async () => {
+	const f = await fixture();
+	const bad = await started(f, "a");
+	const good = await started(f, "b");
+	await f.manager.stop();
+	const endedAt = new Date(Date.now() + 1_000).toISOString();
+	const closed = closeAttempt({
+		record: f.job("a"),
+		opRef: bad.opRef,
+		endState: "attempt_ended",
+		errorCode: "host_lost",
+		endedAt,
+	});
+	const identity = laneJobIdentity("a");
+	f.db.putLaneJob({ ...closed, laneKey: identity.laneKey, json: JSON.stringify(closed) });
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	let recoveredOther = false;
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		if (input.opRef === good.opRef) recoveredOther = true;
+		return status(input);
+	};
+
+	await expect(f.restart()).resolves.toBeDefined();
+	await until(() => recoveredOther);
+
+	// Verify that the invalid attempt was logged
+	const errorLogged = errors.mock.calls.some((call) => {
+		const line = String(call[0]);
+		return (
+			line.includes("work_recovery_invalid_attempt") &&
+			line.includes(bad.opRef) &&
+			line.includes("attempt.endedAt matches runtime.settledAt")
+		);
+	});
+	expect(errorLogged).toBe(true);
+
+	const badJobId = f.db.workAttemptJobId(bad.opRef)!;
+	// Verify that the attempt's job was quarantined
+	expect(f.db.isBrokerQuarantined("work", badJobId)).toBe(true);
+
+	// Verify that recovery doesn't re-log the same error on subsequent calls
+	const errorCountBefore = errors.mock.calls.length;
+	await f.manager.recover();
+	const errorCountAfter = errors.mock.calls.length;
+	// Should not have new work_recovery_invalid_attempt logs
+	const newInvalidLogs = [...errors.mock.calls.slice(errorCountBefore)].filter((call) => {
+		const line = String(call[0]);
+		return line.includes("work_recovery_invalid_attempt") && line.includes(bad.opRef);
+	});
+	expect(newInvalidLogs.length).toBe(0);
+
 	f.port.complete(good.opRef, "recovered other lane");
 	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt !== null);
 });
@@ -2025,4 +2076,32 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 	expect(notice).not.toContain("secret");
 	expect(notice).not.toContain("private");
 	expect(notice).not.toContain("authentication");
+});
+
+test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {
+	const repo = await mkdtemp(join(tmpdir(), "lane-commit-"));
+	const missing = join(repo, "does-not-exist");
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repo, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "t",
+					GIT_AUTHOR_EMAIL: "t@t",
+					GIT_COMMITTER_NAME: "t",
+					GIT_COMMITTER_EMAIL: "t@t",
+				},
+			});
+		git("init", "-q");
+		git("commit", "-q", "--allow-empty", "-m", "lane head");
+		const spawn = spyOn(Bun, "spawn");
+		const commits = await laneLastCommits([repo, missing, repo, repo], 2);
+		expect(spawn).toHaveBeenCalledTimes(2);
+		spawn.mockRestore();
+		expect(commits.get(repo)?.subject).toBe("lane head");
+		expect(commits.get(repo)?.sha).toMatch(/^[0-9a-f]{40}$/);
+		expect(commits.get(missing)).toBeNull();
+	} finally {
+		await rm(repo, { recursive: true, force: true });
+	}
 });
