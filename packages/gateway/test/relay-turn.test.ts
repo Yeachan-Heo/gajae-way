@@ -586,3 +586,19 @@ test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: â
 	expect(error).toBeInstanceOf(RelayRefusedError);
 	expect((error as RelayRefusedError).code).toBe("session_unavailable");
 });
+
+test("stream ending without hello fails fast (#410)", async () => {
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const runner$1 = runner(() => relay, { helloTimeoutMs: 5_000 });
+	const attach = runner$1.attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+	// End the stream without sending hello - should fail fast
+	relay.end();
+	const started = Date.now();
+	const error = await attach.catch((e: unknown) => e);
+	const elapsed = Date.now() - started;
+	expect(error).toBeInstanceOf(Error);
+	const message = (error as Error).message;
+	expect(message).toMatch(/host hello did not arrive after \d+ms \(stream_ended\)/);
+	// Should fail much faster than the hello timeout (5 seconds)
+	expect(elapsed).toBeLessThan(1_000);
+}, 10_000);
