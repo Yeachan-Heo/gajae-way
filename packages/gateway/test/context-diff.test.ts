@@ -8,6 +8,7 @@ import {
 	CONVERSATION_DIFF_MAX_AGE_MS,
 	CONVERSATION_DIFF_MAX_ROWS,
 	GatewayDatabase,
+	RETENTION_BATCH_ROWS,
 } from "../src/store/db";
 
 const ORIGIN_KEY = "discord/channel/context-diff";
@@ -198,4 +199,48 @@ test("recentInbound reads people's messages oldest-first and consumes nothing", 
 	// A reset floor hides everything before it.
 	db.contextSetFloor(ORIGIN_KEY, new Date(NOW.getTime() - 1_500).toISOString());
 	expect(db.recentInbound(ORIGIN_KEY, 10, since).length).toBe(0);
+});
+
+test("batched DELETE processes many consumed rows correctly", async () => {
+	const db = await open();
+	const now = new Date();
+
+	// Create more than RETENTION_BATCH_ROWS rows to test batching in the DELETE phase.
+	// These are older than CONVERSATION_DIFF_MAX_AGE_MS so they'll be expired,
+	// and older than CONVERSATION_CONTEXT_RETENTION_MS so they'll be deleted in batches.
+	const staleCount = RETENTION_BATCH_ROWS * 2 + 100;
+	const staleTimestamp = new Date(now.getTime() - CONVERSATION_CONTEXT_RETENTION_MS - 60_000).toISOString();
+	for (let i = 0; i < staleCount; i++) {
+		record(db, `stale-${String(i).padStart(5, "0")}`, `will-be-deleted-${i}`, staleTimestamp);
+	}
+
+	// Create row that is old enough to expire but not old enough to delete.
+	// Must be > 6 hours old (to expire) but < 7 days old (to not be deleted).
+	const expiredButKeptTimestamp = new Date(
+		now.getTime() - CONVERSATION_DIFF_MAX_AGE_MS - 60_000, // 6 hours + 1 min
+	).toISOString();
+	record(db, "expired-kept", "gets expired but stays within retention", expiredButKeptTimestamp);
+
+	// Call contextMaintain
+	const result = db.contextMaintain(now);
+
+	// All stale rows (older than 7 days) should be deleted
+	expect(result.deleted).toBe(staleCount);
+	// Rows expired include both stale and expired-kept
+	expect(result.expired).toBe(staleCount + 1);
+
+	// contextUnread returns only unconsumed rows (consumed_at IS NULL)
+	// All our rows are either deleted or expired (consumed_at IS NOT NULL)
+	const remaining = db.contextUnread(ORIGIN_KEY);
+	expect(remaining.length).toBe(0);
+
+	// Raw query should show 1 row: the expired-kept row (expired but not deleted)
+	const raw = new Database(join(directory, "gateway.db"), { readonly: true });
+	const count = raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM conversation_context").get()?.n;
+	const consumed = raw
+		.query<{ message_id: string }, []>("SELECT message_id FROM conversation_context WHERE consumed_at IS NOT NULL")
+		.all();
+	raw.close();
+	expect(count).toBe(1);
+	expect(consumed[0]?.message_id).toBe("expired-kept");
 });
