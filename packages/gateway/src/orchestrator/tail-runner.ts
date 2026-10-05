@@ -145,6 +145,7 @@ export interface TailRunnerOptions {
 	readonly idleTtlMs?: number;
 	readonly stallTimeoutMs?: number;
 	readonly requestTimeoutMs?: number;
+	readonly helloTimeoutMs?: number;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
 	readonly log?: (line: string, level?: LogLevel) => void;
@@ -210,6 +211,7 @@ export class TailRunner {
 	readonly #idleTtlMs: number;
 	#stallTimeoutMs: number;
 	readonly #requestTimeoutMs: number;
+	#helloTimeoutMs: number;
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #log: (line: string, level?: LogLevel) => void;
@@ -224,6 +226,7 @@ export class TailRunner {
 		this.#idleTtlMs = positiveInteger(options.idleTtlMs, DEFAULT_IDLE_TTL_MS, "idleTtlMs");
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, "requestTimeoutMs");
+		this.#helloTimeoutMs = positiveInteger(options.helloTimeoutMs, HELLO_TIMEOUT_MS, "helloTimeoutMs");
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
@@ -247,6 +250,10 @@ export class TailRunner {
 
 	get requestTimeoutMs(): number {
 		return this.#requestTimeoutMs;
+	}
+
+	get helloTimeoutMs(): number {
+		return this.#helloTimeoutMs;
 	}
 
 	get streamSpawner(): TailStreamSpawner {
@@ -506,24 +513,34 @@ class ManagedTailHandle implements TailHandle {
 			this.#stream = stream;
 			this.#refusal = undefined;
 			const openedAt = this.#runner.now();
+			let streamEnded = false;
 			const hello = new Promise<void>((resolve) => {
 				this.#helloResolve = resolve;
 			});
-			const helloTimer = setTimeout(() => this.#helloResolve?.(), HELLO_TIMEOUT_MS);
+			const helloTimer = setTimeout(() => this.#helloResolve?.(), this.#runner.helloTimeoutMs);
 			try {
 				const consume = (async () => {
-					for await (const line of stream.lines) {
-						if (this.#closed) break;
-						this.#receiveLine(line);
+					try {
+						for await (const line of stream.lines) {
+							if (this.#closed) break;
+							this.#receiveLine(line);
+						}
+					} finally {
+						streamEnded = true;
+						// The relay ended: whether or not hello arrived, nobody is waiting on it any more.
+						// If stream ended without hello or refusal, this resolves the hello promise and fails immediately.
+						this.#helloResolve?.();
 					}
-					// The relay ended: whether or not hello arrived, nobody is waiting on it any more.
-					this.#helloResolve?.();
 				})();
 				stream.write(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [...HELLO_CAPABILITIES] }));
 				await hello;
 				clearTimeout(helloTimer);
 				if (this.#refusal) throw this.#refusal;
-				if (!this.#connectionId) throw new Error("host hello did not arrive");
+				if (!this.#connectionId) {
+					const elapsedMs = this.#runner.now() - openedAt;
+					const childState = streamEnded ? "stream_ended" : "stream_open";
+					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
+				}
 				if (!this.#ready) {
 					this.#ready = true;
 					this.#readyResolve();
