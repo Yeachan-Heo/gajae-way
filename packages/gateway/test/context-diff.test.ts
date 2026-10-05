@@ -209,16 +209,9 @@ test("batched DELETE processes many consumed rows correctly", async () => {
 	// These are older than CONVERSATION_DIFF_MAX_AGE_MS so they'll be expired,
 	// and older than CONVERSATION_CONTEXT_RETENTION_MS so they'll be deleted in batches.
 	const staleCount = RETENTION_BATCH_ROWS * 2 + 100;
-	const staleTimestamp = new Date(
-		now.getTime() - CONVERSATION_CONTEXT_RETENTION_MS - 60_000,
-	).toISOString();
+	const staleTimestamp = new Date(now.getTime() - CONVERSATION_CONTEXT_RETENTION_MS - 60_000).toISOString();
 	for (let i = 0; i < staleCount; i++) {
-		record(
-			db,
-			`stale-${String(i).padStart(5, "0")}`,
-			`will-be-deleted-${i}`,
-			staleTimestamp,
-		);
+		record(db, `stale-${String(i).padStart(5, "0")}`, `will-be-deleted-${i}`, staleTimestamp);
 	}
 
 	// Create row that is old enough to expire but not old enough to delete.
