@@ -2542,6 +2542,9 @@ async function createInboundTurnLifecycle(
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);
+			// Nothing answered this turn: a later `/new` must carry its messages (#409).
+			if (nonLoopback && !recoveredText && !assistantDeliveryStarted)
+				options.database.markTurnFailed(key, input.turn.opRef);
 			// The turn wrote its answer before it failed (#210): deliver it through
 			// the ordinary terminal slot. It then counts as a visible reply, and the
 			// failure stays in the operator log instead of replacing the answer.

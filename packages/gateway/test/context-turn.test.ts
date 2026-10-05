@@ -534,3 +534,69 @@ test("gateway startup prunes old consumed context even when the database was qui
 	inspected.close();
 	client.close();
 });
+
+function unreadBlock(text: string): string {
+	const start = text.indexOf("[Unread messages in this conversation since your last reply]");
+	if (start < 0) return "";
+	const end = text.indexOf("\n\n", start);
+	return text.slice(start, end < 0 ? undefined : end);
+}
+
+test("issue #409: /new carries the messages of turns that failed after the last answer", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			if (text.includes("will fail")) throw new Error("intentional failure");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const reset = async (id: string) => {
+		send(client, id, "/new");
+		await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === id));
+	};
+
+	send(client, "msg1", "message one - answered");
+	await waitUntil(() => texts.length === 1);
+	await reset("reset-1");
+	send(client, "msg2", "message two - will fail");
+	await waitUntil(() => texts.length === 2);
+	await waitUntil(() => client.frames.some((frame) => JSON.stringify(frame).includes("[turn failed]")));
+	await reset("reset-2");
+	send(client, "msg3", "message three - after reset");
+	await waitUntil(() => texts.length === 3);
+
+	const unread = unreadBlock(texts[2]!);
+	expect(unread).toContain("message two - will fail");
+	expect(unread).not.toContain("message one - answered");
+	expect(texts[2]).not.toContain("expired outside floor");
+	client.close();
+});
+
+test("issue #409: /new after every turn was answered carries nothing", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+
+	send(client, "msg1", "message one");
+	await waitUntil(() => texts.length === 1);
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+	send(client, "msg2", "message two - after reset");
+	await waitUntil(() => texts.length === 2);
+
+	expect(unreadBlock(texts[1]!)).toBe("");
+	client.close();
+});
