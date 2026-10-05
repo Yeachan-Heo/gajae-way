@@ -607,7 +607,12 @@ export interface PromptStatusBody {
 	readonly startedAt?: number;
 	readonly terminalAt?: number;
 	readonly receiptState?: "absent" | "present" | "missing" | "unknown";
-	readonly outcome?: { readonly kind?: string; readonly reason?: string; readonly provenance?: string };
+	readonly outcome?: {
+		readonly kind?: string;
+		readonly reason?: string;
+		readonly provenance?: string;
+		readonly failureCauseDiagnostic?: string;
+	};
 	/** Gateway-filtered safe failure codes/messages, never raw SDK exceptions. */
 	readonly error?: { readonly code?: string; readonly message?: string };
 }

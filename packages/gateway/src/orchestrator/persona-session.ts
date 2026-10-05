@@ -2788,12 +2788,14 @@ function terminalError(
 /** The runtime's bounded failure classifiers, for the operator log only. */
 function terminalFailureDiagnosis(status: StatusReport): string {
 	const outcome = status.status.outcome;
+	const failure = status.status.error;
 	const fields: [string, string | undefined][] = [
-		["code", status.status.error?.code ?? outcome?.code],
-		["provider_code", outcome?.providerCode],
+		["code", failure?.code ?? outcome?.code],
+		["provider_code", outcome?.providerCode ?? failure?.code],
 		["phase", outcome?.phase],
 		["category", outcome?.category],
 		["provenance", outcome?.provenance],
+		["cause", outcome?.failureCauseDiagnostic ?? failure?.message ?? outcome?.message],
 	];
 	return fields
 		.map(([name, value]) => `${name}=${(value === undefined ? "" : sanitizeDiagnostic(value)) || "unknown"}`)
