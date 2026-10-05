@@ -78,7 +78,7 @@ import {
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
-import { laneLastCommit, WorkLaneManager } from "../orchestrator/work-lane";
+import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import {
@@ -1071,12 +1071,17 @@ async function handleRequest(
 			const laneByKey = new Map(
 				options.database.workLaneRows().map((lane) => [`work-${lane.origin_key.slice("work/task/".length)}`, lane]),
 			);
-			const jobs = options.database.laneJobRows(true).map((row) => {
+			const jobRows = options.database.laneJobRows(true);
+			const commits = await laneLastCommits(jobRows.map((row) => row.worktree_path));
+			const jobs = jobRows.map((row) => {
 				const lane = laneByKey.get(row.lane_key);
 				const bound = {
 					...row,
 					session_id: lane?.gjc_session_id ?? "",
 					last_activity_at: lane?.last_activity_at ?? null,
+					// Repository evidence (issue #67): a lane whose op died but whose HEAD
+					// moved is progressing; it is read from the worktree, not the record.
+					last_commit: commits.get(row.worktree_path) ?? null,
 					reports: row.lane_key.startsWith("work-")
 						? options.database.laneReportCounts(row.lane_key.slice("work-".length))
 						: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },

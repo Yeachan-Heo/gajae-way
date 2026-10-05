@@ -1942,26 +1942,46 @@ export function utf8Prefix(text: string, maxBytes = 2048): string {
 	}
 	return text.slice(0, end);
 }
+export type LaneCommit = { readonly sha: string; readonly subject: string; readonly committed_at: string };
+
 /**
  * The lane's HEAD commit (issue #67): the only progress signal that survives an
- * op dying. Null when the worktree yields no commit; never invented.
+ * op dying. Null when the worktree yields no commit; never invented. Async so a
+ * `work.jobs` over hundreds of lanes never blocks the event loop (#407).
  */
-export function laneLastCommit(
-	worktreePath: string,
-): { readonly sha: string; readonly subject: string; readonly committed_at: string } | null {
+export async function laneLastCommit(worktreePath: string): Promise<LaneCommit | null> {
 	try {
-		const log = Bun.spawnSync(["git", "-C", worktreePath, "log", "-1", "--format=%H%x00%cI%x00%s"], {
+		const child = Bun.spawn(["git", "-C", worktreePath, "log", "-1", "--format=%H%x00%cI%x00%s"], {
 			stdout: "pipe",
-			stderr: "pipe",
+			stderr: "ignore",
 		});
-		if (log.exitCode !== 0) return null;
-		const [sha, at, subject] = log.stdout.toString().replace(/\n$/, "").split("\0");
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		if (exitCode !== 0) return null;
+		const [sha, at, subject] = stdout.replace(/\n$/, "").split("\0");
 		const committed = Date.parse(at ?? "");
 		if (!sha || !/^[0-9a-f]{40}$/.test(sha) || subject === undefined || Number.isNaN(committed)) return null;
 		return { sha, subject: utf8Prefix(subject, 256), committed_at: new Date(committed).toISOString() };
 	} catch {
 		return null;
 	}
+}
+
+/** HEAD commits for many worktrees: one git call per distinct path, at most `concurrency` at a time. */
+export async function laneLastCommits(
+	worktreePaths: readonly string[],
+	concurrency = 16,
+): Promise<Map<string, LaneCommit | null>> {
+	const unique = [...new Set(worktreePaths)];
+	const result = new Map<string, LaneCommit | null>();
+	let next = 0;
+	const worker = async () => {
+		while (next < unique.length) {
+			const path = unique[next++]!;
+			result.set(path, await laneLastCommit(path));
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, worker));
+	return result;
 }
 
 /** Shapes the complete lane report under the 2048-byte UTF-8 storage budget. */

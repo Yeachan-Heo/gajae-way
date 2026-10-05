@@ -1229,15 +1229,11 @@ export class GatewayDatabase {
 	 * Called during recovery when an attempt fails validation.
 	 */
 	workAttemptQuarantineInvalid(jobId: string): void {
-		try {
-			this.#database
-				.query(
-					"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING",
-				)
-				.run("work", jobId, "recovery-auto-quarantine");
-		} catch {
-			// Silently ignore if quarantine fails
-		}
+		this.#database
+			.query(
+				"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING",
+			)
+			.run("work", jobId, "recovery-auto-quarantine");
 	}
 
 	#laneReportGetInside(reportId: string): LaneReportRow | undefined {

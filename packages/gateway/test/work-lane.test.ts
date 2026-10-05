@@ -14,6 +14,7 @@ import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import {
+	laneLastCommits,
 	laneSystemNotice,
 	reportText,
 	utf8Prefix,
@@ -781,9 +782,7 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 	await f.manager.recover();
 	const errorCountAfter = errors.mock.calls.length;
 	// Should not have new work_recovery_invalid_attempt logs
-	const newInvalidLogs = [
-		...errors.mock.calls.slice(errorCountBefore),
-	].filter((call) => {
+	const newInvalidLogs = [...errors.mock.calls.slice(errorCountBefore)].filter((call) => {
 		const line = String(call[0]);
 		return line.includes("work_recovery_invalid_attempt") && line.includes(bad.opRef);
 	});
@@ -2077,4 +2076,32 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 	expect(notice).not.toContain("secret");
 	expect(notice).not.toContain("private");
 	expect(notice).not.toContain("authentication");
+});
+
+test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {
+	const repo = await mkdtemp(join(tmpdir(), "lane-commit-"));
+	const missing = join(repo, "does-not-exist");
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repo, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "t",
+					GIT_AUTHOR_EMAIL: "t@t",
+					GIT_COMMITTER_NAME: "t",
+					GIT_COMMITTER_EMAIL: "t@t",
+				},
+			});
+		git("init", "-q");
+		git("commit", "-q", "--allow-empty", "-m", "lane head");
+		const spawn = spyOn(Bun, "spawn");
+		const commits = await laneLastCommits([repo, missing, repo, repo], 2);
+		expect(spawn).toHaveBeenCalledTimes(2);
+		spawn.mockRestore();
+		expect(commits.get(repo)?.subject).toBe("lane head");
+		expect(commits.get(repo)?.sha).toMatch(/^[0-9a-f]{40}$/);
+		expect(commits.get(missing)).toBeNull();
+	} finally {
+		await rm(repo, { recursive: true, force: true });
+	}
 });
