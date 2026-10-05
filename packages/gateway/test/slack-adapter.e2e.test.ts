@@ -3,12 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SlackWebApi } from "../../adapter-slack/src/api";
-import { ReconnectingGateway, settleSlackDelivery } from "../../adapter-slack/src/main";
+import { settleSlackDelivery } from "../../adapter-slack/src/main";
 import { slackMessageId, slackMessageOrigin } from "../../adapter-slack/src/origin";
+import { liveGateway, stopLiveGatewaysAfterEach } from "../../adapter-slack/test/live-gateways";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
+
+stopLiveGatewaysAfterEach();
 
 /**
  * End to end through the real gateway: the Slack adapter's own reconnecting
@@ -90,7 +93,7 @@ const CHANNEL_ORIGIN = slackMessageOrigin({ channel: "C1", user: "U1", ts: "1726
 test("a Slack channel message becomes a turn and its reply is posted as mrkdwn and confirmed", async () => {
 	const { config, database, turns } = await gateway(() => "**done** — see [the doc](https://x.test/d) & more");
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	const result = await adapter.requestInbound(
 		slackMessageId("C1", "1726543210.000100"),
@@ -116,7 +119,7 @@ test("a Slack channel message becomes a turn and its reply is posted as mrkdwn a
 test("a [REACT:👍] reply reacts by Slack emoji name and settles the same ledger row", async () => {
 	const { config, database } = await gateway(() => "[REACT:👍]");
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	await adapter.requestInbound(slackMessageId("C1", "1726543210.000200"), CHANNEL_ORIGIN, "ㅇㅋ?", {
 		mentioned: true,
@@ -135,7 +138,7 @@ test("a [REACT:👍] reply reacts by Slack emoji name and settles the same ledge
 test("a human's thread reply is its own session and the answer stays in that thread", async () => {
 	const { config, database, turns } = await gateway((text) => (text.includes("thread") ? "in thread" : "root answer"));
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	await adapter.requestInbound(slackMessageId("C1", "1726543210.000300"), CHANNEL_ORIGIN, "top question", {
 		mentioned: true,
@@ -185,7 +188,7 @@ test("a delivery the adapter cannot settle is a failed ledger row, not a silent 
 			throw new TypeError("fetch failed");
 		},
 	};
-	const adapter = new ReconnectingGateway(config.socketPath, failing);
+	const adapter = liveGateway(config.socketPath, failing);
 	await adapter.connect();
 	await adapter.requestInbound(slackMessageId("C1", "1726543210.000500"), CHANNEL_ORIGIN, "x", {
 		mentioned: true,
@@ -234,7 +237,7 @@ test("a delivery pending in the ledger before the adapter connects is replayed a
 	const { config, database } = await gateway(() => "answer");
 	// Seed an undelivered Slack row with nobody connected to settle it.
 	const seedApi = fakeSlackApi();
-	const seedAdapter = new ReconnectingGateway(config.socketPath, {
+	const seedAdapter = liveGateway(config.socketPath, {
 		postMessage: async () => {
 			throw new TypeError("link died mid-post");
 		},
@@ -250,7 +253,7 @@ test("a delivery pending in the ledger before the adapter connects is replayed a
 	expect(database.deliveryRows().map((row) => row.state)).not.toEqual(["confirmed"]);
 	// A fresh adapter connects; the replay arrives with negotiation.
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	await settle();
 	expect(slack.posts).toEqual([
@@ -264,7 +267,7 @@ test("a plain answer to a threaded DM stays in that DM thread without a [REPLY] 
 	// survives in engagement.replyTo. The gateway uses it as the default reply target.
 	const { config, database } = await gateway(() => "in your thread");
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	const dm = slackMessageOrigin({ channel: "D1", channel_type: "im", user: "U1", ts: "1726543210.000700" });
 	expect(dm.kind).toBe("dm");
@@ -285,7 +288,7 @@ test("an edited channel message is answered in the ORIGINAL message's thread, ne
 	// root must be the original message the edit points at.
 	const { config, database } = await gateway(() => "answer to the edit");
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	await adapter.requestInbound(slackMessageId("C1", "1726543210.000800"), CHANNEL_ORIGIN, "first draft", {
 		mentioned: true,

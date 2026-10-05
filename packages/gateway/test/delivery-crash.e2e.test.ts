@@ -1,8 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { testOnlyBrokerDependencies } from "../src/orchestrator/test-broker";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 
@@ -74,7 +73,9 @@ async function waitFor(frames: any[], predicate: (frame: any) => boolean) {
 	throw new Error("timed out waiting for frame");
 }
 test("inflight platform delivery is duplicate-labeled after a process crash", async () => {
-	home = await mkdtemp(join(tmpdir(), "gajaeway-crash-"));
+	// The gateway resolves the persona workspace to its canonical path (#396); on
+	// macOS tmpdir() sits behind the /var -> /private/var symlink.
+	home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-crash-")));
 	const first = await client(await start());
 	first.send({
 		v: "0.1",
