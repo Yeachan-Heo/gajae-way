@@ -2795,7 +2795,7 @@ function terminalFailureDiagnosis(status: StatusReport): string {
 		["phase", outcome?.phase],
 		["category", outcome?.category],
 		["provenance", outcome?.provenance],
-		["cause", failure?.message ?? outcome?.message],
+		["cause", outcome?.failureCauseDiagnostic ?? failure?.message ?? outcome?.message],
 	];
 	return fields
 		.map(([name, value]) => `${name}=${(value === undefined ? "" : sanitizeDiagnostic(value)) || "unknown"}`)

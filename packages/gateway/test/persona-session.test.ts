@@ -517,17 +517,24 @@ test("post-start failure captures real error message in terminal_failure log (#4
 	enqueue("boom-failure", "work that throws an error");
 	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	// Failure with error.code and error.message to test error capture (#408)
+	// Failure with error.code and outcome with failureCauseDiagnostic to test real cause capture (#408)
 	port.fail(first.opRef, "boom", {
 		code: "execution_error",
-		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
+		outcome: {
+			kind: "failed",
+			phase: "post_start",
+			category: "agent_runtime",
+			provenance: "agent_failed",
+			failureCauseDiagnostic: "Error boom", // Real cause from SDK (#408)
+		},
 	});
 	await eventually(() => notices.length === 1, "error failure did not reach the lifecycle");
 	expect(notices[0]).toBe("[turn failed] execution_error: boom");
-	// Verify that the real error message is captured in terminal_failure log
+	// Verify that the real error cause from SDK is captured in terminal_failure log
 	const terminalLine = logs.find((line) => line.startsWith("terminal_failure "));
 	expect(terminalLine).toContain("code=execution_error provider_code=execution_error phase=post_start category=agent_runtime provenance=agent_failed");
-	expect(terminalLine).toContain("cause=boom");
+	// Should use failureCauseDiagnostic when available (#408)
+	expect(terminalLine).toContain("cause=Error boom");
 });
 
 test("failed notice must persist before reset completion and may retry without replaying the prompt", async () => {

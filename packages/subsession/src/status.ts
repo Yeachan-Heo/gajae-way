@@ -42,6 +42,7 @@ export type PromptOutcomeBody = {
 	readonly providerCode?: string;
 	readonly phase?: string;
 	readonly category?: string;
+	readonly failureCauseDiagnostic?: string;
 };
 
 export type PromptStatusBody = {
