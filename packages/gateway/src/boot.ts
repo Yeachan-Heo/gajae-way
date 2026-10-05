@@ -52,6 +52,36 @@ export interface BrokerWaitOptions {
 export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
 
 /**
+ * Resolve the gateway's gjc agent directory through proper precedence:
+ * 1. explicit (test seam)
+ * 2. config.json gjc.agentDir
+ * 3. GJC_CODING_AGENT_DIR environment variable
+ * 4. Recorded broker_authority canonicalAgentDir from existing home database
+ * 5. Default $GAJAEWAY_HOME/gjc-agent
+ *
+ * This is a pure function used to resolve the agent directory before full database initialization.
+ */
+export function resolveGatewayAgentDir(options: {
+	explicit?: string;
+	configAgentDir?: string;
+	env: Record<string, string | undefined>;
+	recordedAgentDir?: string | null;
+	home: string;
+}): string {
+	// 1. Explicit override (test/deployment seam)
+	if (options.explicit) return options.explicit;
+	// 2. config.json gjc.agentDir
+	if (options.configAgentDir) return options.configAgentDir;
+	// 3. GJC_CODING_AGENT_DIR or PI_CODING_AGENT_DIR env variable
+	const envAgentDir = options.env.GJC_CODING_AGENT_DIR ?? options.env.PI_CODING_AGENT_DIR;
+	if (envAgentDir) return envAgentDir;
+	// 4. Recorded broker_authority canonicalAgentDir (for established homes)
+	if (options.recordedAgentDir) return options.recordedAgentDir;
+	// 5. Default $GAJAEWAY_HOME/gjc-agent
+	return join(options.home, "gjc-agent");
+}
+
+/**
  * The persona workspace, created if missing and resolved through any symlink.
  *
  * The persona lives in its own dedicated directory, never in the gateway's
@@ -125,19 +155,32 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			options.takeover ?? defaultTakeoverPorts(),
 		);
 		claimed = true;
-		const database = await GatewayDatabase.open(config.dbPath);
-		let broker: GlobalGjcClient | undefined;
+		const personaWorkspace = await resolvePersonaWorkspace(config.home);
+		const pinnedVersion = readPinnedGjcVersion();
+		// Peek at recorded authority from existing database (before full initialization)
+		const recordedAgentDir = GatewayDatabase.peekRecordedAuthority(config.dbPath);
+		// Resolve agent directory with proper precedence: explicit -> config -> env -> recorded -> default
+		const resolvedAgentDir = resolveGatewayAgentDir({
+			explicit: options.broker?.agentDir,
+			configAgentDir: config.gjc?.agentDir,
+			env: process.env,
+			recordedAgentDir,
+			home: config.home,
+		});
+		// Create broker client with resolved agent directory
+		const broker = new GlobalGjcClient({
+			...options.broker,
+			cwd: personaWorkspace,
+			agentDir: resolvedAgentDir,
+			pinnedVersion,
+		});
+		const database = await GatewayDatabase.open(config.dbPath, {
+			canonicalAgentDir: broker.agentDir,
+		});
 		try {
-			const personaWorkspace = await resolvePersonaWorkspace(config.home);
-			const pinnedVersion = readPinnedGjcVersion();
-			broker = new GlobalGjcClient({
-				...options.broker,
-				cwd: personaWorkspace,
-				agentDir: options.broker?.agentDir ?? join(config.home, "gjc-agent"),
-				pinnedVersion,
-			});
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
-			database.assertBrokerAuthority(authority, { initializeEmpty: true });
+			// Authority already checked in GatewayDatabase.open(); this assertion confirms immutability.
+			database.assertBrokerAuthority(authority, { initializeEmpty: false });
 			// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 			const client = broker;
 			await waitForBroker("preflight", () => client.preflight(), options.brokerWait);
