@@ -534,3 +534,48 @@ test("gateway startup prunes old consumed context even when the database was qui
 	inspected.close();
 	client.close();
 });
+
+test("issue #409: unanswered messages whose turns failed remain visible after /new reset", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	let respondCount = 0;
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text, preamble) => {
+			preambles.push(preamble ?? "");
+			respondCount++;
+			// Fail the second turn to create an unanswered message
+			if (respondCount === 2) throw new Error("intentional failure");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+
+	// Send a successful turn (respond count 1)
+	send(client, "successful-turn", "first request");
+	await waitUntil(() => respondCount === 1);
+
+	// Add explicit delay to ensure failed-turn is received AFTER first turn completes
+	await Bun.sleep(10);
+
+	// Send a turn that will fail (respond count 2)
+	send(client, "failed-turn", "second request");
+	await waitUntil(() => respondCount === 2);
+
+
+
+	// Reset the session
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+
+	// Send a new turn in the new epoch (respond count 3)
+	send(client, "new-epoch-turn", "third request");
+	await waitUntil(() => respondCount === 3);
+
+	// Verify that the failed message is visible in the recent conversation after reset
+	const recentCtx = database.recentConversation(ORIGIN_KEY, "context-turn", 10, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+	const failedMessageInRecent = recentCtx.some((r) => r.id === "failed-turn");
+	expect(failedMessageInRecent).toBe(true);
+	client.close();
+});
