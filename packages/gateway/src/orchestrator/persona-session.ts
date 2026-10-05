@@ -2790,7 +2790,7 @@ function terminalFailureDiagnosis(status: StatusReport): string {
 	const outcome = status.status.outcome;
 	const fields: [string, string | undefined][] = [
 		["code", status.status.error?.code ?? outcome?.code],
-		["provider_code", outcome?.providerCode],
+		["provider_code", outcome?.providerCode ?? status.status.error?.code],
 		["phase", outcome?.phase],
 		["category", outcome?.category],
 		["provenance", outcome?.provenance],
