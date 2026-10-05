@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatProgressPayload } from "@gajae-gateway/protocol";
 import { AdapterAlreadyRunningError, AdapterLock } from "../../adapter-discord/src/lock";
-import { ReconnectingGateway } from "../../adapter-slack/src/main";
+import { liveGateway, stopLiveGatewaysAfterEach } from "../../adapter-slack/test/live-gateways";
 import { GajaewayClient } from "../../sdk/src/index";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
+
+stopLiveGatewaysAfterEach();
 
 let home = "";
 let server: GatewayServer | undefined;
@@ -55,7 +57,7 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const posts: unknown[][] = [];
 	const reactions: unknown[][] = [];
-	const adapter = new ReconnectingGateway(config.socketPath, {
+	const adapter = liveGateway(config.socketPath, {
 		async postMessage(channel: string, text: string, threadTs?: string) {
 			const args: [string, string, string?] = [channel, text, threadTs];
 			posts.push(args);
@@ -379,7 +381,7 @@ for (const silent of [false, true])
 			},
 		};
 		const status = new WorkingStatus(api);
-		const adapter = new ReconnectingGateway(config.socketPath, api, undefined, status);
+		const adapter = liveGateway(config.socketPath, api, undefined, status);
 		await adapter.connect();
 		client = await GajaewayClient.connectSocket(config.socketPath);
 		const progress: ChatProgressPayload[] = [];
