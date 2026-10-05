@@ -1495,14 +1495,22 @@ export class WorkLaneManager {
 				);
 			});
 		}
+		const reportedInvalidAttempts = new Set<string>();
 		let after = "";
 		while (!this.#stopped) {
 			let invalidAfter = after;
 			const rows = this.#db.workAttemptOpen(100, after, (error) => {
 				if (error.opRef && error.opRef > invalidAfter) invalidAfter = error.opRef;
-				console.error(
-					`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
-				);
+				// Log and quarantine the invalid attempt once, excluding it from future recovery sweeps (issue #407)
+				if (error.opRef && !reportedInvalidAttempts.has(error.opRef)) {
+					console.error(
+						`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
+					);
+					reportedInvalidAttempts.add(error.opRef);
+					// Quarantine the job to exclude it from future recovery iterations
+					const jobId = this.#db.workAttemptJobId(error.opRef);
+					if (jobId) this.#db.workAttemptQuarantineInvalid(jobId);
+				}
 			});
 			const lastValid = rows.at(-1)?.opRef ?? after;
 			const nextAfter = invalidAfter > lastValid ? invalidAfter : lastValid;

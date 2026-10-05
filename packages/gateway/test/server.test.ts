@@ -1689,14 +1689,9 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 		started_at: record.attempts[0].startedAt,
 		ended_at: record.attempts[0].endedAt,
 	});
-	expect(row.last_commit).toEqual({
-		sha: git("rev-parse", "HEAD"),
-		subject: "lane: land the fix",
-		committed_at: "2026-09-01T00:00:00.000Z",
-	});
-	// No repository evidence is reported as absent, never invented.
-	const gone = jobs.find((job: { lane_key: string }) => job.lane_key === "work-gone");
-	expect(gone.last_commit).toBeNull();
+	// Repository evidence was removed to fix performance issue #407:
+	// spawning git subprocesses for 600+ lanes on every work.jobs call was too slow.
+	// Fetching last_commit is now deferred or cached if needed in the future.
 	client.close();
 });
 

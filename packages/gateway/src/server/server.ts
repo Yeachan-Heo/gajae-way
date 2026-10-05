@@ -1077,9 +1077,6 @@ async function handleRequest(
 					...row,
 					session_id: lane?.gjc_session_id ?? "",
 					last_activity_at: lane?.last_activity_at ?? null,
-					// Repository evidence (issue #67): a lane whose op died but whose HEAD
-					// moved is progressing; it is read from the worktree, not the record.
-					last_commit: laneLastCommit(row.worktree_path),
 					reports: row.lane_key.startsWith("work-")
 						? options.database.laneReportCounts(row.lane_key.slice("work-".length))
 						: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },

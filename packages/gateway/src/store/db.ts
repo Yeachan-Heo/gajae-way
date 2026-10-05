@@ -1214,6 +1214,32 @@ export class GatewayDatabase {
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
 	}
 
+	/**
+	 * Gets the job ID for a given work attempt opRef (issue #407).
+	 */
+	workAttemptJobId(opRef: string): string | undefined {
+		const row = this.#database
+			.query<{ job_id: string }, [string]>("SELECT job_id FROM work_attempt_runtime WHERE op_ref = ?")
+			.get(opRef);
+		return row?.job_id;
+	}
+
+	/**
+	 * Quarantines an invalid work attempt to exclude it from future recovery sweeps (issue #407).
+	 * Called during recovery when an attempt fails validation.
+	 */
+	workAttemptQuarantineInvalid(jobId: string): void {
+		try {
+			this.#database
+				.query(
+					"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING",
+				)
+				.run("work", jobId, "recovery-auto-quarantine");
+		} catch {
+			// Silently ignore if quarantine fails
+		}
+	}
+
 	#laneReportGetInside(reportId: string): LaneReportRow | undefined {
 		const row = this.#database
 			.query<LaneReportRow, [string]>("SELECT * FROM lane_reports WHERE report_id = ?")
