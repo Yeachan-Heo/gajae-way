@@ -741,6 +741,44 @@ test("one inconsistent runtime is logged with its opRef and does not block other
 	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt !== null);
 });
 
+test("a lane row torn under a live observer is logged and dropped, not an unhandled rejection (#401)", async () => {
+	const rejections: unknown[] = [];
+	const onRejection = (reason: unknown) => rejections.push(reason);
+	process.on("unhandledRejection", onRejection);
+	cleanups.push(async () => {
+		process.off("unhandledRejection", onRejection);
+	});
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const f = await fixture();
+	const torn = await started(f, "a");
+	const healthy = await started(f, "b");
+	// The #401 shape: the lane row says the attempt ended host_lost while its
+	// runtime row is still open, so every runtime read for it throws.
+	const closed = closeAttempt({
+		record: f.job("a"),
+		opRef: torn.opRef,
+		endState: "attempt_ended",
+		errorCode: "host_lost",
+		endedAt: new Date(Date.now() + 1_000).toISOString(),
+	});
+	f.db.putLaneJob({ ...closed, laneKey: laneJobIdentity("a").laneKey, json: JSON.stringify(closed) });
+	expect(() => f.db.workAttemptGet(torn.opRef)).toThrow(WorkAttemptStateError);
+
+	await until(() =>
+		errors.mock.calls.some((call) => {
+			const line = String(call[0]);
+			return line.includes("work_observer_failed") && line.includes(torn.opRef);
+		}),
+	);
+	// Several more poll periods: a dropped observer must not keep throwing.
+	await Bun.sleep(50);
+	expect(rejections).toEqual([]);
+	f.port.complete(healthy.opRef, "other lane still served");
+	await until(() => f.db.workAttemptGet(healthy.opRef)?.settledAt !== null);
+	expect(rejections).toEqual([]);
+});
+
 test("saved terminal proof wins over dead liveness and output recovery consumes saved budget", async () => {
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
