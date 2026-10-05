@@ -8,8 +8,11 @@ import {
 	presenceMarkersFor,
 	presenceSnapshot,
 } from "@gajae-gateway/protocol";
-import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
+import { type GatewayClientLike, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
 import { isPresenceReaction, presenceStatusText, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
+import { liveGateway, stopLiveGatewaysAfterEach } from "./live-gateways";
+
+stopLiveGatewaysAfterEach();
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const progress = (extra: Partial<ChatProgressPayload> = {}): ChatProgressPayload => ({
@@ -353,7 +356,7 @@ test("Slack inbound arms presence for every engaged turn, on the triggering mess
 			const f = fixture();
 			const client = new Gateway();
 			client.engaged = engaged;
-			const gateway = new ReconnectingGateway("unused", f.api, client, f.status);
+			const gateway = liveGateway("unused", f.api, client, f.status);
 			await gateway.requestInbound("C1:1.001", origin, "hello", engagement);
 			await flush();
 			const expected = engaged;
