@@ -805,8 +805,21 @@ export class WorkLaneManager {
 						observer,
 						failures ? Math.min(basePollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : basePollMs,
 					);
-				});
+				})
+				// This chain runs off a timer with nothing awaiting it: a throw here (an
+				// unreadable runtime row, #401) would be an unhandled rejection that kills
+				// the gateway. Stop observing only this attempt; recovery reports it.
+				.catch((error: unknown) => this.#dropObserver(observer, error));
 		}, delay);
+	}
+	#dropObserver(observer: Observer, error: unknown): void {
+		const opRef = observer.runtime.opRef;
+		console.error(`work_observer_failed opRef=${JSON.stringify(opRef)} error=${failureReason(error)}`);
+		observer.abort.abort();
+		if (observer.timer) clearTimeout(observer.timer);
+		observer.timer = undefined;
+		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
+		this.#failures.delete(opRef);
 	}
 	/** Counts the failure and reports it once per distinct reason instead of on every poll. */
 	#failed(observer: Observer, error: unknown): void {
