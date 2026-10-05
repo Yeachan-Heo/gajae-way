@@ -310,14 +310,11 @@ export class PersonaSessionManager {
 	 * `/new` is a mailbox transition: idle work bumps immediately; a running turn
 	 * is first accepted, then retired and permanently fenced. The new epoch
 	 * returns to idle while the old turn remains a terminal-only hold.
-	 * The floor preserves unanswered messages (whose turns failed) in the next epoch
-	 * while still excluding pre-reset context that was already handled.
+	 * The floor is set to preserve unanswered messages (whose turns failed).
 	 */
-	reset(originKey: string, originRefJson: string, floorAt?: string): Promise<void> {
+	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
-		// Use the provided floor or calculate one to preserve unanswered messages
-		const calculatedFloor = floorAt ?? "1970-01-01T00:00:00Z";
-		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, calculatedFloor));
+		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
 	}
 
 	/**
@@ -616,8 +613,8 @@ class OriginActor {
 		let discarded: string[] = [];
 		this.#manager.database.withTransaction(() => {
 			nextEpoch = this.#manager.database.bumpEpoch(this.originKey, originRefJson);
-			// Use the new function that preserves unanswered messages whose turns failed
-			this.#manager.database.contextSetFloorPreservingUnanswered(this.originKey);
+			// Set floor to preserve unanswered messages whose turns failed
+			this.#manager.database.contextSetFloorPreservingUnanswered(this.originKey, floorAt);
 			discarded = this.#manager.database.inboundDiscardBefore(this.originKey, floorAt);
 			this.#manager.database.clearFailedTurnResetCap(this.originKey);
 		});

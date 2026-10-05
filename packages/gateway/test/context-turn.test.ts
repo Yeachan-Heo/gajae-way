@@ -539,43 +539,67 @@ test("issue #409: unanswered messages whose turns failed remain visible after /n
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const preambles: string[] = [];
-	let respondCount = 0;
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text, preamble) => {
 			preambles.push(preamble ?? "");
-			respondCount++;
-			// Fail the second turn to create an unanswered message
-			if (respondCount === 2) throw new Error("intentional failure");
+			// Fail turns that contain "fail" in the text
+			if (text.includes("fail")) throw new Error("intentional failure");
 			return "ok";
 		},
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 
-	// Send a successful turn (respond count 1)
-	send(client, "successful-turn", "first request");
-	await waitUntil(() => respondCount === 1);
+	// Send a successful turn
+	send(client, "msg1", "message one - will succeed");
+	await waitUntil(() => preambles.length === 1);
 
-	// Add explicit delay to ensure failed-turn is received AFTER first turn completes
-	await Bun.sleep(10);
-
-	// Send a turn that will fail (respond count 2)
-	send(client, "failed-turn", "second request");
-	await waitUntil(() => respondCount === 2);
-
-
+	// Send a turn that will fail
+	send(client, "msg2", "message two - will fail");
+	await waitUntil(() => preambles.length === 2);
 
 	// Reset the session
 	send(client, "reset-command", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
 
-	// Send a new turn in the new epoch (respond count 3)
-	send(client, "new-epoch-turn", "third request");
-	await waitUntil(() => respondCount === 3);
+	// Send a new turn in the new epoch
+	send(client, "msg3", "message three - after reset");
+	await waitUntil(() => preambles.length === 3);
 
-	// Verify that the failed message is visible in the recent conversation after reset
-	const recentCtx = database.recentConversation(ORIGIN_KEY, "context-turn", 10, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
-	const failedMessageInRecent = recentCtx.some((r) => r.id === "failed-turn");
-	expect(failedMessageInRecent).toBe(true);
+	// The third preamble should contain msg2 (unanswered) but not msg1 (already answered)
+	const thirdPreamble = preambles[2];
+	expect(thirdPreamble).toContain("msg2");
+	expect(thirdPreamble).not.toContain("msg1");
+	client.close();
+});
+
+test("issue #409: reset after everything was answered excludes all previous messages", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok"; // All turns succeed
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+
+	// Send a successful turn
+	send(client, "msg1", "message one");
+	await waitUntil(() => preambles.length === 1);
+
+	// Reset the session
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+
+	// Send a new turn in the new epoch
+	send(client, "msg2", "message two - after reset");
+	await waitUntil(() => preambles.length === 2);
+
+	// The second preamble should NOT contain msg1 (it was already answered)
+	const secondPreamble = preambles[1];
+	expect(secondPreamble).not.toContain("msg1");
 	client.close();
 });

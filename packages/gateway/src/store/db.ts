@@ -3158,9 +3158,13 @@ export class GatewayDatabase {
 				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR rowid <= ?)",
 				[originKey, triggerMessageId, effectiveFloor, floorRowId],
 			);
-			// Do NOT mark expired messages as consumed here.
-			// This allows unanswered messages (whose turns failed) to remain visible.
-			// Messages will be marked as consumed by contextCommitWindow only after turn success.
+			if (expired.count > 0) {
+				this.#database
+					.query(
+						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR rowid <= ?)",
+					)
+					.run(now.toISOString(), originKey, triggerMessageId, effectiveFloor, floorRowId);
+			}
 
 			const newest = this.#database
 				.query<ConversationContextRow & { row_id: number }, [string, string, string, number, number]>(
@@ -3184,9 +3188,24 @@ export class GatewayDatabase {
 						],
 					)
 				: { count: 0, oldest: null, newest: null };
-			// Do NOT mark truncated messages as consumed here.
-			// This allows unanswered messages (whose turns failed) to remain visible.
-			// Messages will be marked as consumed by contextCommitWindow only after turn success.
+			if (boundary && truncated.count > 0) {
+				this.#database
+					.query(
+						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND (received_at < ? OR (received_at = ? AND message_id < ?) OR (received_at = ? AND message_id = ? AND rowid < ?))",
+					)
+					.run(
+						now.toISOString(),
+						originKey,
+						triggerMessageId,
+						effectiveFloor,
+						boundary.received_at,
+						boundary.received_at,
+						boundary.message_id,
+						boundary.received_at,
+						boundary.message_id,
+						boundary.row_id,
+					);
+			}
 			this.#recordContextOmissions(originKey, expired, truncated, now.toISOString());
 			const pending = this.#pendingContextEvidence(originKey);
 			const rows = newest
@@ -3234,31 +3253,24 @@ export class GatewayDatabase {
 	}
 
 	/**
-	 * Sets the floor to preserve unanswered messages (whose turns failed) in the next epoch.
-	 * Messages with failed turns (terminal_delivery_id contains 'none') should remain visible.
-	 * This function finds the earliest message with a failed turn and sets the floor before it.
-	 * For messages without any turn, the floor is set to preserve them as well.
+	 * Sets the floor based on the last successfully answered message.
+	 * This preserves unanswered messages (whose turns failed) in the next epoch
+	 * while excluding messages that were already successfully answered.
 	 */
-	contextSetFloorPreservingUnanswered(originKey: string): void {
+	contextSetFloorPreservingUnanswered(originKey: string, fallbackFloor = new Date().toISOString()): void {
 		const floorRowId =
 			this.#database
 				.query<{ row_id: number }, [string]>(
 					"SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?",
 				)
 				.get(originKey)?.row_id ?? 0;
-		
-		// Find the earliest message with a failed turn (terminal_delivery_id contains 'none')
-		// or messages that have no turn at all
-		const unansweredMessage = this.#database
-			.query<{ received_at: string }, [string]>(
-				"SELECT received_at FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' AND (json_extract(terminal_delivery_id, '$.none') IS NOT NULL OR terminal_delivery_id IS NULL) ORDER BY received_at ASC LIMIT 1",
-			)
-			.get(originKey)?.received_at;
-		
-		// If there are unanswered messages or messages without turns, set floor before the earliest one
-		// Otherwise set floor to epoch time to exclude all pre-reset messages
-		const floorAt = unansweredMessage ?? "1970-01-01T00:00:00Z";
-		
+
+		// Find the last message whose turn was successfully answered (has terminal_delivery_id)
+		const lastAnswered = this.inboundLastSuccessfulAnswerAt(originKey);
+
+		// Set floor to the last answered message's received_at time, or fallback to current time
+		const floorAt = lastAnswered ?? fallbackFloor;
+
 		this.#database
 			.query(
 				"INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at, floor_row_id = excluded.floor_row_id",
