@@ -2549,20 +2549,34 @@ async function createInboundTurnLifecycle(
 				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
 				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
-			if (nonLoopback && !assistantDeliveryStarted) {
+			if (nonLoopback) {
 				// Recovery can observe the same failed terminal after the notice was
 				// persisted but before the trigger was settled. Reuse the trigger's
 				// terminal delivery identity instead of emitting another failure.
-				const notice = runtime.delivery.prepare(
-					turnId,
-					origin,
-					failureNotice,
-					undefined,
-					deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0),
-				);
-				if (notice) {
-					runtime.delivery.markInflight(notice.deliveryId as string);
-					broadcastDelivery(runtime, notice);
+				// Deliver the failure notice regardless of whether assistant delivery started (#408).
+				if (!assistantDeliveryStarted) {
+					const notice = runtime.delivery.prepare(
+						turnId,
+						origin,
+						failureNotice,
+						undefined,
+						deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0),
+					);
+					if (notice) {
+						runtime.delivery.markInflight(notice.deliveryId as string);
+						broadcastDelivery(runtime, notice);
+					}
+				} else {
+					// If assistant delivery already started, send failure notice via a continuation message (#408)
+					const failureNoticeMessage = runtime.delivery.prepare(
+						turnId,
+						origin,
+						failureNotice,
+					);
+					if (failureNoticeMessage) {
+						runtime.delivery.markInflight(failureNoticeMessage.deliveryId as string);
+						broadcastDelivery(runtime, failureNoticeMessage);
+					}
 				}
 			}
 			// A loopback requester waits for a final chat.message on its turnId; without

@@ -393,9 +393,9 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
 	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
 	expect(notices[0]).not.toContain("/new");
-	expect(logs.find((line) => line.startsWith("terminal_failure "))).toContain(
-		"code=prompt_failed provider_code=prompt_failed phase=post_start category=agent_runtime provenance=agent_failed",
-	);
+	const terminalLine = logs.find((line) => line.startsWith("terminal_failure "));
+	expect(terminalLine).toContain("code=prompt_failed provider_code=prompt_failed phase=post_start category=agent_runtime provenance=agent_failed");
+	expect(terminalLine).toContain("cause=Agent run failed after execution started");
 });
 
 // #210: a bash call blocked on an interactive auth prompt (`op whoami`) timed
@@ -446,9 +446,10 @@ test("a turn that fails with a tool still running names the tool and hands over 
 	);
 	expect(failures[0]!.recovered).toBe("the answer written before the tool hung");
 	expect(probes).toHaveLength(1);
-	expect(logs.find((line) => line.startsWith("terminal_failure "))).toContain(
-		"code=prompt_failed provider_code=prompt_failed phase=unknown category=unknown provenance=unknown open_tool=bash open_tool_elapsed_ms=300000",
-	);
+	const terminalLine2 = logs.find((line) => line.startsWith("terminal_failure "));
+	expect(terminalLine2).toContain("code=prompt_failed provider_code=prompt_failed phase=unknown category=unknown provenance=unknown");
+	expect(terminalLine2).toContain("cause=Agent run failed after execution started");
+	expect(terminalLine2).toContain("open_tool=bash open_tool_elapsed_ms=300000");
 	expect(logs.some((line) => line.startsWith("failed_turn_answer_recovered "))).toBe(true);
 });
 
@@ -508,27 +509,25 @@ test("a rebindable post-start code keeps its /new hint, and a codeless failure s
 	expect(notices[1]).toBe("[turn failed] session status failed");
 });
 
-test("post-start failure without explicit provider_code falls back to error.code in terminal_failure log (#408)", async () => {
+test("post-start failure captures real error message in terminal_failure log (#408)", async () => {
 	const port = new ScriptedSessionPort();
 	const notices: string[] = [];
 	const logs: string[] = [];
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
-	enqueue("opaque-provider-failure", "work that failed with opaque provider");
+	enqueue("boom-failure", "work that throws an error");
 	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	// Failure with error.code but no outcome.providerCode (opaque provider)
-	port.fail(first.opRef, "Agent run failed after execution started.", {
-		code: "provider_error",
+	// Failure with error.code and error.message to test error capture (#408)
+	port.fail(first.opRef, "boom", {
+		code: "execution_error",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
-	await eventually(() => notices.length === 1, "opaque provider failure did not reach the lifecycle");
-	expect(notices[0]).toBe("[turn failed] provider_error: Agent run failed after execution started.");
-	// Verify that provider_code falls back to error.code when not in outcome
+	await eventually(() => notices.length === 1, "error failure did not reach the lifecycle");
+	expect(notices[0]).toBe("[turn failed] execution_error: boom");
+	// Verify that the real error message is captured in terminal_failure log
 	const terminalLine = logs.find((line) => line.startsWith("terminal_failure "));
-	expect(terminalLine).toContain("provider_code=provider_error");
-	expect(terminalLine).toContain("phase=post_start");
-	expect(terminalLine).toContain("category=agent_runtime");
-	expect(terminalLine).toContain("provenance=agent_failed");
+	expect(terminalLine).toContain("code=execution_error provider_code=execution_error phase=post_start category=agent_runtime provenance=agent_failed");
+	expect(terminalLine).toContain("cause=boom");
 });
 
 test("failed notice must persist before reset completion and may retry without replaying the prompt", async () => {
