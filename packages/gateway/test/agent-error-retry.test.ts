@@ -61,7 +61,7 @@ test("provider_transport error retries successfully", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
@@ -105,7 +105,7 @@ test("agent_runtime post_start error sends continuation prompt", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
@@ -150,7 +150,7 @@ test("non-retryable agent_error code fails immediately", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
@@ -187,7 +187,7 @@ test("non-retryable errors fail immediately without retry", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
@@ -225,7 +225,7 @@ test("continuation prompt content does not request re-running tools", async () =
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
@@ -266,7 +266,7 @@ test("tool stalled/hung error is NOT retried", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
@@ -304,7 +304,7 @@ test("when both retries fail, failure message posted exactly once", async () => 
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		database,
+		database: database!,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),

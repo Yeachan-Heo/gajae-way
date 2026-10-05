@@ -409,7 +409,6 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 	await eventually(
 		() => notices.length === 1,
 		"post-start failure did not reach the lifecycle after retries exhausted",
-		3000,
 	);
 	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
 	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
