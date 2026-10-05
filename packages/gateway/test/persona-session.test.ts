@@ -394,7 +394,9 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 	// `prompt_failed` is not rebindable: a new session does not fix a runtime fault.
 	expect(notices[0]).not.toContain("/new");
 	const terminalLine = logs.find((line) => line.startsWith("terminal_failure "));
-	expect(terminalLine).toContain("code=prompt_failed provider_code=prompt_failed phase=post_start category=agent_runtime provenance=agent_failed");
+	expect(terminalLine).toContain(
+		"code=prompt_failed provider_code=prompt_failed phase=post_start category=agent_runtime provenance=agent_failed",
+	);
 	expect(terminalLine).toContain("cause=Agent run failed after execution started");
 });
 
@@ -447,7 +449,9 @@ test("a turn that fails with a tool still running names the tool and hands over 
 	expect(failures[0]!.recovered).toBe("the answer written before the tool hung");
 	expect(probes).toHaveLength(1);
 	const terminalLine2 = logs.find((line) => line.startsWith("terminal_failure "));
-	expect(terminalLine2).toContain("code=prompt_failed provider_code=prompt_failed phase=unknown category=unknown provenance=unknown");
+	expect(terminalLine2).toContain(
+		"code=prompt_failed provider_code=prompt_failed phase=unknown category=unknown provenance=unknown",
+	);
 	expect(terminalLine2).toContain("cause=Agent run failed after execution started");
 	expect(terminalLine2).toContain("open_tool=bash open_tool_elapsed_ms=300000");
 	expect(logs.some((line) => line.startsWith("failed_turn_answer_recovered "))).toBe(true);
@@ -532,7 +536,9 @@ test("post-start failure captures real error message in terminal_failure log (#4
 	expect(notices[0]).toBe("[turn failed] execution_error: boom");
 	// Verify that the real error cause from SDK is captured in terminal_failure log
 	const terminalLine = logs.find((line) => line.startsWith("terminal_failure "));
-	expect(terminalLine).toContain("code=execution_error provider_code=execution_error phase=post_start category=agent_runtime provenance=agent_failed");
+	expect(terminalLine).toContain(
+		"code=execution_error provider_code=execution_error phase=post_start category=agent_runtime provenance=agent_failed",
+	);
 	// Should use failureCauseDiagnostic when available (#408)
 	expect(terminalLine).toContain("cause=Error boom");
 });
