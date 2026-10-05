@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, normalize } from "node:path";
 import {
@@ -49,6 +50,21 @@ export class BrokerAuthorityError extends Error {
 	) {
 		super(`broker authority: ${code}`);
 		this.name = "BrokerAuthorityError";
+	}
+}
+
+/**
+ * Two spellings of one directory are the same repo. Bindings recorded before the
+ * persona workspace was canonicalized carry the symlink path, while the runtime now
+ * asks with the resolved one; comparing resolved paths keeps those rows owned
+ * without rewriting immutable broker provenance.
+ */
+function sameRepo(recorded: string, requested: string): boolean {
+	if (recorded === requested) return true;
+	try {
+		return realpathSync(recorded) === realpathSync(requested);
+	} catch {
+		return false;
 	}
 }
 
@@ -970,7 +986,7 @@ export class GatewayDatabase {
 				previous &&
 				(previous.origin_key !== binding.originKey ||
 					previous.epoch !== binding.epoch ||
-					previous.repo !== binding.repo)
+					!sameRepo(previous.repo, binding.repo))
 			)
 				throw new BrokerAuthorityError("unowned_session");
 			const current = this.getSessionRecord(binding.originKey);
@@ -997,7 +1013,7 @@ export class GatewayDatabase {
 				"SELECT origin_key, epoch, repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
 			)
 			.get(brokerAuthorityKey(authority), sessionId);
-		if (!row || row.repo !== repo) throw new BrokerAuthorityError("unowned_session");
+		if (!row || !sameRepo(row.repo, repo)) throw new BrokerAuthorityError("unowned_session");
 		return { sessionId, originKey: row.origin_key, epoch: row.epoch, repo: row.repo, authority };
 	}
 

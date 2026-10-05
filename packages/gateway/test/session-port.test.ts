@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
@@ -59,6 +59,33 @@ afterEach(async () => {
 	database = undefined;
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
+});
+
+test("a binding recorded under a symlinked workspace stays owned when the runtime asks with the resolved path", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-symlink-repo-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const agentDir = join(home, "agent");
+	const real = join(home, "real-workspace");
+	const link = join(home, "workspace");
+	await mkdir(real);
+	await symlink(real, link);
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	// Provenance written before the workspace was canonicalized names the link.
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "legacy-link",
+		originKey: "origin",
+		epoch: 0,
+		repo: link,
+	});
+
+	expect(database.assertOwnedSession("legacy-link", real, authority)).toMatchObject({ originKey: "origin" });
+	expect(database.assertOwnedSession("legacy-link", link, authority)).toMatchObject({ originKey: "origin" });
+
+	// A different directory is still refused.
+	const other = join(home, "other");
+	await mkdir(other);
+	const db = database;
+	expect(() => db.assertOwnedSession("legacy-link", other, authority)).toThrow(BrokerAuthorityError);
 });
 
 test("failed-turn evidence comes from the owned shared session file without exposing provider text", async () => {
