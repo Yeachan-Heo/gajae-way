@@ -374,6 +374,47 @@ test("a message admitted while a persistent turn is running becomes an operator-
 	);
 });
 
+test("a held turn in recovery_hold must not absorb new inbound as steers; new inbound remains pending for a fresh trigger", async () => {
+	// Regression test for the bug where held ops absorbed all new inbound as steers,
+	// preventing mentions and new messages from ever reaching the user (2026-10-05).
+	const port = new GhostSendPort();
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	enqueue("first-msg", "initial message");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sendAttempts.length === 1, "first send attempt did not start");
+	const firstOpRef = port.sendAttempts[0]!.opRef;
+
+	// The first send failed with ambiguous error (timeout)
+	expect(port.sends).toHaveLength(0);
+	await manager!.tick(KEY);
+
+	// Wait for recovery_hold to be logged with operation_state_unknown
+	await eventually(
+		() => logs.some((line) => line.includes("recovery_hold") && line.includes("operation_state_unknown")),
+		"turn did not enter recovery_hold",
+	);
+
+	// New message arrives while the turn is held
+	enqueue("second-msg", "mentioned message");
+	await manager?.notifyInbound(KEY);
+
+	// With the fix: the second message should NOT be absorbed as a steer.
+	// It remains pending so it can start a fresh trigger later.
+	await Bun.sleep(50);
+
+	// Verify: no steers (the message was not absorbed into the held turn)
+	expect(port.steers).toHaveLength(0);
+	// Only the first failed attempt, no new send yet
+	expect(port.sends).toHaveLength(0);
+	// The second message should still be pending in the database
+	const pending = database?.inboundPendingOldest(KEY);
+	expect(pending?.message_id).toBe("second-msg");
+	// It should not have been associated with the first turn
+	expect(pending?.turn_op_ref).toBeNull();
+});
+
 // gajae-code redacts a post-start failure's message to one fixed sentence, so
 // the runtime code is the entire diagnosis. Six lost turns on one host produced
 // six identical code-free lines (#244); the code is what tells them apart.

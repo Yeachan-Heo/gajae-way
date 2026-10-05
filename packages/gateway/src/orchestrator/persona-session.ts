@@ -1536,6 +1536,11 @@ class OriginActor {
 		const current = this.#current;
 		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
 		if (this.#deferredSteerOpRef === current.turn.opRef) return;
+		// A turn in recovery_hold (operation_state_unknown or past stall threshold)
+		// must not absorb new inbound as steers; new inbound must remain pending so it
+		// can start a fresh trigger turn. This ensures mentions and other new messages
+		// always get a reply, not silently absorbed into a dead op (fix for #XXXX).
+		if (this.#holdSweeps.has(current.turn.opRef)) return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
 		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
