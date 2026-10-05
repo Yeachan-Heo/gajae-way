@@ -1546,7 +1546,7 @@ class OriginActor {
 					// Get the text that was already delivered (if any)
 					const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 					const nextAttempt = bound.retryAttempt + 1;
-					
+
 					// Build continuation prompt that doesn't replay the original message
 					// This prevents re-execution of side-effecting tools (git push, posts, merges, etc.)
 					let continuationPrompt: string;
@@ -1555,7 +1555,8 @@ class OriginActor {
 						continuationPrompt = `Your previous response was interrupted due to an error after execution started:\n\n${recoveredText}\n\nPlease continue or complete this response. Do NOT repeat any tool actions that may have already been executed (git push, API posts, database writes, etc.). Only continue typing if more content is needed.`;
 					} else {
 						// No text delivered: ask agent to try the original task again from scratch
-						continuationPrompt = "Your previous attempt encountered an error after it started executing. Please try again, being careful not to duplicate any tool actions that may have already executed.";
+						continuationPrompt =
+							"Your previous attempt encountered an error after it started executing. Please try again, being careful not to duplicate any tool actions that may have already executed.";
 					}
 
 					const newOpRef = personaTurnOpRef(
@@ -1605,7 +1606,6 @@ class OriginActor {
 			if (this.#current !== bound) return; // Turn has been replaced
 			void this.enqueue(async () => {
 				const oldOpRef = bound.turn.opRef;
-				const oldSessionId = bound.sessionId;
 				try {
 					// Mark the turn as pending again and increment the attempt counter
 					const nextAttempt = this.#manager.database.inboundTurnRequeue(oldOpRef);
@@ -2343,10 +2343,11 @@ class OriginActor {
 				) {
 					const category = report.status.outcome?.category;
 					const code = report.status.outcome?.code ?? report.status.error?.code;
-					const isAgentRuntimeError = category === "agent_runtime" && (code === "agent_error" || code === "prompt_failed");
+					const isAgentRuntimeError =
+						category === "agent_runtime" && (code === "agent_error" || code === "prompt_failed");
 					const retryDelayMs = Math.min(
 						AGENT_ERROR_RETRY_MAX_MS,
-						AGENT_ERROR_RETRY_INITIAL_MS * Math.pow(2, bound.retryAttempt),
+						AGENT_ERROR_RETRY_INITIAL_MS * 2 ** bound.retryAttempt,
 					);
 					this.#manager.log(
 						`agent_error_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} attempt=${bound.retryAttempt + 1}/${MAX_AGENT_ERROR_RETRY_ATTEMPTS} delayMs=${retryDelayMs} type=${isAgentRuntimeError ? "continuation" : "requeue"} error=${terminalFailureDiagnosis(report)}`,
