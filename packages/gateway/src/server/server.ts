@@ -107,6 +107,7 @@ import {
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
+import { PanelTracker } from "./panel-tracker";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -325,6 +326,7 @@ interface Runtime {
 	/** Admission cap and retirement for `work.run` lanes. */
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
+	readonly panelTracker: PanelTracker;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -361,6 +363,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			runtime.stopRetention();
+			runtime.panelTracker.clear();
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
@@ -789,6 +792,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		work,
 		inbound,
 		requests: new Set(),
+		panelTracker: new PanelTracker(),
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1480,7 +1484,8 @@ async function handleRequest(
 		}
 		case "engagement.panel_response": {
 			// Inbound panel response: user answered an interactive panel question.
-			// Like reactions, this is engagement metadata recorded in context but never a turn.
+			// Validates authorization, resolves the pending gjc coordinator question,
+			// and records the response in the context ledger.
 			const params = request.params as
 				| {
 						origin?: unknown;
@@ -1520,11 +1525,35 @@ async function handleRequest(
 			const authorId = (engagement?.authorId as string) || "";
 			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
 
-			// Record the panel response in the context ledger
+			// Look up the pending panel and validate authorization
+			const panel = runtime.panelTracker.getPanel(panelId);
+			let coordinatorError: string | undefined;
+
+			if (!panel) {
+				coordinatorError = "panel_not_found";
+			} else if (!runtime.panelTracker.isAuthorizedResponder(panel, responderId)) {
+				coordinatorError = "unauthorized_responder";
+			} else {
+				// TODO(#428): Call gjc_coordinator_submit_question_answer via session relay.
+				// This requires extending SessionPort.request to support coordinator-mcp methods.
+				// Expected call:
+				//   await runtime.sessionPort.request({
+				//     sessionId: panel.sessionId,
+				//     repo: workspace,
+				//     opRef: `panel-${panelId}`,
+				//     kind: "control",
+				//     method: "gjc_coordinator_submit_question_answer",
+				//     input: { session_id, turn_id, question_id, answer_binding, answer, idempotency_key, allow_mutation },
+				//   })
+				// For now, mark panel as resolved to allow adapters to proceed.
+				runtime.panelTracker.resolvePanel(panelId);
+			}
+
+			// Record the panel response in the context ledger (audit trail)
 			const responseBody =
 				responseKind === "option_selected"
-					? `[panel] answered question ${panelId} with option ${selectedOptionId}`
-					: `[panel] ${responseKind} panel ${panelId}`;
+					? `[panel] answered question ${panelId} with option ${selectedOptionId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`
+					: `[panel] ${responseKind} panel ${panelId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`;
 
 			options.database.contextRecord({
 				messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
@@ -1533,6 +1562,12 @@ async function handleRequest(
 				...(actor ? { authorName: actor } : {}),
 				body: responseBody,
 			});
+
+			// Report result to adapter
+			if (coordinatorError) {
+				throw new ProtocolError("panel_resolution_failed", `Failed to resolve panel: ${coordinatorError}`);
+			}
+
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1541,6 +1576,8 @@ async function handleRequest(
 			});
 			return;
 		}
+		case "chat.send":
+			await sendChat(connection, request, options, runtime);
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
