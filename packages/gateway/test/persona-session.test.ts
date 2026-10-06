@@ -143,6 +143,77 @@ async function settleFailedInbound(port: ScriptedSessionPort, messageId: string)
 	return sendsFor().at(-1)!;
 }
 
+for (const failures of [1, 2])
+	test(`prepared prompt submission retries once on the same identity (${failures} failures)`, async () => {
+		const port = new ScriptedSessionPort({
+			onSend: (input, scripted) => scripted.complete(input.opRef, "retried answer"),
+		});
+		Object.assign(port, { queueEmpty: async () => true });
+		const originalSend = port.send.bind(port);
+		const attempts: string[] = [];
+		port.send = async (input) => {
+			attempts.push(input.opRef);
+			if (attempts.length <= failures) throw new Error("internal: Prompt submission failed");
+			return originalSend(input);
+		};
+		const terminal: string[] = [];
+		const failed: string[] = [];
+		const logs: string[] = [];
+		await harness(port, { terminal: (text) => terminal.push(text), failure: (text) => failed.push(text) }, (line) =>
+			logs.push(line),
+		);
+		enqueue("submit-retry", "hello");
+		await manager!.notifyInbound(KEY);
+		await eventually(() => database!.inboundTurnRow(latestOpRef)?.turn_state === "done", "retry did not settle");
+		expect(attempts).toEqual([latestOpRef, latestOpRef]);
+		expect(database!.metaGet(`turn_submit_retry_count:${latestOpRef}`)).toBe("1");
+		expect(terminal).toEqual(failures === 1 ? ["retried answer"] : []);
+		expect(failed).toEqual(failures === 2 ? ["internal: Prompt submission failed"] : []);
+		expect(logs.filter((line) => line.startsWith("turn_submit_retry_attempt "))).toHaveLength(1);
+		expect(logs.some((line) => line.startsWith("turn_submit_retry_exhausted "))).toBe(failures === 2);
+	});
+
+for (const outcome of [
+	"accepted",
+	"delivered",
+	"status_unavailable",
+	"invalid_metadata",
+	"busy_queue",
+	"invalid_status",
+])
+	test(`submission retry fails closed after ${outcome}`, async () => {
+		const port = new ScriptedSessionPort();
+		Object.assign(port, { queueEmpty: async () => outcome !== "busy_queue" });
+		const originalSend = port.send.bind(port);
+		let attempts = 0;
+		port.send = async (input) => {
+			attempts++;
+			if (outcome === "accepted" || outcome === "delivered") {
+				await originalSend(input);
+				if (outcome === "delivered") port.complete(input.opRef, "already delivered");
+			}
+			if (outcome === "invalid_metadata") database!.metaSet(`turn_submit_retry_count:${input.opRef}`, "NaN");
+			throw new Error("internal: Prompt submission failed");
+		};
+		if (outcome === "status_unavailable")
+			port.status = async () => {
+				throw new Error("unavailable");
+			};
+		if (outcome === "invalid_status")
+			port.status = async (input) => ({
+				operationRef: input.opRef,
+				status: { status: "unknown", startedAt: 1 },
+				summaryCompleted: false,
+			});
+		await harness(port);
+		enqueue("no-submit-retry", "hello");
+		await manager!.notifyInbound(KEY);
+		expect(attempts).toBe(1);
+		expect(database!.metaGet(`turn_submit_retry_count:${latestOpRef}`)).toBe(
+			outcome === "invalid_metadata" ? "NaN" : undefined,
+		);
+	});
+
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
 		onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply"),

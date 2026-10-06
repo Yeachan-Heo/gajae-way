@@ -423,6 +423,45 @@ test("reconnection is read-only and only a changed incarnation advances generati
 	expect(commands).toBe(0);
 });
 
+test("stalled probes never publish an unverified replacement and same-authority recovery does not rebind", async () => {
+	let current: BrokerDiscovery | undefined = discovery();
+	let responsive = true;
+	let probes = 0;
+	const logs: string[] = [];
+	const generations: number[] = [];
+	const value = client({
+		releaseBrokerScope: null,
+		discovery: async () => current,
+		healthProbe: () => {
+			probes++;
+			return responsive ? true : new Promise<boolean>(() => {});
+		},
+		healthProbeTimeoutMs: 5,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 1, maxMs: 1 },
+		log: (line) => logs.push(line),
+	});
+	value.onGeneration((generation) => generations.push(generation));
+	await value.start();
+	responsive = false;
+	await eventually(() => logs.some((line) => line.includes("broker_stall_detected")));
+	expect(generations).toEqual([1]);
+	current = { ...discovery(), pid: 54321, token: "unverified-token" };
+	const before = probes;
+	await eventually(() => probes >= before + 3);
+	expect(generations).toEqual([1]);
+	await expect(value.cli(["sdk", "session", "list"])).rejects.toThrow("unavailable");
+	current = undefined;
+	await Bun.sleep(15);
+	expect(generations).toEqual([1]);
+	current = discovery();
+	responsive = true;
+	const recovering = probes;
+	await eventually(() => probes > recovering + 1);
+	expect(generations).toEqual([1]);
+	expect(logs.filter((line) => line.includes("broker_stall_detected"))).toHaveLength(1);
+});
+
 test("issue #189: a broker killed in a loop raises one churn alert and a state change, not N healthy verdicts", async () => {
 	let current = discovery();
 	let available = true;

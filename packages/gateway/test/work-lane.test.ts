@@ -10,7 +10,7 @@ import {
 	GjcCliError,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
-import { GjcCliUnavailableError } from "../src/orchestrator/broker";
+import { GjcCliUnavailableError, GlobalGjcClient } from "../src/orchestrator/broker";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import {
@@ -872,6 +872,63 @@ test("historical open attempt recovery uses no current notification target and n
 	expect(f.notices).toHaveLength(0);
 	expect(f.port.binds).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(0);
+});
+
+test("three broker heartbeat timeouts rebind observers immediately without resending work", async () => {
+	const logs: string[] = [];
+	const logger = spyOn(console, "error").mockImplementation((line) => logs.push(String(line)));
+	let discovery = { pid: 101, url: "ws://127.0.0.1:12345", token: "private-old-token", heartbeatAt: Date.now() };
+	let stalled = false;
+	let timeouts = 0;
+	const broker = new GlobalGjcClient({
+		executable: "/fake/gjc",
+		agentDir: "/fake/global/agent",
+		releaseBrokerScope: null,
+		discovery: async () => discovery,
+		healthIntervalMs: 5,
+		healthProbeTimeoutMs: 10,
+		reconnectBackoff: { initialMs: 1, maxMs: 1 },
+		log: (line) => logs.push(line),
+		healthProbe: () => {
+			if (!stalled || discovery.pid === 102) return true;
+			timeouts++;
+			if (timeouts === 3) discovery = { ...discovery, pid: 102, token: "private-new-token" };
+			return new Promise<boolean>(() => {});
+		},
+	});
+	let unsubscribe = () => {};
+	try {
+		await broker.start();
+		const f = await fixture({ brokerGeneration: () => broker.generation, pollMs: 60_000 });
+		let recovery: Promise<void> | undefined;
+		unsubscribe = broker.onGeneration((_generation, change) => {
+			recovery = f.manager.onBrokerGeneration(change);
+		});
+		const result = await started(f, "a", origin);
+		const oldTail = f.port.tailsOf(result.sessionId)[0];
+		expect(oldTail).toBeDefined();
+		stalled = true;
+		await until(() => recovery !== undefined);
+		await recovery;
+		expect(timeouts).toBe(3);
+		expect(logs.some((line) => line.includes("broker_stall_detected"))).toBe(true);
+		expect(
+			logs.some((line) =>
+				line.includes(
+					"broker_rebind_initiated oldPid=101 oldGeneration=1 newPid=102 newGeneration=2 reason=broker_stall",
+				),
+			),
+		).toBe(true);
+		expect(logs.join(" ")).not.toContain("private-");
+		expect(f.port.tailsOf(result.sessionId)).toHaveLength(1);
+		expect(f.port.tailsOf(result.sessionId)[0]).not.toBe(oldTail);
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	} finally {
+		unsubscribe();
+		await broker.stop();
+		logger.mockRestore();
+	}
 });
 
 test("late output from an obsolete generation cannot settle or fan out", async () => {

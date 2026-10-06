@@ -1,29 +1,29 @@
 {
-  "kind": "artifact-consistency-receipt",
-  "sourceHash": "sha256:afbb9a77cb5ff7da17c201a039f12fd78aa9b2660ed6ce4b1829566b98061917",
-  "frozenCommit": "5001727",
-  "verdict": "passed",
-  "checks": [
-    "JUnit test/failure counts match report",
-    "all 69 IDs present exactly once",
-    "only RT-SLACK-65 fails",
-    "four real CLI probes pass",
-    "build passes",
-    "CLI replay byte-identical to frozen commit",
-    "all artifact refs exist",
-    "test snapshots byte-identical",
-    "product source unchanged"
-  ],
-  "counts": {
-    "tests": 88,
-    "passed": 87,
-    "failed": 1,
-    "cliProbes": 4,
-    "cliPassed": 4,
-    "stableCaseIds": 69,
-    "supportingTests": 211,
-    "supportingPassed": 211,
-    "lockLoopIterations": 10,
-    "lockLoopPassed": 10
-  }
+	"kind": "artifact-consistency-receipt",
+	"sourceHash": "sha256:afbb9a77cb5ff7da17c201a039f12fd78aa9b2660ed6ce4b1829566b98061917",
+	"frozenCommit": "5001727",
+	"verdict": "passed",
+	"checks": [
+		"JUnit test/failure counts match report",
+		"all 69 IDs present exactly once",
+		"only RT-SLACK-65 fails",
+		"four real CLI probes pass",
+		"build passes",
+		"CLI replay byte-identical to frozen commit",
+		"all artifact refs exist",
+		"test snapshots byte-identical",
+		"product source unchanged"
+	],
+	"counts": {
+		"tests": 88,
+		"passed": 87,
+		"failed": 1,
+		"cliProbes": 4,
+		"cliPassed": 4,
+		"stableCaseIds": 69,
+		"supportingTests": 211,
+		"supportingPassed": 211,
+		"lockLoopIterations": 10,
+		"lockLoopPassed": 10
+	}
 }

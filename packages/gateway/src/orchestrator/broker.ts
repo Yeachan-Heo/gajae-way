@@ -69,9 +69,15 @@ const SESSION_VALUE_OPTIONS = new Set([
 export const BROKER_RESPAWN_WINDOW_MS = 30 * 60_000;
 /** Respawns inside the window that turn silent recovery into one operator alert. */
 export const BROKER_RESPAWN_CHURN_THRESHOLD = 3;
+export const BROKER_STALL_THRESHOLD = 3;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
-export type BrokerGenerationListener = (generation: number) => void;
+export interface BrokerAuthorityChange {
+	readonly previous: { readonly pid: number; readonly generation: number };
+	readonly current: { readonly pid: number; readonly generation: number };
+	readonly reason: "broker_stall" | "authority_changed";
+}
+export type BrokerGenerationListener = (generation: number, change?: BrokerAuthorityChange) => void;
 export interface BrokerHealthContext {
 	readonly agentDir: string;
 	readonly cli: CliRunner;
@@ -320,6 +326,9 @@ export class GlobalGjcClient {
 	#inflight = 0;
 	#generation = 0;
 	#identity: string | undefined;
+	#authorityPid: number | undefined;
+	#probeFailures = 0;
+	#stallDetected = false;
 	#available = false;
 	#stopped = false;
 	#stoppedAtEpoch: number | undefined; // When stopped due to involuntary termination failure
@@ -495,6 +504,8 @@ export class GlobalGjcClient {
 		this.#available = false;
 		this.#outageSince = undefined;
 		this.#liveOutageSince = undefined;
+		this.#probeFailures = 0;
+		this.#stallDetected = false;
 		++this.#epoch;
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
@@ -556,23 +567,25 @@ export class GlobalGjcClient {
 			this.#timeout,
 		);
 	}
-	async #observe(epoch: number): Promise<boolean> {
+	async #observe(epoch: number, reread = true): Promise<boolean> {
 		this.#observedLiveBroker = false;
 		try {
 			const discovery = await this.#discovery();
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			if (!discovery) {
 				this.#available = false;
+				this.#probeFailures = 0;
 				const verdict = await this.judgeLiveness();
 				this.#observedLiveBroker = verdict.state === "live";
 				this.#unavailableReason = describeDiscoveryFailure(verdict);
 				return false;
 			}
 			this.#observedLiveBroker = true;
+			const healthProbe = this.#options.healthProbe;
 			const healthy = await bounded(
-				this.#options.healthProbe
-					? Promise.resolve(
-							this.#options.healthProbe({
+				healthProbe
+					? Promise.resolve().then(() =>
+							healthProbe({
 								agentDir: this.agentDir,
 								cli: this.cli,
 								discoveryPath: this.discoveryPath,
@@ -582,28 +595,52 @@ export class GlobalGjcClient {
 						)
 					: probeBrokerEndpoint(discovery, this.#timeout),
 				this.#timeout,
-			);
+			).catch(() => false);
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			this.#assertAgentDirIdentity();
 			this.#available = healthy;
 			if (!healthy) {
 				this.#unavailableReason = `endpoint probe failed for live discovery pid ${discovery.pid}`;
+				if (reread && ++this.#probeFailures >= BROKER_STALL_THRESHOLD) {
+					if (!this.#stallDetected) {
+						this.#stallDetected = true;
+						this.#log(
+							`broker_stall_detected pid=${discovery.pid} generation=${this.#generation} failures=${this.#probeFailures}`,
+						);
+					}
+					// Re-read and authenticate the replacement before publishing authority.
+					// Discovery alone cannot authorize a rebind, and shared daemons are never killed.
+					return await this.#observe(epoch, false);
+				}
 				return false;
 			}
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
+				const previous =
+					this.#authorityPid === undefined ? undefined : { pid: this.#authorityPid, generation: this.#generation };
+				await this.#releaseBroker(discovery.pid);
+				if (epoch !== this.#epoch || this.#stopped) return false;
 				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
-				await this.#releaseBroker(discovery.pid);
+				this.#authorityPid = discovery.pid;
 				this.#generation++;
+				const change: BrokerAuthorityChange | undefined = previous
+					? {
+							previous,
+							current: { pid: discovery.pid, generation: this.#generation },
+							reason: this.#stallDetected ? "broker_stall" : "authority_changed",
+						}
+					: undefined;
 				for (const listener of this.#listeners) {
 					try {
-						listener(this.#generation);
+						listener(this.#generation, change);
 					} catch (error) {
 						this.#log(error);
 					}
 				}
 			}
+			this.#probeFailures = 0;
+			this.#stallDetected = false;
 			return true;
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {

@@ -11,6 +11,7 @@ import {
 	isTerminalStatus,
 	OpRefRejectedError,
 	projectOpState,
+	type SendReceipt,
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
@@ -1240,15 +1241,38 @@ class OriginActor {
 			return;
 		}
 		try {
-			const receipt = await this.#manager.port.send({
-				sessionId: binding.sessionId,
-				repo: this.#manager.repo,
-				text: lifecycle.text,
-				opRef,
-				relay: tail,
-				...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
-				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
-			});
+			const send = () =>
+				this.#manager.port.send({
+					sessionId: binding.sessionId,
+					repo: this.#manager.repo,
+					text: lifecycle.text,
+					opRef,
+					relay: tail,
+					...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
+					...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
+				});
+			let receipt: SendReceipt | undefined;
+			for (;;) {
+				try {
+					receipt = await send();
+					break;
+				} catch (error) {
+					if (!(await this.#submissionRetrySafe(current, error))) throw error;
+					const key = `turn_submit_retry_count:${opRef}`;
+					const count = this.#manager.database.metaGet(key) ?? "0";
+					// Corrupt or unexpected metadata must never grant a fresh retry budget.
+					if (count !== "0") {
+						this.#manager.log(`turn_submit_retry_exhausted opRef=${opRef}`, "error");
+						await lifecycle.onFailure?.({ ...current, error: error as Error });
+						this.#manager.database.inboundTurnComplete(opRef, "no_delivery");
+						await this.#notifySettled(current);
+						await this.#settleAfterTerminal(current, false);
+						return;
+					}
+					this.#manager.database.metaSet(key, "1");
+					this.#manager.log(`turn_submit_retry_attempt opRef=${opRef} retryCount=1`);
+				}
+			}
 			tail.correlate(opRef, receipt);
 			this.#manager.database.inboundTurnAccept(opRef);
 			this.#bindFailures = 0;
@@ -1311,6 +1335,40 @@ class OriginActor {
 			return;
 		}
 		await this.#steerPending();
+	}
+
+	/** Only a proven, still-prepared submission may reuse its durable identity. */
+	async #submissionRetrySafe(bound: BoundTurn, error: unknown): Promise<boolean> {
+		if (!(error instanceof Error) || error.message !== "internal: Prompt submission failed") return false;
+		const prepared = () =>
+			!this.#stopped &&
+			!this.#manager.stopped &&
+			this.#current === bound &&
+			!bound.retired &&
+			bound.epoch === this.#epoch() &&
+			bound.brokerGeneration === this.#manager.brokerGeneration &&
+			!bound.replyVisible &&
+			bound.lastAssistantText === undefined &&
+			!bound.openTool &&
+			!bound.tailTerminalObserved &&
+			!bound.tailEvidenceUnavailable &&
+			this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound";
+		if (!prepared()) return false;
+		try {
+			const report = await this.#statusOf(bound);
+			return (
+				report.operationRef === bound.turn.opRef &&
+				report.status.status === "unknown" &&
+				report.status.receiptState === undefined &&
+				report.status.startedAt === undefined &&
+				report.status.outcome === undefined &&
+				report.summaryCompleted === false &&
+				(await this.#queueIsEmpty(bound.sessionId, bound.tail)) &&
+				prepared()
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	/**

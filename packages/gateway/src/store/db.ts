@@ -137,7 +137,8 @@ export type WorkAttemptDecision =
 	| "fallback"
 	| "suppressed"
 	| "no_target"
-	| "wake_unaccepted";
+	| "wake_unaccepted"
+	| "recovery_indeterminate";
 export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted";
 export interface WorkReportRoot {
 	readonly originKey: string;
@@ -446,7 +447,15 @@ function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): voi
 	workAssert(output.disposition !== "available" || (output.proof !== null && output.excerpt !== null));
 	workAssert(output.disposition !== "silent" || output.knownSilence !== null);
 	workAssert(
-		["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.decision),
+		[
+			"undecided",
+			"reported",
+			"fallback",
+			"suppressed",
+			"no_target",
+			"wake_unaccepted",
+			"recovery_indeterminate",
+		].includes(value.decision),
 	);
 	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
 	if (value.decision !== "undecided") {
@@ -470,6 +479,8 @@ function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): voi
 				(value.wakeReportId !== null && value.mode === "start" && value.terminal !== null && !workAccepted(value)),
 		);
 		workAssert(value.wakeReportId === null || workAccepted(value) || value.decision === "wake_unaccepted");
+		if (value.decision === "recovery_indeterminate")
+			workAssert(output.proof === null && output.knownSilence === null && value.wakeReportId === null);
 	}
 	workAssert(Buffer.byteLength(JSON.stringify(value), "utf8") <= 16384);
 }
@@ -1182,6 +1193,65 @@ export class GatewayDatabase {
 				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
 			);
 		}
+	}
+
+	/** Repair only torn settlement state, atomically; unrelated corruption aborts boot. */
+	workAttemptReconcile(log: (line: string) => void = console.info): number {
+		const count = this.withTransaction(() => {
+			const rows = this.#database
+				.query<{ op_ref: string; record_json: string }, []>(
+					"SELECT op_ref, record_json FROM work_attempt_runtime WHERE settled_at IS NULL",
+				)
+				.all();
+			let reconciled = 0;
+			for (const row of rows) {
+				const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
+				validateWorkRuntime(runtime, this.instanceId);
+				workAssert(runtime.opRef === row.op_ref);
+				const json = this.laneJobJson(runtime.jobId);
+				workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+				const record = parseLaneJobRecord(json);
+				const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
+				workAssert(attempt !== undefined);
+				// Validate every history invariant except the known torn settlement timestamp.
+				this.#workValidateHistory({ ...runtime, settledAt: attempt.endedAt ?? null }, record);
+				if (attempt.endedAt === undefined && runtime.settledAt === null) {
+					this.workAttemptGet(row.op_ref);
+					continue;
+				}
+				this.#assertNotQuarantined("work", runtime.jobId);
+				const settledAt = runtime.terminal?.observedAt ?? attempt.endedAt;
+				workAssert(settledAt !== undefined);
+				const next: WorkAttemptRuntime = {
+					...runtime,
+					terminal: runtime.terminal ?? { kind: "local", reasonCode: "recovery_indeterminate", observedAt: settledAt },
+					output:
+						runtime.output.disposition === "pending"
+							? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
+							: runtime.output,
+					decision: runtime.decision === "undecided" ? "recovery_indeterminate" : runtime.decision,
+					settledAt,
+				};
+				validateWorkRuntime(next, this.instanceId);
+				const history = {
+					...record,
+					attempts: record.attempts.map((item) =>
+						item.opRef === runtime.opRef ? { ...item, endedAt: settledAt } : item,
+					),
+				};
+				this.#workValidateHistory(next, history);
+				// Keep the version unchanged until column identity has been checked by the normal reader.
+				this.#database
+					.query("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ?")
+					.run(JSON.stringify(next), settledAt, row.op_ref);
+				this.#workPutHistory(next, history);
+				this.workAttemptGet(row.op_ref);
+				reconciled++;
+			}
+			return reconciled;
+		});
+		log(`work_attempt_runtime_reconciled count=${count}`);
+		return count;
 	}
 
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */

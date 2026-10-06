@@ -739,9 +739,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			: undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
-			? brokerWithGeneration.onGeneration((generation) => {
+			? brokerWithGeneration.onGeneration((generation, change) => {
 					void work
-						.onBrokerGeneration()
+						.onBrokerGeneration(change)
 						.catch((error: unknown) => console.error(`work broker-generation recovery failed: ${diagnostic(error)}`));
 					void personaSessions
 						.onBrokerGeneration(generation)
