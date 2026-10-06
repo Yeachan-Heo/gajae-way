@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { type FrameWriterSink, OrderedFrameWriter } from "../src/server/frame-writer";
+import { type FrameWriterSink, OrderedFrameWriter } from "@gajae-gateway/protocol";
 
 const response = (id: string, text: string) => ({ v: "0.1", type: "response", id, result: { text } }) as const;
 

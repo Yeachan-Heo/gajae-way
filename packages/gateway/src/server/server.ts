@@ -91,7 +91,7 @@ import {
 import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
-import { OrderedFrameWriter } from "./frame-writer";
+import { OrderedFrameWriter } from "@gajae-gateway/protocol";
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
@@ -385,7 +385,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		return stopPromise;
 	};
 	runtime.stop = stop;
-	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter }>({
+	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter; decoder: TextDecoder }>({
 		unix: options.config.socketPath,
 		socket: {
 			open(socket) {
@@ -393,6 +393,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 					{ write: (bytes) => socket.write(bytes), close: () => socket.end() },
 					(error) => console.error(`gateway socket write failed: ${diagnostic(error)}`),
 				);
+				const decoder = new TextDecoder({ stream: true } as any);
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
@@ -400,13 +401,13 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 					close: () => writer.close(),
 					settle: () => writer.settled(),
 				};
-				socket.data = { connection, writer };
+				socket.data = { connection, writer, decoder };
 				runtime.connections.add(connection);
 			},
 			data(socket, data) {
 				const connection = socket.data.connection;
 				try {
-					for (const frame of connection.decoder.feed(Buffer.from(data).toString())) {
+					for (const frame of connection.decoder.feed(socket.data.decoder.decode(data, { stream: true } as any))) {
 						const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
 						if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
 						runtime.requests.add(task);
@@ -416,6 +417,9 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 						);
 					}
 				} catch (error) {
+					if (error instanceof ProtocolError && (error.code === "malformed_frame" || error.code === "payload_too_large")) {
+						console.error(`gateway frame decode error: ${diagnostic(error)}`);
+					}
 					writeError(connection, error);
 				}
 			},

@@ -167,3 +167,4 @@ export {
 	PROFILE_VERSION,
 	SUPPORTED_PROFILE_VERSIONS,
 } from "./version";
+export { type FrameWriterSink, OrderedFrameWriter, type OrderedFrameWriterOptions } from "./frame-writer";

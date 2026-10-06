@@ -11,9 +11,11 @@ import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
 	encodeFrame,
+	type FrameWriterSink,
 	type Frame,
 	FrameDecoder,
 	LOOPBACK_ORIGIN,
+	OrderedFrameWriter,
 	type OriginRef,
 	PROFILE_VERSION,
 	ProtocolError,
@@ -53,12 +55,24 @@ interface Pending {
 export class GajaewayClient {
 	static async connectSocket(path: string, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
+		const decoder = new TextDecoder({ stream: true } as any);
+		const socketSink: FrameWriterSink = {
+			write: (bytes: Uint8Array) => 0,
+			close: () => {},
+		};
+		let writer: OrderedFrameWriter;
 		const socket = await Bun.connect<undefined>({
 			unix: path,
 			socket: {
-				open() {},
+				open(_socket) {
+					socketSink.write = (bytes: Uint8Array) => _socket.write(bytes);
+					socketSink.close = () => _socket.end();
+					writer = new OrderedFrameWriter(socketSink, (error) => {
+						client.#fail(error as Error);
+					});
+				},
 				data(_socket, data) {
-					client.#receive(new TextDecoder().decode(data));
+					client.#receive(decoder.decode(data, { stream: true } as any));
 				},
 				close() {
 					client.#fail(new Error("gateway connection closed"));
@@ -66,14 +80,19 @@ export class GajaewayClient {
 				error(_socket, error) {
 					client.#fail(error);
 				},
+				drain(_socket) {
+					writer?.drain();
+				},
 			},
 		});
 		client.#transport = {
 			write: async (data) => {
-				socket.write(data);
+				const frame = JSON.parse(data) as Frame;
+				writer.write(frame);
+				await writer.settled();
 			},
 			close: () => {
-				socket.end();
+				writer?.close();
 			},
 		};
 		await client.#negotiate();
@@ -216,7 +235,8 @@ export class GajaewayClient {
 	}
 
 	async #readStdio(readable: StdioTransport["readable"]): Promise<void> {
-		for await (const chunk of readable as AsyncIterable<Uint8Array>) this.#receive(new TextDecoder().decode(chunk));
+		const decoder = new TextDecoder({ stream: true } as any);
+		for await (const chunk of readable as AsyncIterable<Uint8Array>) this.#receive(decoder.decode(chunk, { stream: true } as any));
 	}
 
 	#receive(chunk: string): void {
@@ -241,7 +261,13 @@ export class GajaewayClient {
 						this.#pending.delete(frame.id);
 						pending.reject(error);
 					}
-				} else this.#emit("__negotiation_error", error, frame);
+				} else {
+					if (error.code === "malformed_frame" || error.code === "payload_too_large") {
+						this.#fail(error);
+					} else {
+						this.#emit("__negotiation_error", error, frame);
+					}
+				}
 				continue;
 			}
 			if (frame.type === "response") {
