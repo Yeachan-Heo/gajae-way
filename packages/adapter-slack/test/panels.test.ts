@@ -1,6 +1,6 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
-import { askUserPanelBlocks, askUserPanelFallback, approvalPanelBlocks, approvalPanelFallback } from "../src/panels";
+import { approvalPanelBlocks, approvalPanelFallback, askUserPanelBlocks, askUserPanelFallback } from "../src/panels";
 
 describe("askUserPanelBlocks", () => {
 	it("renders ask-user panel with interactive buttons", () => {
