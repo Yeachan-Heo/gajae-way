@@ -175,8 +175,9 @@ test("Slack presence: a newer turn on the same conversation takes over, and the 
 	await flush();
 	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
 	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand", "C1:2.000:hourglass_flowing_sand"]);
-	const timer = [...f.timers][0];
-	expect(timer?.ms).toBe(WORKING_STATUS_REFRESH_MS);
+	// Find the refresh timer (not the stale timer)
+	const timer = [...f.timers].find((t) => t.ms === WORKING_STATUS_REFRESH_MS);
+	expect(timer).toBeDefined();
 	// Simulate a refresh (does not clear)
 	await timer?.fn();
 	await flush();
@@ -555,6 +556,73 @@ test("Slack presence: periodic refresh keeps status alive across multiple turns"
 	expect(f.removes.length).toBeGreaterThan(0);
 });
 
+test("Slack presence: missing signals clear markers after stale window", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	const initialRemoves = f.removes.length;
+
+	// Simulate gateway crash: no progress signals arrive after arm()
+	// Advance to just before stale timeout
+	f.tick(WORKING_STATUS_STALE_MS - 1_000);
+	let staleTimer: { fn: () => void; ms: number } | undefined;
+	for (const timer of f.timers) {
+		if (timer.ms === WORKING_STATUS_STALE_MS) {
+			staleTimer = timer;
+			break;
+		}
+	}
+	expect(staleTimer).toBeDefined();
+
+	// Markers should still be present (not yet stale)
+	expect(f.removes.length).toBe(initialRemoves);
+
+	// Now advance past stale window
+	f.tick(2_000);
+	if (staleTimer) await staleTimer.fn();
+	await flush();
+
+	// Markers should now be removed (cleared by stale timeout)
+	expect(f.removes.length).toBeGreaterThan(initialRemoves);
+	expect(f.timers.size).toBe(0);
+});
+
+test("Slack presence: periodic signals reset stale window", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	const initialRemoves = f.removes.length;
+
+	// Send a progress signal at 50 seconds (before 90s stale timeout)
+	f.tick(50_000);
+	await f.status.update(progress({ elapsedMs: 50_000 }));
+	await flush();
+
+	// Markers should still be present
+	expect(f.removes.length).toBe(initialRemoves);
+
+	// Advance to 135 seconds total (45s after the signal)
+	f.tick(85_000);
+	let staleTimer: { fn: () => void; ms: number } | undefined;
+	for (const timer of f.timers) {
+		if (timer.ms === WORKING_STATUS_STALE_MS) {
+			staleTimer = timer;
+			break;
+		}
+	}
+
+	// At 135s, the stale timer should not have fired (it was reset at 50s)
+	expect(f.removes.length).toBe(initialRemoves);
+
+	// Advance past the new stale deadline (50s + 90s = 140s)
+	f.tick(10_000);
+	if (staleTimer) await staleTimer.fn();
+	await flush();
+
+	// Now markers should be removed
+	expect(f.removes.length).toBeGreaterThan(initialRemoves);
+});
+
 test("Slack presence: explicit clear removes all markers exactly once", async () => {
 	const f = fixture();
 	f.status.arm(origin, "C1:1.000");
@@ -562,14 +630,9 @@ test("Slack presence: explicit clear removes all markers exactly once", async ()
 	const initialAdds = f.adds.length;
 	const initialRemoves = f.removes.length;
 
-	// Advance a long time without any updates
-	f.tick(150_000);
-	const allTimers = Array.from(f.timers);
-	for (const timer of allTimers) {
-		if (timer.ms === WORKING_STATUS_REFRESH_MS) {
-			await timer.fn();
-		}
-	}
+	// Send a progress signal to reset stale timer
+	f.tick(50_000);
+	await f.status.update(progress({ elapsedMs: 50_000 }));
 	await flush();
 
 	// The status should still be active (no markers removed)
@@ -582,6 +645,9 @@ test("Slack presence: explicit clear removes all markers exactly once", async ()
 	const finalRemoves = f.removes.length;
 	const newRemoves = f.removes.slice(initialRemoves);
 	expect(newRemoves.length).toBeGreaterThan(0);
+
+	// All timers should be cleaned up
+	expect(f.timers.size).toBe(0);
 
 	// Further progress updates are ignored
 	await f.status.update(progress({ elapsedMs: 200_000 }));

@@ -87,6 +87,7 @@ export function presenceStatusText(snapshot: PresenceSnapshot): string {
 export class WorkingStatus {
 	readonly #entries = new Map<string, Entry>();
 	readonly #refreshTimers = new Map<string, Timer>();
+	readonly #staleTimers = new Map<string, Timer>();
 
 	constructor(
 		readonly api: Pick<SlackWebApi, "addReaction" | "removeReaction" | "setThreadStatus">,
@@ -113,6 +114,7 @@ export class WorkingStatus {
 			// restart the gradient from queued.
 			prior.wanted = true;
 			prior.state = presenceInitial(this.now());
+			this.#armStale(key);
 			this.#armRefresh(key, prior);
 			void this.#reconcile(key, prior);
 			return;
@@ -136,6 +138,7 @@ export class WorkingStatus {
 			pending: false,
 		};
 		this.#entries.set(key, entry);
+		this.#armStale(key);
 		this.#armRefresh(key, entry);
 		void this.#reconcile(key, entry);
 	}
@@ -145,6 +148,8 @@ export class WorkingStatus {
 		const key = progress.origin.conversationId;
 		const entry = this.#entries.get(key);
 		if (!entry?.wanted) return;
+		// Reset both stale and refresh timers on each signal: the turn is still alive.
+		this.#armStale(key);
 		this.#armRefresh(key, entry);
 		const swap = presenceTransition(entry.state, progress, this.now());
 		if (!swap) return;
@@ -153,9 +158,12 @@ export class WorkingStatus {
 	}
 
 	async clear(conversationId: string): Promise<void> {
-		const timer = this.#refreshTimers.get(conversationId);
-		if (timer) this.clearTimer(timer);
+		const refreshTimer = this.#refreshTimers.get(conversationId);
+		if (refreshTimer) this.clearTimer(refreshTimer);
 		this.#refreshTimers.delete(conversationId);
+		const staleTimer = this.#staleTimers.get(conversationId);
+		if (staleTimer) this.clearTimer(staleTimer);
+		this.#staleTimers.delete(conversationId);
 		const entry = this.#entries.get(conversationId);
 		if (!entry) return;
 		this.#entries.delete(conversationId);
@@ -178,6 +186,18 @@ export class WorkingStatus {
 	async #retire(key: string, entry: Entry): Promise<void> {
 		entry.wanted = false;
 		await this.#reconcile(key, entry);
+	}
+
+	#armStale(key: string): void {
+		const prior = this.#staleTimers.get(key);
+		if (prior) this.clearTimer(prior);
+		const timer = this.setTimer(async () => {
+			// No gateway signal arrived within the stale window: turn likely crashed or missed
+			// its terminal signal. Clear to prevent the status from staying alive forever.
+			if (this.#entries.has(key)) void this.clear(key);
+		}, WORKING_STATUS_STALE_MS);
+		timer.unref?.();
+		this.#staleTimers.set(key, timer);
 	}
 
 	#armRefresh(key: string, entry: Entry): void {
