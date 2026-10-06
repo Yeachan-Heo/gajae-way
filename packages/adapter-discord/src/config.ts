@@ -61,6 +61,8 @@ export interface DiscordAdapterConfig {
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
 	readonly channels?: Readonly<Record<string, ChannelEngagementPolicy>>;
+	/** Absolute or config-relative directories permitted for outbound MEDIA files. Omitted disables file uploads. */
+	readonly mediaDirectories?: readonly string[];
 	readonly voice?: DiscordVoiceConfig;
 	/**
 	 * Controls WorkingStatus reaction behavior:
@@ -122,12 +124,26 @@ export async function loadDiscordAdapterConfig(
 			`Discord adapter channels entries may only set engagement to ${ENGAGEMENT_MODES.join(", ")} and audience to ${ENGAGEMENT_AUDIENCES.join(", ")}.`,
 		);
 	}
+	if (
+		raw.mediaDirectories !== undefined &&
+		(!Array.isArray(raw.mediaDirectories) ||
+			raw.mediaDirectories.some((directory) => typeof directory !== "string" || !directory.trim()))
+	) {
+		throw new DiscordAdapterStartupError(
+			"Discord adapter mediaDirectories must be an array of non-empty directory paths.",
+		);
+	}
 	if (raw.statusReactions !== undefined && !isStatusReactionsMode(raw.statusReactions)) {
 		throw new DiscordAdapterStartupError(
 			`Discord adapter statusReactions must be "gradient", "static", or "off" when set.`,
 		);
 	}
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
+	const mediaDirectories = Array.isArray(raw.mediaDirectories)
+		? raw.mediaDirectories.map((directory: string) =>
+				isAbsolute(directory) ? directory : resolve(dirname(configPath), directory),
+			)
+		: undefined;
 	let token: string;
 	try {
 		token = (await readFile(tokenFile, "utf8")).trim();
@@ -140,7 +156,14 @@ export async function loadDiscordAdapterConfig(
 		throw new DiscordAdapterStartupError(`Discord token credential file ${tokenFile} is empty.`);
 	}
 	const voice = await loadVoiceConfig(raw.voice, configPath);
-	return { ...raw, tokenFile, token, configPath, ...(voice ? { voice } : {}) } as LoadedDiscordAdapterConfig;
+	return {
+		...raw,
+		tokenFile,
+		token,
+		configPath,
+		...(mediaDirectories ? { mediaDirectories } : {}),
+		...(voice ? { voice } : {}),
+	} as LoadedDiscordAdapterConfig;
 }
 
 /**
