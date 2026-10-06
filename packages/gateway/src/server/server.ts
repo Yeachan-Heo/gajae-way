@@ -2352,7 +2352,12 @@ async function createInboundTurnLifecycle(
 	/** Heartbeats present the most recent tail observation; they never invent progress. */
 	let tailActivitySeen = false;
 	let ended = false;
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false, prompt = false, fromHeartbeat = false) => {
+	const emitProgress = (
+		progress: { toolCalls: number; outputTokens: number },
+		final = false,
+		prompt = false,
+		fromHeartbeat = false,
+	) => {
 		lastKnown = progress;
 		const now = Date.now();
 		// A change of activity (the first tool starting, a new tool) is worth
