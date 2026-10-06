@@ -4,6 +4,7 @@ import { type BootedGateway, bootGateway } from "./boot";
 import { gatewayHome } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { DEFAULT_EXIT_WRITER, installExitReporter } from "./exit-report";
+import { SecretGuard, secretSourcesFromEnv } from "./guard/secret-guard";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 
 /**
@@ -20,8 +21,13 @@ if (command === "config" && args[0] === "check") {
 	const result = await checkConfigFile(args[1] ?? defaultConfigPath());
 	for (const line of renderConfigCheck(result)) console.log(line);
 	process.exitCode = configCheckExitCode(result);
+} else if (command === "redact") {
+	// The daemon's outbound redaction as a filter, for tools that post to chat
+	// without the gateway (a bot-token Slack API wrapper): stdin -> stdout.
+	const guard = new SecretGuard(secretSourcesFromEnv(process.env, undefined, gatewayHome()), { log: () => {} });
+	process.stdout.write(guard.redact(await Bun.stdin.text()).text);
 } else if (command !== "daemon") {
-	console.error("usage: gajaeway-gateway daemon [--stdio] [--only-new] | config check [path]");
+	console.error("usage: gajaeway-gateway daemon [--stdio] [--only-new] | config check [path] | redact < text");
 	process.exitCode = 2;
 } else {
 	let booted: BootedGateway | undefined;
