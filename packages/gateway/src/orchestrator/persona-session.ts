@@ -26,6 +26,7 @@ import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
+import { isSessionBusyTimeout } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
@@ -1241,6 +1242,22 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
+			// Session remained busy after extended wait, indicating prior run may still be active.
+			// This is retriable: requeue the turn and try again after the session settles.
+			if (isSessionBusyTimeout(error)) {
+				await tail.close();
+				const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+				this.#current = undefined;
+				this.#state = "idle";
+				await this.#notifyReleased(current);
+				this.#manager.log(
+					`send_busy_timeout action=requeue origin=${this.originKey} epoch=${epoch} opRef=${opRef} attempt=${attempt}`,
+					"warn",
+				);
+				// Schedule retry with backoff to give the session time to settle
+				this.#scheduleDispatchRetry(Math.min(30_000, 5_000 * attempt));
+				return;
+			}
 			// Only the established session_unavailable status proves this send did
 			// not land. A session_not_found returned after port.send is ambiguous:
 			// the broker may have accepted the operation before the CLI failed.
