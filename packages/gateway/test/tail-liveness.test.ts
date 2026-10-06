@@ -263,7 +263,8 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 		);
 		await eventually(() => port.sends.length === 1, "persistent turn did not start");
 		await Bun.sleep(30);
-		expect(frames.filter((frame) => frame.event === "chat.progress")).toEqual([]);
+		// Liveness frames with zero counters are allowed before tail activity; counters are only from tail.
+		expect(frames.filter((frame) => frame.event === "chat.progress" && (frame.payload.toolCalls > 0 || frame.payload.outputTokens > 0))).toEqual([]);
 
 		const send = port.sends[0]!;
 		for (let call = 0; call < 3; call++) port.emitTool(send.sessionId, { toolName: "read" });
@@ -274,8 +275,13 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 					(frame) =>
 						frame.event === "chat.progress" && frame.payload.toolCalls === 3 && frame.payload.outputTokens === 77,
 				),
-			"tail activity did not become progress",
+			"tail counters did not surface in progress",
 		);
+		// Verify that pre-tail liveness frames do not consume the throttle window: there should be
+		// a fresh progress frame with counters shortly after tail activity, not blocked by heartbeats.
+		const counterFrames = frames.filter((frame) => frame.event === "chat.progress" && (frame.payload.toolCalls > 0 || frame.payload.outputTokens > 0));
+		expect(counterFrames.length).toBeGreaterThan(0);
+		expect(counterFrames[counterFrames.length - 1]).toMatchObject({ payload: { toolCalls: 3, outputTokens: 77 } });
 		port.complete(send.opRef, "done");
 		await eventually(() => database.inboundPendingCount(ORIGIN_KEY) === 0, "completed turn did not settle");
 	} finally {

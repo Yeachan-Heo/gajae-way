@@ -2352,7 +2352,7 @@ async function createInboundTurnLifecycle(
 	/** Heartbeats present the most recent tail observation; they never invent progress. */
 	let tailActivitySeen = false;
 	let ended = false;
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false, prompt = false) => {
+	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false, prompt = false, fromHeartbeat = false) => {
 		lastKnown = progress;
 		const now = Date.now();
 		// A change of activity (the first tool starting, a new tool) is worth
@@ -2367,7 +2367,11 @@ async function createInboundTurnLifecycle(
 		// stayed silent, or failed before its first tail frame never announced
 		// progress - gating final on a prior announcement left Discord "typing…"
 		// for the full 330s cap after every such turn (2026-09-03, local).
-		lastProgressAt = now;
+		// Heartbeats must not consume the throttle window so that real tail activity
+		// can be announced promptly once it arrives.
+		if (!fromHeartbeat) {
+			lastProgressAt = now;
+		}
 		const payload = {
 			turnId,
 			origin,
@@ -2391,7 +2395,7 @@ async function createInboundTurnLifecycle(
 	// function's `due` gate prevents spam: only emits after firstAfterMs has
 	// passed and then every intervalMs thereafter, respecting minGap.
 	const heartbeat = setInterval(() => {
-		emitProgress(lastKnown);
+		emitProgress(lastKnown, false, false, true);
 	}, intervalMs);
 	const endProgress = () => {
 		if (ended) return;
