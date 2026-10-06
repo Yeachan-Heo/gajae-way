@@ -53,6 +53,7 @@ import {
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
 import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
+import { approvalPanelBlocks, approvalPanelFallback, askUserPanelBlocks, askUserPanelFallback } from "./panels";
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
@@ -308,8 +309,23 @@ export async function settleSlackDelivery(
 		const channel = deliveryChannel(message.origin);
 		// Routing is decided before any write, so a bad target never half-posts.
 		const threadTs = replyThreadTs(message);
-		// Mentions are repaired before Markdown \u2192 mrkdwn: a `<@U\u2026>` the model wrapped
-		// in backticks, a bare `@U\u2026`, or an `@handle` the directory knows, all become
+		// Handle interactive panels (ask-user and approval)
+		if (message.askUserPanel) {
+			const blocks = askUserPanelBlocks(message);
+			const fallback = askUserPanelFallback(message);
+			await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		}
+		if (message.approvalPanel) {
+			const blocks = approvalPanelBlocks(message);
+			const fallback = approvalPanelFallback(message);
+			await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		}
+		// Mentions are repaired before Markdown → mrkdwn: a `<@U…>` the model wrapped
+		// in backticks, a bare `@U…`, or an `@handle` the directory knows, all become
 		// a real ping instead of literal text. Unknown or ambiguous names are left alone.
 		const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
 		const text = markdownToMrkdwn(message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired);

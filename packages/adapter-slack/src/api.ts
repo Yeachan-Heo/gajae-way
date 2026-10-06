@@ -260,6 +260,7 @@ export class SlackWebApi {
 		text: string,
 		threadTs?: string,
 		priority: "delivery" | "cosmetic" = "delivery",
+		blocks?: unknown[],
 	): Promise<{ readonly ts: string; readonly channel: string }> {
 		await this.limiter?.acquire(channel, priority);
 		return this.call("chat.postMessage", {
@@ -268,6 +269,7 @@ export class SlackWebApi {
 			mrkdwn: true,
 			unfurl_links: false,
 			...(threadTs === undefined ? {} : { thread_ts: threadTs }),
+			...(blocks === undefined || blocks.length === 0 ? {} : { blocks }),
 		});
 	}
 

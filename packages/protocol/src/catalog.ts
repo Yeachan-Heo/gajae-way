@@ -296,6 +296,40 @@ export interface ChatMessagePayload {
 	 * the safe direction to lose.
 	 */
 	readonly voiceText?: string;
+	/**
+	 * When present, this delivery is an interactive panel for asking the user to
+	 * select from predefined options (e.g., buttons). Adapters render this as an
+	 * interactive UI element with a plain-text fallback if interactivity is unavailable.
+	 * The panel expires after `expiresAt` and becomes read-only.
+	 */
+	readonly askUserPanel?: {
+		/** Unique identifier for this panel instance. */
+		panelId: string;
+		/** Question to display to the user. */
+		question: string;
+		/** ISO-8601 timestamp when this panel expires and becomes non-interactive. */
+		expiresAt: string;
+		/** Selectable options the user can choose from. */
+		options: readonly {
+			/** Unique identifier for this option. */
+			id: string;
+			/** Display label for this option. */
+			label: string;
+		}[];
+	};
+	/**
+	 * When present, this delivery is an interactive approval panel for allow/deny decisions.
+	 * Adapters render this as interactive buttons with a plain-text fallback if interactivity
+	 * is unavailable. The panel expires after `expiresAt` and becomes read-only.
+	 */
+	readonly approvalPanel?: {
+		/** Unique identifier for this panel instance. */
+		panelId: string;
+		/** Message describing what requires approval. */
+		message: string;
+		/** ISO-8601 timestamp when this panel expires and becomes non-interactive. */
+		expiresAt: string;
+	};
 }
 
 export interface DeliveryConfirmParams {
