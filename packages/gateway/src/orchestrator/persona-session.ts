@@ -62,6 +62,12 @@ const STATUS_RECHECK_MAX_MS = 5_000;
 /** Tolerated clock skew between the host's startedAt and the gateway's dispatch stamp. */
 const TURN_FLOOR_SKEW_MS = 2_000;
 const DISPATCH_FAILURE_RETRY_MS = 2_000;
+/**
+ * A prompt the host rejected in its submission phase never ran (gjc's
+ * AgentBusy wait expired, #424). It is re-sent once after this pause, which
+ * gives the still-finishing prior run time to go idle.
+ */
+const SUBMISSION_RETRY_DELAY_MS = 3_000;
 /** Torn steer transports are replayed on the same clientRef this many times before the row is held. */
 const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
@@ -182,6 +188,8 @@ export interface PersonaSessionManagerOptions {
 	readonly now?: () => number;
 	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
 	readonly clearTimeout?: (timer: unknown) => void;
+	/** Pause before the single re-send of a turn that failed in its submission phase. */
+	readonly submissionRetryDelayMs?: number;
 	/** Builds the server delivery/bootstrap lifecycle before an accepted SDK send. */
 	readonly onTurnStart?: (input: PersonaTurnStartInput) => PersonaTurnLifecycle | Promise<PersonaTurnLifecycle>;
 	/** Removes ephemeral request ownership after /new discarded not-yet-dispatched rows. */
@@ -236,6 +244,7 @@ export class PersonaSessionManager {
 	readonly #now: () => number;
 	readonly #setTimeout: (work: () => void, delayMs: number) => unknown;
 	readonly #clearTimeout: (timer: unknown) => void;
+	readonly #submissionRetryDelayMs: number;
 	readonly #onTurnStart: PersonaSessionManagerOptions["onTurnStart"];
 	readonly #onInboundDiscard: PersonaSessionManagerOptions["onInboundDiscard"];
 	readonly #onAssistantText: PersonaSessionManagerOptions["onAssistantText"];
@@ -260,6 +269,7 @@ export class PersonaSessionManager {
 		this.#setTimeout = options.setTimeout ?? ((work: () => void, delayMs: number) => setTimeout(work, delayMs));
 		this.#clearTimeout =
 			options.clearTimeout ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+		this.#submissionRetryDelayMs = options.submissionRetryDelayMs ?? SUBMISSION_RETRY_DELAY_MS;
 		this.#onTurnStart = options.onTurnStart;
 		this.#onInboundDiscard = options.onInboundDiscard;
 		this.#onAssistantText = options.onAssistantText;
@@ -431,6 +441,10 @@ export class PersonaSessionManager {
 
 	now(): number {
 		return this.#now();
+	}
+
+	get submissionRetryDelayMs(): number {
+		return this.#submissionRetryDelayMs;
 	}
 
 	schedule(work: () => void, delayMs: number): unknown {
@@ -2226,6 +2240,10 @@ class OriginActor {
 					"error",
 				);
 				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
+				if (this.#submissionRetryable(bound, report, failedTurnEvidence)) {
+					await this.#releaseForSubmissionRetry(bound);
+					return;
+				}
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
@@ -2358,6 +2376,41 @@ class OriginActor {
 			this.#state = "idle";
 			await this.#dispatchNext();
 		}
+	}
+
+	/**
+	 * A submission-phase failure means the host never started the prompt, so
+	 * re-sending it cannot repeat any work. Only the first such failure of a
+	 * live turn that showed nothing is retried; a second one is reported.
+	 */
+	#submissionRetryable(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
+		return (
+			report.status.outcome?.phase === "submission" &&
+			evidence?.reason !== "provider_quota_exhausted" &&
+			!bound.retired &&
+			this.#current === bound &&
+			!bound.replyVisible &&
+			bound.lastAssistantText === undefined &&
+			!bound.openTool &&
+			this.#manager.database.freshTurnAttempt(this.originKey, bound.epoch, bound.turn.triggerMessageId) === 0
+		);
+	}
+
+	/** Requeues a submission-failed turn on the same session and re-sends it after a pause. */
+	async #releaseForSubmissionRetry(bound: BoundTurn): Promise<void> {
+		this.#holdSweeps.delete(bound.turn.opRef);
+		bound.tail?.setTurnRunning(false);
+		this.#flushStaleOutput(bound, "unlanded");
+		await bound.tail?.close();
+		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+		this.#current = undefined;
+		this.#state = "idle";
+		this.#manager.log(
+			`submission_retry origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt}`,
+			"warn",
+		);
+		await this.#notifyReleased(bound);
+		this.#scheduleDispatchRetry(this.#manager.submissionRetryDelayMs);
 	}
 
 	/**
