@@ -825,6 +825,30 @@ export interface EngagementReactionResult {
 	/** Always false: a reaction is metadata, never a turn. */
 	readonly engaged: false;
 }
+
+/**
+ * Inbound panel response (engagement.panel_response): user answered an interactive
+ * ask-user or approval panel question via Slack block actions.
+ */
+export interface EngagementPanelResponseParams {
+	readonly origin: OriginRef;
+	/** Unique identifier of the panel that was answered. */
+	readonly panelId: string;
+	/** Kind of panel response: option selection or approval decision. */
+	readonly responseKind: "option_selected" | "approved" | "denied";
+	/** Selected option id (for ask-user panels). */
+	readonly selectedOptionId?: string;
+	/** Slack user id who responded. */
+	readonly responderId: string;
+	/** Engagement metadata. */
+	readonly engagement: EngagementContext;
+}
+
+export interface EngagementPanelResponseResult {
+	readonly recorded: boolean;
+	readonly engaged: false;
+}
+
 /**
  * Operator runtime-cycle projection (ops.cycle): a read-only, snapshot view of
  * where every runtime cycle currently stands — durable inbound dispatch,
@@ -996,6 +1020,7 @@ export interface VerbCatalogV01 {
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
+	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
 }
 

@@ -5,6 +5,7 @@ import type {
 	ChatMessagePayload,
 	ChatProgressPayload,
 	EngagementContext,
+	EngagementPanelResponseParams,
 	OriginRef,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
@@ -30,6 +31,7 @@ import {
 	type SlackReactionEvent,
 	slackReactionFor,
 } from "./reactions";
+import { describePanelResponse, type SlackBlockAction } from "./interactions";
 import {
 	classifyRecoveryFailure,
 	clearAttempt,
@@ -705,6 +707,12 @@ export class ReconnectingGateway implements GatewayClientLike {
 			.catch((error) => console.error(`Slack engagement.reaction failed: ${errorText(error)}`));
 	}
 
+	sendPanelResponse(response: EngagementPanelResponseParams): void {
+		void this.#client
+			?.request("engagement.panel_response", response)
+			.catch((error) => console.error(`Slack engagement.panel_response failed: ${errorText(error)}`));
+	}
+
 	private monitor(client: GatewayClientLike, strikes = 0): void {
 		this.#monitorTimer = setTimeout(
 			() => {
@@ -901,6 +909,11 @@ export async function startSlackAdapter(
 			if (reaction.user === identity.botUserId && isPresenceReaction(reaction.reaction)) return;
 			const description = describeSlackReaction(reaction, identity.botUserId, directory);
 			if (description) gateway.sendReaction(description);
+		} else if (event.type === "block_actions") {
+			const blockAction = event as unknown as SlackBlockAction;
+			const origin = slackMessageOrigin({ channel: blockAction.channel.id, user: blockAction.user.id });
+			const response = describePanelResponse(blockAction, origin);
+			if (response) gateway.sendPanelResponse(response);
 		}
 	};
 	const handleSlashCommand = async (command: SlackSlashCommand): Promise<void> => {

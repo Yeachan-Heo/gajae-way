@@ -1478,6 +1478,69 @@ async function handleRequest(
 			});
 			return;
 		}
+		case "engagement.panel_response": {
+			// Inbound panel response: user answered an interactive panel question.
+			// Like reactions, this is engagement metadata recorded in context but never a turn.
+			const params = request.params as
+				| {
+						origin?: unknown;
+						panelId?: unknown;
+						responseKind?: unknown;
+						responderId?: unknown;
+						selectedOptionId?: unknown;
+						engagement?: unknown;
+				  }
+				| undefined;
+			let origin: OriginRef;
+			try {
+				origin = params?.origin as OriginRef;
+			} catch {
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires a valid origin");
+			}
+			if (!isChatPlatform(origin.platform))
+				throw new ProtocolError("invalid_params", `engagement.panel_response requires a ${describeChatPlatforms()} origin`);
+
+			if (typeof params?.panelId !== "string" || !(params.panelId as string).trim())
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires a non-empty panelId");
+			if (typeof params?.responseKind !== "string" || !["option_selected", "approved", "denied"].includes(params.responseKind as string))
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires responseKind to be option_selected, approved, or denied");
+			if (typeof params?.responderId !== "string" || !(params.responderId as string).trim())
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires a non-empty responderId");
+			if ((params?.responseKind as string) === "option_selected" && (typeof params?.selectedOptionId !== "string" || !(params.selectedOptionId as string).trim()))
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires selectedOptionId for option_selected responses");
+
+			const engagement = params?.engagement as Record<string, unknown> | undefined;
+			if (typeof engagement?.authorId !== "string" || !(engagement?.authorId as string))
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires engagement.authorId");
+
+			const panelId = ((params?.panelId as string) || "").trim().slice(0, 256);
+			const responderId = ((params?.responderId as string) || "").trim().slice(0, 256);
+			const responseKind = (params?.responseKind as string) || "";
+			const selectedOptionId = (params?.responseKind as string) === "option_selected" ? ((params?.selectedOptionId as string) || "").trim().slice(0, 256) : undefined;
+			const authorId = (engagement?.authorId as string) || "";
+			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
+
+			// Record the panel response in the context ledger
+			const responseBody =
+				responseKind === "option_selected"
+					? `[panel] answered question ${panelId} with option ${selectedOptionId}`
+					: `[panel] ${responseKind} panel ${panelId}`;
+
+			options.database.contextRecord({
+				messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
+				originKey: originKey(origin),
+				authorId,
+				...(actor ? { authorName: actor } : {}),
+				body: responseBody,
+			});
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { recorded: true, engaged: false },
+			});
+			return;
+		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
