@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { isSlackDmChannel, maybeThreadOnMention, parseSlackMessageId, slackMessageId, slackMessageOrigin } from "../src/origin";
+import {
+	isSlackDmChannel,
+	maybeThreadOnMention,
+	parseSlackMessageId,
+	slackMessageId,
+	slackMessageOrigin,
+} from "../src/origin";
 
 test("Slack origins distinguish direct messages, thread replies, and roots", () => {
 	expect(slackMessageOrigin({ channel: "C1", ts: "1.2" })).toEqual({
