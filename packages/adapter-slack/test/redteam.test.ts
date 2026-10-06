@@ -1135,15 +1135,15 @@ for (const [outage, quarantine] of [
 	});
 }
 
-test("RT-SLACK-53 gradient buckets coalescing exact cleanup and stale timeout", async () => {
+test("RT-SLACK-53 gradient buckets coalescing exact cleanup and explicit clear", async () => {
 	let now = 0;
-	let stale = () => {};
+	let refresh = () => {};
 	const api = new Api();
 	const status = new WorkingStatus(
 		api,
 		console,
 		(fn) => {
-			stale = fn;
+			refresh = fn;
 			return {};
 		},
 		() => {},
@@ -1183,7 +1183,12 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup and stale timeout", 
 	expect(api.removed).toHaveLength(count);
 	status.arm(origin, "C1:2.0");
 	await flush();
-	stale();
+	// Refresh does not clear markers (only keeps them alive)
+	refresh();
+	await flush();
+	expect(api.removed.length).toBe(count);
+	// Explicit clear removes markers
+	await status.clear("C1");
 	await flush();
 	expect(api.removed.at(-1)).toEqual(["C1", "2.0", "hourglass_flowing_sand"]);
 	expect(api.posts).toEqual([]);

@@ -12,6 +12,8 @@ import type { SlackWebApi } from "./api";
 import { parseSlackMessageId } from "./origin";
 
 export const WORKING_STATUS_STALE_MS = 90_000;
+/** Slack's native status line expires after ~2 minutes; refresh every 45s to keep it alive. */
+const WORKING_STATUS_REFRESH_MS = 45_000;
 
 type Timer = { unref?(): void };
 type Entry = {
@@ -84,7 +86,7 @@ export function presenceStatusText(snapshot: PresenceSnapshot): string {
  */
 export class WorkingStatus {
 	readonly #entries = new Map<string, Entry>();
-	readonly #staleTimers = new Map<string, Timer>();
+	readonly #refreshTimers = new Map<string, Timer>();
 
 	constructor(
 		readonly api: Pick<SlackWebApi, "addReaction" | "removeReaction" | "setThreadStatus">,
@@ -111,7 +113,7 @@ export class WorkingStatus {
 			// restart the gradient from queued.
 			prior.wanted = true;
 			prior.state = presenceInitial(this.now());
-			this.#armStale(key);
+			this.#armRefresh(key, prior);
 			void this.#reconcile(key, prior);
 			return;
 		}
@@ -134,7 +136,7 @@ export class WorkingStatus {
 			pending: false,
 		};
 		this.#entries.set(key, entry);
-		this.#armStale(key);
+		this.#armRefresh(key, entry);
 		void this.#reconcile(key, entry);
 	}
 
@@ -143,7 +145,7 @@ export class WorkingStatus {
 		const key = progress.origin.conversationId;
 		const entry = this.#entries.get(key);
 		if (!entry?.wanted) return;
-		this.#armStale(key);
+		this.#armRefresh(key, entry);
 		const swap = presenceTransition(entry.state, progress, this.now());
 		if (!swap) return;
 		entry.state = swap.state;
@@ -151,9 +153,9 @@ export class WorkingStatus {
 	}
 
 	async clear(conversationId: string): Promise<void> {
-		const timer = this.#staleTimers.get(conversationId);
+		const timer = this.#refreshTimers.get(conversationId);
 		if (timer) this.clearTimer(timer);
-		this.#staleTimers.delete(conversationId);
+		this.#refreshTimers.delete(conversationId);
 		const entry = this.#entries.get(conversationId);
 		if (!entry) return;
 		this.#entries.delete(conversationId);
@@ -178,15 +180,24 @@ export class WorkingStatus {
 		await this.#reconcile(key, entry);
 	}
 
-	#armStale(key: string): void {
-		const prior = this.#staleTimers.get(key);
+	#armRefresh(key: string, entry: Entry): void {
+		const prior = this.#refreshTimers.get(key);
 		if (prior) this.clearTimer(prior);
-		const timer = this.setTimer(() => {
-			this.#staleTimers.delete(key);
-			void this.clear(key);
-		}, WORKING_STATUS_STALE_MS);
+		const timer = this.setTimer(async () => {
+			// Periodically refresh the status line to keep it alive (Slack expires after ~2min).
+			// The entry may have been cleared by an explicit clear() call in the meantime.
+			if (!this.#entries.has(key)) return;
+			if (!entry.wanted) return;
+			// Force refresh of the status line by clearing the confirmed state, even if
+			// the desired text hasn't changed. Slack's expiry timer resets on every setStatus call.
+			if (entry.shownStatus) entry.shownStatus = "";
+			// Re-reconcile to refresh the status line without changing the desired state.
+			await this.#reconcile(key, entry);
+			// Re-arm the refresh timer for the next cycle.
+			if (this.#entries.has(key)) this.#armRefresh(key, entry);
+		}, WORKING_STATUS_REFRESH_MS);
 		timer.unref?.();
-		this.#staleTimers.set(key, timer);
+		this.#refreshTimers.set(key, timer);
 	}
 
 	/**

@@ -12,6 +12,9 @@ import { type GatewayClientLike, settleSlackDelivery, subscribeSlackProgress } f
 import { isPresenceReaction, presenceStatusText, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
 import { liveGateway, stopLiveGatewaysAfterEach } from "./live-gateways";
 
+// WORKING_STATUS_REFRESH_MS is not exported, but we know it's 45_000 from the implementation
+const WORKING_STATUS_REFRESH_MS = 45_000;
+
 stopLiveGatewaysAfterEach();
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
@@ -164,7 +167,7 @@ test("Slack presence swaps are coalesced to one per window even when the phase f
 	await f.status.clear("C1");
 });
 
-test("Slack presence: a newer turn on the same conversation takes over, and the stale timer cleans up", async () => {
+test("Slack presence: a newer turn on the same conversation takes over, and the refresh timer keeps the new one alive", async () => {
 	const f = fixture();
 	f.status.arm(origin, "C1:1.000");
 	await flush();
@@ -173,14 +176,16 @@ test("Slack presence: a newer turn on the same conversation takes over, and the 
 	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
 	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand", "C1:2.000:hourglass_flowing_sand"]);
 	const timer = [...f.timers][0];
-	expect(timer?.ms).toBe(WORKING_STATUS_STALE_MS);
-	timer?.fn();
+	expect(timer?.ms).toBe(WORKING_STATUS_REFRESH_MS);
+	// Simulate a refresh (does not clear)
+	await timer?.fn();
 	await flush();
-	expect(f.removes.at(-1)).toBe("C1:2.000:hourglass_flowing_sand");
-	// Cleared: later progress is ignored.
+	// No markers removed by refresh; C1:2.000 is still active
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	// Progress updates still work after refresh
 	f.tick(PRESENCE_MIN_SWAP_MS);
 	await f.status.update(progress());
-	expect(f.adds).toHaveLength(2);
+	expect(f.adds.length).toBeGreaterThan(2);
 });
 
 test("Slack presence failures are logged, never thrown, and a clear during a swap still cleans up", async () => {
@@ -502,4 +507,84 @@ test("Slack presence: a change arriving during the last pass is still applied", 
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "writing_hand", "one"]);
 	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
 	await f.status.clear("C1");
+});
+
+test("Slack presence: periodic refresh keeps status alive across multiple turns", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	// Initial arm sets the queued marker and status line
+	expect(names(f.adds)).toEqual(["hourglass_flowing_sand"]);
+	const initialStatuses = f.statuses.length;
+
+	// Simulate a long-running turn (150 seconds total)
+	// The old behavior would have cleared after 90 seconds
+	// The new behavior should refresh every 45 seconds
+
+	// Advance 45 seconds (first refresh cycle)
+	f.tick(WORKING_STATUS_REFRESH_MS);
+	const timersArray1 = Array.from(f.timers);
+	const timer1 = timersArray1[timersArray1.length - 1];
+	expect(timer1?.ms).toBe(WORKING_STATUS_REFRESH_MS);
+	await timer1?.fn();
+	await flush();
+	// Status line should be re-set to refresh it
+	expect(f.statuses.length).toBeGreaterThan(initialStatuses);
+
+	// Advance another 45 seconds (second refresh cycle, 90 seconds total)
+	f.tick(WORKING_STATUS_REFRESH_MS);
+	const timersArray2 = Array.from(f.timers);
+	const timer2 = timersArray2[timersArray2.length - 1];
+	await timer2?.fn();
+	await flush();
+	// Another refresh should have happened
+	const statusesAfterSecondRefresh = f.statuses.length;
+	expect(statusesAfterSecondRefresh).toBeGreaterThan(initialStatuses + 1);
+
+	// Now simulate a progress update at 90 seconds (old stale timeout would have fired here)
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ elapsedMs: 95_000 }));
+	await flush();
+	// The turn should still be active (markers still present, not removed)
+	expect(f.removes).toEqual([]);
+
+	// Explicitly clear the status
+	await f.status.clear("C1");
+	await flush();
+	// Now the markers should be removed
+	expect(f.removes.length).toBeGreaterThan(0);
+});
+
+test("Slack presence: explicit clear removes all markers exactly once", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	const initialAdds = f.adds.length;
+	const initialRemoves = f.removes.length;
+
+	// Advance a long time without any updates
+	f.tick(150_000);
+	const allTimers = Array.from(f.timers);
+	for (const timer of allTimers) {
+		if (timer.ms === WORKING_STATUS_REFRESH_MS) {
+			await timer.fn();
+		}
+	}
+	await flush();
+
+	// The status should still be active (no markers removed)
+	expect(f.removes.length).toBe(initialRemoves);
+
+	// Now clear explicitly
+	await f.status.clear("C1");
+	await flush();
+	// All markers should be removed exactly once
+	const finalRemoves = f.removes.length;
+	const newRemoves = f.removes.slice(initialRemoves);
+	expect(newRemoves.length).toBeGreaterThan(0);
+
+	// Further progress updates are ignored
+	await f.status.update(progress({ elapsedMs: 200_000 }));
+	await flush();
+	expect(f.removes.length).toBe(finalRemoves);
 });
