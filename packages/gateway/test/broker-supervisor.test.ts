@@ -991,3 +991,55 @@ test("relay stdout and stderr are decoded independently: a multibyte character s
 	expect(lines).toContain('{"ok":false,"error":{"code":"warning"}}');
 	expect(lines.join("\n")).not.toContain("\uFFFD");
 });
+
+test("a stall (pid alive, endpoint dead, 3 probe failures) is actually detected by health probes", async () => {
+	let probeOk = true;
+	let alive = true;
+	let probeCount = 0;
+	const logs: string[] = [];
+	const agentDir = await directory();
+	await mkdir(join(agentDir, "sdk"));
+	await writeFile(
+		join(agentDir, "sdk", "broker.json"),
+		JSON.stringify({ ...discovery(), protocolVersion: 3, host: "127.0.0.1" }),
+	);
+
+	const value = client({
+		agentDir,
+		discovery: undefined,
+		isPidAlive: () => alive,
+		healthProbe: async () => {
+			probeCount++;
+			if (!probeOk) return false;
+			return true;
+		},
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		log: (line) => logs.push(line),
+	});
+
+	// Start with healthy broker
+	await value.start();
+	const initialProbeCount = probeCount;
+	expect(initialProbeCount).toBeGreaterThan(0);
+
+	// Simulate stall: endpoint becomes unreachable but process is still alive
+	probeOk = false; // Endpoint is dead
+	alive = true; // Process is still alive
+
+	// Wait for probes to fail and be detected as a stall condition
+	await eventually(() => {
+		// Should detect multiple failed probes and log about the endpoint being unreachable
+		return probeCount >= initialProbeCount + 3 && 
+			logs.some((line) => line.includes("endpoint probe failed"));
+	});
+
+	// Verify that multiple probe failures were recorded (at least 3)
+	expect(probeCount - initialProbeCount).toBeGreaterThanOrEqual(3);
+	// Verify logs show the stall was detected - endpoint probe failed while process alive
+	const failureLog = logs.find((line) => line.includes("endpoint probe failed"));
+	expect(failureLog).toBeDefined();
+	expect(failureLog).toContain("endpoint probe failed");
+
+	await value.stop();
+});
