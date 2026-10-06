@@ -611,7 +611,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
 		},
-		onReverseRequest: async ({ originKey, sessionId, tail, input }) => {
+		onReverseRequest: async ({ originKey, sessionId, triggerAuthorId, tail, input }) => {
 			// Get the real origin from the originKey
 			const originData = options.database.getOriginByKey(originKey);
 			if (!originData) {
@@ -649,11 +649,36 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			const payload = input.payload?.payload as Record<string, unknown> | undefined;
 
 			// Determine panel type and build panel payload
-			let panelPayload: Partial<Pick<ChatMessagePayload, "askUserPanel" | "approvalPanel">> = {};
+			let panelPayload: Partial<Pick<ChatMessagePayload, "approvalPanel">> = {};
 
 			if (capability === "permission" && method === "request") {
-				// Permission request: create approval panel (allow/deny)
-				const message = typeof payload?.message === "string" ? payload.message : "Approve this action?";
+				// Permission request: render from toolCall and options
+				const toolCall = payload?.toolCall as Record<string, unknown> | undefined;
+				const options_list = Array.isArray(payload?.options) ? payload.options : [];
+
+				// Extract message from toolCall title or kind
+				const message =
+					typeof toolCall?.title === "string"
+						? toolCall.title
+						: typeof toolCall?.kind === "string"
+							? toolCall.kind
+							: "Permission Request";
+
+				// Transform offered options to the format expected by adapters
+				const approvalOptions = (options_list as unknown[])
+					.map((opt: unknown) => {
+						if (typeof opt === "object" && opt !== null) {
+							const optRecord = opt as Record<string, unknown>;
+							return {
+								optionId: String(optRecord.optionId || ""),
+								name: String(optRecord.name || ""),
+								kind: String(optRecord.kind || ""),
+							};
+						}
+						return null;
+					})
+					.filter((opt): opt is { optionId: string; name: string; kind: string } => opt !== null);
+
 				const expiresAt = new Date(Date.now() + 300000).toISOString(); // 5 minutes
 				const panelId = randomUUID();
 
@@ -662,6 +687,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 						panelId,
 						message,
 						expiresAt,
+						options: approvalOptions,
 					},
 				};
 
@@ -672,7 +698,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					turnId: sessionId,
 					sessionId,
 					origin,
-					authorId: originKey, // Responder must match the turn's trigger author
+					authorId: triggerAuthorId ?? originKey, // Use trigger author, fall back to originKey
 					expiresAt: new Date(Date.now() + 300000),
 					answerBinding: input.id,
 					reverseRequest: {
@@ -706,80 +732,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					runtime.delivery.markInflight(deliveryId);
 					broadcastDelivery(runtime, messagePayload);
 				}
-			} else if ((capability === "ui" && method === "select") || (capability === "ui" && method === "confirm")) {
-				// ui.select or ui.confirm: create ask-user panel with options
-				const question = typeof payload?.question === "string" ? payload.question : "Choose one:";
-				const panelOptions = Array.isArray(payload?.options)
-					? (payload.options as unknown[]).map((opt: unknown) => {
-							if (
-								typeof opt === "object" &&
-								opt !== null &&
-								"id" in opt &&
-								"label" in opt &&
-								typeof (opt as Record<string, unknown>).id === "string" &&
-								typeof (opt as Record<string, unknown>).label === "string"
-							) {
-								const optRecord = opt as Record<string, unknown>;
-								return { id: String(optRecord.id), label: String(optRecord.label) };
-							}
-							return { id: "unknown", label: String(opt) };
-						})
-					: [];
-				const expiresAt = new Date(Date.now() + 300000).toISOString(); // 5 minutes
-				const panelId = randomUUID();
-
-				panelPayload = {
-					askUserPanel: {
-						panelId,
-						question,
-						expiresAt,
-						options: panelOptions,
-					},
-				};
-
-				// Register the panel for tracking and response routing
-				runtime.panelTracker.registerPanel({
-					panelId,
-					questionId: input.id,
-					turnId: sessionId,
-					sessionId,
-					origin,
-					authorId: originKey,
-					expiresAt: new Date(Date.now() + 300000),
-					answerBinding: input.id,
-					reverseRequest: {
-						id: input.id,
-						connectionId: input.connectionId,
-						leaseId: input.leaseId,
-						capability: input.capability,
-						method: input.payload.method,
-						payload: payload || {},
-					},
-				});
-
-				// Store the tail handle for later response
-				runtime.panelTails ??= new Map();
-				runtime.panelTails.set(panelId, tail);
-
-				// Send outbound message with panel
-				const turnId = crypto.randomUUID();
-				const deliveryId = crypto.randomUUID();
-				const messagePayload: ChatMessagePayload = {
-					turnId,
-					origin,
-					role: "assistant",
-					text: question,
-					final: true,
-					deliveryId,
-					...panelPayload,
-				};
-
-				if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(messagePayload))) {
-					runtime.delivery.markInflight(deliveryId);
-					broadcastDelivery(runtime, messagePayload);
-				}
 			} else {
-				// Unsupported request type: decline with unavailable
+				// Unknown capability/method: decline with unavailable
 				await tail
 					.sendReverseResponse({
 						id: input.id,
@@ -869,7 +823,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
 		}
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
-	// Panel expiry sweep: send cancel/error to hosts for expired panels
+	// Panel expiry sweep: send cancellation result to hosts for expired panels
 	const panelExpirySweepTimer = setInterval(async () => {
 		try {
 			const expiredPanels = runtime.panelTracker.reapExpiredPanels();
@@ -882,7 +836,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 								id: panel.reverseRequest.id,
 								connectionId: panel.reverseRequest.connectionId,
 								leaseId: panel.reverseRequest.leaseId,
-								error: { code: "cancelled", message: "panel expired" },
+								result: { outcome: "cancelled" },
 							})
 							.catch(() => {});
 						runtime.panelTails?.delete(panel.panelId);
@@ -1776,33 +1730,44 @@ async function handleRequest(
 						const method = String(panel.reverseRequest.method).toLowerCase();
 
 						if (capability === "permission" && method === "request") {
-							// permission.request result: { outcome: "selected" | "cancelled", optionId?: string }
+							// permission.request result: { outcome: "selected", optionId: <one of offered optionIds>, kind? }
+							const optionsList = Array.isArray((panel.reverseRequest.payload as any)?.options)
+								? (panel.reverseRequest.payload as any).options
+								: [];
+
+							// Find the allowed and reject option IDs from the offered options
+							let allowOptionId: string | undefined;
+							let rejectOptionId: string | undefined;
+
+							for (const opt of optionsList) {
+								if (typeof opt === "object" && opt !== null) {
+									const optRecord = opt as Record<string, unknown>;
+									const kind = String(optRecord.kind || "").toLowerCase();
+									if (kind.includes("allow")) {
+										allowOptionId = String(optRecord.optionId || "");
+									} else if (kind.includes("reject")) {
+										rejectOptionId = String(optRecord.optionId || "");
+									}
+								}
+							}
+
 							if (responseKind === "approved") {
-								result = { outcome: "selected", optionId: "approved" };
+								result = {
+									outcome: "selected",
+									optionId: allowOptionId || "allow_once",
+									kind: "allow_once",
+								};
 							} else if (responseKind === "denied") {
-								result = { outcome: "cancelled" };
+								result = {
+									outcome: "selected",
+									optionId: rejectOptionId || "reject_once",
+									kind: "reject_once",
+								};
 							} else {
 								coordinatorError = "invalid_response_kind_for_permission_request";
 							}
-						} else if (capability === "ui" && method === "select") {
-							// ui.select result: { selected: [optionId] } or { cancelled: true }
-							if (responseKind === "option_selected" && selectedOptionId) {
-								result = { selected: [selectedOptionId] };
-							} else {
-								// User cancelled or no selection
-								result = { cancelled: true };
-							}
-						} else if (capability === "ui" && method === "confirm") {
-							// ui.confirm result: { outcome: "selected" | "cancelled", optionId: "yes" | "no" }
-							if (responseKind === "approved") {
-								result = { outcome: "selected", optionId: "yes" };
-							} else if (responseKind === "denied") {
-								result = { outcome: "selected", optionId: "no" };
-							} else {
-								result = { outcome: "cancelled" };
-							}
 						} else {
-							// Unsupported capability/method combination
+							// Unknown capability/method: do not respond
 							coordinatorError = `unsupported_request_type: ${capability}.${method}`;
 						}
 

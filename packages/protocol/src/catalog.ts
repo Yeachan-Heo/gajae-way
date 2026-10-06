@@ -318,9 +318,9 @@ export interface ChatMessagePayload {
 		}[];
 	};
 	/**
-	 * When present, this delivery is an interactive approval panel for allow/deny decisions.
-	 * Adapters render this as interactive buttons with a plain-text fallback if interactivity
-	 * is unavailable. The panel expires after `expiresAt` and becomes read-only.
+	 * When present, this delivery is an interactive approval panel for permission decisions.
+	 * Adapters render the offered options as interactive buttons with a plain-text fallback if
+	 * interactivity is unavailable. The panel expires after `expiresAt` and becomes read-only.
 	 */
 	readonly approvalPanel?: {
 		/** Unique identifier for this panel instance. */
@@ -329,6 +329,15 @@ export interface ChatMessagePayload {
 		message: string;
 		/** ISO-8601 timestamp when this panel expires and becomes non-interactive. */
 		expiresAt: string;
+		/** Offered permission options; empty if not a permission request. */
+		options?: readonly {
+			/** Unique identifier for this option. */
+			optionId: string;
+			/** Display name for this option. */
+			name: string;
+			/** Option kind (e.g., 'allow_once', 'reject_once'). */
+			kind: string;
+		}[];
 	};
 }
 

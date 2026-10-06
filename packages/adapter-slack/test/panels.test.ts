@@ -99,6 +99,35 @@ describe("approvalPanelBlocks", () => {
 		expect(buttons[1].text.text).toBe("Deny");
 	});
 
+	it("renders approval panel with offered permission options", () => {
+		const futureTime = new Date(Date.now() + 60 * 1000).toISOString();
+		const message: ChatMessagePayload = {
+			turnId: "turn123",
+			origin: { platform: "slack", kind: "channel", conversationId: "C123" },
+			role: "assistant",
+			text: "Permission request",
+			final: true,
+			approvalPanel: {
+				panelId: "perm-panel-456",
+				message: "Grant permission?",
+				expiresAt: futureTime,
+				options: [
+					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+					{ optionId: "reject_once", name: "Reject once", kind: "reject_once" },
+				],
+			},
+		};
+
+		const blocks = approvalPanelBlocks(message);
+		expect(blocks.length).toBeGreaterThan(0);
+		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
+		expect(actionBlocks.length).toBeGreaterThan(0);
+		const buttons = actionBlocks[0].elements as any[];
+		expect(buttons.length).toBe(2);
+		expect(buttons.map((b: any) => b.text.text)).toContain("Allow once");
+		expect(buttons.map((b: any) => b.text.text)).toContain("Reject once");
+	});
+
 	it("renders expired approval panel without buttons", () => {
 		const pastTime = new Date(Date.now() - 60 * 1000).toISOString();
 		const message: ChatMessagePayload = {
@@ -214,6 +243,32 @@ describe("approvalPanelFallback", () => {
 		expect(fallback).toBeTruthy();
 		expect(fallback).toContain("Do you agree?");
 		expect(fallback).toContain("check_mark");
+	});
+
+	it("returns fallback with offered permission options", () => {
+		const futureTime = new Date(Date.now() + 60 * 1000).toISOString();
+		const message: ChatMessagePayload = {
+			turnId: "turn123",
+			origin: { platform: "slack", kind: "channel", conversationId: "C123" },
+			role: "assistant",
+			text: "Permission?",
+			final: true,
+			approvalPanel: {
+				panelId: "perm-fallback",
+				message: "Grant this permission?",
+				expiresAt: futureTime,
+				options: [
+					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+					{ optionId: "reject_once", name: "Reject once", kind: "reject_once" },
+				],
+			},
+		};
+
+		const fallback = approvalPanelFallback(message);
+		expect(fallback).toBeTruthy();
+		expect(fallback).toContain("Grant this permission?");
+		expect(fallback).toContain("Allow once");
+		expect(fallback).toContain("Reject once");
 	});
 
 	it("includes expiration notice for expired panel", () => {

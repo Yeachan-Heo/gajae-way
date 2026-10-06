@@ -94,18 +94,44 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 
 	if (isExpired) {
 		// Expired: show plain text without interactive buttons
+		const optionsList = panel.options ? panel.options.map((opt) => `• ${opt.name}`).join("\n") : "";
 		blocks.push({
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: "_(This approval request has expired.)_",
+				text: `_(This approval request has expired.${optionsList ? ` Options were:\n${optionsList}` : ""})_`,
 			},
 		});
 	} else {
-		// Not expired: show interactive allow/deny buttons
-		blocks.push({
-			type: "actions",
-			elements: [
+		// Not expired: show interactive buttons for offered options
+		const buttonElements: Array<{
+			type: "button";
+			text: { type: "plain_text"; text: string; emoji: boolean };
+			action_id: string;
+			value: string;
+			style?: string;
+		}> = [];
+
+		// If options are provided, render them; otherwise fall back to allow/deny
+		if (panel.options && panel.options.length > 0) {
+			for (const option of panel.options) {
+				// Style reject-like options as danger
+				const style = option.kind.toLowerCase().includes("reject") ? "danger" : "primary";
+				buttonElements.push({
+					type: "button",
+					text: {
+						type: "plain_text",
+						text: option.name,
+						emoji: true,
+					},
+					style,
+					action_id: `approval_${panel.panelId}_${option.optionId}`,
+					value: option.optionId,
+				});
+			}
+		} else {
+			// Fallback to allow/deny buttons if no options provided
+			buttonElements.push(
 				{
 					type: "button",
 					text: {
@@ -116,24 +142,6 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 					style: "primary",
 					action_id: `approval_${panel.panelId}_allow`,
 					value: "allow",
-					confirm: {
-						title: {
-							type: "plain_text",
-							text: "Confirm",
-						},
-						text: {
-							type: "mrkdwn",
-							text: "Are you sure you want to allow this?",
-						},
-						confirm: {
-							type: "plain_text",
-							text: "Allow",
-						},
-						deny: {
-							type: "plain_text",
-							text: "Cancel",
-						},
-					},
 				},
 				{
 					type: "button",
@@ -145,27 +153,18 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 					style: "danger",
 					action_id: `approval_${panel.panelId}_deny`,
 					value: "deny",
-					confirm: {
-						title: {
-							type: "plain_text",
-							text: "Confirm",
-						},
-						text: {
-							type: "mrkdwn",
-							text: "Are you sure you want to deny this?",
-						},
-						confirm: {
-							type: "plain_text",
-							text: "Deny",
-						},
-						deny: {
-							type: "plain_text",
-							text: "Cancel",
-						},
-					},
 				},
-			],
-		});
+			);
+		}
+
+		// Slack button layouts have a max of 5 buttons per row
+		for (let i = 0; i < buttonElements.length; i += 5) {
+			const rowActions = buttonElements.slice(i, i + 5);
+			blocks.push({
+				type: "actions",
+				elements: rowActions as unknown[],
+			});
+		}
 	}
 
 	return blocks;
@@ -206,6 +205,11 @@ export function approvalPanelFallback(message: ChatMessagePayload): string | nul
 	let text = `${panel.message}\n`;
 	if (isExpired) {
 		text += "_(This approval request has expired.)_";
+	} else if (panel.options && panel.options.length > 0) {
+		text += "Options:\n";
+		for (const option of panel.options) {
+			text += `• ${option.name}\n`;
+		}
 	} else {
 		text += "React with :white_check_mark: to allow or :x: to deny.";
 	}

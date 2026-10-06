@@ -221,6 +221,7 @@ export interface PersonaSessionManagerOptions {
 	readonly onReverseRequest?: (input: {
 		originKey: string;
 		sessionId: string;
+		triggerAuthorId?: string;
 		tail: TailHandle;
 		input: {
 			id: string;
@@ -2024,7 +2025,7 @@ class OriginActor {
 		sessionId: string,
 		epoch: number,
 		brokerGeneration: number,
-		retired: boolean,
+		_retired: boolean,
 		input: {
 			id: string;
 			connectionId: string;
@@ -2036,11 +2037,17 @@ class OriginActor {
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
+		// Extract the trigger author ID from the bound turn
+		const trigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
+		const triggerAuthorId = trigger?.engagement_json
+			? (JSON.parse(trigger.engagement_json) as { authorId?: string }).authorId
+			: undefined;
 		// Forward reverse requests to the server's panel handling
 		if (this.#manager.onReverseRequest) {
 			await this.#manager.onReverseRequest({
 				originKey: this.originKey,
 				sessionId,
+				triggerAuthorId,
 				tail,
 				input,
 			});
