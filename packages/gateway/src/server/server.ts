@@ -1503,16 +1503,31 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "engagement.panel_response requires a valid origin");
 			}
 			if (!isChatPlatform(origin.platform))
-				throw new ProtocolError("invalid_params", `engagement.panel_response requires a ${describeChatPlatforms()} origin`);
+				throw new ProtocolError(
+					"invalid_params",
+					`engagement.panel_response requires a ${describeChatPlatforms()} origin`,
+				);
 
 			if (typeof params?.panelId !== "string" || !(params.panelId as string).trim())
 				throw new ProtocolError("invalid_params", "engagement.panel_response requires a non-empty panelId");
-			if (typeof params?.responseKind !== "string" || !["option_selected", "approved", "denied"].includes(params.responseKind as string))
-				throw new ProtocolError("invalid_params", "engagement.panel_response requires responseKind to be option_selected, approved, or denied");
+			if (
+				typeof params?.responseKind !== "string" ||
+				!["option_selected", "approved", "denied"].includes(params.responseKind as string)
+			)
+				throw new ProtocolError(
+					"invalid_params",
+					"engagement.panel_response requires responseKind to be option_selected, approved, or denied",
+				);
 			if (typeof params?.responderId !== "string" || !(params.responderId as string).trim())
 				throw new ProtocolError("invalid_params", "engagement.panel_response requires a non-empty responderId");
-			if ((params?.responseKind as string) === "option_selected" && (typeof params?.selectedOptionId !== "string" || !(params.selectedOptionId as string).trim()))
-				throw new ProtocolError("invalid_params", "engagement.panel_response requires selectedOptionId for option_selected responses");
+			if (
+				(params?.responseKind as string) === "option_selected" &&
+				(typeof params?.selectedOptionId !== "string" || !(params.selectedOptionId as string).trim())
+			)
+				throw new ProtocolError(
+					"invalid_params",
+					"engagement.panel_response requires selectedOptionId for option_selected responses",
+				);
 
 			const engagement = params?.engagement as Record<string, unknown> | undefined;
 			if (typeof engagement?.authorId !== "string" || !(engagement?.authorId as string))
@@ -1521,7 +1536,10 @@ async function handleRequest(
 			const panelId = ((params?.panelId as string) || "").trim().slice(0, 256);
 			const responderId = ((params?.responderId as string) || "").trim().slice(0, 256);
 			const responseKind = (params?.responseKind as string) || "";
-			const selectedOptionId = (params?.responseKind as string) === "option_selected" ? ((params?.selectedOptionId as string) || "").trim().slice(0, 256) : undefined;
+			const selectedOptionId =
+				(params?.responseKind as string) === "option_selected"
+					? ((params?.selectedOptionId as string) || "").trim().slice(0, 256)
+					: undefined;
 			const authorId = (engagement?.authorId as string) || "";
 			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
 
@@ -1534,19 +1552,70 @@ async function handleRequest(
 			} else if (!runtime.panelTracker.isAuthorizedResponder(panel, responderId)) {
 				coordinatorError = "unauthorized_responder";
 			} else {
-				// TODO(#428): Call gjc_coordinator_submit_question_answer via session relay.
-				// This requires extending SessionPort.request to support coordinator-mcp methods.
-				// Expected call:
-				//   await runtime.sessionPort.request({
-				//     sessionId: panel.sessionId,
-				//     repo: workspace,
-				//     opRef: `panel-${panelId}`,
-				//     kind: "control",
-				//     method: "gjc_coordinator_submit_question_answer",
-				//     input: { session_id, turn_id, question_id, answer_binding, answer, idempotency_key, allow_mutation },
-				//   })
-				// For now, mark panel as resolved to allow adapters to proceed.
-				runtime.panelTracker.resolvePanel(panelId);
+				// Submit the answer to gjc coordinator via the session relay.
+				try {
+					// Build the answer payload based on response kind
+					let answer: Record<string, unknown>;
+					if (responseKind === "option_selected") {
+						if (!selectedOptionId) {
+							coordinatorError = "invalid_answer: missing selectedOptionId";
+							throw new ProtocolError("invalid_params", "option_selected requires selectedOptionId");
+						}
+						answer = { selected: [selectedOptionId] };
+					} else if (responseKind === "approved") {
+						answer = { selected: ["approved"] };
+					} else {
+						answer = { selected: ["denied"] };
+					}
+
+					// The panel has the workspace information through its origin
+					// For now, use a default workspace (the gateway default)
+					const sessionWorkspace = options.config.home ? join(options.config.home, "workspace") : "";
+
+					// Get or create a relay connection to the session
+					const relay = await runtime.sessionPort.attachTail({
+						sessionId: panel.sessionId,
+						brokerGeneration: 0,
+						repo: sessionWorkspace,
+					});
+
+					const idempotencyKey = `panel-${panelId}-${responderId}-${Date.now()}`;
+
+					// Submit the answer to the coordinator
+					const response = await relay.control("gjc_coordinator_submit_question_answer", {
+						session_id: panel.sessionId,
+						turn_id: panel.turnId,
+						question_id: panel.questionId,
+						answer_binding: panel.answerBinding,
+						answer,
+						idempotency_key: idempotencyKey,
+						allow_mutation: true,
+					});
+
+					// Close the relay connection
+					await relay.close();
+
+					// Check if the answer was accepted
+					if (response && typeof response === "object" && "ok" in response && response.ok !== true) {
+						const errorResponse = response as Record<string, unknown>;
+						if (errorResponse.error && typeof errorResponse.error === "object") {
+							const error = errorResponse.error as Record<string, unknown>;
+							const errorCode = typeof error.code === "string" ? error.code : "unknown_error";
+							const errorMessage = typeof error.message === "string" ? error.message : "Failed to submit answer";
+							coordinatorError = `${errorCode}: ${errorMessage}`;
+						} else {
+							coordinatorError = "answer_submission_failed";
+						}
+					} else {
+						// Answer was accepted, resolve the panel
+						runtime.panelTracker.resolvePanel(panelId);
+					}
+				} catch (error) {
+					const errorMsg = error instanceof Error ? error.message : String(error);
+					coordinatorError = `relay_error: ${errorMsg}`;
+					// Still resolve the panel so adapters can proceed
+					runtime.panelTracker.resolvePanel(panelId);
+				}
 			}
 
 			// Record the panel response in the context ledger (audit trail)
@@ -1565,7 +1634,7 @@ async function handleRequest(
 
 			// Report result to adapter
 			if (coordinatorError) {
-				throw new ProtocolError("panel_resolution_failed", `Failed to resolve panel: ${coordinatorError}`);
+				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${coordinatorError}`);
 			}
 
 			connection.write({
