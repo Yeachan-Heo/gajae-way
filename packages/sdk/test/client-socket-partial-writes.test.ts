@@ -1,8 +1,6 @@
-import { expect, test, describe } from "bun:test";
-import type { FrameWriterSink } from "@gajae-gateway/protocol";
-import { OrderedFrameWriter } from "@gajae-gateway/protocol";
-import { encodeFrame, FrameDecoder } from "@gajae-gateway/protocol";
-import type { Frame } from "@gajae-gateway/protocol";
+import { describe, expect, test } from "bun:test";
+import type { Frame, FrameWriterSink } from "@gajae-gateway/protocol";
+import { encodeFrame, FrameDecoder, OrderedFrameWriter } from "@gajae-gateway/protocol";
 
 describe("SDK socket partial writes (issue #420 acceptance)", () => {
 	test("64KB chat.send arrives intact with stub sink accepting 64 bytes per write", async () => {
@@ -19,7 +17,7 @@ describe("SDK socket partial writes (issue #420 acceptance)", () => {
 				// If not all accepted, signal that drain will be needed
 				if (accepted < bytes.length && sinkState.writer) {
 					// Schedule drain asynchronously
-					setTimeout(() => sinkState.writer!.drain(), 0);
+					setTimeout(() => sinkState.writer?.drain(), 0);
 				}
 				return accepted;
 			},
@@ -53,6 +51,7 @@ describe("SDK socket partial writes (issue #420 acceptance)", () => {
 		expect(frames[0].type).toBe("request");
 		if (frames[0].type === "request") {
 			expect(frames[0].id).toBe("large-1");
+			// biome-ignore lint/suspicious/noExplicitAny: test convenience
 			const params = frames[0].params as any;
 			expect(params.text).toBe(largeText);
 		}
@@ -70,7 +69,7 @@ describe("SDK socket partial writes (issue #420 acceptance)", () => {
 				const accepted = Math.min(bytes.length, 512);
 				received.push(Buffer.from(bytes.subarray(0, accepted)));
 				if (accepted < bytes.length && sinkState.writer) {
-					setTimeout(() => sinkState.writer!.drain(), 0);
+					setTimeout(() => sinkState.writer?.drain(), 0);
 				}
 				return accepted;
 			},
@@ -104,10 +103,11 @@ describe("SDK socket partial writes (issue #420 acceptance)", () => {
 		expect(frames.length).toBe(50);
 
 		for (let i = 0; i < 50; i++) {
-			expect(frames[i].type).toBe("request");
-			if (frames[i].type === "request") {
-				expect(frames[i].id).toBe(String(i));
-				expect(frames[i].verb).toBe("chat.send");
+			const frame = frames[i];
+			expect(frame.type).toBe("request");
+			if (frame.type === "request") {
+				expect(frame.id).toBe(String(i));
+				expect(frame.verb).toBe("chat.send");
 			}
 		}
 	});
@@ -124,7 +124,7 @@ describe("SDK socket partial writes (issue #420 acceptance)", () => {
 				const accepted = Math.min(bytes.length, 128);
 				totalWritten += accepted;
 				if (accepted < bytes.length && sinkState.writer) {
-					setTimeout(() => sinkState.writer!.drain(), 0);
+					setTimeout(() => sinkState.writer?.drain(), 0);
 				}
 				return accepted;
 			},

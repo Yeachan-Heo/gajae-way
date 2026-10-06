@@ -88,6 +88,7 @@ export {
 	ProtocolError,
 	type ProtocolErrorPayload,
 } from "./errors";
+export { type FrameWriterSink, OrderedFrameWriter, type OrderedFrameWriterOptions } from "./frame-writer";
 export {
 	decodeFrame,
 	type ErrorFrame,
@@ -167,4 +168,3 @@ export {
 	PROFILE_VERSION,
 	SUPPORTED_PROFILE_VERSIONS,
 } from "./version";
-export { type FrameWriterSink, OrderedFrameWriter, type OrderedFrameWriterOptions } from "./frame-writer";

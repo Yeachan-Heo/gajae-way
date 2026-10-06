@@ -11,9 +11,9 @@ import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
 	encodeFrame,
-	type FrameWriterSink,
 	type Frame,
 	FrameDecoder,
+	type FrameWriterSink,
 	LOOPBACK_ORIGIN,
 	OrderedFrameWriter,
 	type OriginRef,
@@ -42,7 +42,7 @@ export function processStartedAt(): string {
 }
 
 interface Transport {
-	write(data: string): Promise<void>;
+	write(frame: Frame): Promise<void>;
 	close(): void | Promise<void>;
 }
 
@@ -55,24 +55,24 @@ interface Pending {
 export class GajaewayClient {
 	static async connectSocket(path: string, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
-		const decoder = new TextDecoder({ stream: true } as any);
+		const decoder = new TextDecoder();
 		const socketSink: FrameWriterSink = {
-			write: (bytes: Uint8Array) => 0,
+			write: (_bytes: Uint8Array) => 0,
 			close: () => {},
 		};
 		let writer: OrderedFrameWriter;
-		const socket = await Bun.connect<undefined>({
+		const _socket = await Bun.connect<undefined>({
 			unix: path,
 			socket: {
-				open(_socket) {
-					socketSink.write = (bytes: Uint8Array) => _socket.write(bytes);
-					socketSink.close = () => _socket.end();
+				open(socket) {
+					socketSink.write = (bytes: Uint8Array) => socket.write(bytes);
+					socketSink.close = () => socket.end();
 					writer = new OrderedFrameWriter(socketSink, (error) => {
 						client.#fail(error as Error);
 					});
 				},
 				data(_socket, data) {
-					client.#receive(decoder.decode(data, { stream: true } as any));
+					client.#receive(decoder.decode(data, { stream: true }));
 				},
 				close() {
 					client.#fail(new Error("gateway connection closed"));
@@ -86,8 +86,7 @@ export class GajaewayClient {
 			},
 		});
 		client.#transport = {
-			write: async (data) => {
-				const frame = JSON.parse(data) as Frame;
+			write: async (frame) => {
 				writer.write(frame);
 				await writer.settled();
 			},
@@ -102,7 +101,8 @@ export class GajaewayClient {
 	static async connectStdio(transport: StdioTransport, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
 		client.#transport = {
-			write: async (data) => {
+			write: async (frame) => {
+				const data = encodeFrame(frame);
 				const writable = transport.writable;
 				if ("getWriter" in writable) {
 					const writer = writable.getWriter();
@@ -178,7 +178,7 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
-		await this.#transport.write(encodeFrame({ v: PROFILE_VERSION, type: "request", id, verb, params }));
+		await this.#transport.write({ v: PROFILE_VERSION, type: "request", id, verb, params });
 		return promise;
 	}
 
@@ -219,27 +219,26 @@ export class GajaewayClient {
 				reject(payload as Error);
 			});
 			void this.#transport
-				?.write(
-					encodeFrame({
-						v: PROFILE_VERSION,
-						type: "hello",
-						payload: {
-							supportedVersions: [PROFILE_VERSION],
-							clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
-						},
-					}),
-				)
+				?.write({
+					v: PROFILE_VERSION,
+					type: "hello",
+					payload: {
+						supportedVersions: [PROFILE_VERSION],
+						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
+					},
+				})
 				.catch(reject);
 		});
 		return this.#negotiated;
 	}
 
 	async #readStdio(readable: StdioTransport["readable"]): Promise<void> {
-		const decoder = new TextDecoder({ stream: true } as any);
-		for await (const chunk of readable as AsyncIterable<Uint8Array>) this.#receive(decoder.decode(chunk, { stream: true } as any));
+		const decoder = new TextDecoder();
+		for await (const chunk of readable as AsyncIterable<Uint8Array>)
+			this.#receive(decoder.decode(chunk, { stream: true }));
 	}
 
-	#receive(chunk: string): void {
+	async #receive(chunk: string): Promise<void> {
 		let frames: Frame[];
 		try {
 			frames = this.#decoder.feed(chunk);

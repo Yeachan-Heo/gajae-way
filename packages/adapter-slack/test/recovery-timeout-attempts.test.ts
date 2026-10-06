@@ -1,12 +1,12 @@
-import { expect, test, describe } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import {
 	classifyRecoveryFailure,
-	recordAttempt,
-	RECOVERY_MAX_ATTEMPTS,
 	EMPTY_RECOVERY_STATE,
+	RECOVERY_MAX_ATTEMPTS,
 	type RecoveryCursorState,
+	recordAttempt,
 } from "../src/recovery";
-import { ProtocolError } from "@gajae-gateway/protocol";
 
 describe("Recovery dead-lettering after N timeout attempts (issue #420 acceptance)", () => {
 	test("timeout error is classified as terminal-message, not retryable", () => {
@@ -110,7 +110,6 @@ describe("Recovery dead-lettering after N timeout attempts (issue #420 acceptanc
 		const conversationId = "C123";
 
 		// First: timeout (terminal-message)
-		const timeoutError = new ProtocolError("verb_failed", "request timed out after 30000ms");
 		let result = recordAttempt(state, messageId, conversationId, "terminal-message", "timeout", Date.now());
 		state = result.state;
 

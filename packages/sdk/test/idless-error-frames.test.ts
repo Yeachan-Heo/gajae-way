@@ -1,5 +1,5 @@
-import { expect, test, describe } from "bun:test";
-import { encodeFrame, FrameDecoder, ProtocolError } from "@gajae-gateway/protocol";
+import { describe, expect, test } from "bun:test";
+import { encodeFrame, FrameDecoder } from "@gajae-gateway/protocol";
 
 describe("Id-less error frames fail pending requests (issue #420 acceptance)", () => {
 	test("id-less malformed_frame error frame is recognized as fatal stream error", () => {

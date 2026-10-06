@@ -1,6 +1,6 @@
-import { expect, test, describe } from "bun:test";
-import { encodeFrame, FrameDecoder } from "@gajae-gateway/protocol";
+import { describe, expect, test } from "bun:test";
 import type { Frame } from "@gajae-gateway/protocol";
+import { encodeFrame, FrameDecoder } from "@gajae-gateway/protocol";
 
 describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)", () => {
 	test("multibyte character split across two data chunks decodes correctly", () => {
@@ -8,11 +8,11 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 		// Split it across two chunks
 		const decoder = new TextDecoder();
 
-		const part1 = new Uint8Array([0xED, 0x95]); // First 2 bytes of "한"
-		const part2 = new Uint8Array([0x9C]); // Third byte of "한"
+		const part1 = new Uint8Array([0xed, 0x95]); // First 2 bytes of "한"
+		const part2 = new Uint8Array([0x9c]); // Third byte of "한"
 
-		const decoded1 = decoder.decode(part1, { stream: true } as any);
-		const decoded2 = decoder.decode(part2, { stream: true } as any);
+		const decoded1 = decoder.decode(part1, { stream: true });
+		const decoded2 = decoder.decode(part2, { stream: true });
 		const result = decoded1 + decoded2;
 
 		expect(result).toBe("한");
@@ -36,9 +36,9 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 
 		// Find a location to split that will split a multibyte character
 		// Try several split points to find one that breaks a multibyte sequence
-		let foundSplit = false;
-		let split1: string = "";
-		let split2: string = "";
+		let _foundSplit = false;
+		let _split1: string = "";
+		let _split2: string = "";
 
 		for (let i = 10; i < bytes.length - 10; i++) {
 			const chunk1 = bytes.subarray(0, i);
@@ -49,15 +49,15 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 				const decoder1 = new TextDecoder();
 				const decoder2 = new TextDecoder();
 
-				const decoded1 = decoder1.decode(chunk1, { stream: true } as any);
-				const decoded2 = decoder2.decode(chunk2, { stream: true } as any);
+				const decoded1 = decoder1.decode(chunk1, { stream: true });
+				const decoded2 = decoder2.decode(chunk2, { stream: true });
 
 				// If we got a replacement character, we found a good split
 				if (decoded1.includes("\uFFFD") || (decoded1 + decoded2).includes("\uFFFD")) {
 					// This is a split that doesn't work without streaming
-					foundSplit = true;
-					split1 = decoded1;
-					split2 = decoded2;
+					_foundSplit = true;
+					_split1 = decoded1;
+					_split2 = decoded2;
 					break;
 				}
 			} catch {
@@ -71,8 +71,8 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 		const chunk1Bytes = bytes.subarray(0, Math.floor(bytes.length / 2));
 		const chunk2Bytes = bytes.subarray(Math.floor(bytes.length / 2));
 
-		const decoded1 = decoder1.decode(chunk1Bytes, { stream: true } as any);
-		const decoded2 = decoder1.decode(chunk2Bytes, { stream: true } as any);
+		const decoded1 = decoder1.decode(chunk1Bytes, { stream: true });
+		const decoded2 = decoder1.decode(chunk2Bytes, { stream: true });
 		const fullDecoded = decoded1 + decoded2;
 
 		// Verify we can decode frames from the concatenated result
@@ -80,6 +80,7 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 		expect(frames.length).toBe(1);
 		expect(frames[0].type).toBe("request");
 		if (frames[0].type === "request") {
+			// biome-ignore lint/suspicious/noExplicitAny: test convenience
 			const params = frames[0].params as any;
 			expect(params.text).toBe("한글 테스트");
 		}
@@ -106,8 +107,8 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 
 		// Gateway uses streaming decoder to handle this
 		const decoder = new TextDecoder();
-		const decoded1 = decoder.decode(chunk1, { stream: true } as any);
-		const decoded2 = decoder.decode(chunk2, { stream: true } as any);
+		const decoded1 = decoder.decode(chunk1, { stream: true });
+		const decoded2 = decoder.decode(chunk2, { stream: true });
 		const fullDecoded = decoded1 + decoded2;
 
 		// Verify frame decodes correctly
@@ -115,6 +116,7 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 		expect(frames.length).toBe(1);
 		expect(frames[0].type).toBe("response");
 		if (frames[0].type === "response") {
+			// biome-ignore lint/suspicious/noExplicitAny: test convenience
 			const result = frames[0].result as any;
 			expect(result.text).toBe("응답: 한글 처리");
 		}
@@ -137,20 +139,21 @@ describe("Streaming TextDecoder for multibyte characters (issue #420 acceptance)
 		const bytes = Buffer.from(encoded, "utf-8");
 
 		// Split at multiple points and verify all decode correctly
-		for (let splitPoint of [64, 256, 512, 1024]) {
+		for (const splitPoint of [64, 256, 512, 1024]) {
 			if (splitPoint >= bytes.length) continue;
 
 			const chunk1 = bytes.subarray(0, splitPoint);
 			const chunk2 = bytes.subarray(splitPoint);
 
 			const decoder1 = new TextDecoder();
-			const decoded1 = decoder1.decode(chunk1, { stream: true } as any);
-			const decoded2 = decoder1.decode(chunk2, { stream: true } as any);
+			const decoded1 = decoder1.decode(chunk1, { stream: true });
+			const decoded2 = decoder1.decode(chunk2, { stream: true });
 			const fullDecoded = decoded1 + decoded2;
 
 			const frames = frameDecoder.feed(fullDecoded);
 			expect(frames.length).toBeGreaterThan(0);
 			if (frames[0].type === "request") {
+				// biome-ignore lint/suspicious/noExplicitAny: test convenience
 				const params = frames[0].params as any;
 				expect(params.text).toBe(text);
 			}
