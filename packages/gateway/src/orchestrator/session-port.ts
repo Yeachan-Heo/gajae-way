@@ -325,26 +325,6 @@ const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
 
 /**
- * Error thrown when a prompt cannot be sent due to the session being busy
- * for an extended period, indicating the previous run may still be active.
- * This is distinct from a single "busy" rejection and signals that retry
- * from a higher level may help if the session eventually settles.
- */
-export class SessionBusyTimeoutError extends GjcCliError {
-	readonly retriable = true;
-
-	constructor(sessionId: string, opRef: string, busyWaitMs: number) {
-		super(
-			`session still busy after ${busyWaitMs}ms waiting for prior run to settle; consider retry`,
-			0,
-			"",
-			{ code: SESSION_BUSY_CODE, retriable: true },
-		);
-		this.name = "SessionBusyTimeoutError";
-	}
-}
-
-/**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
  * transport: it neither discovers an endpoint nor opens an authenticated socket.
  */
@@ -356,7 +336,6 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
-
 	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
@@ -749,9 +728,7 @@ export class BrokerSessionPort implements SessionPort {
 				// `busy` is occupancy, not failure: the prompt was never accepted and
 				// the op-ref is still unused. Wait for the session to go idle
 				// (bounded) and resend under the same op-ref before giving up.
-				if (this.#now() >= deadline) {
-					throw new SessionBusyTimeoutError(input.sessionId, input.opRef, input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
-				}
+				if (this.#now() >= deadline) throw error;
 				if (!waited) {
 					waited = true;
 					console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
@@ -1639,11 +1616,6 @@ function sanitizeSdkFailure(error: unknown): Error {
 /** Exact `busy` envelope code: the runtime refused the prompt because a turn is still running. */
 export function isSessionBusy(error: unknown): boolean {
 	return error instanceof GjcCliError && envelopeErrorCode(error.details) === SESSION_BUSY_CODE;
-}
-
-/** Session remained busy after extended retry period, indicating prior run may still be active. */
-export function isSessionBusyTimeout(error: unknown): boolean {
-	return error instanceof SessionBusyTimeoutError;
 }
 
 /** A refused relay control/query as the same GjcCliError the CLI transport raised, so callers classify once. */

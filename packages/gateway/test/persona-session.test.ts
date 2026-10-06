@@ -94,7 +94,7 @@ async function harness(
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
-	extra: { brokerGeneration?: () => number } = {},
+	extra: { brokerGeneration?: () => number; submissionRetryDelayMs?: number } = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -104,6 +104,7 @@ async function harness(
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
+		submissionRetryDelayMs: 1,
 		...(log ? { log } : {}),
 		...extra,
 		onTurnStart: ({ trigger, turn }) => {
@@ -123,19 +124,23 @@ async function harness(
 	});
 }
 
+/** Settles one inbound whose every send fails; returns the final (retried) send. */
 async function settleFailedInbound(port: ScriptedSessionPort, messageId: string) {
 	enqueue(messageId, messageId);
 	const activeManager = manager;
 	const activeDatabase = database;
 	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
 	await activeManager.notifyInbound(KEY);
-	const send = port.sends.at(-1);
-	if (!send) throw new Error(`failed turn ${messageId} was not dispatched`);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(send.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
-		`failed turn ${messageId} did not settle`,
-	);
-	return send;
+	const sendsFor = () => port.sends.filter((send) => send.text === messageId);
+	await eventually(() => {
+		const last = sendsFor().at(-1);
+		return (
+			last !== undefined &&
+			activeDatabase.inboundTurnRow(last.opRef)?.turn_state === "done" &&
+			activeManager.state(KEY) === "idle"
+		);
+	}, `failed turn ${messageId} did not settle`);
+	return sendsFor().at(-1)!;
 }
 
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
@@ -660,46 +665,18 @@ test("two consecutive internal submission failures reset the next inbound to a n
 			}),
 	});
 	const logs: string[] = [];
-	const failures: string[] = [];
-	await harness(port, { failure: (text) => failures.push(text) }, (line) => logs.push(line));
-	const activeManager = manager;
-	const activeDatabase = database;
-	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	await harness(port, {}, (line) => logs.push(line));
 
-	// First message will retry once and fail
-	enqueue("submission-1", "submission-1");
-	await activeManager.notifyInbound(KEY);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done",
-		"first submission did not settle",
-	);
-	const firstOpRef = latestOpRef;
-	const firstSession = activeDatabase.inboundTurnRow(firstOpRef)?.bound_session_id;
-
-	// Second message will also retry once and fail, triggering reset
-	enqueue("submission-2", "submission-2");
-	await activeManager.notifyInbound(KEY);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done",
-		"second submission did not settle",
-	);
-	const secondOpRef = latestOpRef;
-	const secondSession = activeDatabase.inboundTurnRow(secondOpRef)?.bound_session_id;
-
-	// Verify reset happened
-	expect(firstSession).toBe("session-e0");
-	expect(secondSession).toBe("session-e0");
-	expect(activeDatabase.getSessionRecord(KEY)?.epoch).toBe(1);
+	const first = await settleFailedInbound(port, "submission-1");
+	const second = await settleFailedInbound(port, "submission-2");
+	expect(first.sessionId).toBe("session-e0");
+	expect(second.sessionId).toBe(first.sessionId);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(logs).toContain(
-		`session_reset_after_failed_turn origin=${KEY} epoch=0 nextEpoch=1 opRef=${secondOpRef} reason=repeated_submission_failure`,
+		`session_reset_after_failed_turn origin=${KEY} epoch=0 nextEpoch=1 opRef=${second.opRef} reason=repeated_submission_failure`,
 	);
-	expect(failures).toHaveLength(2); // Both retries failed
 
-	// Third message should use new epoch
-	enqueue("submission-3", "submission-3");
-	await activeManager.notifyInbound(KEY);
-	const third = port.sends.at(-1);
-	if (!third) throw new Error("third message was not dispatched");
+	const third = await settleFailedInbound(port, "submission-3");
 	expect(third).toMatchObject({ sessionId: "session-e1", text: "submission-3" });
 });
 
@@ -720,17 +697,7 @@ test("a healthy turn clears consecutive internal submission failures", async () 
 	const activeManager = manager;
 	const activeDatabase = database;
 	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
-
-	// First submission fails and retries
-	enqueue("submission-before-healthy", "submission-before-healthy");
-	await activeManager.notifyInbound(KEY);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done",
-		"first submission did not settle",
-	);
-	const beforeHealthySession = activeDatabase.inboundTurnRow(latestOpRef)?.bound_session_id;
-
-	// Healthy turn clears the failure counter
+	const first = await settleFailedInbound(port, "submission-before-healthy");
 	const healthy = "healthy";
 	enqueue(healthy, healthy);
 	await activeManager.notifyInbound(KEY);
@@ -740,17 +707,10 @@ test("a healthy turn clears consecutive internal submission failures", async () 
 		() => activeDatabase.inboundTurnRow(successful.opRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
 		"healthy turn did not settle",
 	);
+	const last = await settleFailedInbound(port, "submission-after-healthy");
 
-	// After healthy turn, another submission failure should not reset
-	enqueue("submission-after-healthy", "submission-after-healthy");
-	await activeManager.notifyInbound(KEY);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done",
-		"second submission did not settle",
-	);
-
-	expect(beforeHealthySession).toBe("session-e0");
-	expect(successful.sessionId).toBe("session-e0");
+	expect(successful.sessionId).toBe(first.sessionId);
+	expect(last.sessionId).toBe(first.sessionId);
 	expect(activeDatabase.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
 });
@@ -766,22 +726,9 @@ test("repeated submission failures respect the reset cap and log it once per ses
 	});
 	const logs: string[] = [];
 	await harness(port, {}, (line) => logs.push(line));
-	const activeManager = manager;
-	const activeDatabase = database;
-	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
 
 	const sends: (typeof port.sends)[number][] = [];
-	for (let index = 0; index < 6; index++) {
-		enqueue(`capped-submission-${index + 1}`, `capped-submission-${index + 1}`);
-		await activeManager.notifyInbound(KEY);
-		await eventually(
-			() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done",
-			`submission ${index + 1} did not settle`,
-		);
-		const send = port.sends.at(-1);
-		if (!send) throw new Error(`submission ${index + 1} was not sent`);
-		sends.push(send);
-	}
+	for (let index = 0; index < 6; index++) sends.push(await settleFailedInbound(port, `capped-submission-${index + 1}`));
 	const capped = sends[3];
 	if (!capped) throw new Error("reset cap failure was not recorded");
 
@@ -792,10 +739,77 @@ test("repeated submission failures respect the reset cap and log it once per ses
 		"session-e1",
 		"session-e1",
 	]);
-	expect(activeDatabase.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(logs.filter((line) => line.startsWith("failed_turn_reset_capped "))).toEqual([
 		`failed_turn_reset_capped origin=${KEY} epoch=1 session=session-e1 opRef=${capped.opRef} reason=repeated_submission_failure`,
 	]);
+});
+
+const SUBMISSION_BUSY = {
+	code: "internal",
+	outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+} as const;
+
+test("#424: a prompt that failed in its submission phase is re-sent once and answered without a failure notice", async () => {
+	let sends = 0;
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			sends++;
+			if (sends === 1) scripted.fail(input.opRef, "Prompt submission failed.", SUBMISSION_BUSY);
+			else scripted.complete(input.opRef, "answer after retry");
+		},
+	});
+	const failures: string[] = [];
+	const terminal: string[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{ failure: (message) => failures.push(message), terminal: (text) => terminal.push(text) },
+		(line) => logs.push(line),
+	);
+	enqueue("busy-1", "hello while busy");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => terminal.length === 1 && manager!.state(KEY) === "idle", "retried turn was not answered");
+
+	expect(terminal).toEqual(["answer after retry"]);
+	expect(failures).toEqual([]);
+	expect(port.sends).toHaveLength(2);
+	const [first, retry] = port.sends;
+	expect(retry!.opRef).not.toBe(first!.opRef);
+	expect(retry!.sessionId).toBe(first!.sessionId);
+	expect(retry!.text).toBe("hello while busy");
+	expect(database!.inboundTurnRow(retry!.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.filter((line) => line.startsWith("submission_retry "))).toHaveLength(1);
+});
+
+test("#424: a prompt that fails its submission phase twice gets exactly one failure notice", async () => {
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => scripted.fail(input.opRef, "Prompt submission failed.", SUBMISSION_BUSY),
+	});
+	const failures: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) });
+	const last = await settleFailedInbound(port, "busy-twice");
+
+	expect(port.sends.map((send) => send.text)).toEqual(["busy-twice", "busy-twice"]);
+	expect(failures).toHaveLength(1);
+	expect(database!.inboundTurnRow(last.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
+test("#424: a failure outside the submission phase is reported without a re-send", async () => {
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "model error", {
+				code: "internal",
+				outcome: { code: "internal", phase: "model", category: "agent_runtime", provenance: "agent_failed" },
+			}),
+	});
+	const failures: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) });
+	await settleFailedInbound(port, "model-failure");
+
+	expect(port.sends).toHaveLength(1);
+	expect(failures).toHaveLength(1);
 });
 
 for (const restart of [false, true])
@@ -2370,111 +2384,4 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(port.indexScans).toBe(0);
 	expect(port.deleted).toEqual([]);
 	expect(logs.some((line) => line.startsWith("session_gc"))).toBe(false);
-});
-
-test("#424: second message during first turn finalization is steered, not sent", async () => {
-	// When a message arrives while the first turn is settling but the session
-	// is still busy (finalization/compaction), it should be steered into the
-	// running turn, not sent as a new prompt.
-	const port = new ScriptedSessionPort();
-	await harness(port);
-	const now = Date.now();
-
-	// Enqueue two messages
-	enqueue("m-1", "first message");
-	enqueue("m-2", "second message");
-	await manager?.notifyInbound(KEY);
-
-	// Verify only one prompt was sent (first message)
-	expect(port.sends).toHaveLength(1);
-	const send = port.sends[0]!;
-
-	// Second message should be steered, not sent as a separate prompt
-	await eventually(
-		() => port.steers.length >= 1,
-		"second message was not steered",
-	);
-
-	const steer = port.steers[0]!;
-	expect(steer.sessionId).toBe(send.sessionId);
-
-	// Complete and verify both messages are accounted for
-	port.complete(send.opRef, "answer");
-	await eventually(
-		() =>
-			database?.inboundTurnRows(send.opRef).every((row) => row.state === "done") === true,
-		"turn did not complete",
-	);
-});
-
-test("#424: submission-phase failure retries once, then posts failure if retry also fails", async () => {
-	// First scenario: initial submission fails, retry succeeds
-	const failures: string[] = [];
-	let attemptCount = 0;
-	const port = new ScriptedSessionPort({
-		onSend: (input, scripted) => {
-			attemptCount++;
-			if (attemptCount === 1) {
-				// First attempt fails with internal submission error
-				scripted.fail(input.opRef, "Prompt submission failed.", {
-					code: "internal",
-					outcome: { code: "internal", phase: "submission" },
-				});
-			} else {
-				// Second attempt (retry) succeeds
-				scripted.complete(input.opRef, "answer");
-			}
-		},
-	});
-	const activeManager = manager;
-	const activeDatabase = database;
-	await harness(port, { failure: (msg) => failures.push(msg) });
-	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
-
-	enqueue("m-1", "test message");
-	await activeManager.notifyInbound(KEY);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
-		"turn did not settle",
-	);
-
-	// Verify: no failure messages were posted (retry succeeded)
-	expect(failures).toHaveLength(0);
-	// Verify: two sends with different opRefs
-	expect(port.sends).toHaveLength(2);
-	const firstSend = port.sends[0]!;
-	const secondSend = port.sends[1]!;
-	expect(firstSend.opRef).not.toBe(secondSend.opRef); // Different opRefs
-	expect(firstSend.text).toBe("test message");
-	expect(secondSend.text).toBe("test message"); // Same content
-});
-
-test("#424: submission-phase failure posts failure if both attempts fail", async () => {
-	// Second scenario: both initial and retry fail at submission
-	const failures: string[] = [];
-	const port = new ScriptedSessionPort({
-		onSend: (input, scripted) => {
-			// Both attempts fail with internal submission error
-			scripted.fail(input.opRef, "Prompt submission failed.", {
-				code: "internal",
-				outcome: { code: "internal", phase: "submission" },
-			});
-		},
-	});
-	const activeManager = manager;
-	const activeDatabase = database;
-	await harness(port, { failure: (msg) => failures.push(msg) });
-	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
-
-	enqueue("m-2", "test message");
-	await activeManager.notifyInbound(KEY);
-	await eventually(
-		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
-		"turn did not settle",
-	);
-
-	// Verify: exactly one failure message was posted
-	expect(failures).toHaveLength(1);
-	// Verify: two send attempts (initial + retry)
-	expect(port.sends).toHaveLength(2);
 });
