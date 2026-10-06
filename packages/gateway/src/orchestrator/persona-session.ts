@@ -2036,22 +2036,30 @@ class OriginActor {
 		tail: TailHandle,
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
-		if (!bound) return;
+		if (!bound || !this.#manager.onReverseRequest) {
+			// Nobody will ever answer this request; tell gjc now instead of leaving its tool call waiting.
+			await tail
+				.sendReverseResponse({
+					id: input.id,
+					connectionId: input.connectionId,
+					leaseId: input.leaseId,
+					error: { code: "unavailable", message: "no bound turn for this reverse request" },
+				})
+				.catch(() => {});
+			return;
+		}
 		// Extract the trigger author ID from the bound turn
 		const trigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
 		const triggerAuthorId = trigger?.engagement_json
 			? (JSON.parse(trigger.engagement_json) as { authorId?: string }).authorId
 			: undefined;
-		// Forward reverse requests to the server's panel handling
-		if (this.#manager.onReverseRequest) {
-			await this.#manager.onReverseRequest({
-				originKey: this.originKey,
-				sessionId,
-				triggerAuthorId,
-				tail,
-				input,
-			});
-		}
+		await this.#manager.onReverseRequest({
+			originKey: this.originKey,
+			sessionId,
+			triggerAuthorId,
+			tail,
+			input,
+		});
 	}
 
 	/**

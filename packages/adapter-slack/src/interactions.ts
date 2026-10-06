@@ -100,13 +100,25 @@ export function describePanelResponse(
 		};
 	}
 
-	const approvalMatch = action.action_id.match(/^approval_(.+?)_(allow|deny)$/);
-	if (approvalMatch) {
+	// Option buttons are `approval_<panelId>_<optionId>` with the optionId as value;
+	// optionIds such as allow_once contain underscores, so split on the value.
+	const optionId = action.value;
+	const optionSuffix = optionId && optionId !== "allow" && optionId !== "deny" ? `_${optionId}` : undefined;
+	const approvalMatch = optionSuffix
+		? action.action_id.startsWith("approval_") && action.action_id.endsWith(optionSuffix)
+			? [action.action_id, action.action_id.slice("approval_".length, -optionSuffix.length), optionId]
+			: null
+		: action.action_id.match(/^approval_(.+)_(allow|deny)$/);
+	if (approvalMatch?.[1]) {
 		const [, panelId, decision] = approvalMatch;
+		const choice =
+			decision === "allow" || decision === "deny"
+				? { responseKind: decision === "allow" ? ("approved" as const) : ("denied" as const) }
+				: { responseKind: "option_selected" as const, selectedOptionId: decision };
 		return {
 			origin,
 			panelId,
-			responseKind: decision === "allow" ? "approved" : "denied",
+			...choice,
 			responderId: event.user.id,
 			engagement: {
 				mentioned: true,

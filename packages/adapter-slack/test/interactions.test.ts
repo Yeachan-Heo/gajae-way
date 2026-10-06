@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { describePanelResponse, type SlackBlockAction } from "../src/interactions";
+import { approvalPanelBlocks } from "../src/panels";
 
 describe("describePanelResponse", () => {
 	it("parses ask-user panel option selection", () => {
@@ -269,5 +271,45 @@ describe("describePanelResponse", () => {
 
 		expect(response).not.toBeNull();
 		expect(response?.engagement.group).toBe(false);
+	});
+
+	it("a click on a rendered permission option button reports that exact offered option", () => {
+		const panelId = "3f1c2a9e-8b7d-4c1e-9a2b-1d2e3f4a5b6c";
+		const message = {
+			turnId: "t1",
+			origin: { platform: "slack", kind: "channel", conversationId: "C123" },
+			role: "assistant",
+			text: "Run tests",
+			final: true,
+			approvalPanel: {
+				panelId,
+				message: "Run tests",
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				options: [
+					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+					{ optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+					{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+				],
+			},
+		} as ChatMessagePayload;
+		const buttons = approvalPanelBlocks(message).flatMap((block) =>
+			((block as { elements?: { action_id?: string; value?: string }[] }).elements ?? []).filter((e) => e.action_id),
+		);
+		expect(buttons.map((button) => button.value)).toEqual(["allow_once", "allow_always", "reject_once"]);
+		const clicked = buttons.map((button) =>
+			describePanelResponse(
+				{
+					type: "block_actions",
+					actions: [{ type: "button", action_id: button.action_id ?? "", value: button.value }],
+					user: { id: "U1", username: "u", name: "U", team_id: "T1" },
+				} as SlackBlockAction,
+				message.origin,
+			),
+		);
+		expect(clicked.map((response) => [response?.panelId, response?.responseKind, response?.selectedOptionId])).toEqual([
+			[panelId, "option_selected", "allow_once"],
+			[panelId, "option_selected", "allow_always"],
+			[panelId, "option_selected", "reject_once"],
+		]);
 	});
 });

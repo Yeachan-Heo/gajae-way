@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -77,11 +77,7 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
-import {
-	deterministicInterimDeliveryId,
-	deterministicTerminalDeliveryId,
-	type TailHandle,
-} from "../orchestrator/tail-runner";
+import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
 import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
@@ -111,7 +107,7 @@ import {
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
-import { PanelTracker } from "./panel-tracker";
+import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -331,9 +327,7 @@ interface Runtime {
 	/** Admission cap and retirement for `work.run` lanes. */
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
-	readonly panelTracker: PanelTracker;
-	/** Maps panel IDs to relay handles for sending reverse_response frames */
-	panelTails?: Map<string, TailHandle>;
+	readonly permissionPanels: PermissionPanels;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -371,7 +365,6 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			runtime.stopRetention();
-			runtime.panelTracker.clear();
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
@@ -611,137 +604,21 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
 		},
-		onReverseRequest: async ({ originKey, sessionId, triggerAuthorId, tail, input }) => {
-			// Get the real origin from the originKey
-			const originData = options.database.getOriginByKey(originKey);
-			if (!originData) {
-				// Cannot find origin; decline with error
-				await tail
-					.sendReverseResponse({
-						id: input.id,
-						connectionId: input.connectionId,
-						leaseId: input.leaseId,
-						error: { code: "unavailable", message: "session origin not found" },
-					})
-					.catch(() => {});
-				return;
-			}
-
-			const origin = validateOriginRef(originData as unknown as OriginRef);
-
-			// Validate platform: only Slack is supported for interactive panels
-			if (origin.platform !== "slack") {
-				// Non-Slack origins: fall back to declining with unavailable
-				await tail
-					.sendReverseResponse({
-						id: input.id,
-						connectionId: input.connectionId,
-						leaseId: input.leaseId,
-						error: { code: "unavailable", message: "panels not available for this platform" },
-					})
-					.catch(() => {});
-				return;
-			}
-
-			// Parse the request payload to determine panel type
-			const capability = String(input.capability).toLowerCase();
-			const method = String(input.payload?.method || "").toLowerCase();
-			const payload = input.payload?.payload as Record<string, unknown> | undefined;
-
-			// Determine panel type and build panel payload
-			let panelPayload: Partial<Pick<ChatMessagePayload, "approvalPanel">> = {};
-
-			if (capability === "permission" && method === "request") {
-				// Permission request: render from toolCall and options
-				const toolCall = payload?.toolCall as Record<string, unknown> | undefined;
-				const options_list = Array.isArray(payload?.options) ? payload.options : [];
-
-				// Extract message from toolCall title or kind
-				const message =
-					typeof toolCall?.title === "string"
-						? toolCall.title
-						: typeof toolCall?.kind === "string"
-							? toolCall.kind
-							: "Permission Request";
-
-				// Transform offered options to the format expected by adapters
-				const approvalOptions = (options_list as unknown[])
-					.map((opt: unknown) => {
-						if (typeof opt === "object" && opt !== null) {
-							const optRecord = opt as Record<string, unknown>;
-							return {
-								optionId: String(optRecord.optionId || ""),
-								name: String(optRecord.name || ""),
-								kind: String(optRecord.kind || ""),
-							};
-						}
-						return null;
-					})
-					.filter((opt): opt is { optionId: string; name: string; kind: string } => opt !== null);
-
-				const expiresAt = new Date(Date.now() + 300000).toISOString(); // 5 minutes
-				const panelId = randomUUID();
-
-				panelPayload = {
-					approvalPanel: {
-						panelId,
-						message,
-						expiresAt,
-						options: approvalOptions,
-					},
-				};
-
-				// Register the panel for tracking and response routing
-				runtime.panelTracker.registerPanel({
-					panelId,
-					questionId: input.id,
-					turnId: sessionId,
-					sessionId,
-					origin,
-					authorId: triggerAuthorId ?? originKey, // Use trigger author, fall back to originKey
-					expiresAt: new Date(Date.now() + 300000),
-					answerBinding: input.id,
-					reverseRequest: {
-						id: input.id,
-						connectionId: input.connectionId,
-						leaseId: input.leaseId,
-						capability: input.capability,
-						method: input.payload.method,
-						payload: payload || {},
-					},
-				});
-
-				// Store the tail handle for later response
-				runtime.panelTails ??= new Map();
-				runtime.panelTails.set(panelId, tail);
-
-				// Send outbound message with panel
-				const turnId = crypto.randomUUID();
-				const deliveryId = crypto.randomUUID();
-				const messagePayload: ChatMessagePayload = {
-					turnId,
-					origin,
-					role: "assistant",
-					text: message,
-					final: true,
-					deliveryId,
-					...panelPayload,
-				};
-
-				if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(messagePayload))) {
-					runtime.delivery.markInflight(deliveryId);
-					broadcastDelivery(runtime, messagePayload);
-				}
-			} else {
-				// Unknown capability/method: decline with unavailable
-				await tail
-					.sendReverseResponse({
-						id: input.id,
-						connectionId: input.connectionId,
-						leaseId: input.leaseId,
-						error: { code: "unavailable", message: `${input.capability}.${input.payload?.method} not available` },
-					})
-					.catch(() => {});
+		onReverseRequest: async ({ originKey, triggerAuthorId, tail, input }) => {
+			const origin = options.database.getOriginByKey(originKey);
+			await permissionPanels.open({
+				origin: origin ? validateOriginRef(origin as unknown as OriginRef) : undefined,
+				triggerAuthorId,
+				tail,
+				request: input,
+			});
+		},
+	});
+	const permissionPanels = new PermissionPanels({
+		deliver: (payload) => {
+			if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(payload))) {
+				if (payload.deliveryId) runtime.delivery.markInflight(payload.deliveryId);
+				broadcastDelivery(runtime, payload);
 			}
 		},
 	});
@@ -823,29 +700,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
 		}
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
-	// Panel expiry sweep: send cancellation result to hosts for expired panels
-	const panelExpirySweepTimer = setInterval(async () => {
-		try {
-			const expiredPanels = runtime.panelTracker.reapExpiredPanels();
-			for (const panel of expiredPanels) {
-				if (panel.reverseRequest) {
-					const tail = runtime.panelTails?.get(panel.panelId);
-					if (tail) {
-						await tail
-							.sendReverseResponse({
-								id: panel.reverseRequest.id,
-								connectionId: panel.reverseRequest.connectionId,
-								leaseId: panel.reverseRequest.leaseId,
-								result: { outcome: "cancelled" },
-							})
-							.catch(() => {});
-						runtime.panelTails?.delete(panel.panelId);
-					}
-				}
-			}
-		} catch (error) {
-			console.error(`panel expiry sweep failed: ${diagnostic(error)}`);
-		}
+	// Expired permission panels are answered as cancelled so gjc never waits on a dead panel.
+	const panelExpirySweepTimer = setInterval(() => {
+		void permissionPanels
+			.sweep()
+			.catch((error: unknown) => console.error(`panel expiry sweep failed: ${diagnostic(error)}`));
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
@@ -959,7 +818,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		work,
 		inbound,
 		requests: new Set(),
-		panelTracker: new PanelTracker(),
+		permissionPanels,
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1665,7 +1524,7 @@ async function handleRequest(
 				| undefined;
 			let origin: OriginRef;
 			try {
-				origin = params?.origin as OriginRef;
+				origin = validateOriginRef(params?.origin as OriginRef);
 			} catch {
 				throw new ProtocolError("invalid_params", "engagement.panel_response requires a valid origin");
 			}
@@ -1710,99 +1569,9 @@ async function handleRequest(
 			const authorId = (engagement?.authorId as string) || "";
 			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
 
-			// Look up the pending panel and validate authorization
-			const panel = runtime.panelTracker.getPanel(panelId);
-			let coordinatorError: string | undefined;
-
-			if (!panel) {
-				coordinatorError = "panel_not_found";
-			} else if (!runtime.panelTracker.isAuthorizedResponder(panel, responderId)) {
-				coordinatorError = "unauthorized_responder";
-			} else {
-				// Handle the panel response
-				try {
-					// If this panel was created from a reverse request, respond to the SDK host
-					if (panel.reverseRequest) {
-						// Build the response based on the reverse request type
-						// Map panel response to the exact result shapes gjc's host expects
-						let result: unknown;
-						const capability = String(panel.reverseRequest.capability).toLowerCase();
-						const method = String(panel.reverseRequest.method).toLowerCase();
-
-						if (capability === "permission" && method === "request") {
-							// permission.request result: { outcome: "selected", optionId: <one of offered optionIds>, kind? }
-							const optionsList = Array.isArray((panel.reverseRequest.payload as any)?.options)
-								? (panel.reverseRequest.payload as any).options
-								: [];
-
-							// Find the allowed and reject option IDs from the offered options
-							let allowOptionId: string | undefined;
-							let rejectOptionId: string | undefined;
-
-							for (const opt of optionsList) {
-								if (typeof opt === "object" && opt !== null) {
-									const optRecord = opt as Record<string, unknown>;
-									const kind = String(optRecord.kind || "").toLowerCase();
-									if (kind.includes("allow")) {
-										allowOptionId = String(optRecord.optionId || "");
-									} else if (kind.includes("reject")) {
-										rejectOptionId = String(optRecord.optionId || "");
-									}
-								}
-							}
-
-							if (responseKind === "approved") {
-								result = {
-									outcome: "selected",
-									optionId: allowOptionId || "allow_once",
-									kind: "allow_once",
-								};
-							} else if (responseKind === "denied") {
-								result = {
-									outcome: "selected",
-									optionId: rejectOptionId || "reject_once",
-									kind: "reject_once",
-								};
-							} else {
-								coordinatorError = "invalid_response_kind_for_permission_request";
-							}
-						} else {
-							// Unknown capability/method: do not respond
-							coordinatorError = `unsupported_request_type: ${capability}.${method}`;
-						}
-
-						if (!coordinatorError) {
-							// Get the relay that received the original reverse_request
-							const tail = runtime.panelTails?.get(panelId);
-							if (!tail) {
-								coordinatorError = "relay_not_found";
-							} else {
-								// Send the reverse response to the SDK host
-								await tail.sendReverseResponse({
-									id: panel.reverseRequest.id,
-									connectionId: panel.reverseRequest.connectionId,
-									leaseId: panel.reverseRequest.leaseId,
-									result,
-								});
-
-								// Clean up the stored tail handle
-								runtime.panelTails?.delete(panelId);
-							}
-						}
-
-						// Resolve the panel and mark it as handled
-						runtime.panelTracker.resolvePanel(panelId);
-					} else {
-						// Legacy coordinator path (if needed in the future)
-						coordinatorError = "no_reverse_request_handler";
-					}
-				} catch (error) {
-					const errorMsg = error instanceof Error ? error.message : String(error);
-					coordinatorError = `response_error: ${errorMsg}`;
-					// Still resolve the panel so adapters can proceed
-					runtime.panelTracker.resolvePanel(panelId);
-				}
-			}
+			const coordinatorError = await runtime.permissionPanels
+				.respond({ panelId, responderId, responseKind: responseKind as PanelResponseKind, selectedOptionId })
+				.catch((error: unknown) => `response_error: ${diagnostic(error)}`);
 
 			// Record the panel response in the context ledger (audit trail)
 			const responseBody =
