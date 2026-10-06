@@ -623,7 +623,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			const now = Date.now();
 			const panelId = randomUUID();
 			const expiresAt = new Date(now + 300000); // 5 minute timeout
-			const origin: OriginRef = { platform: "slack", id: `${sessionId}:0:0` }; // Default origin for SDK requests
+			// Create a synthetic origin for SDK-initiated panels
+			const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: `sdk-${sessionId}` };
 			
 			// Register the panel with reverse request details (including the relay for responses)
 			runtime.panelTracker.registerPanel({
@@ -648,21 +649,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			// Store the tail handle for later response (we'll need it when the panel is answered)
 			runtime.panelTails ??= new Map();
 			runtime.panelTails.set(panelId, tail);
-			
-			// Emit the panel to the origin (for display in UI)
-			const payload = runtime.delivery.prepare(
-				sessionId,
-				origin,
-				`Permission request from SDK session: ${sessionId}`,
-				{
-					type: "engagement.panel",
-					panelId,
-					questionId: input.id,
-					requestedBy: "sdk",
-					capability: input.capability,
-				},
-			);
-			if (payload) broadcastDelivery(runtime, payload);
+			// Note: SDK-initiated panels are tracked internally via panelTracker
+			// and responses are routed back through the reverse_response protocol.
 		},
 	});
 	const monitors = new MonitorPropagator({

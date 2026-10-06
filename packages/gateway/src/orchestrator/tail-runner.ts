@@ -390,6 +390,12 @@ class ManagedTailHandle implements TailHandle {
 	#opRef: string | undefined;
 	#correlation: TurnCorrelation = {};
 	#droppedForeign = 0;
+	/** Map of capability -> leaseId for active provider leases */
+	#providerLeases = new Map<string, string>();
+	/** Map of leaseId -> expiresAt for tracking lease expiry */
+	#leaseExpiryTimes = new Map<string, number>();
+	/** Timer for provider heartbeats to keep leases alive */
+	#heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(runner: TailRunner, input: TailAttachInput) {
 		this.#runner = runner;
@@ -482,20 +488,22 @@ class ManagedTailHandle implements TailHandle {
 		const frame: Record<string, unknown> = {
 			type: "reverse_response",
 			id: input.id,
+			connectionId: input.connectionId,
 			leaseId: input.leaseId,
 		};
 		if (input.error) {
+			frame.ok = false;
 			frame.error = input.error;
-		} else if (input.result !== undefined) {
-			frame.result = input.result;
+		} else {
+			frame.ok = true;
+			if (input.result !== undefined) {
+				frame.result = input.result;
+			}
 		}
 		try {
 			stream.write(JSON.stringify(frame));
 		} catch (error) {
-			throw new RelayClosedError(
-				this.sessionId,
-				sanitizeDiagnostic(messageOf(error)) || "write_failed",
-			);
+			throw new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed");
 		}
 	}
 
@@ -587,6 +595,7 @@ class ManagedTailHandle implements TailHandle {
 					const childState = streamEnded ? "stream_ended" : "stream_open";
 					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
 				}
+				this.#registerProviders(stream);
 				if (!this.#ready) {
 					this.#ready = true;
 					this.#readyResolve();
@@ -716,6 +725,14 @@ class ManagedTailHandle implements TailHandle {
 			}
 			return;
 		}
+		if (frame.type === "register_provider_result") {
+			this.#handleRegisterProviderResult(frame);
+			return;
+		}
+		if (frame.type === "lease_state") {
+			this.#handleLeaseState(frame);
+			return;
+		}
 		if (frame.type === "transport_error") {
 			this.#input.onDiagnostic?.(
 				`tail_transport_error session=${this.sessionId} code=${sanitizeDiagnostic(String(frame.code ?? "unknown"))}`,
@@ -790,9 +807,139 @@ class ManagedTailHandle implements TailHandle {
 		return compared > 0;
 	}
 
+	#registerProviders(stream: TailStream): void {
+		if (!this.#connectionId) return;
+		// Register for 'permission' capability with an ask-user method
+		const permissionId = `gw-perm-${this.brokerGeneration}-${this.sessionId}`;
+		stream.write(
+			JSON.stringify({
+				type: "register_provider",
+				id: permissionId,
+				connectionId: this.#connectionId,
+				capability: "permission",
+				definitions: { methods: ["request"] },
+			}),
+		);
+		// Register for 'ui' capability with select and confirm methods
+		const uiId = `gw-ui-${this.brokerGeneration}-${this.sessionId}`;
+		stream.write(
+			JSON.stringify({
+				type: "register_provider",
+				id: uiId,
+				connectionId: this.#connectionId,
+				capability: "ui",
+				definitions: { methods: ["select", "confirm"] },
+			}),
+		);
+		// Start heartbeat timer to keep leases alive
+		this.#startHeartbeat();
+	}
+
+	#startHeartbeat(): void {
+		if (this.#heartbeatTimer) return;
+		// Send heartbeat every 3 seconds (before the 5s SDK heartbeat interval)
+		const HEARTBEAT_INTERVAL_MS = 3000;
+		this.#heartbeatTimer = setInterval(() => {
+			if (this.#closed || !this.#stream) {
+				if (this.#heartbeatTimer) {
+					clearInterval(this.#heartbeatTimer);
+					this.#heartbeatTimer = undefined;
+				}
+				return;
+			}
+			const now = this.#runner.now();
+			// Send heartbeat for each active lease that is not expired
+			for (const [leaseId, expiresAt] of this.#leaseExpiryTimes.entries()) {
+				if (expiresAt <= now) {
+					// Lease is expired, remove it
+					this.#leaseExpiryTimes.delete(leaseId);
+					for (const [cap, lid] of this.#providerLeases.entries()) {
+						if (lid === leaseId) {
+							this.#providerLeases.delete(cap);
+						}
+					}
+					continue;
+				}
+				// Send heartbeat if lease will expire in less than 2 seconds
+				if (expiresAt - now < 2000) {
+					try {
+						this.#stream?.write(
+							JSON.stringify({
+								type: "provider_heartbeat",
+								leaseId,
+							}),
+						);
+					} catch (_error) {
+						// Stream write failed; will be handled by stream error handlers
+					}
+				}
+			}
+		}, HEARTBEAT_INTERVAL_MS);
+		this.#heartbeatTimer.unref?.();
+	}
+
+	#handleLeaseState(frame: Record<string, unknown>): void {
+		const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : undefined;
+		if (!leaseId) return;
+		const expiresAt = typeof frame.leaseExpiresAt === "string" ? new Date(frame.leaseExpiresAt).getTime() : undefined;
+		if (!expiresAt || Number.isNaN(expiresAt)) return;
+		const active = frame.active === true;
+		if (active) {
+			// Store the expiry time for this lease
+			this.#leaseExpiryTimes.set(leaseId, expiresAt);
+		} else {
+			// Lease is no longer active, remove it
+			this.#leaseExpiryTimes.delete(leaseId);
+			for (const [cap, lid] of this.#providerLeases.entries()) {
+				if (lid === leaseId) {
+					this.#providerLeases.delete(cap);
+				}
+			}
+		}
+	}
+
+	#handleRegisterProviderResult(frame: Record<string, unknown>): void {
+		const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : undefined;
+		const capability = typeof frame.capability === "string" ? frame.capability : undefined;
+		if (!leaseId || !capability) return;
+		const expiresAt = typeof frame.leaseExpiresAt === "string" ? new Date(frame.leaseExpiresAt).getTime() : undefined;
+		if (!expiresAt || Number.isNaN(expiresAt)) return;
+		// Store the lease ID and expiry time
+		this.#providerLeases.set(capability, leaseId);
+		this.#leaseExpiryTimes.set(leaseId, expiresAt);
+	}
+
+	async #releaseAllLeases(): Promise<void> {
+		if (!this.#stream || this.#closed) return;
+		try {
+			for (const [, leaseId] of this.#providerLeases.entries()) {
+				try {
+					this.#stream.write(
+						JSON.stringify({
+							type: "lease_release",
+							leaseId,
+						}),
+					);
+				} catch (_error) {
+					// Ignore errors, stream may already be closed
+				}
+			}
+		} finally {
+			this.#providerLeases.clear();
+			this.#leaseExpiryTimes.clear();
+		}
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		// Clear heartbeat timer
+		if (this.#heartbeatTimer) {
+			clearInterval(this.#heartbeatTimer);
+			this.#heartbeatTimer = undefined;
+		}
+		// Release all active leases
+		await this.#releaseAllLeases();
 		this.#stream?.close();
 		this.#stream = undefined;
 		this.#failPending("handle closed");

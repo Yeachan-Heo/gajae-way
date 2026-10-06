@@ -999,6 +999,17 @@ export class ScriptedTailHandle implements TailHandle {
 		void this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 	}
 
+	async sendReverseResponse(_input: {
+		id: string;
+		connectionId: string;
+		leaseId: string;
+		result?: unknown;
+		error?: { code: string; message: string };
+	}): Promise<void> {
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		// Scripted handles do not send reverse responses
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;

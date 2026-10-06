@@ -10,7 +10,7 @@ describe("panel coordinator integration", () => {
 	});
 
 	it("registers a pending panel for a question", () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 		const panelId = panelTracker.registerPanel({
 			panelId: "test-panel-1",
 			questionId: "q-12345",
@@ -33,7 +33,7 @@ describe("panel coordinator integration", () => {
 	});
 
 	it("validates authorized responders", () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 		panelTracker.registerPanel({
 			panelId: "test-panel-2",
 			questionId: "q-67890",
@@ -55,7 +55,7 @@ describe("panel coordinator integration", () => {
 	});
 
 	it("marks panels as resolved", () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 		panelTracker.registerPanel({
 			panelId: "test-panel-3",
 			questionId: "q-11111",
@@ -77,7 +77,7 @@ describe("panel coordinator integration", () => {
 	});
 
 	it("handles expired panels", () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 		panelTracker.registerPanel({
 			panelId: "test-panel-expired",
 			questionId: "q-expired",
@@ -95,7 +95,7 @@ describe("panel coordinator integration", () => {
 	});
 
 	it("reaps expired panels", () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 		panelTracker.registerPanel({
 			panelId: "panel-reap-1",
 			questionId: "q-reap-1",

@@ -17,7 +17,7 @@ describe("interactive panels end-to-end", () => {
 		});
 		testConnection = {
 			messages: [],
-			write(msg) {
+			write(msg: unknown) {
 				this.messages.push(msg);
 			},
 			negotiated: true,
@@ -25,7 +25,7 @@ describe("interactive panels end-to-end", () => {
 	});
 
 	it("emits askUserPanel when gjc session sends waiting_for_answer event with options", async () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 		const sessionId = "test-session-1";
 
 		// Create panel delivery and respond with options
@@ -80,7 +80,7 @@ describe("interactive panels end-to-end", () => {
 	});
 
 	it("emits approvalPanel when gjc sends waiting_for_answer event for approval", async () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 
 		const panelDelivery = {
 			deliveryId: "delivery-2",
@@ -120,7 +120,7 @@ describe("interactive panels end-to-end", () => {
 	});
 
 	it("rejects stale or unknown panelIds", async () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 
 		const response = {
 			v: "0.1",
@@ -141,7 +141,7 @@ describe("interactive panels end-to-end", () => {
 	});
 
 	it("rejects unauthorized responders", async () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 
 		const response = {
 			v: "0.1",
@@ -163,7 +163,7 @@ describe("interactive panels end-to-end", () => {
 	});
 
 	it("handles panel expiry as cancellation", async () => {
-		const origin: OriginRef = { platform: "slack", id: "C123:456.789" };
+		const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C123" };
 
 		// Panel expires
 		const expiryTime = new Date(Date.now() - 1000).toISOString();

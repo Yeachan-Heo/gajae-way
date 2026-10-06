@@ -257,6 +257,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
+	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
@@ -281,6 +282,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
+		this.#onReverseRequest = options.onReverseRequest;
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 	}
 
@@ -303,6 +305,10 @@ export class PersonaSessionManager {
 
 	get stopped(): boolean {
 		return this.#stopped;
+	}
+
+	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
+		return this.#onReverseRequest;
 	}
 
 	/** Presentation/recovery tick; the port's stall check never sends an abort. */
