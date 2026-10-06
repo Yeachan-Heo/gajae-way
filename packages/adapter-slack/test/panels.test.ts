@@ -1,11 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "bun:test";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
-import {
-	askUserPanelBlocks,
-	askUserPanelFallback,
-	approvalPanelBlocks,
-	approvalPanelFallback,
-} from "../src/panels";
+import { askUserPanelBlocks, askUserPanelFallback, approvalPanelBlocks, approvalPanelFallback } from "../src/panels";
 
 describe("askUserPanelBlocks", () => {
 	it("renders ask-user panel with interactive buttons", () => {
@@ -58,9 +53,7 @@ describe("askUserPanelBlocks", () => {
 		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(0); // No action blocks for expired panels
 		// Should have a section indicating expiration
-		const expiredText = blocks.some((b: any) =>
-			b.text?.text?.includes("expired")
-		);
+		const expiredText = blocks.some((b: any) => b.text?.text?.includes("expired"));
 		expect(expiredText).toBe(true);
 	});
 

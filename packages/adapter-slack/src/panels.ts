@@ -1,5 +1,7 @@
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
-import type { Block } from "@slack/web-api";
+
+/** Slack Block Kit block definition */
+type Block = Record<string, unknown>;
 
 /**
  * Slack Block Kit blocks for an ask-user interactive panel with buttons.
