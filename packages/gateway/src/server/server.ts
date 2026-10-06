@@ -77,7 +77,11 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
-import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId, type TailHandle } from "../orchestrator/tail-runner";
+import {
+	deterministicInterimDeliveryId,
+	deterministicTerminalDeliveryId,
+	type TailHandle,
+} from "../orchestrator/tail-runner";
 import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
@@ -309,6 +313,7 @@ interface Runtime {
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
 	readonly deliverySweepTimer: ReturnType<typeof setInterval>;
+	readonly panelExpirySweepTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly stopRetention: () => void;
@@ -362,6 +367,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.deliverySweepTimer);
+			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			runtime.stopRetention();
@@ -474,6 +480,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.stdin.off("end", onEnd);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.deliverySweepTimer);
+			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			runtime.stopRetention();
@@ -605,52 +612,183 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			for (const messageId of messageIds) inbound.delete(messageId);
 		},
 		onReverseRequest: async ({ originKey, sessionId, tail, input }) => {
-			// Handle reverse requests from the SDK (e.g., permission.request, ui.select)
-			if (input.capability !== "permission" || input.payload.method !== "request") {
-				// Not a permission request we handle; decline with unavailable
-				await tail.sendReverseResponse({
-					id: input.id,
-					connectionId: input.connectionId,
-					leaseId: input.leaseId,
-					error: { code: "unavailable", message: `${input.capability}.${input.payload.method} not available` },
-				}).catch((error) => {
-					console.error(`Failed to send reverse response for unsupported request: ${diagnostic(error)}`);
-				});
+			// Get the real origin from the originKey
+			const originData = options.database.getOriginByKey(originKey);
+			if (!originData) {
+				// Cannot find origin; decline with error
+				await tail
+					.sendReverseResponse({
+						id: input.id,
+						connectionId: input.connectionId,
+						leaseId: input.leaseId,
+						error: { code: "unavailable", message: "session origin not found" },
+					})
+					.catch(() => {});
 				return;
 			}
-			
-			// Create a panel from the permission request
-			const now = Date.now();
-			const panelId = randomUUID();
-			const expiresAt = new Date(now + 300000); // 5 minute timeout
-			// Create a synthetic origin for SDK-initiated panels
-			const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: `sdk-${sessionId}` };
-			
-			// Register the panel with reverse request details (including the relay for responses)
-			runtime.panelTracker.registerPanel({
-				panelId,
-				questionId: input.id,
-				turnId: sessionId,
-				sessionId,
-				origin,
-				authorId: "sdk",
-				expiresAt,
-				answerBinding: "",
-				reverseRequest: {
-					id: input.id,
-					connectionId: input.connectionId,
-					leaseId: input.leaseId,
-					capability: input.capability,
-					method: input.payload.method,
-					payload: input.payload.payload,
-				},
-			});
-			
-			// Store the tail handle for later response (we'll need it when the panel is answered)
-			runtime.panelTails ??= new Map();
-			runtime.panelTails.set(panelId, tail);
-			// Note: SDK-initiated panels are tracked internally via panelTracker
-			// and responses are routed back through the reverse_response protocol.
+
+			const origin = validateOriginRef(originData as unknown as OriginRef);
+
+			// Validate platform: only Slack is supported for interactive panels
+			if (origin.platform !== "slack") {
+				// Non-Slack origins: fall back to declining with unavailable
+				await tail
+					.sendReverseResponse({
+						id: input.id,
+						connectionId: input.connectionId,
+						leaseId: input.leaseId,
+						error: { code: "unavailable", message: "panels not available for this platform" },
+					})
+					.catch(() => {});
+				return;
+			}
+
+			// Parse the request payload to determine panel type
+			const capability = String(input.capability).toLowerCase();
+			const method = String(input.payload?.method || "").toLowerCase();
+			const payload = input.payload?.payload as Record<string, unknown> | undefined;
+
+			// Determine panel type and build panel payload
+			let panelPayload: Partial<Pick<ChatMessagePayload, "askUserPanel" | "approvalPanel">> = {};
+
+			if (capability === "permission" && method === "request") {
+				// Permission request: create approval panel (allow/deny)
+				const message = typeof payload?.message === "string" ? payload.message : "Approve this action?";
+				const expiresAt = new Date(Date.now() + 300000).toISOString(); // 5 minutes
+				const panelId = randomUUID();
+
+				panelPayload = {
+					approvalPanel: {
+						panelId,
+						message,
+						expiresAt,
+					},
+				};
+
+				// Register the panel for tracking and response routing
+				runtime.panelTracker.registerPanel({
+					panelId,
+					questionId: input.id,
+					turnId: sessionId,
+					sessionId,
+					origin,
+					authorId: originKey, // Responder must match the turn's trigger author
+					expiresAt: new Date(Date.now() + 300000),
+					answerBinding: input.id,
+					reverseRequest: {
+						id: input.id,
+						connectionId: input.connectionId,
+						leaseId: input.leaseId,
+						capability: input.capability,
+						method: input.payload.method,
+						payload: payload || {},
+					},
+				});
+
+				// Store the tail handle for later response
+				runtime.panelTails ??= new Map();
+				runtime.panelTails.set(panelId, tail);
+
+				// Send outbound message with panel
+				const turnId = crypto.randomUUID();
+				const deliveryId = crypto.randomUUID();
+				const messagePayload: ChatMessagePayload = {
+					turnId,
+					origin,
+					role: "assistant",
+					text: message,
+					final: true,
+					deliveryId,
+					...panelPayload,
+				};
+
+				if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(messagePayload))) {
+					runtime.delivery.markInflight(deliveryId);
+					broadcastDelivery(runtime, messagePayload);
+				}
+			} else if ((capability === "ui" && method === "select") || (capability === "ui" && method === "confirm")) {
+				// ui.select or ui.confirm: create ask-user panel with options
+				const question = typeof payload?.question === "string" ? payload.question : "Choose one:";
+				const panelOptions = Array.isArray(payload?.options)
+					? (payload.options as unknown[]).map((opt: unknown) => {
+							if (
+								typeof opt === "object" &&
+								opt !== null &&
+								"id" in opt &&
+								"label" in opt &&
+								typeof (opt as Record<string, unknown>).id === "string" &&
+								typeof (opt as Record<string, unknown>).label === "string"
+							) {
+								const optRecord = opt as Record<string, unknown>;
+								return { id: String(optRecord.id), label: String(optRecord.label) };
+							}
+							return { id: "unknown", label: String(opt) };
+						})
+					: [];
+				const expiresAt = new Date(Date.now() + 300000).toISOString(); // 5 minutes
+				const panelId = randomUUID();
+
+				panelPayload = {
+					askUserPanel: {
+						panelId,
+						question,
+						expiresAt,
+						options: panelOptions,
+					},
+				};
+
+				// Register the panel for tracking and response routing
+				runtime.panelTracker.registerPanel({
+					panelId,
+					questionId: input.id,
+					turnId: sessionId,
+					sessionId,
+					origin,
+					authorId: originKey,
+					expiresAt: new Date(Date.now() + 300000),
+					answerBinding: input.id,
+					reverseRequest: {
+						id: input.id,
+						connectionId: input.connectionId,
+						leaseId: input.leaseId,
+						capability: input.capability,
+						method: input.payload.method,
+						payload: payload || {},
+					},
+				});
+
+				// Store the tail handle for later response
+				runtime.panelTails ??= new Map();
+				runtime.panelTails.set(panelId, tail);
+
+				// Send outbound message with panel
+				const turnId = crypto.randomUUID();
+				const deliveryId = crypto.randomUUID();
+				const messagePayload: ChatMessagePayload = {
+					turnId,
+					origin,
+					role: "assistant",
+					text: question,
+					final: true,
+					deliveryId,
+					...panelPayload,
+				};
+
+				if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(messagePayload))) {
+					runtime.delivery.markInflight(deliveryId);
+					broadcastDelivery(runtime, messagePayload);
+				}
+			} else {
+				// Unsupported request type: decline with unavailable
+				await tail
+					.sendReverseResponse({
+						id: input.id,
+						connectionId: input.connectionId,
+						leaseId: input.leaseId,
+						error: { code: "unavailable", message: `${input.capability}.${input.payload?.method} not available` },
+					})
+					.catch(() => {});
+			}
 		},
 	});
 	const monitors = new MonitorPropagator({
@@ -729,6 +867,30 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
+		}
+	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
+	// Panel expiry sweep: send cancel/error to hosts for expired panels
+	const panelExpirySweepTimer = setInterval(async () => {
+		try {
+			const expiredPanels = runtime.panelTracker.reapExpiredPanels();
+			for (const panel of expiredPanels) {
+				if (panel.reverseRequest) {
+					const tail = runtime.panelTails?.get(panel.panelId);
+					if (tail) {
+						await tail
+							.sendReverseResponse({
+								id: panel.reverseRequest.id,
+								connectionId: panel.reverseRequest.connectionId,
+								leaseId: panel.reverseRequest.leaseId,
+								error: { code: "cancelled", message: "panel expired" },
+							})
+							.catch(() => {});
+						runtime.panelTails?.delete(panel.panelId);
+					}
+				}
+			}
+		} catch (error) {
+			console.error(`panel expiry sweep failed: ${diagnostic(error)}`);
 		}
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
@@ -825,6 +987,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitorRuntime,
 		reconcileTimer,
 		deliverySweepTimer,
+		panelExpirySweepTimer,
 		stallTimer,
 		contextMaintenanceTimer,
 		stopRetention,
@@ -1606,35 +1769,60 @@ async function handleRequest(
 				try {
 					// If this panel was created from a reverse request, respond to the SDK host
 					if (panel.reverseRequest) {
-						// Build the response based on response kind
+						// Build the response based on the reverse request type
+						// Map panel response to the exact result shapes gjc's host expects
 						let result: unknown;
-						if (responseKind === "option_selected") {
-							if (!selectedOptionId) {
-								coordinatorError = "invalid_answer: missing selectedOptionId";
-								throw new ProtocolError("invalid_params", "option_selected requires selectedOptionId");
+						const capability = String(panel.reverseRequest.capability).toLowerCase();
+						const method = String(panel.reverseRequest.method).toLowerCase();
+
+						if (capability === "permission" && method === "request") {
+							// permission.request result: { outcome: "selected" | "cancelled", optionId?: string }
+							if (responseKind === "approved") {
+								result = { outcome: "selected", optionId: "approved" };
+							} else if (responseKind === "denied") {
+								result = { outcome: "cancelled" };
+							} else {
+								coordinatorError = "invalid_response_kind_for_permission_request";
 							}
-							result = { selected: [selectedOptionId] };
-						} else if (responseKind === "approved") {
-							result = { outcome: "selected", optionId: "approved" };
+						} else if (capability === "ui" && method === "select") {
+							// ui.select result: { selected: [optionId] } or { cancelled: true }
+							if (responseKind === "option_selected" && selectedOptionId) {
+								result = { selected: [selectedOptionId] };
+							} else {
+								// User cancelled or no selection
+								result = { cancelled: true };
+							}
+						} else if (capability === "ui" && method === "confirm") {
+							// ui.confirm result: { outcome: "selected" | "cancelled", optionId: "yes" | "no" }
+							if (responseKind === "approved") {
+								result = { outcome: "selected", optionId: "yes" };
+							} else if (responseKind === "denied") {
+								result = { outcome: "selected", optionId: "no" };
+							} else {
+								result = { outcome: "cancelled" };
+							}
 						} else {
-							result = { outcome: "selected", optionId: "denied" };
+							// Unsupported capability/method combination
+							coordinatorError = `unsupported_request_type: ${capability}.${method}`;
 						}
 
-						// Get the relay that received the original reverse_request
-						const tail = runtime.panelTails?.get(panelId);
-						if (!tail) {
-							coordinatorError = "relay_not_found";
-						} else {
-							// Send the reverse response to the SDK host
-							await tail.sendReverseResponse({
-								id: panel.reverseRequest.id,
-								connectionId: panel.reverseRequest.connectionId,
-								leaseId: panel.reverseRequest.leaseId,
-								result,
-							});
+						if (!coordinatorError) {
+							// Get the relay that received the original reverse_request
+							const tail = runtime.panelTails?.get(panelId);
+							if (!tail) {
+								coordinatorError = "relay_not_found";
+							} else {
+								// Send the reverse response to the SDK host
+								await tail.sendReverseResponse({
+									id: panel.reverseRequest.id,
+									connectionId: panel.reverseRequest.connectionId,
+									leaseId: panel.reverseRequest.leaseId,
+									result,
+								});
 
-							// Clean up the stored tail handle
-							runtime.panelTails?.delete(panelId);
+								// Clean up the stored tail handle
+								runtime.panelTails?.delete(panelId);
+							}
 						}
 
 						// Resolve the panel and mark it as handled
