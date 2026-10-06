@@ -14,6 +14,7 @@ import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
+import { describePanelResponse, type SlackBlockAction } from "./interactions";
 import { LiveReplyTracker } from "./live-reply";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type MentionDirectory, repairMentions } from "./mentions";
@@ -25,13 +26,13 @@ import {
 	slackMessageId,
 	slackMessageOrigin,
 } from "./origin";
+import { approvalPanelBlocks, approvalPanelFallback, askUserPanelBlocks, askUserPanelFallback } from "./panels";
 import {
 	describeSlackReaction,
 	type SlackReactionDescription,
 	type SlackReactionEvent,
 	slackReactionFor,
 } from "./reactions";
-import { describePanelResponse, type SlackBlockAction } from "./interactions";
 import {
 	classifyRecoveryFailure,
 	clearAttempt,
@@ -55,7 +56,6 @@ import {
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
 import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
-import { approvalPanelBlocks, approvalPanelFallback, askUserPanelBlocks, askUserPanelFallback } from "./panels";
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
