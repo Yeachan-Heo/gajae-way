@@ -28,6 +28,7 @@ import {
 } from "./config";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+import { loadDiscordMedia, parseDiscordMedia } from "./outgoing-attachments";
 import {
 	type DiscordInboundReaction,
 	type DiscordReactingUser,
@@ -151,7 +152,12 @@ export interface DiscordTextChannelLike {
 			| string
 			| { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } }
 			// A voice message carries no content: only the attachment and the flag.
-			| { files: readonly unknown[]; flags: number },
+			| { files: readonly unknown[]; flags: number }
+			| {
+					files: readonly unknown[];
+					content?: string;
+					reply?: { messageReference: string; failIfNotExists?: boolean };
+			  },
 	): Promise<unknown>;
 }
 
@@ -783,20 +789,42 @@ export async function settleDiscordDelivery(
 	}
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
-		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const parsed = parseDiscordMedia(message.text);
+		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const text = notice ? `${notice}\n${body}` : body;
-		const chunks = chunkDiscordMessage(text);
-		for (let index = 0; index < chunks.length; index++) {
-			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-			// deleted target from failing the whole delivery.
-			const chunk = chunks[index] as string;
-			// A reply reference points into the thread, so it is dropped on parent fallback.
-			if (index === 0 && message.replyToMessageId && !notice)
-				await channel.send({
-					content: chunk,
-					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-				});
-			else await channel.send(chunk);
+		const chunks = text === "" ? [] : chunkDiscordMessage(text);
+		const files = await loadDiscordMedia(parsed.paths);
+		if (files.length > 0 && chunks.length === 0) {
+			const reply =
+				message.replyToMessageId && !notice
+					? { messageReference: message.replyToMessageId, failIfNotExists: false }
+					: undefined;
+			await channel.send({
+				files,
+				content: chunks[0] ?? "",
+				...(reply ? { reply } : {}),
+			});
+		} else {
+			for (let index = 0; index < chunks.length; index++) {
+				// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+				// deleted target from failing the whole delivery.
+				const chunk = chunks[index] as string;
+				// A reply reference points into the thread, so it is dropped on parent fallback.
+				if (index === 0 && files.length > 0)
+					await channel.send({
+						content: chunk,
+						files,
+						...(message.replyToMessageId && !notice
+							? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
+							: {}),
+					});
+				else if (index === 0 && message.replyToMessageId && !notice)
+					await channel.send({
+						content: chunk,
+						reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+					});
+				else await channel.send(chunk);
+			}
 		}
 		// Voice rides AFTER the text, and only after the text actually landed:
 		// pairing them is for a readable history, so the readable half must be

@@ -193,6 +193,144 @@ test("chunks Discord messages at the 2000 character limit", () => {
 	expect(chunks.map((chunk) => chunk.length)).toEqual([2_000, 2_000, 1]);
 });
 
+// Purpose: prove an explicit MEDIA directive becomes a real Discord upload and is not exposed as text.
+// Expected: one captioned native file upload is sent without exposing the path; completion requires delivery confirmation.
+test("uploads an explicit MEDIA path as a Discord attachment", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-"));
+	try {
+		const filePath = join(home, "chatting_client.cpp");
+		const bytes = Buffer.from("int main() {}\n");
+		await writeFile(filePath, bytes);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, delivery(`Source file:\nMEDIA:${filePath}`));
+		expect(sent).toHaveLength(1);
+		const upload = sent[0] as { content: string; files: Array<{ name: string; attachment: Buffer }> };
+		expect(upload.content).toBe("Source file:");
+		expect(upload.files[0]?.name).toBe("chatting_client.cpp");
+		expect(upload.files[0]?.attachment).toEqual(bytes);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: verify a file-only reply still reaches Discord when removing MEDIA leaves no caption.
+// Expected: one empty-content upload is sent and the delivery confirms; both are required for completion.
+test("sends a MEDIA attachment without an empty text-only message", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-only-"));
+	try {
+		const filePath = join(home, "report.pdf");
+		await writeFile(filePath, Buffer.from("pdf"));
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, delivery(`MEDIA:${filePath}`));
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({ content: "", files: [{ name: "report.pdf" }] });
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: ensure redelivery metadata never hides a leading MEDIA directive or exposes its local path.
+// Expected: the recovered warning and attachment are delivered together and the ledger confirms the send.
+test("preserves MEDIA uploads on ambiguous redelivery", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-retry-"));
+	try {
+		const filePath = join(home, "retry.cpp");
+		await writeFile(filePath, Buffer.from("source"));
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		let failFirstSend = true;
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async () => ({
+					send: async (payload: unknown) => {
+						if (failFirstSend) {
+							failFirstSend = false;
+							throw Object.assign(new Error("connection reset after dispatch"), { code: "ECONNRESET" });
+						}
+						void sent.push(payload);
+					},
+				}),
+			},
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, delivery(`MEDIA:${filePath}`));
+		await settleDiscordDelivery(mockGateway(requests), discord, {
+			...delivery(`MEDIA:${filePath}`),
+			duplicateWarning: true,
+		});
+		expect(sent).toHaveLength(1);
+		const upload = sent[0] as { content: string; files: Array<{ name: string }> };
+		expect(upload.content).toContain("[recovered - may be a duplicate]");
+		expect(upload.content).not.toContain(filePath);
+		expect(upload.files[0]?.name).toBe("retry.cpp");
+		expect(requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "delivery-1",
+					reason: "connection reset after dispatch",
+					ambiguous: true,
+				},
+			},
+			{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: ensure long captions keep their upload attached to the first Discord chunk.
+// Expected: the first chunk carries both reply metadata and files; remaining chunks contain text only.
+test("keeps files and reply metadata with the first chunk of a long caption", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-long-"));
+	try {
+		const filePath = join(home, "long.txt");
+		await writeFile(filePath, Buffer.from("long"));
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, {
+			...delivery(`${"x".repeat(2_001)}\nMEDIA:${filePath}`),
+			replyToMessageId: "message-1",
+		});
+		expect(sent).toHaveLength(2);
+		expect(sent[0]).toMatchObject({
+			content: "x".repeat(2_000),
+			reply: { messageReference: "message-1", failIfNotExists: false },
+			files: [{ name: "long.txt" }],
+		});
+		expect(sent[1]).toBe("x");
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: ensure missing requested files fail visibly instead of confirming a caption-only send.
+// Expected: no Discord message is sent and the delivery ledger receives a failure; that is the completion condition.
+test("fails delivery before posting when a MEDIA file is missing", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("Caption\nMEDIA:/not/a/real/gajaeway-file.bin"));
+	expect(sent).toEqual([]);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]?.verb).toBe("delivery.fail");
+});
+
 test("settles a delivery after sending all chunks", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const sent: string[] = [];
