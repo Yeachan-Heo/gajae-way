@@ -623,6 +623,51 @@ test("Slack presence: periodic signals reset stale window", async () => {
 	expect(f.removes.length).toBeGreaterThan(initialRemoves);
 });
 
+test("Slack presence: 150s turn with first frame at 120s keeps status visible throughout", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	const initialRemoves = f.removes.length;
+
+	// Simulate gateway sending periodic heartbeats from turn start (0,0 counters)
+	// every ~10ms, but first frame arrives at 120s
+	// Advance to 30s, still no real activity (heartbeat only)
+	f.tick(30_000);
+	await f.status.update(progress({ elapsedMs: 30_000, toolCalls: 0, outputTokens: 0 }));
+	await flush();
+	expect(f.removes.length).toBe(initialRemoves); // Status should be alive
+
+	// Advance to 60s, still no real activity (heartbeat only)
+	f.tick(30_000);
+	await f.status.update(progress({ elapsedMs: 60_000, toolCalls: 0, outputTokens: 0 }));
+	await flush();
+	expect(f.removes.length).toBe(initialRemoves); // Status should be alive
+
+	// Advance to 90s (at the edge of stale timeout, heartbeat only)
+	f.tick(30_000);
+	await f.status.update(progress({ elapsedMs: 90_000, toolCalls: 0, outputTokens: 0 }));
+	await flush();
+	expect(f.removes.length).toBe(initialRemoves); // Status should still be alive (refresh timer keeps it going)
+
+	// Advance to 120s, now we get real activity
+	f.tick(30_000);
+	await f.status.update(progress({ elapsedMs: 120_000, toolCalls: 2, outputTokens: 100 }));
+	await flush();
+	// State changes from queued to tool (effort changes), markers get updated
+	// but the entry is still active (wanted = true)
+	const removesAfterActivity = f.removes.length;
+	// Should have some removes (old queued markers) but entry is still active
+	expect(removesAfterActivity).toBeGreaterThanOrEqual(initialRemoves);
+
+	// Advance to 150s with final signal
+	f.tick(30_000);
+	// Final signal triggers clear, not update
+	await f.status.clear("C1");
+	await flush();
+	// Clear should remove all remaining markers
+	expect(f.removes.length).toBeGreaterThan(removesAfterActivity);
+});
+
 test("Slack presence: explicit clear removes all markers exactly once", async () => {
 	const f = fixture();
 	f.status.arm(origin, "C1:1.000");

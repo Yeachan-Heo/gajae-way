@@ -2361,7 +2361,7 @@ async function createInboundTurnLifecycle(
 		// the interval, so a tool-per-second turn cannot become a request storm.
 		const minGap = prompt ? intervalMs / 2 : intervalMs;
 		const due = now - startedAt >= firstAfterMs && now - lastProgressAt >= minGap;
-		if (!final && (!tailActivitySeen || !due)) return;
+		if (!final && !due) return;
 		// `final` is UNCONDITIONAL. It is the adapter's only signal that the turn
 		// stopped (typing hint, "working" status), and a turn that answered fast,
 		// stayed silent, or failed before its first tail frame never announced
@@ -2385,8 +2385,13 @@ async function createInboundTurnLifecycle(
 	// and polling transcript.list/usage.get cost two gjc spawns (~1s CPU each)
 	// every interval per running turn, which starved the broker health probe
 	// under load. The heartbeat now only re-presents the last tail observation.
+	//
+	// Emit from turn start (with initial 0,0 counters) to keep the adapter's
+	// stale timeout from firing during long thinking phases. The emitProgress
+	// function's `due` gate prevents spam: only emits after firstAfterMs has
+	// passed and then every intervalMs thereafter, respecting minGap.
 	const heartbeat = setInterval(() => {
-		if (tailActivitySeen) emitProgress(lastKnown);
+		emitProgress(lastKnown);
 	}, intervalMs);
 	const endProgress = () => {
 		if (ended) return;
