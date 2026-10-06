@@ -31,6 +31,24 @@ export function slackMessageOrigin(event: SlackMessageOriginShape): OriginRef {
 	return { platform: "slack", kind: "channel", conversationId: event.channel };
 }
 
+/**
+ * When a mentioned message arrives in a channel (not DM, not thread), convert it to a thread-rooted origin.
+ * Implements Hermes-like contract: channel mention → thread + new session.
+ * In Slack, the message's own timestamp becomes the thread root.
+ */
+export function maybeThreadOnMention(origin: OriginRef, mentioned: boolean, messageTs: string | undefined): OriginRef {
+	// Only thread channel mentions: origin must be a channel, not DM or thread, and bot must be mentioned.
+	if (origin.kind !== "channel" || !mentioned || !messageTs) return origin;
+
+	// Convert channel origin to thread origin using message's own ts as thread root.
+	return {
+		platform: origin.platform,
+		kind: "thread",
+		conversationId: slackMessageId(origin.conversationId, messageTs),
+		parentId: origin.conversationId,
+	};
+}
+
 export function slackMessageId(channel: string, ts: string): string {
 	const id = `${channel}:${ts}`;
 	if (!parseSlackMessageId(id)) throw new Error("Slack message id requires a safe channel and timestamp");

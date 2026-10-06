@@ -1021,3 +1021,57 @@ test("statusReactions with undefined engagement produces zero reaction calls", a
 	await Bun.sleep(1);
 	expect(reacted).toEqual([]); // No reactions when engagement is undefined
 });
+
+test("DM messages stay flat with no thread creation", () => {
+	const botUser = { id: "bot-1" };
+	const dmMessage = {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "dm-channel-1", isDMBased: () => true },
+		mentions: { has: () => true },
+		content: "hello bot",
+	};
+	const engagement = engagementForMessage(dmMessage as any, botUser);
+	const origin = discordMessageOrigin(dmMessage as any);
+	// DM should stay kind="dm" even with mention, no threading
+	expect(origin.kind).toBe("dm");
+	expect(engagement.mentioned).toBe(true);
+	expect(engagement.group).toBe(false);
+});
+
+test("channel mention should set mentioned flag for thread creation logic", () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "channel-1", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// Channel mention should be marked as mentioned and group
+	expect(origin.kind).toBe("channel");
+	expect(engagement.mentioned).toBe(true);
+	expect(engagement.group).toBe(true);
+});
+
+test("thread reply message stays in thread", () => {
+	const botUser = { id: "bot-1" };
+	const threadMessage = {
+		id: "msg-2",
+		author: { id: "user-1" },
+		channel: {
+			id: "thread-1",
+			parentId: "channel-1",
+			isThread: () => true,
+		},
+		mentions: { has: () => false },
+		content: "reply in thread",
+	};
+	const origin = discordMessageOrigin(threadMessage as any);
+	// Thread message should preserve thread origin
+	expect(origin.kind).toBe("thread");
+	expect(origin.conversationId).toBe("thread-1");
+	expect(origin.parentId).toBe("channel-1");
+});
