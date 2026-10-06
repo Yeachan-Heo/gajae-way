@@ -1,255 +1,255 @@
 {
-	"schemaVersion": 1,
-	"kind": "api-package-test-report",
-	"sourceHash": "see hashChain: the lane-reviewed digest and the final boundary digest are recorded there",
-	"head": "3e102a9299a3044de20f1fb7dca2f7dc71387c27",
-	"generatedAt": "2026-09-03T17:13:03.224514+00:00",
-	"command": "bun test packages/gateway packages/adapter-discord packages/adapter-telegram packages/protocol packages/subsession packages/conformance --reporter=junit --reporter-outfile=artifacts/ultragoal-test-report.junit.xml",
-	"junit": "artifacts/ultragoal-test-report.junit.xml",
-	"totals": {
-		"tests": 1220,
-		"passed": 1217,
-		"failed": 0,
-		"skipped": 3
-	},
-	"redTeamSuite": "packages/gateway/test/redteam-canonical.test.ts",
-	"cases": [
-		{
-			"id": "C1a",
-			"obligation": "replay inside 2s skew tolerated; terminal uses current durable answer",
-			"verdict": "passed"
-		},
-		{
-			"id": "C1b",
-			"obligation": "foreign-session/foreign-op frames never reach the current turn",
-			"verdict": "passed"
-		},
-		{
-			"id": "C1c",
-			"obligation": "three turns each with cursorless replay -> each trigger its own text",
-			"verdict": "passed"
-		},
-		{
-			"id": "C1d",
-			"obligation": "startedAt floor on host clock: behind never reopens prior row, ahead never hides answer",
-			"verdict": "passed"
-		},
-		{
-			"id": "C2a",
-			"obligation": "20-message burst: 1 send, 19 ordered steers, none pending",
-			"verdict": "passed"
-		},
-		{
-			"id": "C2b",
-			"obligation": "message in terminal->dispatch window sent once",
-			"verdict": "passed"
-		},
-		{
-			"id": "C2c",
-			"obligation": "bind failure waits for the retry seam; no synchronous re-bind",
-			"verdict": "passed"
-		},
-		{
-			"id": "C2d",
-			"obligation": "/new discards undispatched row, fences retired output, nothing stranded",
-			"verdict": "passed"
-		},
-		{
-			"id": "C3a",
-			"obligation": "refused steer: old answer + refused message once each on separate sessions",
-			"verdict": "passed"
-		},
-		{
-			"id": "C3b",
-			"obligation": "two refusals: epoch 0->1->2, each message sent once",
-			"verdict": "passed"
-		},
-		{
-			"id": "C3c",
-			"obligation": "bind failures 2s/4s/8s, unrecoverable logged at bound, row pending",
-			"verdict": "passed"
-		},
-		{
-			"id": "C4",
-			"obligation": "3h-old row across restart dispatched; never inbound_expired",
-			"verdict": "passed"
-		},
-		{
-			"id": "C5a",
-			"obligation": "send+edit in one packet: original sent, edit steered once",
-			"verdict": "passed"
-		},
-		{
-			"id": "C5b",
-			"obligation": "two edits during a turn steered in order",
-			"verdict": "passed"
-		},
-		{
-			"id": "C5c",
-			"obligation": "edit of context-only message becomes a pointer turn",
-			"verdict": "passed"
-		},
-		{
-			"id": "C5d",
-			"obligation": "empty text / missing messageId -> invalid_params; loopback edit accepted",
-			"verdict": "passed"
-		},
-		{
-			"id": "C6a",
-			"obligation": "restart after accept: one onTerminal, no resend",
-			"verdict": "passed"
-		},
-		{
-			"id": "C6b",
-			"obligation": "restart, unknown status + disowned dead session: one resend with new opRef",
-			"verdict": "passed"
-		},
-		{
-			"id": "D4",
-			"obligation": "bind backoff 2/4/8/16s, one unrecoverable log, counter reset",
-			"verdict": "passed"
-		},
-		{
-			"id": "D5",
-			"obligation": "admission while retry armed waits; retry dispatches oldest, steers newer",
-			"verdict": "passed"
-		},
-		{
-			"id": "D7",
-			"obligation": "steer headers for DM/channel(reply); loopback raw body",
-			"verdict": "passed"
-		},
-		{
-			"id": "D8",
-			"obligation": "migration 19 under corrupt attributed_op_ref collision maps each row once",
-			"verdict": "passed"
-		},
-		{
-			"id": "S1",
-			"obligation": "torn steer replayed on same clientRef, no rebind (steering.test)",
-			"verdict": "passed"
-		},
-		{
-			"id": "S2",
-			"obligation": "persistently torn steer held; later acceptance attributes without duplicate",
-			"verdict": "passed"
-		},
-		{
-			"id": "S3",
-			"obligation": "torn then definitive refusal rebinds once, sends once",
-			"verdict": "passed"
-		},
-		{
-			"id": "S4",
-			"obligation": "held steer survives terminal + restart; released exactly once on refusal",
-			"verdict": "passed"
-		},
-		{
-			"id": "E1",
-			"obligation": "steered edit consumes ORIGINAL context row; next turn does not replay (mutation-checked)",
-			"verdict": "passed"
-		},
-		{
-			"id": "M19",
-			"obligation": "v18->v19 drill: accepted/settled-bound/settled-unbound/done/processing/wedged rows",
-			"verdict": "passed"
-		},
-		{
-			"id": "A1",
-			"obligation": "messageUpdate: no editedTimestamp or unchanged cached body -> not forwarded",
-			"verdict": "passed"
-		},
-		{
-			"id": "S5",
-			"obligation": "held steer accepted at terminal / after restart consumes context; next turn does not replay (mutation-checked)",
-			"verdict": "passed"
-		},
-		{
-			"id": "S6",
-			"obligation": "crash after durable steer acceptance: context consumed in the same transaction (fault-injected)",
-			"verdict": "passed"
-		},
-		{
-			"id": "G1",
-			"obligation": "held steer A blocks B; A's replay acceptance issues B next",
-			"verdict": "passed"
-		},
-		{
-			"id": "G2",
-			"obligation": "held steer survives /new + terminal; tick() resolves it by clientRef, no new turn",
-			"verdict": "passed"
-		},
-		{
-			"id": "G3",
-			"obligation": "held steer refused at terminal becomes the next turn once",
-			"verdict": "passed"
-		},
-		{
-			"id": "G4",
-			"obligation": "terminal acceptance finalizer fires exactly once across ticks",
-			"verdict": "passed"
-		},
-		{
-			"id": "G5",
-			"obligation": "accepted release needs positive dead evidence; bound releases on unknown",
-			"verdict": "passed"
-		},
-		{
-			"id": "G6",
-			"obligation": "send-time session_unavailable attempts 1..3, one unrecoverable, armed retry, counter reset",
-			"verdict": "passed"
-		},
-		{
-			"id": "G7",
-			"obligation": "v18 settled-bound trigger+member ride along; requeue releases both in order",
-			"verdict": "passed"
-		},
-		{
-			"id": "G8",
-			"obligation": "chat.edit of a held steer: pointer row independent, no duplicate turn",
-			"verdict": "passed"
-		},
-		{
-			"id": "A2",
-			"obligation": "edit failing to reach the gateway is queued (newest per message wins) and replayed in order on reconnect",
-			"verdict": "passed"
-		},
-		{
-			"id": "H1",
-			"obligation": "outbox overflow: 256 kept, first dropped, logged",
-			"verdict": "passed"
-		},
-		{
-			"id": "H2",
-			"obligation": "superseding edit arriving mid-flush is sent next; outbox drains",
-			"verdict": "passed"
-		},
-		{
-			"id": "H3",
-			"obligation": "partial failure stops at the failed edit; adoptClient replays the tail",
-			"verdict": "passed"
-		},
-		{
-			"id": "H4",
-			"obligation": "same-tick edits: one serial flush, each sent once",
-			"verdict": "passed"
-		}
-	],
-	"redTeamSuites": [
-		"packages/gateway/test/redteam-canonical.test.ts",
-		"packages/gateway/test/redteam-generation5.test.ts",
-		"packages/adapter-discord/test/edit-outbox-redteam.test.ts"
-	],
-	"hashChain": {
-		"laneReviewedSourceHash": "sha256:0106e74e73038fd4985509afcae81e328ad8752f4f3cfceab2caac9e0a17d3ef",
-		"laneReviewedSourceCommit": "3e102a9",
-		"supersededStaleField": "sha256:a3203a646329e97ca299ad90da73768a9773b45fefc9e7b617680e0eeb6384f5 (computed at generation 4; retained here only as the superseded value)",
-		"postReviewArtifactOnlyDelta": [
-			"artifacts/ultragoal-cli-pty.cap",
-			"artifacts/ultragoal-cli-replay.json",
-			"artifacts/ultragoal-redteam-report.json"
-		],
-		"postReviewPackagesOrDocsChanged": false,
-		"verifyWith": "git diff 3e102a9..HEAD --name-only"
-	}
+ "schemaVersion": 1,
+ "kind": "api-package-test-report",
+ "sourceHash": "see hashChain: the lane-reviewed digest and the final boundary digest are recorded there",
+ "head": "3e102a9299a3044de20f1fb7dca2f7dc71387c27",
+ "generatedAt": "2026-09-03T17:13:03.224514+00:00",
+ "command": "bun test packages/gateway packages/adapter-discord packages/adapter-telegram packages/protocol packages/subsession packages/conformance --reporter=junit --reporter-outfile=artifacts/ultragoal-test-report.junit.xml",
+ "junit": "artifacts/ultragoal-test-report.junit.xml",
+ "totals": {
+  "tests": 1220,
+  "passed": 1217,
+  "failed": 0,
+  "skipped": 3
+ },
+ "redTeamSuite": "packages/gateway/test/redteam-canonical.test.ts",
+ "cases": [
+  {
+   "id": "C1a",
+   "obligation": "replay inside 2s skew tolerated; terminal uses current durable answer",
+   "verdict": "passed"
+  },
+  {
+   "id": "C1b",
+   "obligation": "foreign-session/foreign-op frames never reach the current turn",
+   "verdict": "passed"
+  },
+  {
+   "id": "C1c",
+   "obligation": "three turns each with cursorless replay -> each trigger its own text",
+   "verdict": "passed"
+  },
+  {
+   "id": "C1d",
+   "obligation": "startedAt floor on host clock: behind never reopens prior row, ahead never hides answer",
+   "verdict": "passed"
+  },
+  {
+   "id": "C2a",
+   "obligation": "20-message burst: 1 send, 19 ordered steers, none pending",
+   "verdict": "passed"
+  },
+  {
+   "id": "C2b",
+   "obligation": "message in terminal->dispatch window sent once",
+   "verdict": "passed"
+  },
+  {
+   "id": "C2c",
+   "obligation": "bind failure waits for the retry seam; no synchronous re-bind",
+   "verdict": "passed"
+  },
+  {
+   "id": "C2d",
+   "obligation": "/new discards undispatched row, fences retired output, nothing stranded",
+   "verdict": "passed"
+  },
+  {
+   "id": "C3a",
+   "obligation": "refused steer: old answer + refused message once each on separate sessions",
+   "verdict": "passed"
+  },
+  {
+   "id": "C3b",
+   "obligation": "two refusals: epoch 0->1->2, each message sent once",
+   "verdict": "passed"
+  },
+  {
+   "id": "C3c",
+   "obligation": "bind failures 2s/4s/8s, unrecoverable logged at bound, row pending",
+   "verdict": "passed"
+  },
+  {
+   "id": "C4",
+   "obligation": "3h-old row across restart dispatched; never inbound_expired",
+   "verdict": "passed"
+  },
+  {
+   "id": "C5a",
+   "obligation": "send+edit in one packet: original sent, edit steered once",
+   "verdict": "passed"
+  },
+  {
+   "id": "C5b",
+   "obligation": "two edits during a turn steered in order",
+   "verdict": "passed"
+  },
+  {
+   "id": "C5c",
+   "obligation": "edit of context-only message becomes a pointer turn",
+   "verdict": "passed"
+  },
+  {
+   "id": "C5d",
+   "obligation": "empty text / missing messageId -> invalid_params; loopback edit accepted",
+   "verdict": "passed"
+  },
+  {
+   "id": "C6a",
+   "obligation": "restart after accept: one onTerminal, no resend",
+   "verdict": "passed"
+  },
+  {
+   "id": "C6b",
+   "obligation": "restart, unknown status + disowned dead session: one resend with new opRef",
+   "verdict": "passed"
+  },
+  {
+   "id": "D4",
+   "obligation": "bind backoff 2/4/8/16s, one unrecoverable log, counter reset",
+   "verdict": "passed"
+  },
+  {
+   "id": "D5",
+   "obligation": "admission while retry armed waits; retry dispatches oldest, steers newer",
+   "verdict": "passed"
+  },
+  {
+   "id": "D7",
+   "obligation": "steer headers for DM/channel(reply); loopback raw body",
+   "verdict": "passed"
+  },
+  {
+   "id": "D8",
+   "obligation": "migration 19 under corrupt attributed_op_ref collision maps each row once",
+   "verdict": "passed"
+  },
+  {
+   "id": "S1",
+   "obligation": "torn steer replayed on same clientRef, no rebind (steering.test)",
+   "verdict": "passed"
+  },
+  {
+   "id": "S2",
+   "obligation": "persistently torn steer held; later acceptance attributes without duplicate",
+   "verdict": "passed"
+  },
+  {
+   "id": "S3",
+   "obligation": "torn then definitive refusal rebinds once, sends once",
+   "verdict": "passed"
+  },
+  {
+   "id": "S4",
+   "obligation": "held steer survives terminal + restart; released exactly once on refusal",
+   "verdict": "passed"
+  },
+  {
+   "id": "E1",
+   "obligation": "steered edit consumes ORIGINAL context row; next turn does not replay (mutation-checked)",
+   "verdict": "passed"
+  },
+  {
+   "id": "M19",
+   "obligation": "v18->v19 drill: accepted/settled-bound/settled-unbound/done/processing/wedged rows",
+   "verdict": "passed"
+  },
+  {
+   "id": "A1",
+   "obligation": "messageUpdate: no editedTimestamp or unchanged cached body -> not forwarded",
+   "verdict": "passed"
+  },
+  {
+   "id": "S5",
+   "obligation": "held steer accepted at terminal / after restart consumes context; next turn does not replay (mutation-checked)",
+   "verdict": "passed"
+  },
+  {
+   "id": "S6",
+   "obligation": "crash after durable steer acceptance: context consumed in the same transaction (fault-injected)",
+   "verdict": "passed"
+  },
+  {
+   "id": "G1",
+   "obligation": "held steer A blocks B; A's replay acceptance issues B next",
+   "verdict": "passed"
+  },
+  {
+   "id": "G2",
+   "obligation": "held steer survives /new + terminal; tick() resolves it by clientRef, no new turn",
+   "verdict": "passed"
+  },
+  {
+   "id": "G3",
+   "obligation": "held steer refused at terminal becomes the next turn once",
+   "verdict": "passed"
+  },
+  {
+   "id": "G4",
+   "obligation": "terminal acceptance finalizer fires exactly once across ticks",
+   "verdict": "passed"
+  },
+  {
+   "id": "G5",
+   "obligation": "accepted release needs positive dead evidence; bound releases on unknown",
+   "verdict": "passed"
+  },
+  {
+   "id": "G6",
+   "obligation": "send-time session_unavailable attempts 1..3, one unrecoverable, armed retry, counter reset",
+   "verdict": "passed"
+  },
+  {
+   "id": "G7",
+   "obligation": "v18 settled-bound trigger+member ride along; requeue releases both in order",
+   "verdict": "passed"
+  },
+  {
+   "id": "G8",
+   "obligation": "chat.edit of a held steer: pointer row independent, no duplicate turn",
+   "verdict": "passed"
+  },
+  {
+   "id": "A2",
+   "obligation": "edit failing to reach the gateway is queued (newest per message wins) and replayed in order on reconnect",
+   "verdict": "passed"
+  },
+  {
+   "id": "H1",
+   "obligation": "outbox overflow: 256 kept, first dropped, logged",
+   "verdict": "passed"
+  },
+  {
+   "id": "H2",
+   "obligation": "superseding edit arriving mid-flush is sent next; outbox drains",
+   "verdict": "passed"
+  },
+  {
+   "id": "H3",
+   "obligation": "partial failure stops at the failed edit; adoptClient replays the tail",
+   "verdict": "passed"
+  },
+  {
+   "id": "H4",
+   "obligation": "same-tick edits: one serial flush, each sent once",
+   "verdict": "passed"
+  }
+ ],
+ "redTeamSuites": [
+  "packages/gateway/test/redteam-canonical.test.ts",
+  "packages/gateway/test/redteam-generation5.test.ts",
+  "packages/adapter-discord/test/edit-outbox-redteam.test.ts"
+ ],
+ "hashChain": {
+  "laneReviewedSourceHash": "sha256:0106e74e73038fd4985509afcae81e328ad8752f4f3cfceab2caac9e0a17d3ef",
+  "laneReviewedSourceCommit": "3e102a9",
+  "supersededStaleField": "sha256:a3203a646329e97ca299ad90da73768a9773b45fefc9e7b617680e0eeb6384f5 (computed at generation 4; retained here only as the superseded value)",
+  "postReviewArtifactOnlyDelta": [
+   "artifacts/ultragoal-cli-pty.cap",
+   "artifacts/ultragoal-cli-replay.json",
+   "artifacts/ultragoal-redteam-report.json"
+  ],
+  "postReviewPackagesOrDocsChanged": false,
+  "verifyWith": "git diff 3e102a9..HEAD --name-only"
+ }
 }

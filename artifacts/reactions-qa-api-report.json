@@ -675,7 +675,10 @@
 			}
 		],
 		"rebaseIntegrity": {
-			"conflictSurface": ["packages/adapter-discord/src/main.ts", "packages/adapter-telegram/src/main.ts"],
+			"conflictSurface": [
+				"packages/adapter-discord/src/main.ts",
+				"packages/adapter-telegram/src/main.ts"
+			],
 			"verdict": "BOTH SIDES SURVIVED AND STILL COMPOSE, verified from source and from green tests. The reaction side and the sibling reply-metadata side occupy disjoint branches of the same functions and neither swallows the other.",
 			"evidence": {
 				"discordReactionSideStillReactsAndPostsNothing": "packages/adapter-discord/src/main.ts:364-372 — settleDiscordDelivery returns early through settleDiscordReaction when message.reaction is set, so the text path (:373-403) is never entered. Reaction ports are created once per subscription at :415 and threaded into the call at :417.",
@@ -753,7 +756,9 @@
 			"overall": "pass",
 			"e2eStatus": "pass",
 			"redTeamStatus": "pass with one coverage blocker (BLOCKER-CC-1); no behavioural defeat of the reaction surface or of the platform-capability guard was found",
-			"blockers": ["BLOCKER-CC-1"],
+			"blockers": [
+				"BLOCKER-CC-1"
+			],
 			"statement": "At commit d8733e4, frozen sourceHash sha256:a37edba27a6fd0f8184e323228ddda3dbce7ca2a0f13916f86e1ecabbe9a4ba7, the reaction surface re-certifies green on all four commands and the post-rebase composition of the reaction wiring with the sibling reply-metadata work is intact in both adapter main.ts files. The single blocker is a missing test guard on the merge seam, not a broken behaviour."
 		},
 		"blockerResolution": {

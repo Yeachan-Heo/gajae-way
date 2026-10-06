@@ -1,5 +1,4 @@
 import { strict as assert } from "node:assert";
-
 const sourceHash = "sha256:afbb9a77cb5ff7da17c201a039f12fd78aa9b2660ed6ce4b1829566b98061917";
 const report = await Bun.file("artifacts/slack-adapter-redteam-report.json").json();
 const junit = await Bun.file("artifacts/slack-adapter-redteam.junit.xml").text();
@@ -13,60 +12,25 @@ assert(junit.includes(sourceHash));
 assert.equal(Number(junit.match(/<testsuites[^>]* tests="(\d+)"/)?.[1]), report.counts.tests);
 assert.equal(Number(junit.match(/<testsuites[^>]* failures="(\d+)"/)?.[1]), report.counts.failed);
 assert.equal((junit.match(/<testcase\b/g) ?? []).length, report.counts.tests);
-assert.deepEqual(
-	report.adversarialCases.map((c: { id: string }) => c.id),
-	Array.from({ length: 69 }, (_, i) => `RT-SLACK-${String(i + 1).padStart(2, "0")}`),
-);
-assert.deepEqual(
-	report.adversarialCases.filter((c: { verdict: string }) => c.verdict === "failed").map((c: { id: string }) => c.id),
-	["RT-SLACK-65"],
-);
+assert.deepEqual(report.adversarialCases.map((c: { id: string }) => c.id), Array.from({ length: 69 }, (_, i) => `RT-SLACK-${String(i + 1).padStart(2, "0")}`));
+assert.deepEqual(report.adversarialCases.filter((c: { verdict: string }) => c.verdict === "failed").map((c: { id: string }) => c.id), ["RT-SLACK-65"]);
 assert.equal(proof.probes.length, 4);
 assert(proof.probes.every((p: { verdict: string }) => p.verdict === "passed"));
 assert.equal(frozen.build.exitCode, 0);
 assert(frozen.replayByteIdentical);
 const baseline = Bun.spawnSync(["git", "show", "5001727:artifacts/slack-adapter-cli-replay.json"]);
 assert.equal(baseline.exitCode, 0);
-assert(
-	Buffer.from(baseline.stdout).equals(
-		Buffer.from(await Bun.file("artifacts/slack-adapter-cli-replay.json").arrayBuffer()),
-	),
-);
+assert(Buffer.from(baseline.stdout).equals(Buffer.from(await Bun.file("artifacts/slack-adapter-cli-replay.json").arrayBuffer())));
 for (const ref of report.artifactRefs) assert(await Bun.file(ref).exists(), ref);
-for (const [source, snapshot] of Object.entries(report.sourceSnapshots))
-	assert.equal(await Bun.file(source).text(), await Bun.file(snapshot as string).text());
-for (const testCase of report.adversarialCases)
-	for (const test of testCase.subcases) {
-		assert.equal(testCase.sourceHash, sourceHash);
-		assert(junit.includes(`name="${test.name.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}"`));
-	}
+for (const [source, snapshot] of Object.entries(report.sourceSnapshots)) assert.equal(await Bun.file(source).text(), await Bun.file(snapshot as string).text());
+for (const testCase of report.adversarialCases) for (const test of testCase.subcases) {
+	assert.equal(testCase.sourceHash, sourceHash);
+	assert(junit.includes(`name="${test.name.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}"`));
+}
 const changed = Bun.spawnSync(["git", "diff", "--name-only"]);
 assert.equal(changed.exitCode, 0);
-const allowed = [
-	"packages/adapter-slack/test/redteam.test.ts",
-	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
-	"packages/sdk/test/client-held-events.test.ts",
-	"packages/adapter-discord/test/slack-presence-redteam.test.ts",
-];
-for (const path of new TextDecoder().decode(changed.stdout).trim().split("\n"))
-	assert(path.startsWith("artifacts/slack-adapter-") || allowed.includes(path), path);
-const receipt = {
-	kind: "artifact-consistency-receipt",
-	sourceHash,
-	frozenCommit: "5001727",
-	verdict: "passed",
-	checks: [
-		"JUnit test/failure counts match report",
-		"all 69 IDs present exactly once",
-		"only RT-SLACK-65 fails",
-		"four real CLI probes pass",
-		"build passes",
-		"CLI replay byte-identical to frozen commit",
-		"all artifact refs exist",
-		"test snapshots byte-identical",
-		"product source unchanged",
-	],
-	counts: report.counts,
-};
+const allowed = ["packages/adapter-slack/test/redteam.test.ts", "packages/gateway/test/slack-adapter-redteam.e2e.test.ts", "packages/sdk/test/client-held-events.test.ts", "packages/adapter-discord/test/slack-presence-redteam.test.ts"];
+for (const path of new TextDecoder().decode(changed.stdout).trim().split("\n")) assert(path.startsWith("artifacts/slack-adapter-") || allowed.includes(path), path);
+const receipt = { kind: "artifact-consistency-receipt", sourceHash, frozenCommit: "5001727", verdict: "passed", checks: ["JUnit test/failure counts match report", "all 69 IDs present exactly once", "only RT-SLACK-65 fails", "four real CLI probes pass", "build passes", "CLI replay byte-identical to frozen commit", "all artifact refs exist", "test snapshots byte-identical", "product source unchanged"], counts: report.counts };
 await Bun.write("artifacts/slack-adapter-consistency.json", JSON.stringify(receipt, null, 2) + "\n");
 console.log(JSON.stringify(receipt));

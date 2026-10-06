@@ -161,11 +161,8 @@ const blockers = tests
 		observed: t.failure,
 		scenario: t.name,
 		source: t.name.startsWith("RT-SLACK-65") ? "packages/adapter-slack/src/lock.ts:orphanedElection" : t.file,
-		explanation:
-			"A three-second-old ownerless election is permanently treated as mid-creation, so acquisition fails closed with pid 0. Reproduced independently; source deliberately left unchanged.",
-		artifactRefs: [junitPath, "artifacts/slack-adapter-ownerless-repro.junit.xml", sourceSnapshots[t.file]].filter(
-			Boolean,
-		),
+		explanation: "A three-second-old ownerless election is permanently treated as mid-creation, so acquisition fails closed with pid 0. Reproduced independently; source deliberately left unchanged.",
+		artifactRefs: [junitPath, "artifacts/slack-adapter-ownerless-repro.junit.xml", sourceSnapshots[t.file]].filter(Boolean),
 	}));
 const cover = (contractRef: string, ids: number[], detail: string, supportingEvidence: string[] = []) => ({
 	contractRef,
@@ -320,13 +317,11 @@ contractCoverage.push(
 		"All requested case IDs exercised with assertions; generation 5 regressions pass on the frozen generation 6 source.",
 	),
 );
-contractCoverage.push(
-	cover(
-		"Generation 6 directory election, reconcile loop and lane retirement acceptance",
-		[64, 65, 66, 67, 68, 69],
-		"Twenty 20-contender elections, ownerless crash, fresh directory replacement, failed presence I/O, eight-pass churn and retirement/waiter race. Ownerless crash failure retained as a blocker.",
-	),
-);
+contractCoverage.push(cover(
+	"Generation 6 directory election, reconcile loop and lane retirement acceptance",
+	[64, 65, 66, 67, 68, 69],
+	"Twenty 20-contender elections, ownerless crash, fresh directory replacement, failed presence I/O, eight-pass churn and retirement/waiter race. Ownerless crash failure retained as a blocker.",
+));
 const matrix = {
 	sourceHash,
 	contractCoverage,

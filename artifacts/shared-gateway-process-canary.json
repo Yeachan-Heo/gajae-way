@@ -1,15 +1,15 @@
 {
-	"status": "passed",
-	"home": "/tmp/gajaeway-shared-process-y73svftz",
-	"sessionId": "aa809ead-00e8-4d75-8138-8a01671ccb76",
-	"opRef": "gw-work-process-proof-01m22gmsghzs8ekzyjcpa226sc",
-	"sharedBroker": {
-		"pid": 1213073,
-		"ownerId": "ffabdb564e39c55cc5997b99",
-		"incarnation": "linux:432228496"
-	},
-	"unrelatedLivePreserved": 79,
-	"sameSessionAfterGatewayRestart": true,
-	"configUnchanged": true,
-	"originalResult": "SHARED_PROCESS_OK"
+  "status": "passed",
+  "home": "/tmp/gajaeway-shared-process-y73svftz",
+  "sessionId": "aa809ead-00e8-4d75-8138-8a01671ccb76",
+  "opRef": "gw-work-process-proof-01m22gmsghzs8ekzyjcpa226sc",
+  "sharedBroker": {
+    "pid": 1213073,
+    "ownerId": "ffabdb564e39c55cc5997b99",
+    "incarnation": "linux:432228496"
+  },
+  "unrelatedLivePreserved": 79,
+  "sameSessionAfterGatewayRestart": true,
+  "configUnchanged": true,
+  "originalResult": "SHARED_PROCESS_OK"
 }
