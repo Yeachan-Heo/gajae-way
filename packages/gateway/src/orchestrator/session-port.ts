@@ -336,6 +336,7 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
+	readonly #sessionSends = new Map<string, Promise<SendReceipt>>();
 	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
@@ -694,49 +695,77 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
-		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
-		const text = renderPrompt(input.systemPreamble, input.text);
-		// The prompt is submitted on the session's resident relay so that this
-		// connection OWNS the turn: the host streams the turn's content only to
-		// the connection that submitted it. A caller without a relay gets one
-		// for the duration of the send.
-		const relay =
-			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
-		try {
-			const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
-			let waited = false;
-			for (;;) {
-				this.#database.assertBrokerAuthority(this.#authority);
-				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
-				this.#database.assertBrokerAuthority(this.#authority);
-				if (response.ok) {
-					const result = recordOf(response.result) ?? {};
-					const receipt = recordOf(result.receipt) ?? result;
-					return {
-						sessionId: input.sessionId,
-						operationRef: input.opRef,
-						...(typeof receipt.commandId === "string" ? { commandId: receipt.commandId } : {}),
-						...(typeof receipt.turnId === "string" ? { turnId: receipt.turnId } : {}),
-						acceptedAt: new Date(this.#now()).toISOString(),
-						taskKey: "gateway",
-					};
+
+		// Serialize sends to the same session: never submit a new prompt while a previous
+		// one is still in flight. This prevents the session from receiving concurrent prompts,
+		// which would cause the agent to timeout waiting for the session to become idle.
+		const sessionSendKey = input.sessionId;
+		const previousSend = this.#sessionSends.get(sessionSendKey);
+
+		const currentSend = (async () => {
+			// Wait for the previous send to complete before proceeding
+			if (previousSend) {
+				try {
+					await previousSend;
+				} catch {
+					// Ignore errors from the previous send; we'll attempt our own send
 				}
-				const error = relayFailure("turn.prompt", response);
-				if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
-					throw new OpRefRejectedError(input.opRef, CLIENT_REF_CONFLICT_CODE, error.details);
-				if (!isSessionBusy(error)) throw error;
-				// `busy` is occupancy, not failure: the prompt was never accepted and
-				// the op-ref is still unused. Wait for the session to go idle
-				// (bounded) and resend under the same op-ref before giving up.
-				if (this.#now() >= deadline) throw error;
-				if (!waited) {
-					waited = true;
-					console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
-				}
-				await this.#sleep(BUSY_POLL_MS);
 			}
+
+			if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
+			const text = renderPrompt(input.systemPreamble, input.text);
+			// The prompt is submitted on the session's resident relay so that this
+			// connection OWNS the turn: the host streams the turn's content only to
+			// the connection that submitted it. A caller without a relay gets one
+			// for the duration of the send.
+			const relay =
+				input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+			try {
+				const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+				let waited = false;
+				for (;;) {
+					this.#database.assertBrokerAuthority(this.#authority);
+					const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+					this.#database.assertBrokerAuthority(this.#authority);
+					if (response.ok) {
+						const result = recordOf(response.result) ?? {};
+						const receipt = recordOf(result.receipt) ?? result;
+						return {
+							sessionId: input.sessionId,
+							operationRef: input.opRef,
+							...(typeof receipt.commandId === "string" ? { commandId: receipt.commandId } : {}),
+							...(typeof receipt.turnId === "string" ? { turnId: receipt.turnId } : {}),
+							acceptedAt: new Date(this.#now()).toISOString(),
+							taskKey: "gateway",
+						};
+					}
+					const error = relayFailure("turn.prompt", response);
+					if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
+						throw new OpRefRejectedError(input.opRef, CLIENT_REF_CONFLICT_CODE, error.details);
+					if (!isSessionBusy(error)) throw error;
+					// `busy` is occupancy, not failure: the prompt was never accepted and
+					// the op-ref is still unused. Wait for the session to go idle
+					// (bounded) and resend under the same op-ref before giving up.
+					if (this.#now() >= deadline) throw error;
+					if (!waited) {
+						waited = true;
+						console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
+					}
+					await this.#sleep(BUSY_POLL_MS);
+				}
+			} finally {
+				if (!input.relay) await relay.close();
+			}
+		})();
+
+		this.#sessionSends.set(sessionSendKey, currentSend);
+		try {
+			return await currentSend;
 		} finally {
-			if (!input.relay) await relay.close();
+			// Clear the send promise when done (only if it's still the current one)
+			if (this.#sessionSends.get(sessionSendKey) === currentSend) {
+				this.#sessionSends.delete(sessionSendKey);
+			}
 		}
 	}
 

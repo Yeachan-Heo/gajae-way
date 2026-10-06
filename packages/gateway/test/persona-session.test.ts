@@ -2313,3 +2313,102 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(port.deleted).toEqual([]);
 	expect(logs.some((line) => line.startsWith("session_gc"))).toBe(false);
 });
+
+test("#424: second input during active run does not create a concurrent submission", async () => {
+	// When a second message arrives while the first prompt is still in flight,
+	// it should be absorbed as a steer, not submitted as a new prompt to the same session.
+	// This prevents concurrent submissions that could cause the agent to timeout.
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	const now = Date.now();
+
+	// Enqueue two messages
+	expect(
+		database?.inboundEnqueue({
+			messageId: "m-1",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "first message",
+			receivedAt: new Date(now).toISOString(),
+		}),
+	).toBe(true);
+	expect(
+		database?.inboundEnqueue({
+			messageId: "m-2",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "second message",
+			receivedAt: new Date(now + 10).toISOString(),
+		}),
+	).toBe(true);
+
+	// Notify inbound and verify only one send is made
+	await manager?.notifyInbound(KEY);
+
+	// Should have exactly one send (not two)
+	expect(port.sends).toHaveLength(1);
+	const firstSend = port.sends[0]!;
+	const sessionId = firstSend.sessionId;
+
+	// The second message should be steered, not sent as a separate prompt
+	expect(port.steers).toHaveLength(1);
+	const steer = port.steers[0]!;
+	expect(steer.sessionId).toBe(sessionId); // Same session
+
+	// Verify that only one send was attempted to this session
+	const sendsToSession = port.sends.filter((s) => s.sessionId === sessionId);
+	expect(sendsToSession).toHaveLength(1);
+
+	// Complete the turn and verify both messages are accounted for
+	port.complete(firstSend.opRef, "answer");
+	await eventually(
+		() =>
+			database?.inboundTurnRows(firstSend.opRef).every((row) => row.state === "done") === true,
+		"turn did not complete",
+	);
+});
+
+test("#424: rapid messages to same origin never create concurrent session sends", async () => {
+	// Test the specific race condition: if two messages arrive while the first prompt
+	// is being sent (and hasn't completed yet), the second should be queued as a steer.
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	const now = Date.now();
+
+	// Enqueue three messages in rapid succession
+	for (let i = 1; i <= 3; i++) {
+		expect(
+			database?.inboundEnqueue({
+				messageId: `m-${i}`,
+				originKey: KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body: `message ${i}`,
+				receivedAt: new Date(now + i).toISOString(),
+			}),
+		).toBe(true);
+	}
+
+	// Admit all messages at once
+	await manager?.notifyInbound(KEY);
+
+	// Should have exactly one send - the first message
+	expect(port.sends).toHaveLength(1);
+	const send = port.sends[0]!;
+	expect(send.text).toContain("message 1");
+
+	// All subsequent messages should be steered, not sent as separate prompts
+	const allSteersToSession = port.steers.filter((s) => s.sessionId === send.sessionId);
+	expect(allSteersToSession.length).toBeGreaterThanOrEqual(1); // At least m-2 should be steered
+
+	// Verify no additional sends to the same session were created
+	const additionalSends = port.sends.filter((s) => s.sessionId === send.sessionId && s.opRef !== send.opRef);
+	expect(additionalSends).toHaveLength(0);
+
+	// Complete and verify all messages are accounted for
+	port.complete(send.opRef, "answer");
+	await eventually(
+		() =>
+			database?.inboundTurnRows(send.opRef).every((row) => row.state === "done") === true,
+		"turn did not complete",
+	);
+});
