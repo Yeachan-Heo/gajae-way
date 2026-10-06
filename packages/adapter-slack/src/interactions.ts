@@ -1,5 +1,4 @@
-import type { EngagementPanelResponseParams } from "@gajae-gateway/protocol";
-import type { OriginRef } from "@gajae-gateway/protocol";
+import type { EngagementPanelResponseParams, OriginRef } from "@gajae-gateway/protocol";
 
 /**
  * Slack block_actions event from Socket Mode.
