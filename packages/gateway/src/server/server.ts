@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -77,7 +77,7 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
-import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
+import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId, type TailHandle } from "../orchestrator/tail-runner";
 import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
@@ -327,6 +327,8 @@ interface Runtime {
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
 	readonly panelTracker: PanelTracker;
+	/** Maps panel IDs to relay handles for sending reverse_response frames */
+	panelTails?: Map<string, TailHandle>;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -601,6 +603,66 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
+		},
+		onReverseRequest: async ({ originKey, sessionId, tail, input }) => {
+			// Handle reverse requests from the SDK (e.g., permission.request, ui.select)
+			if (input.capability !== "permission" || input.payload.method !== "request") {
+				// Not a permission request we handle; decline with unavailable
+				await tail.sendReverseResponse({
+					id: input.id,
+					connectionId: input.connectionId,
+					leaseId: input.leaseId,
+					error: { code: "unavailable", message: `${input.capability}.${input.payload.method} not available` },
+				}).catch((error) => {
+					console.error(`Failed to send reverse response for unsupported request: ${diagnostic(error)}`);
+				});
+				return;
+			}
+			
+			// Create a panel from the permission request
+			const now = Date.now();
+			const panelId = randomUUID();
+			const expiresAt = new Date(now + 300000); // 5 minute timeout
+			const origin: OriginRef = { platform: "slack", id: `${sessionId}:0:0` }; // Default origin for SDK requests
+			
+			// Register the panel with reverse request details (including the relay for responses)
+			runtime.panelTracker.registerPanel({
+				panelId,
+				questionId: input.id,
+				turnId: sessionId,
+				sessionId,
+				origin,
+				authorId: "sdk",
+				expiresAt,
+				answerBinding: "",
+				reverseRequest: {
+					id: input.id,
+					connectionId: input.connectionId,
+					leaseId: input.leaseId,
+					capability: input.capability,
+					method: input.payload.method,
+					payload: input.payload.payload,
+				},
+			});
+			
+			// Store the tail handle for later response (we'll need it when the panel is answered)
+			runtime.panelTails ??= new Map();
+			runtime.panelTails.set(panelId, tail);
+			
+			// Emit the panel to the origin (for display in UI)
+			const payload = runtime.delivery.prepare(
+				sessionId,
+				origin,
+				`Permission request from SDK session: ${sessionId}`,
+				{
+					type: "engagement.panel",
+					panelId,
+					questionId: input.id,
+					requestedBy: "sdk",
+					capability: input.capability,
+				},
+			);
+			if (payload) broadcastDelivery(runtime, payload);
 		},
 	});
 	const monitors = new MonitorPropagator({
@@ -1552,67 +1614,50 @@ async function handleRequest(
 			} else if (!runtime.panelTracker.isAuthorizedResponder(panel, responderId)) {
 				coordinatorError = "unauthorized_responder";
 			} else {
-				// Submit the answer to gjc coordinator via the session relay.
+				// Handle the panel response
 				try {
-					// Build the answer payload based on response kind
-					let answer: Record<string, unknown>;
-					if (responseKind === "option_selected") {
-						if (!selectedOptionId) {
-							coordinatorError = "invalid_answer: missing selectedOptionId";
-							throw new ProtocolError("invalid_params", "option_selected requires selectedOptionId");
-						}
-						answer = { selected: [selectedOptionId] };
-					} else if (responseKind === "approved") {
-						answer = { selected: ["approved"] };
-					} else {
-						answer = { selected: ["denied"] };
-					}
-
-					// The panel has the workspace information through its origin
-					// For now, use a default workspace (the gateway default)
-					const sessionWorkspace = options.config.home ? join(options.config.home, "workspace") : "";
-
-					// Get or create a relay connection to the session
-					const relay = await runtime.sessionPort.attachTail({
-						sessionId: panel.sessionId,
-						brokerGeneration: 0,
-						repo: sessionWorkspace,
-					});
-
-					const idempotencyKey = `panel-${panelId}-${responderId}-${Date.now()}`;
-
-					// Submit the answer to the coordinator
-					const response = await relay.control("gjc_coordinator_submit_question_answer", {
-						session_id: panel.sessionId,
-						turn_id: panel.turnId,
-						question_id: panel.questionId,
-						answer_binding: panel.answerBinding,
-						answer,
-						idempotency_key: idempotencyKey,
-						allow_mutation: true,
-					});
-
-					// Close the relay connection
-					await relay.close();
-
-					// Check if the answer was accepted
-					if (response && typeof response === "object" && "ok" in response && response.ok !== true) {
-						const errorResponse = response as Record<string, unknown>;
-						if (errorResponse.error && typeof errorResponse.error === "object") {
-							const error = errorResponse.error as Record<string, unknown>;
-							const errorCode = typeof error.code === "string" ? error.code : "unknown_error";
-							const errorMessage = typeof error.message === "string" ? error.message : "Failed to submit answer";
-							coordinatorError = `${errorCode}: ${errorMessage}`;
+					// If this panel was created from a reverse request, respond to the SDK host
+					if (panel.reverseRequest) {
+						// Build the response based on response kind
+						let result: unknown;
+						if (responseKind === "option_selected") {
+							if (!selectedOptionId) {
+								coordinatorError = "invalid_answer: missing selectedOptionId";
+								throw new ProtocolError("invalid_params", "option_selected requires selectedOptionId");
+							}
+							result = { selected: [selectedOptionId] };
+						} else if (responseKind === "approved") {
+							result = { outcome: "selected", optionId: "approved" };
 						} else {
-							coordinatorError = "answer_submission_failed";
+							result = { outcome: "selected", optionId: "denied" };
 						}
-					} else {
-						// Answer was accepted, resolve the panel
+
+						// Get the relay that received the original reverse_request
+						const tail = runtime.panelTails?.get(panelId);
+						if (!tail) {
+							coordinatorError = "relay_not_found";
+						} else {
+							// Send the reverse response to the SDK host
+							await tail.sendReverseResponse({
+								id: panel.reverseRequest.id,
+								connectionId: panel.reverseRequest.connectionId,
+								leaseId: panel.reverseRequest.leaseId,
+								result,
+							});
+
+							// Clean up the stored tail handle
+							runtime.panelTails?.delete(panelId);
+						}
+
+						// Resolve the panel and mark it as handled
 						runtime.panelTracker.resolvePanel(panelId);
+					} else {
+						// Legacy coordinator path (if needed in the future)
+						coordinatorError = "no_reverse_request_handler";
 					}
 				} catch (error) {
 					const errorMsg = error instanceof Error ? error.message : String(error);
-					coordinatorError = `relay_error: ${errorMsg}`;
+					coordinatorError = `response_error: ${errorMsg}`;
 					// Still resolve the panel so adapters can proceed
 					runtime.panelTracker.resolvePanel(panelId);
 				}

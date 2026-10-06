@@ -6,6 +6,21 @@ import type { OriginRef } from "@gajae-gateway/protocol";
  * to question metadata so responses can be routed back to gjc sessions via
  * the coordinator answer API.
  */
+export interface ReverseRequestDetails {
+	/** The reverse request ID from the SDK */
+	readonly id: string;
+	/** Connection ID from the SDK relay */
+	readonly connectionId: string;
+	/** Lease ID for responding to the reverse request */
+	readonly leaseId: string;
+	/** The host request capability (e.g., 'permission') */
+	readonly capability: string;
+	/** The host request method (e.g., 'request') */
+	readonly method: string;
+	/** The host request payload */
+	readonly payload: unknown;
+}
+
 export interface PendingPanel {
 	/** Unique panel identifier */
 	readonly panelId: string;
@@ -25,6 +40,8 @@ export interface PendingPanel {
 	readonly createdAt: Date;
 	/** Answer binding from gjc coordinator for idempotent resolution */
 	readonly answerBinding: string;
+	/** Details of the reverse request that created this panel, if any */
+	readonly reverseRequest?: ReverseRequestDetails;
 }
 
 /**

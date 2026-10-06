@@ -91,6 +91,13 @@ export interface TailAttachInput {
 	/** Current tails may wait for capacity; parked retired holds must not consume it. */
 	priority?: "current" | "retired";
 	onFrame?: (frame: TailFrame) => void | Promise<void>;
+	onReverseRequest?: (input: {
+		id: string;
+		connectionId: string;
+		capability: string;
+		leaseId: string;
+		payload: { method: string; payload: unknown };
+	}) => void | Promise<void>;
 	onStall?: (input: { sessionId: string; brokerGeneration: number; elapsedMs: number }) => void | Promise<void>;
 	/** The relay died mid-turn; frames emitted while it was down are lost (best-effort content). It reopens. */
 	onRelayLost?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
@@ -123,6 +130,14 @@ export interface TailHandle {
 	control(operation: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse>;
 	/** Sends `query_request` and resolves with its `query_response`. */
 	query(name: string, input: Record<string, unknown>, options?: RelayRequestOptions): Promise<RelayResponse>;
+	/** Sends a `reverse_response` to answer a host's `reverse_request`. */
+	sendReverseResponse(input: {
+		id: string;
+		connectionId: string;
+		leaseId: string;
+		result?: unknown;
+		error?: { code: string; message: string };
+	}): Promise<void>;
 	/**
 	 * Names the turn whose content this handle delivers. Frames with a different
 	 * correlation are dropped; uncorrelated frames were never turn content.
@@ -453,6 +468,37 @@ class ManagedTailHandle implements TailHandle {
 		);
 	}
 
+	async sendReverseResponse(input: {
+		id: string;
+		connectionId: string;
+		leaseId: string;
+		result?: unknown;
+		error?: { code: string; message: string };
+	}): Promise<void> {
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		await this.ready;
+		const stream = this.#stream;
+		if (!stream) throw new RelayClosedError(this.sessionId, "relay not open");
+		const frame: Record<string, unknown> = {
+			type: "reverse_response",
+			id: input.id,
+			leaseId: input.leaseId,
+		};
+		if (input.error) {
+			frame.error = input.error;
+		} else if (input.result !== undefined) {
+			frame.result = input.result;
+		}
+		try {
+			stream.write(JSON.stringify(frame));
+		} catch (error) {
+			throw new RelayClosedError(
+				this.sessionId,
+				sanitizeDiagnostic(messageOf(error)) || "write_failed",
+			);
+		}
+	}
+
 	async #request(
 		type: "control_request" | "query_request",
 		responseType: "control_response" | "query_response",
@@ -648,6 +694,26 @@ class ManagedTailHandle implements TailHandle {
 			clearTimeout(pending.timer);
 			this.#pending.delete(id!);
 			pending.resolve(decodeResponse(frame));
+			return;
+		}
+		if (frame.type === "reverse_request") {
+			const id = typeof frame.id === "string" ? frame.id : undefined;
+			const connectionId = typeof frame.connectionId === "string" ? frame.connectionId : undefined;
+			const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : undefined;
+			const capability = typeof frame.capability === "string" ? frame.capability : undefined;
+			const payload = recordOf(frame.payload);
+			if (id && connectionId && leaseId && capability && payload) {
+				const method = typeof payload.method === "string" ? payload.method : undefined;
+				if (method) {
+					void this.#input.onReverseRequest?.({
+						id,
+						connectionId,
+						leaseId,
+						capability,
+						payload: { method, payload: payload.payload },
+					});
+				}
+			}
 			return;
 		}
 		if (frame.type === "transport_error") {

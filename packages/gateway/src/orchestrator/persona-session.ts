@@ -217,6 +217,19 @@ export interface PersonaSessionManagerOptions {
 	readonly brokerLiveness?: BrokerLivenessProbe;
 	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
+	/** Called when a reverse request from the SDK host arrives. */
+	readonly onReverseRequest?: (input: {
+		originKey: string;
+		sessionId: string;
+		tail: TailHandle;
+		input: {
+			id: string;
+			connectionId: string;
+			capability: string;
+			leaseId: string;
+			payload: { method: string; payload: unknown };
+		};
+	}) => void | Promise<void>;
 	readonly log?: (line: string, level?: LogLevel) => void;
 }
 
@@ -1746,6 +1759,17 @@ class OriginActor {
 					await this.#onStall(sessionId, epoch, generation, retired, elapsedMs);
 				}).catch(() => {});
 			},
+			onReverseRequest: async (input) => {
+				await this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onReverseRequest(sessionId, epoch, generation, retired, input, self!);
+				}).catch((error: unknown) =>
+					this.#manager.log(
+						`persona_reverse_request_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+						"error",
+					),
+				);
+			},
 			onDiagnostic: (line, level) => this.#manager.log(line, level),
 		});
 		self = handle;
@@ -1987,6 +2011,33 @@ class OriginActor {
 				"warn",
 			);
 			await this.#reconcileBound(bound);
+		}
+	}
+
+	async #onReverseRequest(
+		sessionId: string,
+		epoch: number,
+		brokerGeneration: number,
+		retired: boolean,
+		input: {
+			id: string;
+			connectionId: string;
+			capability: string;
+			leaseId: string;
+			payload: { method: string; payload: unknown };
+		},
+		tail: TailHandle,
+	): Promise<void> {
+		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
+		if (!bound) return;
+		// Forward reverse requests to the server's panel handling
+		if (this.#manager.onReverseRequest) {
+			await this.#manager.onReverseRequest({
+				originKey: this.originKey,
+				sessionId,
+				tail,
+				input,
+			});
 		}
 	}
 
