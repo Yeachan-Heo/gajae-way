@@ -1251,33 +1251,14 @@ class OriginActor {
 					...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
 					...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 				});
-			let receipt: SendReceipt | undefined;
-			for (;;) {
-				try {
-					receipt = await send();
-					break;
-				} catch (error) {
-					if (!(await this.#submissionRetrySafe(current, error))) throw error;
-					const key = `turn_submit_retry_count:${opRef}`;
-					const count = this.#manager.database.metaGet(key) ?? "0";
-					// Corrupt or unexpected metadata must never grant a fresh retry budget.
-					if (count !== "0") {
-						this.#manager.log(`turn_submit_retry_exhausted opRef=${opRef}`, "error");
-						await lifecycle.onFailure?.({ ...current, error: error as Error });
-						this.#manager.database.inboundTurnComplete(opRef, "no_delivery");
-						await this.#notifySettled(current);
-						await this.#settleAfterTerminal(current, false);
-						return;
-					}
-					this.#manager.database.metaSet(key, "1");
-					this.#manager.log(`turn_submit_retry_attempt opRef=${opRef} retryCount=1`);
-				}
-			}
+			const receipt = await send();
 			tail.correlate(opRef, receipt);
 			this.#manager.database.inboundTurnAccept(opRef);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
+			// Clean up retry metadata when turn settles successfully.
+			this.#manager.database.metaDelete(`turn_submit_retry_count:${opRef}`);
 		} catch (error) {
 			// Only the established session_unavailable status proves this send did
 			// not land. A session_not_found returned after port.send is ambiguous:
@@ -1337,38 +1318,32 @@ class OriginActor {
 		await this.#steerPending();
 	}
 
-	/** Only a proven, still-prepared submission may reuse its durable identity. */
-	async #submissionRetrySafe(bound: BoundTurn, error: unknown): Promise<boolean> {
-		if (!(error instanceof Error) || error.message !== "internal: Prompt submission failed") return false;
-		const prepared = () =>
-			!this.#stopped &&
-			!this.#manager.stopped &&
-			this.#current === bound &&
-			!bound.retired &&
-			bound.epoch === this.#epoch() &&
-			bound.brokerGeneration === this.#manager.brokerGeneration &&
-			!bound.replyVisible &&
-			bound.lastAssistantText === undefined &&
-			!bound.openTool &&
-			!bound.tailTerminalObserved &&
-			!bound.tailEvidenceUnavailable &&
-			this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound";
-		if (!prepared()) return false;
-		try {
-			const report = await this.#statusOf(bound);
-			return (
-				report.operationRef === bound.turn.opRef &&
-				report.status.status === "unknown" &&
-				report.status.receiptState === undefined &&
-				report.status.startedAt === undefined &&
-				report.status.outcome === undefined &&
-				report.summaryCompleted === false &&
-				(await this.#queueIsEmpty(bound.sessionId, bound.tail)) &&
-				prepared()
-			);
-		} catch {
+	/** Check if submission can be retried after a failure. */
+	async #checkSubmissionRetryConditions(bound: BoundTurn, report: StatusReport): Promise<boolean> {
+		// Only retry internal submission failures when nothing was delivered.
+		if (
+			report.status.outcome?.code !== "internal" ||
+			report.status.outcome?.phase !== "submission" ||
+			bound.replyVisible ||
+			bound.lastAssistantText !== undefined ||
+			bound.openTool
+		)
 			return false;
-		}
+		// Check if we've already attempted a retry for this turn.
+		const key = `turn_submit_retry_count:${bound.turn.opRef}`;
+		const retryAttempted = this.#manager.database.metaGet(key) === "1";
+		return !retryAttempted;
+	}
+	
+	/** Mark the turn for retry and prevent its settlement. */
+	#markSubmissionForRetry(bound: BoundTurn): void {
+		const key = `turn_submit_retry_count:${bound.turn.opRef}`;
+		this.#manager.database.metaSet(key, "1");
+		this.#manager.log(
+			`turn_submit_retry_attempt origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef}`,
+		);
+		// Set tail terminal to false to prevent settlement and allow re-reconciliation.
+		bound.tailTerminalObserved = false;
 	}
 
 	/**
@@ -2317,6 +2292,13 @@ class OriginActor {
 			);
 			throw error;
 		}
+		// Check for submission failure retry opportunity: if nothing was delivered and
+		// this is an internal submission failure, attempt the retry once before resetting.
+		const retryConditionsMet = await this.#checkSubmissionRetryConditions(bound, report);
+		if (retryConditionsMet) {
+			this.#markSubmissionForRetry(bound);
+			return; // Don't settle; let the turn stay in queue for re-send.
+		}
 		// Persist the failure notice before settling its trigger. If delivery fails,
 		// recovery can retry the same deterministic notice without losing it. Reset
 		// completion and its budget are then committed atomically below.
@@ -2414,6 +2396,8 @@ class OriginActor {
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
+		// Clean up retry metadata when turn settles.
+		this.#manager.database.metaDelete(`turn_submit_retry_count:${bound.turn.opRef}`);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);

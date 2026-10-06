@@ -180,16 +180,20 @@ describe("work attempt durable transactions", () => {
 		});
 	}
 
-	test("reconciliation rolls back the entire batch on a validation failure", async () => {
+	test("reconciliation validates and repairs torn rows per-row without throwing", async () => {
 		const f = await fixture();
 		f.database.workAttemptPrepare(f.runtime, f.record);
 		f.database.putLaneJob({ ...f.closed, laneKey: f.runtime.laneKey, json: JSON.stringify(f.closed) });
-		// A late column-identity failure occurs after the staged repair, exercising rollback.
-		f.raw.query("UPDATE work_attempt_runtime SET version = 99").run();
+		// Corrupt the record_json to cause a validation error
+		f.raw.query("UPDATE work_attempt_runtime SET record_json = ?").run("{invalid json");
 		const before = f.raw.query("SELECT * FROM work_attempt_runtime").all();
-		expect(() => f.database.workAttemptReconcile(() => {})).toThrow();
+		const lines: string[] = [];
+		const count = f.database.workAttemptReconcile((line) => lines.push(line));
+		// Corrupt row is skipped, no error is thrown, and the row is unchanged.
+		expect(count).toBe(0);
 		expect(f.raw.query("SELECT * FROM work_attempt_runtime").all()).toEqual(before);
-		expect(f.database.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.closed));
+		// The skip should be logged.
+		expect(lines.some((line) => line.includes("work_attempt_reconcile_skip"))).toBe(true);
 	});
 
 	test("reconciliation leaves a valid open attempt untouched", async () => {

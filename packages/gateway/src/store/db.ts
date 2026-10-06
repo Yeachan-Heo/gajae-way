@@ -1195,7 +1195,7 @@ export class GatewayDatabase {
 		}
 	}
 
-	/** Repair only torn settlement state, atomically; unrelated corruption aborts boot. */
+	/** Repair only torn settlement state; corrupt rows are skipped and logged. */
 	workAttemptReconcile(log: (line: string) => void = console.info): number {
 		const count = this.withTransaction(() => {
 			const rows = this.#database
@@ -1204,49 +1204,72 @@ export class GatewayDatabase {
 				)
 				.all();
 			let reconciled = 0;
+			const skipped: string[] = [];
+			const updates: { opRef: string; next: WorkAttemptRuntime; history: any; settledAt: number }[] = [];
+			// First pass: validate all rows before any updates
 			for (const row of rows) {
-				const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
-				validateWorkRuntime(runtime, this.instanceId);
-				workAssert(runtime.opRef === row.op_ref);
-				const json = this.laneJobJson(runtime.jobId);
-				workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
-				const record = parseLaneJobRecord(json);
-				const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-				workAssert(attempt !== undefined);
-				// Validate every history invariant except the known torn settlement timestamp.
-				this.#workValidateHistory({ ...runtime, settledAt: attempt.endedAt ?? null }, record);
-				if (attempt.endedAt === undefined && runtime.settledAt === null) {
-					this.workAttemptGet(row.op_ref);
-					continue;
+				try {
+					const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
+					validateWorkRuntime(runtime, this.instanceId);
+					workAssert(runtime.opRef === row.op_ref);
+					const json = this.laneJobJson(runtime.jobId);
+					workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+					const record = parseLaneJobRecord(json);
+					const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
+					workAssert(attempt !== undefined);
+					// Validate every history invariant except the known torn settlement timestamp.
+					this.#workValidateHistory({ ...runtime, settledAt: attempt.endedAt ?? null }, record);
+					if (attempt.endedAt === undefined && runtime.settledAt === null) {
+						// Not torn; skip update.
+						continue;
+					}
+					this.#assertNotQuarantined("work", runtime.jobId);
+					const settledAt = runtime.terminal?.observedAt ?? attempt.endedAt;
+					workAssert(settledAt !== undefined);
+					const next: WorkAttemptRuntime = {
+						...runtime,
+						terminal: runtime.terminal ?? {
+							kind: "local",
+							reasonCode: "recovery_indeterminate",
+							observedAt: settledAt,
+						},
+						output:
+							runtime.output.disposition === "pending"
+								? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
+								: runtime.output,
+						decision: runtime.decision === "undecided" ? "recovery_indeterminate" : runtime.decision,
+						settledAt,
+					};
+					validateWorkRuntime(next, this.instanceId);
+					const history = {
+						...record,
+						attempts: record.attempts.map((item) =>
+							item.opRef === runtime.opRef ? { ...item, endedAt: settledAt } : item,
+						),
+					};
+					this.#workValidateHistory(next, history);
+					// All validations passed; queue for update in second pass.
+					updates.push({ opRef: row.op_ref, next, history, settledAt });
+				} catch (error) {
+					skipped.push(row.op_ref);
+					log(
+						`work_attempt_reconcile_skip opRef=${row.op_ref} reason=${error instanceof Error ? error.message : String(error)}`,
+					);
 				}
-				this.#assertNotQuarantined("work", runtime.jobId);
-				const settledAt = runtime.terminal?.observedAt ?? attempt.endedAt;
-				workAssert(settledAt !== undefined);
-				const next: WorkAttemptRuntime = {
-					...runtime,
-					terminal: runtime.terminal ?? { kind: "local", reasonCode: "recovery_indeterminate", observedAt: settledAt },
-					output:
-						runtime.output.disposition === "pending"
-							? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
-							: runtime.output,
-					decision: runtime.decision === "undecided" ? "recovery_indeterminate" : runtime.decision,
-					settledAt,
-				};
-				validateWorkRuntime(next, this.instanceId);
-				const history = {
-					...record,
-					attempts: record.attempts.map((item) =>
-						item.opRef === runtime.opRef ? { ...item, endedAt: settledAt } : item,
-					),
-				};
-				this.#workValidateHistory(next, history);
+			}
+			// Second pass: apply all validated updates
+			for (const { opRef, next, history, settledAt } of updates) {
 				// Keep the version unchanged until column identity has been checked by the normal reader.
 				this.#database
 					.query("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ? WHERE op_ref = ?")
-					.run(JSON.stringify(next), settledAt, row.op_ref);
+					.run(JSON.stringify(next), settledAt, opRef);
 				this.#workPutHistory(next, history);
-				this.workAttemptGet(row.op_ref);
 				reconciled++;
+			}
+			if (skipped.length > 0) {
+				log(
+					`work_attempt_reconcile_report reconciled=${reconciled} skipped=${skipped.length} opRefs=${skipped.join(",")}`,
+				);
 			}
 			return reconciled;
 		});
