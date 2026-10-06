@@ -159,9 +159,12 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 {
   "tokenFile": "/Users/me/gajaeway/secrets/discord-token",
   "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
-  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } }
+  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } },
+  "mediaDirectories": ["/Users/me/gajaeway/shared-files"]
 }
 ```
+
+Outbound `MEDIA:/absolute/path` attachments are disabled unless `mediaDirectories` is configured. Relative entries resolve from the directory containing `adapter-discord.json`; uploads are accepted only when the file's resolved real path remains inside one of those directories. Keep this allowlist limited to files that may be exposed in Discord.
 
 `engagement` selects how messages become turns: `open` admits them without addressing, `mention-open` requires a real mention or native reply to this bot, and `closed` requires both addressing and owner/allowlist authorization. `audience` independently restricts authors to `all`, `human-only`, or `bot-only`; `closed` ignores it. Omitting `audience` keeps the safe `human-only` default (humans follow the mode; bots stay on the closed gate).
 

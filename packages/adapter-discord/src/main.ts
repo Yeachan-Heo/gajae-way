@@ -775,6 +775,7 @@ export async function settleDiscordDelivery(
 	status?: WorkingStatus,
 	reactions: DiscordReactionPorts = createReactionPorts(),
 	speech?: DiscordSpeechPorts,
+	mediaDirectories: readonly string[] = [],
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -793,7 +794,7 @@ export async function settleDiscordDelivery(
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const text = notice ? `${notice}\n${body}` : body;
 		const chunks = text === "" ? [] : chunkDiscordMessage(text);
-		const files = await loadDiscordMedia(parsed.paths);
+		const files = await loadDiscordMedia(parsed.paths, mediaDirectories);
 		if (files.length > 0 && chunks.length === 0) {
 			const reply =
 				message.replyToMessageId && !notice
@@ -948,15 +949,17 @@ export function subscribeDiscordDeliveries(
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
 	speech?: DiscordSpeechPorts,
+	mediaDirectories: readonly string[] = [],
 ): () => void {
 	// One reaction port pair per subscription: the emoji cache and the throttle are
 	// only useful across deliveries, and a live adapter has exactly one subscription.
 	const reactions = createReactionPorts();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech).catch((error) =>
-			log.error(
-				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech, mediaDirectories).catch(
+			(error) =>
+				log.error(
+					`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
 		);
 	});
 }
@@ -1383,6 +1386,7 @@ export class ReconnectingGateway {
 				this.status,
 				console,
 				this.speech,
+				this.config.mediaDirectories,
 			);
 			this.#progressOff?.();
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;

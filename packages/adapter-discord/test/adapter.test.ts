@@ -206,7 +206,16 @@ test("uploads an explicit MEDIA path as a Discord attachment", async () => {
 		const discord: DiscordClientLike = {
 			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
 		};
-		await settleDiscordDelivery(mockGateway(requests), discord, delivery(`Source file:\nMEDIA:${filePath}`));
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`Source file:\nMEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
 		expect(sent).toHaveLength(1);
 		const upload = sent[0] as { content: string; files: Array<{ name: string; attachment: Buffer }> };
 		expect(upload.content).toBe("Source file:");
@@ -230,7 +239,16 @@ test("sends a MEDIA attachment without an empty text-only message", async () => 
 		const discord: DiscordClientLike = {
 			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
 		};
-		await settleDiscordDelivery(mockGateway(requests), discord, delivery(`MEDIA:${filePath}`));
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`MEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
 		expect(sent).toHaveLength(1);
 		expect(sent[0]).toMatchObject({ content: "", files: [{ name: "report.pdf" }] });
 		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
@@ -262,11 +280,29 @@ test("preserves MEDIA uploads on ambiguous redelivery", async () => {
 				}),
 			},
 		};
-		await settleDiscordDelivery(mockGateway(requests), discord, delivery(`MEDIA:${filePath}`));
-		await settleDiscordDelivery(mockGateway(requests), discord, {
-			...delivery(`MEDIA:${filePath}`),
-			duplicateWarning: true,
-		});
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`MEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			{
+				...delivery(`MEDIA:${filePath}`),
+				duplicateWarning: true,
+			},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
 		expect(sent).toHaveLength(1);
 		const upload = sent[0] as { content: string; files: Array<{ name: string }> };
 		expect(upload.content).toContain("[recovered - may be a duplicate]");
@@ -300,10 +336,19 @@ test("keeps files and reply metadata with the first chunk of a long caption", as
 		const discord: DiscordClientLike = {
 			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
 		};
-		await settleDiscordDelivery(mockGateway(requests), discord, {
-			...delivery(`${"x".repeat(2_001)}\nMEDIA:${filePath}`),
-			replyToMessageId: "message-1",
-		});
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			{
+				...delivery(`${"x".repeat(2_001)}\nMEDIA:${filePath}`),
+				replyToMessageId: "message-1",
+			},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
 		expect(sent).toHaveLength(2);
 		expect(sent[0]).toMatchObject({
 			content: "x".repeat(2_000),

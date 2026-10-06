@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, open, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadDiscordMedia, parseDiscordMedia, readDiscordMediaFile } from "../src/outgoing-attachments";
@@ -68,7 +68,7 @@ test("rejects files truncated, extended, or rewritten during preparation", async
 });
 
 // Purpose: verify the accepted file-count boundary at the upload loader, not only in its parser caller.
-// Expected: ten files load; eleven direct paths reject before opening, both required for completion.
+// Expected: ten allowlisted files load; eleven direct paths reject before opening, both required for completion.
 test("accepts ten files and rejects eleven at the upload boundary", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-count-"));
 	try {
@@ -79,8 +79,8 @@ test("accepts ten files and rejects eleven at the upload boundary", async () => 
 				return path;
 			}),
 		);
-		expect(await loadDiscordMedia(paths)).toHaveLength(10);
-		await expect(loadDiscordMedia(Array(11).fill(paths[0] as string))).rejects.toThrow("at most 10 files");
+		expect(await loadDiscordMedia(paths, [home])).toHaveLength(10);
+		await expect(loadDiscordMedia(Array(11).fill(paths[0] as string), [home])).rejects.toThrow("at most 10 files");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -100,10 +100,38 @@ test("rejects relative paths, directories, and oversized uploads", async () => {
 		await writeFile(second, "");
 		await truncate(first, 13 * 1024 * 1024);
 		await truncate(second, 13 * 1024 * 1024);
-		await expect(loadDiscordMedia(["relative.txt"])).rejects.toThrow("must be absolute");
-		await expect(loadDiscordMedia([home])).rejects.toThrow("regular file");
-		await expect(loadDiscordMedia([oversized])).rejects.toThrow("25 MiB");
-		await expect(loadDiscordMedia([first, second])).rejects.toThrow("25 MiB");
+		await expect(loadDiscordMedia(["relative.txt"], [home])).rejects.toThrow("must be absolute");
+		await expect(loadDiscordMedia([home], [home])).rejects.toThrow("regular file");
+		await expect(loadDiscordMedia([oversized], [home])).rejects.toThrow("25 MiB");
+		await expect(loadDiscordMedia([first, second], [home])).rejects.toThrow("25 MiB");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: prove MEDIA uploads cannot escape configured roots through direct paths, traversal, or symlinks.
+// Expected: outside targets are rejected even when the symlink itself is inside the allowlist; all assertions must complete.
+test("rejects files outside mediaDirectories, including traversal and outward symlinks", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-allowlist-"));
+	const allowed = join(home, "allowed");
+	const outside = join(home, "outside");
+	try {
+		await mkdir(allowed);
+		await mkdir(outside);
+		const insideFile = join(allowed, "inside.txt");
+		const outsideFile = join(outside, "secret.txt");
+		await writeFile(insideFile, "safe");
+		await writeFile(outsideFile, "secret");
+		await symlink(outsideFile, join(allowed, "linked.txt"));
+		expect(await loadDiscordMedia([insideFile], [allowed])).toHaveLength(1);
+		await expect(loadDiscordMedia([outsideFile], [allowed])).rejects.toThrow("outside configured mediaDirectories");
+		await expect(loadDiscordMedia([join(allowed, "..", "outside", "secret.txt")], [allowed])).rejects.toThrow(
+			"outside configured mediaDirectories",
+		);
+		await expect(loadDiscordMedia([join(allowed, "linked.txt")], [allowed])).rejects.toThrow(
+			"outside configured mediaDirectories",
+		);
+		await expect(loadDiscordMedia([insideFile])).rejects.toThrow("uploads are disabled");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
