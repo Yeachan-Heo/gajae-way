@@ -604,9 +604,23 @@ export class GlobalGjcClient {
 				if (reread && ++this.#probeFailures >= BROKER_STALL_THRESHOLD) {
 					if (!this.#stallDetected) {
 						this.#stallDetected = true;
-						this.#log(
-							`broker_stall_detected pid=${discovery.pid} generation=${this.#generation} failures=${this.#probeFailures}`,
-						);
+						const isOwned = !!this.#releaseBrokerScope;
+						if (isOwned) {
+							// Owned broker: terminate to recover from wedge, respawn via normal lifecycle
+							this.#log(
+								`broker_stall_detected pid=${discovery.pid} generation=${this.#generation} failures=${this.#probeFailures} action=terminate_owned`,
+							);
+							this.#terminateWedgedOwnedBroker(discovery.pid).catch((error) => {
+								try {
+									this.#log(`broker_termination_failed pid=${discovery.pid} error=${error instanceof Error ? error.message : String(error)}`);
+								} catch {}
+							});
+						} else {
+							// Shared broker: mark unavailable but keep probing, do not kill
+							this.#log(
+								`broker_stall_detected pid=${discovery.pid} generation=${this.#generation} failures=${this.#probeFailures} action=keep_probing_shared`,
+							);
+						}
 					}
 					// Re-read and authenticate the replacement before publishing authority.
 					// Discovery alone cannot authorize a rebind, and shared daemons are never killed.
@@ -682,6 +696,32 @@ export class GlobalGjcClient {
 		this.#log(
 			`broker_respawn_churn respawns=${this.recentRespawns(now)} windowMs=${BROKER_RESPAWN_WINDOW_MS} pid=${pid} generation=${this.#generation + 1}`,
 		);
+	}
+	/** Terminate a wedged owned broker with SIGTERM/SIGKILL escalation to allow respawn via normal lifecycle. */
+	async #terminateWedgedOwnedBroker(pid: number): Promise<void> {
+		for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+			try {
+				process.kill(pid, signal);
+				// Brief wait to allow process to respond to signal
+				await delay(100);
+				// Check if process is still alive
+				try {
+					process.kill(pid, 0);
+					// Process still alive, continue to next signal escalation
+					continue;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+						// Process is dead
+						return;
+					}
+					// EPERM or other error means we can't verify, but continue
+					continue;
+				}
+			} catch {
+				// Signal send failed, try next escalation
+				continue;
+			}
+		}
 	}
 	#schedule(epoch: number): void {
 		// Continue observation after involuntary stops so the #246 guard can trigger.
