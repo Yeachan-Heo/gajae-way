@@ -1,5 +1,5 @@
-import { type FileHandle, open } from "node:fs/promises";
-import { basename, isAbsolute } from "node:path";
+import { type FileHandle, open, realpath } from "node:fs/promises";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { AttachmentBuilder } from "discord.js";
 
 const MAX_DISCORD_FILES = 10;
@@ -64,21 +64,39 @@ export async function readDiscordMediaFile(file: FileHandle, snapshot: DiscordMe
 }
 
 /** Reads explicit local media directives into bounded Discord uploads. */
-export async function loadDiscordMedia(paths: readonly string[]): Promise<AttachmentBuilder[]> {
+export async function loadDiscordMedia(
+	paths: readonly string[],
+	allowedDirectories: readonly string[] = [],
+): Promise<AttachmentBuilder[]> {
 	if (paths.length > MAX_DISCORD_FILES)
 		throw new Error(`Discord accepts at most ${MAX_DISCORD_FILES} files per message`);
+	if (paths.length > 0 && allowedDirectories.length === 0)
+		throw new Error("Discord MEDIA uploads are disabled until mediaDirectories are configured");
+	const realAllowedDirectories = await Promise.all(allowedDirectories.map((directory) => realpath(directory)));
 	const attachments: AttachmentBuilder[] = [];
 	let totalBytes = 0;
 	for (const path of paths) {
 		if (!isAbsolute(path)) throw new Error("Discord MEDIA file path must be absolute");
-		const file = await open(path, "r");
+		const resolvedPath = resolve(path);
+		const realFilePath = await realpath(resolvedPath);
+		if (
+			!realAllowedDirectories.some((directory) => {
+				const relativePath = relative(directory, realFilePath);
+				return (
+					relativePath === "" ||
+					(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+				);
+			})
+		)
+			throw new Error("Discord MEDIA file is outside configured mediaDirectories");
+		const file = await open(realFilePath, "r");
 		try {
 			const info = await file.stat({ bigint: true });
 			if (!info.isFile()) throw new Error("Discord MEDIA path must name a regular file");
 			const remainingBytes = MAX_UPLOAD_BYTES - totalBytes;
 			if (info.size > BigInt(remainingBytes)) throw new Error("Discord MEDIA files exceed the 25 MiB upload limit");
 			const bytes = await readDiscordMediaFile(file, info);
-			const name = basename(path);
+			const name = basename(realFilePath);
 			if (!name) throw new Error("Discord MEDIA file must have a filename");
 			totalBytes += bytes.length;
 			attachments.push(new AttachmentBuilder(bytes, { name }));
