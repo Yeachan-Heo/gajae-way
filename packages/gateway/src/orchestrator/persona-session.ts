@@ -1347,8 +1347,8 @@ class OriginActor {
 		if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
-			// Schedule the next dispatch after this work completes.
-			void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+			// Schedule retry with short backoff to allow session to settle before resend.
+			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MS);
 		}
 	}
 
@@ -2398,6 +2398,11 @@ class OriginActor {
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
+		// Clean up the retry marker if it was set for this message.
+		const retryKey = `turn_submit_retry_count:${bound.turn.triggerMessageId}`;
+		if (this.#manager.database.metaGet(retryKey)) {
+			this.#manager.database.metaDelete(retryKey);
+		}
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);

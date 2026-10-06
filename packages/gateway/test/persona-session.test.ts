@@ -2406,3 +2406,75 @@ test("#424: second message during first turn finalization is steered, not sent",
 		"turn did not complete",
 	);
 });
+
+test("#424: submission-phase failure retries once, then posts failure if retry also fails", async () => {
+	// First scenario: initial submission fails, retry succeeds
+	const failures: string[] = [];
+	let attemptCount = 0;
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			attemptCount++;
+			if (attemptCount === 1) {
+				// First attempt fails with internal submission error
+				scripted.fail(input.opRef, "Prompt submission failed.", {
+					code: "internal",
+					outcome: { code: "internal", phase: "submission" },
+				});
+			} else {
+				// Second attempt (retry) succeeds
+				scripted.complete(input.opRef, "answer");
+			}
+		},
+	});
+	const activeManager = manager;
+	const activeDatabase = database;
+	await harness(port, { failure: (msg) => failures.push(msg) });
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+
+	enqueue("m-1", "test message");
+	await activeManager.notifyInbound(KEY);
+	await eventually(
+		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
+		"turn did not settle",
+	);
+
+	// Verify: no failure messages were posted (retry succeeded)
+	expect(failures).toHaveLength(0);
+	// Verify: two sends with different opRefs
+	expect(port.sends).toHaveLength(2);
+	const firstSend = port.sends[0]!;
+	const secondSend = port.sends[1]!;
+	expect(firstSend.opRef).not.toBe(secondSend.opRef); // Different opRefs
+	expect(firstSend.text).toBe("test message");
+	expect(secondSend.text).toBe("test message"); // Same content
+});
+
+test("#424: submission-phase failure posts failure if both attempts fail", async () => {
+	// Second scenario: both initial and retry fail at submission
+	const failures: string[] = [];
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			// Both attempts fail with internal submission error
+			scripted.fail(input.opRef, "Prompt submission failed.", {
+				code: "internal",
+				outcome: { code: "internal", phase: "submission" },
+			});
+		},
+	});
+	const activeManager = manager;
+	const activeDatabase = database;
+	await harness(port, { failure: (msg) => failures.push(msg) });
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+
+	enqueue("m-2", "test message");
+	await activeManager.notifyInbound(KEY);
+	await eventually(
+		() => activeDatabase.inboundTurnRow(latestOpRef)?.turn_state === "done" && activeManager.state(KEY) === "idle",
+		"turn did not settle",
+	);
+
+	// Verify: exactly one failure message was posted
+	expect(failures).toHaveLength(1);
+	// Verify: two send attempts (initial + retry)
+	expect(port.sends).toHaveLength(2);
+});
