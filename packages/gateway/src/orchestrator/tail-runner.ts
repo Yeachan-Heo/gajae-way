@@ -390,6 +390,7 @@ class ManagedTailHandle implements TailHandle {
 	#opRef: string | undefined;
 	#correlation: TurnCorrelation = {};
 	#droppedForeign = 0;
+	#streamWithRegisteredProviders: TailStream | undefined;
 	/** Map of capability -> leaseId for active provider leases */
 	#providerLeases = new Map<string, string>();
 	/** Map of leaseId -> expiresAt for tracking lease expiry */
@@ -431,6 +432,10 @@ class ManagedTailHandle implements TailHandle {
 		this.#opRef = opRef;
 		this.#correlation = { ...correlation };
 		this.#droppedForeign = 0;
+		// Register providers only on the turn-owning relay, and only once per relay
+		if (this.#stream && this.#stream !== this.#streamWithRegisteredProviders) {
+			this.#registerProviders(this.#stream);
+		}
 	}
 
 	correlate(opRef: string, correlation: TurnCorrelation): void {
@@ -595,7 +600,6 @@ class ManagedTailHandle implements TailHandle {
 					const childState = streamEnded ? "stream_ended" : "stream_open";
 					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
 				}
-				this.#registerProviders(stream);
 				if (!this.#ready) {
 					this.#ready = true;
 					this.#readyResolve();
@@ -809,6 +813,7 @@ class ManagedTailHandle implements TailHandle {
 
 	#registerProviders(stream: TailStream): void {
 		if (!this.#connectionId) return;
+		this.#streamWithRegisteredProviders = stream;
 		// Register for 'permission' capability with an ask-user method
 		const permissionId = `gw-perm-${this.brokerGeneration}-${this.sessionId}`;
 		stream.write(

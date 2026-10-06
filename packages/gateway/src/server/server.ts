@@ -1680,8 +1680,6 @@ async function handleRequest(
 		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
-		case "chat.send":
-			await sendChat(connection, request, options, runtime);
 			return;
 		case "chat.edit":
 			await editChat(connection, request, options, runtime);
