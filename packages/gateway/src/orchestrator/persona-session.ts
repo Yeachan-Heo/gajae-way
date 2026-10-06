@@ -1316,6 +1316,42 @@ class OriginActor {
 		await this.#steerPending();
 	}
 
+	/** Check if submission can be retried after a failure. */
+	async #checkSubmissionRetryConditions(bound: BoundTurn, report: StatusReport): Promise<boolean> {
+		// Only retry internal submission failures when nothing was delivered.
+		if (
+			report.status.outcome?.code !== "internal" ||
+			report.status.outcome?.phase !== "submission" ||
+			bound.replyVisible ||
+			bound.lastAssistantText !== undefined ||
+			bound.openTool
+		)
+			return false;
+		// Check if we've already attempted a retry for this message.
+		const key = `turn_submit_retry_count:${bound.turn.triggerMessageId}`;
+		const retryAttempted = this.#manager.database.metaGet(key) === "1";
+		return !retryAttempted;
+	}
+
+	/** Mark the turn for retry and prevent its settlement. */
+	async #markSubmissionForRetry(bound: BoundTurn): Promise<void> {
+		const key = `turn_submit_retry_count:${bound.turn.triggerMessageId}`;
+		this.#manager.database.metaSet(key, "1");
+		this.#manager.log(
+			`turn_submit_retry_attempt origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef}`,
+		);
+		// Requeue the trigger message for a fresh dispatch with a new attempt number.
+		// This clears the turn binding but leaves the message pending for retry.
+		this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+		// Detach the current binding so the origin can dispatch the next attempt.
+		if (this.#current === bound) {
+			this.#current = undefined;
+			this.#state = "idle";
+			// Schedule the next dispatch after this work completes.
+			void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+		}
+	}
+
 	/**
 	 * The ONE place a recorded steer acceptance is finalized: durable state
 	 * (steer done AND its platform message consumed from the unread window, in
@@ -2243,6 +2279,13 @@ class OriginActor {
 					"error",
 				);
 				failedTurnEvidence = await this.#classifyFailedTurn(bound, report);
+				// Check for submission failure retry opportunity: if nothing was delivered and
+				// this is an internal submission failure, attempt the retry once before posting failure.
+				const retryConditionsMet = await this.#checkSubmissionRetryConditions(bound, report);
+				if (retryConditionsMet) {
+					await this.#markSubmissionForRetry(bound);
+					return; // Don't settle or call onFailure; let the turn stay in queue for re-send.
+				}
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
