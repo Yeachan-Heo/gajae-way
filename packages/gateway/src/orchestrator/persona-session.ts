@@ -1318,7 +1318,7 @@ class OriginActor {
 		const retryAttempted = this.#manager.database.metaGet(key) === "1";
 		return !retryAttempted;
 	}
-	
+
 	/** Mark the turn for retry and prevent its settlement. */
 	async #markSubmissionForRetry(bound: BoundTurn): Promise<void> {
 		const key = `turn_submit_retry_count:${bound.turn.triggerMessageId}`;
@@ -2273,9 +2273,11 @@ class OriginActor {
 				}
 				// If a reply was already delivered to the user on an internal submission failure,
 				// treat the turn as successful since the user got their answer.
-				if ((bound.replyVisible || bound.lastAssistantText) && 
-					report.status.outcome?.code === "internal" && 
-					report.status.outcome?.phase === "submission") {
+				if (
+					(bound.replyVisible || bound.lastAssistantText) &&
+					report.status.outcome?.code === "internal" &&
+					report.status.outcome?.phase === "submission"
+				) {
 					const text = bound.lastAssistantText || "";
 					if (text) {
 						await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });

@@ -1196,7 +1196,7 @@ export class GatewayDatabase {
 	}
 
 	/** Repair only torn settlement state; corrupt rows are skipped and logged. */
-	workAttemptReconcile(log: (line: string) => void = console.info): number {
+	workAttemptReconcile(log: (line: string) => void = console.error): number {
 		const count = this.withTransaction(() => {
 			const rows = this.#database
 				.query<{ op_ref: string; record_json: string }, []>(
@@ -1205,7 +1205,7 @@ export class GatewayDatabase {
 				.all();
 			let reconciled = 0;
 			const skipped: string[] = [];
-			const updates: { opRef: string; next: WorkAttemptRuntime; history: any; settledAt: number }[] = [];
+			const updates: { opRef: string; next: WorkAttemptRuntime; history: LaneJobRecord; settledAt: string }[] = [];
 			// First pass: validate all rows before any updates
 			for (const row of rows) {
 				try {

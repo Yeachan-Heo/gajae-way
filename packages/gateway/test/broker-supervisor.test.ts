@@ -999,10 +999,16 @@ test("owned wedged broker is terminated and respawned with generation bump and l
 	let stallCount = 0;
 	const logs: string[] = [];
 	const changes: Array<{ generation: number; change: any }> = [];
+	const signals: Array<[number, string]> = [];
 
 	const value = client({
-		// Simulate owned broker: releaseBrokerScope is defined
+		// The releaser moved this broker out of the gateway unit: proof the gateway owns it.
 		releaseBrokerScope: async () => ({ outcome: "released" as const, scope: "broker.scope", pids: [currentPid] }),
+		signalBroker: (pid, signal) => {
+			signals.push([pid, signal]);
+			if (signal === "SIGTERM") brokerAlive = false;
+		},
+		brokerGracePeriodMs: 1,
 		isPidAlive: () => brokerAlive,
 		discovery: async () => {
 			// Return the current pid
@@ -1054,7 +1060,39 @@ test("owned wedged broker is terminated and respawned with generation bump and l
 	expect(stallChange).toBeDefined();
 	expect(stallChange?.generation).toBe(initialGeneration + 1);
 	expect(stallChange?.change?.current.pid).toBe(newPid);
+	expect(signals).toEqual([[12345, "SIGTERM"]]);
 
+	await value.stop();
+});
+
+test("a wedged broker the releaser skipped is never signalled even when a releaser exists", async () => {
+	let probeOk = true;
+	const logs: string[] = [];
+	const signals: Array<[number, string]> = [];
+	const value = client({
+		// Linux default: a releaser is always configured, but this broker was not in the gateway unit.
+		releaseBrokerScope: async () => ({ outcome: "skipped" as const, reason: "not_in_gateway_unit" }),
+		signalBroker: (pid, signal) => {
+			signals.push([pid, signal]);
+		},
+		brokerGracePeriodMs: 1,
+		isPidAlive: () => true,
+		discovery: async () => ({ pid: 22222, url: "ws://127.0.0.1:22222", token: "token", heartbeatAt: Date.now() }),
+		healthProbe: async () => probeOk,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		log: (line) => logs.push(line),
+	});
+	await value.start();
+	const initialGeneration = value.generation;
+	probeOk = false;
+	await eventually(() =>
+		logs.some((line) => line.includes("broker_stall_detected") && line.includes("action=keep_probing_shared")),
+	);
+	await Bun.sleep(50);
+	expect(signals).toEqual([]);
+	expect(logs.some((line) => line.includes("action=terminate_owned"))).toBe(false);
+	expect(value.generation).toBe(initialGeneration);
 	await value.stop();
 });
 

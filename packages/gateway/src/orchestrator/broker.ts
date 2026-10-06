@@ -113,7 +113,10 @@ export interface GlobalGjcClientOptions {
 	 * discovery record says it is live before `onLiveOutageExceeded` fires.
 	 */
 	readonly liveOutageLimitMs?: number;
+	/** Wait between SIGTERM and SIGKILL when terminating a wedged gateway-owned broker. */
 	readonly brokerGracePeriodMs?: number;
+	/** Sends a termination signal to a gateway-owned broker; defaults to `process.kill`. */
+	readonly signalBroker?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
 	/**
 	 * The broker is up but this process has not reached it for
 	 * `liveOutageLimitMs`: the fault is on the gateway side, so the owner should
@@ -318,7 +321,6 @@ export class GlobalGjcClient {
 	readonly #interval: number;
 	readonly #initialBackoff: number;
 	readonly #maxBackoff: number;
-	readonly #brokerGracePeriodOverride: number | undefined;
 	readonly #listeners = new Set<BrokerGenerationListener>();
 	readonly #children = new Set<ReturnType<SpawnFn>>();
 	readonly #terminations = new Map<ReturnType<SpawnFn>, Promise<void>>();
@@ -331,8 +333,10 @@ export class GlobalGjcClient {
 	#authorityPid: number | undefined;
 	#probeFailures = 0;
 	#stallDetected = false;
-	#ownedPids = new Map<number, string>(); // pid -> discovery identity, for real ownership tracking
-	#brokerGracePeriodMs = 2_000; // Configurable for tests, must be >= 2s
+	/** Pids proven gateway-owned: the releaser moved them out of the gateway's own unit. */
+	#ownedPids = new Set<number>();
+	readonly #brokerGracePeriodMs: number;
+	readonly #signalBroker: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
 	#available = false;
 	#stopped = false;
 	#stoppedAtEpoch: number | undefined; // When stopped due to involuntary termination failure
@@ -393,10 +397,8 @@ export class GlobalGjcClient {
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
-		this.#brokerGracePeriodOverride = options.brokerGracePeriodMs;
-		if (this.#brokerGracePeriodOverride !== undefined) {
-			this.#brokerGracePeriodMs = this.#brokerGracePeriodOverride;
-		}
+		this.#brokerGracePeriodMs = integer(options.brokerGracePeriodMs, 2_000, 1);
+		this.#signalBroker = options.signalBroker ?? ((pid, signal) => process.kill(pid, signal));
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
@@ -620,7 +622,9 @@ export class GlobalGjcClient {
 							);
 							this.#terminateWedgedOwnedBroker(discovery.pid).catch((error) => {
 								try {
-									this.#log(`broker_termination_failed pid=${discovery.pid} error=${error instanceof Error ? error.message : String(error)}`);
+									this.#log(
+										`broker_termination_failed pid=${discovery.pid} error=${error instanceof Error ? error.message : String(error)}`,
+									);
 								} catch {}
 							});
 						} else {
@@ -640,13 +644,13 @@ export class GlobalGjcClient {
 			if (identity !== this.#identity) {
 				const previous =
 					this.#authorityPid === undefined ? undefined : { pid: this.#authorityPid, generation: this.#generation };
+				// Ownership proof belongs to one broker identity; drop it before the new broker is released.
+				this.#ownedPids.clear();
 				await this.#releaseBroker(discovery.pid);
 				if (epoch !== this.#epoch || this.#stopped) return false;
 				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
 				this.#authorityPid = discovery.pid;
-				// Clear owned pids on identity change to prevent stale ownership tracking
-				this.#ownedPids.clear();
 				this.#generation++;
 				const change: BrokerAuthorityChange | undefined = previous
 					? {
@@ -688,9 +692,7 @@ export class GlobalGjcClient {
 			};
 		}
 		if (result.outcome === "released") {
-			// Record this pid as owned: the releaser actually moved it out of the gateway's systemd unit
-			const identity = `${pid}|${this.#identity ?? "unknown"}`;
-			this.#ownedPids.set(pid, identity);
+			this.#ownedPids.add(pid);
 			this.#log(`broker_scope_released pid=${pid} scope=${result.scope} processes=${result.pids.length}`);
 		} else if (result.reason.startsWith("scope_failed")) {
 			this.#log(`broker_scope_release_failed pid=${pid} reason=${result.reason}`);
@@ -714,32 +716,20 @@ export class GlobalGjcClient {
 			`broker_respawn_churn respawns=${this.recentRespawns(now)} windowMs=${BROKER_RESPAWN_WINDOW_MS} pid=${pid} generation=${this.#generation + 1}`,
 		);
 	}
-	/** Terminate a wedged owned broker with SIGTERM/SIGKILL escalation to allow respawn via normal lifecycle. */
+	/** Terminate a wedged owned broker with SIGTERM then SIGKILL so the normal lifecycle respawns it. */
 	async #terminateWedgedOwnedBroker(pid: number): Promise<void> {
-		const gracePeriod = this.#brokerGracePeriodMs;
+		const isPidAlive = this.#options.isPidAlive ?? defaultPidAlive;
 		for (const signal of ["SIGTERM", "SIGKILL"] as const) {
 			try {
-				process.kill(pid, signal);
-				// Allow sane grace period (>=2s by default) for process to respond to signal
-				await delay(gracePeriod);
-				// Check if process is still alive
-				try {
-					process.kill(pid, 0);
-					// Process still alive, continue to next signal escalation
-					continue;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-						// Process is dead
-						return;
-					}
-					// EPERM or other error means we can't verify, but continue
-					continue;
-				}
-			} catch {
-				// Signal send failed, try next escalation
-				continue;
+				this.#signalBroker(pid, signal);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+				throw error;
 			}
+			await delay(this.#brokerGracePeriodMs);
+			if (!isPidAlive(pid)) return;
 		}
+		this.#log(`broker_termination_incomplete pid=${pid}`);
 	}
 	#schedule(epoch: number): void {
 		// Continue observation after involuntary stops so the #246 guard can trigger.
