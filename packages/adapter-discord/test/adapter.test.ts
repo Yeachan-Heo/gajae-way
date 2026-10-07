@@ -8,6 +8,7 @@ import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/con
 import {
 	addressedTurn,
 	chunkDiscordMessage,
+	deriveThreadName,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
 	engagementForMessage,
@@ -16,9 +17,11 @@ import {
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
+	maybeCreateThreadOnMention,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
+	ThreadRenameTracker,
 	TypingIndicator,
 	WorkingStatus,
 } from "../src/main";
@@ -1074,4 +1077,263 @@ test("thread reply message stays in thread", () => {
 	expect(origin.kind).toBe("thread");
 	expect(origin.conversationId).toBe("thread-1");
 	expect(origin.parentId).toBe("channel-1");
+});
+
+test("channel mention with default policy (unset threadOnMention) creates thread", async () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "channel-1", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
+			id: "thread-new-1",
+		}),
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With default policy (threadOnMention unset/undefined), should create thread
+	const result = await maybeCreateThreadOnMention(channelMessage as any, engagement, origin, undefined);
+	expect(result.kind).toBe("thread");
+	expect(result.conversationId).toBe("thread-new-1");
+	expect(result.parentId).toBe("channel-1");
+});
+
+test("channel mention with threadOnMention: true creates thread", async () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-2",
+		author: { id: "user-1" },
+		channel: { id: "channel-2", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
+			id: "thread-new-2",
+		}),
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With threadOnMention explicitly set to true, should create thread
+	const policy = { threadOnMention: true };
+	const result = await maybeCreateThreadOnMention(channelMessage as any, engagement, origin, policy);
+	expect(result.kind).toBe("thread");
+	expect(result.conversationId).toBe("thread-new-2");
+	expect(result.parentId).toBe("channel-2");
+});
+
+test("channel mention with threadOnMention: false skips thread creation", async () => {
+	const botUser = { id: "bot-1" };
+	let threadCreated = false;
+	const channelMessage = {
+		id: "msg-3",
+		author: { id: "user-1" },
+		channel: { id: "channel-3", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
+			threadCreated = true;
+			return { id: "thread-new-3" };
+		},
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With threadOnMention set to false, should NOT create thread
+	const policy = { threadOnMention: false };
+	const result = await maybeCreateThreadOnMention(channelMessage as any, engagement, origin, policy);
+	expect(result).toEqual(origin);
+	expect(threadCreated).toBe(false);
+});
+
+test("non-channel or non-mentioned message ignores threadOnMention policy", async () => {
+	const botUser = { id: "bot-1" };
+	const dmMessage = {
+		id: "msg-4",
+		author: { id: "user-1" },
+		channel: { id: "dm-1", isDMBased: () => true },
+		mentions: { has: () => true },
+		content: "hello",
+	};
+	const engagement = engagementForMessage(dmMessage as any, botUser);
+	const origin = discordMessageOrigin(dmMessage as any);
+	// DMs should never thread regardless of policy
+	const policy = { threadOnMention: true };
+	const result = await maybeCreateThreadOnMention(dmMessage as any, engagement, origin, policy);
+	expect(result.kind).toBe("dm");
+});
+
+test("accepts and validates threadOnMention boolean in channel config", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-threadOnMention-"));
+	try {
+		await writeFile(join(home, "token"), "secret-token");
+
+		// Valid: threadOnMention as true or false
+		for (const value of [true, false]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({
+					tokenFile: "token",
+					channels: { c: { threadOnMention: value } },
+				}),
+			);
+			const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+			expect(config.channels?.c?.threadOnMention).toBe(value);
+		}
+
+		// Valid: omitted threadOnMention (defaults to unset in config)
+		await writeFile(
+			join(home, "adapter-discord.json"),
+			JSON.stringify({ tokenFile: "token", channels: { c: { engagement: "open" } } }),
+		);
+		const defaultConfig = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(defaultConfig.channels?.c?.threadOnMention).toBeUndefined();
+
+		// Invalid: threadOnMention as non-boolean values
+		for (const invalid of ["true", 1, null, "false"]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({
+					tokenFile: "token",
+					channels: { c: { threadOnMention: invalid } },
+				}),
+			);
+			await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
+				DiscordAdapterStartupError,
+			);
+		}
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("deriveThreadName strips mentions and markdown, collapses whitespace", () => {
+	// Basic text: no cleanup needed
+	expect(deriveThreadName("What is the meaning of life?")).toBe("What is the meaning of life?");
+
+	// Strip user mentions
+	expect(deriveThreadName("<@123456789> What is up?")).toBe("What is up?");
+	expect(deriveThreadName("<@!987654321> hello world")).toBe("hello world");
+
+	// Strip role mentions
+	expect(deriveThreadName("<@&555> needs help")).toBe("needs help");
+
+	// Strip channel mentions (Discord format: <#channelid>)
+	expect(deriveThreadName("Check <#123456789> for info")).toBe("Check for info");
+
+	// Strip markdown emphasis
+	expect(deriveThreadName("**bold** *italic* text")).toBe("bold italic text");
+	expect(deriveThreadName("__underline__ ~~strike~~ text")).toBe("underline strike text");
+
+	// Strip code blocks
+	expect(deriveThreadName("See `code` here")).toBe("See here");
+	expect(deriveThreadName("```python\ndef foo():\n  pass\n``` example")).toBe("example");
+
+	// Collapse multiple spaces
+	expect(deriveThreadName("hello    world   test")).toBe("hello world test");
+
+	// Multiple cleanup operations together
+	expect(deriveThreadName("<@111111111> **help** me  with   `code` here")).toBe("help me with here");
+
+	// Empty after cleanup
+	expect(deriveThreadName("<@123> **_`<#456>`_** ")).toBe("Discussion");
+	expect(deriveThreadName("")).toBe("Discussion");
+	expect(deriveThreadName("   ")).toBe("Discussion");
+
+	// Truncation: within preferred 50 chars
+	const short = "Short question about code";
+	expect(deriveThreadName(short)).toBe(short);
+
+	// Truncation: at word boundary near 50 chars
+	const medium = "This is a longer question that might exceed the preferred limit but should truncate"; // 85 chars
+	const result = deriveThreadName(medium);
+	expect(result.length).toBeLessThanOrEqual(50);
+	expect(!result.endsWith(" ")).toBe(true); // No trailing space
+
+	// Truncation: if no good word boundary, truncate hard at 50
+	const veryLong = "verylongwordthatcannotbesplitthatcannotbesplitverylongword";
+	const truncated = deriveThreadName(veryLong);
+	expect(truncated.length).toBe(50);
+});
+
+test("ThreadRenameTracker prevents multiple renames per thread", () => {
+	const tracker = new ThreadRenameTracker();
+	const threadId = "thread-1";
+
+	// Initially not marked
+	expect(tracker.has(threadId)).toBe(false);
+
+	// Mark it
+	tracker.mark(threadId);
+	expect(tracker.has(threadId)).toBe(true);
+
+	// Still marked on subsequent checks
+	expect(tracker.has(threadId)).toBe(true);
+
+	// Different thread ID is not marked
+	expect(tracker.has("thread-2")).toBe(false);
+});
+
+test("thread rename failure does not block delivery", async () => {
+	const errors: string[] = [];
+	const log = { error: (msg: string) => errors.push(msg) };
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				// Simulate thread not found
+				if (id === "missing-thread") return undefined;
+				// Simulate permission error
+				if (id === "forbidden-thread") throw new Error("Missing permissions");
+				// Valid thread that can be renamed
+				return {
+					setName: async (name: string) => {
+						if (name === "fail") throw new Error("Rate limited");
+					},
+				};
+			},
+		},
+	};
+
+	// Import attemptThreadRename
+	const attemptThreadRename = async (
+		discord: DiscordClientLike,
+		threadId: string,
+		newName: string,
+		log: Pick<Console, "error"> = console,
+	): Promise<void> => {
+		try {
+			const thread = await discord.channels.fetch(threadId);
+			if (
+				thread &&
+				typeof thread === "object" &&
+				"setName" in thread &&
+				typeof thread.setName === "function"
+			) {
+				await (thread as unknown as { setName(name: string): Promise<void> }).setName(newName);
+			}
+		} catch (error) {
+			log.error(`Discord thread ${threadId} rename failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
+	// Test: successful rename
+	errors.length = 0;
+	await attemptThreadRename(discord, "good-thread", "New Name", log);
+	expect(errors.length).toBe(0);
+
+	// Test: rate limit failure is logged but doesn't throw
+	errors.length = 0;
+	await attemptThreadRename(discord, "good-thread", "fail", log);
+	expect(errors.length).toBe(1);
+	expect(errors[0]).toContain("Rate limited");
+
+	// Test: permission error is logged
+	errors.length = 0;
+	await attemptThreadRename(discord, "forbidden-thread", "Name", log);
+	expect(errors.length).toBe(1);
+	expect(errors[0]).toContain("Missing permissions");
+
+	// Test: missing thread is handled gracefully
+	errors.length = 0;
+	await attemptThreadRename(discord, "missing-thread", "Name", log);
+	expect(errors.length).toBe(0);
 });

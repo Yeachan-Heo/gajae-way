@@ -10,6 +10,8 @@ export interface ChannelEngagementPolicy {
 	readonly engagement?: EngagementMode;
 	/** Unset preserves historical `open` behavior: humans use the mode, bots use the closed gate. */
 	readonly audience?: EngagementAudience;
+	/** Discord: whether to auto-thread on mention. Unset defaults to true (current behavior). */
+	readonly threadOnMention?: boolean;
 }
 
 export interface ChannelEngagementInput {

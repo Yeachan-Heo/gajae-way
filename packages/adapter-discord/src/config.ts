@@ -205,9 +205,10 @@ function validChannels(value: unknown): value is Record<string, ChannelEngagemen
 		Object.values(value).every(
 			(entry) =>
 				isObject(entry) &&
-				Object.keys(entry).every((key) => key === "engagement" || key === "audience") &&
+				Object.keys(entry).every((key) => key === "engagement" || key === "audience" || key === "threadOnMention") &&
 				(entry.engagement === undefined || ENGAGEMENT_MODES.includes(entry.engagement as never)) &&
-				(entry.audience === undefined || ENGAGEMENT_AUDIENCES.includes(entry.audience as never)),
+				(entry.audience === undefined || ENGAGEMENT_AUDIENCES.includes(entry.audience as never)) &&
+				(entry.threadOnMention === undefined || typeof entry.threadOnMention === "boolean"),
 		)
 	);
 }
