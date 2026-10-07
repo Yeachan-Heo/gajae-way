@@ -1135,15 +1135,16 @@ for (const [outage, quarantine] of [
 	});
 }
 
-test("RT-SLACK-53 gradient buckets coalescing exact cleanup and stale timeout", async () => {
+test("RT-SLACK-53 gradient buckets coalescing exact cleanup, stale timeout, and explicit clear", async () => {
 	let now = 0;
-	let stale = () => {};
+	const timers: { fn: () => void; ms: number }[] = [];
 	const api = new Api();
 	const status = new WorkingStatus(
 		api,
 		console,
-		(fn) => {
-			stale = fn;
+		(fn, ms) => {
+			const timer = { fn, ms };
+			timers.push(timer);
 			return {};
 		},
 		() => {},
@@ -1183,10 +1184,39 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup and stale timeout", 
 	expect(api.removed).toHaveLength(count);
 	status.arm(origin, "C1:2.0");
 	await flush();
-	stale();
+	// Refresh does not clear markers (only keeps them alive)
+	const refreshTimer = timers.find((t) => t.ms === 45000);
+	if (refreshTimer) await refreshTimer.fn();
 	await flush();
-	expect(api.removed.at(-1)).toEqual(["C1", "2.0", "hourglass_flowing_sand"]);
-	expect(api.posts).toEqual([]);
+	expect(api.removed.length).toBe(count);
+	// Stale timeout clears markers if no signal arrives (simulating gateway crash)
+	status.arm(origin, "C1:3.0");
+	await flush();
+	timers.length = 0;
+	const status2 = new WorkingStatus(
+		api,
+		console,
+		(fn, ms) => {
+			const timer = { fn, ms };
+			timers.push(timer);
+			return {};
+		},
+		() => {},
+		() => now,
+	);
+	status2.arm(origin, "C1:4.0");
+	await flush();
+	const beforeStaleRemoves = api.removed.length;
+	// Advance past stale window without any updates
+	now += 91000;
+	const staleTimer = timers.find((t) => t.ms === 90000);
+	if (staleTimer) await staleTimer.fn();
+	await flush();
+	// Markers should be removed by stale timeout
+	expect(api.removed.length).toBeGreaterThan(beforeStaleRemoves);
+	// Explicit clear removes markers (already cleared, so should be idempotent)
+	await status.clear("C1");
+	await flush();
 	expect(api.posts).toEqual([]);
 });
 

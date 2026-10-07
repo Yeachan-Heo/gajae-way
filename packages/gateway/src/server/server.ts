@@ -2352,7 +2352,12 @@ async function createInboundTurnLifecycle(
 	/** Heartbeats present the most recent tail observation; they never invent progress. */
 	let tailActivitySeen = false;
 	let ended = false;
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false, prompt = false) => {
+	const emitProgress = (
+		progress: { toolCalls: number; outputTokens: number },
+		final = false,
+		prompt = false,
+		fromHeartbeat = false,
+	) => {
 		lastKnown = progress;
 		const now = Date.now();
 		// A change of activity (the first tool starting, a new tool) is worth
@@ -2361,13 +2366,17 @@ async function createInboundTurnLifecycle(
 		// the interval, so a tool-per-second turn cannot become a request storm.
 		const minGap = prompt ? intervalMs / 2 : intervalMs;
 		const due = now - startedAt >= firstAfterMs && now - lastProgressAt >= minGap;
-		if (!final && (!tailActivitySeen || !due)) return;
+		if (!final && !due) return;
 		// `final` is UNCONDITIONAL. It is the adapter's only signal that the turn
 		// stopped (typing hint, "working" status), and a turn that answered fast,
 		// stayed silent, or failed before its first tail frame never announced
 		// progress - gating final on a prior announcement left Discord "typing…"
 		// for the full 330s cap after every such turn (2026-09-03, local).
-		lastProgressAt = now;
+		// Heartbeats must not consume the throttle window so that real tail activity
+		// can be announced promptly once it arrives.
+		if (!fromHeartbeat) {
+			lastProgressAt = now;
+		}
 		const payload = {
 			turnId,
 			origin,
@@ -2385,8 +2394,13 @@ async function createInboundTurnLifecycle(
 	// and polling transcript.list/usage.get cost two gjc spawns (~1s CPU each)
 	// every interval per running turn, which starved the broker health probe
 	// under load. The heartbeat now only re-presents the last tail observation.
+	//
+	// Emit from turn start (with initial 0,0 counters) to keep the adapter's
+	// stale timeout from firing during long thinking phases. The emitProgress
+	// function's `due` gate prevents spam: only emits after firstAfterMs has
+	// passed and then every intervalMs thereafter, respecting minGap.
 	const heartbeat = setInterval(() => {
-		if (tailActivitySeen) emitProgress(lastKnown);
+		emitProgress(lastKnown, false, false, true);
 	}, intervalMs);
 	const endProgress = () => {
 		if (ended) return;

@@ -15,7 +15,7 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 	expect(predicate(), message).toBe(true);
 }
 
-test("chat.progress is silent until a tail observation supplies its counters", async () => {
+test("chat.progress emits periodically from turn start even before tail frames, with real counters from tail", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-tail-progress-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -61,13 +61,20 @@ test("chat.progress is silent until a tail observation supplies its counters", a
 				verb: "chat.send",
 				params: {
 					origin: { platform: "loopback", kind: "loopback", conversationId: "tail" },
-					text: "show progress only from tail",
+					text: "emit progress from turn start",
 				},
 			})}\n`,
 		);
 		await eventually(() => port.sends.length === 1, "turn was not sent");
-		await Bun.sleep(30);
-		expect(frames.filter((frame) => frame.event === "chat.progress")).toEqual([]);
+		// Heartbeat emits immediately with initial 0,0 counters (no tail yet)
+		await eventually(
+			() =>
+				frames.some(
+					(frame) =>
+						frame.event === "chat.progress" && frame.payload.toolCalls === 0 && frame.payload.outputTokens === 0,
+				),
+			"initial heartbeat with 0,0 counters not emitted",
+		);
 
 		const send = port.sends[0]!;
 		port.emitActivity(send.sessionId, { toolCalls: 2, outputTokens: 42 });
@@ -102,6 +109,88 @@ test("chat.progress is silent until a tail observation supplies its counters", a
 		// count it again. Counters came from the activity frame (2) + one start.
 		expect(Math.max(...frames.filter((f) => f.event === "chat.progress").map((f) => f.payload.toolCalls))).toBe(3);
 		port.complete(send.opRef, "done");
+	} finally {
+		socket?.end();
+		await server.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("chat.progress without tail frames for >90s still yields periodic progress (keeps adapter stale timer alive)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-heartbeat-long-think-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
+	const server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		// Progress every 10ms for fast test
+		progress: { firstAfterMs: 0, intervalMs: 10 },
+		onStop: () => database.close(),
+	});
+	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+	const frames: any[] = [];
+	try {
+		let buffered = "";
+		socket = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					buffered += Buffer.from(data).toString();
+					const lines = buffered.split("\n");
+					buffered = lines.pop() ?? "";
+					for (const line of lines) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		await eventually(() => frames.length >= 1, "negotiation did not complete");
+		socket.write(
+			`${JSON.stringify({
+				v: "0.1",
+				type: "request",
+				id: "turn",
+				verb: "chat.send",
+				params: {
+					origin: { platform: "loopback", kind: "loopback", conversationId: "longthink" },
+					text: "model is thinking for >90s",
+				},
+			})}\n`,
+		);
+		await eventually(() => port.sends.length === 1, "turn was not sent");
+		// Clear initial frames and count from here
+		const progressFramesBefore = frames.filter((f) => f.event === "chat.progress").length;
+		// Wait for >90s worth of heartbeats (but with a short actual wait using test intervals)
+		// Collect progress frames over 100ms to simulate >90s of periodic heartbeats
+		await Bun.sleep(100);
+		const progressFramesAfter = frames.filter((f) => f.event === "chat.progress").length;
+		// Should have multiple progress frames even without tail activity
+		expect(progressFramesAfter).toBeGreaterThan(progressFramesBefore);
+		// All should have the same 0,0 counters (no tail frames)
+		const heartbeatFrames = frames
+			.filter((f) => f.event === "chat.progress" && !f.payload.final)
+			.slice(progressFramesBefore);
+		for (const frame of heartbeatFrames) {
+			expect(frame.payload.toolCalls).toBe(0);
+			expect(frame.payload.outputTokens).toBe(0);
+		}
+		// Now send final to clean up
+		const send = port.sends[0]!;
+		port.complete(send.opRef, "done");
+		await eventually(
+			() => frames.some((f) => f.event === "chat.progress" && f.payload.final),
+			"final progress not emitted",
+		);
 	} finally {
 		socket?.end();
 		await server.stop();
