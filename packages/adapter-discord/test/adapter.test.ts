@@ -8,9 +8,9 @@ import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/con
 import {
 	addressedTurn,
 	chunkDiscordMessage,
-	deriveThreadName,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
+	deriveThreadName,
 	engagementForMessage,
 	type GatewayClientLike,
 	handleModelAutocomplete,
@@ -1302,12 +1302,7 @@ test("thread rename failure does not block delivery", async () => {
 	): Promise<void> => {
 		try {
 			const thread = await discord.channels.fetch(threadId);
-			if (
-				thread &&
-				typeof thread === "object" &&
-				"setName" in thread &&
-				typeof thread.setName === "function"
-			) {
+			if (thread && typeof thread === "object" && "setName" in thread && typeof thread.setName === "function") {
 				await (thread as unknown as { setName(name: string): Promise<void> }).setName(newName);
 			}
 		} catch (error) {

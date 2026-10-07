@@ -900,11 +900,7 @@ export async function settleDiscordDelivery(
 		await gateway.request("delivery.confirm", { deliveryId });
 		// After first reply settles to a thread, rename it using a summary if available.
 		// Rename is non-blocking and failures are logged only, never blocking delivery.
-		if (
-			threadRenames &&
-			message.origin.kind === "thread" &&
-			!threadRenames.has(message.origin.conversationId)
-		) {
+		if (threadRenames && message.origin.kind === "thread" && !threadRenames.has(message.origin.conversationId)) {
 			threadRenames.mark(message.origin.conversationId);
 			// Use message.text[:100] as a topic name from the bot's reply.
 			// In the future, a cheap gateway path could provide a summary; for now,
@@ -1010,12 +1006,7 @@ async function attemptThreadRename(
 ): Promise<void> {
 	try {
 		const thread = await discord.channels.fetch(threadId);
-		if (
-			thread &&
-			typeof thread === "object" &&
-			"setName" in thread &&
-			typeof thread.setName === "function"
-		) {
+		if (thread && typeof thread === "object" && "setName" in thread && typeof thread.setName === "function") {
 			await (thread as unknown as { setName(name: string): Promise<void> }).setName(newName);
 		}
 	} catch (error) {
