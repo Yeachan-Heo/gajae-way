@@ -150,7 +150,7 @@ export type WorkParent =
 			readonly origin: OriginRef;
 			/** Trigger message ID for threading lane reports (channel root origins only). */
 			readonly triggerMessageId?: string;
-		}
+	  }
 	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
 export interface WorkAttemptOutputProof {
 	readonly opRef: string;
@@ -495,10 +495,7 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
  * Resolve the lane report origin for a persona parent. If the parent is a channel root
  * origin with a triggerMessageId, route the report to a thread instead of the channel root.
  */
-function resolveLaneReportOrigin(
-	parent: WorkParent | null,
-	admissionOriginRefJson: string,
-): string {
+function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
 	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
 
 	try {
