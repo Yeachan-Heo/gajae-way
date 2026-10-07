@@ -124,6 +124,34 @@ test("bind hold descriptions identify the wedge cause instead of reporting a bar
 	expect(hold.notice).not.toContain("Prompt submission failed");
 });
 
+test("bind hold notices explicitly identify broker index lock blocks from exit records", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-exit-"));
+	directories.push(agentDir);
+	const sdkDir = join(agentDir, "sdk");
+	await mkdir(sdkDir, { recursive: true });
+	const exitPath = join(sdkDir, "broker.exit.json");
+	const verdict: BrokerLivenessVerdict = { state: "absent" };
+
+	for (const record of [
+		{ reason: "startup-lock-blocked" },
+		{ reason: "startup-error", detail: "retained removal transition" },
+	]) {
+		await writeFile(exitPath, JSON.stringify(record));
+		const hold = await describeBindHold(verdict, "sdk bind failed", 2, agentDir);
+		expect(hold.notice).toContain("broker index lock blocked");
+		expect(hold.notice).toContain("broker exit:");
+	}
+
+	for (const record of [
+		{ reason: "normal-exit", detail: "clean shutdown" },
+		{ reason: { toString: null }, detail: { includes: "retained removal transition" } },
+	]) {
+		await writeFile(exitPath, JSON.stringify(record));
+		const hold = await describeBindHold(verdict, "sdk bind failed", 2, agentDir);
+		expect(hold.notice).not.toContain("broker index lock blocked");
+	}
+});
+
 test("poisoned create-key rotation stops at exactly three rotations and rethrows on the fourth", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-rotation-"));
 	directories.push(home);

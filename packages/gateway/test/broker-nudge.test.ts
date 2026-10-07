@@ -2,231 +2,189 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	BROKER_HEARTBEAT_TTL_MS,
-	brokerHealthArgs,
-	GlobalGjcClient,
-} from "../src/orchestrator/broker";
+import { BROKER_HEARTBEAT_TTL_MS, GlobalGjcClient } from "../src/orchestrator/broker";
 
 const directories: string[] = [];
 const clients: GlobalGjcClient[] = [];
-
 afterEach(async () => {
 	await Promise.all(clients.splice(0).map((client) => client.stop()));
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-function discovery(pid: number, heartbeatAt: number): Record<string, unknown> {
-	return {
+const healthy = { stdout: JSON.stringify({ ok: true, result: { sessions: [] } }), stderr: "", exitCode: 0 };
+
+async function fixture(state: "pid_dead" | "absent" | "heartbeat_stale", failure?: "exit" | "throw") {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-"));
+	directories.push(home);
+	const agentDir = join(home, "agent");
+	await mkdir(join(agentDir, "sdk"), { recursive: true });
+	const record = {
 		protocolVersion: 3,
 		host: "127.0.0.1",
 		url: "ws://127.0.0.1:43123",
 		token: "test-token",
-		pid,
-		heartbeatAt,
+		pid: 8123,
+		heartbeatAt: Date.now() - (state === "heartbeat_stale" ? BROKER_HEARTBEAT_TTL_MS + 1 : 0),
 	};
-}
-
-async function discoveryFile(home: string, body: unknown): Promise<string> {
-	const path = join(home, "sdk", "broker.json");
-	await mkdir(join(home, "sdk"), { recursive: true });
-	await writeFile(path, JSON.stringify(body));
-	return path;
-}
-
-function healthySessionListResponse(): { stdout: string; stderr: string; exitCode: number } {
-	return {
-		stdout: JSON.stringify({ ok: true, result: { sessions: [] } }),
-		stderr: "",
-		exitCode: 0,
-	};
-}
-
-test("nudge is sent when broker pid is dead", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-dead-"));
-	directories.push(home);
-	const agentDir = join(home, "agent");
-	const now = Date.now();
-
-	const nudgeCalls: Array<readonly string[]> = [];
+	if (state !== "absent") await writeFile(join(agentDir, "sdk", "broker.json"), JSON.stringify(record));
+	let available = true;
+	let now = 0;
+	const calls: Array<{ args: readonly string[]; priority?: string; timeoutMs?: number }> = [];
 	const logs: string[] = [];
-
-	const command = async (args: readonly string[], options?: { readonly timeoutMs?: number; readonly priority?: "interactive" | "background" }) => {
-		if (args[0] === "sdk" && args[1] === "session") {
-			nudgeCalls.push(args.slice(0, 3));
-			return healthySessionListResponse();
-		}
-		throw new Error(`unexpected command: ${args.join(" ")}`);
-	};
-
+	let completed: (() => void) | undefined;
 	const broker = new GlobalGjcClient({
 		executable: "/fake/gjc",
 		agentDir,
 		cwd: home,
-		command,
-		isPidAlive: () => false,
-		healthIntervalMs: 50,
-		readinessDelayMs: 10,
-		log: (line) => logs.push(line),
-	});
-	clients.push(broker);
-
-	// Create discovery file with dead pid
-	await discoveryFile(agentDir, discovery(8123, now));
-
-	// Start should trigger observation
-	try {
-		await broker.start();
-	} catch {
-		// Expected to fail
-	}
-
-	await Bun.sleep(150);
-
-	// Nudge should have been sent
-	const sentHealthProbes = nudgeCalls.filter((args) => args[0] === "sdk" && args[1] === "session" && args[2] === "list");
-	expect(sentHealthProbes.length).toBeGreaterThan(0);
-	const nudgeLogLines = logs.filter((l) => l.includes("broker_nudge"));
-	expect(nudgeLogLines.length).toBeGreaterThan(0);
-});
-
-test("nudge is not sent when broker is heartbeat_stale", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-stale-"));
-	directories.push(home);
-	const agentDir = join(home, "agent");
-	const now = Date.now();
-
-	const logs: string[] = [];
-
-	const command = async (args: readonly string[], options?: { readonly timeoutMs?: number; readonly priority?: "interactive" | "background" }) => {
-		if (args[0] === "sdk" && args[1] === "session" && args[2] === "list") {
-			return healthySessionListResponse();
-		}
-		throw new Error(`unexpected command: ${args.join(" ")}`);
-	};
-
-	const broker = new GlobalGjcClient({
-		executable: "/fake/gjc",
-		agentDir,
-		cwd: home,
-		command,
-		isPidAlive: () => true,
-		healthIntervalMs: 50,
-		readinessDelayMs: 10,
-		log: (line) => logs.push(line),
-	});
-	clients.push(broker);
-
-	// Create discovery file with stale heartbeat (pid alive but heartbeat old)
-	await discoveryFile(agentDir, discovery(8123, now - BROKER_HEARTBEAT_TTL_MS - 1));
-
-	try {
-		await broker.start();
-	} catch {
-		// Expected to fail
-	}
-
-	await Bun.sleep(150);
-
-	// Nudge should NOT have been sent for heartbeat_stale
-	const nudgeLogLines = logs.filter((l) => l.includes("broker_nudge"));
-	expect(nudgeLogLines.length).toBe(0);
-});
-
-test("nudge is sent when broker discovery is absent", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-absent-"));
-	directories.push(home);
-	const agentDir = join(home, "agent");
-
-	const nudgeCalls: Array<readonly string[]> = [];
-	const logs: string[] = [];
-
-	const command = async (args: readonly string[], options?: { readonly timeoutMs?: number; readonly priority?: "interactive" | "background" }) => {
-		if (args[0] === "sdk" && args[1] === "session") {
-			nudgeCalls.push(args.slice(0, 3));
-			return healthySessionListResponse();
-		}
-		throw new Error(`unexpected command: ${args.join(" ")}`);
-	};
-
-	const broker = new GlobalGjcClient({
-		executable: "/fake/gjc",
-		agentDir,
-		cwd: home,
-		command,
-		isPidAlive: () => false,
-		healthIntervalMs: 50,
-		readinessDelayMs: 10,
-		log: (line) => logs.push(line),
-	});
-	clients.push(broker);
-
-	// Create no discovery file (absent)
-	await mkdir(join(agentDir, "sdk"), { recursive: true });
-
-	try {
-		await broker.start();
-	} catch {
-		// Expected to fail
-	}
-
-	await Bun.sleep(150);
-
-	// Nudge should have been sent for absent discovery
-	const sentHealthProbes = nudgeCalls.filter((args) => args[0] === "sdk" && args[1] === "session" && args[2] === "list");
-	expect(sentHealthProbes.length).toBeGreaterThan(0);
-	const nudgeLogLines = logs.filter((l) => l.includes("broker_nudge"));
-	expect(nudgeLogLines.length).toBeGreaterThan(0);
-});
-
-test("nudge backoff prevents rapid repeated attempts", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-backoff-"));
-	directories.push(home);
-	const agentDir = join(home, "agent");
-	const now = Date.now();
-
-	const nudgeLogs: string[] = [];
-	const logs: string[] = [];
-
-	const command = async (args: readonly string[], options?: { readonly timeoutMs?: number; readonly priority?: "interactive" | "background" }) => {
-		if (args[0] === "sdk" && args[1] === "session") {
-			return healthySessionListResponse();
-		}
-		throw new Error(`unexpected command: ${args.join(" ")}`);
-	};
-
-	const broker = new GlobalGjcClient({
-		executable: "/fake/gjc",
-		agentDir,
-		cwd: home,
-		command,
-		isPidAlive: () => false,
-		healthIntervalMs: 50,
-		readinessDelayMs: 10,
+		discovery: async () => (available ? record : undefined),
+		healthProbe: () => true,
+		isPidAlive: () => state === "heartbeat_stale",
+		releaseBrokerScope: null,
+		healthIntervalMs: 2_000_000_000,
+		nudgeClock: () => now,
+		command: async (args, options) => {
+			calls.push({ args, ...options });
+			if (failure === "throw") throw new Error("launcher failed");
+			return failure === "exit" ? { ...healthy, exitCode: 1 } : healthy;
+		},
 		log: (line) => {
 			logs.push(line);
-			if (line.includes("broker_nudge")) nudgeLogs.push(line);
+			if (line.startsWith("broker_nudge_")) completed?.();
 		},
 	});
 	clients.push(broker);
+	await broker.start();
+	available = false;
+	return {
+		broker,
+		calls,
+		logs,
+		agentDir,
+		setNow(value: number) {
+			now = value;
+		},
+		async tick(expectNudge = false) {
+			const done = expectNudge
+				? new Promise<void>((resolve) => {
+						completed = resolve;
+					})
+				: undefined;
+			expect(await broker.observe()).toBe(false);
+			if (done) await done;
+			// Drain the nudge's finally handler, not a wall-clock sleep.
+			await Promise.resolve();
+			completed = undefined;
+		},
+	};
+}
 
-	await discoveryFile(agentDir, discovery(8123, now));
-
-	try {
-		await broker.start();
-	} catch {
-		// Expected to fail
+test("pid_dead gets exactly one nudge inside the window and a second at its boundary", async () => {
+	const f = await fixture("pid_dead");
+	await f.tick(true);
+	for (const now of [1, 1_000, 44_999]) {
+		f.setNow(now);
+		await f.tick();
 	}
+	expect(f.calls).toHaveLength(1);
+	expect(f.logs).toEqual(["broker_nudge_success triggered autostart"]);
+	expect(f.calls[0].args.slice(0, 3)).toEqual(["sdk", "session", "list"]);
+	expect(f.calls[0].args).toContain("--agent-dir");
+	expect(f.calls[0].args).toContain(f.agentDir);
+	expect(f.calls[0].priority).toBe("background");
+	f.setNow(45_000);
+	await f.tick(true);
+	expect(f.calls).toHaveLength(2);
+});
 
-	await Bun.sleep(200);
-	const firstWave = nudgeLogs.length;
+for (const failure of ["exit", "throw"] as const) {
+	test(`a failed nudge (${failure}) retains its backoff`, async () => {
+		const f = await fixture("pid_dead", failure);
+		await f.tick(true);
+		for (const now of [1, 20_000, 44_999]) {
+			f.setNow(now);
+			await f.tick();
+		}
+		expect(f.calls).toHaveLength(1);
+		expect(f.logs).toEqual([
+			failure === "exit" ? "broker_nudge_failed exitCode=1" : "broker_nudge_error: launcher failed",
+		]);
+		f.setNow(45_000);
+		await f.tick(true);
+		expect(f.calls).toHaveLength(2);
+	});
+}
 
-	// Wait but not long enough for 45s backoff
-	nudgeLogs.length = 0;
-	await Bun.sleep(200);
-	const secondWave = nudgeLogs.length;
+test("absent discovery gets nudged but ordinary commands stay fenced after start", async () => {
+	const f = await fixture("absent");
+	await f.tick(true);
+	await expect(f.broker.cli(["sdk", "session", "list"])).rejects.toThrow("client stopped or broker unavailable");
+	await expect(f.broker.cli(["sdk", "session", "list"], { priority: "background" })).rejects.toThrow(
+		"client stopped or broker unavailable",
+	);
+	expect(f.calls).toHaveLength(1);
+	await f.tick();
+	expect(f.calls).toHaveLength(1);
+});
 
-	// Backoff should prevent new nudges in second wave
-	// (both waves may have some due to timing, but second should be significantly less or zero)
-	expect(firstWave).toBeGreaterThan(0);
+test("heartbeat_stale never gets nudged even beyond the backoff window", async () => {
+	const f = await fixture("heartbeat_stale");
+	for (const now of [0, 1_000, 45_000, 90_000]) {
+		f.setNow(now);
+		await f.tick();
+	}
+	expect(f.calls).toHaveLength(0);
+	expect(f.logs).toEqual([]);
+	await expect(f.broker.cli(["sdk", "session", "list"])).rejects.toThrow("broker unavailable");
+});
+
+test("ordinary commands forward their priority and requested timeout to the command runner", async () => {
+	const f = await fixture("absent");
+	await f.broker.cli(["sdk", "session", "list"], { timeoutMs: 1000 });
+	await f.broker.cli(["sdk", "session", "list"], { priority: "background", timeoutMs: 2000 });
+	expect(f.calls.map((call) => call.priority)).toEqual(["interactive", "background"]);
+	expect(f.calls[0].timeoutMs).toBeGreaterThan(0);
+	expect(f.calls[0].timeoutMs).toBeLessThanOrEqual(1000);
+	expect(f.calls[1].timeoutMs).toBeGreaterThan(0);
+	expect(f.calls[1].timeoutMs).toBeLessThanOrEqual(2000);
+});
+
+test("background commands retain their two-slot cap and interactive waiters dequeue first", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-priority-"));
+	directories.push(home);
+	const calls: Array<{ name: string; priority?: string; finish: () => void }> = [];
+	const interactiveStarted = Promise.withResolvers<void>();
+	const backgroundStarted = Promise.withResolvers<void>();
+	const broker = new GlobalGjcClient({
+		executable: "/fake/gjc",
+		agentDir: join(home, "agent"),
+		cwd: home,
+		command: (args, options) =>
+			new Promise((resolve) => {
+				calls.push({ name: args[3], priority: options?.priority, finish: () => resolve(healthy) });
+				if (args[3] === "i3") interactiveStarted.resolve();
+				if (args[3] === "b3") backgroundStarted.resolve();
+			}),
+	});
+	clients.push(broker);
+	const pending = [
+		broker.cli(["sdk", "session", "get", "b1"], { priority: "background" }),
+		broker.cli(["sdk", "session", "get", "b2"], { priority: "background" }),
+		broker.cli(["sdk", "session", "get", "b3"], { priority: "background" }),
+		broker.cli(["sdk", "session", "get", "i1"]),
+		broker.cli(["sdk", "session", "get", "i2"]),
+		broker.cli(["sdk", "session", "get", "i3"]),
+	];
+	expect(calls.map((call) => call.name)).toEqual(["b1", "b2", "i1", "i2"]);
+	calls[0].finish();
+	await pending[0];
+	await interactiveStarted.promise;
+	expect(calls.map((call) => call.name)).toEqual(["b1", "b2", "i1", "i2", "i3"]);
+	expect(calls[4].priority).toBe("interactive");
+	calls[4].finish();
+	await pending[5];
+	await backgroundStarted.promise;
+	expect(calls[5].name).toBe("b3");
+	expect(calls[5].priority).toBe("background");
+	for (const call of calls) call.finish();
+	await Promise.all(pending);
 });

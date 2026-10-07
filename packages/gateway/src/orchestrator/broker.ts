@@ -94,6 +94,8 @@ export interface GlobalGjcClientOptions {
 	readonly healthProbeTimeoutMs?: number;
 	readonly readinessAttempts?: number;
 	readonly readinessDelayMs?: number;
+	/** Clock for the autostart nudge backoff; command deadlines remain wall-clock bounded. */
+	readonly nudgeClock?: () => number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
@@ -477,7 +479,8 @@ export class GlobalGjcClient {
 	async #start(epoch: number): Promise<void> {
 		const attempts = this.#options.readinessAttempts ?? 20;
 		// This one read-only SDK request may auto-start GJC through GJC's own normal lifecycle.
-		// Recovery observation below never retries launcher commands or repairs a shared daemon.
+		// Recovery observation may repeat this probe with backoff for dead/absent brokers,
+		// but never repairs shared daemon state or nudges a live, stale-heartbeat owner.
 		const discovery = await this.#discovery();
 		if (!discovery) {
 			const result = await this.cli(brokerHealthArgs(), { timeoutMs: this.#timeout });
@@ -562,6 +565,10 @@ export class GlobalGjcClient {
 			this.#timeout,
 		);
 	}
+	/** Refreshes broker availability without waiting for the next scheduled observation. */
+	async observe(): Promise<boolean> {
+		return await this.#observe(this.#epoch);
+	}
 	async #observe(epoch: number): Promise<boolean> {
 		this.#observedLiveBroker = false;
 		try {
@@ -573,9 +580,12 @@ export class GlobalGjcClient {
 				this.#observedLiveBroker = verdict.state === "live";
 				this.#unavailableReason = describeDiscoveryFailure(verdict);
 				// Nudge GJC to autostart the broker if it's absent or dead, with backoff.
-				if ((verdict.state === "absent" || (verdict.state === "wedged" && verdict.reason === "pid_dead")) &&
-					epoch === this.#epoch && !this.#stopped) {
-					await this.#nudgeBrokerAutostart();
+				if (
+					(verdict.state === "absent" || (verdict.state === "wedged" && verdict.reason === "pid_dead")) &&
+					epoch === this.#epoch &&
+					!this.#stopped
+				) {
+					this.#nudgeBrokerAutostart();
 				}
 				return false;
 			}
@@ -649,8 +659,8 @@ export class GlobalGjcClient {
 	 * discovered to be absent or dead, with backoff to avoid hammering.
 	 */
 	#nudgeBrokerAutostart(): void {
-		const now = Date.now();
-		// Check backoff: only nudge if we haven't nudged recently, or if the last nudge failed
+		const now = (this.#options.nudgeClock ?? Date.now)();
+		// Every attempt retains its backoff, even if the launcher command succeeds.
 		if (this.#lastNudgeAttemptAt !== undefined && now - this.#lastNudgeAttemptAt < this.#NUDGE_BACKOFF_MS) {
 			return;
 		}
@@ -672,22 +682,21 @@ export class GlobalGjcClient {
 		try {
 			// Send read-only session list command that bypasses availability check.
 			// This is a safe probe that triggers GJC's normal autostart mechanism.
-			const result = await this.#executeCommand(brokerHealthArgs(), this.#timeout);
+			const result = await this.#executeCommand(
+				bindAgentDir(brokerHealthArgs(), this.agentDir),
+				this.#timeout,
+				"background",
+			);
 			if (result.exitCode === 0 && isHealthySessionList(result)) {
-				// Nudge succeeded; reset the backoff timer for next failure
-				this.#lastNudgeAttemptAt = undefined;
 				this.#log(`broker_nudge_success triggered autostart`);
 			} else {
 				this.#log(`broker_nudge_failed exitCode=${result.exitCode}`);
 			}
 		} catch (error) {
-			// Failure extends the backoff (lastNudgeAttemptAt was already set)
+			// Failure retains the backoff (lastNudgeAttemptAt was already set).
 			this.#log(`broker_nudge_error: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	/**
-	 * Internal command execution with optional availability check bypass (for nudge).
-	 */
 	/**
 	 * Low-level command execution (spawn/track/terminate). Used by both #run
 	 * (with availability checks) and #executeNudge (without).
@@ -695,13 +704,11 @@ export class GlobalGjcClient {
 	async #executeCommand(
 		args: readonly string[],
 		timeout: number,
+		priority: "interactive" | "background",
 	): Promise<CliResult> {
 		const remaining = Math.max(1, timeout);
 		if (this.#options.command)
-			return await bounded(
-				this.#options.command(args, { timeoutMs: remaining, priority: "background" }),
-				remaining,
-			);
+			return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
 		const child = this.#spawn({
 			cmd: [this.executable, ...args],
 			cwd: this.#cwd,
@@ -843,9 +850,7 @@ export class GlobalGjcClient {
 		if (priority === "background") this.#backgroundInFlight++;
 		try {
 			const remaining = Math.max(1, deadline - Date.now());
-			// Note: #executeCommand handles priority internally for command mock;
-			// actual priority param is used only by #run's queue management
-			return await this.#executeCommand(args, remaining);
+			return await this.#executeCommand(args, remaining, priority);
 		} finally {
 			this.#inflight--;
 			if (priority === "background") this.#backgroundInFlight--;

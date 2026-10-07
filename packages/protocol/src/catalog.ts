@@ -817,7 +817,8 @@ export type CycleGateReason =
 	| "agent_disk_headroom"
 	| "gjc_unverified_version"
 	| "monitor_dispatch_failing"
-	| "broker_respawn_churn";
+	| "broker_respawn_churn"
+	| "broker_index_lock_blocked";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.

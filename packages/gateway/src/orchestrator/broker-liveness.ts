@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -130,16 +131,39 @@ export interface BindHoldDescription {
 	readonly brokerExitReason?: string;
 }
 
+function brokerExitRecordPaths(agentDir: string): string[] {
+	return [join(agentDir, "sdk", "broker.exit.json"), join(agentDir, "sdk", "broker.startup-exit.json")];
+}
+
+function parseBrokerExitRecord(raw: string): BrokerExitRecord | undefined {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+		return parsed as BrokerExitRecord;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Reads the broker exit record from the GJC agent directory. */
 async function readBrokerExitRecord(agentDir: string): Promise<BrokerExitRecord | undefined> {
-	const paths = [
-		join(agentDir, "sdk", "broker.exit.json"),
-		join(agentDir, "sdk", "broker.startup-exit.json"),
-	];
-	for (const path of paths) {
+	for (const path of brokerExitRecordPaths(agentDir)) {
 		try {
-			const raw = JSON.parse(await readFile(path, "utf8")) as BrokerExitRecord;
-			return raw;
+			const record = parseBrokerExitRecord(await readFile(path, "utf8"));
+			if (record) return record;
+		} catch {
+			// Try next path
+		}
+	}
+	return undefined;
+}
+
+/** Synchronous snapshot reader for the runtime-cycle projection. */
+export function readBrokerExitRecordSync(agentDir: string): unknown {
+	for (const path of brokerExitRecordPaths(agentDir)) {
+		try {
+			const record = parseBrokerExitRecord(readFileSync(path, "utf8"));
+			if (record) return record;
 		} catch {
 			// Try next path
 		}
@@ -150,7 +174,7 @@ async function readBrokerExitRecord(agentDir: string): Promise<BrokerExitRecord 
 /** Formats broker exit information for display in hold notices. */
 function describeBrokerExit(record: BrokerExitRecord | undefined): string | undefined {
 	if (!record) return undefined;
-	const reason = String(record.reason ?? "unknown");
+	const reason = typeof record.reason === "string" ? record.reason : "unknown";
 	const details: string[] = [reason];
 	if (record.path && typeof record.path === "string") details.push(`path=${record.path}`);
 	if (record.detail && typeof record.detail === "string") details.push(`detail=${record.detail}`);
@@ -158,10 +182,11 @@ function describeBrokerExit(record: BrokerExitRecord | undefined): string | unde
 }
 
 /** Detects broker_index_lock_blocked from exit record. */
-export function isBrokerIndexLockBlocked(record: BrokerExitRecord | undefined): boolean {
-	if (!record) return false;
-	const reason = String(record.reason ?? "").toLowerCase();
-	const detail = String(record.detail ?? "").toLowerCase();
+export function isBrokerIndexLockBlocked(record: unknown): boolean {
+	if (typeof record !== "object" || record === null || Array.isArray(record)) return false;
+	const candidate = record as BrokerExitRecord;
+	const reason = typeof candidate.reason === "string" ? candidate.reason.toLowerCase() : "";
+	const detail = typeof candidate.detail === "string" ? candidate.detail.toLowerCase() : "";
 	return (
 		reason.includes("startup-lock-blocked") ||
 		reason.includes("retained removal transition") ||
@@ -179,7 +204,8 @@ export async function describeBindHold(
 	const failures = `${attempts} consecutive bind failures: ${detail}`;
 	const exitRecord = agentDir ? await readBrokerExitRecord(agentDir) : undefined;
 	const brokerExitReason = describeBrokerExit(exitRecord);
-	const exitDetails = brokerExitReason ? ` (broker exit: ${brokerExitReason})` : "";
+	const exitCause = isBrokerIndexLockBlocked(exitRecord) ? "broker index lock blocked; " : "";
+	const exitDetails = brokerExitReason ? ` (${exitCause}broker exit: ${brokerExitReason})` : "";
 
 	if (verdict?.state === "wedged") {
 		const since = new Date(verdict.heartbeatAt).toISOString();
