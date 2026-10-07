@@ -1354,7 +1354,12 @@ test("typing begins for all engaged turns: overheard public-channel, mentioned g
 		async () => {},
 	);
 	const channelOrigin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
-	const threadOrigin = { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" } as const;
+	const threadOrigin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+	} as const;
 	const dmOrigin = { platform: "discord", kind: "dm", conversationId: "dm-1" } as const;
 	// Overheard channel: engaged but not mentioned (live, 2026-09-17: no typing = bug).
 	// Gateway engages, so typing should show.
