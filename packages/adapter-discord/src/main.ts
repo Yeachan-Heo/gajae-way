@@ -21,6 +21,7 @@ import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
 import {
 	adapterHome,
+	type DiscordChannelPolicy,
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
@@ -342,25 +343,33 @@ export function describeMessageEdit(
  * When a mentioned message arrives in a channel (not DM, not thread), create a thread on that message.
  * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
  * Implements Hermes-like contract: channel mention → auto-thread + new session.
+ * A channel whose policy sets `threadOnMention: false` is answered in place.
+ * The thread is named after the message; a bare mention leaves the fallback
+ * name, and the thread is renamed from the first message that says something.
  */
-async function maybeCreateThreadOnMention(
+export async function maybeCreateThreadOnMention(
 	message: DiscordInboundMessage,
 	engagement: EngagementContext,
 	origin: OriginRef,
+	policy: DiscordChannelPolicy | undefined,
+	unnamed: UnnamedThreads,
 ): Promise<OriginRef> {
 	// Only thread channel mentions: not DMs, not already in a thread, and bot must be mentioned.
 	if (origin.kind !== "channel" || !engagement.mentioned) return origin;
+	if (policy?.threadOnMention === false) return origin;
 
 	try {
+		const name = deriveThreadName(message.content);
 		// discord.js: startThread() creates a thread on this message.
 		const thread = await (
 			message as unknown as {
 				startThread(options: { name: string; autoArchiveDuration: number }): Promise<{ id: string }>;
 			}
 		).startThread({
-			name: `Discussion`,
+			name: name ?? THREAD_NAME_FALLBACK,
 			autoArchiveDuration: 1440, // 24 hours
 		});
+		if (name === undefined) unnamed.add(thread.id);
 		// Return thread origin; session key is now the thread ID.
 		return {
 			platform: "discord",
@@ -374,6 +383,73 @@ async function maybeCreateThreadOnMention(
 			`Discord thread creation failed for message ${message.id} in channel ${origin.conversationId}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 		return origin;
+	}
+}
+
+export const THREAD_NAME_FALLBACK = "Discussion";
+/** Discord allows 100; a sidebar entry stays readable at about half that. */
+const THREAD_NAME_MAX_CHARS = 50;
+
+/**
+ * A thread title from a message: mentions, custom emoji, links, code blocks and
+ * markdown markers removed, whitespace collapsed, cut at a word boundary.
+ * Undefined when nothing nameable is left (a bare mention, an image).
+ */
+export function deriveThreadName(text: string): string | undefined {
+	const cleaned = text
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/<@[!&]?\d+>|<#\d+>|<a?:\w+:\d+>/g, " ")
+		.replace(/https?:\/\/\S+/g, " ")
+		.replace(/^\s*(?:>+|#{1,3}|[-*]\s)\s*/gm, "")
+		.replace(/\*\*|__|~~|\|\||[`*]/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (cleaned === "") return undefined;
+	const chars = Array.from(cleaned);
+	if (chars.length <= THREAD_NAME_MAX_CHARS) return cleaned;
+	const head = chars.slice(0, THREAD_NAME_MAX_CHARS).join("");
+	const space = head.lastIndexOf(" ");
+	return `${(space >= head.length - 20 ? head.slice(0, space) : head).trimEnd()}…`;
+}
+
+/** Threads the adapter opened under the fallback name, still waiting for a message to name them. */
+export class UnnamedThreads {
+	readonly #ids = new Set<string>();
+	constructor(readonly limit = 1_000) {}
+
+	add(threadId: string): void {
+		this.#ids.add(threadId);
+		if (this.#ids.size > this.limit) this.#ids.delete(this.#ids.values().next().value as string);
+	}
+
+	/** Claims the one rename a thread gets; false when it is not waiting for one. */
+	take(threadId: string): boolean {
+		return this.#ids.delete(threadId);
+	}
+}
+
+/**
+ * Renames a fallback-named thread from the first message in it that has
+ * something to say. One rename per thread, never awaited by ingress: a failed
+ * rename (permissions, rate limit) is logged and the message still goes through.
+ */
+export async function nameThreadFromMessage(
+	message: DiscordInboundMessage,
+	origin: OriginRef,
+	unnamed: UnnamedThreads,
+	log: Pick<Console, "error"> = console,
+): Promise<void> {
+	if (origin.kind !== "thread") return;
+	const name = deriveThreadName(message.content);
+	if (name === undefined || !unnamed.take(origin.conversationId)) return;
+	const channel = message.channel as { setName?: (name: string) => Promise<unknown> };
+	if (typeof channel.setName !== "function") return;
+	try {
+		await channel.setName(name);
+	} catch (error) {
+		log.error(
+			`Discord thread ${origin.conversationId} rename failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }
 
@@ -1086,6 +1162,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	// The gateway serializes turns per origin, but it serializes them in arrival
 	// order, so the ordering has to be preserved here, before it hands them over.
 	const ingress = new OrderedIngress();
+	const unnamedThreads = new UnnamedThreads();
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
@@ -1100,7 +1177,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
 			// Auto-create thread on mention in channel (Hermes-like contract).
-			origin = await maybeCreateThreadOnMention(message, engagement, origin);
+			void nameThreadFromMessage(message, origin, unnamedThreads);
+			origin = await maybeCreateThreadOnMention(
+				message,
+				engagement,
+				origin,
+				config.channels?.[origin.conversationId],
+				unnamedThreads,
+			);
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the
 			// runtime rather than the persona is a standing owner instruction.

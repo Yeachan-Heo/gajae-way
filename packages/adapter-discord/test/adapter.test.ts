@@ -9,16 +9,20 @@ import {
 	chunkDiscordMessage,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
+	deriveThreadName,
 	engagementForMessage,
 	type GatewayClientLike,
 	handleModelAutocomplete,
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
+	maybeCreateThreadOnMention,
+	nameThreadFromMessage,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
 	TypingIndicator,
+	UnnamedThreads,
 	WorkingStatus,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
@@ -1188,4 +1192,269 @@ test("thread reply message stays in thread", () => {
 	expect(origin.kind).toBe("thread");
 	expect(origin.conversationId).toBe("thread-1");
 	expect(origin.parentId).toBe("channel-1");
+});
+
+test("channel mention with default policy (unset threadOnMention) creates thread", async () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "channel-1", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
+			id: "thread-new-1",
+		}),
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With default policy (threadOnMention unset/undefined), should create thread
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		undefined,
+		new UnnamedThreads(),
+	);
+	expect(result.kind).toBe("thread");
+	expect(result.conversationId).toBe("thread-new-1");
+	expect(result.parentId).toBe("channel-1");
+});
+
+test("channel mention with threadOnMention: true creates thread", async () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-2",
+		author: { id: "user-1" },
+		channel: { id: "channel-2", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
+			id: "thread-new-2",
+		}),
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With threadOnMention explicitly set to true, should create thread
+	const policy = { threadOnMention: true };
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		policy,
+		new UnnamedThreads(),
+	);
+	expect(result.kind).toBe("thread");
+	expect(result.conversationId).toBe("thread-new-2");
+	expect(result.parentId).toBe("channel-2");
+});
+
+test("channel mention with threadOnMention: false skips thread creation", async () => {
+	const botUser = { id: "bot-1" };
+	let threadCreated = false;
+	const channelMessage = {
+		id: "msg-3",
+		author: { id: "user-1" },
+		channel: { id: "channel-3", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
+			threadCreated = true;
+			return { id: "thread-new-3" };
+		},
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With threadOnMention set to false, should NOT create thread
+	const policy = { threadOnMention: false };
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		policy,
+		new UnnamedThreads(),
+	);
+	expect(result).toEqual(origin);
+	expect(threadCreated).toBe(false);
+});
+
+test("non-channel or non-mentioned message ignores threadOnMention policy", async () => {
+	const botUser = { id: "bot-1" };
+	const dmMessage = {
+		id: "msg-4",
+		author: { id: "user-1" },
+		channel: { id: "dm-1", isDMBased: () => true },
+		mentions: { has: () => true },
+		content: "hello",
+	};
+	const engagement = engagementForMessage(dmMessage as any, botUser);
+	const origin = discordMessageOrigin(dmMessage as any);
+	// DMs should never thread regardless of policy
+	const policy = { threadOnMention: true };
+	const result = await maybeCreateThreadOnMention(dmMessage as any, engagement, origin, policy, new UnnamedThreads());
+	expect(result.kind).toBe("dm");
+});
+
+test("accepts and validates threadOnMention boolean in channel config", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-threadOnMention-"));
+	try {
+		await writeFile(join(home, "token"), "secret-token");
+
+		// Valid: threadOnMention as true or false
+		for (const value of [true, false]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({
+					tokenFile: "token",
+					channels: { c: { threadOnMention: value } },
+				}),
+			);
+			const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+			expect(config.channels?.c?.threadOnMention).toBe(value);
+		}
+
+		// Valid: omitted threadOnMention (defaults to unset in config)
+		await writeFile(
+			join(home, "adapter-discord.json"),
+			JSON.stringify({ tokenFile: "token", channels: { c: { engagement: "open" } } }),
+		);
+		const defaultConfig = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(defaultConfig.channels?.c?.threadOnMention).toBeUndefined();
+
+		// Invalid: threadOnMention as non-boolean values
+		for (const invalid of ["true", 1, null, "false"]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({
+					tokenFile: "token",
+					channels: { c: { threadOnMention: invalid } },
+				}),
+			);
+			await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
+				DiscordAdapterStartupError,
+			);
+		}
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("deriveThreadName keeps the words of the message and drops Discord markup", () => {
+	expect(deriveThreadName("<@123456789> 디코는 쓰레드 파지 말고 플랫하게 대화하는 옵션 없냐")).toBe(
+		"디코는 쓰레드 파지 말고 플랫하게 대화하는 옵션 없냐",
+	);
+	expect(deriveThreadName("<@!1> <@&2> check <#3> **now**")).toBe("check now");
+	expect(deriveThreadName("fix `threadOnMention` <:gajae:42> please")).toBe("fix threadOnMention please");
+	expect(deriveThreadName("see https://example.com/x\n> quoted\n```ts\nconst a = 1;\n```")).toBe("see quoted");
+	expect(deriveThreadName("thread_on_mention stays")).toBe("thread_on_mention stays");
+});
+
+test("deriveThreadName is undefined when nothing nameable is left", () => {
+	expect(deriveThreadName("<@123>")).toBeUndefined();
+	expect(deriveThreadName("  <@123>  ```x```  ")).toBeUndefined();
+	expect(deriveThreadName("")).toBeUndefined();
+});
+
+test("deriveThreadName cuts long text at a word boundary without splitting characters", () => {
+	const long = "This is a longer question that might exceed the preferred limit but should truncate";
+	const name = deriveThreadName(long) as string;
+	expect(name).toBe("This is a longer question that might exceed the…");
+	const unbroken = "🦞".repeat(80);
+	const cut = deriveThreadName(unbroken) as string;
+	expect(Array.from(cut)).toHaveLength(51);
+	expect(cut.endsWith("🦞…")).toBe(true);
+});
+
+function threadingMessage(content: string, started: string[]) {
+	return {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "channel-1", type: 0 },
+		mentions: { has: () => true },
+		content,
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
+			started.push(name);
+			return { id: "thread-1" };
+		},
+	};
+}
+
+test("a mention opens a thread named after the message and needs no rename", async () => {
+	const started: string[] = [];
+	const message = threadingMessage("<@111> 스레드 이름 좀 바꿔줘", started);
+	const unnamed = new UnnamedThreads();
+	const engagement = engagementForMessage(message as any, { id: "111" });
+	await maybeCreateThreadOnMention(
+		message as any,
+		engagement,
+		discordMessageOrigin(message as any),
+		undefined,
+		unnamed,
+	);
+	expect(started).toEqual(["스레드 이름 좀 바꿔줘"]);
+	expect(unnamed.take("thread-1")).toBe(false);
+});
+
+test("a bare mention opens a fallback-named thread, renamed once from the first message with words", async () => {
+	const started: string[] = [];
+	const unnamed = new UnnamedThreads();
+	const trigger = threadingMessage("<@111>", started);
+	const engagement = engagementForMessage(trigger as any, { id: "111" });
+	const origin = await maybeCreateThreadOnMention(
+		trigger as any,
+		engagement,
+		discordMessageOrigin(trigger as any),
+		undefined,
+		unnamed,
+	);
+	expect(started).toEqual(["Discussion"]);
+	const renamed: string[] = [];
+	const inThread = (content: string) => ({
+		content,
+		channel: { setName: async (name: string) => void renamed.push(name) },
+	});
+	// A message with nothing nameable does not use up the rename.
+	await nameThreadFromMessage(inThread("<@111>") as any, origin, unnamed);
+	expect(renamed).toEqual([]);
+	await nameThreadFromMessage(inThread("디코 플랫 대화 옵션") as any, origin, unnamed);
+	await nameThreadFromMessage(inThread("그리고 하나 더") as any, origin, unnamed);
+	expect(renamed).toEqual(["디코 플랫 대화 옵션"]);
+});
+
+test("threads the adapter did not open are never renamed", async () => {
+	const renamed: string[] = [];
+	const origin = { platform: "discord", kind: "thread", conversationId: "human-thread", parentId: "c" } as const;
+	await nameThreadFromMessage(
+		{ content: "hello there", channel: { setName: async (name: string) => void renamed.push(name) } } as any,
+		origin,
+		new UnnamedThreads(),
+	);
+	expect(renamed).toEqual([]);
+});
+
+test("a failed thread rename is logged and does not throw", async () => {
+	const errors: string[] = [];
+	const unnamed = new UnnamedThreads();
+	unnamed.add("thread-1");
+	const origin = { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "c" } as const;
+	const failing = {
+		content: "name me",
+		channel: {
+			setName: async () => {
+				throw new Error("Missing Permissions");
+			},
+		},
+	};
+	await nameThreadFromMessage(failing as any, origin, unnamed, { error: (line: string) => void errors.push(line) });
+	expect(errors).toEqual(["Discord thread thread-1 rename failed: Missing Permissions"]);
+});
+
+test("UnnamedThreads forgets the oldest thread past its bound", () => {
+	const unnamed = new UnnamedThreads(2);
+	unnamed.add("a");
+	unnamed.add("b");
+	unnamed.add("c");
+	expect(unnamed.take("a")).toBe(false);
+	expect(unnamed.take("b")).toBe(true);
+	expect(unnamed.take("c")).toBe(true);
 });

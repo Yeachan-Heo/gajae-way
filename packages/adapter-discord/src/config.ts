@@ -56,11 +56,17 @@ export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
 
 export type StatusReactionsMode = "gradient" | "static" | "off";
 
+/** Channel policy as the Discord adapter reads it: the shared engagement fields plus Discord-only ones. */
+export interface DiscordChannelPolicy extends ChannelEngagementPolicy {
+	/** Open a thread on the message when the bot is mentioned in this channel. Unset means true. */
+	readonly threadOnMention?: boolean;
+}
+
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
-	readonly channels?: Readonly<Record<string, ChannelEngagementPolicy>>;
+	readonly channels?: Readonly<Record<string, DiscordChannelPolicy>>;
 	readonly voice?: DiscordVoiceConfig;
 	/**
 	 * Controls WorkingStatus reaction behavior:
@@ -199,15 +205,16 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validChannels(value: unknown): value is Record<string, ChannelEngagementPolicy> {
+function validChannels(value: unknown): value is Record<string, DiscordChannelPolicy> {
 	return (
 		isObject(value) &&
 		Object.values(value).every(
 			(entry) =>
 				isObject(entry) &&
-				Object.keys(entry).every((key) => key === "engagement" || key === "audience") &&
+				Object.keys(entry).every((key) => key === "engagement" || key === "audience" || key === "threadOnMention") &&
 				(entry.engagement === undefined || ENGAGEMENT_MODES.includes(entry.engagement as never)) &&
-				(entry.audience === undefined || ENGAGEMENT_AUDIENCES.includes(entry.audience as never)),
+				(entry.audience === undefined || ENGAGEMENT_AUDIENCES.includes(entry.audience as never)) &&
+				(entry.threadOnMention === undefined || typeof entry.threadOnMention === "boolean"),
 		)
 	);
 }
