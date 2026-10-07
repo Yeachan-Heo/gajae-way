@@ -21,6 +21,7 @@ import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
 import {
 	adapterHome,
+	type DiscordChannelPolicy,
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
@@ -224,22 +225,6 @@ export function resolveAuthorDisplayName(message: DiscordInboundMessage): string
 	return resolveDisplayName(message.author, message.member);
 }
 
-/**
- * Tracks which threads have been renamed after their first reply.
- * Prevents rate-limit violations by renaming at most once per thread.
- */
-export class ThreadRenameTracker {
-	readonly #renamed = new Set<string>();
-
-	has(threadId: string): boolean {
-		return this.#renamed.has(threadId);
-	}
-
-	mark(threadId: string): void {
-		this.#renamed.add(threadId);
-	}
-}
-
 /** Bounded inbound message-id memory prevents gateway replay/reconnect duplicate turns. */
 export class LruSet {
 	readonly #values = new Map<string, undefined>();
@@ -366,65 +351,36 @@ export function addressedTurn(engagement: Pick<EngagementContext, "group" | "men
 }
 
 /**
- * Derives a thread name from a message, stripping mentions, markdown, and normalizing whitespace.
- * Fallback to 'Discussion' if the result is empty.
- * Truncates to ~50 chars preferred, max 100 chars (Discord's limit).
- */
-export function deriveThreadName(text: string): string {
-	if (typeof text !== "string") return "Discussion";
-	// Strip code blocks and inline code first (```...``` and `...`)
-	// These need to come first to avoid stripping markers inside them
-	let cleaned = text.replace(/```[\s\S]*?```|`[^`]*`/g, "");
-	// Strip user/role mentions: <@!userid>, <@userid>, <@&roleid>
-	cleaned = cleaned.replace(/<@!?\d+>|<@&\d+>/g, "");
-	// Strip channel mentions: <#channelid>
-	cleaned = cleaned.replace(/<#\d+>/g, "");
-	// Strip markdown emphasis: **bold**, *italic*, __underline__, ~~strike~~
-	cleaned = cleaned.replace(/\*\*|\*|__|~~/g, "");
-	// Trim after cleanup
-	cleaned = cleaned.trim();
-	// Collapse multiple whitespace into single space
-	cleaned = cleaned.replace(/\s+/g, " ").trim();
-	// If empty after cleanup, use fallback
-	if (cleaned.length === 0) return "Discussion";
-	// Truncate to ~50 chars preferred, but allow up to 100 (Discord's limit)
-	const preferred = 50;
-	if (cleaned.length <= preferred) return cleaned;
-	// If longer than preferred, truncate at word boundary near ~50 chars
-	const truncated = cleaned.substring(0, preferred);
-	const lastSpace = truncated.lastIndexOf(" ");
-	if (lastSpace > preferred - 20) return truncated.substring(0, lastSpace);
-	return truncated;
-}
-
-/**
  * When a mentioned message arrives in a channel (not DM, not thread), create a thread on that message.
  * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
  * Implements Hermes-like contract: channel mention → auto-thread + new session.
- * Respects the per-channel threadOnMention policy (defaults to true).
+ * A channel whose policy sets `threadOnMention: false` is answered in place.
+ * The thread is named after the message; a bare mention leaves the fallback
+ * name, and the thread is renamed from the first message that says something.
  */
 export async function maybeCreateThreadOnMention(
 	message: DiscordInboundMessage,
 	engagement: EngagementContext,
 	origin: OriginRef,
-	policy: ChannelEngagementPolicy | undefined,
+	policy: DiscordChannelPolicy | undefined,
+	unnamed: UnnamedThreads,
 ): Promise<OriginRef> {
-	// Only thread channel mentions: not DMs, not already in a thread, bot must be mentioned, and threadOnMention must be enabled.
+	// Only thread channel mentions: not DMs, not already in a thread, and bot must be mentioned.
 	if (origin.kind !== "channel" || !engagement.mentioned) return origin;
-	// Check if threadOnMention is explicitly disabled (defaults to true/enabled).
 	if (policy?.threadOnMention === false) return origin;
 
 	try {
+		const name = deriveThreadName(message.content);
 		// discord.js: startThread() creates a thread on this message.
-		const threadName = deriveThreadName(message.content);
 		const thread = await (
 			message as unknown as {
 				startThread(options: { name: string; autoArchiveDuration: number }): Promise<{ id: string }>;
 			}
 		).startThread({
-			name: threadName,
+			name: name ?? THREAD_NAME_FALLBACK,
 			autoArchiveDuration: 1440, // 24 hours
 		});
+		if (name === undefined) unnamed.add(thread.id);
 		// Return thread origin; session key is now the thread ID.
 		return {
 			platform: "discord",
@@ -438,6 +394,73 @@ export async function maybeCreateThreadOnMention(
 			`Discord thread creation failed for message ${message.id} in channel ${origin.conversationId}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 		return origin;
+	}
+}
+
+export const THREAD_NAME_FALLBACK = "Discussion";
+/** Discord allows 100; a sidebar entry stays readable at about half that. */
+const THREAD_NAME_MAX_CHARS = 50;
+
+/**
+ * A thread title from a message: mentions, custom emoji, links, code blocks and
+ * markdown markers removed, whitespace collapsed, cut at a word boundary.
+ * Undefined when nothing nameable is left (a bare mention, an image).
+ */
+export function deriveThreadName(text: string): string | undefined {
+	const cleaned = text
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/<@[!&]?\d+>|<#\d+>|<a?:\w+:\d+>/g, " ")
+		.replace(/https?:\/\/\S+/g, " ")
+		.replace(/^\s*(?:>+|#{1,3}|[-*]\s)\s*/gm, "")
+		.replace(/\*\*|__|~~|\|\||[`*]/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (cleaned === "") return undefined;
+	const chars = Array.from(cleaned);
+	if (chars.length <= THREAD_NAME_MAX_CHARS) return cleaned;
+	const head = chars.slice(0, THREAD_NAME_MAX_CHARS).join("");
+	const space = head.lastIndexOf(" ");
+	return `${(space >= head.length - 20 ? head.slice(0, space) : head).trimEnd()}…`;
+}
+
+/** Threads the adapter opened under the fallback name, still waiting for a message to name them. */
+export class UnnamedThreads {
+	readonly #ids = new Set<string>();
+	constructor(readonly limit = 1_000) {}
+
+	add(threadId: string): void {
+		this.#ids.add(threadId);
+		if (this.#ids.size > this.limit) this.#ids.delete(this.#ids.values().next().value as string);
+	}
+
+	/** Claims the one rename a thread gets; false when it is not waiting for one. */
+	take(threadId: string): boolean {
+		return this.#ids.delete(threadId);
+	}
+}
+
+/**
+ * Renames a fallback-named thread from the first message in it that has
+ * something to say. One rename per thread, never awaited by ingress: a failed
+ * rename (permissions, rate limit) is logged and the message still goes through.
+ */
+export async function nameThreadFromMessage(
+	message: DiscordInboundMessage,
+	origin: OriginRef,
+	unnamed: UnnamedThreads,
+	log: Pick<Console, "error"> = console,
+): Promise<void> {
+	if (origin.kind !== "thread") return;
+	const name = deriveThreadName(message.content);
+	if (name === undefined || !unnamed.take(origin.conversationId)) return;
+	const channel = message.channel as { setName?: (name: string) => Promise<unknown> };
+	if (typeof channel.setName !== "function") return;
+	try {
+		await channel.setName(name);
+	} catch (error) {
+		log.error(
+			`Discord thread ${origin.conversationId} rename failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }
 
@@ -861,8 +884,6 @@ export async function settleDiscordDelivery(
 	status?: WorkingStatus,
 	reactions: DiscordReactionPorts = createReactionPorts(),
 	speech?: DiscordSpeechPorts,
-	threadRenames?: ThreadRenameTracker,
-	log: Pick<Console, "error"> = console,
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -898,18 +919,6 @@ export async function settleDiscordDelivery(
 		// delivery still confirms — the words arrived, which is the deliverable.
 		if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
 		await gateway.request("delivery.confirm", { deliveryId });
-		// After first reply settles to a thread, rename it using a summary if available.
-		// Rename is non-blocking and failures are logged only, never blocking delivery.
-		if (threadRenames && message.origin.kind === "thread" && !threadRenames.has(message.origin.conversationId)) {
-			threadRenames.mark(message.origin.conversationId);
-			// Use message.text[:100] as a topic name from the bot's reply.
-			// In the future, a cheap gateway path could provide a summary; for now,
-			// keeping the bot's first words is both sensible and free.
-			const topicName = message.text.substring(0, 100).replace(/\n/g, " ").trim();
-			if (topicName) {
-				void attemptThreadRename(discord, message.origin.conversationId, topicName, log);
-			}
-		}
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,
@@ -994,28 +1003,6 @@ async function resolveDeliveryChannel(
 }
 
 /**
- * Safely renames a thread after its first reply, using the bot's summary if available.
- * Failures are logged but never block delivery.
- * Discord limits renames; this is called at most once per thread.
- */
-async function attemptThreadRename(
-	discord: DiscordClientLike,
-	threadId: string,
-	newName: string,
-	log: Pick<Console, "error"> = console,
-): Promise<void> {
-	try {
-		const thread = await discord.channels.fetch(threadId);
-		if (thread && typeof thread === "object" && "setName" in thread && typeof thread.setName === "function") {
-			await (thread as unknown as { setName(name: string): Promise<void> }).setName(newName);
-		}
-	} catch (error) {
-		// Rate limit, permission error, or thread not found: log but don't fail delivery
-		log.error(`Discord thread ${threadId} rename failed: ${error instanceof Error ? error.message : String(error)}`);
-	}
-}
-
-/**
  * Posts a spoken copy of a reply as a real Discord voice message.
  *
  * Never throws: the text half of this delivery has already been sent and
@@ -1052,13 +1039,11 @@ export function subscribeDiscordDeliveries(
 	// One reaction port pair per subscription: the emoji cache and the throttle are
 	// only useful across deliveries, and a live adapter has exactly one subscription.
 	const reactions = createReactionPorts();
-	const threadRenames = new ThreadRenameTracker();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech, threadRenames, log).catch(
-			(error) =>
-				log.error(
-					`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
-				),
+		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech).catch((error) =>
+			log.error(
+				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+			),
 		);
 	});
 }
@@ -1176,6 +1161,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	// The gateway serializes turns per origin, but it serializes them in arrival
 	// order, so the ordering has to be preserved here, before it hands them over.
 	const ingress = new OrderedIngress();
+	const unnamedThreads = new UnnamedThreads();
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
@@ -1189,8 +1175,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
 			// Auto-create thread on mention in channel (Hermes-like contract).
-			const channelPolicy = config.channels?.[origin.conversationId];
-			origin = await maybeCreateThreadOnMention(message, engagement, origin, channelPolicy);
+			void nameThreadFromMessage(message, origin, unnamedThreads);
+			origin = await maybeCreateThreadOnMention(
+				message,
+				engagement,
+				origin,
+				config.channels?.[origin.conversationId],
+				unnamedThreads,
+			);
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the
 			// runtime rather than the persona is a standing owner instruction.
