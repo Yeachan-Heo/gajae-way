@@ -110,18 +110,46 @@ test("the broker supervisor exposes a discovery-file liveness seam with an injec
 	expect(await broker.judgeLiveness()).toMatchObject({ state: "wedged", reason: "heartbeat_stale" });
 });
 
-test("bind hold descriptions identify the wedge cause instead of reporting a bare prompt failure", () => {
+test("bind hold descriptions identify the wedge cause instead of reporting a bare prompt failure", async () => {
 	const verdict: BrokerLivenessVerdict = {
 		state: "wedged",
 		reason: "pid_dead",
 		pid: 9123,
 		heartbeatAt: Date.parse("2026-09-17T21:30:00.000Z"),
 	};
-	const hold = describeBindHold(verdict, "gjc sdk request failed: unavailable", BIND_WEDGE_PROBE_STRIKES);
+	const hold = await describeBindHold(verdict, "gjc sdk request failed: unavailable", BIND_WEDGE_PROBE_STRIKES);
 	expect(hold.reason).toBe("broker_wedged");
 	expect(hold.notice).toContain("sdk unavailable / broker wedged since 2026-09-17T21:30:00.000Z");
 	expect(hold.notice).toContain("pid 9123 is dead");
 	expect(hold.notice).not.toContain("Prompt submission failed");
+});
+
+test("bind hold notices explicitly identify broker index lock blocks from exit records", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-exit-"));
+	directories.push(agentDir);
+	const sdkDir = join(agentDir, "sdk");
+	await mkdir(sdkDir, { recursive: true });
+	const exitPath = join(sdkDir, "broker.exit.json");
+	const verdict: BrokerLivenessVerdict = { state: "absent" };
+
+	for (const record of [
+		{ reason: "startup-lock-blocked" },
+		{ reason: "startup-error", detail: "retained removal transition" },
+	]) {
+		await writeFile(exitPath, JSON.stringify(record));
+		const hold = await describeBindHold(verdict, "sdk bind failed", 2, agentDir);
+		expect(hold.notice).toContain("broker index lock blocked");
+		expect(hold.notice).toContain("broker exit:");
+	}
+
+	for (const record of [
+		{ reason: "normal-exit", detail: "clean shutdown" },
+		{ reason: { toString: null }, detail: { includes: "retained removal transition" } },
+	]) {
+		await writeFile(exitPath, JSON.stringify(record));
+		const hold = await describeBindHold(verdict, "sdk bind failed", 2, agentDir);
+		expect(hold.notice).not.toContain("broker index lock blocked");
+	}
 });
 
 test("poisoned create-key rotation stops at exactly three rotations and rethrows on the fourth", async () => {

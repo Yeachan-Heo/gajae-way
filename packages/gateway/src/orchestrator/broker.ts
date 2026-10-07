@@ -94,6 +94,8 @@ export interface GlobalGjcClientOptions {
 	readonly healthProbeTimeoutMs?: number;
 	readonly readinessAttempts?: number;
 	readonly readinessDelayMs?: number;
+	/** Clock for the autostart nudge backoff; command deadlines remain wall-clock bounded. */
+	readonly nudgeClock?: () => number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
@@ -342,6 +344,12 @@ export class GlobalGjcClient {
 	/** Observation times of incarnation changes after the first; bounded by the churn window. */
 	#respawns: number[] = [];
 	#churnAlerted = false;
+	/** Timestamp of last nudge attempt (when broker was absent or pid_dead). */
+	#lastNudgeAttemptAt: number | undefined;
+	/** Nudge backoff constant: 45 seconds between attempts. */
+	readonly #NUDGE_BACKOFF_MS = 45_000;
+	/** Guard nudge execution to avoid stalling observe loop. */
+	#nudgeInFlight = false;
 
 	constructor(options: GlobalGjcClientOptions = {}) {
 		this.#options = options;
@@ -471,7 +479,8 @@ export class GlobalGjcClient {
 	async #start(epoch: number): Promise<void> {
 		const attempts = this.#options.readinessAttempts ?? 20;
 		// This one read-only SDK request may auto-start GJC through GJC's own normal lifecycle.
-		// Recovery observation below never retries launcher commands or repairs a shared daemon.
+		// Recovery observation may repeat this probe with backoff for dead/absent brokers,
+		// but never repairs shared daemon state or nudges a live, stale-heartbeat owner.
 		const discovery = await this.#discovery();
 		if (!discovery) {
 			const result = await this.cli(brokerHealthArgs(), { timeoutMs: this.#timeout });
@@ -556,6 +565,10 @@ export class GlobalGjcClient {
 			this.#timeout,
 		);
 	}
+	/** Refreshes broker availability without waiting for the next scheduled observation. */
+	async observe(): Promise<boolean> {
+		return await this.#observe(this.#epoch);
+	}
 	async #observe(epoch: number): Promise<boolean> {
 		this.#observedLiveBroker = false;
 		try {
@@ -566,6 +579,14 @@ export class GlobalGjcClient {
 				const verdict = await this.judgeLiveness();
 				this.#observedLiveBroker = verdict.state === "live";
 				this.#unavailableReason = describeDiscoveryFailure(verdict);
+				// Nudge GJC to autostart the broker if it's absent or dead, with backoff.
+				if (
+					(verdict.state === "absent" || (verdict.state === "wedged" && verdict.reason === "pid_dead")) &&
+					epoch === this.#epoch &&
+					!this.#stopped
+				) {
+					this.#nudgeBrokerAutostart();
+				}
 				return false;
 			}
 			this.#observedLiveBroker = true;
@@ -630,6 +651,87 @@ export class GlobalGjcClient {
 			this.#log(`broker_scope_released pid=${pid} scope=${result.scope} processes=${result.pids.length}`);
 		else if (result.reason.startsWith("scope_failed"))
 			this.#log(`broker_scope_release_failed pid=${pid} reason=${result.reason}`);
+	}
+	/**
+	 * Sends a read-only health-check command to trigger GJC's autostart of the broker.
+	 * Fires and forgets to avoid stalling the observe loop; guarded to prevent concurrent nudges.
+	 * This bypasses the normal availability check and is only sent when the broker is
+	 * discovered to be absent or dead, with backoff to avoid hammering.
+	 */
+	#nudgeBrokerAutostart(): void {
+		const now = (this.#options.nudgeClock ?? Date.now)();
+		// Every attempt retains its backoff, even if the launcher command succeeds.
+		if (this.#lastNudgeAttemptAt !== undefined && now - this.#lastNudgeAttemptAt < this.#NUDGE_BACKOFF_MS) {
+			return;
+		}
+		// Avoid concurrent nudge executions
+		if (this.#nudgeInFlight) {
+			return;
+		}
+		this.#nudgeInFlight = true;
+		this.#lastNudgeAttemptAt = now;
+		// Fire-and-forget: do not await, do not stall observe
+		void this.#executeNudge().finally(() => {
+			this.#nudgeInFlight = false;
+		});
+	}
+	/**
+	 * Executes the nudge command, invoked fire-and-forget by #nudgeBrokerAutostart.
+	 */
+	async #executeNudge(): Promise<void> {
+		try {
+			// Send read-only session list command that bypasses availability check.
+			// This is a safe probe that triggers GJC's normal autostart mechanism.
+			const result = await this.#executeCommand(
+				bindAgentDir(brokerHealthArgs(), this.agentDir),
+				this.#timeout,
+				"background",
+			);
+			if (result.exitCode === 0 && isHealthySessionList(result)) {
+				this.#log(`broker_nudge_success triggered autostart`);
+			} else {
+				this.#log(`broker_nudge_failed exitCode=${result.exitCode}`);
+			}
+		} catch (error) {
+			// Failure retains the backoff (lastNudgeAttemptAt was already set).
+			this.#log(`broker_nudge_error: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	/**
+	 * Low-level command execution (spawn/track/terminate). Used by both #run
+	 * (with availability checks) and #executeNudge (without).
+	 */
+	async #executeCommand(
+		args: readonly string[],
+		timeout: number,
+		priority: "interactive" | "background",
+	): Promise<CliResult> {
+		const remaining = Math.max(1, timeout);
+		if (this.#options.command)
+			return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
+		const child = this.#spawn({
+			cmd: [this.executable, ...args],
+			cwd: this.#cwd,
+			env: this.#env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		this.#track(child);
+		try {
+			const [stdout, stderr, exitCode] = await bounded(
+				Promise.all([
+					new Response(child.stdout as ReadableStream).text(),
+					new Response(child.stderr as ReadableStream).text(),
+					child.exited,
+				]),
+				remaining,
+			);
+			return { stdout, stderr, exitCode };
+		} catch (error) {
+			await this.#terminate(child);
+			throw error;
+		}
 	}
 	#noteRespawn(pid: number): void {
 		const now = Date.now();
@@ -748,31 +850,7 @@ export class GlobalGjcClient {
 		if (priority === "background") this.#backgroundInFlight++;
 		try {
 			const remaining = Math.max(1, deadline - Date.now());
-			if (this.#options.command)
-				return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
-			const child = this.#spawn({
-				cmd: [this.executable, ...args],
-				cwd: this.#cwd,
-				env: this.#env,
-				stdin: "ignore",
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			this.#track(child);
-			try {
-				const [stdout, stderr, exitCode] = await bounded(
-					Promise.all([
-						new Response(child.stdout as ReadableStream).text(),
-						new Response(child.stderr as ReadableStream).text(),
-						child.exited,
-					]),
-					remaining,
-				);
-				return { stdout, stderr, exitCode };
-			} catch (error) {
-				await this.#terminate(child);
-				throw error;
-			}
+			return await this.#executeCommand(args, remaining, priority);
 		} finally {
 			this.#inflight--;
 			if (priority === "background") this.#backgroundInFlight--;
