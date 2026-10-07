@@ -1071,6 +1071,7 @@ export const VERBS_V01 = [
 	"work.retire",
 	"chat.react",
 	"engagement.reaction",
+	"engagement.panel_response",
 	"gateway.reloadConfig",
 	"ops.cycle",
 ] as const;
