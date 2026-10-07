@@ -26,7 +26,7 @@ export interface CredentialFileReference {
 export type GjcModelSelection = string | { readonly preset: string };
 
 /** Upper bound on concurrently bound `work.run` lanes; more are refused with `lane_capacity`. */
-export const DEFAULT_WORK_MAX_LANES = 8;
+export const DEFAULT_WORK_MAX_LANES = 4;
 /** A bound worker lane quiet for this long is closed by the sweep and rebound on its next run. */
 export const DEFAULT_WORK_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const WORK_IDLE_RETIRE_MIN_MS = 60_000;

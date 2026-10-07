@@ -1,7 +1,15 @@
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 /** Process-table seam used when judging the daemon that published discovery. */
 export type PidAliveProbe = (pid: number) => boolean | Promise<boolean>;
+
+interface BrokerExitRecord {
+	readonly reason?: unknown;
+	readonly path?: unknown;
+	readonly detail?: unknown;
+	[key: string]: unknown;
+}
 
 /** gjc's own discovery heartbeat TTL. */
 export const BROKER_HEARTBEAT_TTL_MS = 15_000;
@@ -119,15 +127,60 @@ export async function judgeBrokerLiveness(
 export interface BindHoldDescription {
 	readonly reason: "broker_wedged" | "broker_discovery_absent" | "sdk_unavailable";
 	readonly notice: string;
+	readonly brokerExitReason?: string;
+}
+
+/** Reads the broker exit record from the GJC agent directory. */
+async function readBrokerExitRecord(agentDir: string): Promise<BrokerExitRecord | undefined> {
+	const paths = [
+		join(agentDir, "sdk", "broker.exit.json"),
+		join(agentDir, "sdk", "broker.startup-exit.json"),
+	];
+	for (const path of paths) {
+		try {
+			const raw = JSON.parse(await readFile(path, "utf8")) as BrokerExitRecord;
+			return raw;
+		} catch {
+			// Try next path
+		}
+	}
+	return undefined;
+}
+
+/** Formats broker exit information for display in hold notices. */
+function describeBrokerExit(record: BrokerExitRecord | undefined): string | undefined {
+	if (!record) return undefined;
+	const reason = String(record.reason ?? "unknown");
+	const details: string[] = [reason];
+	if (record.path && typeof record.path === "string") details.push(`path=${record.path}`);
+	if (record.detail && typeof record.detail === "string") details.push(`detail=${record.detail}`);
+	return details.join(" ");
+}
+
+/** Detects broker_index_lock_blocked from exit record. */
+export function isBrokerIndexLockBlocked(record: BrokerExitRecord | undefined): boolean {
+	if (!record) return false;
+	const reason = String(record.reason ?? "").toLowerCase();
+	const detail = String(record.detail ?? "").toLowerCase();
+	return (
+		reason.includes("startup-lock-blocked") ||
+		reason.includes("retained removal transition") ||
+		detail.includes("retained removal transition")
+	);
 }
 
 /** Builds the single-line operator/user-facing notice for a pending bind hold. */
-export function describeBindHold(
+export async function describeBindHold(
 	verdict: BrokerLivenessVerdict | undefined,
 	detail: string,
 	attempts: number,
-): BindHoldDescription {
+	agentDir?: string,
+): Promise<BindHoldDescription> {
 	const failures = `${attempts} consecutive bind failures: ${detail}`;
+	const exitRecord = agentDir ? await readBrokerExitRecord(agentDir) : undefined;
+	const brokerExitReason = describeBrokerExit(exitRecord);
+	const exitDetails = brokerExitReason ? ` (broker exit: ${brokerExitReason})` : "";
+
 	if (verdict?.state === "wedged") {
 		const since = new Date(verdict.heartbeatAt).toISOString();
 		const why =
@@ -136,16 +189,19 @@ export function describeBindHold(
 				: `daemon pid ${verdict.pid} stopped heartbeating`;
 		return {
 			reason: "broker_wedged",
-			notice: `[turn held] sdk unavailable / broker wedged since ${since} (${why}; ${failures}). Retrying in the background.`,
+			notice: `[turn held] sdk unavailable / broker wedged since ${since} (${why}; ${failures})${exitDetails}. Retrying in the background.`,
+			brokerExitReason,
 		};
 	}
 	if (verdict?.state === "absent")
 		return {
 			reason: "broker_discovery_absent",
-			notice: `[turn held] sdk unavailable / broker discovery absent (${failures}). Retrying in the background.`,
+			notice: `[turn held] sdk unavailable / broker discovery absent (${failures})${exitDetails}. Retrying in the background.`,
+			brokerExitReason,
 		};
 	return {
 		reason: "sdk_unavailable",
-		notice: `[turn held] sdk unavailable (broker daemon ${verdict ? "is live" : "liveness unknown"}; ${failures}). Retrying in the background.`,
+		notice: `[turn held] sdk unavailable (broker daemon ${verdict ? "is live" : "liveness unknown"}; ${failures})${exitDetails}. Retrying in the background.`,
+		brokerExitReason,
 	};
 }

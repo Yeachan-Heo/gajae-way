@@ -110,14 +110,14 @@ test("the broker supervisor exposes a discovery-file liveness seam with an injec
 	expect(await broker.judgeLiveness()).toMatchObject({ state: "wedged", reason: "heartbeat_stale" });
 });
 
-test("bind hold descriptions identify the wedge cause instead of reporting a bare prompt failure", () => {
+test("bind hold descriptions identify the wedge cause instead of reporting a bare prompt failure", async () => {
 	const verdict: BrokerLivenessVerdict = {
 		state: "wedged",
 		reason: "pid_dead",
 		pid: 9123,
 		heartbeatAt: Date.parse("2026-09-17T21:30:00.000Z"),
 	};
-	const hold = describeBindHold(verdict, "gjc sdk request failed: unavailable", BIND_WEDGE_PROBE_STRIKES);
+	const hold = await describeBindHold(verdict, "gjc sdk request failed: unavailable", BIND_WEDGE_PROBE_STRIKES);
 	expect(hold.reason).toBe("broker_wedged");
 	expect(hold.notice).toContain("sdk unavailable / broker wedged since 2026-09-17T21:30:00.000Z");
 	expect(hold.notice).toContain("pid 9123 is dead");

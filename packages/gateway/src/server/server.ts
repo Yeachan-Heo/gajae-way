@@ -552,6 +552,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		port: sessionPort,
 		instanceId: options.database.instanceId,
 		repo: workspace,
+		brokerAgentDir: options.broker?.agentDir,
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
