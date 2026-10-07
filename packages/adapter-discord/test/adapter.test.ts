@@ -18,12 +18,12 @@ import {
 	isPresenceReaction,
 	LruSet,
 	maybeCreateThreadOnMention,
+	nameThreadFromMessage,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
-	UnnamedThreads,
-	nameThreadFromMessage,
 	TypingIndicator,
+	UnnamedThreads,
 	WorkingStatus,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
@@ -1095,7 +1095,13 @@ test("channel mention with default policy (unset threadOnMention) creates thread
 	const engagement = engagementForMessage(channelMessage as any, botUser);
 	const origin = discordMessageOrigin(channelMessage as any);
 	// With default policy (threadOnMention unset/undefined), should create thread
-	const result = await maybeCreateThreadOnMention(channelMessage as any, engagement, origin, undefined, new UnnamedThreads());
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		undefined,
+		new UnnamedThreads(),
+	);
 	expect(result.kind).toBe("thread");
 	expect(result.conversationId).toBe("thread-new-1");
 	expect(result.parentId).toBe("channel-1");
@@ -1117,7 +1123,13 @@ test("channel mention with threadOnMention: true creates thread", async () => {
 	const origin = discordMessageOrigin(channelMessage as any);
 	// With threadOnMention explicitly set to true, should create thread
 	const policy = { threadOnMention: true };
-	const result = await maybeCreateThreadOnMention(channelMessage as any, engagement, origin, policy, new UnnamedThreads());
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		policy,
+		new UnnamedThreads(),
+	);
 	expect(result.kind).toBe("thread");
 	expect(result.conversationId).toBe("thread-new-2");
 	expect(result.parentId).toBe("channel-2");
@@ -1141,7 +1153,13 @@ test("channel mention with threadOnMention: false skips thread creation", async 
 	const origin = discordMessageOrigin(channelMessage as any);
 	// With threadOnMention set to false, should NOT create thread
 	const policy = { threadOnMention: false };
-	const result = await maybeCreateThreadOnMention(channelMessage as any, engagement, origin, policy, new UnnamedThreads());
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		policy,
+		new UnnamedThreads(),
+	);
 	expect(result).toEqual(origin);
 	expect(threadCreated).toBe(false);
 });
@@ -1252,7 +1270,13 @@ test("a mention opens a thread named after the message and needs no rename", asy
 	const message = threadingMessage("<@111> 스레드 이름 좀 바꿔줘", started);
 	const unnamed = new UnnamedThreads();
 	const engagement = engagementForMessage(message as any, { id: "111" });
-	await maybeCreateThreadOnMention(message as any, engagement, discordMessageOrigin(message as any), undefined, unnamed);
+	await maybeCreateThreadOnMention(
+		message as any,
+		engagement,
+		discordMessageOrigin(message as any),
+		undefined,
+		unnamed,
+	);
 	expect(started).toEqual(["스레드 이름 좀 바꿔줘"]);
 	expect(unnamed.take("thread-1")).toBe(false);
 });
