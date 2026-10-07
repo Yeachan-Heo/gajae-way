@@ -339,17 +339,6 @@ export function describeMessageEdit(
 }
 
 /**
- * True when the persona was addressed: a DM, or a group message that mentions
- * it (an `open` channel promotes every human message to a mention, so it is
- * covered here too). Only addressed turns show presence - typing, the
- * "working…" post - before the reply lands; an overheard public-channel turn
- * stays invisible until it actually says something.
- */
-export function addressedTurn(engagement: Pick<EngagementContext, "group" | "mentioned">): boolean {
-	return !engagement.group || engagement.mentioned;
-}
-
-/**
  * When a mentioned message arrives in a channel (not DM, not thread), create a thread on that message.
  * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
  * Implements Hermes-like contract: channel mention → auto-thread + new session.
@@ -620,16 +609,18 @@ export class WorkingStatus {
 
 	#shouldShowReactions(conversationId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): boolean {
 		if (this.#statusReactionsMode === "off") return false;
-		if (this.#statusReactionsMode !== undefined) return true;
 		if (!engagement) return false;
 		if (this.#channels[conversationId]?.audience === "bot-only") return false;
-		return !engagement.group;
+		// Show status reactions for all engaged turns: DMs, channels, threads, mention or not.
+		// The gateway's engagement decision is authoritative. Only 'off' mode can disable.
+		return true;
 	}
 
 	/**
-	 * An addressed turn was accepted for `messageId` in `conversationId`. The
+	 * An engaged turn was accepted for `messageId` in `conversationId`. The
 	 * queued marker goes on immediately; it is the room's only sign the message
-	 * was seen until the first progress tick. Best-effort, never awaited.
+	 * was seen until the first progress tick. When a new message is armed in the
+	 * same conversation, prior presence markers are cleaned up. Best-effort, never awaited.
 	 */
 	arm(conversationId: string, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): void {
 		const prior = this.#entries.get(conversationId);
@@ -1854,7 +1845,7 @@ export class ReconnectingGateway {
 					// Acknowledged: drop it unless a newer edit of the same message
 					// was queued behind this one meanwhile.
 					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
-					if (result?.engaged && addressedTurn(edit.engagement)) {
+					if (result?.engaged) {
 						this.status?.arm(edit.origin.conversationId, edit.messageId, edit.engagement);
 						this.typing?.begin(edit.origin.conversationId);
 					}
@@ -1946,11 +1937,11 @@ export class ReconnectingGateway {
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
-				// Presence hints are shown only where the persona was ADDRESSED: a DM,
-				// an explicit mention, or an `open` channel's promotion (all three are
-				// `mentioned` by the time engagement is built). A public channel the
-				// persona merely overhears shows nothing until the reply itself lands.
-				if (result?.engaged && addressedTurn(engagement)) {
+				// The gateway's engagement decision is authoritative: show presence for every
+				// turn it admits to run, including un-mentioned thread follow-ups and open
+				// channels (live, 2026-09-17: un-mentioned thread reply showed no typing).
+				// Only explicit config (statusReactions 'off') may disable presence.
+				if (result?.engaged) {
 					this.status?.arm(origin.conversationId, messageId, engagement);
 					this.typing?.begin(origin.conversationId);
 				}

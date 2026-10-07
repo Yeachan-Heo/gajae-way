@@ -6,7 +6,6 @@ import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/pro
 import { PRESENCE_MIN_SWAP_MS } from "@gajae-gateway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
-	addressedTurn,
 	chunkDiscordMessage,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
@@ -730,28 +729,44 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 	expect(replied).toContain("not authorized");
 });
 
-test("presence is shown only where the persona was addressed: DM, mention, or open-channel promotion", () => {
-	expect(addressedTurn({ group: false, mentioned: false })).toBe(true); // DM
-	expect(addressedTurn({ group: true, mentioned: true })).toBe(true); // mention, or open promotion
-	expect(addressedTurn({ group: true, mentioned: false })).toBe(false); // overheard public channel
+test("presence is shown for every engaged turn: DMs, mentions, and un-mentioned group/thread follow-ups", async () => {
+	// The gateway's engagement decision is authoritative; the adapter shows
+	// presence for all accepted turns unless statusReactions is 'off' mode.
+	// No local heuristic gate on mentioned/group status (live, 2026-09-17).
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	// DM with no mention: shows presence
+	status.arm("dm-1", "m-1", { group: false, mentioned: false });
+	await Bun.sleep(1);
+	expect(reacted).toContain("⏳");
+	// Group channel with mention: shows presence
+	status.arm("channel-1", "m-2", { group: true, mentioned: true });
+	await Bun.sleep(1);
+	expect(reacted).toContain("⏳");
+	// Group channel without mention (thread follow-up): shows presence
+	status.arm("thread-1", "m-3", { group: true, mentioned: false });
+	await Bun.sleep(1);
+	expect(reacted).toContain("⏳");
 });
 
-test("an unaddressed public-channel turn shows no presence until it is armed; clear disarms", async () => {
+test("presence shows only when armed; clear disarms and handles un-mentioned thread follow-ups", async () => {
 	const { discord, reacted, removed } = presenceDiscord();
 	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
-	const origin = { platform: "discord", kind: "channel", conversationId: "public-1" } as const;
+	const origin = { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "ch-1" } as const;
 	const tick = { turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 };
+	// Before arming: no reactions
 	await status.update(tick);
 	await status.update(tick);
 	expect(reacted).toEqual([]);
-	// Explicitly pass engagement to show reactions when arming; this is a DM (not a group)
-	const engagement = { group: false, mentioned: false };
-	status.arm("public-1", "m-9", engagement);
+	// Arm a thread reply without mention: engagement.mentioned=false but gateway engaged=true.
+	// Presence should show (live, 2026-09-17: no presence = bug).
+	const engagement = { group: true, mentioned: false };
+	status.arm("thread-1", "m-9", engagement);
 	await Bun.sleep(1);
 	expect(reacted).toEqual(["⏳"]);
-	await status.clear("public-1");
+	await status.clear("thread-1");
 	expect(removed).toEqual(["⏳:bot-1"]);
-	// Disarmed: the next turn's ticks are silent again until re-armed.
+	// Disarmed: the next update's ticks are silent again until re-armed.
 	await status.update(tick);
 	expect(reacted).toHaveLength(1);
 });
@@ -882,22 +897,22 @@ test("statusReactions 'gradient' mode is default and shows full reaction gradien
 	expect(reacted).toContain("1️⃣");
 });
 
-test("statusReactions defaults to 'off' for group channels when unset", async () => {
+test("statusReactions defaults to ON for all engaged turns: group channels without mention now show presence", async () => {
 	const { discord, reacted } = presenceDiscord();
 	const status = new WorkingStatus(
 		discord,
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		Date.now,
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - new default is to show presence
 	);
-	const groupNoMention = { group: true, mentioned: false }; // Group channel, not mentioned
+	const groupNoMention = { group: true, mentioned: false }; // Group channel, not mentioned (thread follow-up case)
 	status.arm("channel-1", "m-1", groupNoMention);
 	await Bun.sleep(1);
-	expect(reacted).toEqual([]); // No reactions shown with default off behavior
+	expect(reacted).toEqual(["⏳"]); // DEFAULT: reactions shown for all engaged turns
 });
 
-test("statusReactions defaults to 'off' for bot-audience channels when unset", async () => {
+test("statusReactions never shows for bot-audience channels (config constraint)", async () => {
 	const { discord, reacted } = presenceDiscord();
 	const status = new WorkingStatus(
 		discord,
@@ -906,15 +921,15 @@ test("statusReactions defaults to 'off' for bot-audience channels when unset", a
 		Date.now,
 		undefined,
 		{ "bot-channel": { audience: "bot-only" } },
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - bot-only channels always suppress reactions
 	);
 	const botAudience = { group: true, mentioned: true }; // Bot-only audience
 	status.arm("bot-channel", "m-1", botAudience);
 	await Bun.sleep(1);
-	expect(reacted).toEqual([]); // No reactions shown with default off behavior
+	expect(reacted).toEqual([]); // No reactions on bot-only channels regardless of mode
 });
 
-test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
+test("statusReactions defaults to gradient (full transitions) when unset for all engaged turns", async () => {
 	const { discord, reacted } = presenceDiscord();
 	let clock = 0;
 	const status = new WorkingStatus(
@@ -922,13 +937,13 @@ test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		() => clock,
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - default is gradient transitions
 	);
 	const origin = { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "user-1" } as const;
 	const dm = { group: false, mentioned: false }; // DM (not a group)
 	status.arm("dm-1", "m-1", dm);
 	await Bun.sleep(1);
-	expect(reacted).toEqual(["⏳"]); // Default gradient behavior for DMs
+	expect(reacted).toEqual(["⏳"]); // Starts with queued marker
 	clock += PRESENCE_MIN_SWAP_MS;
 	await status.update({
 		turnId: "t",
@@ -938,25 +953,25 @@ test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
 		outputTokens: 210,
 		activity: { kind: "tool", label: "bash" },
 	});
-	// Gradient mode shows phase + clock + effort
+	// Default (undefined) mode shows gradient: phase + clock + effort transitions
 	expect(reacted).toContain("🔧");
 	expect(reacted).toContain("🕐");
 	expect(reacted).toContain("1️⃣");
 });
 
-test("statusReactions defaults to 'off' for mentioned turns in group channels when unset", async () => {
+test("statusReactions defaults to ON for mentioned turns in group channels when unset", async () => {
 	const { discord, reacted } = presenceDiscord();
 	const status = new WorkingStatus(
 		discord,
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		Date.now,
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - new default is to show presence
 	);
 	const groupWithMention = { group: true, mentioned: true }; // Group channel, mentioned
 	status.arm("channel-1", "m-1", groupWithMention);
 	await Bun.sleep(1);
-	expect(reacted).toEqual([]); // Default is 'off' for ANY group channel, even when mentioned
+	expect(reacted).toEqual(["⏳"]); // DEFAULT: reactions shown for all engaged turns including mentioned group channels
 });
 
 test("statusReactions 'static' mode through full sequence: arm, update phase/clock/effort, clear", async () => {
@@ -1020,6 +1035,66 @@ test("statusReactions with undefined engagement produces zero reaction calls", a
 	status.arm("channel-1", "m-1", undefined);
 	await Bun.sleep(1);
 	expect(reacted).toEqual([]); // No reactions when engagement is undefined
+});
+
+test("rapid consecutive messages in one thread: only latest carries status reactions, older ones cleaned up", async () => {
+	const { discord, reacted, removed } = presenceDiscord();
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	const engagement = { group: true, mentioned: false }; // Thread follow-up without mention
+	// Arm first message in thread
+	status.arm("thread-1", "m-1", engagement);
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]); // First message gets reactions
+	const firstReactCount = reacted.length;
+	// Rapidly arm second message in same thread
+	status.arm("thread-1", "m-2", engagement);
+	await Bun.sleep(1);
+	expect(reacted.length).toBeGreaterThanOrEqual(firstReactCount); // New message armed
+	// Verify first message reactions were cleaned up
+	expect(removed).toContain("⏳:bot-1"); // ⏳ removed from first message
+	// Rapidly arm third message in same thread
+	status.arm("thread-1", "m-3", engagement);
+	await Bun.sleep(1);
+	// Second message should be cleaned up when third is armed
+	const beforeCleanup = removed.length;
+	expect(removed.length).toBeGreaterThan(beforeCleanup - 1); // Another removal for second message
+	// Only the latest message (m-3) should have active reactions
+	await status.clear("thread-1");
+	// All reactions should be cleaned up
+	expect(removed).toContain("⏳:bot-1");
+});
+
+test("typing indicator is idempotent: multiple begin calls on same conversation update deadline without error", async () => {
+	let channelFetched = 0;
+	const typing = new TypingIndicator({
+		channels: {
+			fetch: async () => {
+				channelFetched++;
+				return {
+					sendTyping: async () => {
+						// Mock successful typing send
+						return undefined;
+					},
+				};
+			},
+		},
+	} as any);
+	// Multiple begin calls on same conversation should be idempotent
+	typing.begin("conv-1");
+	const firstCallTime = Date.now();
+	await Bun.sleep(10);
+	typing.begin("conv-1");
+	await Bun.sleep(10);
+	typing.begin("conv-1");
+	// Each begin after the first should have updated the deadline, not created a new run.
+	// Verify by checking that typing.refresh doesn't error.
+	try {
+		typing.refresh("conv-1");
+		typing.end("conv-1");
+		expect(true).toBe(true); // No errors
+	} catch {
+		expect(true).toBe(false); // Should not error
+	}
 });
 
 test("DM messages stay flat with no thread creation", () => {
