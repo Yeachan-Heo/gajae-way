@@ -350,6 +350,45 @@ export function addressedTurn(engagement: Pick<EngagementContext, "group" | "men
 }
 
 /**
+ * When a mentioned message arrives in a channel (not DM, not thread), create a thread on that message.
+ * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
+ * Implements Hermes-like contract: channel mention → auto-thread + new session.
+ */
+async function maybeCreateThreadOnMention(
+	message: DiscordInboundMessage,
+	engagement: EngagementContext,
+	origin: OriginRef,
+): Promise<OriginRef> {
+	// Only thread channel mentions: not DMs, not already in a thread, and bot must be mentioned.
+	if (origin.kind !== "channel" || !engagement.mentioned) return origin;
+
+	try {
+		// discord.js: startThread() creates a thread on this message.
+		const thread = await (
+			message as unknown as {
+				startThread(options: { name: string; autoArchiveDuration: number }): Promise<{ id: string }>;
+			}
+		).startThread({
+			name: `Discussion`,
+			autoArchiveDuration: 1440, // 24 hours
+		});
+		// Return thread origin; session key is now the thread ID.
+		return {
+			platform: "discord",
+			kind: "thread",
+			conversationId: thread.id,
+			parentId: origin.conversationId,
+		};
+	} catch (error) {
+		// Thread creation failed (permissions, rate limits, etc.); continue with channel origin.
+		console.error(
+			`Discord thread creation failed for message ${message.id} in channel ${origin.conversationId}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return origin;
+	}
+}
+
+/**
  * Preserves arrival order per conversation across asynchronous ingress work.
  *
  * Transcribing a voice message takes a network round-trip, so a short text
@@ -1054,10 +1093,12 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		// forwarding content alone dropped the message without a trace.
 		const rendered = describeInboundBody(message);
 		if (rendered === "") return;
-		const origin = discordMessageOrigin(message);
+		let origin = discordMessageOrigin(message);
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
+			// Auto-create thread on mention in channel (Hermes-like contract).
+			origin = await maybeCreateThreadOnMention(message, engagement, origin);
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the
 			// runtime rather than the persona is a standing owner instruction.

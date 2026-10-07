@@ -19,6 +19,7 @@ import { type MentionDirectory, repairMentions } from "./mentions";
 import { chunkSlackMessage, markdownToMrkdwn } from "./mrkdwn";
 import {
 	isSlackDmChannel,
+	maybeThreadOnMention,
 	parseSlackMessageId,
 	type SlackMessageOriginShape,
 	slackMessageId,
@@ -869,14 +870,16 @@ export async function startSlackAdapter(
 				const text = renderInboundText(message, directory);
 				if (text === "") return;
 				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+				// Auto-thread on mention in channel (Hermes-like contract: channel mention → thread + new session).
+				const origin = maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
 				const result = await gateway.requestInbound(
 					slackMessageId(message.channel, message.ts),
-					admitted.origin,
+					origin,
 					text,
 					engagement,
 					timestamp(message.ts),
 				);
-				if (result?.engaged) await rememberThread(admitted.origin);
+				if (result?.engaged) await rememberThread(origin);
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
 			const reaction = event as unknown as SlackReactionEvent;
