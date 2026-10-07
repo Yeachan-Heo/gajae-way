@@ -999,6 +999,17 @@ export class ScriptedTailHandle implements TailHandle {
 		void this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
 	}
 
+	async sendReverseResponse(_input: {
+		id: string;
+		connectionId: string;
+		leaseId: string;
+		result?: unknown;
+		error?: { code: string; message: string };
+	}): Promise<void> {
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		// Scripted handles do not send reverse responses
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -1086,6 +1097,26 @@ export class ScriptedRelayStream implements SessionRelayStream {
 		this.written.push(frame);
 		if (frame.type === "hello") {
 			this.host({ type: "hello", protocolVersion: 3, connectionId: this.connectionId });
+			return;
+		}
+		if (frame.type === "register_provider") {
+			// Mock response to register_provider
+			const leaseId = `lease-${frame.id}`;
+			this.host({
+				type: "register_provider_result",
+				id: frame.id,
+				leaseId,
+				capability: frame.capability,
+				leaseExpiresAt: new Date(Date.now() + 5000).toISOString(),
+			});
+			return;
+		}
+		if (frame.type === "provider_heartbeat") {
+			// Silently accept heartbeats
+			return;
+		}
+		if (frame.type === "lease_release") {
+			// Silently accept lease releases
 			return;
 		}
 		if (frame.type === "control_request" || frame.type === "query_request")

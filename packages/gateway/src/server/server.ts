@@ -107,6 +107,7 @@ import {
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
+import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -308,6 +309,7 @@ interface Runtime {
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
 	readonly deliverySweepTimer: ReturnType<typeof setInterval>;
+	readonly panelExpirySweepTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly stopRetention: () => void;
@@ -325,6 +327,7 @@ interface Runtime {
 	/** Admission cap and retirement for `work.run` lanes. */
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
+	readonly permissionPanels: PermissionPanels;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -358,6 +361,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.deliverySweepTimer);
+			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			runtime.stopRetention();
@@ -469,6 +473,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.stdin.off("end", onEnd);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.deliverySweepTimer);
+			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			runtime.stopRetention();
@@ -599,6 +604,23 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
 		},
+		onReverseRequest: async ({ originKey, triggerAuthorId, tail, input }) => {
+			const origin = options.database.getOriginByKey(originKey);
+			await permissionPanels.open({
+				origin: origin ? validateOriginRef(origin as unknown as OriginRef) : undefined,
+				triggerAuthorId,
+				tail,
+				request: input,
+			});
+		},
+	});
+	const permissionPanels = new PermissionPanels({
+		deliver: (payload) => {
+			if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(payload))) {
+				if (payload.deliveryId) runtime.delivery.markInflight(payload.deliveryId);
+				broadcastDelivery(runtime, payload);
+			}
+		},
 	});
 	const monitors = new MonitorPropagator({
 		database: options.database,
@@ -677,6 +699,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		} catch (error) {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
 		}
+	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
+	// Expired permission panels are answered as cancelled so gjc never waits on a dead panel.
+	const panelExpirySweepTimer = setInterval(() => {
+		void permissionPanels
+			.sweep()
+			.catch((error: unknown) => console.error(`panel expiry sweep failed: ${diagnostic(error)}`));
 	}, options.deliverySweepIntervalMs ?? DEFAULT_DELIVERY_SWEEP_INTERVAL_MS);
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
@@ -772,6 +800,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitorRuntime,
 		reconcileTimer,
 		deliverySweepTimer,
+		panelExpirySweepTimer,
 		stallTimer,
 		contextMaintenanceTimer,
 		stopRetention,
@@ -789,6 +818,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		work,
 		inbound,
 		requests: new Set(),
+		permissionPanels,
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1470,6 +1500,98 @@ async function handleRequest(
 						? `[reaction] reacted ${emoji} to message ${targetMessageId}`
 						: `[reaction] removed their ${emoji} reaction from message ${targetMessageId}`,
 			});
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { recorded: true, engaged: false },
+			});
+			return;
+		}
+		case "engagement.panel_response": {
+			// Inbound panel response: user answered an interactive panel question.
+			// Validates authorization, resolves the pending gjc coordinator question,
+			// and records the response in the context ledger.
+			const params = request.params as
+				| {
+						origin?: unknown;
+						panelId?: unknown;
+						responseKind?: unknown;
+						responderId?: unknown;
+						selectedOptionId?: unknown;
+						engagement?: unknown;
+				  }
+				| undefined;
+			let origin: OriginRef;
+			try {
+				origin = validateOriginRef(params?.origin as OriginRef);
+			} catch {
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires a valid origin");
+			}
+			if (!isChatPlatform(origin.platform))
+				throw new ProtocolError(
+					"invalid_params",
+					`engagement.panel_response requires a ${describeChatPlatforms()} origin`,
+				);
+
+			if (typeof params?.panelId !== "string" || !(params.panelId as string).trim())
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires a non-empty panelId");
+			if (
+				typeof params?.responseKind !== "string" ||
+				!["option_selected", "approved", "denied"].includes(params.responseKind as string)
+			)
+				throw new ProtocolError(
+					"invalid_params",
+					"engagement.panel_response requires responseKind to be option_selected, approved, or denied",
+				);
+			if (typeof params?.responderId !== "string" || !(params.responderId as string).trim())
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires a non-empty responderId");
+			if (
+				(params?.responseKind as string) === "option_selected" &&
+				(typeof params?.selectedOptionId !== "string" || !(params.selectedOptionId as string).trim())
+			)
+				throw new ProtocolError(
+					"invalid_params",
+					"engagement.panel_response requires selectedOptionId for option_selected responses",
+				);
+
+			const engagement = params?.engagement as Record<string, unknown> | undefined;
+			if (typeof engagement?.authorId !== "string" || !(engagement?.authorId as string))
+				throw new ProtocolError("invalid_params", "engagement.panel_response requires engagement.authorId");
+
+			const panelId = ((params?.panelId as string) || "").trim().slice(0, 256);
+			const responderId = ((params?.responderId as string) || "").trim().slice(0, 256);
+			const responseKind = (params?.responseKind as string) || "";
+			const selectedOptionId =
+				(params?.responseKind as string) === "option_selected"
+					? ((params?.selectedOptionId as string) || "").trim().slice(0, 256)
+					: undefined;
+			const authorId = (engagement?.authorId as string) || "";
+			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
+
+			const coordinatorError = await runtime.permissionPanels
+				.respond({ panelId, responderId, responseKind: responseKind as PanelResponseKind, selectedOptionId })
+				.catch((error: unknown) => `response_error: ${diagnostic(error)}`);
+
+			// Record the panel response in the context ledger (audit trail)
+			const responseBody =
+				responseKind === "option_selected"
+					? `[panel] answered question ${panelId} with option ${selectedOptionId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`
+					: `[panel] ${responseKind} panel ${panelId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`;
+
+			options.database.contextRecord({
+				messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
+				originKey: originKey(origin),
+				authorId,
+				...(actor ? { authorName: actor } : {}),
+				body: responseBody,
+			});
+
+			// Report result to adapter
+			if (coordinatorError) {
+				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${coordinatorError}`);
+			}
+
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",

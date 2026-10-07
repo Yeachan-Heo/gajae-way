@@ -5,6 +5,7 @@ import type {
 	ChatMessagePayload,
 	ChatProgressPayload,
 	EngagementContext,
+	EngagementPanelResponseParams,
 	OriginRef,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
@@ -13,6 +14,7 @@ import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
+import { describePanelResponse, type SlackBlockAction } from "./interactions";
 import { LiveReplyTracker } from "./live-reply";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type MentionDirectory, repairMentions } from "./mentions";
@@ -25,6 +27,7 @@ import {
 	slackMessageId,
 	slackMessageOrigin,
 } from "./origin";
+import { approvalPanelBlocks, approvalPanelFallback, askUserPanelBlocks, askUserPanelFallback } from "./panels";
 import {
 	describeSlackReaction,
 	type SlackReactionDescription,
@@ -309,8 +312,23 @@ export async function settleSlackDelivery(
 		const channel = deliveryChannel(message.origin);
 		// Routing is decided before any write, so a bad target never half-posts.
 		const threadTs = replyThreadTs(message);
-		// Mentions are repaired before Markdown \u2192 mrkdwn: a `<@U\u2026>` the model wrapped
-		// in backticks, a bare `@U\u2026`, or an `@handle` the directory knows, all become
+		// Handle interactive panels (ask-user and approval)
+		if (message.askUserPanel) {
+			const blocks = askUserPanelBlocks(message);
+			const fallback = askUserPanelFallback(message);
+			await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		}
+		if (message.approvalPanel) {
+			const blocks = approvalPanelBlocks(message);
+			const fallback = approvalPanelFallback(message);
+			await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		}
+		// Mentions are repaired before Markdown → mrkdwn: a `<@U…>` the model wrapped
+		// in backticks, a bare `@U…`, or an `@handle` the directory knows, all become
 		// a real ping instead of literal text. Unknown or ambiguous names are left alone.
 		const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
 		const text = markdownToMrkdwn(message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired);
@@ -690,6 +708,12 @@ export class ReconnectingGateway implements GatewayClientLike {
 			.catch((error) => console.error(`Slack engagement.reaction failed: ${errorText(error)}`));
 	}
 
+	sendPanelResponse(response: EngagementPanelResponseParams): void {
+		void this.#client
+			?.request("engagement.panel_response", response)
+			.catch((error) => console.error(`Slack engagement.panel_response failed: ${errorText(error)}`));
+	}
+
 	private monitor(client: GatewayClientLike, strikes = 0): void {
 		this.#monitorTimer = setTimeout(
 			() => {
@@ -888,6 +912,11 @@ export async function startSlackAdapter(
 			if (reaction.user === identity.botUserId && isPresenceReaction(reaction.reaction)) return;
 			const description = describeSlackReaction(reaction, identity.botUserId, directory);
 			if (description) gateway.sendReaction(description);
+		} else if (event.type === "block_actions") {
+			const blockAction = event as unknown as SlackBlockAction;
+			const origin = slackMessageOrigin({ channel: blockAction.channel.id, user: blockAction.user.id });
+			const response = describePanelResponse(blockAction, origin);
+			if (response) gateway.sendPanelResponse(response);
 		}
 	};
 	const handleSlashCommand = async (command: SlackSlashCommand): Promise<void> => {

@@ -225,6 +225,20 @@ export interface PersonaSessionManagerOptions {
 	readonly brokerLiveness?: BrokerLivenessProbe;
 	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
+	/** Called when a reverse request from the SDK host arrives. */
+	readonly onReverseRequest?: (input: {
+		originKey: string;
+		sessionId: string;
+		triggerAuthorId?: string;
+		tail: TailHandle;
+		input: {
+			id: string;
+			connectionId: string;
+			capability: string;
+			leaseId: string;
+			payload: { method: string; payload: unknown };
+		};
+	}) => void | Promise<void>;
 	readonly log?: (line: string, level?: LogLevel) => void;
 }
 
@@ -253,6 +267,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
+	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
@@ -278,6 +293,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
+		this.#onReverseRequest = options.onReverseRequest;
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 	}
 
@@ -300,6 +316,10 @@ export class PersonaSessionManager {
 
 	get stopped(): boolean {
 		return this.#stopped;
+	}
+
+	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
+		return this.#onReverseRequest;
 	}
 
 	/** Presentation/recovery tick; the port's stall check never sends an abort. */
@@ -1760,6 +1780,17 @@ class OriginActor {
 					await this.#onStall(sessionId, epoch, generation, retired, elapsedMs);
 				}).catch(() => {});
 			},
+			onReverseRequest: async (input) => {
+				await this.enqueue(async () => {
+					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					await this.#onReverseRequest(sessionId, epoch, generation, retired, input, self!);
+				}).catch((error: unknown) =>
+					this.#manager.log(
+						`persona_reverse_request_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+						"error",
+					),
+				);
+			},
 			onDiagnostic: (line, level) => this.#manager.log(line, level),
 		});
 		self = handle;
@@ -2002,6 +2033,47 @@ class OriginActor {
 			);
 			await this.#reconcileBound(bound);
 		}
+	}
+
+	async #onReverseRequest(
+		sessionId: string,
+		epoch: number,
+		brokerGeneration: number,
+		_retired: boolean,
+		input: {
+			id: string;
+			connectionId: string;
+			capability: string;
+			leaseId: string;
+			payload: { method: string; payload: unknown };
+		},
+		tail: TailHandle,
+	): Promise<void> {
+		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
+		if (!bound || !this.#manager.onReverseRequest) {
+			// Nobody will ever answer this request; tell gjc now instead of leaving its tool call waiting.
+			await tail
+				.sendReverseResponse({
+					id: input.id,
+					connectionId: input.connectionId,
+					leaseId: input.leaseId,
+					error: { code: "unavailable", message: "no bound turn for this reverse request" },
+				})
+				.catch(() => {});
+			return;
+		}
+		// Extract the trigger author ID from the bound turn
+		const trigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
+		const triggerAuthorId = trigger?.engagement_json
+			? (JSON.parse(trigger.engagement_json) as { authorId?: string }).authorId
+			: undefined;
+		await this.#manager.onReverseRequest({
+			originKey: this.originKey,
+			sessionId,
+			triggerAuthorId,
+			tail,
+			input,
+		});
 	}
 
 	/**

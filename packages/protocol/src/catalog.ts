@@ -296,6 +296,49 @@ export interface ChatMessagePayload {
 	 * the safe direction to lose.
 	 */
 	readonly voiceText?: string;
+	/**
+	 * When present, this delivery is an interactive panel for asking the user to
+	 * select from predefined options (e.g., buttons). Adapters render this as an
+	 * interactive UI element with a plain-text fallback if interactivity is unavailable.
+	 * The panel expires after `expiresAt` and becomes read-only.
+	 */
+	readonly askUserPanel?: {
+		/** Unique identifier for this panel instance. */
+		panelId: string;
+		/** Question to display to the user. */
+		question: string;
+		/** ISO-8601 timestamp when this panel expires and becomes non-interactive. */
+		expiresAt: string;
+		/** Selectable options the user can choose from. */
+		options: readonly {
+			/** Unique identifier for this option. */
+			id: string;
+			/** Display label for this option. */
+			label: string;
+		}[];
+	};
+	/**
+	 * When present, this delivery is an interactive approval panel for permission decisions.
+	 * Adapters render the offered options as interactive buttons with a plain-text fallback if
+	 * interactivity is unavailable. The panel expires after `expiresAt` and becomes read-only.
+	 */
+	readonly approvalPanel?: {
+		/** Unique identifier for this panel instance. */
+		panelId: string;
+		/** Message describing what requires approval. */
+		message: string;
+		/** ISO-8601 timestamp when this panel expires and becomes non-interactive. */
+		expiresAt: string;
+		/** Offered permission options; empty if not a permission request. */
+		options?: readonly {
+			/** Unique identifier for this option. */
+			optionId: string;
+			/** Display name for this option. */
+			name: string;
+			/** Option kind (e.g., 'allow_once', 'reject_once'). */
+			kind: string;
+		}[];
+	};
 }
 
 export interface DeliveryConfirmParams {
@@ -791,6 +834,30 @@ export interface EngagementReactionResult {
 	/** Always false: a reaction is metadata, never a turn. */
 	readonly engaged: false;
 }
+
+/**
+ * Inbound panel response (engagement.panel_response): user answered an interactive
+ * ask-user or approval panel question via Slack block actions.
+ */
+export interface EngagementPanelResponseParams {
+	readonly origin: OriginRef;
+	/** Unique identifier of the panel that was answered. */
+	readonly panelId: string;
+	/** Kind of panel response: option selection or approval decision. */
+	readonly responseKind: "option_selected" | "approved" | "denied";
+	/** Selected option id (for ask-user panels). */
+	readonly selectedOptionId?: string;
+	/** Slack user id who responded. */
+	readonly responderId: string;
+	/** Engagement metadata. */
+	readonly engagement: EngagementContext;
+}
+
+export interface EngagementPanelResponseResult {
+	readonly recorded: boolean;
+	readonly engaged: false;
+}
+
 /**
  * Operator runtime-cycle projection (ops.cycle): a read-only, snapshot view of
  * where every runtime cycle currently stands — durable inbound dispatch,
@@ -962,6 +1029,7 @@ export interface VerbCatalogV01 {
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
+	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
 }
 
@@ -1003,6 +1071,7 @@ export const VERBS_V01 = [
 	"work.retire",
 	"chat.react",
 	"engagement.reaction",
+	"engagement.panel_response",
 	"gateway.reloadConfig",
 	"ops.cycle",
 ] as const;

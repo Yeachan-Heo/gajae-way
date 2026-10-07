@@ -18,6 +18,8 @@ export {
 	type DeliveryErrorCode,
 	type DeliveryFailParams,
 	type EngagementContext,
+	type EngagementPanelResponseParams,
+	type EngagementPanelResponseResult,
 	type EngagementReactionParams,
 	type EngagementReactionResult,
 	EVENTS_V01,

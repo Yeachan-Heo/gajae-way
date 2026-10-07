@@ -1933,6 +1933,22 @@ export class GatewayDatabase {
 		return row ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
 	}
 
+	/**
+	 * Get the origin_ref_json for a session by originKey.
+	 * Returns the parsed origin or undefined if not found.
+	 */
+	getOriginByKey(originKey: string): Record<string, unknown> | undefined {
+		const row = this.#database
+			.query<{ origin_ref_json: string | null }, [string]>("SELECT origin_ref_json FROM sessions WHERE origin_key = ?")
+			.get(originKey);
+		if (!row || !row.origin_ref_json) return undefined;
+		try {
+			return JSON.parse(row.origin_ref_json) as Record<string, unknown>;
+		} catch {
+			return undefined;
+		}
+	}
+
 	getSessionBootstrap(originKey: string):
 		| {
 				epoch: number;
