@@ -1475,7 +1475,12 @@ class OriginActor {
 						"error",
 					);
 				}
-				const hold = await describeBindHold(verdict, detail, this.#sameDetailBindFailures, this.#manager.brokerAgentDir);
+				const hold = await describeBindHold(
+					verdict,
+					detail,
+					this.#sameDetailBindFailures,
+					this.#manager.brokerAgentDir,
+				);
 				this.#bindWedged = verdict?.state === "wedged";
 				this.#manager.log(
 					`persona_bind_hold origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${this.#sameDetailBindFailures} reason=${hold.reason} detail=${detail}`,
