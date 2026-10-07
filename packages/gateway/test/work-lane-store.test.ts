@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -33,10 +34,11 @@ afterEach(async () => {
 async function fixture() {
 	const directory = await mkdtemp(join(tmpdir(), "work-lane-store-"));
 	directories.push(directory);
-	const path = join(directory, "gateway.db");
+	const realDirectory = realpathSync(directory);
+	const path = join(realDirectory, "gateway.db");
 	const database = await GatewayDatabase.open(path);
 	handles.push(database);
-	const canonicalAgentDir = join(directory, "agent");
+	const canonicalAgentDir = join(realDirectory, "agent");
 	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
 	database.assertBrokerAuthority(authority, { initializeEmpty: true });
 	expect(
@@ -725,10 +727,10 @@ describe("work attempt durable transactions", () => {
 		f.database.workAttemptPrepare(f.runtime, f.record);
 		const settled = f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)!;
 		expect(settled.runtime.decision).toBe("fallback");
-		const targetAuthority = {
-			canonicalAgentDir: join(f.path, "..", "target-agent"),
-			identity: "target-broker",
-		};
+const targetAuthority = {
+		canonicalAgentDir: join(realpathSync(join(f.path, "..")) , "target-agent"),
+		identity: "target-broker",
+	};
 		f.database.cutoverBrokerAuthority({
 			expectedAuthority: f.authority,
 			targetAuthority,
