@@ -501,27 +501,18 @@ function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJs
 	try {
 		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
 		if (origin.kind !== "channel") return admissionOriginRefJson;
-
-		// Convert channel root to thread origin using trigger message ID
-		const threadOrigin: OriginRef =
-			origin.platform === "slack"
-				? {
-						platform: "slack",
-						kind: "thread",
-						conversationId: `${origin.conversationId}:${parent.triggerMessageId}`,
-						parentId: origin.conversationId,
-					}
-				: origin.platform === "discord"
-					? {
-							platform: "discord",
-							kind: "thread",
-							conversationId: parent.triggerMessageId,
-							parentId: origin.conversationId,
-						}
-					: admissionOriginRefJson; // Return unchanged for other platforms
-
-		if (threadOrigin === admissionOriginRefJson) return admissionOriginRefJson;
-
+		// Slack message ids are already `<channel>:<ts>`, which is exactly the thread conversation id;
+		// a Discord thread started from a message shares that message's id.
+		if (origin.platform === "slack" && !parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) {
+			return admissionOriginRefJson;
+		}
+		if (origin.platform !== "slack" && origin.platform !== "discord") return admissionOriginRefJson;
+		const threadOrigin: OriginRef = {
+			platform: origin.platform,
+			kind: "thread",
+			conversationId: parent.triggerMessageId,
+			parentId: origin.conversationId,
+		};
 		validateOriginRef(threadOrigin);
 		return JSON.stringify(threadOrigin);
 	} catch {

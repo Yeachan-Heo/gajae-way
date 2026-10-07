@@ -618,7 +618,7 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 		ownerTarget: slackChannelOrigin,
 		channels: { "slack:C_issue435_slack": { engagement: "open", audience: "all" } },
 	});
-	const triggerMessageId = "slack-trigger-msg-id";
+	const triggerMessageId = "C_issue435_slack:1700000000.000435";
 	const persona = await startPersonaTurn(f, slackChannelOrigin, triggerMessageId);
 	const lane = await startLane(f, "ac435-slack-worker", persona.sessionId);
 	expect(lane.error).toBeUndefined();
@@ -633,7 +633,7 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
 	expect(laneReportOrigin.kind).toBe("thread");
 	expect(laneReportOrigin.platform).toBe("slack");
-	expect(laneReportOrigin.conversationId).toBe(`${slackChannelOrigin.conversationId}:${triggerMessageId}`);
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
 	expect(laneReportOrigin.parentId).toBe(slackChannelOrigin.conversationId);
 	f.port.complete(persona.opRef, "ack");
 });
