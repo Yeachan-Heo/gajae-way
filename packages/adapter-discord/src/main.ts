@@ -343,7 +343,8 @@ export function describeMessageEdit(
  * When a mentioned message arrives in a channel (not DM, not thread), create a thread on that message.
  * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
  * Implements Hermes-like contract: channel mention → auto-thread + new session.
- * A channel whose policy sets `threadOnMention: false` is answered in place.
+ * A channel whose policy sets `threadOnMention: false` is answered in place; a channel
+ * without its own setting follows the adapter-wide default (true when unset).
  * The thread is named after the message; a bare mention leaves the fallback
  * name, and the thread is renamed from the first message that says something.
  */
@@ -353,10 +354,11 @@ export async function maybeCreateThreadOnMention(
 	origin: OriginRef,
 	policy: DiscordChannelPolicy | undefined,
 	unnamed: UnnamedThreads,
+	defaultThreadOnMention = true,
 ): Promise<OriginRef> {
 	// Only thread channel mentions: not DMs, not already in a thread, and bot must be mentioned.
 	if (origin.kind !== "channel" || !engagement.mentioned) return origin;
-	if (policy?.threadOnMention === false) return origin;
+	if (!(policy?.threadOnMention ?? defaultThreadOnMention)) return origin;
 
 	try {
 		const name = deriveThreadName(message.content);
@@ -1184,6 +1186,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				origin,
 				config.channels?.[origin.conversationId],
 				unnamedThreads,
+				config.threadOnMention,
 			);
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the

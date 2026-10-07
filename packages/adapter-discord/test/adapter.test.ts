@@ -1278,6 +1278,44 @@ test("channel mention with threadOnMention: false skips thread creation", async 
 	expect(threadCreated).toBe(false);
 });
 
+test("adapter-wide threadOnMention: false skips threads unless the channel overrides it", async () => {
+	const botUser = { id: "bot-1" };
+	let threadsCreated = 0;
+	const channelMessage = {
+		id: "msg-5",
+		author: { id: "user-1" },
+		channel: { id: "channel-5", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async () => {
+			threadsCreated++;
+			return { id: "thread-new-5" };
+		},
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	const flat = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		undefined,
+		new UnnamedThreads(),
+		false,
+	);
+	expect(flat).toEqual(origin);
+	expect(threadsCreated).toBe(0);
+	const overridden = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		{ threadOnMention: true },
+		new UnnamedThreads(),
+		false,
+	);
+	expect(overridden.kind).toBe("thread");
+	expect(threadsCreated).toBe(1);
+});
+
 test("non-channel or non-mentioned message ignores threadOnMention policy", async () => {
 	const botUser = { id: "bot-1" };
 	const dmMessage = {
