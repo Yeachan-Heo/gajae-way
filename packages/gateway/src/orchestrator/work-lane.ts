@@ -40,6 +40,7 @@ import {
 	workAttemptDeliveryId,
 	workAttemptReportId,
 } from "../store/db";
+import type { BrokerAuthorityChange } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
@@ -634,7 +635,7 @@ export class WorkLaneManager {
 				opRef,
 				latest.version,
 				accepted
-					? { sendPhase: "accepted", sendEvidence: { source, observedAt: this.#at() } }
+					? { sendPhase: "accepted", sendEvidence: latest.sendEvidence ?? { source, observedAt: this.#at() } }
 					: {
 							sendPhase: "uncertain",
 							...(rejected
@@ -1603,7 +1604,13 @@ export class WorkLaneManager {
 			await this.#drainLaneReports(parentName);
 		}
 	}
-	onBrokerGeneration(): Promise<void> {
+	onBrokerGeneration(change?: BrokerAuthorityChange): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
+		if (change) {
+			console.error(
+				`broker_rebind_initiated oldPid=${change.previous.pid} oldGeneration=${change.previous.generation} newPid=${change.current.pid} newGeneration=${change.current.generation} reason=${change.reason}`,
+			);
+		}
 		if (this.#generationRecovery) return this.#generationRecovery;
 		const prior = this.#recovery;
 		const recovery = (async () => {
@@ -1612,6 +1619,7 @@ export class WorkLaneManager {
 			do {
 				generation = this.#options.brokerGeneration?.() ?? 0;
 				await this.#detachObservers();
+				this.#failures.clear();
 				if (!this.#stopped) await this.#recover();
 			} while (!this.#stopped && generation !== (this.#options.brokerGeneration?.() ?? 0));
 		})();

@@ -178,6 +178,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			canonicalAgentDir: broker.agentDir,
 		});
 		try {
+			database.workAttemptReconcile();
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
 			// Authority already checked in GatewayDatabase.open(); this assertion confirms immutability.
 			database.assertBrokerAuthority(authority, { initializeEmpty: false });

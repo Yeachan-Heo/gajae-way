@@ -69,9 +69,15 @@ const SESSION_VALUE_OPTIONS = new Set([
 export const BROKER_RESPAWN_WINDOW_MS = 30 * 60_000;
 /** Respawns inside the window that turn silent recovery into one operator alert. */
 export const BROKER_RESPAWN_CHURN_THRESHOLD = 3;
+export const BROKER_STALL_THRESHOLD = 3;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
-export type BrokerGenerationListener = (generation: number) => void;
+export interface BrokerAuthorityChange {
+	readonly previous: { readonly pid: number; readonly generation: number };
+	readonly current: { readonly pid: number; readonly generation: number };
+	readonly reason: "broker_stall" | "authority_changed";
+}
+export type BrokerGenerationListener = (generation: number, change?: BrokerAuthorityChange) => void;
 export interface BrokerHealthContext {
 	readonly agentDir: string;
 	readonly cli: CliRunner;
@@ -107,6 +113,10 @@ export interface GlobalGjcClientOptions {
 	 * discovery record says it is live before `onLiveOutageExceeded` fires.
 	 */
 	readonly liveOutageLimitMs?: number;
+	/** Wait between SIGTERM and SIGKILL when terminating a wedged gateway-owned broker. */
+	readonly brokerGracePeriodMs?: number;
+	/** Sends a termination signal to a gateway-owned broker; defaults to `process.kill`. */
+	readonly signalBroker?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
 	/**
 	 * The broker is up but this process has not reached it for
 	 * `liveOutageLimitMs`: the fault is on the gateway side, so the owner should
@@ -320,6 +330,13 @@ export class GlobalGjcClient {
 	#inflight = 0;
 	#generation = 0;
 	#identity: string | undefined;
+	#authorityPid: number | undefined;
+	#probeFailures = 0;
+	#stallDetected = false;
+	/** Pids proven gateway-owned: the releaser moved them out of the gateway's own unit. */
+	#ownedPids = new Set<number>();
+	readonly #brokerGracePeriodMs: number;
+	readonly #signalBroker: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
 	#available = false;
 	#stopped = false;
 	#stoppedAtEpoch: number | undefined; // When stopped due to involuntary termination failure
@@ -380,6 +397,8 @@ export class GlobalGjcClient {
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
+		this.#brokerGracePeriodMs = integer(options.brokerGracePeriodMs, 2_000, 1);
+		this.#signalBroker = options.signalBroker ?? ((pid, signal) => process.kill(pid, signal));
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
@@ -495,6 +514,8 @@ export class GlobalGjcClient {
 		this.#available = false;
 		this.#outageSince = undefined;
 		this.#liveOutageSince = undefined;
+		this.#probeFailures = 0;
+		this.#stallDetected = false;
 		++this.#epoch;
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
@@ -556,23 +577,25 @@ export class GlobalGjcClient {
 			this.#timeout,
 		);
 	}
-	async #observe(epoch: number): Promise<boolean> {
+	async #observe(epoch: number, reread = true): Promise<boolean> {
 		this.#observedLiveBroker = false;
 		try {
 			const discovery = await this.#discovery();
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			if (!discovery) {
 				this.#available = false;
+				this.#probeFailures = 0;
 				const verdict = await this.judgeLiveness();
 				this.#observedLiveBroker = verdict.state === "live";
 				this.#unavailableReason = describeDiscoveryFailure(verdict);
 				return false;
 			}
 			this.#observedLiveBroker = true;
+			const healthProbe = this.#options.healthProbe;
 			const healthy = await bounded(
-				this.#options.healthProbe
-					? Promise.resolve(
-							this.#options.healthProbe({
+				healthProbe
+					? Promise.resolve().then(() =>
+							healthProbe({
 								agentDir: this.agentDir,
 								cli: this.cli,
 								discoveryPath: this.discoveryPath,
@@ -582,28 +605,70 @@ export class GlobalGjcClient {
 						)
 					: probeBrokerEndpoint(discovery, this.#timeout),
 				this.#timeout,
-			);
+			).catch(() => false);
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			this.#assertAgentDirIdentity();
 			this.#available = healthy;
 			if (!healthy) {
 				this.#unavailableReason = `endpoint probe failed for live discovery pid ${discovery.pid}`;
+				if (reread && ++this.#probeFailures >= BROKER_STALL_THRESHOLD) {
+					if (!this.#stallDetected) {
+						this.#stallDetected = true;
+						const isOwned = this.#ownedPids.has(discovery.pid);
+						if (isOwned) {
+							// Owned broker: terminate to recover from wedge, respawn via normal lifecycle
+							this.#log(
+								`broker_stall_detected pid=${discovery.pid} generation=${this.#generation} failures=${this.#probeFailures} action=terminate_owned`,
+							);
+							this.#terminateWedgedOwnedBroker(discovery.pid).catch((error) => {
+								try {
+									this.#log(
+										`broker_termination_failed pid=${discovery.pid} error=${error instanceof Error ? error.message : String(error)}`,
+									);
+								} catch {}
+							});
+						} else {
+							// Shared broker: mark unavailable but keep probing, do not kill
+							this.#log(
+								`broker_stall_detected pid=${discovery.pid} generation=${this.#generation} failures=${this.#probeFailures} action=keep_probing_shared reason=broker_stall_shared_broker_not_owned_by_gateway_not_terminating`,
+							);
+						}
+					}
+					// Re-read and authenticate the replacement before publishing authority.
+					// Discovery alone cannot authorize a rebind, and shared daemons are never killed.
+					return await this.#observe(epoch, false);
+				}
 				return false;
 			}
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
+				const previous =
+					this.#authorityPid === undefined ? undefined : { pid: this.#authorityPid, generation: this.#generation };
+				// Ownership proof belongs to one broker identity; drop it before the new broker is released.
+				this.#ownedPids.clear();
+				await this.#releaseBroker(discovery.pid);
+				if (epoch !== this.#epoch || this.#stopped) return false;
 				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
-				await this.#releaseBroker(discovery.pid);
+				this.#authorityPid = discovery.pid;
 				this.#generation++;
+				const change: BrokerAuthorityChange | undefined = previous
+					? {
+							previous,
+							current: { pid: discovery.pid, generation: this.#generation },
+							reason: this.#stallDetected ? "broker_stall" : "authority_changed",
+						}
+					: undefined;
 				for (const listener of this.#listeners) {
 					try {
-						listener(this.#generation);
+						listener(this.#generation, change);
 					} catch (error) {
 						this.#log(error);
 					}
 				}
 			}
+			this.#probeFailures = 0;
+			this.#stallDetected = false;
 			return true;
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {
@@ -626,10 +691,15 @@ export class GlobalGjcClient {
 				reason: `scope_failed: ${error instanceof Error ? error.message : String(error)}`,
 			};
 		}
-		if (result.outcome === "released")
+		if (result.outcome === "released") {
+			this.#ownedPids.add(pid);
 			this.#log(`broker_scope_released pid=${pid} scope=${result.scope} processes=${result.pids.length}`);
-		else if (result.reason.startsWith("scope_failed"))
+		} else if (result.reason.startsWith("scope_failed")) {
 			this.#log(`broker_scope_release_failed pid=${pid} reason=${result.reason}`);
+		} else {
+			// outcome: "skipped" - this broker was not released, so it's shared
+			this.#log(`broker_scope_skipped pid=${pid} reason=${result.reason}`);
+		}
 	}
 	#noteRespawn(pid: number): void {
 		const now = Date.now();
@@ -645,6 +715,21 @@ export class GlobalGjcClient {
 		this.#log(
 			`broker_respawn_churn respawns=${this.recentRespawns(now)} windowMs=${BROKER_RESPAWN_WINDOW_MS} pid=${pid} generation=${this.#generation + 1}`,
 		);
+	}
+	/** Terminate a wedged owned broker with SIGTERM then SIGKILL so the normal lifecycle respawns it. */
+	async #terminateWedgedOwnedBroker(pid: number): Promise<void> {
+		const isPidAlive = this.#options.isPidAlive ?? defaultPidAlive;
+		for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+			try {
+				this.#signalBroker(pid, signal);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+				throw error;
+			}
+			await delay(this.#brokerGracePeriodMs);
+			if (!isPidAlive(pid)) return;
+		}
+		this.#log(`broker_termination_incomplete pid=${pid}`);
 	}
 	#schedule(epoch: number): void {
 		// Continue observation after involuntary stops so the #246 guard can trigger.

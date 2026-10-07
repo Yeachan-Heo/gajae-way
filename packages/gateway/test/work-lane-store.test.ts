@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -5,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { bootGateway } from "../src/boot";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
+import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import {
 	DatabaseStartupError,
 	GatewayDatabase,
@@ -31,10 +34,11 @@ afterEach(async () => {
 async function fixture() {
 	const directory = await mkdtemp(join(tmpdir(), "work-lane-store-"));
 	directories.push(directory);
-	const path = join(directory, "gateway.db");
+	const realDirectory = realpathSync(directory);
+	const path = join(realDirectory, "gateway.db");
 	const database = await GatewayDatabase.open(path);
 	handles.push(database);
-	const canonicalAgentDir = join(directory, "agent");
+	const canonicalAgentDir = join(realDirectory, "agent");
 	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
 	database.assertBrokerAuthority(authority, { initializeEmpty: true });
 	expect(
@@ -133,6 +137,93 @@ function seedLinkedWakeReport(
 }
 
 describe("work attempt durable transactions", () => {
+	for (const terminal of [false, true]) {
+		test(`boot reconciles torn settlement with terminal=${terminal} before recovery`, async () => {
+			const f = await fixture();
+			f.database.workAttemptPrepare(f.runtime, f.record);
+			if (terminal) {
+				f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission);
+				f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL").run();
+			} else {
+				f.database.putLaneJob({ ...f.closed, laneKey: f.runtime.laneKey, json: JSON.stringify(f.closed) });
+			}
+			const server = await bootGateway({
+				home: f.authority.canonicalAgentDir,
+				overrides: { dbPath: f.path },
+				broker: {
+					executable: "/test-only/gjc",
+					agentDir: f.authority.canonicalAgentDir,
+					command: async (args) => ({
+						exitCode: 0,
+						stdout:
+							args[0] === "--version"
+								? `gjc/${readPinnedGjcVersion()}\n`
+								: JSON.stringify({ ok: true, result: { sessions: [] } }),
+						stderr: "",
+					}),
+					healthProbe: async () => true,
+					discovery: async () => ({ pid: 1, url: "ws://127.0.0.1:1", token: "test-only", heartbeatAt: Date.now() }),
+					healthIntervalMs: 60_000,
+					log: () => {},
+				},
+			});
+			try {
+				const healed = f.database.workAttemptGet(f.runtime.opRef)!;
+				expect(healed.settledAt).toBe(END);
+				expect(healed.terminal?.reasonCode).toBe(terminal ? "end_turn" : "recovery_indeterminate");
+				const invalid: WorkAttemptStateError[] = [];
+				for (let pass = 0; pass < 2; pass++)
+					expect(f.database.workAttemptOpen(100, "", (error) => invalid.push(error))).toEqual([]);
+				expect(invalid).toEqual([]);
+				expect(f.database.workAttemptReconcile(() => {})).toBe(0);
+			} finally {
+				await server.stop("test shutdown");
+			}
+		});
+	}
+
+	test("reconciliation validates and repairs torn rows per-row without throwing", async () => {
+		const f = await fixture();
+		f.database.workAttemptPrepare(f.runtime, f.record);
+		f.database.putLaneJob({ ...f.closed, laneKey: f.runtime.laneKey, json: JSON.stringify(f.closed) });
+		// Corrupt the record_json to cause a validation error
+		f.raw.query("UPDATE work_attempt_runtime SET record_json = ?").run("{invalid json");
+		const before = f.raw.query("SELECT * FROM work_attempt_runtime").all();
+		const lines: string[] = [];
+		const count = f.database.workAttemptReconcile((line) => lines.push(line));
+		// Corrupt row is skipped, no error is thrown, and the row is unchanged.
+		expect(count).toBe(0);
+		expect(f.raw.query("SELECT * FROM work_attempt_runtime").all()).toEqual(before);
+		// The skip should be logged.
+		expect(lines.some((line) => line.includes("work_attempt_reconcile_skip"))).toBe(true);
+	});
+
+	test("reconciliation leaves a valid open attempt untouched", async () => {
+		const f = await fixture();
+		f.database.workAttemptPrepare(f.runtime, f.record);
+		const lines: string[] = [];
+		expect(f.database.workAttemptReconcile((line) => lines.push(line))).toBe(0);
+		expect(f.database.workAttemptGet(f.runtime.opRef)).toEqual(f.runtime);
+		expect(lines).toEqual(["work_attempt_runtime_reconciled count=0"]);
+	});
+
+	test("reconciliation uses existing terminal observation rather than torn history time", async () => {
+		const f = await fixture();
+		f.database.workAttemptPrepare(f.runtime, f.record);
+		f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission);
+		f.raw.query("UPDATE work_attempt_runtime SET settled_at = NULL").run();
+		const torn = {
+			...f.closed,
+			attempts: f.closed.attempts.map((attempt) => ({ ...attempt, endedAt: "2026-09-08T00:00:11.000Z" })),
+		};
+		f.database.putLaneJob({ ...torn, laneKey: f.runtime.laneKey, json: JSON.stringify(torn) });
+		const deliveries = f.database.deliveryRows();
+		expect(f.database.workAttemptReconcile(() => {})).toBe(1);
+		expect(f.database.workAttemptGet(f.runtime.opRef)?.settledAt).toBe(END);
+		expect(parseLaneJobRecord(f.database.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBe(END);
+		expect(f.database.deliveryRows()).toEqual(deliveries);
+	});
+
 	for (const mode of ["start", "run"] as const) {
 		test(`${mode} publishes worker metadata and activity atomically at prepare and settlement`, async () => {
 			const f = await fixture();
@@ -636,10 +727,10 @@ describe("work attempt durable transactions", () => {
 		f.database.workAttemptPrepare(f.runtime, f.record);
 		const settled = f.database.workAttemptSettle(f.runtime.opRef, 0, f.closed, f.settlement, f.admission)!;
 		expect(settled.runtime.decision).toBe("fallback");
-		const targetAuthority = {
-			canonicalAgentDir: join(f.path, "..", "target-agent"),
-			identity: "target-broker",
-		};
+const targetAuthority = {
+		canonicalAgentDir: join(realpathSync(join(f.path, "..")) , "target-agent"),
+		identity: "target-broker",
+	};
 		f.database.cutoverBrokerAuthority({
 			expectedAuthority: f.authority,
 			targetAuthority,
