@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +15,7 @@ afterEach(async () => {
 const healthy = { stdout: JSON.stringify({ ok: true, result: { sessions: [] } }), stderr: "", exitCode: 0 };
 
 async function fixture(state: "pid_dead" | "absent" | "heartbeat_stale", failure?: "exit" | "throw") {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-"));
+	const home = realpathSync(await mkdtemp(join(tmpdir(), "gajaeway-broker-nudge-")));
 	directories.push(home);
 	const agentDir = join(home, "agent");
 	await mkdir(join(agentDir, "sdk"), { recursive: true });
