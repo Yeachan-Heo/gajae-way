@@ -9,6 +9,7 @@ interface BrokerExitRecord {
 	readonly reason?: unknown;
 	readonly path?: unknown;
 	readonly detail?: unknown;
+	readonly blockingLockPath?: unknown;
 	[key: string]: unknown;
 }
 
@@ -177,6 +178,8 @@ function describeBrokerExit(record: BrokerExitRecord | undefined): string | unde
 	const reason = typeof record.reason === "string" ? record.reason : "unknown";
 	const details: string[] = [reason];
 	if (record.path && typeof record.path === "string") details.push(`path=${record.path}`);
+	if (record.blockingLockPath && typeof record.blockingLockPath === "string")
+		details.push(`blockingLockPath=${record.blockingLockPath}`);
 	if (record.detail && typeof record.detail === "string") details.push(`detail=${record.detail}`);
 	return details.join(" ");
 }
@@ -189,6 +192,8 @@ export function isBrokerIndexLockBlocked(record: unknown): boolean {
 	const detail = typeof candidate.detail === "string" ? candidate.detail.toLowerCase() : "";
 	return (
 		reason.includes("startup-lock-blocked") ||
+		reason.includes("heartbeat-renewal-blocked") ||
+		(typeof candidate.blockingLockPath === "string" && candidate.blockingLockPath.length > 0) ||
 		reason.includes("retained removal transition") ||
 		detail.includes("retained removal transition")
 	);

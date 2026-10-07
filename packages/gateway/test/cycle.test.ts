@@ -191,6 +191,23 @@ describe("runtime cycle projection", () => {
 		expect(retainedRemoval.gates).toEqual(["broker_index_lock_blocked"]);
 		expect(retainedRemoval.phase).toBe("degraded");
 
+		const heartbeatLock = projectRuntimeCycle(
+			sources({
+				brokerExitRecord: {
+					reason: "heartbeat-renewal-blocked",
+					blockingLockPath: "/agent/sessions/index.jsonl.lock.removing",
+				},
+			}),
+			generatedAt,
+		);
+		expect(heartbeatLock.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const blockingPathOnly = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-error", blockingLockPath: "/agent/x.lock.removing" } }),
+			generatedAt,
+		);
+		expect(blockingPathOnly.gates).toEqual(["broker_index_lock_blocked"]);
+
 		const retainedRemovalReason = projectRuntimeCycle(
 			sources({ brokerExitRecord: { reason: "RETAINED REMOVAL TRANSITION refused" } }),
 			generatedAt,
