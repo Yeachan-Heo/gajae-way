@@ -6,7 +6,6 @@ import {
 	CAPABILITIES,
 	type ChatMessagePayload,
 	type ChatProgressActivity,
-	containsSilenceToken,
 	describeChatPlatforms,
 	type EngagementContext,
 	encodeFrame,
@@ -15,13 +14,13 @@ import {
 	type HelloPayload,
 	isChatPlatform,
 	isPlatformMessageId,
-	isSilenceToken,
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type MonitorScheduleProjection,
 	negotiate,
+	OrderedFrameWriter,
 	type OriginRef,
 	originKey,
 	PROFILE_VERSION,
@@ -35,7 +34,6 @@ import {
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
 	validateOriginRef,
-	type WorkRetireResult,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
@@ -91,7 +89,6 @@ import {
 import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
-import { OrderedFrameWriter } from "./frame-writer";
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
@@ -389,7 +386,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		return stopPromise;
 	};
 	runtime.stop = stop;
-	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter }>({
+	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter; decoder: TextDecoder }>({
 		unix: options.config.socketPath,
 		socket: {
 			open(socket) {
@@ -397,6 +394,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 					{ write: (bytes) => socket.write(bytes), close: () => socket.end() },
 					(error) => console.error(`gateway socket write failed: ${diagnostic(error)}`),
 				);
+				const decoder = new TextDecoder();
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
@@ -404,13 +402,13 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 					close: () => writer.close(),
 					settle: () => writer.settled(),
 				};
-				socket.data = { connection, writer };
+				socket.data = { connection, writer, decoder };
 				runtime.connections.add(connection);
 			},
 			data(socket, data) {
 				const connection = socket.data.connection;
 				try {
-					for (const frame of connection.decoder.feed(Buffer.from(data).toString())) {
+					for (const frame of connection.decoder.feed(socket.data.decoder.decode(data, { stream: true }))) {
 						const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
 						if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
 						runtime.requests.add(task);
@@ -420,6 +418,12 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 						);
 					}
 				} catch (error) {
+					if (
+						error instanceof ProtocolError &&
+						(error.code === "malformed_frame" || error.code === "payload_too_large")
+					) {
+						console.error(`gateway frame decode error: ${diagnostic(error)}`);
+					}
 					writeError(connection, error);
 				}
 			},
@@ -560,6 +564,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
 		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
@@ -1369,6 +1374,7 @@ async function handleRequest(
 			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
 			const eventId = runtime.monitors.submit(
 				params.monitorId,
+				// biome-ignore lint/style/noNonNullAssertion: monitor.eventTypes is guaranteed to be non-empty when monitor exists
 				typeof params.eventType === "string" ? params.eventType : monitor.eventTypes[0]!,
 				params.payload ?? {},
 			);
@@ -2531,6 +2537,7 @@ async function createInboundTurnLifecycle(
 		emitProgress(lastKnown, true);
 	};
 
+	// biome-ignore lint/correctness/noUnusedFunctionParameters: sessionId provided by caller
 	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
 		if (ended) return false;
 		tailActivitySeen = true;
