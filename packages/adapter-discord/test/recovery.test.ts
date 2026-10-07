@@ -1361,8 +1361,7 @@ test("typing begins for all engaged turns: overheard public-channel, mentioned g
 		parentId: "channel-1",
 	} as const;
 	const dmOrigin = { platform: "discord", kind: "dm", conversationId: "dm-1" } as const;
-	// Overheard channel: engaged but not mentioned (live, 2026-09-17: no typing = bug).
-	// Gateway engages, so typing should show.
+	// Overheard channel: engaged but not mentioned. The gateway engaged, so typing shows.
 	await gateway.requestInbound("m-1", channelOrigin, "just chatting", {
 		group: true,
 		mentioned: false,
@@ -1384,4 +1383,33 @@ test("typing begins for all engaged turns: overheard public-channel, mentioned g
 	// DM: typed.
 	await gateway.requestInbound("m-4", dmOrigin, "hi", { group: false, mentioned: false, authorId: "u" } as never);
 	expect(began).toEqual(["channel-1", "channel-1", "thread-1", "dm-1"]);
+});
+
+test("a channel mention answered in a new thread types in the thread and arms presence on the parent message", async () => {
+	const cursorPath = join(home, "typing-new-thread", "recovery-cursor.json");
+	const began: string[] = [];
+	const armed: unknown[][] = [];
+	const typing = { begin: (id: string) => void began.push(id), refresh: () => {}, end: () => {} };
+	const status = { arm: (...args: unknown[]) => void armed.push(args) };
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{ channels: { fetch: async () => fakeChannel([]) } },
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		typing,
+		status as never,
+		cursorPath,
+		() => bot,
+		{ request: async () => ({ engaged: true }), onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	const threadOrigin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+	} as const;
+	const engagement = { group: true, mentioned: true, authorId: "u" } as never;
+	await gateway.requestInbound("m-1", threadOrigin, "<@bot> hey", engagement, undefined, undefined, "channel-1");
+	expect(began).toEqual(["thread-1"]);
+	expect(armed).toEqual([["thread-1", "m-1", engagement, "channel-1"]]);
 });

@@ -550,6 +550,8 @@ function isPresenceMessage(value: unknown): value is PresenceMessageLike {
 
 type PresenceEntry = {
 	readonly conversationId: string;
+	/** Channel holding `messageId`; differs from `conversationId` for a thread opened on it. */
+	readonly messageChannelId: string;
 	readonly messageId: string;
 	message?: PresenceMessageLike;
 	/** Coalescing state: what the gradient should show. */
@@ -621,8 +623,15 @@ export class WorkingStatus {
 	 * queued marker goes on immediately; it is the room's only sign the message
 	 * was seen until the first progress tick. When a new message is armed in the
 	 * same conversation, prior presence markers are cleaned up. Best-effort, never awaited.
+	 * `messageChannelId` names the channel the message lives in when the reply goes
+	 * elsewhere (a thread the adapter opened on a channel mention).
 	 */
-	arm(conversationId: string, messageId: string, engagement?: Pick<EngagementContext, "group" | "mentioned">): void {
+	arm(
+		conversationId: string,
+		messageId: string,
+		engagement?: Pick<EngagementContext, "group" | "mentioned">,
+		messageChannelId: string = conversationId,
+	): void {
 		const prior = this.#entries.get(conversationId);
 		if (prior && prior.messageId === messageId) {
 			// Same message re-armed (an accepted edit): the markers on it are still
@@ -636,6 +645,7 @@ export class WorkingStatus {
 		if (prior) void this.#retire(prior);
 		const entry: PresenceEntry = {
 			conversationId,
+			messageChannelId,
 			messageId,
 			state: presenceInitial(this.#now()),
 			shown: new Set(),
@@ -687,7 +697,7 @@ export class WorkingStatus {
 
 	async #resolve(entry: PresenceEntry): Promise<PresenceMessageLike | undefined> {
 		if (entry.message) return entry.message;
-		const channel = await this.#discord.channels.fetch(entry.conversationId);
+		const channel = await this.#discord.channels.fetch(entry.messageChannelId);
 		const fetched = await (channel as { messages?: { fetch(id: string): Promise<unknown> } }).messages?.fetch(
 			entry.messageId,
 		);
@@ -1085,6 +1095,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const rendered = describeInboundBody(message);
 		if (rendered === "") return;
 		let origin = discordMessageOrigin(message);
+		const messageChannelId = origin.conversationId;
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
@@ -1098,7 +1109,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken);
+			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
@@ -1778,8 +1789,9 @@ export class ReconnectingGateway {
 		engagement: EngagementContext,
 		receivedAt?: string,
 		voice?: boolean,
+		messageChannelId?: string,
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, messageChannelId);
 	}
 
 	/**
@@ -1912,6 +1924,12 @@ export class ReconnectingGateway {
 		receivedAt?: string,
 		/** The message was spoken, so the reply is owed in both modalities. */
 		voice?: boolean,
+		/**
+		 * Channel the message itself lives in, when it differs from the reply
+		 * conversation: a channel mention that opened a thread is answered in the
+		 * thread, but its presence markers belong on the message in the parent.
+		 */
+		messageChannelId?: string,
 	): Promise<{ engaged?: boolean } | undefined> {
 		if (origin.platform === "discord" && origin.kind === "dm") {
 			await this.ensureCursors();
@@ -1937,12 +1955,11 @@ export class ReconnectingGateway {
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
-				// The gateway's engagement decision is authoritative: show presence for every
-				// turn it admits to run, including un-mentioned thread follow-ups and open
-				// channels (live, 2026-09-17: un-mentioned thread reply showed no typing).
-				// Only explicit config (statusReactions 'off') may disable presence.
+				// The gateway's engagement decision is authoritative: every turn it admits
+				// shows presence, mentioned or not (an un-mentioned thread follow-up used
+				// to show nothing). Only statusReactions "off" disables the reactions.
 				if (result?.engaged) {
-					this.status?.arm(origin.conversationId, messageId, engagement);
+					this.status?.arm(origin.conversationId, messageId, engagement, messageChannelId);
 					this.typing?.begin(origin.conversationId);
 				}
 				return "acked";

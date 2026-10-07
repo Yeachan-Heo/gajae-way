@@ -759,7 +759,6 @@ test("presence shows only when armed; clear disarms and handles un-mentioned thr
 	await status.update(tick);
 	expect(reacted).toEqual([]);
 	// Arm a thread reply without mention: engagement.mentioned=false but gateway engaged=true.
-	// Presence should show (live, 2026-09-17: no presence = bug).
 	const engagement = { group: true, mentioned: false };
 	status.arm("thread-1", "m-9", engagement);
 	await Bun.sleep(1);
@@ -769,6 +768,46 @@ test("presence shows only when armed; clear disarms and handles un-mentioned thr
 	// Disarmed: the next update's ticks are silent again until re-armed.
 	await status.update(tick);
 	expect(reacted).toHaveLength(1);
+});
+
+test("presence for a channel mention answered in a new thread reacts on the message in the parent channel", async () => {
+	const reacted: string[] = [];
+	const removed: string[] = [];
+	const fetchedChannels: string[] = [];
+	const trigger = {
+		react: async (emoji: string) => void reacted.push(emoji),
+		reactions: {
+			resolve: (emoji: string) => ({
+				users: { remove: async (userId: string) => void removed.push(`${emoji}:${userId}`) },
+			}),
+		},
+	};
+	// The trigger lives only in the parent channel; the new thread does not hold it.
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				fetchedChannels.push(id);
+				return {
+					messages: {
+						fetch: async (messageId: string) => {
+							if (id !== "ch-1" || messageId !== "m-1")
+								throw Object.assign(new Error("Unknown Message"), { code: 10008 });
+							return trigger;
+						},
+					},
+					send: async () => ({}),
+				};
+			},
+		},
+	};
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	status.arm("thread-1", "m-1", { group: true, mentioned: true }, "ch-1");
+	await Bun.sleep(1);
+	expect(fetchedChannels).toEqual(["ch-1"]);
+	expect(reacted).toEqual(["⏳"]);
+	// The reply lands in the thread conversation and clears the parent-channel marker.
+	await status.clear("thread-1");
+	expect(removed).toEqual(["⏳:bot-1"]);
 });
 
 test("our own presence markers are never reported inbound as engagement", () => {
