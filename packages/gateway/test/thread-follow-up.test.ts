@@ -64,7 +64,7 @@ function store(
 ) {
 	return {
 		originTriggeredTurn: (key: string) => (options.triggeredOrigins ?? []).includes(key),
-		messageTriggeredTurn: (key: string, messageId: string) =>
+		messageJoinedTurn: (key: string, messageId: string) =>
 			(options.triggeredMessages ?? []).some(([k, m]) => k === key && m === messageId),
 	};
 }

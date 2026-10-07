@@ -254,7 +254,7 @@ export function decideEngagement(
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */
 export interface ThreadEngagementStore {
 	originTriggeredTurn(originKey: string): boolean;
-	messageTriggeredTurn(originKey: string, messageId: string): boolean;
+	messageJoinedTurn(originKey: string, messageId: string): boolean;
 }
 
 /**
@@ -272,6 +272,10 @@ export interface ThreadEngagementStore {
  * opens a thread by answering a mention, and the next line in that thread is
  * refused because the thread origin itself had never been triggered (verified
  * live, 2026-09-17).
+ *
+ * The root counts whether it triggered its turn or was steered into one that
+ * was already running: a mention sent while the persona is busy is a steer, and
+ * refusing its thread left that user's first thread unanswered.
  */
 export function threadFollowUpEngaged(
 	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
@@ -286,7 +290,7 @@ export function threadFollowUpEngaged(
 		kind: "channel",
 		conversationId: origin.parentId,
 	});
-	return store.messageTriggeredTurn(parentKey, origin.conversationId);
+	return store.messageJoinedTurn(parentKey, origin.conversationId);
 }
 
 /**
