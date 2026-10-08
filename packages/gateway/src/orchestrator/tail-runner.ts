@@ -205,6 +205,19 @@ export class RelayRefusedError extends Error {
 	}
 }
 
+/**
+ * The relay child never said hello: the host did not attach (spawn refused,
+ * broker not serving, lifecycle not ready). Named so a monitor failure row
+ * reports it as such instead of a bare `Error`.
+ */
+export class RelayHelloError extends Error {
+	readonly code = "relay_hello_missing";
+	constructor(elapsedMs: number, childState: "stream_ended" | "stream_open") {
+		super(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
+		this.name = "RelayHelloError";
+	}
+}
+
 export class RelayRequestTimeoutError extends Error {
 	readonly code = "relay_timeout";
 	constructor(sessionId: string, id: string, timeoutMs: number) {
@@ -598,7 +611,7 @@ class ManagedTailHandle implements TailHandle {
 				if (!this.#connectionId) {
 					const elapsedMs = this.#runner.now() - openedAt;
 					const childState = streamEnded ? "stream_ended" : "stream_open";
-					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
+					throw new RelayHelloError(elapsedMs, childState);
 				}
 				if (!this.#ready) {
 					this.#ready = true;

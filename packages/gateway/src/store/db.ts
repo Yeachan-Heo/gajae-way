@@ -860,6 +860,13 @@ export const MONITOR_EVENT_RETRY_BACKOFF_MS: readonly number[] = [
 ];
 /** Upper bound on how often a single event may be reclaimed by reconcile. */
 export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = MONITOR_EVENT_RETRY_BACKOFF_MS.length;
+/**
+ * An event still owing its authoring turn this long after it fired, with no
+ * live dispatch lease, is reaped to `failed_no_retry` (`stale_open_event`).
+ * Past the whole retry schedule (~17h), so it only catches rows the budget
+ * path never reached: a wedged sweep, a row stranded by an older binary.
+ */
+export const MONITOR_EVENT_MAX_OPEN_AGE_MS = 24 * 60 * 60_000;
 
 export class GatewayDatabase {
 	readonly #database: Database;
@@ -3918,8 +3925,52 @@ export class GatewayDatabase {
 	 * both see "nothing in flight": the event lands as terminal `skipped` naming
 	 * the oldest same-monitor event still awaiting authoring (issue #83).
 	 * Returns the predecessor's id when skipped, undefined when admitted.
+	 *
+	 * A `failed` predecessor is not running: it only waits for its retry
+	 * backoff, which spans ~17h (MONITOR_EVENT_RETRY_BACKOFF_MS). Counting it as
+	 * in flight skipped every later fire for that whole window. Under `skip` the
+	 * new fire supersedes it instead: the failed event settles `failed_no_retry`
+	 * (code `superseded`, naming the successor) in the same transaction, unless a
+	 * live dispatch lease shows a retry is actually running right now.
 	 */
 	monitorEventCreate(row: {
+		eventId: string;
+		monitorId: string;
+		eventType: string;
+		payloadJson: string;
+		firedAt: string;
+		overlap?: "queue" | "skip";
+	}): string | undefined {
+		const work = () => {
+			if (row.overlap === "skip") this.#monitorEventsSupersedeFailed(row.monitorId, row.eventId);
+			return this.#monitorEventInsert(row);
+		};
+		// Admission runs inside the caller's slot/submit transaction; the
+		// supersede and the insert must commit together either way.
+		return this.#inTransaction ? work() : this.withTransaction(work);
+	}
+	#monitorEventsSupersedeFailed(monitorId: string, successorId: string): void {
+		const now = Date.now();
+		const failed = this.#database
+			.query<{ event_id: string }, [string]>(
+				`SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage = 'failed' AND ${REPLAYABLE_MONITOR}`,
+			)
+			.all(monitorId);
+		for (const { event_id } of failed) {
+			if (this.monitorEventLiveLeaseOwner(event_id, now)) continue;
+			this.#database
+				.query(
+					"UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage = 'failed'",
+				)
+				.run(new Date(now).toISOString(), event_id);
+			this.monitorFailureRecord(
+				event_id,
+				"superseded",
+				`failed event superseded by the next fire ${successorId} under overlap=skip; it is not retried`,
+			);
+		}
+	}
+	#monitorEventInsert(row: {
 		eventId: string;
 		monitorId: string;
 		eventType: string;
@@ -4194,6 +4245,84 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			if (changes === 0) return false;
 			this.monitorFailureRecord(eventId, code, detail, options);
 			return true;
+		});
+	}
+	/**
+	 * Reaps reconcilable events (admitted/batched/dispatched/failed) that fired
+	 * before `cutoff` and hold no live dispatch lease: `failed_no_retry` with a
+	 * `stale_open_event` evidence row. Returns the reaped rows (pre-update).
+	 */
+	monitorEventsReapStale(cutoff: number, now = Date.now()): MonitorEventDbRow[] {
+		return this.withTransaction(() => {
+			const candidates = this.#database
+				.query<MonitorEventDbRow, [string]>(
+					`SELECT * FROM monitor_events WHERE stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND fired_at < ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid`,
+				)
+				.all(new Date(cutoff).toISOString());
+			const reaped: MonitorEventDbRow[] = [];
+			for (const row of candidates) {
+				if (this.monitorEventLiveLeaseOwner(row.event_id, now)) continue;
+				const changes = this.#database
+					.query(
+						`UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES})`,
+					)
+					.run(new Date(now).toISOString(), row.event_id).changes;
+				if (changes === 0) continue;
+				this.monitorFailureRecord(
+					row.event_id,
+					"stale_open_event",
+					`event left ${row.stage} after ${row.dispatch_attempts} reclaims, fired ${row.fired_at}; reaped as stale`,
+				);
+				reaped.push(row);
+			}
+			return reaped;
+		});
+	}
+	/**
+	 * Operator settle (`gajaeway monitors settle <eventId>`): ends an event that
+	 * still owes its authoring turn as `failed_no_retry` (`operator_settled`), so
+	 * an overlap=skip monitor stops skipping behind it. Refused while a live
+	 * dispatch lease shows an attempt is running.
+	 */
+	monitorEventOperatorSettle(
+		eventId: string,
+		now = Date.now(),
+	): { settled: true; previousStage: string } | { settled: false; reason: string } {
+		return this.withTransaction(() => {
+			const row = this.monitorEventGet(eventId);
+			if (!row) return { settled: false as const, reason: "unknown_event" };
+			if (!(RECONCILABLE_STAGES as readonly string[]).includes(row.stage))
+				return { settled: false as const, reason: `stage_${row.stage}` };
+			if (this.monitorEventLiveLeaseOwner(eventId, now))
+				return { settled: false as const, reason: "dispatch_in_flight" };
+			this.#database
+				.query("UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ?")
+				.run(new Date(now).toISOString(), eventId);
+			this.monitorFailureRecord(eventId, "operator_settled", `settled by operator from ${row.stage}`);
+			return { settled: true as const, previousStage: row.stage };
+		});
+	}
+	/**
+	 * Operator retry (`gajaeway monitors retry <eventId>`): puts a failed event
+	 * (`failed` or a `failed_no_retry` that never authored) back to `failed`
+	 * with a fresh reclaim budget, so the next reconcile redispatches it at once.
+	 */
+	monitorEventOperatorRetry(
+		eventId: string,
+		now = Date.now(),
+	): { retried: true; previousStage: string } | { retried: false; reason: string } {
+		return this.withTransaction(() => {
+			const row = this.monitorEventGet(eventId);
+			if (!row) return { retried: false as const, reason: "unknown_event" };
+			if (row.stage !== "failed" && row.stage !== "failed_no_retry")
+				return { retried: false as const, reason: `stage_${row.stage}` };
+			if (this.authoredOutput(eventId) !== undefined) return { retried: false as const, reason: "already_authored" };
+			if (this.monitorEventLiveLeaseOwner(eventId, now))
+				return { retried: false as const, reason: "dispatch_in_flight" };
+			this.#database
+				.query("UPDATE monitor_events SET stage = 'failed', dispatch_attempts = 0, updated_at = ? WHERE event_id = ?")
+				.run(new Date(now).toISOString(), eventId);
+			return { retried: true as const, previousStage: row.stage };
 		});
 	}
 	/** Terminalizes an event that cannot safely enter dispatch, with bounded public-safe evidence. */

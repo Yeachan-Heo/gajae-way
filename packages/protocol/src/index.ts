@@ -34,6 +34,7 @@ export {
 	type MemorySearchResult,
 	type MonitorCatchUpDiagnostic,
 	type MonitorChannelTarget,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorEventRecovery,
 	type MonitorOverlapPolicy,

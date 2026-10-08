@@ -562,6 +562,17 @@ export interface MonitorEventRecovery {
 	readonly dispatchAttempts: number;
 }
 
+/**
+ * Outcome of an operator event action. `done: false` names why it was refused
+ * (`unknown_event`, `stage_<stage>`, `dispatch_in_flight`, `already_authored`).
+ */
+export interface MonitorEventOperatorResult {
+	readonly eventId: string;
+	readonly done: boolean;
+	readonly previousStage?: string;
+	readonly reason?: string;
+}
+
 export interface MonitorTestParams {
 	readonly monitorId: string;
 	readonly eventType?: string;
@@ -1016,6 +1027,10 @@ export interface VerbCatalogV01 {
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
+	/** Operator: end one event that still owes its authoring turn as `failed_no_retry`. */
+	"monitor.settle": { params: { readonly eventId: string }; result: MonitorEventOperatorResult };
+	/** Operator: give one failed event a fresh reclaim budget and redispatch it. */
+	"monitor.retry": { params: { readonly eventId: string }; result: MonitorEventOperatorResult };
 	"ops.backup": {
 		params: { readonly path: string };
 		result: { readonly path: string; readonly bytes: number };
@@ -1061,6 +1076,8 @@ export const VERBS_V01 = [
 	"monitor.inspect",
 	"monitor.test",
 	"monitor.remove",
+	"monitor.settle",
+	"monitor.retry",
 	"ops.backup",
 	"ops.redeliver",
 	"ops.integrity",

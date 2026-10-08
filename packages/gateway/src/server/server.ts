@@ -1382,6 +1382,16 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { eventId } });
 			return;
 		}
+		case "monitor.settle":
+		case "monitor.retry": {
+			const eventId = (request.params as { eventId?: unknown } | undefined)?.eventId;
+			if (typeof eventId !== "string" || !eventId)
+				throw new ProtocolError("invalid_params", `${request.verb} requires eventId`);
+			const result =
+				request.verb === "monitor.settle" ? runtime.monitors.settle(eventId) : runtime.monitors.retry(eventId);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "monitor.remove": {
 			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
 			if (typeof monitorId !== "string" || !runtime.registry.remove(monitorId))
