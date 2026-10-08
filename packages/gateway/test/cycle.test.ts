@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,8 +9,10 @@ import {
 	MONITOR_TERMINAL_STREAK_THRESHOLD,
 	observeAgentDisk,
 	projectRuntimeCycle,
+	RuntimeCycleProjector,
 	type RuntimeCycleSources,
 } from "../src/ops/cycle";
+import { GatewayDatabase } from "../src/store/db";
 
 const generatedAt = "2026-08-26T00:00:00.000Z";
 
@@ -46,6 +49,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		gjcVersion: undefined,
 		monitorTerminalStreak: 0,
 		brokerRespawnChurn: false,
+		brokerExitRecord: undefined,
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -170,6 +174,103 @@ describe("runtime cycle projection", () => {
 		const churn = projectRuntimeCycle(sources({ brokerRespawnChurn: true }), generatedAt);
 		expect(churn.gates).toEqual(["broker_respawn_churn"]);
 		expect(churn.phase).toBe("degraded");
+	});
+
+	test("broker index lock exit records gate matching causes but ignore ordinary and unknown records", () => {
+		const startupLock = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-lock-blocked", extra: { ignored: true } } }),
+			generatedAt,
+		);
+		expect(startupLock.gates).toEqual(["broker_index_lock_blocked"]);
+		expect(startupLock.phase).toBe("degraded");
+
+		const retainedRemoval = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-error", detail: "retained removal transition detected" } }),
+			generatedAt,
+		);
+		expect(retainedRemoval.gates).toEqual(["broker_index_lock_blocked"]);
+		expect(retainedRemoval.phase).toBe("degraded");
+
+		const heartbeatLock = projectRuntimeCycle(
+			sources({
+				brokerExitRecord: {
+					reason: "heartbeat-renewal-blocked",
+					blockingLockPath: "/agent/sessions/index.jsonl.lock.removing",
+				},
+			}),
+			generatedAt,
+		);
+		expect(heartbeatLock.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const blockingPathOnly = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "startup-error", blockingLockPath: "/agent/x.lock.removing" } }),
+			generatedAt,
+		);
+		expect(blockingPathOnly.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const retainedRemovalReason = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "RETAINED REMOVAL TRANSITION refused" } }),
+			generatedAt,
+		);
+		expect(retainedRemovalReason.gates).toEqual(["broker_index_lock_blocked"]);
+
+		const ordinary = projectRuntimeCycle(
+			sources({ brokerExitRecord: { reason: "normal-exit", detail: "clean shutdown" } }),
+			generatedAt,
+		);
+		expect(ordinary.gates).toEqual([]);
+
+		for (const brokerExitRecord of [
+			undefined,
+			null,
+			"unknown record",
+			[],
+			{ reason: { toString: "startup-lock-blocked" }, detail: { includes: "retained removal transition" } },
+		]) {
+			const unknown = projectRuntimeCycle(sources({ brokerExitRecord }), generatedAt);
+			expect(unknown.gates).not.toContain("broker_index_lock_blocked");
+		}
+	});
+
+	test("runtime-cycle snapshot reads the broker exit file from agentDir without changing GJC state", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-broker-exit-"));
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		try {
+			const agentDir = join(directory, "agent");
+			const sdkDir = join(agentDir, "sdk");
+			const exitPath = join(sdkDir, "broker.exit.json");
+			await mkdir(sdkDir, { recursive: true });
+			const matchingRecord = '{"reason":"startup-lock-blocked","detail":"retained removal transition"}';
+			await writeFile(exitPath, matchingRecord);
+
+			const projector = new RuntimeCycleProjector(database, { queueDepth: 0 }, { agentDir });
+			const blocked = projector.project();
+			expect(blocked.gates).toContain("broker_index_lock_blocked");
+			expect(blocked.phase).toBe("degraded");
+			expect(await readFile(exitPath, "utf8")).toBe(matchingRecord);
+
+			const malformedFields = '{"reason":{"toString":null},"detail":{"includes":"retained removal transition"}}';
+			await writeFile(exitPath, malformedFields);
+			expect(projector.project().gates).not.toContain("broker_index_lock_blocked");
+
+			await writeFile(exitPath, '{"reason":"ordinary-shutdown"}');
+			expect(projector.project().gates).not.toContain("broker_index_lock_blocked");
+
+			// Invalid/missing primary records fall through to the startup record.
+			const startupPath = join(sdkDir, "broker.startup-exit.json");
+			await writeFile(startupPath, '{"reason":"STARTUP-LOCK-BLOCKED","unknown":true}');
+			for (const invalid of ["invalid JSON", "null", "[]"]) {
+				await writeFile(exitPath, invalid);
+				expect(projector.project().gates).toContain("broker_index_lock_blocked");
+			}
+			await rm(exitPath);
+			expect(projector.project().gates).toContain("broker_index_lock_blocked");
+			await rm(startupPath);
+			expect(projector.project().gates).not.toContain("broker_index_lock_blocked");
+		} finally {
+			database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("empty durable state projects idle with no gates", () => {

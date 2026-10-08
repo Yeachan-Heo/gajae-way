@@ -610,3 +610,56 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 	)!;
 	await silencePersona(f, internalReport.opRef);
 });
+
+// Issue #435: lane report thread routing for channel root origins
+test("AC-435 Slack channel root trigger routes lane report to thread", async () => {
+	const slackChannelOrigin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C_issue435_slack" };
+	const f = await fixture({
+		ownerTarget: slackChannelOrigin,
+		channels: { "slack:C_issue435_slack": { engagement: "open", audience: "all" } },
+	});
+	const triggerMessageId = "C_issue435_slack:1700000000.000435";
+	const persona = await startPersonaTurn(f, slackChannelOrigin, triggerMessageId);
+	const lane = await startLane(f, "ac435-slack-worker", persona.sessionId);
+	expect(lane.error).toBeUndefined();
+	await settleLane(f, lane.result.opRef, "slack thread result");
+	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportRows = await eventually(
+		() => f.database.inboundTurnRows(persona.opRef),
+		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
+		"lane report row for AC-435 slack",
+	);
+	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
+	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
+	expect(laneReportOrigin.kind).toBe("thread");
+	expect(laneReportOrigin.platform).toBe("slack");
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
+	expect(laneReportOrigin.parentId).toBe(slackChannelOrigin.conversationId);
+	f.port.complete(persona.opRef, "ack");
+});
+
+test("AC-435 Discord channel root trigger routes lane report to thread", async () => {
+	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
+	const f = await fixture({
+		ownerTarget: discordChannelOrigin,
+		channels: { "discord-ch-435": { engagement: "open", audience: "all" } },
+	});
+	const triggerMessageId = "discord-trigger-msg-id";
+	const persona = await startPersonaTurn(f, discordChannelOrigin, triggerMessageId);
+	const lane = await startLane(f, "ac435-discord-worker", persona.sessionId);
+	expect(lane.error).toBeUndefined();
+	await settleLane(f, lane.result.opRef, "discord thread result");
+	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportRows = await eventually(
+		() => f.database.inboundTurnRows(persona.opRef),
+		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
+		"lane report row for AC-435 discord",
+	);
+	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
+	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
+	expect(laneReportOrigin.kind).toBe("thread");
+	expect(laneReportOrigin.platform).toBe("discord");
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
+	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
+	f.port.complete(persona.opRef, "ack");
+});

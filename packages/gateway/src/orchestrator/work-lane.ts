@@ -407,10 +407,18 @@ export class WorkLaneManager {
 		const lanePrefix = "work/task/";
 		const callerLane = callerOrigin?.startsWith(lanePrefix) ? callerOrigin.slice(lanePrefix.length) : undefined;
 		let callerPersona: OriginRef | undefined;
+		let triggerMessageId: string | undefined;
 		if (callerOrigin && callerLane === undefined) {
 			try {
 				const origin = parseOriginKey(callerOrigin);
-				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) callerPersona = origin;
+				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) {
+					callerPersona = origin;
+					// Capture trigger message ID from the current nonterminal turn for threading
+					const nonterminalTurns = this.#db.inboundNonterminalTurns(callerOrigin);
+					if (nonterminalTurns.length > 0) {
+						triggerMessageId = nonterminalTurns[0]?.triggerMessageId;
+					}
+				}
 			} catch {
 				/* Unknown and non-persona origins fall back to ownerTarget for starts. */
 			}
@@ -437,7 +445,12 @@ export class WorkLaneManager {
 			return null;
 		}
 		if (callerPersona) {
-			const parent: WorkParent = { kind: "persona", originKey: originKey(callerPersona), origin: callerPersona };
+			const parent: WorkParent = {
+				kind: "persona",
+				originKey: originKey(callerPersona),
+				origin: callerPersona,
+				...(triggerMessageId ? { triggerMessageId } : {}),
+			};
 			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
 			return parent;
 		}
@@ -446,7 +459,19 @@ export class WorkLaneManager {
 			try {
 				validateOriginRef(owner);
 				if (["discord", "slack", "telegram", "loopback"].includes(owner.platform)) {
-					const parent: WorkParent = { kind: "persona", originKey: originKey(owner), origin: structuredClone(owner) };
+					// Capture trigger message ID from the ownerTarget's origin for threading
+					let ownerTriggerMessageId: string | undefined;
+					const ownerOriginKey = originKey(owner);
+					const ownerNonterminalTurns = this.#db.inboundNonterminalTurns(ownerOriginKey);
+					if (ownerNonterminalTurns.length > 0) {
+						ownerTriggerMessageId = ownerNonterminalTurns[0]?.triggerMessageId;
+					}
+					const parent: WorkParent = {
+						kind: "persona",
+						originKey: ownerOriginKey,
+						origin: structuredClone(owner),
+						...(ownerTriggerMessageId ? { triggerMessageId: ownerTriggerMessageId } : {}),
+					};
 					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona`);
 					return parent;
 				}

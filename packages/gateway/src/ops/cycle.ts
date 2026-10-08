@@ -9,6 +9,7 @@ import {
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
+import { isBrokerIndexLockBlocked, readBrokerExitRecordSync } from "../orchestrator/broker-liveness";
 import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
 import type { GatewayDatabase } from "../store/db";
@@ -140,6 +141,8 @@ export interface RuntimeCycleSources {
 	readonly monitorTerminalStreak: number;
 	/** True while the shared broker's incarnation keeps changing (die/respawn churn). */
 	readonly brokerRespawnChurn: boolean;
+	/** Untrusted broker exit record from the GJC-owned agent directory, when present. */
+	readonly brokerExitRecord: unknown;
 }
 
 export class RuntimeCycleProjector {
@@ -230,6 +233,7 @@ export class RuntimeCycleProjector {
 			gjcVersion: this.#gjcVersion(),
 			monitorTerminalStreak: this.#database.monitorConsecutiveTerminalFailures(),
 			brokerRespawnChurn: this.#brokerRespawnChurn(),
+			brokerExitRecord: this.#agentDir === undefined ? undefined : readBrokerExitRecordSync(this.#agentDir),
 		};
 	}
 }
@@ -320,6 +324,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// Dispatch outcome and incarnation churn are the health signals that moved.
 	if (sources.monitorTerminalStreak >= MONITOR_TERMINAL_STREAK_THRESHOLD) gates.add("monitor_dispatch_failing");
 	if (sources.brokerRespawnChurn) gates.add("broker_respawn_churn");
+	if (isBrokerIndexLockBlocked(sources.brokerExitRecord)) gates.add("broker_index_lock_blocked");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);

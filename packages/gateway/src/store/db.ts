@@ -144,7 +144,13 @@ export interface WorkReportRoot {
 	readonly origin: OriginRef;
 }
 export type WorkParent =
-	| { readonly kind: "persona"; readonly originKey: string; readonly origin: OriginRef }
+	| {
+			readonly kind: "persona";
+			readonly originKey: string;
+			readonly origin: OriginRef;
+			/** Trigger message ID for threading lane reports (channel root origins only). */
+			readonly triggerMessageId?: string;
+	  }
 	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
 export interface WorkAttemptOutputProof {
 	readonly opRef: string;
@@ -483,6 +489,35 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
 	const root = JSON.parse(row.root_json) as WorkReportRoot;
 	validateWorkRoot(root);
 	return root;
+}
+
+/**
+ * Resolve the lane report origin for a persona parent. If the parent is a channel root
+ * origin with a triggerMessageId, route the report to a thread instead of the channel root.
+ */
+function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
+	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
+
+	try {
+		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
+		if (origin.kind !== "channel") return admissionOriginRefJson;
+		// Slack message ids are already `<channel>:<ts>`, which is exactly the thread conversation id;
+		// a Discord thread started from a message shares that message's id.
+		if (origin.platform === "slack" && !parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) {
+			return admissionOriginRefJson;
+		}
+		if (origin.platform !== "slack" && origin.platform !== "discord") return admissionOriginRefJson;
+		const threadOrigin: OriginRef = {
+			platform: origin.platform,
+			kind: "thread",
+			conversationId: parent.triggerMessageId,
+			parentId: origin.conversationId,
+		};
+		validateOriginRef(threadOrigin);
+		return JSON.stringify(threadOrigin);
+	} catch {
+		return admissionOriginRefJson;
+	}
 }
 
 function validateLaneReportRow(row: LaneReportRow): void {
@@ -1601,11 +1636,12 @@ export class GatewayDatabase {
 
 			if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(next);
 			if (next.decision === "reported" && admission?.kind === "persona") {
+				const resolvedOriginRefJson = resolveLaneReportOrigin(next.parent, admission.row.originRefJson);
 				workAssert(
 					this.inboundEnqueueInTransaction({
 						messageId: admission.row.messageId,
 						originKey: admission.row.originKey,
-						originRefJson: admission.row.originRefJson,
+						originRefJson: resolvedOriginRefJson,
 						body: admission.row.body,
 						receivedAt: next.settledAt!,
 						source: "lane_report",

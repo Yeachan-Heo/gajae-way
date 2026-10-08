@@ -181,6 +181,8 @@ export interface PersonaSessionManagerOptions {
 	readonly port: SessionPort;
 	readonly instanceId: string;
 	readonly repo: string;
+	/** GJC agent directory, used to read broker exit information. */
+	readonly brokerAgentDir?: string;
 	/** Startup model/preset passed to session.create; conversation overrides may replace it later. */
 	readonly sessionModel?: GjcModelSelection;
 	readonly stallTimeoutMs?: number;
@@ -252,6 +254,7 @@ export class PersonaSessionManager {
 	readonly #port: SessionPort;
 	readonly #instanceId: string;
 	readonly #repo: string;
+	readonly #brokerAgentDir: string | undefined;
 	readonly #sessionModel: GjcModelSelection | undefined;
 	#stallTimeoutMs: number;
 	readonly #brokerGeneration: () => number;
@@ -277,6 +280,7 @@ export class PersonaSessionManager {
 		this.#port = options.port;
 		this.#instanceId = options.instanceId;
 		this.#repo = options.repo;
+		this.#brokerAgentDir = options.brokerAgentDir;
 		this.#sessionModel = options.sessionModel;
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
@@ -457,6 +461,10 @@ export class PersonaSessionManager {
 
 	get brokerGeneration(): number {
 		return this.#brokerGeneration();
+	}
+
+	get brokerAgentDir(): string | undefined {
+		return this.#brokerAgentDir;
 	}
 
 	now(): number {
@@ -1501,7 +1509,12 @@ class OriginActor {
 						"error",
 					);
 				}
-				const hold = describeBindHold(verdict, detail, this.#sameDetailBindFailures);
+				const hold = await describeBindHold(
+					verdict,
+					detail,
+					this.#sameDetailBindFailures,
+					this.#manager.brokerAgentDir,
+				);
 				this.#bindWedged = verdict?.state === "wedged";
 				this.#manager.log(
 					`persona_bind_hold origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${this.#sameDetailBindFailures} reason=${hold.reason} detail=${detail}`,
