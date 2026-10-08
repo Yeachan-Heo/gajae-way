@@ -63,6 +63,26 @@ const DEFAULT_RECONCILE_MS = 60_000;
 const AUDIT_TAIL_DEFAULT = 20;
 const AUDIT_TAIL_MAX = 200;
 
+function disconnectedSnapshot(snapshot: ConsoleSnapshot): ConsoleSnapshot {
+	const origin = formatClockSeconds(new Date(snapshot.at));
+	return {
+		...snapshot,
+		gateway: { ...snapshot.gateway, reachable: false, error: "gateway disconnected" },
+		status: {
+			...snapshot.status,
+			tone: "danger",
+			state: "unreachable",
+			fields: {
+				...snapshot.status.fields,
+				alive: "gateway unreachable",
+				profile: "gateway disconnected",
+				stream: `gateway disconnected — showing data from ${origin}`,
+			},
+			tones: { ...(snapshot.status.tones ?? {}), alive: "danger", profile: "danger", stream: "danger" },
+		},
+	};
+}
+
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
@@ -113,29 +133,41 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 	const now = options.now ?? (() => new Date());
 	const turns = new TurnTracker(() => now().getTime());
 
-	// Gateway reachability is tracked from real read outcomes, so the console can
-	// distinguish "the daemon is down" from "this browser lost the admin process".
-	let gatewayReachable = true;
-	const request: GatewayRequest = async (method, params) => {
-		try {
-			const result = await options.request(method, params);
-			gatewayReachable = true;
-			return result;
-		} catch (error) {
-			gatewayReachable = false;
-			throw error;
+	// Gateway reachability is tracked from real read outcomes and the local
+	// connection lifecycle, so the console can distinguish gateway loss from a
+	// browser losing the admin process.
+	let gatewayConnection: boolean | undefined;
+	let connectionEpoch = 0;
+	let latestSnapshot: { readonly epoch: number; readonly state: ConsoleSnapshot } | undefined;
+	const request: GatewayRequest = options.request;
+
+	const snapshot = async (): Promise<ConsoleSnapshot> => {
+		const epoch = connectionEpoch;
+		if (gatewayConnection === false && latestSnapshot) return disconnectedSnapshot(latestSnapshot.state);
+
+		const snapshotRequest: GatewayRequest =
+			gatewayConnection === false
+				? async () => {
+						throw new Error("gateway connection is closed");
+					}
+				: request;
+		const state = await buildSnapshot({ request: snapshotRequest, turns, now });
+		if (epoch !== connectionEpoch) {
+			if (latestSnapshot?.epoch === connectionEpoch) return latestSnapshot.state;
+			return disconnectedSnapshot(state);
 		}
+
+		const current = gatewayConnection === false ? disconnectedSnapshot(state) : state;
+		latestSnapshot = { epoch, state: current };
+		return current;
 	};
 
-	const snapshot = (): Promise<ConsoleSnapshot> => buildSnapshot({ request, turns, now });
-
 	const stream = new StreamHub({
-		snapshot: async () => {
-			const state = await snapshot();
-			gatewayReachable = state.gateway.reachable;
-			return state;
-		},
-		gatewayReachable: () => gatewayReachable,
+		snapshot,
+		gatewayReachable: () =>
+			gatewayConnection !== false &&
+			(latestSnapshot === undefined ||
+				(latestSnapshot.epoch === connectionEpoch && latestSnapshot.state.gateway.reachable)),
 	});
 
 	const pushSnapshot = (): void => {
@@ -155,11 +187,21 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 				pushSnapshot();
 				return;
 			case "gateway.stopping":
-				gatewayReachable = false;
 				turns.clear();
 				stream.broadcast("gateway.stopping", payload);
 				pushSnapshot();
 				return;
+			case "gateway.connection": {
+				if (typeof payload !== "object" || payload === null) return;
+				const connection = payload as { connected?: unknown };
+				if (typeof connection.connected !== "boolean") return;
+				const connected = connection.connected;
+				gatewayConnection = connected;
+				connectionEpoch += 1;
+				stream.broadcast("gateway.connection", { connected });
+				if (connected) pushSnapshot();
+				return;
+			}
 			default:
 				return;
 		}

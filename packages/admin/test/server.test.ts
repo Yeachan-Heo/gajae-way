@@ -1,9 +1,29 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { memoryAuditLog } from "../src/audit";
 import { createAdminApp } from "../src/server";
-import { FIXED_NOW, type Harness, harness, MONITOR, post } from "./fixture";
+import { FIXED_NOW, type Harness, harness, MONITOR, post, SESSIONS, STATUS } from "./fixture";
 
 let open: Harness | undefined;
+
+type ResponseReader = Pick<ReadableStreamDefaultReader<Uint8Array>, "read" | "cancel">;
+
+async function readUntil(reader: ResponseReader, marker: string): Promise<string> {
+	const decoder = new TextDecoder();
+	let text = "";
+	while (!text.includes(marker)) {
+		const chunk = await reader.read();
+		if (chunk.done) break;
+		text += decoder.decode(chunk.value, { stream: true });
+	}
+	return text;
+}
+
+function eventData(frame: string, event: string): unknown {
+	const block = frame.split("\n\n").find((candidate) => candidate.includes(`event: ${event}`));
+	const line = block?.split("\n").find((candidate) => candidate.startsWith("data: "));
+	if (!line) throw new Error("SSE frame did not contain data");
+	return JSON.parse(line.slice("data: ".length));
+}
 
 function app(...args: Parameters<typeof harness>): Harness {
 	open?.stop();
@@ -391,6 +411,128 @@ describe("event stream", () => {
 		expect(text).toContain("event: snapshot");
 		expect(text).toContain('"alive 4d 6h"');
 		await reader?.cancel();
+	});
+
+	test("gateway connection loss is immediate and recovery sends a fresh snapshot", async () => {
+		const instance = app();
+		const response = await instance.fetch("/api/stream");
+		const reader = response.body?.getReader();
+		expect(reader).toBeDefined();
+		await readUntil(reader!, "event: snapshot");
+
+		instance.emit("gateway.connection", { connected: false });
+		const disconnected = await readUntil(reader!, "event: gateway.connection");
+		expect(eventData(disconnected, "gateway.connection")).toEqual({ connected: false });
+
+		const loaded = await instance.fetch("/");
+		expect(await loaded.text()).toContain("gateway disconnected");
+
+		const lateResponse = await instance.fetch("/api/stream");
+		const lateReader = lateResponse.body?.getReader();
+		const lateSnapshot = await readUntil(lateReader!, "event: snapshot");
+		expect(lateSnapshot).toContain("retry: 15000");
+		expect((eventData(lateSnapshot, "snapshot") as { gateway: { reachable: boolean } }).gateway.reachable).toBe(false);
+
+		instance.emit("gateway.connection", { connected: true });
+		const reconnected = await readUntil(reader!, "event: gateway.connection");
+		expect(eventData(reconnected, "gateway.connection")).toEqual({ connected: true });
+		const refreshed = await readUntil(reader!, "event: snapshot");
+		expect((eventData(refreshed, "snapshot") as { gateway: { reachable: boolean } }).gateway.reachable).toBe(true);
+		expect(
+			instance.calls.every(({ method }) =>
+				["gateway.status", "session.list", "monitor.list", "monitor.inspect"].includes(method),
+			),
+		).toBe(true);
+		await lateReader?.cancel();
+		await reader?.cancel();
+	});
+
+	test("reconnect retains and ages observed turns without waiting for another progress event", async () => {
+		let now = FIXED_NOW;
+		const instance = app({ now: () => now });
+		instance.emit("chat.progress", {
+			turnId: "retained-turn",
+			origin: { platform: "discord", kind: "channel", conversationId: "1493635653441945762" },
+			elapsedMs: 10_000,
+			toolCalls: 2,
+			outputTokens: 40,
+		});
+		const snapshot = async () =>
+			(await (await instance.fetch("/api/snapshot")).json()) as {
+				result: {
+					at: string;
+					gateway: { reachable: boolean };
+					live: { rows: { key: string; state: string; ages: { lastEvent: string } }[] };
+				};
+			};
+		const before = await snapshot();
+		expect(before.result.live.rows[0]?.state).toBe("running");
+		instance.emit("gateway.connection", { connected: false });
+		now = new Date(FIXED_NOW.getTime() + 60_000);
+		const offline = await snapshot();
+		expect(offline.result.gateway.reachable).toBe(false);
+		expect(offline.result.at).toBe(before.result.at);
+		expect(offline.result.at).toBe(FIXED_NOW.toISOString());
+		expect(offline.result.live.rows[0]?.key).toBe("retained-turn");
+		instance.emit("gateway.connection", { connected: true });
+		const recovered = await snapshot();
+		expect(recovered.result.gateway.reachable).toBe(true);
+		expect(recovered.result.live.rows[0]).toMatchObject({
+			key: "retained-turn",
+			state: "stalled",
+			ages: { lastEvent: FIXED_NOW.toISOString() },
+		});
+	});
+
+	test("a successful in-flight read cannot erase an observed disconnection", async () => {
+		let listener: (event: string, payload: unknown) => void = () => {};
+		let releaseStatus = (): void => {};
+		let markStatusStarted = (): void => {};
+		const statusStarted = new Promise<void>((resolve) => {
+			markStatusStarted = resolve;
+		});
+		const statusGate = new Promise<void>((resolve) => {
+			releaseStatus = resolve;
+		});
+		const instance = createAdminApp({
+			request: async (method) => {
+				switch (method) {
+					case "gateway.status":
+						markStatusStarted();
+						await statusGate;
+						return STATUS;
+					case "session.list":
+						return SESSIONS;
+					case "monitor.list":
+						return { monitors: [], schedules: {} };
+					default:
+						throw new Error(`unexpected verb ${method}`);
+				}
+			},
+			events: (handler) => {
+				listener = handler;
+				return () => {};
+			},
+			reconcileMs: 0,
+			now: () => FIXED_NOW,
+		});
+		let reader: ResponseReader | undefined;
+		try {
+			const response = await instance.handler(new Request("http://admin.test/api/stream"));
+			reader = response.body?.getReader();
+			await statusStarted;
+			listener("gateway.connection", { connected: false });
+			await readUntil(reader!, "event: gateway.connection");
+			releaseStatus();
+			const snapshotFrame = await readUntil(reader!, "event: snapshot");
+			expect((eventData(snapshotFrame, "snapshot") as { gateway: { reachable: boolean } }).gateway.reachable).toBe(
+				false,
+			);
+		} finally {
+			releaseStatus();
+			await reader?.cancel();
+			instance.stop();
+		}
 	});
 
 	test("a live progress event turns into a live-work row", async () => {
