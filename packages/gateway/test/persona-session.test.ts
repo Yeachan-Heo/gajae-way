@@ -2041,6 +2041,68 @@ test("successful /model resumes the refused trigger on its existing session", as
 	expect(notices).toHaveLength(1);
 	expect(port.steers).toHaveLength(0);
 });
+// The refusal's inboundTurnRequeue already advanced the shared per-trigger
+// retry ordinal that arms the one automatic submission-phase re-send, so the
+// turn resumed by /model reports its own submission failure instead of
+// spending a second send on the same trigger.
+test("an accepted turn resumed after an authenticated refusal reports its submission failure without a re-send", async () => {
+	const port = new ModelNotSelectedPort({
+		onSend: (input, scripted) => scripted.fail(input.opRef, "Prompt submission failed.", SUBMISSION_BUSY),
+	});
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	const notices: PersonaFailureInput[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			terminal: (text) => terminal.push(text),
+			failure: (message) => failures.push(message),
+			modelRefusal: (input) => notices.push(input),
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("refused-then-submission", "refusal spends the shared retry budget");
+	await manager!.notifyInbound(KEY);
+	const refusedOpRef = latestOpRef;
+	expect(database!.freshTurnAttempt(KEY, 0, "refused-then-submission")).toBe(1);
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(port.sends).toHaveLength(0);
+	expect(notices).toHaveLength(1);
+
+	await manager!.rebindModel(KEY, "provider/model");
+	await eventually(
+		() => failures.length === 1 && manager!.state(KEY) === "idle",
+		"resumed submission failure did not settle through the ordinary failure path",
+	);
+
+	expect(port.models).toContainEqual({
+		sessionId: "session-e0",
+		repo: join(home, "workspace"),
+		selection: "provider/model",
+	});
+	expect(port.sendAttempts).toHaveLength(2);
+	expect(port.sends).toHaveLength(1);
+	const accepted = port.sends[0]!;
+	expect(accepted.opRef).not.toBe(refusedOpRef);
+	expect(accepted).toMatchObject({ sessionId: "session-e0", text: "refusal spends the shared retry budget" });
+	expect(failures).toEqual(["internal: Prompt submission failed."]);
+	expect(terminal).toEqual([]);
+	expect(database!.inboundTurnRow(accepted.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.freshTurnAttempt(KEY, 0, "refused-then-submission")).toBe(1);
+	expect(database!.inboundPendingCount(KEY)).toBe(0);
+	expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(notices).toHaveLength(1);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("terminal_failure ") &&
+				line.includes(`opRef=${accepted.opRef}`) &&
+				line.includes("phase=submission"),
+		),
+	).toBe(true);
+	expect(logs.filter((line) => line.startsWith("submission_retry "))).toHaveLength(0);
+});
 
 test("failed /model keeps the pending refusal paused", async () => {
 	const port = new ModelNotSelectedPort();
