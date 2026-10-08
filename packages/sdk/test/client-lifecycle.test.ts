@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,6 +86,71 @@ test("invalid request params do not leak pending work or disconnect the client",
 			expect(requests).toBe(2);
 			expect(disconnects).toBe(0);
 			await client.close();
+		},
+	);
+});
+
+test("stdio serialization errors reject only the invalid request", async () => {
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const client = await GajaewayClient.connectStdio({
+		readable: new ReadableStream<Uint8Array>({
+			start(value) {
+				controller = value;
+			},
+		}),
+		writable: {
+			write(data) {
+				const frame = JSON.parse(String(data));
+				controller.enqueue(
+					new TextEncoder().encode(
+						frame.type === "hello"
+							? negotiated()
+							: `${JSON.stringify({ v: PROFILE_VERSION, type: "response", id: frame.id, result: "ok" })}\n`,
+					),
+				);
+			},
+		},
+	});
+	let disconnects = 0;
+	client.onDisconnect(() => disconnects++);
+	try {
+		const circular: { self?: unknown } = {};
+		circular.self = circular;
+		for (const params of [circular, { value: 1n }]) {
+			await expect(client.request("invalid", params)).rejects.toThrow();
+			expect(disconnects).toBe(0);
+		}
+		expect(await client.request("valid")).toBe("ok");
+	} finally {
+		controller.close();
+		await client.close();
+	}
+});
+
+test("throwing disconnect subscribers cannot prevent later notifications or explicit socket close", async () => {
+	await withSocket(
+		(socket, frame) => {
+			if (frame.type === "hello") socket.write(negotiated());
+		},
+		async (path, peers) => {
+			const client = await GajaewayClient.connectSocket(path);
+			const failure = new Error("subscriber failed");
+			const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+			let notifications = 0;
+			client.onDisconnect(() => {
+				throw failure;
+			});
+			client.onDisconnect(() => notifications++);
+			try {
+				await client.close();
+				await until(() => peers.size === 0);
+				await client.close();
+				expect(notifications).toBe(1);
+				expect(diagnostic).toHaveBeenCalledWith("SDK disconnect subscriber failed", failure);
+			} finally {
+				diagnostic.mockRestore();
+				await client.close();
+			}
 		},
 	);
 });
