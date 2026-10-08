@@ -325,7 +325,7 @@ test("a mention steered into a busy turn still opens its thread for unmentioned 
 		return `answer ${calls}`;
 	}, "mention-open");
 	const slack = fakeSlackApi();
-	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
 	const earlier = "1726543210.000900";
 	await adapter.requestInbound(
