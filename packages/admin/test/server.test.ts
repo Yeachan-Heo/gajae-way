@@ -447,6 +447,43 @@ describe("event stream", () => {
 		await reader?.cancel();
 	});
 
+	test("reconnect retains and ages observed turns without waiting for another progress event", async () => {
+		let now = FIXED_NOW;
+		const instance = app({ now: () => now });
+		instance.emit("chat.progress", {
+			turnId: "retained-turn",
+			origin: { platform: "discord", kind: "channel", conversationId: "1493635653441945762" },
+			elapsedMs: 10_000,
+			toolCalls: 2,
+			outputTokens: 40,
+		});
+		const snapshot = async () =>
+			(await (await instance.fetch("/api/snapshot")).json()) as {
+				result: {
+					at: string;
+					gateway: { reachable: boolean };
+					live: { rows: { key: string; state: string; ages: { lastEvent: string } }[] };
+				};
+			};
+		const before = await snapshot();
+		expect(before.result.live.rows[0]?.state).toBe("running");
+		instance.emit("gateway.connection", { connected: false });
+		now = new Date(FIXED_NOW.getTime() + 60_000);
+		const offline = await snapshot();
+		expect(offline.result.gateway.reachable).toBe(false);
+		expect(offline.result.at).toBe(before.result.at);
+		expect(offline.result.at).toBe(FIXED_NOW.toISOString());
+		expect(offline.result.live.rows[0]?.key).toBe("retained-turn");
+		instance.emit("gateway.connection", { connected: true });
+		const recovered = await snapshot();
+		expect(recovered.result.gateway.reachable).toBe(true);
+		expect(recovered.result.live.rows[0]).toMatchObject({
+			key: "retained-turn",
+			state: "stalled",
+			ages: { lastEvent: FIXED_NOW.toISOString() },
+		});
+	});
+
 	test("a successful in-flight read cannot erase an observed disconnection", async () => {
 		let listener: (event: string, payload: unknown) => void = () => {};
 		let releaseStatus = (): void => {};

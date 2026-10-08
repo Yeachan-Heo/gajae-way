@@ -44,6 +44,7 @@ export function processStartedAt(): string {
 }
 
 interface Transport {
+	/** Encoding errors throw synchronously; transport failures reject asynchronously. */
 	write(frame: Frame): Promise<void>;
 	close(): void | Promise<void>;
 }
@@ -114,9 +115,9 @@ export class GajaewayClient {
 			throw error;
 		}
 		client.#transport = {
-			write: async (frame) => {
+			write: (frame) => {
 				writer.write(frame);
-				await writer.settled();
+				return writer.settled();
 			},
 			close: () => {
 				writer?.close();
@@ -142,17 +143,19 @@ export class GajaewayClient {
 	static async connectStdio(transport: StdioTransport, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
 		client.#transport = {
-			write: async (frame) => {
+			write: (frame) => {
 				const data = encodeFrame(frame);
-				const writable = transport.writable;
-				if ("getWriter" in writable) {
-					const writer = writable.getWriter();
-					try {
-						await writer.write(new TextEncoder().encode(data));
-					} finally {
-						writer.releaseLock();
-					}
-				} else await writable.write(data);
+				return (async () => {
+					const writable = transport.writable;
+					if ("getWriter" in writable) {
+						const writer = writable.getWriter();
+						try {
+							await writer.write(new TextEncoder().encode(data));
+						} finally {
+							writer.releaseLock();
+						}
+					} else await writable.write(data);
+				})();
 			},
 			close: () => {
 				if ("getWriter" in transport.writable) transport.writable.getWriter().releaseLock();
@@ -232,9 +235,18 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
-		void transport.write({ v: PROFILE_VERSION, type: "request", id, verb, params }).catch((error: unknown) => {
-			this.#fail(error instanceof Error ? error : new Error(String(error)));
-		});
+		try {
+			void transport.write({ v: PROFILE_VERSION, type: "request", id, verb, params }).catch((error: unknown) => {
+				this.#fail(error instanceof Error ? error : new Error(String(error)));
+			});
+		} catch (error) {
+			const pending = this.#pending.get(id);
+			if (pending) {
+				clearTimeout(pending.timer);
+				this.#pending.delete(id);
+				pending.reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
 		return promise;
 	}
 
@@ -295,13 +307,13 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			void transport
 				.write({
-						v: PROFILE_VERSION,
-						type: "hello",
-						payload: {
-							supportedVersions: [PROFILE_VERSION],
-							clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
-						},
-					})
+					v: PROFILE_VERSION,
+					type: "hello",
+					payload: {
+						supportedVersions: [PROFILE_VERSION],
+						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
+					},
+				})
 				.catch((error) => this.#fail(error instanceof Error ? error : new Error(String(error))));
 		});
 		return this.#negotiated;
@@ -395,7 +407,13 @@ export class GajaewayClient {
 				void Promise.resolve(transport.close()).catch(() => {});
 			} catch {}
 		}
-		for (const handler of this.#disconnectHandlers) handler(error);
+		for (const handler of this.#disconnectHandlers) {
+			try {
+				handler(error);
+			} catch (callbackError) {
+				console.error("SDK disconnect subscriber failed", callbackError);
+			}
+		}
 		this.#disconnectHandlers.clear();
 		return transport;
 	}

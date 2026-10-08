@@ -198,7 +198,6 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 				const connected = connection.connected;
 				gatewayConnection = connected;
 				connectionEpoch += 1;
-				if (!connected) turns.clear();
 				stream.broadcast("gateway.connection", { connected });
 				if (connected) pushSnapshot();
 				return;
