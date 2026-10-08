@@ -13,7 +13,9 @@ import {
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
+	type FrameWriterSink,
 	LOOPBACK_ORIGIN,
+	OrderedFrameWriter,
 	type OriginRef,
 	PROFILE_VERSION,
 	ProtocolError,
@@ -40,7 +42,7 @@ export function processStartedAt(): string {
 }
 
 interface Transport {
-	write(data: string): Promise<void>;
+	write(frame: Frame): Promise<void>;
 	close(): void | Promise<void>;
 }
 
@@ -53,12 +55,24 @@ interface Pending {
 export class GajaewayClient {
 	static async connectSocket(path: string, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
-		const socket = await Bun.connect<undefined>({
+		const decoder = new TextDecoder();
+		const socketSink: FrameWriterSink = {
+			write: (_bytes: Uint8Array) => 0,
+			close: () => {},
+		};
+		let writer: OrderedFrameWriter;
+		const _socket = await Bun.connect<undefined>({
 			unix: path,
 			socket: {
-				open() {},
+				open(socket) {
+					socketSink.write = (bytes: Uint8Array) => socket.write(bytes);
+					socketSink.close = () => socket.end();
+					writer = new OrderedFrameWriter(socketSink, (error) => {
+						client.#fail(error as Error);
+					});
+				},
 				data(_socket, data) {
-					client.#receive(new TextDecoder().decode(data));
+					client.#receive(decoder.decode(data, { stream: true }));
 				},
 				close() {
 					client.#fail(new Error("gateway connection closed"));
@@ -66,14 +80,18 @@ export class GajaewayClient {
 				error(_socket, error) {
 					client.#fail(error);
 				},
+				drain(_socket) {
+					writer?.drain();
+				},
 			},
 		});
 		client.#transport = {
-			write: async (data) => {
-				socket.write(data);
+			write: async (frame) => {
+				writer.write(frame);
+				await writer.settled();
 			},
 			close: () => {
-				socket.end();
+				writer?.close();
 			},
 		};
 		await client.#negotiate();
@@ -83,7 +101,8 @@ export class GajaewayClient {
 	static async connectStdio(transport: StdioTransport, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
 		client.#transport = {
-			write: async (data) => {
+			write: async (frame) => {
+				const data = encodeFrame(frame);
 				const writable = transport.writable;
 				if ("getWriter" in writable) {
 					const writer = writable.getWriter();
@@ -159,7 +178,7 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
-		await this.#transport.write(encodeFrame({ v: PROFILE_VERSION, type: "request", id, verb, params }));
+		await this.#transport.write({ v: PROFILE_VERSION, type: "request", id, verb, params });
 		return promise;
 	}
 
@@ -200,26 +219,26 @@ export class GajaewayClient {
 				reject(payload as Error);
 			});
 			void this.#transport
-				?.write(
-					encodeFrame({
-						v: PROFILE_VERSION,
-						type: "hello",
-						payload: {
-							supportedVersions: [PROFILE_VERSION],
-							clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
-						},
-					}),
-				)
+				?.write({
+					v: PROFILE_VERSION,
+					type: "hello",
+					payload: {
+						supportedVersions: [PROFILE_VERSION],
+						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
+					},
+				})
 				.catch(reject);
 		});
 		return this.#negotiated;
 	}
 
 	async #readStdio(readable: StdioTransport["readable"]): Promise<void> {
-		for await (const chunk of readable as AsyncIterable<Uint8Array>) this.#receive(new TextDecoder().decode(chunk));
+		const decoder = new TextDecoder();
+		for await (const chunk of readable as AsyncIterable<Uint8Array>)
+			this.#receive(decoder.decode(chunk, { stream: true }));
 	}
 
-	#receive(chunk: string): void {
+	async #receive(chunk: string): Promise<void> {
 		let frames: Frame[];
 		try {
 			frames = this.#decoder.feed(chunk);
@@ -241,7 +260,13 @@ export class GajaewayClient {
 						this.#pending.delete(frame.id);
 						pending.reject(error);
 					}
-				} else this.#emit("__negotiation_error", error, frame);
+				} else {
+					if (error.code === "malformed_frame" || error.code === "payload_too_large") {
+						this.#fail(error);
+					} else {
+						this.#emit("__negotiation_error", error, frame);
+					}
+				}
 				continue;
 			}
 			if (frame.type === "response") {
