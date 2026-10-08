@@ -78,6 +78,11 @@ export interface DiscordAdapterConfig {
 	 *   * group/bot-audience channels: "off"
 	 */
 	readonly statusReactions?: StatusReactionsMode;
+	/**
+	 * Default for channel mentions auto-creating a thread (default true).
+	 * A per-channel `channels[id].threadOnMention` overrides it.
+	 */
+	readonly threadOnMention?: boolean;
 }
 
 export interface LoadedDiscordAdapterConfig extends DiscordAdapterConfig {
@@ -132,6 +137,9 @@ export async function loadDiscordAdapterConfig(
 		throw new DiscordAdapterStartupError(
 			`Discord adapter statusReactions must be "gradient", "static", or "off" when set.`,
 		);
+	}
+	if (raw.threadOnMention !== undefined && typeof raw.threadOnMention !== "boolean") {
+		throw new DiscordAdapterStartupError("Discord adapter threadOnMention must be a boolean when set.");
 	}
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
 	let token: string;
