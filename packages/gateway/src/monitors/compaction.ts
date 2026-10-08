@@ -298,7 +298,10 @@ export type SessionRollReason =
 	| "context_failures_native_compaction_failed"
 	| "context_failures_native_compaction_skipped"
 	| "protocol_failures_off_contract"
-	| "session_busy_stalled";
+	| "session_busy_stalled"
+	// The request could not reach a live host for the bound session. Rolling
+	// mints a fresh session instead of aiming every retry at the same dead one.
+	| "session_host_unavailable";
 
 const ROLL_REASON_BY_STATUS: Partial<Record<NativeCompactionStatus, SessionRollReason>> = {
 	unavailable: "context_failures_native_compaction_unavailable",

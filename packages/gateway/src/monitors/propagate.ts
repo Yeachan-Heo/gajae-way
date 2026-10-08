@@ -3,6 +3,7 @@ import {
 	type ChatMessagePayload,
 	eventTypeOrigin,
 	isSilentOutput,
+	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	monitorSessionOrigin,
@@ -14,10 +15,19 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
-import { isSessionBusy, type SessionPort } from "../orchestrator/session-port";
-import type { GatewayDatabase } from "../store/db";
 import {
+	isSessionBusy,
+	type SessionPort,
+	SessionRequestTimeoutError,
+	SessionTerminalError,
+	sessionRequestStep,
+} from "../orchestrator/session-port";
+import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
+import {
+	BrokerAuthorityError,
+	type GatewayDatabase,
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
+	MONITOR_EVENT_MAX_OPEN_AGE_MS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 	RECONCILABLE_STAGES,
 	TERMINAL_STAGES,
@@ -86,6 +96,20 @@ type DispatchFailureCode =
 	// re-dispatches instead of waiting for the lease to expire, and the failure
 	// row names the session whose host may have outlived the gateway.
 	| "gateway_shutdown"
+	// The session host could not be reached for the request: the relay never
+	// said hello, the broker refused to attach, or the SDK reported the session
+	// unavailable. The monitor session is rolled to a fresh epoch (a new host).
+	| "session_host_unavailable"
+	// The authoring turn ended terminal_ok but its answer could not be read back
+	// (`session.last_assistant`). The turn's side effects may have happened.
+	| "authoring_result_unreadable"
+	// The gateway's own broker authority refused the session (unowned, cut over,
+	// quarantined): nothing was sent.
+	| "broker_authority_refused"
+	// The SDK refused the model selection itself (unknown model / profile not
+	// resolvable against this host's models.yml). The selector is in
+	// `operation_args.model`.
+	| "model_unavailable"
 	| "event_type_invalid"
 	| "monitor_invalid"
 	| "internal_error";
@@ -495,6 +519,10 @@ export class MonitorPropagator {
 	 * than five consecutive sweeps (#179); BACKOFF_EXEMPT_FAILURES retry at once.
 	 */
 	async reconcile(): Promise<void> {
+		// Reaped before the re-entrancy guard: a sweep stuck awaiting one long
+		// dispatch must not also keep every stale row of every other monitor open
+		// (an open row is what an overlap=skip monitor skips behind).
+		if (!this.#closing) this.reapStale();
 		if (this.#reconciling) {
 			// Yield once so a caller racing the first sweep observes its claimed work
 			// rather than an artificial pre-bind microtask gap in the shared port.
@@ -570,6 +598,39 @@ export class MonitorPropagator {
 		}
 	}
 
+	/** Operator settle: see GatewayDatabase.monitorEventOperatorSettle. */
+	settle(eventId: string): MonitorEventOperatorResult {
+		const row = this.#database.monitorEventGet(eventId);
+		const result = this.#database.monitorEventOperatorSettle(eventId, this.#now());
+		if (!result.settled) return { eventId, done: false, reason: result.reason };
+		this.#database.metaDelete(authoringTurnKey(eventId));
+		if (row) this.#emitStage(row, "failed_no_retry");
+		return { eventId, done: true, previousStage: result.previousStage };
+	}
+	/** Operator retry: fresh reclaim budget, then an immediate reconcile sweep redispatches it. */
+	retry(eventId: string): MonitorEventOperatorResult {
+		const row = this.#database.monitorEventGet(eventId);
+		const result = this.#database.monitorEventOperatorRetry(eventId, this.#now());
+		if (!result.retried) return { eventId, done: false, reason: result.reason };
+		if (row) this.#emitStage(row, "failed");
+		void this.reconcile();
+		return { eventId, done: true, previousStage: result.previousStage };
+	}
+	/**
+	 * Settles events that fired more than MONITOR_EVENT_MAX_OPEN_AGE_MS ago and
+	 * still owe their authoring turn with no live lease (`stale_open_event`).
+	 * Runs on every sweep, including the boot sweep.
+	 */
+	reapStale(): number {
+		const now = this.#now();
+		const reaped = this.#database.monitorEventsReapStale(now - MONITOR_EVENT_MAX_OPEN_AGE_MS, now);
+		for (const row of reaped) {
+			this.#database.metaDelete(authoringTurnKey(row.event_id));
+			this.#emitStage(row, "failed_no_retry");
+		}
+		if (reaped.length) console.error(`monitor events reaped as stale: ${reaped.map((row) => row.event_id).join(",")}`);
+		return reaped.length;
+	}
 	/**
 	 * `batched` is a live stage: a dispatch that is still awaiting its authoring turn sits there
 	 * for minutes. It is also where an event is stranded forever if the process dies mid-dispatch,
@@ -735,10 +796,18 @@ export class MonitorPropagator {
 				const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
 				const effectiveModel = (monitor.model as GjcModelSelection | undefined) ?? this.#model;
 				const effectiveServiceTier = (monitor.serviceTier as GjcServiceTier | undefined) ?? this.#serviceTier;
+				const modelKey = effectiveModel
+					? typeof effectiveModel === "string"
+						? effectiveModel
+						: `preset:${effectiveModel.preset}`
+					: undefined;
 				dispatchOperation = "bind";
+				// The selector is configuration, not secret, and is the first thing an
+				// operator needs when the model is the failure (`model_unavailable`).
 				dispatchOperationArgs = {
 					epoch: boundEpoch,
 					hasModel: effectiveModel !== undefined,
+					...(modelKey ? { model: modelKey } : {}),
 				};
 				const binding = await this.#sessionPort.bind({
 					originKey: sessionOriginKey,
@@ -750,11 +819,6 @@ export class MonitorPropagator {
 				boundSessionId = sessionId;
 				boundSessionEpoch = binding.epoch;
 				dispatchPhase = "configure";
-				const modelKey = effectiveModel
-					? typeof effectiveModel === "string"
-						? effectiveModel
-						: `preset:${effectiveModel.preset}`
-					: undefined;
 				if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
 					dispatchOperation = "setModel";
 					dispatchOperationArgs = {
@@ -944,7 +1008,11 @@ export class MonitorPropagator {
 				// Mark all silent notes as authored_no_delivery
 				for (const entry of silentEntries) {
 					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
-					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
+					const row = fenced.find((candidate) => candidate.event_id === entry.eventId);
+					// Emitted like every other stage: `monitors test --wait` waits for a
+					// terminal stage event and timed out on every silent note.
+					if (this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId) && row)
+						this.#emitStage(row, "authored_no_delivery");
 				}
 				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
 				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
@@ -1148,6 +1216,19 @@ export class MonitorPropagator {
 				state.stalledSessionId = sessionId;
 				console.error(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_busy_stalled busy_failures=${state.busyFailures}/${MONITOR_BUSY_FAILURE_ROLL_THRESHOLD} session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
+		if (isSessionHostUnavailable(error)) {
+			// Nothing reached a host, so this says nothing about context, contract
+			// or executor; it says the bound session is unreachable. Only a failure
+			// against the CURRENT epoch rolls it — a dead epoch's failure must never
+			// roll its successor. Replayed events count: the session is the subject.
+			if (currentEpoch && !state.pendingRoll) {
+				state.pendingRoll = "session_host_unavailable";
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_host_unavailable session=${sessionId ?? "none"} turns=${state.turns}`,
 				);
 			}
 			return;
@@ -1358,6 +1439,15 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	// The session port waited for the runtime to go idle and it never did.
 	// Nothing was sent, so the event replays cleanly on the next reconcile.
 	if (isSessionBusy(error)) return "session_busy";
+	if (error instanceof BrokerAuthorityError) return "broker_authority_refused";
+	if (isModelUnavailable(error)) return "model_unavailable";
+	if (isSessionHostUnavailable(error)) return "session_host_unavailable";
+	// Inside the request, the step it failed in is the actionable fact; a bare
+	// `Error` there used to collapse into `internal_error` (mk-gajae 2026-10-08).
+	const step = phase === "request" ? sessionRequestStep(error) : undefined;
+	if (step === "last_assistant") return "authoring_result_unreadable";
+	if (error instanceof SessionTerminalError || error instanceof SessionRequestTimeoutError)
+		return "authoring_turn_failed";
 	// A structured SDK refusal is classified by the phase it interrupted: the
 	// sanitized message no longer carries the verb name, and "internal_error"
 	// hid every configure/request refusal (live: 169 rows in one day, all
@@ -1370,7 +1460,45 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	if (message.includes("session send") || message.includes("SessionPort")) return "authoring_turn_failed";
 	if (message.includes("session bind")) return "session_bind_failed";
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
+	if (step !== undefined) return "authoring_turn_failed";
 	return "internal_error";
+}
+
+/** SDK codes that mean the model selection could not be resolved on this host. */
+const MODEL_UNAVAILABLE_CODES: ReadonlySet<string> = new Set([
+	"model_not_selected",
+	"model_not_found",
+	"model_unavailable",
+	"unknown_model",
+	"model_profile_registry_error",
+]);
+
+function isModelUnavailable(error: unknown): boolean {
+	const fields = error !== null && typeof error === "object" ? (error as Record<string, unknown>) : {};
+	const status = (
+		fields.status as { status?: { error?: { code?: unknown }; outcome?: { code?: unknown } } } | undefined
+	)?.status;
+	const codes = [
+		fields.code,
+		error instanceof GjcCliError ? envelopeErrorCode(error.details) : undefined,
+		status?.error?.code,
+		status?.outcome?.code,
+	];
+	return codes.some((code) => typeof code === "string" && MODEL_UNAVAILABLE_CODES.has(code));
+}
+
+/**
+ * Positive evidence the request never reached a live host for this session:
+ * the relay child never said hello, the broker refused the attach, the relay
+ * closed before the prompt was sent, or the SDK named the session unavailable.
+ */
+export function isSessionHostUnavailable(error: unknown): boolean {
+	if (error instanceof RelayHelloError || error instanceof RelayRefusedError) return true;
+	const step = sessionRequestStep(error);
+	if (error instanceof RelayClosedError && (step === "attach" || step === "send")) return true;
+	const code = error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+	const envelope = error instanceof GjcCliError ? envelopeErrorCode(error.details) : undefined;
+	return [code, envelope].some((value) => value === "session_unavailable" || value === "session_not_found");
 }
 
 /**
@@ -1448,6 +1576,17 @@ function failureDetail(error: unknown): string {
 		"SessionTerminalError",
 		"SessionRequestTimeoutError",
 		"RebindCapExceededError",
+		"RelayHelloError",
+		"RelayRefusedError",
+		"RelayClosedError",
+		"RelayRequestTimeoutError",
+		"TailCapacityError",
+		"BrokerAuthorityError",
+		"TranscriptIncompleteError",
+		"OpRefError",
+		"OpRefRejectedError",
+		"GjcCliUnavailableError",
+		"LastAssistantUnreadableError",
 	]);
 	const allowedCodes = new Set([
 		"session_not_found",
@@ -1469,6 +1608,20 @@ function failureDetail(error: unknown): string {
 		"invalid_request",
 		"resource_gone",
 		"usage",
+		"relay_hello_missing",
+		"relay_closed",
+		"relay_timeout",
+		"session_not_found",
+		"cutover_required",
+		"authority_mismatch",
+		"unowned_session",
+		"old_work_open",
+		"quarantined",
+		"last_assistant_not_json",
+		"last_assistant_no_page",
+		"last_assistant_no_items",
+		"last_assistant_null_item",
+		"last_assistant_non_text_item",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
@@ -1519,8 +1672,10 @@ function failureDetail(error: unknown): string {
 		error instanceof Error && error.stack
 			? frameNames.find((candidate) => error.stack?.split("\n").some((line) => line.includes(candidate)))
 			: undefined;
+	const step = sessionRequestStep(error);
 	return JSON.stringify({
 		class: name,
+		...(step ? { step } : {}),
 		...(code ? { code } : {}),
 		...(transport ? { transport } : {}),
 		...(typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255

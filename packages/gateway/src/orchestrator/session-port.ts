@@ -291,6 +291,30 @@ export class SessionTerminalError extends Error {
 	}
 }
 
+/**
+ * Where inside `SessionPort.request` a rejection happened. A closed vocabulary:
+ * it crosses the durable failure boundary, so it never carries error text.
+ */
+export const SESSION_REQUEST_STEPS = ["authority", "attach", "send", "status", "last_assistant", "close"] as const;
+export type SessionRequestStep = (typeof SESSION_REQUEST_STEPS)[number];
+
+/** The step a `SessionPort.request` rejection was raised in, when the port recorded one. */
+export function sessionRequestStep(error: unknown): SessionRequestStep | undefined {
+	const step =
+		error !== null && typeof error === "object" ? (error as { requestStep?: unknown }).requestStep : undefined;
+	return (SESSION_REQUEST_STEPS as readonly unknown[]).includes(step) ? (step as SessionRequestStep) : undefined;
+}
+
+function tagRequestStep(error: unknown, step: SessionRequestStep): unknown {
+	if (error === null || typeof error !== "object" || sessionRequestStep(error) !== undefined) return error;
+	try {
+		Object.defineProperty(error, "requestStep", { value: step, enumerable: false, configurable: true });
+	} catch {
+		// A frozen foreign error keeps its identity; only the step is lost.
+	}
+	return error;
+}
+
 export interface BrokerSessionPortOptions {
 	readonly database: GatewayDatabase;
 	readonly cli: CliRunner;
@@ -1087,8 +1111,25 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
+	/**
+	 * Every rejection carries `requestStep` (see {@link SessionRequestStep}): the
+	 * request bundles a relay attach, the send, the terminal wait and the final
+	 * transcript read, and a bare `Error` from any of them was indistinguishable
+	 * in the monitor failure row (mk-gajae: phase request `internal_error` while
+	 * the host was idle after `terminal_ok`).
+	 */
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
+		const step: { current: SessionRequestStep } = { current: "authority" };
+		try {
+			return await this.#request(input, step);
+		} catch (error) {
+			throw tagRequestStep(error, step.current);
+		}
+	}
+
+	async #request(input: SessionRequestInput, step: { current: SessionRequestStep }): Promise<SessionRequestResult> {
 		this.#assertOwned(input);
+		step.current = "attach";
 		// One relay owns the whole request: the send, the terminal wait, and the
 		// final read. Monitor/batch authoring consumes no mid-turn content, so
 		// the handle's frames only feed the stall alarm and the activity lease.
@@ -1123,6 +1164,7 @@ export class BrokerSessionPort implements SessionPort {
 		try {
 			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
+			step.current = "send";
 			try {
 				receipt = await this.send({ ...input, relay });
 				relay.correlate(input.opRef, receipt);
@@ -1147,6 +1189,7 @@ export class BrokerSessionPort implements SessionPort {
 			// request record while the work was still landing (issue #9).
 			const leaseMs = input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS;
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
+			step.current = "status";
 			status ??= await readStatus();
 			while (!isTerminalStatus(status.status.status) && this.#now() < lastActivityAt + leaseMs) {
 				this.checkStalls();
@@ -1156,11 +1199,10 @@ export class BrokerSessionPort implements SessionPort {
 			if (!isTerminalStatus(status.status.status))
 				throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);
 			if (status.status.status !== "terminal_ok") throw new SessionTerminalError(status);
-			return {
-				receipt,
-				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }),
-			};
+			step.current = "last_assistant";
+			const assistant = await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay });
+			step.current = "close";
+			return { receipt, status, assistant };
 		} finally {
 			relay.setTurnRunning(false);
 			await relay.close();
@@ -1439,6 +1481,24 @@ function renderPrompt(systemPreamble: string | undefined, text: string): string 
 	return `${systemPreamble}\n\n${text}`;
 }
 
+/**
+ * `session.last_assistant` answered, but not with a readable text page. `code`
+ * is a closed token so the monitor failure row can name the exact shape.
+ */
+export class LastAssistantUnreadableError extends Error {
+	constructor(
+		readonly code:
+			| "last_assistant_not_json"
+			| "last_assistant_no_page"
+			| "last_assistant_no_items"
+			| "last_assistant_null_item"
+			| "last_assistant_non_text_item",
+	) {
+		super(`session.last_assistant answer unreadable (${code})`);
+		this.name = "LastAssistantUnreadableError";
+	}
+}
+
 type LastAssistantPage = {
 	readonly text: string;
 	readonly complete: boolean;
@@ -1461,7 +1521,7 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
 		envelope = parsed as Record<string, unknown>;
 	} catch {
-		throw new Error("session.last_assistant did not print a JSON query response");
+		throw new LastAssistantUnreadableError("last_assistant_not_json");
 	}
 	if (envelope.ok !== true) {
 		parseEnvelope<unknown>(result, "session raw query session.last_assistant");
@@ -1469,10 +1529,13 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 	}
 	const page = envelope.page;
 	if (typeof page !== "object" || page === null || Array.isArray(page))
-		throw new Error("session.last_assistant succeeded without a query page");
+		throw new LastAssistantUnreadableError("last_assistant_no_page");
 	const items = (page as Record<string, unknown>).items;
-	if (!Array.isArray(items) || items.some((item) => typeof item !== "string"))
-		throw new Error("session.last_assistant query page contained non-text items");
+	if (!Array.isArray(items)) throw new LastAssistantUnreadableError("last_assistant_no_items");
+	if (items.some((item) => typeof item !== "string"))
+		throw new LastAssistantUnreadableError(
+			items.some((item) => item === null) ? "last_assistant_null_item" : "last_assistant_non_text_item",
+		);
 	// gjc hosts grant `continuationCursor`; older CLI prints carried `cursor`.
 	const record = page as Record<string, unknown>;
 	const cursor = typeof record.continuationCursor === "string" ? record.continuationCursor : record.cursor;

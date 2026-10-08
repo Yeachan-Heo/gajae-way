@@ -341,7 +341,12 @@ export interface LaunchRestartOptions {
 	/** Argv that re-enters the CLI; `--run <id>` is appended. */
 	readonly worker?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
+	/** Linux supervisor launcher; defaults to `systemd-run`. */
+	readonly systemdRun?: string;
 }
+
+/** How long `systemd-run` may take to hand the transient unit to the user manager. */
+const SYSTEMD_RUN_TIMEOUT_MS = 15_000;
 
 /** The argv that runs this CLI again, whether compiled or run from source. */
 export function cliCommand(): string[] {
@@ -372,13 +377,45 @@ export async function launchRestartStack(
 	const receipt = newReceipt(randomUUID(), platform, options.uid, Date.now());
 	await writeReceipt(options.home, receipt);
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
-	const child = Bun.spawn(supervisorArgv(platform, worker, options.home, receipt.id), {
-		detached: true,
-		stdin: "ignore",
-		stdout: "ignore",
-		stderr: "ignore",
-		env: { ...(options.env ?? process.env), GAJAEWAY_HOME: options.home },
-	});
+	// A launch that never reaches a supervisor must not leave the receipt
+	// `queued` forever: in a container without a user service manager
+	// (no systemd-run / no user bus) the restart was reported queued and
+	// nothing ever ran it.
+	const refuse = async (detail: string): Promise<never> => {
+		receipt.state = "failed";
+		receipt.finishedAt = new Date().toISOString();
+		const first = receipt.steps[0];
+		if (first) {
+			first.result = "failed";
+			first.detail = detail;
+		}
+		await writeReceipt(options.home, receipt);
+		throw new Error(`restart-stack ${receipt.id} failed: ${detail}`);
+	};
+	let child: ReturnType<typeof Bun.spawn>;
+	try {
+		child = Bun.spawn(supervisorArgv(platform, worker, options.home, receipt.id, options.systemdRun), {
+			detached: true,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			env: { ...(options.env ?? process.env), GAJAEWAY_HOME: options.home },
+		});
+	} catch (error) {
+		return await refuse(
+			`supervisor could not start (${(error as NodeJS.ErrnoException).code ?? "spawn_failed"}); no service manager to restart the stack — restart the gateway processes directly`,
+		);
+	}
+	// On linux the spawned process is `systemd-run`, which exits as soon as the
+	// transient unit is queued; its status is the only evidence the supervisor
+	// exists. On darwin the child IS the long-running supervisor.
+	if (platform !== "darwin") {
+		const status = await Promise.race([child.exited, Bun.sleep(SYSTEMD_RUN_TIMEOUT_MS).then(() => undefined)]);
+		if (status !== undefined && status !== 0)
+			return await refuse(
+				`systemd-run exited ${status}; no user service manager to restart the stack — restart the gateway processes directly`,
+			);
+	}
 	child.unref();
 	return { receipt, supervisorPid: child.pid };
 }
@@ -394,10 +431,11 @@ export function supervisorArgv(
 	worker: readonly string[],
 	home: string,
 	id: string,
+	systemdRun = "systemd-run",
 ): string[] {
 	if (platform === "darwin") return [...worker];
 	return [
-		"systemd-run",
+		systemdRun,
 		"--user",
 		"--collect",
 		"--quiet",

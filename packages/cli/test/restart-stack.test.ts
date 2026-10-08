@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { main } from "../src/main";
 import {
 	effectiveRestartState,
+	launchRestartStack,
 	readRestartReceipt,
 	renderRestartReceipt,
 	runRestartStack,
@@ -210,6 +211,23 @@ test("the supervisor never uses bootout and escapes the gateway cgroup on system
 	expect(linux).toContain("--unit=gajaeway-restart-stack-r6");
 	expect(linux.slice(-worker.length)).toEqual(worker);
 	expect([...linux, ...worker]).not.toContain("bootout");
+});
+
+test("a linux host without a user service manager fails the launch instead of leaving it queued", async () => {
+	for (const systemdRun of ["/nonexistent/systemd-run", "false"]) {
+		const { home, cleanup } = await tempHome();
+		try {
+			await expect(
+				launchRestartStack({ home, platform: "linux", uid: 1000, worker: ["true"], systemdRun }),
+			).rejects.toThrow(/no (user )?service manager/);
+			const receipt = await readRestartReceipt(home);
+			expect(receipt?.state).toBe("failed");
+			expect(receipt?.finishedAt).toBeDefined();
+			expect(receipt?.steps[0]?.result).toBe("failed");
+		} finally {
+			await cleanup();
+		}
+	}
 });
 
 test("an uninstalled service is skipped and does not abort remaining services", async () => {

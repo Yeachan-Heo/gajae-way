@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
+	MonitorEventOperatorResult,
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
@@ -70,7 +71,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]]|settle <eventId>|retry <eventId>)|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -251,7 +252,7 @@ function parseMonitorTestArgs(args: readonly string[]): ParsedMonitorTestArgs {
 	};
 }
 
-const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry"]);
+const TERMINAL_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed", "failed_no_retry", "skipped"]);
 
 function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSeconds: number): Promise<string> {
 	return new Promise((resolve) => {
@@ -747,7 +748,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(JSON.stringify(await client.request("monitor.inspect", { monitorId: args[0] })));
 					else if (command === "remove" && args[0])
 						console.log(JSON.stringify(await client.request("monitor.remove", { monitorId: args[0] })));
-					else if (command === "test" && monitorTest) {
+					else if ((command === "settle" || command === "retry") && args.length === 1 && args[0]) {
+						const result = await client.request<MonitorEventOperatorResult>(
+							command === "settle" ? "monitor.settle" : "monitor.retry",
+							{ eventId: args[0] },
+						);
+						console.log(JSON.stringify(result));
+						if (!result.done) process.exitCode = 1;
+					} else if (command === "test" && monitorTest) {
 						const result = await client.request<{ eventId: string }>("monitor.test", {
 							monitorId: monitorTest.monitorId,
 							...(monitorTest.eventType === undefined ? {} : { eventType: monitorTest.eventType }),
@@ -760,7 +768,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						}
 					} else
 						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]`,
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|update <id> (--json '<partial MonitorSpec JSON>'|--schedule '<cron>' [--enabled true|false]|--enabled true|false [--schedule '<cron>'])|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J] [--wait[=SECONDS]]|settle <eventId>|retry <eventId>`,
 						);
 				} finally {
 					await client.close();
