@@ -663,3 +663,43 @@ test("AC-435 Discord channel root trigger routes lane report to thread", async (
 	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
 	f.port.complete(persona.opRef, "ack");
 });
+
+// Issue #455: lane-report synthetic ids must never become Discord thread conversationIds
+test("AC-455 synthetic lane-report ids are never used as Discord thread conversationIds", async () => {
+	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-455" };
+	const f = await fixture({
+		ownerTarget: discordChannelOrigin,
+		channels: { "discord-ch-455": { engagement: "open", audience: "all" } },
+	});
+
+	// Simulate a lane report being enqueued as an inbound message with a synthetic lane-report-<sha256> ID.
+	// This can happen when a lane report is fedback into the same conversation.
+	const syntheticLaneReportId = "lane-report-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	const parentOrigin = { platform: "discord", kind: "channel", conversationId: "parent-channel" } as OriginRef;
+	const triggerOpRef = "persona/test-455/trigger1";
+
+	// Enqueue a lane report as an inbound message
+	f.database.inboundEnqueue({
+		messageId: syntheticLaneReportId,
+		originKey: originKey(parentOrigin),
+		originRefJson: JSON.stringify(parentOrigin),
+		body: "[lane child] completed: test result",
+		source: "lane_report",
+	});
+
+	// Start a persona turn
+	const persona = await startPersonaTurn(f, discordChannelOrigin, "real-msg-id-123");
+
+	// Now process the lane report, which has a synthetic ID as the messageId.
+	// The lane report should NOT be routed to a thread because its messageId is synthetic.
+	const oldestPending = f.database.inboundPendingOldest(originKey(parentOrigin));
+	if (oldestPending) {
+		const origin = JSON.parse(oldestPending.origin_ref_json) as OriginRef;
+		// Verify that the origin is still a channel, not a thread, even though the messageId was set
+		expect(origin.kind).toBe("channel");
+		// Verify that the conversationId is NOT the synthetic lane-report ID
+		expect(origin.conversationId).not.toContain("lane-report-");
+	}
+
+	f.port.complete(persona.opRef, "ack");
+});

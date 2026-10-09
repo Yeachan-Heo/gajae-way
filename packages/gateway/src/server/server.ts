@@ -701,6 +701,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			const connected = [...connections].some((connection) => connection.negotiated);
 			const sweep = delivery.sweep(Date.now(), false, connected);
 			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
+			// After processing expired deliveries, mark any turns with all deliveries expired
+			options.database.markTurnsWithAllDeliveriesExpired();
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
@@ -884,6 +886,8 @@ async function handleFrame(
 			connection.write({ v: PROFILE_VERSION, type: "negotiated", payload: result.negotiated });
 			const sweep = runtime.delivery.sweep(Date.now(), true);
 			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
+			// After processing expired deliveries, mark any turns with all deliveries expired
+			options.database.markTurnsWithAllDeliveriesExpired();
 			for (const payload of sweep.payloads)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 			return;
