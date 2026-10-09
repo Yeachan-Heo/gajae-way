@@ -85,20 +85,18 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	return undefined;
 }
 
-/** Internal: reads the failed assistant message from the session transcript with all guards. Returns the message or undefined. */
-async function readFailedAssistantMessage(
+/**
+ * The one saved transcript `<agentDir>/sessions/<scope>/<created>_<sessionId>.jsonl`
+ * gjc keeps for a session (SessionManager.managedDestination). Undefined unless
+ * exactly one plain, non-symlinked file matches: zero or several is no authority.
+ * Only locates; whether it belongs to the session's workspace is gjc's to judge.
+ */
+export async function locateSavedTranscript(
 	agentDir: string | undefined,
-	input: FailedTurnEvidenceInput,
-): Promise<Row | undefined> {
+	sessionId: string,
+): Promise<string | undefined> {
 	try {
-		if (!agentDir || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.sessionId)) return undefined;
-		if (
-			!Number.isFinite(input.startedAtMs) ||
-			!Number.isFinite(input.terminalAtMs) ||
-			input.startedAtMs < 0 ||
-			input.terminalAtMs < input.startedAtMs
-		)
-			return undefined;
+		if (!agentDir || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(sessionId)) return undefined;
 		const root = await realpath(agentDir);
 		const sessions = join(root, "sessions");
 		if ((await lstat(sessions)).isSymbolicLink() || (await realpath(sessions)) !== sessions) return undefined;
@@ -115,14 +113,35 @@ async function readFailedAssistantMessage(
 			scanned += files.length;
 			if (scanned > MAX_LINES) return undefined;
 			for (const file of files) {
-				if (!file.name.endsWith(`_${input.sessionId}.jsonl`)) continue;
+				if (!file.name.endsWith(`_${sessionId}.jsonl`)) continue;
 				if (!file.isFile() || file.isSymbolicLink()) return undefined;
 				candidates.push(join(directory, file.name));
 			}
 		}
 		if (candidates.length !== 1) return undefined;
 		const path = candidates[0]!;
-		if ((await realpath(path)) !== path) return undefined;
+		return (await realpath(path)) === path ? path : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Internal: reads the failed assistant message from the session transcript with all guards. Returns the message or undefined. */
+async function readFailedAssistantMessage(
+	agentDir: string | undefined,
+	input: FailedTurnEvidenceInput,
+): Promise<Row | undefined> {
+	try {
+		if (!agentDir || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.sessionId)) return undefined;
+		if (
+			!Number.isFinite(input.startedAtMs) ||
+			!Number.isFinite(input.terminalAtMs) ||
+			input.startedAtMs < 0 ||
+			input.terminalAtMs < input.startedAtMs
+		)
+			return undefined;
+		const path = await locateSavedTranscript(agentDir, input.sessionId);
+		if (path === undefined) return undefined;
 		const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 		let text: string;
 		try {

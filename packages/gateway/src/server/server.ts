@@ -2196,11 +2196,13 @@ async function createInboundTurnLifecycle(
 				config: runtime.config,
 			})
 		: undefined;
+	// Stable per origin: the persona actor sends it only when the session's
+	// context may not hold it. The bootstrap and a changed-AGENTS.md section are
+	// one-shot and ride their own send.
+	const sessionBootstrap = [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n");
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
-		...(agentsMdSection ? [agentsMdSection] : []),
 		currentConversationNotice(origin),
-		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 	].join("\n\n");
@@ -2609,7 +2611,7 @@ async function createInboundTurnLifecycle(
 		runtime.inbound.delete(steered.message_id);
 		acknowledgeSteer(runtime, steered, turnId);
 	};
-	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+	const onTerminal = async ({ text, alreadyPosted }: PersonaTerminalInput) => {
 		let threw = false;
 		try {
 			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
@@ -2630,6 +2632,9 @@ async function createInboundTurnLifecycle(
 				);
 			});
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
+			// Recovered from the transcript after it already reached the room under
+			// another turn: recorded above, never posted a second time.
+			if (alreadyPosted) return;
 			if (!nonLoopback) {
 				if (connection)
 					connection.write({
@@ -2677,7 +2682,7 @@ async function createInboundTurnLifecycle(
 			throw error;
 		} finally {
 			try {
-				if (!threw) closeTerminalLink(nonLoopback ? "silent" : "loopback");
+				if (!threw) closeTerminalLink(nonLoopback ? (alreadyPosted ? "no_delivery" : "silent") : "loopback");
 			} finally {
 				endProgress();
 			}
@@ -2744,6 +2749,7 @@ async function createInboundTurnLifecycle(
 	return {
 		text: turnText,
 		systemPreamble,
+		...(sessionBootstrap ? { sessionBootstrap } : {}),
 		...(effectiveModel ? { effectiveModel } : {}),
 		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
 		contextMessageIds: new Set(contextMessageIds),

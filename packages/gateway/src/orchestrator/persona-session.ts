@@ -19,13 +19,21 @@ import {
 	type GatewayDatabase,
 	type InboundMessageRow,
 	type InboundTurn,
+	type TerminalUnlinkedReason,
 	terminalDeliveryIds,
 } from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
-import type { SessionBinding, SessionPort } from "./session-port";
+import {
+	isSilentReply,
+	type SessionBinding,
+	type SessionContextUsage,
+	type SessionLiveness,
+	type SessionPort,
+	spokenParts,
+} from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
@@ -76,6 +84,45 @@ const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 export const BIND_WEDGE_PROBE_STRIKES = 5;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
+/**
+ * An ACCEPTED turn still unresolved (status in_flight/unknown/unreadable, or
+ * terminal_ok with its output never provable) on a session the broker reports
+ * live and `idle` for this long is wedged, not working: nothing will ever
+ * settle it (live 2026-09-29: a host whose prompt was force-ended mid-tool
+ * kept `turn.result` in_flight forever; another's receipt stayed `missing`).
+ * It is released - answer recovered from the transcript, host ended if the
+ * turn is not terminal - instead of held until an operator restarts the host.
+ * A session doing anything but idling is never released by this rule.
+ */
+export const WEDGED_TURN_IDLE_MS = 10 * 60_000;
+/** A held turn's liveness is re-probed for the wedge rule at most this often (reconcile runs every few seconds). */
+const WEDGED_PROBE_INTERVAL_MS = 30_000;
+/**
+ * Sends between full persona preambles on one session when nothing proved the
+ * context lost it. A compaction that both starts and regrows inside one turn
+ * leaves no drop in the context percentage sampled before each send; this
+ * bounds how long such a session can run without its persona.
+ */
+export const PERSONA_PREAMBLE_REFRESH_SENDS = 25;
+/**
+ * Context size at which the persona actor compacts a session itself before the
+ * next send. gjc compacts at 300K tokens by default, and a prompt that pushes a
+ * session over that line makes gjc compact before accepting it, inside a 30s
+ * wait it cannot meet at that size: #회의실 failed eight turns in a row that way
+ * (2026-09-30). Compacting here, between turns with the origin's queue held,
+ * leaves a whole turn (preamble, message, tool output) of room below gjc's line.
+ */
+export const PERSONA_COMPACTION_TOKENS = 200_000;
+
+/** What the actor last put into one session's context: the persona preamble and the usage seen since. */
+type PersonaPreambleState = {
+	readonly signature: string;
+	readonly contextPercent: number;
+	readonly sendsSince: number;
+};
+
+/** A session's context right before a send: its usage when readable, and whether the actor just compacted it. */
+type PreparedContext = { readonly usage?: SessionContextUsage; readonly compacted: boolean };
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -86,7 +133,15 @@ export type PersonaActorState = "idle" | "turn-running";
  */
 export interface PersonaTurnLifecycle {
 	readonly text: string;
+	/**
+	 * Stable persona preamble. The actor puts it into a session's context on the
+	 * first send, after it changes, after the context shrank (compaction) or a
+	 * failed turn, and every PERSONA_PREAMBLE_REFRESH_SENDS sends; other sends
+	 * rely on the copy already in the context.
+	 */
 	readonly systemPreamble?: string;
+	/** One-shot trusted context for this send only (the per-epoch session bootstrap). */
+	readonly sessionBootstrap?: string;
 	/** The selection applied by `model.set` before this session's first send. */
 	readonly effectiveModel?: GjcModelSelection;
 	/** GJC request tier; `priority` enables provider fast mode where supported. */
@@ -150,6 +205,11 @@ export interface PersonaSteerInput extends PersonaTurnIdentity {
 export interface PersonaTerminalInput extends PersonaTurnIdentity {
 	readonly text: string;
 	readonly status: StatusReport;
+	/**
+	 * `text` is this turn's answer but was already posted to the origin (under
+	 * another turn's delivery): record it and settle presentation, never post it again.
+	 */
+	readonly alreadyPosted?: boolean;
 }
 
 export interface PersonaFailureInput extends PersonaTurnIdentity {
@@ -587,6 +647,7 @@ class OriginActor {
 	readonly #submissionFailures = new Map<string, number>();
 	/** Prevents repeating the capped-reset warning for the same bound session. */
 	readonly #loggedCappedFailedTurnSessions = new Set<string>();
+	readonly #personaPreamble = new Map<string, PersonaPreambleState>();
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
@@ -792,6 +853,30 @@ class OriginActor {
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+			// The usual cause on a live binding is a host that closed itself after
+			// 30 idle minutes (`host hello did not arrive`). Its saved session is
+			// intact: resume it once and re-send this never-run turn under the same
+			// session and epoch, so the conversation keeps its memory. A deleted or
+			// disowned session, or a second failure of the same turn, rebinds below.
+			if (!retired && attempt === 1 && raw?.deleted !== true && raw?.disowned !== true) {
+				try {
+					await this.#manager.port.resume({
+						sessionId,
+						repo: this.#manager.repo,
+						originKey: this.originKey,
+						epoch: turn.epoch,
+					});
+					this.#manager.log(
+						`session_resumed origin=${this.originKey} epoch=${turn.epoch} session=${sessionId} opRef=${turn.opRef} reason=host_idle_closed`,
+					);
+					return;
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw error;
+					this.#manager.log(
+						`session_resume_failed origin=${this.originKey} epoch=${turn.epoch} session=${sessionId} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+					);
+				}
+			}
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next dispatch binds a fresh live session.
 			// A retired turn's epoch was already rotated away from; it simply
@@ -1018,6 +1103,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
+	/** Last wedge-rule liveness probe per held op-ref (manager clock). */
+	readonly #wedgeProbeAt = new Map<string, number>();
 
 	async #queueIsEmpty(sessionId: string, relay?: TailHandle): Promise<boolean> {
 		const port = this.#manager.port;
@@ -1027,6 +1114,28 @@ class OriginActor {
 		} catch {
 			return false;
 		}
+	}
+
+	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
+	async #bindingState(sessionId: string): Promise<{
+		readonly live: boolean | undefined;
+		readonly deleted?: boolean;
+		readonly workspace?: string;
+		readonly disowned?: boolean;
+	}> {
+		const port = this.#manager.port;
+		if (port.liveness) {
+			try {
+				return await port.liveness({ sessionId, repo: this.#manager.repo });
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
+				return { live: undefined };
+			}
+		}
+		const { session } = await this.#inspectForRecovery(sessionId);
+		return session === undefined
+			? { live: undefined }
+			: { live: session.live, deleted: session.deleted, workspace: session.repo };
 	}
 
 	async #inspectForRecovery(
@@ -1123,8 +1232,11 @@ class OriginActor {
 		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
 		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
 		let binding: SessionBinding;
+		// Outside the bind retry: the stored binding's liveness probe throws only
+		// on lost broker authority, which fails closed as on the attach-failure probe.
+		const stored = await this.#reuseStoredBinding(epoch);
 		try {
-			binding = await this.#ensureSession(epoch);
+			binding = stored ?? (await this.#bindSession(epoch));
 			this.#clearBindWedgeProbe();
 		} catch (error) {
 			await this.#noteBindFailure(trigger, epoch, error);
@@ -1184,6 +1296,9 @@ class OriginActor {
 				);
 			return;
 		}
+		// Before the turn starts: the stall clock is not running yet and the
+		// actor queue holds every steer and later send until the context is ready.
+		const context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,
@@ -1267,6 +1382,7 @@ class OriginActor {
 			);
 			return;
 		}
+		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
@@ -1274,11 +1390,12 @@ class OriginActor {
 				text: lifecycle.text,
 				opRef,
 				relay: tail,
-				...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
+				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.inboundTurnAccept(opRef);
+			if (preamble.next) this.#personaPreamble.set(binding.sessionId, preamble.next);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
@@ -1700,16 +1817,24 @@ class OriginActor {
 	}
 
 	async #ensureSession(epoch: number): Promise<SessionBinding> {
+		return (await this.#reuseStoredBinding(epoch)) ?? (await this.#bindSession(epoch));
+	}
+
+	/** The stored binding when its session is live or was resumed; undefined when a bind must replace it. */
+	async #reuseStoredBinding(epoch: number): Promise<SessionBinding | undefined> {
 		const existing = this.#manager.database.getSessionRecord(this.originKey);
 		if (existing?.epoch === epoch && existing.sessionId) {
 			const binding = { sessionId: existing.sessionId, originKey: this.originKey, epoch, repo: this.#manager.repo };
 			// An idle binding may point at a session the broker no longer hosts
-			// (broker restart while idle). Dead + saved authority is resumed through
-			// the unchanged decision table's `session.resume` branch BEFORE any send;
-			// a dead binding is never handed to a send as if it were live.
-			const { session, failed } = await this.#inspectForRecovery(existing.sessionId);
-			if (failed || session === undefined || session.live) return binding;
-			if (!session.deleted && session.repo === this.#manager.repo) {
+			// (broker restart while idle, or a host that closed itself after 30
+			// idle minutes). Dead + saved authority is resumed through the
+			// unchanged decision table's `session.resume` branch BEFORE any send;
+			// a dead binding is never handed to a send as if it were live. Read
+			// from the raw envelope: the normalized inspect is undefined for every
+			// session gjc >= 0.16.0 reports, which handed dead bindings to sends.
+			const state = await this.#bindingState(existing.sessionId);
+			if (state.live !== false) return binding;
+			if (state.deleted !== true && (state.workspace === undefined || state.workspace === this.#manager.repo)) {
 				try {
 					await this.#manager.port.resume({
 						sessionId: existing.sessionId,
@@ -1728,9 +1853,13 @@ class OriginActor {
 					);
 				}
 			}
-			// Deleted or unresumable: fall through to the epoch-scoped idempotent bind,
+			// Deleted or unresumable: the epoch-scoped idempotent bind replaces it,
 			// whose rebind policy owns condemnation (SessionRebinder), not this actor.
 		}
+		return undefined;
+	}
+
+	async #bindSession(epoch: number): Promise<SessionBinding> {
 		const binding = await this.#manager.port.bind({
 			originKey: this.originKey,
 			epoch,
@@ -1894,6 +2023,151 @@ class OriginActor {
 			);
 			return undefined;
 		}
+	}
+
+	/**
+	 * How long the session has been live and `idle`, when that is at least
+	 * WEDGED_TURN_IDLE_MS on an ACCEPTED turn at least that old; otherwise
+	 * undefined and the turn keeps its hold. A busy host (running a tool,
+	 * streaming), an unanswerable probe, or an activity without a timestamp is
+	 * never release evidence. `supplied` reuses a probe the caller already made.
+	 */
+	async #wedgedIdleMs(bound: BoundTurn, supplied?: SessionLiveness): Promise<number | undefined> {
+		const port = this.#manager.port;
+		if (!port.liveness) return undefined;
+		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state !== "accepted") return undefined;
+		const now = this.#manager.now();
+		if (bound.dispatchedAtMs !== undefined && now - bound.dispatchedAtMs < WEDGED_TURN_IDLE_MS) return undefined;
+		let probe = supplied;
+		if (!probe) {
+			const last = this.#wedgeProbeAt.get(bound.turn.opRef);
+			if (last !== undefined && now - last < WEDGED_PROBE_INTERVAL_MS) return undefined;
+			this.#wedgeProbeAt.set(bound.turn.opRef, now);
+			try {
+				probe = await port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo });
+			} catch {
+				return undefined;
+			}
+		}
+		if (probe.live !== true || probe.disowned || probe.activity?.state !== "idle") return undefined;
+		const idleMs = this.#manager.now() - probe.activity.at;
+		return idleMs >= WEDGED_TURN_IDLE_MS ? idleMs : undefined;
+	}
+
+	/**
+	 * A wedged turn's answer from the transcript: the last assistant row written
+	 * since dispatch that says something (a trailing `[SILENT]` from a later
+	 * wake-up loses to it), else the silent row. `alreadyDelivered` = every part
+	 * of it is already confirmed posted to this origin in the delivery ledger
+	 * (under another turn) and must not be posted again; a copy the tail showed
+	 * under THIS turn is deduplicated by the terminal path's per-part claim.
+	 * `unreadable` keeps the hold.
+	 */
+	async #wedgedAnswer(bound: BoundTurn): Promise<{ text?: string; alreadyDelivered: boolean } | "unreadable"> {
+		const port = this.#manager.port;
+		if (bound.retired && !bound.answerWanted) return { alreadyDelivered: false };
+		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return { alreadyDelivered: false };
+		let found: Awaited<ReturnType<NonNullable<typeof port.fetchAssistantSince>>>;
+		try {
+			found = await port.fetchAssistantSince({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				notBeforeMs: bound.dispatchedAtMs,
+				preferSpoken: true,
+			});
+		} catch (error) {
+			this.#manager.log(
+				`wedged_turn_transcript_unreadable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return "unreadable";
+		}
+		const text = found?.text?.trim();
+		if (!text) return { alreadyDelivered: false };
+		const parts = spokenParts(text);
+		if (parts.length === 0) return { text, alreadyDelivered: false };
+		const posted = new Set(
+			this.#manager.database
+				.deliveryConfirmedTextsSince(this.originKey, new Date(bound.dispatchedAtMs - TURN_FLOOR_SKEW_MS).toISOString())
+				.map((posted) => posted.trim()),
+		);
+		return { text, alreadyDelivered: posted.has(text) || parts.every((part) => posted.has(part)) };
+	}
+
+	/**
+	 * Hands a wedged turn's transcript answer to the lifecycle as its terminal
+	 * text (an already-posted one flagged so it is recorded, not re-posted).
+	 * Returns true when something was actually posted.
+	 */
+	async #postWedgedAnswer(
+		bound: BoundTurn,
+		answer: { readonly text?: string; readonly alreadyDelivered: boolean },
+		status: StatusReport,
+	): Promise<boolean> {
+		if (answer.text === undefined) return false;
+		await bound.lifecycle.onTerminal?.({
+			...bound,
+			text: answer.text,
+			status,
+			...(answer.alreadyDelivered ? { alreadyPosted: true } : {}),
+		});
+		return !answer.alreadyDelivered && !isSilentReply(answer.text);
+	}
+
+	/** True while `bound` is still this actor's current or retired turn and the actor runs. */
+	#stillTracked(bound: BoundTurn): boolean {
+		return (
+			!this.#stopped &&
+			!this.#manager.stopped &&
+			(this.#current === bound || this.#retired.get(retiredKey(bound)) === bound)
+		);
+	}
+
+	/**
+	 * An accepted turn whose operation never settles (status in_flight, unknown
+	 * or unreadable) on a session idle past WEDGED_TURN_IDLE_MS: the host
+	 * finished whatever it was doing and nothing will ever end this turn. Post
+	 * the answer the transcript holds, end the host, and close the turn the way
+	 * a dead session's is closed - never re-sent, binding rotated, held steers
+	 * resolved. Returns true when it did (or the turn is no longer tracked).
+	 */
+	async #releaseWedgedTurn(bound: BoundTurn, reason: string, supplied?: SessionLiveness): Promise<boolean> {
+		const idleMs = await this.#wedgedIdleMs(bound, supplied);
+		if (idleMs === undefined) return false;
+		const answer = await this.#wedgedAnswer(bound);
+		if (answer === "unreadable") return false;
+		if (!this.#stillTracked(bound)) return true;
+		const status = {
+			operationRef: bound.turn.opRef,
+			status: { status: "terminal_ok", receiptState: "present" },
+			summary: { completed: true },
+			summaryCompleted: true,
+		} as unknown as StatusReport;
+		const delivered = await this.#postWedgedAnswer(bound, answer, status);
+		this.#manager.log(
+			`wedged_turn_released origin=${this.originKey} opRef=${bound.turn.opRef} reason=${reason} idleMs=${idleMs} delivered=${delivered}`,
+		);
+		if (bound.retired) await this.#terminateRetiredSession(bound.sessionId, "wedged_idle", bound);
+		else if (this.#manager.port.terminateHost) {
+			try {
+				const ended = await this.#manager.port.terminateHost({
+					sessionId: bound.sessionId,
+					repo: this.#manager.repo,
+				});
+				this.#manager.log(
+					`wedged_turn_host origin=${this.originKey} session=${bound.sessionId} outcome=${ended.outcome}${"pid" in ended ? ` pid=${ended.pid}` : ""}${ended.outcome === "refused" ? ` detail=${ended.reason}` : ""}`,
+				);
+			} catch (error) {
+				this.#manager.log(
+					`wedged_turn_host origin=${this.originKey} session=${bound.sessionId} outcome=error detail=${safeDiagnostic(error)}`,
+				);
+			}
+		}
+		await this.#closeAcceptedOnDeadSession(
+			bound,
+			"wedged_idle",
+			answer.text === undefined ? undefined : { unlinkedReason: isSilentReply(answer.text) ? "silent" : "no_delivery" },
+		);
+		return true;
 	}
 
 	/**
@@ -2149,6 +2423,9 @@ class OriginActor {
 					await this.#closeAcceptedOnDeadSession(bound, "session_gone");
 					return;
 				}
+				// Live and idle long past any work: the status endpoint will never
+				// answer for this turn again (a host whose prompt was force-ended).
+				if (state === "accepted" && raw && (await this.#releaseWedgedTurn(bound, "status_unavailable", raw))) return;
 			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
@@ -2197,6 +2474,7 @@ class OriginActor {
 					return;
 				}
 			}
+			if (state === "accepted" && (await this.#releaseWedgedTurn(bound, "operation_state_unknown"))) return;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
 				"warn",
@@ -2207,6 +2485,9 @@ class OriginActor {
 		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
 		if (!isTerminalStatus(report.status.status)) {
+			// Reported running while the host has idled past the bound: the run
+			// ended without settling its operation and never will.
+			if (await this.#releaseWedgedTurn(bound, `status_${report.status.status}`)) return;
 			if (bound.detached && !bound.tailEvidenceUnavailable) {
 				// A turn the user still wants answered is re-attached like the
 				// current one; only a discarded (`/new`) hold is deferred.
@@ -2308,13 +2589,35 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
+					// Terminal, but its output will never be provable (receipt missing)
+					// and the host has idled past the bound: the transcript is the only
+					// place the answer lives. The host is healthy and is left alone.
+					const idleMs = await this.#wedgedIdleMs(bound);
+					const answer = idleMs === undefined ? undefined : await this.#wedgedAnswer(bound);
+					if (idleMs === undefined || answer === undefined || answer === "unreadable") {
+						this.#manager.log(
+							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
+							"warn",
+						);
+						return;
+					}
+					if (!this.#stillTracked(bound)) return;
+					const delivered = await this.#postWedgedAnswer(bound, answer, report);
+					// Finished with nothing in the transcript at all: say so instead of
+					// completing in silence.
+					if (answer.text === undefined)
+						await bound.lifecycle.onFailure?.({
+							...bound,
+							error: new GjcRuntimeError("output_unavailable: the turn finished but its answer could not be read", {
+								code: "output_unavailable",
+								message: "the turn finished but its answer could not be read",
+							}),
+							status: report,
+						});
 					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
-						"warn",
+						`wedged_turn_released origin=${this.originKey} opRef=${bound.turn.opRef} reason=terminal_output_pending idleMs=${idleMs} delivered=${delivered}`,
 					);
-					return;
-				}
-				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
+				} else await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
 				const openTool = bound.openTool && {
 					name: toolLabel(bound.openTool.name),
@@ -2347,6 +2650,9 @@ class OriginActor {
 		// Persist the failure notice before settling its trigger. If delivery fails,
 		// recovery can retry the same deterministic notice without losing it. Reset
 		// completion and its budget are then committed atomically below.
+		// A failed turn may never have put its preamble into the context: the next
+		// send on this session carries it again.
+		if (report.status.status !== "terminal_ok") this.#personaPreamble.delete(bound.sessionId);
 		const resetApplied = this.#resetFailedTurn(bound, report, failedTurnEvidence);
 		const completed = resetApplied
 			? 1
@@ -2440,7 +2746,86 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * Decides what trusted preamble one send carries. The persona preamble is
+	 * resent only when the session's context may not hold its current text: no
+	 * record for the session (first send, new session, gateway restart), changed
+	 * text, compacted just now, usage unreadable, usage lower than at the previous
+	 * send (compaction or pruning removed history), or the refresh bound reached.
+	 * Resending it on every turn grew #회의실 by ~12K tokens per message until
+	 * pre-prompt compaction wedged eight turns in a row (2026-09-30).
+	 */
+	#preambleForSend(
+		sessionId: string,
+		epoch: number,
+		lifecycle: PersonaTurnLifecycle,
+		context: PreparedContext,
+	): { readonly text?: string; readonly next?: PersonaPreambleState } {
+		const persona = lifecycle.systemPreamble;
+		if (!persona) return lifecycle.sessionBootstrap ? { text: lifecycle.sessionBootstrap } : {};
+		const signature = createHash("sha256").update(persona).digest("hex");
+		const contextPercent = context.usage?.percent;
+		const previous = this.#personaPreamble.get(sessionId);
+		const reason = !previous
+			? "first"
+			: previous.signature !== signature
+				? "changed"
+				: context.compacted
+					? "compacted"
+					: contextPercent === undefined
+						? "usage_unknown"
+						: contextPercent < previous.contextPercent
+							? "context_shrank"
+							: previous.sendsSince + 1 >= PERSONA_PREAMBLE_REFRESH_SENDS
+								? "refresh"
+								: undefined;
+		if (reason === undefined && previous && contextPercent !== undefined)
+			return {
+				...(lifecycle.sessionBootstrap ? { text: lifecycle.sessionBootstrap } : {}),
+				next: { signature, contextPercent, sendsSince: previous.sendsSince + 1 },
+			};
+		this.#manager.log(
+			`persona_preamble origin=${this.originKey} epoch=${epoch} session=${sessionId} reason=${reason} context_percent=${contextPercent ?? "unknown"}${previous ? ` previous_percent=${previous.contextPercent}` : ""}`,
+		);
+		return {
+			text: lifecycle.sessionBootstrap ? `${persona}\n\n${lifecycle.sessionBootstrap}` : persona,
+			next: { signature, contextPercent: contextPercent ?? 0, sendsSince: 0 },
+		};
+	}
+
+	/**
+	 * Reads the session's context usage on the turn's relay and, at
+	 * PERSONA_COMPACTION_TOKENS or more, has gjc compact the session before the
+	 * send, so no prompt ever lands on a session gjc would compact first. A
+	 * compaction that fails or is unavailable is logged and the send goes ahead:
+	 * gjc's own compaction and the wedged-submission reset stay the fallback.
+	 */
+	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		let usage: SessionContextUsage | undefined;
+		try {
+			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			this.#manager.log(
+				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+			);
+			return { compacted: false };
+		}
+		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
+		const startedAt = this.#manager.now();
+		const { status } = await this.#manager.port.runCompaction({
+			sessionId,
+			repo: this.#manager.repo,
+			originKey: this.originKey,
+		});
+		this.#manager.log(
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+		);
+		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
+	}
+
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
+		this.#wedgeProbeAt.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);
@@ -2507,6 +2892,7 @@ class OriginActor {
 	 */
 	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
+		this.#wedgeProbeAt.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
@@ -2540,7 +2926,12 @@ class OriginActor {
 	 * Holding it instead re-checked a dead endpoint forever and blocked the
 	 * conversation (live: a broker restart held four origins for minutes).
 	 */
-	async #closeAcceptedOnDeadSession(bound: BoundTurn, reason: string): Promise<void> {
+	async #closeAcceptedOnDeadSession(
+		bound: BoundTurn,
+		reason: string,
+		/** The turn's answer was already handled (posted, silent, or posted before): no cut-off notice. */
+		answered?: { readonly unlinkedReason: TerminalUnlinkedReason },
+	): Promise<void> {
 		const database = this.#manager.database;
 		// Only a still-open trigger is closed: a repeat call after completion (or
 		// after a restart that already closed it) sends no second notice.
@@ -2557,7 +2948,7 @@ class OriginActor {
 		// The notice is persisted BEFORE the trigger closes. If persisting it
 		// throws, the trigger stays open and the next sweep retries the same
 		// deterministic notice: a closed turn never silently loses it.
-		if (!discarded)
+		if (!discarded && !answered)
 			await bound.lifecycle.onFailure?.({
 				...bound,
 				error: new GjcRuntimeError(
@@ -2572,7 +2963,10 @@ class OriginActor {
 		const rotate =
 			!bound.retired && this.#current === bound && database.getSessionRecord(this.originKey)?.epoch === bound.epoch;
 		const completed = database.withTransaction(() => {
-			const changed = database.inboundTurnComplete(bound.turn.opRef, discarded ? "retired" : "turn_failed");
+			const changed = database.inboundTurnComplete(
+				bound.turn.opRef,
+				discarded ? "retired" : (answered?.unlinkedReason ?? "turn_failed"),
+			);
 			if (changed === 1 && rotate) database.rebindEpoch(this.originKey);
 			return changed;
 		});
@@ -2592,6 +2986,7 @@ class OriginActor {
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
+		this.#wedgeProbeAt.delete(bound.turn.opRef);
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
@@ -2812,12 +3207,16 @@ class OriginActor {
 		}
 	}
 
-	/** Exact context/request failures and repeated submission failures reset only the next binding. */
+	/**
+	 * Exact context/request failures, a wedged prompt submission and repeated
+	 * submission failures reset only the next binding; the failed trigger is
+	 * completed, never resent. Quota failures never reset.
+	 */
 	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
-		if (evidence)
-			this.#manager.log(
-				`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
-			);
+		const wedged = isWedgedSubmission(report);
+		const reason = wedged ? "submission_wedged" : evidence?.reason;
+		if (reason !== undefined)
+			this.#manager.log(`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${reason}`);
 		if (
 			report.status.status !== "failed" ||
 			report.operationRef !== bound.turn.opRef ||
@@ -2826,19 +3225,25 @@ class OriginActor {
 			bound.epoch !== this.#epoch() ||
 			bound.brokerGeneration !== this.#manager.brokerGeneration ||
 			this.#stopped ||
-			this.#manager.stopped ||
-			typeof report.status.startedAt !== "number" ||
-			!Number.isFinite(report.status.startedAt) ||
-			report.status.startedAt <= 0 ||
-			typeof report.status.terminalAt !== "number" ||
-			!Number.isFinite(report.status.terminalAt) ||
-			report.status.terminalAt < report.status.startedAt ||
-			report.status.terminalAt > this.#manager.now() ||
-			bound.dispatchedAtMs === undefined ||
-			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
+			this.#manager.stopped
 		)
 			return false;
-		if (evidence?.reason === "provider_quota_exhausted") {
+		// A wedged submission never started, so gjc reports no start time; only
+		// transcript evidence is tied to the turn's own time window.
+		if (
+			!wedged &&
+			(typeof report.status.startedAt !== "number" ||
+				!Number.isFinite(report.status.startedAt) ||
+				report.status.startedAt <= 0 ||
+				typeof report.status.terminalAt !== "number" ||
+				!Number.isFinite(report.status.terminalAt) ||
+				report.status.terminalAt < report.status.startedAt ||
+				report.status.terminalAt > this.#manager.now() ||
+				bound.dispatchedAtMs === undefined ||
+				report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs)
+		)
+			return false;
+		if (reason === "provider_quota_exhausted") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
@@ -2849,8 +3254,9 @@ class OriginActor {
 			this.#submissionFailures.set(bound.sessionId, count);
 			repeatedSubmissionFailure = count >= 2;
 		} else this.#submissionFailures.delete(bound.sessionId);
-		const resetReason =
-			evidence?.reason === "unsupported_input_status" || evidence?.reason === "context_exhausted"
+		const resetReason = wedged
+			? "submission_wedged"
+			: evidence?.reason === "unsupported_input_status" || evidence?.reason === "context_exhausted"
 				? evidence.reason
 				: repeatedSubmissionFailure
 					? "repeated_submission_failure"
@@ -2881,6 +3287,23 @@ class OriginActor {
 		);
 		return true;
 	}
+}
+
+/**
+ * gajae-code reports a prompt the host accepted but never got into the agent as
+ * `phase=submission` (no start, no activity). An agent-runtime cause there - e.g.
+ * `Timed out waiting for prior agent run to finish before prompting.` while the
+ * pre-prompt compaction of a session at gjc's 300K-token ceiling holds the agent -
+ * repeats on every later prompt to the same session (2026-09-30: eight in a row
+ * over 80 minutes, fixed only by the 3h idle reset). It earns the same one-shot
+ * reset as an exhausted context. Provider/transport failures and cancellations
+ * stay on their session.
+ */
+function isWedgedSubmission(report: StatusReport): boolean {
+	const outcome = report.status.outcome;
+	if (outcome?.phase !== "submission" || outcome.provenance !== "agent_failed" || outcome.category !== "agent_runtime")
+		return false;
+	return ![report.status.error?.code, outcome.code, outcome.providerCode].includes("aborted");
 }
 
 /**

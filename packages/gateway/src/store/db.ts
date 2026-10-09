@@ -3651,6 +3651,17 @@ export class GatewayDatabase {
 		);
 	}
 
+	/** Texts of the confirmed (posted) non-reaction deliveries to `originKey` created at or after `sinceIso`. */
+	deliveryConfirmedTextsSince(originKey: string, sinceIso: string): string[] {
+		return this.#database
+			.query<{ payload_json: string }, [string, string]>(
+				"SELECT payload_json FROM deliveries WHERE origin_key = ? AND state = 'confirmed' AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ?",
+			)
+			.all(originKey, sinceIso)
+			.map((row) => (JSON.parse(row.payload_json) as { text?: unknown }).text)
+			.filter((text): text is string => typeof text === "string" && text.length > 0);
+	}
+
 	deliveryUpdate(id: string, state: string, attempts?: number, lastError?: string): void {
 		this.#database
 			.query(

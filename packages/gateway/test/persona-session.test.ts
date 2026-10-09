@@ -3,9 +3,17 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isSilenceToken } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
+import {
+	PERSONA_COMPACTION_TOKENS,
+	PERSONA_PREAMBLE_REFRESH_SENDS,
+	PersonaSessionManager,
+	personaTurnOpRef,
+	WEDGED_TURN_IDLE_MS,
+} from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
+import type { SessionCompactionStatus, SessionContextUsage } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
@@ -86,7 +94,7 @@ function registerFixtureBindings(port: ScriptedSessionPort): void {
 async function harness(
 	port: ScriptedSessionPort,
 	hooks: {
-		terminal?: (text: string) => void;
+		terminal?: (text: string, alreadyPosted?: boolean) => void;
 		retired?: () => void;
 		released?: (opRef: string) => void;
 		failure?: (message: string) => void;
@@ -94,7 +102,7 @@ async function harness(
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
-	extra: { brokerGeneration?: () => number; submissionRetryDelayMs?: number } = {},
+	extra: { brokerGeneration?: () => number; submissionRetryDelayMs?: number; now?: () => number } = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -112,7 +120,7 @@ async function harness(
 			return {
 				text: trigger.body,
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
-				onTerminal: ({ text }) => hooks.terminal?.(text),
+				onTerminal: ({ text, alreadyPosted }) => hooks.terminal?.(text, alreadyPosted),
 				onFailure: ({ error }) => {
 					hooks.failure?.(error.message);
 					hooks.failureError?.(error);
@@ -655,13 +663,22 @@ test("provider quota exhaustion gives a safe notice and does not reset or rebind
 	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+// A submission failure that is not a wedged agent run (that one resets on the
+// first failure, see WEDGED_SUBMISSION) resets only when it repeats.
+const REPEATABLE_SUBMISSION = {
+	code: "internal",
+	phase: "submission",
+	category: "provider_transport",
+	provenance: "agent_failed",
+};
+
 test("two consecutive internal submission failures reset the next inbound to a new epoch", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,
 		onSend: (input, scripted) =>
 			scripted.fail(input.opRef, "Prompt submission failed.", {
 				code: "internal",
-				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				outcome: REPEATABLE_SUBMISSION,
 			}),
 	});
 	const logs: string[] = [];
@@ -688,7 +705,7 @@ test("a healthy turn clears consecutive internal submission failures", async () 
 			else
 				scripted.fail(input.opRef, "Prompt submission failed.", {
 					code: "internal",
-					outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+					outcome: REPEATABLE_SUBMISSION,
 				});
 		},
 	});
@@ -721,7 +738,7 @@ test("repeated submission failures respect the reset cap and log it once per ses
 		onSend: (input, scripted) =>
 			scripted.fail(input.opRef, "Prompt submission failed.", {
 				code: "internal",
-				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				outcome: REPEATABLE_SUBMISSION,
 			}),
 	});
 	const logs: string[] = [];
@@ -903,6 +920,71 @@ for (const evidence of ["missing", "throws"] as const)
 		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(port.sends).toHaveLength(1);
 		expect(failures).toEqual(["429 rate limited"]);
+	});
+
+const WEDGED_SUBMISSION = {
+	phase: "submission",
+	provenance: "agent_failed",
+	category: "agent_runtime",
+	providerCode: "internal",
+};
+
+test("a wedged submission resets the next binding once without transcript evidence", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	// gjc reports a never-started prompt without startedAt.
+	port.omitStartedAt = true;
+	const failures: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) }, (line) => logs.push(line));
+	enqueue("wedged", "first");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	port.fail(first.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	// #424 re-sends a never-started prompt once on the same session; only a wedge that survives it resets.
+	await eventually(() => port.sends.length === 2, "wedged submission was not re-sent");
+	const retry = port.sends[1]!;
+	expect(retry).toMatchObject({ text: "first", sessionId: "session-e0" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(failures).toEqual([]);
+	port.fail(retry.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => manager!.state(KEY) === "idle", "wedged submission did not settle");
+	expect(port.failureEvidenceProbes).toEqual([]);
+	expect(failures).toEqual(["internal: Prompt submission failed."]);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs.some((line) => line.includes("reason=submission_wedged"))).toBe(true);
+	enqueue("next", "second");
+	await manager!.notifyInbound(KEY);
+	expect(port.sends.map((send) => send.text)).toEqual(["first", "first", "second"]);
+	expect(port.sends[2]!.sessionId).toBe("session-e1");
+	// The cap holds until a healthy turn: a second wedge on the fresh session stays put.
+	port.fail(port.sends[2]!.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => port.sends.length === 4, "capped wedge was not re-sent");
+	port.fail(port.sends[3]!.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => manager!.state(KEY) === "idle", "capped wedge did not settle");
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+});
+
+for (const [label, detail] of [
+	["aborted submission", { code: "aborted", outcome: { ...WEDGED_SUBMISSION, providerCode: "aborted" } }],
+	[
+		"provider transport submission",
+		{ code: "provider_down", outcome: { ...WEDGED_SUBMISSION, category: "provider_transport" } },
+	],
+	["post-start agent failure", { code: "internal", outcome: { ...WEDGED_SUBMISSION, phase: "post_start" } }],
+] as const)
+	test(`${label} never resets without transcript evidence`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		await harness(port);
+		enqueue("kept", "original");
+		await manager!.notifyInbound(KEY);
+		port.fail(port.sends[0]!.opRef, "failed", detail);
+		// A submission-phase failure is re-sent once (#424); fail the re-send the same way.
+		if (detail.outcome.phase === "submission") {
+			await eventually(() => port.sends.length === 2, "submission failure was not re-sent");
+			port.fail(port.sends[1]!.opRef, "failed", detail);
+		}
+		await eventually(() => manager!.state(KEY) === "idle", "failure did not settle");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
 	});
 
 for (const missing of ["start", "terminal", "nan", "reversed", "future", "op-ref"] as const)
@@ -1691,6 +1773,285 @@ test("a dead-session close whose notice fails to persist leaves the turn open an
 	expect(port.sends).toHaveLength(1);
 });
 
+/**
+ * The 2026-09-29 wedge: an ACCEPTED turn whose operation never settles on a
+ * session the broker reports live and idle. `stale` answers status
+ * endpoint_stale (case A: host force-ended mid-tool); `pending` reports
+ * terminal_ok whose original output is never provable (case B: receipt missing).
+ */
+class WedgedSessionPort extends ScriptedSessionPort {
+	readonly stale = new Set<string>();
+	readonly pending = new Set<string>();
+	livenessFails = false;
+	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+		if (this.stale.has(input.sessionId)) throw endpointStale();
+		return await super.status(input);
+	}
+	override async fetchWorkerOutput(input: Parameters<ScriptedSessionPort["fetchWorkerOutput"]>[0]) {
+		if (this.pending.has(input.opRef)) return { status: "absent", code: "output_pending" } as const;
+		return await super.fetchWorkerOutput(input);
+	}
+	override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+		if (this.livenessFails) throw new Error("inspect timed out");
+		return await super.liveness(input);
+	}
+}
+
+async function wedgedHarness(port: WedgedSessionPort) {
+	const clock = { offsetMs: 0 };
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const recorded: string[] = [];
+	const failures: string[] = [];
+	await harness(
+		port,
+		{
+			terminal: (text, alreadyPosted) => (alreadyPosted ? recorded : terminal).push(text),
+			failure: (message) => failures.push(message),
+		},
+		(line) => logs.push(line),
+		{ now: () => Date.now() + clock.offsetMs },
+	);
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	expect(database?.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
+	return { clock, logs, terminal, recorded, failures, first };
+}
+
+const MINUTE = 60_000;
+
+test("case A: an ACCEPTED turn on a live session idle past the bound with status endpoint_stale is answered from the transcript once, its host ended, and closed", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, failures, first } = await wedgedHarness(port);
+	port.stale.add(first.sessionId);
+	port.appendAssistant(first.sessionId, "the answer to a steer");
+	port.setActivity(first.sessionId, "idle");
+
+	// Before the bound: the ordinary hold, nothing released or killed.
+	for (const offset of [0, 5 * MINUTE, WEDGED_TURN_IDLE_MS - MINUTE]) {
+		clock.offsetMs = offset;
+		await manager!.tick(KEY);
+	}
+	expect(logs.some((line) => line.includes("reason=status_unavailable") && line.includes(first.opRef))).toBe(true);
+	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(port.closes).toHaveLength(0);
+	expect(terminal).toEqual([]);
+
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "wedged turn was not released");
+	const released = logs.filter((line) => line.startsWith("wedged_turn_released"));
+	expect(released).toHaveLength(1);
+	expect(released[0]).toContain(`opRef=${first.opRef}`);
+	expect(released[0]).toContain("reason=status_unavailable");
+	expect(released[0]).toMatch(/idleMs=\d+/);
+	expect(released[0]).toContain("delivered=true");
+	expect(terminal).toEqual(["the answer to a steer"]);
+	// Answered, so no cut-off notice on top of it.
+	expect(failures).toEqual([]);
+	// The host is ended and the turn closed through the dead-session path; never re-sent.
+	expect(port.closes.map((close) => close.sessionId)).toEqual([first.sessionId]);
+	expect(logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes("reason=wedged_idle"))).toBe(
+		true,
+	);
+	expect(port.sends).toHaveLength(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+
+	// A later sweep delivers nothing again; the next inbound binds a fresh epoch.
+	await manager!.tick(KEY);
+	expect(terminal).toHaveLength(1);
+	enqueue("m-2", "next question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2, "next message was not dispatched");
+	expect(port.sends[1]!.text).toBe("next question");
+	expect(port.sends[1]!.sessionId).toBe("session-e1");
+});
+
+test("case A with nothing in the transcript is closed with the cut-off notice, host ended, never re-sent", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, failures, first } = await wedgedHarness(port);
+	port.stale.add(first.sessionId);
+	port.setActivity(first.sessionId, "idle");
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "wedged turn was not released");
+	expect(logs.some((line) => line.startsWith("wedged_turn_released") && line.includes("delivered=false"))).toBe(true);
+	expect(terminal).toEqual([]);
+	expect(failures).toHaveLength(1);
+	expect(failures[0]).toContain("session_unavailable");
+	expect(port.closes).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
+});
+
+test("case A shape with an in_flight status: released past the bound like an unreadable one", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, first } = await wedgedHarness(port);
+	port.appendAssistant(first.sessionId, "answered");
+	port.setActivity(first.sessionId, "idle");
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "wedged turn was not released");
+	expect(logs.some((line) => line.startsWith("wedged_turn_released") && line.includes("reason=status_in_flight"))).toBe(
+		true,
+	);
+	expect(terminal).toEqual(["answered"]);
+	expect(port.closes).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
+});
+
+async function caseB(port: WedgedSessionPort) {
+	const fixture = await wedgedHarness(port);
+	const { first, logs } = fixture;
+	port.pending.add(first.opRef);
+	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "");
+	port.setActivity(first.sessionId, "idle");
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes("reason=no_assistant_text_for_terminal") && line.includes(first.opRef)),
+		`terminal_ok with pending output was not held:\n${logs.join("\n")}`,
+	);
+	return fixture;
+}
+
+test("case B: terminal_ok whose output stays pending past the bound delivers the last non-silent transcript answer and leaves the host alone", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, failures, first } = await caseB(port);
+	port.appendAssistant(first.sessionId, "the real answer");
+	port.appendAssistant(first.sessionId, "[SILENT]");
+
+	clock.offsetMs = WEDGED_TURN_IDLE_MS - MINUTE;
+	await manager!.tick(KEY);
+	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "case B turn was not completed");
+	expect(terminal).toEqual(["the real answer"]);
+	expect(failures).toEqual([]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("wedged_turn_released") &&
+				line.includes("reason=terminal_output_pending") &&
+				line.includes("delivered=true"),
+		),
+	).toBe(true);
+	// A healthy host is not killed and the binding is kept.
+	expect(port.closes).toHaveLength(0);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
+	await manager!.tick(KEY);
+	expect(terminal).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
+});
+
+test("case B with only [SILENT] in the transcript is completed with no post", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, failures, first } = await caseB(port);
+	port.appendAssistant(first.sessionId, "[SILENT]");
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "case B turn was not completed");
+	// The lifecycle sees the silence token (it suppresses delivery), never a spoken text.
+	expect(terminal.every((text) => isSilenceToken(text))).toBe(true);
+	expect(failures).toEqual([]);
+	expect(logs.some((line) => line.startsWith("wedged_turn_released") && line.includes("delivered=false"))).toBe(true);
+	expect(port.closes).toHaveLength(0);
+});
+
+test("a wedged answer already confirmed delivered to the origin is not posted again", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, recorded, failures, first } = await caseB(port);
+	port.appendAssistant(first.sessionId, "already posted");
+	database!.deliveryCreate({
+		id: "delivery-earlier",
+		turnId: "turn-earlier",
+		originKey: KEY,
+		payloadJson: JSON.stringify({ origin: ORIGIN, role: "assistant", text: "already posted", final: true }),
+	});
+	database!.deliveryUpdate("delivery-earlier", "confirmed");
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "case B turn was not completed");
+	// Handed to the lifecycle only to be recorded (and its presentation ended), never posted.
+	expect(terminal).toEqual([]);
+	expect(recorded).toEqual(["already posted"]);
+	expect(failures).toEqual([]);
+	expect(logs.some((line) => line.startsWith("wedged_turn_released") && line.includes("delivered=false"))).toBe(true);
+});
+
+test("case B with nothing in the transcript is completed with a failure notice instead of held forever", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, failures, first } = await caseB(port);
+	clock.offsetMs = WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "case B turn was not completed");
+	expect(terminal).toEqual([]);
+	expect(failures).toHaveLength(1);
+	expect(failures[0]).toContain("output_unavailable");
+	expect(logs.some((line) => line.startsWith("wedged_turn_released") && line.includes("delivered=false"))).toBe(true);
+	expect(port.closes).toHaveLength(0);
+	expect(port.sends).toHaveLength(1);
+});
+
+test("a live session that is busy (not idle) past the bound is never released", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, first } = await wedgedHarness(port);
+	port.stale.add(first.sessionId);
+	port.appendAssistant(first.sessionId, "mid-work line");
+	port.setActivity(first.sessionId, "tool", Date.now());
+	for (const offset of [WEDGED_TURN_IDLE_MS + MINUTE, 3 * WEDGED_TURN_IDLE_MS, 12 * WEDGED_TURN_IDLE_MS]) {
+		clock.offsetMs = offset;
+		await manager!.tick(KEY);
+	}
+	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(port.closes).toHaveLength(0);
+	expect(terminal).toEqual([]);
+});
+
+test("an unanswerable liveness probe is not wedge evidence: the turn stays held", async () => {
+	class UnanswerablePort extends WedgedSessionPort {
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			if (this.stale.has(input.sessionId)) return { live: undefined, disowned: false };
+			return await super.liveness(input);
+		}
+	}
+	// Case A shape: status unreadable, liveness unanswerable.
+	const port = new UnanswerablePort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, first } = await wedgedHarness(port);
+	port.stale.add(first.sessionId);
+	port.appendAssistant(first.sessionId, "answer");
+	port.setActivity(first.sessionId, "idle");
+	clock.offsetMs = 3 * WEDGED_TURN_IDLE_MS;
+	await manager!.tick(KEY);
+	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(port.closes).toHaveLength(0);
+});
+
+test("a throwing liveness probe on a terminal_ok turn with pending output keeps it held", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { clock, logs, terminal, first } = await caseB(port);
+	port.appendAssistant(first.sessionId, "the real answer");
+	port.livenessFails = true;
+	clock.offsetMs = 3 * WEDGED_TURN_IDLE_MS;
+	await manager!.tick(KEY);
+	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
+	expect(database?.inboundTurnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(terminal).toEqual([]);
+	// Once the probe answers again the same turn is released on a later sweep.
+	port.livenessFails = false;
+	clock.offsetMs = 3 * WEDGED_TURN_IDLE_MS + MINUTE;
+	await manager!.tick(KEY);
+	await eventually(() => database?.inboundTurnRow(first.opRef)?.turn_state === "done", "turn was not released");
+	expect(terminal).toEqual(["the real answer"]);
+});
+
 test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,
@@ -2020,6 +2381,157 @@ test("a tail attach that fails before any send releases the lifecycle it created
 	expect(port.sends).toEqual([]);
 	expect(released).toEqual([latestOpRef]);
 	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+});
+
+/**
+ * 가8: a gjc session host closes itself after 30 idle minutes. The broker keeps
+ * the saved session (inspect: live=false, deleted=false, and since gjc 0.16 no
+ * `locator.repo`, so the normalized inspect is undefined). `staleLive` models a
+ * broker that still reports the closed host live, so the send reaches the dead
+ * host and fails with `host hello did not arrive`.
+ */
+class IdleClosedHostPort extends ScriptedSessionPort {
+	closed = new Set<string>();
+	staleLive = false;
+	deleted = false;
+	resumeCalls = 0;
+
+	override async inspect(input: { sessionId: string; repo: string }) {
+		if (this.closed.has(input.sessionId)) {
+			this.inspections.push(input);
+			return undefined;
+		}
+		return await super.inspect(input);
+	}
+
+	override async liveness(input: { sessionId: string; repo: string }) {
+		if (!this.closed.has(input.sessionId)) return await super.liveness(input);
+		return {
+			live: this.staleLive,
+			disowned: false,
+			workspace: input.repo,
+			...(this.deleted ? { deleted: true } : {}),
+		};
+	}
+
+	override async attachTail(input: TailAttachInput) {
+		if (this.closed.has(input.sessionId)) throw new Error("host hello did not arrive");
+		return await super.attachTail(input);
+	}
+
+	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+		if (this.closed.has(input.sessionId))
+			throw Object.assign(new Error("session_unavailable"), { code: "session_unavailable" });
+		return await super.status(input);
+	}
+
+	override async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }) {
+		this.resumeCalls += 1;
+		const binding = await super.resume(input);
+		this.closed.delete(input.sessionId);
+		return binding;
+	}
+}
+
+async function idleClosedHarness() {
+	const port = new IdleClosedHostPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
+	enqueue("before-idle", "earlier conversation");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "first turn did not start");
+	const first = port.sends[0]!;
+	port.complete(first.opRef, "earlier answer");
+	await eventually(() => terminal.length === 1, "first turn did not finish");
+	// Thirty idle minutes later the host is gone.
+	port.closed.add(first.sessionId);
+	return { port, logs, terminal, sessionId: first.sessionId };
+}
+
+test("가8: the first message after the host closed itself resumes the same session before sending", async () => {
+	const { port, logs, terminal, sessionId } = await idleClosedHarness();
+	enqueue("after-idle", "결론?");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2, "message after idle was not sent");
+	expect(port.resumeCalls).toBe(1);
+	expect(port.sends[1]).toMatchObject({ sessionId, text: "결론?" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(logs.some((line) => line.startsWith("session_resumed") && line.includes(`session=${sessionId}`))).toBe(true);
+	port.complete(port.sends[1]!.opRef, "이어서 답");
+	await eventually(() => terminal.length === 2, "resumed turn did not deliver");
+	expect(terminal).toEqual(["earlier answer", "이어서 답"]);
+});
+
+test("가8: a send that hits the closed host is recovered by resume on the same session and epoch, sent once", async () => {
+	const { port, logs, terminal, sessionId } = await idleClosedHarness();
+	port.staleLive = true;
+	enqueue("after-idle", "작업다됨?");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	expect(port.sends).toHaveLength(1);
+	const opRef = latestOpRef;
+	expect(database!.inboundTurnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+
+	await manager!.recover();
+	await eventually(() => port.sends.length === 2, "recovered turn was not re-sent");
+	expect(port.resumeCalls).toBe(1);
+	expect(port.sends[1]).toMatchObject({ sessionId, text: "작업다됨?" });
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith(`session_resumed origin=${KEY} epoch=0 session=${sessionId}`) &&
+				line.includes("reason=host_idle_closed"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
+	port.complete(port.sends[1]!.opRef, "응 다 됐어");
+	await eventually(() => terminal.length === 2, "recovered turn did not deliver");
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(port.sends).toHaveLength(2);
+	expect(terminal).toEqual(["earlier answer", "응 다 됐어"]);
+	expect(database!.inboundPendingCount(KEY)).toBe(0);
+});
+
+test("가8: a failed resume falls back to the existing rebind onto a new epoch", async () => {
+	const { port, logs, sessionId } = await idleClosedHarness();
+	port.staleLive = true;
+	port.failResume(sessionId);
+	enqueue("after-idle", "결론");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	await manager!.recover();
+	await eventually(() => port.sends.length === 2, "rebound turn was not sent");
+	expect(port.resumeCalls).toBe(1);
+	expect(logs.some((line) => line.startsWith("session_resume_failed") && line.includes(`session=${sessionId}`))).toBe(
+		true,
+	);
+	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted") && line.includes("nextEpoch=1"))).toBe(
+		true,
+	);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(port.sends[1]).toMatchObject({ sessionId: "session-e1", text: "결론" });
+});
+
+test("가8: a deleted saved session is never resumed", async () => {
+	const { port, sessionId } = await idleClosedHarness();
+	port.staleLive = true;
+	port.deleted = true;
+	enqueue("after-idle", "로컬에놔둬");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	await manager!.recover();
+	await eventually(() => port.sends.length === 2, "rebound turn was not sent");
+	expect(port.resumeCalls).toBe(0);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(port.sends[1]!.sessionId).not.toBe(sessionId);
+});
+
+test("가8: a deleted closed binding is not resumed before the send either", async () => {
+	const { port } = await idleClosedHarness();
+	port.deleted = true;
+	enqueue("after-idle", "다음");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	expect(port.resumeCalls).toBe(0);
 });
 
 test("startup recovery reconstructs an accepted durable turn and reconciles status plus turn.result", async () => {
@@ -2384,4 +2896,236 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(port.indexScans).toBe(0);
 	expect(port.deleted).toEqual([]);
 	expect(logs.some((line) => line.startsWith("session_gc"))).toBe(false);
+});
+
+/** Reports a scripted context usage of a 1M-token window, like `context.get` on the turn's relay. */
+class ContextUsagePort extends ScriptedSessionPort {
+	percent: number | undefined = 1;
+	readonly failing = new Set<string>();
+	compactionStatus: SessionCompactionStatus = "succeeded";
+	/** How many sends had been made when each compaction ran. */
+	readonly compactedAfterSends: number[] = [];
+
+	constructor() {
+		super({
+			onSend: (input, port) => {
+				if (this.failing.has(input.text)) port.fail(input.opRef, "post-start failure");
+				else port.complete(input.opRef, "ok");
+			},
+		});
+	}
+
+	async contextUsage(): Promise<SessionContextUsage | undefined> {
+		return this.percent === undefined ? undefined : { percent: this.percent, tokens: this.percent * 10_000 };
+	}
+
+	override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
+		this.compactedAfterSends.push(this.sends.length);
+		if (this.compactionStatus === "succeeded") this.percent = undefined;
+		return { status: this.compactionStatus };
+	}
+}
+
+const PERSONA = "## SOUL.md\npersona rules";
+
+async function preambleHarness(
+	port: ScriptedSessionPort,
+	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
+	log?: (line: string) => void,
+): Promise<void> {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		...(log ? { log } : {}),
+		onTurnStart: ({ trigger }) => {
+			const bootstrap = lifecycle.bootstrap?.();
+			return {
+				text: trigger.body,
+				systemPreamble: lifecycle.persona(),
+				...(bootstrap ? { sessionBootstrap: bootstrap } : {}),
+			};
+		},
+	});
+}
+
+async function sendTurn(port: ScriptedSessionPort, body: string): Promise<string | undefined> {
+	const before = port.sends.length;
+	enqueue(`m-${before}-${body}`, body);
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => port.sends.length === before + 1 && manager!.state(KEY) === "idle",
+		`turn ${body} did not settle`,
+	);
+	return port.sends[before]!.systemPreamble;
+}
+
+test("persona preamble rides the first send only while the context keeps growing", async () => {
+	const port = new ContextUsagePort();
+	let bootstrap: string | undefined = "bootstrap once";
+	await preambleHarness(port, { persona: () => PERSONA, bootstrap: () => bootstrap });
+
+	expect(await sendTurn(port, "first")).toBe(`${PERSONA}\n\nbootstrap once`);
+	bootstrap = undefined;
+	port.percent = 2;
+	expect(await sendTurn(port, "second")).toBeUndefined();
+	port.percent = 2;
+	expect(await sendTurn(port, "same usage")).toBeUndefined();
+	bootstrap = "bootstrap without persona";
+	port.percent = 3;
+	expect(await sendTurn(port, "bootstrap only")).toBe("bootstrap without persona");
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("persona preamble is resent after the context shrank (compaction)", async () => {
+	const port = new ContextUsagePort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	// gjc compacted on its own: the actor's compaction line is never reached.
+	port.percent = 15;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.percent = 15.5;
+	expect(await sendTurn(port, "grown")).toBeUndefined();
+	port.percent = 4;
+	expect(await sendTurn(port, "after compaction")).toBe(PERSONA);
+	port.percent = 4.5;
+	expect(await sendTurn(port, "grown again")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([]);
+});
+
+test("persona preamble is resent when its text changes", async () => {
+	const port = new ContextUsagePort();
+	let persona = PERSONA;
+	await preambleHarness(port, { persona: () => persona });
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	persona = `${PERSONA}\nnew rule`;
+	port.percent = 2;
+	expect(await sendTurn(port, "edited")).toBe(persona);
+	port.percent = 3;
+	expect(await sendTurn(port, "unchanged")).toBeUndefined();
+});
+
+test("persona preamble is resent on every send while context usage is unreadable", async () => {
+	const port = new ContextUsagePort();
+	port.percent = undefined;
+	await preambleHarness(port, { persona: () => PERSONA });
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	expect(await sendTurn(port, "second")).toBe(PERSONA);
+});
+
+test("a failed turn makes the next send carry the persona preamble again", async () => {
+	const port = new ContextUsagePort();
+	port.failing.add("fails");
+	await preambleHarness(port, { persona: () => PERSONA });
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.percent = 2;
+	expect(await sendTurn(port, "fails")).toBeUndefined();
+	port.percent = 2;
+	expect(await sendTurn(port, "after failure")).toBe(PERSONA);
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("persona preamble is refreshed after the bounded number of sends without it", async () => {
+	const port = new ContextUsagePort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	const carried: boolean[] = [];
+	for (let send = 0; send <= PERSONA_PREAMBLE_REFRESH_SENDS; send++) {
+		// Growing, but below the compaction line throughout.
+		port.percent = 1 + send * 0.5;
+		carried.push((await sendTurn(port, `turn ${send}`)) === PERSONA);
+	}
+	expect(port.compactedAfterSends).toEqual([]);
+	expect(carried.map((value, index) => (value ? index : -1)).filter((index) => index >= 0)).toEqual([
+		0,
+		PERSONA_PREAMBLE_REFRESH_SENDS,
+	]);
+});
+
+/** Percent of the fake 1M-token window at which the actor compacts. */
+const COMPACTION_PERCENT = PERSONA_COMPACTION_TOKENS / 10_000;
+
+test("a session at the compaction line is compacted before the send, which carries the persona again", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.percent = COMPACTION_PERCENT - 0.01;
+	expect(await sendTurn(port, "just under the line")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([]);
+
+	port.percent = COMPACTION_PERCENT;
+	expect(await sendTurn(port, "at the line")).toBe(PERSONA);
+	expect(port.compactedAfterSends).toEqual([2]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("persona_compaction ") &&
+				line.includes(`tokens=${PERSONA_COMPACTION_TOKENS}`) &&
+				line.includes("status=succeeded"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+
+	// Regrowing from the compacted size rides the copy the compacted send put back.
+	port.percent = 3;
+	expect(await sendTurn(port, "after compaction")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([2]);
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+});
+
+test("a compaction that does not succeed still sends the turn on the same session", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	port.compactionStatus = "failed";
+	port.percent = COMPACTION_PERCENT + 5;
+	expect(await sendTurn(port, "compaction fails")).toBeUndefined();
+	port.compactionStatus = "unavailable";
+	port.percent = COMPACTION_PERCENT + 6;
+	expect(await sendTurn(port, "compaction unavailable")).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([1, 2]);
+	expect(port.sends.map((send) => send.text)).toEqual(["first", "compaction fails", "compaction unavailable"]);
+	expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
+	expect(
+		logs.filter((line) => line.startsWith("persona_compaction ")).map((line) => line.match(/status=\w+/)?.[0]),
+	).toEqual(["status=failed", "status=unavailable"]);
+});
+
+test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {
+	let releaseCompaction!: () => void;
+	const compactionGate = new Promise<void>((resolve) => {
+		releaseCompaction = resolve;
+	});
+	class GatedCompactionPort extends ContextUsagePort {
+		override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
+			const result = super.runCompaction();
+			await compactionGate;
+			return await result;
+		}
+	}
+	const port = new GatedCompactionPort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	port.percent = COMPACTION_PERCENT + 1;
+	enqueue("m-full", "lands after compaction");
+	void manager!.notifyInbound(KEY);
+	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
+	enqueue("m-during", "arrives during compaction");
+	void manager!.notifyInbound(KEY);
+	await Bun.sleep(20);
+	expect(port.sends).toHaveLength(0);
+	expect(port.steers).toHaveLength(0);
+
+	releaseCompaction();
+	await eventually(
+		() => port.sends.length + port.steers.length === 2 && manager!.state(KEY) === "idle",
+		"queued messages did not follow the compacted send",
+	);
+	expect(port.sends[0]).toMatchObject({ text: "lands after compaction", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([0]);
 });
