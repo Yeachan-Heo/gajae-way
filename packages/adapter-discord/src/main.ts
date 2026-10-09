@@ -2316,7 +2316,9 @@ if (import.meta.main) {
 			.catch((error) => {
 				console.error(error instanceof Error ? error.message : String(error));
 				disposeLogging();
-				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
+				// Startup may already own recovery/monitor timers. Exit now so the service
+				// manager can retry login rather than keeping a permanently offline process.
+				process.exit(error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1);
 			});
 	}
 }
