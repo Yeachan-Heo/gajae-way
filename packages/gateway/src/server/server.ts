@@ -116,6 +116,20 @@ const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
+/** Per-message cap for unread context lines. Slack posts run to ~4k chars; a silent 1k cut lost the tail of normal replies. */
+const UNREAD_BODY_MAX = 4000;
+/** Per-message cap for the fresh-session history block, which can hold up to RECENT_HISTORY_MAX entries. */
+const RECENT_HISTORY_BODY_MAX = 500;
+
+/**
+ * Clip a context message body, saying so when it does. A silent cut reads as the
+ * whole message, so the persona treats the sender's text as ending mid-sentence.
+ */
+export function clipContextBody(body: string, max: number): string {
+	const chars = Array.from(body);
+	if (chars.length <= max) return body;
+	return `${chars.slice(0, max).join("")} …[clipped: first ${max} of ${chars.length} chars shown; the message itself is complete]`;
+}
 // 16 turns is where the shadow's separation stopped improving (help on answer-me
 // messages: 0.465 context-free, 0.574 at 3, 0.668 at 8, 0.729 at 16) and it costs
 // ~1.4k tokens / ~520 ms on the local judge, which nothing waits for.
@@ -2147,7 +2161,7 @@ async function createInboundTurnLifecycle(
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(entry.body, UNREAD_BODY_MAX)}`,
 		);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
@@ -2173,7 +2187,10 @@ async function createInboundTurnLifecycle(
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
-			.map((entry) => `- [${entry.at}] ${entry.author}: ${redactHistoricalAttachments(entry.body).slice(0, 500)}`);
+			.map(
+				(entry) =>
+					`- [${entry.at}] ${entry.author}: ${clipContextBody(redactHistoricalAttachments(entry.body), RECENT_HISTORY_BODY_MAX)}`,
+			);
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";

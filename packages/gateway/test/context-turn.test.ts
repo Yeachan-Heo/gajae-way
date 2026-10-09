@@ -600,3 +600,43 @@ test("issue #409: /new after every turn was answered carries nothing", async () 
 	expect(unreadBlock(texts[1]!)).toBe("");
 	client.close();
 });
+
+test("unread context keeps a normal long reply whole and marks a clip it does make", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			return "ok";
+		},
+	});
+	const longReply = `${"가".repeat(2500)}END-OF-LONG-REPLY`;
+	const oversized = `${"나".repeat(4100)}TAIL-NEVER-SHOWN`;
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({
+			messageId: "peer-long",
+			originKey: ORIGIN_KEY,
+			authorId: "bot-2",
+			authorName: "peer",
+			body: longReply,
+		});
+		database.contextRecord({
+			messageId: "peer-huge",
+			originKey: ORIGIN_KEY,
+			authorId: "bot-2",
+			authorName: "peer",
+			body: oversized,
+		});
+	});
+
+	send(client, "trigger", "owner asks about the peer reply");
+	await waitUntil(() => texts.length === 1);
+
+	const unread = unreadBlock(texts[0]!);
+	expect(unread).toContain(longReply);
+	expect(unread).not.toContain("TAIL-NEVER-SHOWN");
+	expect(unread).toContain("[clipped: first 4000 of 4116 chars shown; the message itself is complete]");
+	client.close();
+});
