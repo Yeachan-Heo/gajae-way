@@ -976,6 +976,13 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
 	return channel;
 }
 
+function isChannelNotFoundError(error: unknown): boolean {
+	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
+	return (
+		candidate?.code === 10_003 || candidate?.code === "10003" || candidate?.status === 404 || candidate?.httpStatus === 404
+	);
+}
+
 /**
  * Resolves where a delivery is posted. A thread archives after inactivity, and
  * posting into it only auto-unarchives when the bot holds the right permission,
@@ -983,14 +990,36 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
  * reply goes to the parent channel with a visible notice and a log line: a
  * monitor result that silently vanishes behind an archived thread is the worst
  * outcome, because its schedule still looks healthy.
+ *
+ * When a thread does not exist at all, the delivery also falls back to the parent
+ * channel with a notice explaining why.
  */
 async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
 	origin: ChatMessagePayload["origin"],
 	deliveryId: string,
 ): Promise<{ readonly channel: DiscordTextChannelLike; readonly notice?: string }> {
-	const channel = await fetchTextChannel(discord, origin.conversationId);
+	let channel: DiscordTextChannelLike | undefined;
+
+	// Try to fetch the channel (thread or regular)
+	try {
+		channel = await fetchTextChannel(discord, origin.conversationId);
+	} catch (error) {
+		if (origin.kind !== "thread" || !origin.parentId || !isChannelNotFoundError(error)) throw error;
+		// Thread doesn't exist; fall back to parent channel
+		const reason = `thread ${origin.conversationId} does not exist`;
+		const parent = await fetchTextChannel(discord, origin.parentId);
+		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		return {
+			channel: parent,
+			notice: `[thread <#${origin.conversationId}> does not exist; posting here instead]`,
+		};
+	}
+
+	// Channel fetched successfully; check if it's an archived thread
 	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
+
+	// Archived thread - try to unarchive
 	try {
 		await channel.setArchived(false);
 		return { channel };
