@@ -171,7 +171,19 @@ export function decideInbound(
 		!(message.user ?? message.bot_id)
 	)
 		return undefined;
-	const origin = slackMessageOrigin(message);
+	// A reply threaded under the bot's own message continues the channel conversation rather than
+	// opening an isolated thread session: a human who clicks "reply" on the bot's answer expects the
+	// bot to remember that answer. `replyTo` still carries thread_ts, so the reply lands in the thread.
+	// Threads a human starts on their own message keep their own session.
+	const origin =
+		message.thread_ts && message.thread_ts !== message.ts && message.parent_user_id === identity.botUserId
+			? slackMessageOrigin({
+					channel: message.channel,
+					channel_type: message.channel_type,
+					user: message.user,
+					bot_id: message.bot_id,
+				})
+			: slackMessageOrigin(message);
 	return { origin, engagement: engagementForMessage(message, origin, identity, names, channels) };
 }
 
@@ -895,7 +907,13 @@ export async function startSlackAdapter(
 				if (text === "") return;
 				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
 				// Auto-thread on mention in channel (Hermes-like contract: channel mention → thread + new session).
-				const origin = maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
+				// A reply inside a thread is never a fresh channel mention: decideInbound already chose its
+				// session (a thread under the bot's own message keeps the channel one), and re-rooting it
+				// at the reply would open a new thread and a new session.
+				const inThread = message.thread_ts !== undefined && message.thread_ts !== message.ts;
+				const origin = inThread
+					? admitted.origin
+					: maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
 				const result = await gateway.requestInbound(
 					slackMessageId(message.channel, message.ts),
 					origin,
