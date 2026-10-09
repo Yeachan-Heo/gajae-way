@@ -296,6 +296,39 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 	expect(chatMessages(f)[0]?.payload.text).toBe("ack");
 });
 
+test("a lane-report turn can [POST:] its result line to another configured channel", async () => {
+	const f = await fixture({
+		channels: {
+			"parent-channel": { engagement: "open", audience: "all" },
+			"report-room": { engagement: "open", audience: "all" },
+		},
+	});
+	const personaSessionId = crypto.randomUUID();
+	await bindPersonaSession(f, rootKey, personaSessionId);
+	const lane = await startLane(f, "post-worker", personaSessionId);
+	await settleLane(f, lane.result.opRef, "deployed");
+	const sends = await eventually(
+		() => f.port.sends,
+		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
+		"persona wake send",
+	);
+	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
+	f.port.complete(
+		reportSend.opRef,
+		"배포 끝났어\n[BREAK]\n[POST:discord/channel/report-room] 완료: 배포 <#parent-channel>",
+	);
+	await eventually(
+		() => chatMessages(f),
+		(messages) => messages.length === 2,
+		"lane-report reply and post",
+	);
+	expect(chatMessages(f).map((frame) => [frame.payload.origin.conversationId, frame.payload.text])).toEqual([
+		["parent-channel", "배포 끝났어"],
+		["report-room", "완료: 배포 <#parent-channel>"],
+	]);
+	expect(f.database.deliveryRows().filter((row) => row.origin_key === "discord/channel/report-room")).toHaveLength(1);
+});
+
 for (const [label, callerSessionId] of [
 	["no caller id", undefined],
 	["unknown caller id", "unknown-session-id"],
