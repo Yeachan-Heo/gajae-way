@@ -213,3 +213,73 @@ describe("a second adapter instance refuses to boot", () => {
 		expect(processIsAlive(0x7ff_ffff)).toBe(false);
 	});
 });
+
+describe("startup failures terminate even with live recovery timers", () => {
+	async function runLoginFixture(fail: boolean): Promise<{ code: number; stderr: string; timedOut: boolean }> {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-login-"));
+		const main = join(import.meta.dir, "../src/main.ts");
+		let killChild: (() => void) | undefined;
+		try {
+			await writeFile(join(home, "token"), "fixture-not-a-real-token");
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({ tokenFile: join(home, "token"), gatewaySocket: join(home, "absent.sock") }),
+			);
+			const preload = join(home, "login-fixture.ts");
+			// Patch only this child process. No real Discord login or gateway exists in the fixture.
+			await writeFile(
+				preload,
+				`import { createRequire } from "node:module";
+const { Client } = createRequire(${JSON.stringify(main)})("discord.js");
+Client.prototype.login = async function () {
+	setInterval(() => {}, 10000);
+	${fail ? 'throw new Error("getaddrinfo ENOTFOUND discord.com (fixture)");' : 'console.log("fixture login succeeded"); return "fixture";'}
+};`,
+			);
+			const child = Bun.spawn([process.execPath, "--preload", preload, main], {
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { PATH: process.env.PATH, HOME: home, GAJAEWAY_HOME: home },
+			});
+			killChild = () => child.kill();
+			const stderr = new Response(child.stderr).text();
+			const stdout = new Response(child.stdout).text();
+			let timedOut = false;
+			if (fail) {
+				const outcome = await Promise.race([child.exited, Bun.sleep(3000).then(() => "timeout" as const)]);
+				timedOut = outcome === "timeout";
+				if (timedOut) child.kill();
+			} else {
+				// Successful startup must stay resident, then release its lock on SIGTERM.
+				for (let attempt = 0; attempt < 100; attempt++) {
+					const log = Bun.file(join(home, "adapter-discord.log"));
+					if ((await log.exists()) && (await log.text()).includes("fixture login succeeded")) break;
+					await Bun.sleep(20);
+				}
+				expect(child.exitCode).toBeNull();
+				child.kill("SIGTERM");
+			}
+			const [code, errorText, output] = await Promise.all([child.exited, stderr, stdout]);
+			if (!fail) {
+				expect(output).toContain("fixture login succeeded");
+				expect(await Bun.file(join(home, "adapter-discord.pid")).exists()).toBe(false);
+			}
+			return { code, stderr: errorText, timedOut };
+		} finally {
+			killChild?.();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+
+	test("DNS login failure exits nonzero instead of keeping recovery timers alive", async () => {
+		const result = await runLoginFixture(true);
+		expect(result.stderr).toContain("getaddrinfo ENOTFOUND discord.com (fixture)");
+		expect(result.timedOut).toBe(false);
+		expect(result.code).toBe(1);
+	}, 10000);
+
+	test("successful login remains supervised and SIGTERM releases the lock", async () => {
+		const result = await runLoginFixture(false);
+		expect(result.code).toBe(0);
+	}, 10000);
+});
