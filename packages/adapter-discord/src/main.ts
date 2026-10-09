@@ -22,11 +22,13 @@ import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author"
 import {
 	adapterHome,
 	type DiscordChannelPolicy,
+	type GatewayDownAlertConfig,
 	type LoadedDiscordAdapterConfig,
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
 	type StatusReactionsMode,
 } from "./config";
+import { GatewayDownAlarm, lastLogLine } from "./down-alert";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
@@ -969,6 +971,18 @@ function isArchivedThread(value: unknown): value is ArchivableThreadLike {
 	);
 }
 
+/** Posts with the adapter's own bot: it keeps its Discord session while the gateway is the thing that is down. */
+function gatewayDownAlarm(discord: DiscordClientLike, alert: GatewayDownAlertConfig): GatewayDownAlarm {
+	return new GatewayDownAlarm(alert, {
+		now: Date.now,
+		post: async (text) => {
+			await (await fetchTextChannel(discord, alert.channelId)).send(text);
+		},
+		lastError: async () => (alert.logFile ? lastLogLine(alert.logFile) : undefined),
+		log: console,
+	});
+}
+
 async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise<DiscordTextChannelLike> {
 	const channel = await discord.channels.fetch(id);
 	if (!isDiscordTextChannel(channel))
@@ -1158,6 +1172,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		undefined,
 		undefined,
 		discordSpeechPorts(config.voice),
+		config.gatewayDownAlert ? gatewayDownAlarm(discord, config.gatewayDownAlert) : undefined,
 	);
 	// Transcription makes ingress asynchronous, and two messages in one
 	// conversation must not overtake each other while one waits on the network.
@@ -1460,6 +1475,7 @@ export class ReconnectingGateway {
 		/** Injectable only so tests do not pay real recovery backoff. */
 		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 		readonly speech?: DiscordSpeechPorts,
+		readonly downAlarm?: GatewayDownAlarm,
 	) {
 		this.#client = initialClient;
 		void this.ensureCursors();
@@ -1469,6 +1485,7 @@ export class ReconnectingGateway {
 	adoptClient(client: GajaewayClient): void {
 		this.#client = client;
 		this.#attempt = 0;
+		void this.downAlarm?.up();
 		void this.#flushEdits();
 	}
 
@@ -1477,6 +1494,7 @@ export class ReconnectingGateway {
 			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-discord" });
 			this.#client = client;
 			this.#attempt = 0;
+			void this.downAlarm?.up();
 			this.#deliveryOff?.();
 			this.#deliveryOff = subscribeDiscordDeliveries(
 				client,
@@ -2128,6 +2146,7 @@ export class ReconnectingGateway {
 		this.#reconnecting = true;
 		this.#client = undefined;
 		this.#deliveryOff?.();
+		void this.downAlarm?.down();
 		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
 		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
 		console.log(`Discord adapter gateway reconnecting in ${delay + jitter}ms.`);
