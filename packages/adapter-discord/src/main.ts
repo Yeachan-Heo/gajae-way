@@ -979,7 +979,10 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
 function isChannelNotFoundError(error: unknown): boolean {
 	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
 	return (
-		candidate?.code === 10_003 || candidate?.code === "10003" || candidate?.status === 404 || candidate?.httpStatus === 404
+		candidate?.code === 10_003 ||
+		candidate?.code === "10003" ||
+		candidate?.status === 404 ||
+		candidate?.httpStatus === 404
 	);
 }
 

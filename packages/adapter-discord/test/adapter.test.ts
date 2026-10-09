@@ -295,8 +295,7 @@ test("a thread that does not exist falls back to its parent channel and says why
 	const discord: DiscordClientLike = {
 		channels: {
 			fetch: async (id: string) => {
-				if (id === "thread-1")
-					return Promise.reject(Object.assign(new Error("Unknown Channel"), { code: 10003 }));
+				if (id === "thread-1") return Promise.reject(Object.assign(new Error("Unknown Channel"), { code: 10003 }));
 				return { send: async (payload: unknown) => void sent.push([id, payload]) };
 			},
 		},
@@ -308,12 +307,7 @@ test("a thread that does not exist falls back to its parent channel and says why
 	} finally {
 		console.error = original;
 	}
-	expect(sent).toEqual([
-		[
-			"channel-1",
-			"[thread <#thread-1> does not exist; posting here instead]\nmonitor result",
-		],
-	]);
+	expect(sent).toEqual([["channel-1", "[thread <#thread-1> does not exist; posting here instead]\nmonitor result"]]);
 	expect(errors).toEqual([
 		"Discord delivery delivery-1: thread thread-1 does not exist; delivered to parent channel channel-1 instead.",
 	]);
@@ -326,27 +320,17 @@ test("a non-existent thread with a reply reference clears the reply when falling
 	const discord: DiscordClientLike = {
 		channels: {
 			fetch: async (id: string) => {
-				if (id === "thread-1")
-					return Promise.reject(Object.assign(new Error("Unknown Channel"), { code: 10003 }));
+				if (id === "thread-1") return Promise.reject(Object.assign(new Error("Unknown Channel"), { code: 10003 }));
 				return { send: async (payload: unknown) => void sent.push([id, payload]) };
 			},
 		},
 	};
-	await settleDiscordDelivery(
-		mockGateway(requests),
-		discord,
-		{
-			...threadDelivery("reply text"),
-			replyToMessageId: "msg-42", // This references a message in the non-existent thread
-		},
-	);
+	await settleDiscordDelivery(mockGateway(requests), discord, {
+		...threadDelivery("reply text"),
+		replyToMessageId: "msg-42", // This references a message in the non-existent thread
+	});
 	// The delivery should succeed but the reply reference should not be used
-	expect(sent).toEqual([
-		[
-			"channel-1",
-			"[thread <#thread-1> does not exist; posting here instead]\nreply text",
-		],
-	]);
+	expect(sent).toEqual([["channel-1", "[thread <#thread-1> does not exist; posting here instead]\nreply text"]]);
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
