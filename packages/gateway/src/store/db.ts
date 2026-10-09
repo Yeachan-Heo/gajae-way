@@ -494,9 +494,13 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
 /**
  * Resolve the lane report origin for a persona parent. If the parent is a channel root
  * origin with a triggerMessageId, route the report to a thread instead of the channel root.
+ * Synthetic lane-report-<sha256> ids are never used as conversationIds since they are not
+ * real platform message ids.
  */
 function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
 	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
+	// Synthetic lane-report ids must never become Discord thread conversationIds
+	if (/^lane-report-[0-9a-f]{64}$/.test(parent.triggerMessageId)) return admissionOriginRefJson;
 
 	try {
 		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
@@ -3803,6 +3807,46 @@ export class GatewayDatabase {
 			recentExpired,
 			recentPending,
 		};
+	}
+
+	/**
+	 * Mark turns with all deliveries expired. For each inbound message that triggered
+	 * a turn, if all deliveries for that turn have expired (and none were confirmed),
+	 * update the terminal_delivery_id to reflect that all deliveries were lost.
+	 * Returns the count of updated messages.
+	 */
+	markTurnsWithAllDeliveriesExpired(): number {
+		// Find all turns where:
+		// - the inbound message is done
+		// - the turn_op_ref is set
+		// - terminal_delivery_id is NULL (no delivery was claimed)
+		// - all deliveries for this turn are in 'expired' state
+		const expiredTurns = this.#database
+			.query<{ turn_op_ref: string }, []>(
+				"SELECT DISTINCT im.turn_op_ref FROM inbound_messages im " +
+					"WHERE im.turn_op_ref IS NOT NULL " +
+					"AND im.state = 'done' " +
+					"AND im.terminal_delivery_id IS NULL " +
+					"AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.turn_id = im.turn_op_ref AND d.state != 'expired') " +
+					"AND EXISTS (SELECT 1 FROM deliveries d WHERE d.turn_id = im.turn_op_ref)",
+			)
+			.all();
+
+		if (expiredTurns.length === 0) return 0;
+
+		const now = new Date().toISOString();
+		let updatedCount = 0;
+
+		for (const turn of expiredTurns) {
+			const changes = this.#database
+				.query(
+					"UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND terminal_delivery_id IS NULL",
+				)
+				.run(JSON.stringify({ none: "all_deliveries_expired" }), turn.turn_op_ref).changes;
+			updatedCount += changes;
+		}
+
+		return updatedCount;
 	}
 
 	monitorCreate(row: {
