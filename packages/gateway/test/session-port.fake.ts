@@ -139,6 +139,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
 	readonly closes: Array<{ sessionId: string; repo: string }> = [];
+	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
 	readonly #resumeFailures = new Map<string, Error>();
@@ -370,7 +371,9 @@ export class ScriptedSessionPort implements SessionPort {
 		return this.failedTransportCauseMap.get(input.sessionId);
 	}
 
-	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
+	async status(input: { sessionId: string; repo: string; opRef: string; relay?: unknown }): Promise<StatusReport> {
+		const relayUsed = input.relay !== undefined;
+		this.statusReads.push({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relayUsed });
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)
 			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };

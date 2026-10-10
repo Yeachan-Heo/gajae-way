@@ -44,7 +44,7 @@ import { readFailedTransportCause } from "./failed-turn-evidence";
 import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionPort } from "./session-port";
-import type { TailHandle } from "./tail-runner";
+import { isRelayTransportFailure, type TailHandle } from "./tail-runner";
 
 const owners = new WeakSet<GatewayDatabase>();
 /** Consecutive failed reconciliations between authority re-checks through recovery. */
@@ -641,7 +641,7 @@ export class WorkLaneManager {
 		let latest = this.#db.workAttemptGet(opRef)!;
 		if (!accepted && !rejected) {
 			try {
-				accepted = provesAcceptance(await this.#query(latest));
+				accepted = provesAcceptance(await this.#query(latest, observer.tail));
 				source = "status";
 			} catch {
 				/* Observation owns recovery; never replay. */
@@ -752,14 +752,26 @@ export class WorkLaneManager {
 			return { steered: true, clientRef };
 		});
 	}
-	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
+	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }, tail?: TailHandle): Promise<PromptStatusBody> {
 		this.#assertNotQuarantined(runtime.jobId);
-		const report = await this.#port.status({
+		const base = {
 			sessionId: runtime.sessionId,
 			repo: runtime.cwd,
 			opRef: runtime.opRef,
-			priority: "background",
-		});
+			priority: "background" as const,
+		};
+		let report;
+		if (tail) {
+			try {
+				report = await this.#port.status({ ...base, relay: tail });
+			} catch (error) {
+				if (!isRelayTransportFailure(error)) throw error;
+				// Relay failed; fall back to CLI
+				report = await this.#port.status(base);
+			}
+		} else {
+			report = await this.#port.status(base);
+		}
 		if (
 			report.operationRef !== runtime.opRef ||
 			!report.status ||
@@ -956,7 +968,7 @@ export class WorkLaneManager {
 			this.#attach(observer);
 			let status: PromptStatusBody | undefined;
 			try {
-				status = await this.#query(runtime);
+				status = await this.#query(runtime, observer.tail);
 				observer.goneSince = undefined;
 			} catch (error) {
 				if (!(await this.#hostGone(runtime, error))) {
@@ -1559,7 +1571,7 @@ export class WorkLaneManager {
 				let status: PromptStatusBody | undefined;
 				let statusError: unknown;
 				try {
-					status = await this.#query(runtime);
+					status = await this.#query(runtime, observer.tail);
 				} catch (error) {
 					/* Liveness decides whether authority can be recovered. */
 					statusError = error;
