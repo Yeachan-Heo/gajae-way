@@ -176,6 +176,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		});
 		const database = await GatewayDatabase.open(config.dbPath, {
 			canonicalAgentDir: broker.agentDir,
+			journalMode: config.sqlite?.journalMode,
 		});
 		try {
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient

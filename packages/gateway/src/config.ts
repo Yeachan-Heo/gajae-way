@@ -106,6 +106,8 @@ export interface GatewayConfigFile {
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
 	/** Absolute path to gjc agent directory; overrides GJC_CODING_AGENT_DIR. Defaults to $GAJAEWAY_HOME/gjc-agent for fresh homes; existing homes keep their established directory. */
 	readonly gjc?: { readonly agentDir?: string } | undefined;
+	/** SQLite configuration (issue #440): journal_mode for NFS volume support and other use cases. */
+	readonly sqlite?: { readonly journalMode?: string } | undefined;
 }
 
 export interface MonitorCatchUpConfig {
@@ -537,6 +539,27 @@ function parseGjcConfig(value: unknown): { readonly agentDir?: string } | undefi
 	return undefined;
 }
 
+function parseSqliteConfig(value: unknown): { readonly journalMode?: string } | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "sqlite");
+	if (Object.keys(input).some((key) => key !== "journalMode"))
+		throw new ConfigError("config_invalid", "sqlite may only contain journalMode");
+	if (input.journalMode !== undefined) {
+		const journalMode = optionalString(input.journalMode, "sqlite.journalMode");
+		if (journalMode) {
+			const validModes = ["DELETE", "TRUNCATE", "PERSIST", "WAL"];
+			const upperMode = journalMode.toUpperCase();
+			if (!validModes.includes(upperMode))
+				throw new ConfigError(
+					"config_invalid",
+					`sqlite.journalMode must be one of ${validModes.join(", ")}, got ${journalMode}`,
+				);
+			return { journalMode: upperMode };
+		}
+	}
+	return undefined;
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -561,6 +584,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const model = parseModel(input.model);
 	const serviceTier = parseServiceTier(input.serviceTier);
 	const runtime = parseRuntimeConfig(input.runtime);
+	const sqlite = parseSqliteConfig(input.sqlite);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -595,6 +619,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
+		...(sqlite ? { sqlite } : {}),
 	};
 }
 
@@ -721,6 +746,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"work",
 	"interimSpeech",
 	"gjc",
+	"sqlite",
 ] as const;
 
 /**
