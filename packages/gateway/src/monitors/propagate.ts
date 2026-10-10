@@ -32,6 +32,7 @@ import {
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
+	isContractRestatement,
 	isOrphanedExecutorFailure,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
@@ -925,29 +926,32 @@ export class MonitorPropagator {
 				const deliveryId = crypto.randomUUID();
 				// Evaluate silence PER NOTE BEFORE joining: a silent note in a batch
 				// must not leak, and a real note must not be swallowed by a neighbour's marker.
-				const nonSilentEntries = authored
+				// Also evaluate contract restatements (issue #369): if the authored note only
+				// echoes the instruction without providing actual work/evidence, treat it as
+				// authored_no_delivery to prevent false deliveries.
+				const validDeliveryEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
-					.filter((entry) => !isSilentOutput(entry.note));
-				const silentEntries = authored
+					.filter((entry) => !isSilentOutput(entry.note) && !isContractRestatement(entry.note, monitor.instruction));
+				const noOpEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
-					.filter((entry) => isSilentOutput(entry.note));
-				// Mark all silent notes as authored_no_delivery
-				for (const entry of silentEntries) {
+					.filter((entry) => isSilentOutput(entry.note) || isContractRestatement(entry.note, monitor.instruction));
+				// Mark all silent/no-op notes as authored_no_delivery
+				for (const entry of noOpEntries) {
 					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
 					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
 				}
-				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
-				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				// Deliver only valid notes; silent/no-op entries were already marked as authored_no_delivery.
+				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
@@ -967,7 +971,7 @@ export class MonitorPropagator {
 						batchId,
 						originKey(origin),
 						JSON.stringify(payload),
-						fenced.map((row) => row.event_id),
+						validDeliveryEntries.map((entry) => entry.eventId),
 						leaseId,
 					);
 					if (!admitted) return;

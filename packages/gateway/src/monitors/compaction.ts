@@ -381,3 +381,28 @@ export function buildMonitorCompactionDigest(input: MonitorDigestInput): string 
 	// instruction); a hard clip is the last resort so the bound always holds.
 	return trimmed.length <= maxTotalLength ? trimmed : clip(trimmed, maxTotalLength);
 }
+
+/**
+ * Detects if a note is essentially a restatement of the monitor's instruction/contract.
+ * This occurs when an authored response echoes the instruction verbatim instead of
+ * providing actual work/evidence. Such notes should be treated as no-op responses.
+ * Issue #369: Monitor runs marked delivered when the authored note only restates the run contract.
+ */
+export function isContractRestatement(note: string, instruction: string | undefined): boolean {
+	if (!instruction || !note) return false;
+	const normalizeText = (text: string) => text.trim().toLowerCase();
+	const normalizedNote = normalizeText(note);
+	const normalizedInstruction = normalizeText(instruction);
+
+	// Exact match or near-exact match (allowing minor differences)
+	if (normalizedNote === normalizedInstruction) return true;
+
+	// The note is a prefix of the instruction (echoing the start of the task)
+	if (normalizedInstruction.startsWith(normalizedNote) && normalizedNote.length > 15) return true;
+
+	// The instruction is contained within the note (echoed verbatim or with minimal additions)
+	// This catches cases like "As per instruction: [instruction text]" or "[instruction text] is complete"
+	if (normalizedInstruction.length > 10 && normalizedNote.includes(normalizedInstruction)) return true;
+
+	return false;
+}
