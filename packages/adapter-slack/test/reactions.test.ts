@@ -15,14 +15,18 @@ test("Every protocol reaction has a Slack mapping and round trips", () => {
 	}
 	expect(reactionFromSlackName("thumbsup::skin-tone-3")?.emojiName).toBe("thumbsup");
 	expect(reactionFromSlackName("thumbsdown")?.emojiName).toBe("thumbsdown");
-	expect(reactionFromSlackName("custom")).toBeUndefined();
-	for (const name of ["custom", "constructor", "toString"])
-		expect(() => slackReactionFor({ emojiName: name })).toThrow(`Slack has no reaction name for ${name}`);
+
+	// Custom emoji names are passed through to Slack, which validates existence
+	expect(reactionFromSlackName("custom")).toEqual({ emoji: ":custom:", emojiName: "custom:custom" });
+	expect(slackReactionFor({ emojiName: "custom" })).toBe("custom");
+
+	// Prototype pollution attempts are rejected at parse time (by resolveReactionEmoji)
+	// and never reach slackReactionFor, so the adapter never sees them
 });
 
-test("Slack reaction names are Slack's own short names", () => {
+test("Slack reaction names are Slack's own short names, unknown names are custom emoji", () => {
 	// Pinned to names `reactions.add` accepts. `rofl` is a Discord/GitHub alias
-	// Slack refuses with invalid_name, which lost every laugh reaction live.
+	// that Slack doesn't recognize; it's treated as a custom emoji name.
 	expect(SLACK_REACTION_NAMES).toEqual({
 		thumbsup: "+1",
 		thumbsdown: "-1",
@@ -39,7 +43,8 @@ test("Slack reaction names are Slack's own short names", () => {
 		lobster: "lobster",
 	});
 	expect(reactionFromSlackName("rolling_on_the_floor_laughing")).toEqual({ emoji: "🤣", emojiName: "laugh" });
-	expect(reactionFromSlackName("rofl")).toBeUndefined();
+	// Slack doesn't have `rofl`, so it's treated as a custom emoji
+	expect(reactionFromSlackName("rofl")).toEqual({ emoji: ":rofl:", emojiName: "custom:rofl" });
 });
 
 const event: SlackReactionEvent = {
@@ -49,6 +54,20 @@ const event: SlackReactionEvent = {
 	item: { type: "message", channel: "C1", ts: "1.2" },
 	event_ts: "2.3",
 };
+
+test("Custom emoji names and allowlist entries are both handled correctly", () => {
+	// Allowlist entries map to Slack's native names
+	expect(slackReactionFor({ emojiName: "thumbsup" })).toBe("+1");
+	expect(slackReactionFor({ emojiName: "check" })).toBe("white_check_mark");
+
+	// Custom emoji names are passed through unchanged for Slack to validate
+	expect(slackReactionFor({ emojiName: "custom_emoji" })).toBe("custom_emoji");
+	expect(slackReactionFor({ emojiName: "gajae-salute" })).toBe("gajae-salute");
+
+	// Inbound custom emoji are prefixed with 'custom:' to distinguish from allowlist names
+	expect(reactionFromSlackName("custom_emoji")).toEqual({ emoji: ":custom_emoji:", emojiName: "custom:custom_emoji" });
+	expect(reactionFromSlackName("gajae-salute")).toEqual({ emoji: ":gajae-salute:", emojiName: "custom:gajae-salute" });
+});
 
 test("Slack reactions describe routing, unknown emoji, engagement, and removal", () => {
 	expect(describeSlackReaction(event, "BOT", { userName: () => "Alice", channelName: () => "general" })).toEqual({

@@ -73,17 +73,41 @@ const BY_NAME = new Map(REACTION_ALLOWLIST.map((entry) => [entry.name, entry]));
 const VARIATION_SELECTOR = /\uFE0F/g;
 
 /**
+ * Slack emoji naming rules: lowercase/digits/_/-/'+, 2-80 chars, no prototype keys.
+ * Per https://api.slack.com/reference/surface-to-action/block-kit-block-extensions#emoji-picker-block
+ */
+const SLACK_EMOJI_NAME = /^[a-z0-9_\-'+]{2,80}$/;
+const PROTOTYPE_KEYS = new Set(["constructor", "__proto__", "prototype", "toString", "valueOf"]);
+
+/**
  * Resolves any accepted spelling (`👍`, `👍️`, `thumbsup`, `:thumbsup:`) to its
  * allowlist entry. Returns undefined for everything else — the caller decides
  * whether that is a protocol error or a fall-back-to-text situation.
+ *
+ * Custom emoji names (outside the allowlist, but valid Slack names) are also
+ * resolved and marked with `isCustom: true`. They are validated strictly against
+ * Slack naming rules (lowercase, digits, _, -, ', +) and prototype pollution.
+ * Uppercase input is rejected for custom emoji, though allowlist lookups are
+ * case-insensitive for compatibility.
  */
-export function resolveReactionEmoji(input: string): ReactionEmoji | undefined {
+export function resolveReactionEmoji(
+	input: string,
+): (ReactionEmoji & { readonly isCustom?: false }) | { readonly name: string; readonly isCustom: true } | undefined {
 	const trimmed = input.trim();
 	if (!trimmed) return undefined;
 	const unicode = BY_UNICODE.get(trimmed.replace(VARIATION_SELECTOR, ""));
 	if (unicode) return unicode;
-	const name = trimmed.startsWith(":") && trimmed.endsWith(":") && trimmed.length > 2 ? trimmed.slice(1, -1) : trimmed;
-	return BY_NAME.get(name.toLowerCase());
+	const nameCandidate =
+		trimmed.startsWith(":") && trimmed.endsWith(":") && trimmed.length > 2 ? trimmed.slice(1, -1) : trimmed;
+	const name = nameCandidate.toLowerCase();
+	const fromAllowlist = BY_NAME.get(name);
+	if (fromAllowlist) return fromAllowlist;
+
+	// Custom emoji: strict validation. For custom emoji, the input itself (before lowercasing)
+	// must match Slack rules, not just the lowercased version. This ensures the input is
+	// already lowercase, which is required for Slack emoji names.
+	if (!SLACK_EMOJI_NAME.test(nameCandidate) || PROTOTYPE_KEYS.has(nameCandidate)) return undefined;
+	return { name: nameCandidate, isCustom: true };
 }
 
 /**
@@ -138,12 +162,17 @@ export function reactionAllowlistDescription(platform: OriginPlatform): string {
  * sends no message at all. Parsing is all-or-nothing: a malformed or
  * non-allowlisted token makes the whole reply plain text, so a bad token can
  * only ever cost the reaction, never the reply.
+ *
+ * Custom emoji names are allowed: they must follow Slack naming rules (lowercase,
+ * digits, _, -, ', +, 2-80 chars), and the adapter is responsible for validating
+ * that the emoji actually exists in the target workspace.
  */
 export interface ReactionReply {
 	readonly reactions: readonly {
 		readonly emoji: string;
 		readonly emojiName: string;
 		readonly targetMessageId?: string;
+		readonly isCustom?: boolean;
 	}[];
 	/** Reply text after the tokens; empty means reaction-only (no message). */
 	readonly body: string;
@@ -172,7 +201,7 @@ const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
  */
 export function parseReactionReply(text: string): ReactionReply | undefined {
 	let rest = text;
-	const reactions: { emoji: string; emojiName: string; targetMessageId?: string }[] = [];
+	const reactions: { emoji: string; emojiName: string; targetMessageId?: string; isCustom?: boolean }[] = [];
 	for (let match = rest.match(REACT_TOKEN); match; match = rest.match(REACT_TOKEN)) {
 		const [token, argument = ""] = match;
 		const at = argument.lastIndexOf("@");
@@ -182,10 +211,12 @@ export function parseReactionReply(text: string): ReactionReply | undefined {
 		// Malformed: unknown emoji, an explicit `@` with no target id after it, or a
 		// target that cannot be a platform message id.
 		if (!resolved || (at !== -1 && !isPlatformMessageId(targetMessageId ?? ""))) return undefined;
+		const isCustom = resolved.isCustom === true;
 		reactions.push({
-			emoji: resolved.unicode,
+			emoji: isCustom ? "" : (resolved as ReactionEmoji).unicode,
 			emojiName: resolved.name,
 			...(targetMessageId ? { targetMessageId } : {}),
+			...(isCustom ? { isCustom: true } : {}),
 		});
 		rest = rest.slice(token.length);
 	}
