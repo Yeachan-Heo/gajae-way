@@ -1450,25 +1450,7 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** Inject a monitor result as an internal report into a conversation session. */
-	monitorInjectReport(reportId: string, parentOriginKey: string, childName: string, body: string): boolean {
-		return this.withTransaction(
-			() =>
-				this.#database
-					.query(
-						"INSERT INTO lane_reports (report_id, parent_name, child_name, child_op_ref, body, root_json, state, claim_kind, claim_ref, claim_target_op_ref, claim_seq, hold_reason, consumed_op_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, NULL, 0, NULL, NULL, ?, ?)",
-					)
-					.run(
-						reportId,
-						parentOriginKey.replace(/\//g, "__"),
-						childName,
-						"",
-						body,
-						new Date().toISOString(),
-						new Date().toISOString(),
-					).changes > 0,
-		);
-	}
+
 
 	/** Atomically append history, freeze notification intent and refresh activity before send. */
 	workAttemptPrepare(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {

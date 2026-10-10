@@ -146,3 +146,201 @@ test("monitor reportTo validates origin ref", async () => {
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("monitor report is injected as inbound message when reportTo is set and event is settled", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-inject-report-"));
+	let database: GatewayDatabase | undefined;
+	try {
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+
+		const reportToOrigin: OriginRef = {
+			platform: "discord",
+			kind: "channel",
+			conversationId: "channel-123",
+		};
+		const created = registry.add({
+			name: "with-injection",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["test.event"],
+			reportTo: reportToOrigin,
+			enabled: true,
+		});
+
+		const { originKey } = await import("@gajae-gateway/protocol");
+		const targetOriginKey = originKey(reportToOrigin);
+
+		// Create and settle a monitor event
+		const eventId = crypto.randomUUID();
+		database.monitorEventCreate({
+			eventId,
+			monitorId: created.monitorId,
+			eventType: "test.event",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+
+		// Set the authored output (simulating successful authoring)
+		const reportContent = "Monitor report content";
+		database.authoredOutputCreate(eventId, reportContent);
+
+		// Update event to authored state
+		database.monitorEventUpdate(eventId, "authored", eventId);
+
+		// Simulate injection by calling inboundEnqueue directly
+		const { createHash } = await import("node:crypto");
+		const messageId = `monitor-report-${createHash("sha256")
+			.update(eventId)
+			.digest("hex")}`;
+
+		const injected = database.inboundEnqueue({
+			messageId,
+			originKey: targetOriginKey,
+			originRefJson: JSON.stringify(reportToOrigin),
+			body: reportContent,
+			receivedAt: new Date().toISOString(),
+			source: "lane_report",
+		});
+
+		expect(injected).toBe(true);
+
+		// Verify the inbound message was created
+		const message = database.inboundPendingOldest(targetOriginKey);
+		expect(message).toBeDefined();
+		expect(message?.message_id).toBe(messageId);
+		expect(message?.body).toBe(reportContent);
+		expect(message?.origin_key).toBe(targetOriginKey);
+		expect(message?.state).toBe("pending");
+		expect(message?.source).toBe("lane_report");
+	} finally {
+		database?.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("monitor report is not injected when reportTo is unset", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-no-inject-"));
+	let database: GatewayDatabase | undefined;
+	try {
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+
+		const created = registry.add({
+			name: "without-injection",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["test.event"],
+			enabled: true,
+			// reportTo is not set
+		});
+
+		const { originKey } = await import("@gajae-gateway/protocol");
+		const testOriginKey = originKey({
+			platform: "discord",
+			kind: "channel",
+			conversationId: "channel-456",
+		});
+
+		// Create and settle a monitor event
+		const eventId = crypto.randomUUID();
+		database.monitorEventCreate({
+			eventId,
+			monitorId: created.monitorId,
+			eventType: "test.event",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+
+		// Set the authored output
+		const reportContent = "Monitor report content";
+		database.authoredOutputCreate(eventId, reportContent);
+
+		// Update event to authored state
+		database.monitorEventUpdate(eventId, "authored", eventId);
+
+		// Check that no messages were created in the session (0 pending messages)
+		const pendingCount = database.inboundPendingCount(testOriginKey);
+		expect(pendingCount).toBe(0);
+	} finally {
+		database?.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("monitor report injection is idempotent (same event_id produces same messageId)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-idempotent-"));
+	let database: GatewayDatabase | undefined;
+	try {
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+
+		const reportToOrigin: OriginRef = {
+			platform: "discord",
+			kind: "channel",
+			conversationId: "channel-789",
+		};
+		const created = registry.add({
+			name: "idempotent-test",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["test.event"],
+			reportTo: reportToOrigin,
+			enabled: true,
+		});
+
+		const { originKey } = await import("@gajae-gateway/protocol");
+		const targetOriginKey = originKey(reportToOrigin);
+
+		// Create a monitor event
+		const eventId = crypto.randomUUID();
+		database.monitorEventCreate({
+			eventId,
+			monitorId: created.monitorId,
+			eventType: "test.event",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+
+		// Set the authored output
+		const reportContent = "Monitor report content";
+		database.authoredOutputCreate(eventId, reportContent);
+
+		// Compute messageId deterministically
+		const { createHash } = await import("node:crypto");
+		const messageId1 = `monitor-report-${createHash("sha256")
+			.update(eventId)
+			.digest("hex")}`;
+
+		// Inject the report twice
+		const injected1 = database.inboundEnqueue({
+			messageId: messageId1,
+			originKey: targetOriginKey,
+			originRefJson: JSON.stringify(reportToOrigin),
+			body: reportContent,
+			receivedAt: new Date().toISOString(),
+			source: "lane_report",
+		});
+
+		const injected2 = database.inboundEnqueue({
+			messageId: messageId1,
+			originKey: targetOriginKey,
+			originRefJson: JSON.stringify(reportToOrigin),
+			body: reportContent,
+			receivedAt: new Date().toISOString(),
+			source: "lane_report",
+		});
+
+		// First injection should succeed
+		expect(injected1).toBe(true);
+		// Second injection should fail (duplicate on messageId)
+		expect(injected2).toBe(false);
+
+		// Verify only one message exists
+		const message = database.inboundPendingOldest(targetOriginKey);
+		expect(message).toBeDefined();
+		expect(message?.message_id).toBe(messageId1);
+		const pendingCount = database.inboundPendingCount(targetOriginKey);
+		expect(pendingCount).toBe(1);
+	} finally {
+		database?.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});

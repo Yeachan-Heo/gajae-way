@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
@@ -1326,10 +1327,20 @@ export class MonitorPropagator {
 		if (!monitor?.reportTo) return;
 		const output = this.#database.authoredOutput(row.event_id);
 		if (!output) return;
-		const reportId = `monitor-report-${crypto.randomUUID()}`;
+		// Deterministic message ID from event_id for idempotency
+		const messageId = `monitor-report-${createHash("sha256")
+			.update(row.event_id)
+			.digest("hex")}`;
 		const parentOriginKey = originKey(monitor.reportTo);
-		const childName = `monitor-${row.monitor_id}-${row.event_type}`;
-		this.#database.monitorInjectReport(reportId, parentOriginKey, childName, output);
+		// Enqueue as an inbound message in the target conversation session
+		this.#database.inboundEnqueue({
+			messageId,
+			originKey: parentOriginKey,
+			originRefJson: JSON.stringify(monitor.reportTo),
+			body: output,
+			receivedAt: new Date().toISOString(),
+			source: "lane_report",
+		});
 	}
 	#author(
 		eventId: string,
