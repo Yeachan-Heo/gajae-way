@@ -533,6 +533,9 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
  * console is the operator's own tool; monitor sessions are event-scoped already).
  * A running turn is never touched; it is picked up on a later sweep.
  */
+/** A row whose stored origin ref names another conversation is logged once, not on every sweep. */
+const idleResetMismatchesLogged = new Set<string>();
+
 export async function sweepIdleSessions(
 	runtime: Pick<Runtime, "config" | "personaSessions">,
 	database: Pick<GatewayDatabase, "sessionRows">,
@@ -553,6 +556,13 @@ export async function sweepIdleSessions(
 		const lastActivity = Date.parse(row.last_activity_at ?? row.created_at);
 		if (!Number.isFinite(lastActivity) || now - lastActivity < idleMs) continue;
 		const key = originKey(origin);
+		if (key !== row.origin_key) {
+			if (!idleResetMismatchesLogged.has(row.origin_key)) {
+				idleResetMismatchesLogged.add(row.origin_key);
+				console.error(`session_idle_reset_skipped origin=${row.origin_key} ref=${key} reason=origin_ref_mismatch`);
+			}
+			continue;
+		}
 		if (runtime.personaSessions.state(key) === "turn-running") continue;
 		try {
 			await runtime.personaSessions.reset(key, JSON.stringify(origin));

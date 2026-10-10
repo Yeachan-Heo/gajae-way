@@ -1,9 +1,11 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { sweepIdleSessions } from "../src/server/server";
 
 const HOUR = 60 * 60 * 1000;
 const t0 = Date.parse("2026-09-26T00:00:00.000Z");
-const row = (origin: object, lastActivityAt: string | null, epoch = 0) => ({
+const row = (origin: object, lastActivityAt: string | null, epoch = 0, key = originKey(origin as OriginRef)) => ({
+	origin_key: key,
 	origin_ref_json: JSON.stringify(origin),
 	created_at: "2026-09-25T00:00:00.000Z",
 	last_activity_at: lastActivityAt,
@@ -72,4 +74,25 @@ test("created_at stands in when last_activity_at is null; a failed reset does no
 	};
 	expect(await sweepIdleSessions(h.runtime, h.database, t0)).toEqual(["slack/dm/D1/peer=U1"]);
 	expect(calls).toBe(2);
+});
+
+test("a row whose stored origin ref names another conversation is skipped and logged once; a matching row still resets", async () => {
+	const thread = { platform: "discord", kind: "thread", conversationId: "T9", parentId: "C9" };
+	const channel = { platform: "discord", kind: "channel", conversationId: "C9" };
+	const quiet = new Date(t0 - 10 * HOUR).toISOString();
+	const h = harness(HOUR, [row(thread, quiet, 0, "discord/channel/C9"), row(channel, quiet)]);
+	const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		expect(await sweepIdleSessions(h.runtime, h.database, t0)).toEqual(["discord/channel/C9"]);
+		expect(await sweepIdleSessions(h.runtime, h.database, t0)).toEqual(["discord/channel/C9"]);
+		expect(h.resets.map((reset) => reset.key)).toEqual(["discord/channel/C9", "discord/channel/C9"]);
+		const skipped = errorSpy.mock.calls
+			.map((call) => String(call[0]))
+			.filter((line) => line.startsWith("session_idle_reset_skipped"));
+		expect(skipped).toEqual([
+			`session_idle_reset_skipped origin=discord/channel/C9 ref=${originKey(thread as OriginRef)} reason=origin_ref_mismatch`,
+		]);
+	} finally {
+		errorSpy.mockRestore();
+	}
 });

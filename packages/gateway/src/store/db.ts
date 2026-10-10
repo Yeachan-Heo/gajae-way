@@ -2174,6 +2174,7 @@ export class GatewayDatabase {
 	}
 
 	sessionRows(): Array<{
+		origin_key: string;
 		origin_ref_json: string | null;
 		created_at: string;
 		last_activity_at: string | null;
@@ -2187,9 +2188,10 @@ export class GatewayDatabase {
 	}> {
 		return this.#database
 			.query(
-				"SELECT origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
+				"SELECT origin_key, origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
 			)
 			.all() as Array<{
+			origin_key: string;
 			origin_ref_json: string | null;
 			created_at: string;
 			last_activity_at: string | null;
