@@ -652,7 +652,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 32;
+const LATEST_SCHEMA_VERSION = 33;
 
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
@@ -785,6 +785,7 @@ export const MONITOR_EVENT_STAGES = [
 	"failed",
 	"failed_no_retry",
 	"skipped",
+	"contract_unmet",
 ] as const;
 export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 /** Stages whose rows reconcile() may claim and redispatch. */
@@ -795,6 +796,7 @@ export const TERMINAL_STAGES: readonly MonitorEventStage[] = [
 	"authored_no_delivery",
 	"failed_no_retry",
 	"skipped",
+	"contract_unmet",
 ];
 
 /**
@@ -828,6 +830,7 @@ export interface MonitorEventDbRow {
 	readonly skipped_by: string | null;
 	readonly updated_at: string;
 	readonly procedure_json: string | null;
+	readonly proof_json: string | null;
 }
 
 export interface MemoryIntentDbRow {
@@ -842,9 +845,9 @@ export interface MemoryIntentDbRow {
 const DELIVERY_COLUMNS =
 	"delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error";
 /** Matches the partial index `monitor_events_open`; keep the two spellings identical. */
-const OPEN_MONITOR_EVENT = "stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped')";
+const OPEN_MONITOR_EVENT = "stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
 /** Terminal stages as SQL; must mirror TERMINAL_STAGES and the `monitor_events_gc` partial index predicate. */
-const TERMINAL_MONITOR_EVENT = "stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped')";
+const TERMINAL_MONITOR_EVENT = "stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
 
 /**
  * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
@@ -935,7 +938,7 @@ export class GatewayDatabase {
 		try {
 			openMonitors = this.#database
 				.query<{ n: number }, []>(
-					"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+					"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 				)
 				.get()!.n;
 		} catch (error) {
@@ -5405,8 +5408,8 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 					CREATE INDEX IF NOT EXISTS inbound_messages_gc ON inbound_messages(received_at) WHERE state = 'done';
 					CREATE INDEX IF NOT EXISTS deliveries_gc ON deliveries(state, updated_at);
 					CREATE INDEX IF NOT EXISTS deliveries_turn ON deliveries(turn_id);
-					CREATE INDEX IF NOT EXISTS monitor_events_gc ON monitor_events(updated_at) WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped');
-					CREATE INDEX IF NOT EXISTS monitor_events_open ON monitor_events(fired_at) WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped');
+					CREATE INDEX IF NOT EXISTS monitor_events_gc ON monitor_events(updated_at) WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet');
+					CREATE INDEX IF NOT EXISTS monitor_events_open ON monitor_events(fired_at) WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet');
 					CREATE INDEX IF NOT EXISTS monitor_events_batch ON monitor_events(batch_id);
 					CREATE INDEX IF NOT EXISTS monitor_events_authored ON monitor_events(batch_id) WHERE stage = 'authored';
 					CREATE INDEX IF NOT EXISTS monitor_events_monitor ON monitor_events(monitor_id, fired_at);
@@ -5450,6 +5453,20 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(32, new Date().toISOString());
+			});
+		}
+		if (current < 33) {
+			// Issue #369: Add proof_json column and contract_unmet stage for completion proof validation.
+			this.withTransaction(() => {
+				this.#database.exec(
+					`CREATE TABLE monitor_events_v29 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped','contract_unmet')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT, proof_json TEXT);
+INSERT INTO monitor_events_v29 (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, skipped_by, updated_at, procedure_json) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, skipped_by, updated_at, procedure_json FROM monitor_events ORDER BY rowid;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_v29 RENAME TO monitor_events;`,
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(33, new Date().toISOString());
 			});
 		}
 	}

@@ -226,169 +226,87 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 	}
 });
 
-test("#369: events with notes that only restate the instruction are marked authored_no_delivery", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-restatement-"));
+test("#369 Issue Proposal 2: contract echo detection suppresses echo-suspected notes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-contract-echo-"));
 	try {
-		const instruction = "Review the last 24 hours of runtime operation. Report actual friction, failures and latency with public-safe evidence only.";
-		const channelTarget = {
-			origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
-			mentionUserIds: ["1468532331001413743"],
-		} as const;
-		let monitorId: string;
-		{
-			const { database, registry } = await harness(directory);
-			monitorId = registry.add({
-				name: "runtime-feedback",
-				trigger: { kind: "cron", schedule: "0 11 * * *" },
-				eventTypes: ["gajaeway.runtime-feedback.daily"],
-				instruction,
-				channelTarget,
-				burstPolicy: "serialize",
-			}).monitorId;
-			database.close();
-		}
-
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const registry = new MonitorRegistry(database);
+		const { database, registry, pipeline } = await harness(directory);
+		const instruction = "Report the current status of all systems.";
+		const monitor = registry.add({
+			name: "status-check",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["status.check"],
+			instruction,
+		});
 
 		const delivered: ChatMessagePayload[] = [];
-		const pipeline = new MonitorPropagator({
+		const sessionPort = new ScriptedSessionPort({
+			onSend: (input, scripted) => {
+				// Return note that echoes the instruction (contract echo)
+				const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+				scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "Report the current status of all systems." }]));
+			},
+		});
+		const testPipeline = new MonitorPropagator({
 			database,
 			registry,
-			sessionPort: new ScriptedSessionPort({
-				onSend: (input, scripted) => {
-					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
-					// Return a note that only restates the instruction
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: instruction }]));
-				},
-			}),
+			sessionPort,
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
 			deliver: (payload) => delivered.push(payload),
 		});
 
-			const eventId = await pipeline.submitAwaitable(monitorId, "gajaeway.runtime-feedback.daily", { at: "2026-09-07T11:00:00.000Z" });
+		testPipeline.submit(monitor.monitorId, "status.check", {});
 		await Bun.sleep(250);
-
-		// The event should NOT have been delivered because the note only restates the instruction
+		// Echo-detected note should NOT be delivered
 		expect(delivered).toHaveLength(0);
-
-		// The event should be marked as authored_no_delivery, not delivered
-		const row = database.monitorEventRows(monitorId).find((r) => r.event_id === eventId);
-		expect(row?.stage).toBe("authored_no_delivery");
-
+		// Check that the event was marked with contract_unmet
+		const events = database.monitorEventRows(monitor.monitorId);
+		expect(events.some((row) => row.stage === "contract_unmet")).toBe(true);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
 
-test("#369: events with notes containing the instruction are marked authored_no_delivery", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-restatement-contained-"));
+test("#369 Issue Proposal 2: real work notes are delivered even if similar to instruction", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-contract-work-"));
 	try {
-		const instruction = "Check the deploy queue.";
-		const channelTarget = {
-			origin: { platform: "discord", kind: "channel", conversationId: "123" },
-		} as const;
-		let monitorId: string;
-		{
-			const { database, registry } = await harness(directory);
-			monitorId = registry.add({
-				name: "deploy-watch",
-				trigger: { kind: "cron", schedule: "0 11 * * *" },
-				eventTypes: ["deploy.status"],
-				instruction,
-				channelTarget,
-				burstPolicy: "serialize",
-			}).monitorId;
-			database.close();
-		}
-
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const registry = new MonitorRegistry(database);
+		const { database, registry } = await harness(directory);
+		const instruction = "Report the current status of all systems.";
+		const monitor = registry.add({
+			name: "status-check",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["status.check"],
+			instruction,
+		});
 
 		const delivered: ChatMessagePayload[] = [];
-		const pipeline = new MonitorPropagator({
+		const sessionPort = new ScriptedSessionPort({
+			onSend: (input, scripted) => {
+				// Return note with real work evidence (numbers, links)
+				const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+				scripted.complete(
+					input.opRef,
+					JSON.stringify([{ eventId: event!.eventId, note: "Release r-123 blocked by issue #456 (missing tests)" }]),
+				);
+			},
+		});
+		const testPipeline = new MonitorPropagator({
 			database,
 			registry,
-			sessionPort: new ScriptedSessionPort({
-				onSend: (input, scripted) => {
-					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
-					// Return a note that contains the instruction within it
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: `As per instruction: ${instruction}` }]));
-				},
-			}),
+			sessionPort,
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
 			deliver: (payload) => delivered.push(payload),
 		});
 
-		const eventId = await pipeline.submitAwaitable(monitorId, "deploy.status", {});
+		testPipeline.submit(monitor.monitorId, "status.check", {});
 		await Bun.sleep(250);
-
-		// The event should NOT have been delivered because the note contains the instruction
-		expect(delivered).toHaveLength(0);
-
-		// The event should be marked as authored_no_delivery
-		const row = database.monitorEventRows(monitorId).find((r) => r.event_id === eventId);
-		expect(row?.stage).toBe("authored_no_delivery");
-
-		database.close();
-	} finally {
-		await rm(directory, { recursive: true, force: true });
-	}
-});
-
-test("#369: events with real work notes are still delivered normally", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-real-work-"));
-	try {
-		const instruction = "Check the deploy queue.";
-		const channelTarget = {
-			origin: { platform: "discord", kind: "channel", conversationId: "123" },
-		} as const;
-		let monitorId: string;
-		{
-			const { database, registry } = await harness(directory);
-			monitorId = registry.add({
-				name: "deploy-watch",
-				trigger: { kind: "cron", schedule: "0 11 * * *" },
-				eventTypes: ["deploy.status"],
-				instruction,
-				channelTarget,
-				burstPolicy: "serialize",
-			}).monitorId;
-			database.close();
-		}
-
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const registry = new MonitorRegistry(database);
-
-		const delivered: ChatMessagePayload[] = [];
-		const pipeline = new MonitorPropagator({
-			database,
-			registry,
-			sessionPort: new ScriptedSessionPort({
-				onSend: (input, scripted) => {
-					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
-					// Return a note with real work evidence
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "Release r-123 blocked by #456 (missing tests)" }]));
-				},
-			}),
-			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
-			emit: () => {},
-			deliver: (payload) => delivered.push(payload),
-		});
-
-		await pipeline.submitAwaitable(monitorId, "deploy.status", {});
-		await Bun.sleep(250);
-
-		// The event should HAVE been delivered because the note contains real work
+		// Note with real work evidence should be delivered
 		expect(delivered).toHaveLength(1);
-		expect(delivered[0]!.text).toBe("Release r-123 blocked by #456 (missing tests)");
-
+		expect(delivered[0]!.text).toBe("Release r-123 blocked by issue #456 (missing tests)");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

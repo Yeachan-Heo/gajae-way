@@ -592,6 +592,8 @@ export interface MonitorEventRecord {
 	/** Procedure file versions the authoring turn was given; present once authored with declared procedure files. */
 	readonly procedure?: readonly MonitorProcedureVersion[];
 	readonly recovery?: MonitorEventRecovery;
+	/** Proof of completion, when declared. Required for delivery settlement when the monitor declares proof requirements. */
+	readonly proof?: { readonly requires?: readonly { readonly kind: string; readonly condition: string }[] };
 }
 
 /** Version of one declared procedure file as read for one firing. */

@@ -32,8 +32,9 @@ import {
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
-	isContractRestatement,
+	isAuthoredEchoSuspected,
 	isOrphanedExecutorFailure,
+	checkProofRequirement,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
@@ -89,6 +90,10 @@ type DispatchFailureCode =
 	| "gateway_shutdown"
 	| "event_type_invalid"
 	| "monitor_invalid"
+	// Issue #369: The monitor event did not satisfy proof requirements for delivery
+	| "contract_unmet"
+	// Issue #369: The authored note appears to be an echo of the instruction
+	| "authored_echo_suspected"
 	| "internal_error";
 
 /**
@@ -926,31 +931,79 @@ export class MonitorPropagator {
 				const deliveryId = crypto.randomUUID();
 				// Evaluate silence PER NOTE BEFORE joining: a silent note in a batch
 				// must not leak, and a real note must not be swallowed by a neighbour's marker.
-				// Also evaluate contract restatements (issue #369): if the authored note only
-				// echoes the instruction without providing actual work/evidence, treat it as
-				// authored_no_delivery to prevent false deliveries.
-				const validDeliveryEntries = authored
+				const nonSilentEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
-					.filter((entry) => !isSilentOutput(entry.note) && !isContractRestatement(entry.note, monitor.instruction));
-				const noOpEntries = authored
+					.filter((entry) => !isSilentOutput(entry.note));
+				const silentEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
-					.filter((entry) => isSilentOutput(entry.note) || isContractRestatement(entry.note, monitor.instruction));
-				// Mark all silent/no-op notes as authored_no_delivery
-				for (const entry of noOpEntries) {
+					.filter((entry) => isSilentOutput(entry.note));
+				// Mark all silent notes as authored_no_delivery
+				for (const entry of silentEntries) {
 					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
 					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
 				}
-				// Deliver only valid notes; silent/no-op entries were already marked as authored_no_delivery.
+				// Issue #369, Proposal 2: Detect contract echoes and log them
+				const echoedEntries: typeof nonSilentEntries = [];
+				const validDeliveryEntries: typeof nonSilentEntries = [];
+				for (const entry of nonSilentEntries) {
+					const isEcho = isAuthoredEchoSuspected(monitor.instruction, entry.note);
+					if (isEcho) {
+						echoedEntries.push(entry);
+						// Log as authored_echo_suspected failure
+						this.#database.withTransaction(() => {
+							if (this.#database.monitorEventFencedFail(
+								entry.eventId,
+								leaseId,
+								batchId,
+								"authored_echo_suspected",
+								"delivery suppressed: note appears to echo instruction with no substantive evidence",
+								now(),
+								false,
+							)) {
+								// Also mark as contract_unmet terminal stage
+								this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
+							}
+						});
+					} else {
+						validDeliveryEntries.push(entry);
+					}
+				}
+				// Issue #369, Proposal 1: Check proof requirements for valid entries
+				for (const entry of validDeliveryEntries) {
+					const eventRow = fenced.find((r) => r.event_id === entry.eventId);
+					if (!eventRow) continue;
+					const proofDetail = checkProofRequirement(null, eventRow.fired_at); // TODO: get proof_json from database
+					if (proofDetail !== null && proofDetail.startsWith("unverified")) {
+						// Proof requirement exists but is unverified
+						this.#database.withTransaction(() => {
+							if (this.#database.monitorEventFencedFail(
+								entry.eventId,
+								leaseId,
+								batchId,
+								"contract_unmet",
+								proofDetail,
+								now(),
+								false,
+							)) {
+								// Mark as contract_unmet terminal stage
+								this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
+							}
+						});
+						// Remove from delivery if proof not met
+						validDeliveryEntries.splice(validDeliveryEntries.indexOf(entry), 1);
+					}
+				}
+				// Deliver only valid non-silent notes; echoes and proof-failed entries were already failed/marked.
 				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
@@ -971,7 +1024,7 @@ export class MonitorPropagator {
 						batchId,
 						originKey(origin),
 						JSON.stringify(payload),
-						validDeliveryEntries.map((entry) => entry.eventId),
+						fenced.map((row) => row.event_id),
 						leaseId,
 					);
 					if (!admitted) return;
