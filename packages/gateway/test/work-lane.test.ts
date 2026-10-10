@@ -13,6 +13,7 @@ import {
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
+import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import {
 	laneLastCommits,
 	laneSystemNotice,
@@ -2104,4 +2105,85 @@ test("#407: laneLastCommits reads each distinct worktree once, concurrently, nul
 	} finally {
 		await rm(repo, { recursive: true, force: true });
 	}
+});
+
+test("#439 work-lane status reads use relay when tail is attached to avoid CLI spawns", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	// Emit multiple tail frames to trigger polling
+	for (let i = 0; i < 5; i++) {
+		f.port.emitTool(result.sessionId, { toolName: "bash" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	// Give the observer time to process frames and poll
+	await until(() => f.port.statusReads.length >= 5);
+	// Verify that all status reads used the relay (relayUsed = true)
+	const statusReads = f.port.statusReads.filter((r) => r.opRef === result.opRef);
+	expect(statusReads.length).toBeGreaterThanOrEqual(5);
+	for (const read of statusReads) {
+		expect(read.relayUsed).toBe(true);
+	}
+	// Explicitly verify no CLI fallback occurred: all status reads should use relay
+	const cliOnlyReads = statusReads.filter((r) => !r.relayUsed);
+	expect(cliOnlyReads).toHaveLength(0);
+});
+
+test("#439 relay transport failure triggers exactly one CLI fallback per status call", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const originalStatus = f.port.status.bind(f.port);
+	// Track call sequence for specific opRef
+	let firstRelayCalled = false;
+	let fallbackCalled = false;
+	// Inject relay transport failure on first relay attempt
+	f.port.status = async (input) => {
+		const isRelay = input.relay !== undefined;
+		if (input.opRef === result.opRef) {
+			if (isRelay && !firstRelayCalled) {
+				firstRelayCalled = true;
+				throw new RelayClosedError(input.sessionId, "test relay failure");
+			}
+			if (!isRelay) {
+				fallbackCalled = true;
+			}
+		}
+		return originalStatus(input);
+	};
+	// Trigger one status poll cycle
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => f.port.statusReads.length >= 1);
+	// With relay failure, should have triggered both relay attempt and CLI fallback
+	expect(firstRelayCalled).toBe(true);
+	expect(fallbackCalled).toBe(true);
+});
+
+test("#439 relay non-transport failure is not caught as transport failure", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const originalStatus = f.port.status.bind(f.port);
+	// Track whether relay was called and if fallback was attempted
+	let relayErrorThrown = false;
+	let fallbackCalled = false;
+	// Inject a non-transport error (regular Error, not RelayClosedError)
+	f.port.status = async (input) => {
+		const isRelay = input.relay !== undefined;
+		if (input.opRef === result.opRef) {
+			if (isRelay && !relayErrorThrown) {
+				relayErrorThrown = true;
+				// This error is NOT a transport failure (not RelayClosedError)
+				throw new Error("non-transport relay error");
+			}
+			if (!isRelay) {
+				fallbackCalled = true;
+			}
+		}
+		return originalStatus(input);
+	};
+	// Trigger one status poll cycle
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	// Wait briefly for any error handling
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	// Non-transport error should not trigger fallback
+	expect(relayErrorThrown).toBe(true);
+	expect(fallbackCalled).toBe(false);
 });
