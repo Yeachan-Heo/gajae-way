@@ -676,7 +676,7 @@ describe("work attempt durable transactions", () => {
 
 		const migrated = await GatewayDatabase.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(32);
+		expect(migrated.schemaVersion).toBe(33);
 		expect(migrated.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -753,7 +753,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(32);
+		expect(migrated.schemaVersion).toBe(33);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.workAttemptPrepare(historical, f.record);

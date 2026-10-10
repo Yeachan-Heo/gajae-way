@@ -226,6 +226,104 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 	}
 });
 
+test("#369 Issue Proposal 2: contract echo detection suppresses echo-suspected notes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-contract-echo-"));
+	try {
+		const { database, registry, pipeline } = await harness(directory);
+		const instruction = "Report the current status of all systems.";
+		const monitor = registry.add({
+			name: "status-check",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["status.check"],
+			instruction,
+			channelTarget: {
+				origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
+				mentionUserIds: [],
+			},
+		});
+
+		const delivered: ChatMessagePayload[] = [];
+		const sessionPort = new ScriptedSessionPort({
+			onSend: (input, scripted) => {
+				// Return note that echoes the instruction (contract echo)
+				const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+				scripted.complete(
+					input.opRef,
+					JSON.stringify([{ eventId: event!.eventId, note: "Report the current status of all systems." }]),
+				);
+			},
+		});
+		const testPipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(database)),
+			emit: () => {},
+			deliver: (payload) => delivered.push(payload),
+		});
+
+		testPipeline.submit(monitor.monitorId, "status.check", {});
+		await Bun.sleep(250);
+		// Echo-detected note should NOT be delivered
+		expect(delivered).toHaveLength(0);
+		// Check that the event was marked with contract_unmet
+		const events = database.monitorEventRows(monitor.monitorId);
+		expect(events.some((row) => row.stage === "contract_unmet")).toBe(true);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("#369 Issue Proposal 2: real work notes are delivered even if similar to instruction", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-contract-work-"));
+	try {
+		const { database, registry } = await harness(directory);
+		const instruction = "Report the current status of all systems.";
+		const monitor = registry.add({
+			name: "status-check",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["status.check"],
+			instruction,
+			channelTarget: {
+				origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
+				mentionUserIds: [],
+			},
+		});
+
+		const delivered: ChatMessagePayload[] = [];
+		const sessionPort = new ScriptedSessionPort({
+			onSend: (input, scripted) => {
+				// Return note with real work evidence (numbers, links)
+				const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+				scripted.complete(
+					input.opRef,
+					JSON.stringify([{ eventId: event!.eventId, note: "Release r-123 blocked by issue #456 (missing tests)" }]),
+				);
+			},
+		});
+		const testPipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(database)),
+			emit: () => {},
+			deliver: (payload) => delivered.push(payload),
+		});
+
+		testPipeline.submit(monitor.monitorId, "status.check", {});
+		await Bun.sleep(250);
+		// Note with real work evidence should be delivered
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]!.text).toBe("Release r-123 blocked by issue #456 (missing tests)");
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("#180: mention targets are validated as platform ids", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-mention-invalid-"));
 	try {

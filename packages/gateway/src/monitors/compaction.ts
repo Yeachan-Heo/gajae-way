@@ -381,3 +381,118 @@ export function buildMonitorCompactionDigest(input: MonitorDigestInput): string 
 	// instruction); a hard clip is the last resort so the bound always holds.
 	return trimmed.length <= maxTotalLength ? trimmed : clip(trimmed, maxTotalLength);
 }
+
+/**
+ * Issue #369, Proposal 2: Detect if a note appears to be an echo of the monitor's
+ * instruction with high token/tag duplication and no numbers/links (authored_echo_suspected).
+ *
+ * Returns true if the note exhibits high similarity to the instruction and lacks
+ * substantive evidence (numbers, URLs, etc.).
+ */
+export function isAuthoredEchoSuspected(
+	instruction: string | undefined,
+	note: string,
+): boolean {
+	if (!instruction || instruction.length === 0) return false;
+	if (note.length === 0) return false;
+
+	// Extract tokens from both instruction and note (words, keeping structure)
+	const tokenize = (text: string): string[] => {
+		return text
+			.toLowerCase()
+			.split(/\s+/)
+			.map((token) => token.replace(/[^a-z0-9]+/g, ""))
+			.filter((token) => token.length > 0);
+	};
+
+	const instructionTokens = tokenize(instruction);
+	const noteTokens = tokenize(note);
+
+	if (instructionTokens.length === 0 || noteTokens.length === 0) return false;
+
+	// Count matching tokens
+	const instructionSet = new Set(instructionTokens);
+	const matchingTokens = noteTokens.filter((t) => instructionSet.has(t)).length;
+
+	// High overlap ratio: 70% or more of the note tokens appear in instruction
+	const overlapRatio = matchingTokens / noteTokens.length;
+	const hasHighOverlap = overlapRatio >= 0.7;
+
+	// Evidence of substantive content: numbers, URLs, issue references, etc.
+	const hasNumbers = /\d+/.test(note);
+	const hasUrls = /https?:\/\/|www\./i.test(note);
+	const hasIssueRefs = /#\d+|[A-Z]+-\d+/.test(note); // GitHub issues, Jira-style
+	const hasCodeBlocks = /```|`[^`]+`/.test(note);
+	const hasSubstantiveEvidence = hasNumbers || hasUrls || hasIssueRefs || hasCodeBlocks;
+
+	// If high overlap AND no substantive evidence, it's likely an echo
+	return hasHighOverlap && !hasSubstantiveEvidence;
+}
+
+/**
+ * Issue #369, Proposal 1: Check if a monitor event satisfies proof requirements
+ * for delivery settlement. Returns null if proof is satisfied or not required,
+ * or a detail string describing the unmet proof requirement.
+ */
+export function checkProofRequirement(
+	proofJson: string | null | undefined,
+	_fired_at: string,
+): string | null {
+	if (!proofJson) {
+		// No proof recorded; assume not required
+		return null;
+	}
+
+	let proof: unknown;
+	try {
+		proof = JSON.parse(proofJson);
+	} catch {
+		return "invalid proof JSON";
+	}
+
+	if (typeof proof !== "object" || proof === null) {
+		return "proof must be an object";
+	}
+
+	const proofObj = proof as Record<string, unknown>;
+	const requires = proofObj.requires;
+
+	if (!requires) {
+		// No requirements specified
+		return null;
+	}
+
+	if (!Array.isArray(requires)) {
+		return "proof.requires must be an array";
+	}
+
+	if (requires.length === 0) {
+		return null; // Empty requirements
+	}
+
+	// Check each requirement
+	for (const req of requires) {
+		if (typeof req !== "object" || req === null) {
+			return "each requirement must be an object";
+		}
+
+		const reqObj = req as Record<string, unknown>;
+		const kind = reqObj.kind;
+		const condition = reqObj.condition;
+
+		if (typeof kind !== "string") {
+			return "requirement.kind must be a string";
+		}
+		if (typeof condition !== "string") {
+			return "requirement.condition must be a string";
+		}
+
+		// For now, we do not actually verify the conditions (that would require
+		// filesystem or git access). We just validate the schema and log the
+		// requirement. Future work: wire condition verification.
+		// Return non-null to indicate the requirement is recorded but unverified.
+		return `unverified proof requirement: ${kind}(${condition})`;
+	}
+
+	return null;
+}

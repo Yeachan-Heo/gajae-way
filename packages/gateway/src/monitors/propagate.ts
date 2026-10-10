@@ -26,12 +26,14 @@ import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
 	type CompactionPort,
+	checkProofRequirement,
 	classifyAuthoringFailure,
 	classifyExecutorFailure,
 	classifyProtocolFailure,
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
+	isAuthoredEchoSuspected,
 	isOrphanedExecutorFailure,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
@@ -88,6 +90,10 @@ type DispatchFailureCode =
 	| "gateway_shutdown"
 	| "event_type_invalid"
 	| "monitor_invalid"
+	// Issue #369: The monitor event did not satisfy proof requirements for delivery
+	| "contract_unmet"
+	// Issue #369: The authored note appears to be an echo of the instruction
+	| "authored_echo_suspected"
 	| "internal_error";
 
 /**
@@ -946,8 +952,59 @@ export class MonitorPropagator {
 					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
 					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
 				}
-				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
-				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				// Issue #369, Proposal 2: Detect contract echoes and log them
+				const echoedEntries: typeof nonSilentEntries = [];
+				const validDeliveryEntries: typeof nonSilentEntries = [];
+				for (const entry of nonSilentEntries) {
+					const isEcho = isAuthoredEchoSuspected(monitor.instruction, entry.note);
+					if (isEcho) {
+						echoedEntries.push(entry);
+						// Log as authored_echo_suspected failure
+						if (
+							this.#database.monitorEventFencedFail(
+								entry.eventId,
+								leaseId,
+								batchId,
+								"authored_echo_suspected",
+								"delivery suppressed: note appears to echo instruction with no substantive evidence",
+								now(),
+								false,
+							)
+						) {
+							// Also mark as contract_unmet terminal stage
+							this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
+						}
+					} else {
+						validDeliveryEntries.push(entry);
+					}
+				}
+				// Issue #369, Proposal 1: Check proof requirements for valid entries
+				for (const entry of validDeliveryEntries) {
+					const eventRow = fenced.find((r) => r.event_id === entry.eventId);
+					if (!eventRow) continue;
+					const proofDetail = checkProofRequirement(eventRow.proof_json, eventRow.fired_at);
+					if (proofDetail?.startsWith("unverified")) {
+						// Proof requirement exists but is unverified
+						if (
+							this.#database.monitorEventFencedFail(
+								entry.eventId,
+								leaseId,
+								batchId,
+								"contract_unmet",
+								proofDetail,
+								now(),
+								false,
+							)
+						) {
+							// Mark as contract_unmet terminal stage
+							this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
+						}
+						// Remove from delivery if proof not met
+						validDeliveryEntries.splice(validDeliveryEntries.indexOf(entry), 1);
+					}
+				}
+				// Deliver only valid non-silent notes; echoes and proof-failed entries were already failed/marked.
+				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
