@@ -3,7 +3,7 @@
 `SIGHUP` and the `gateway.reloadConfig` verb use the same fail-safe reload implementation. Read its result rather than inferring configuration from process age:
 
 - `changed`: live fields are `mentionAllowlist`, `channels` (including `engagement` and `audience`), `stallTimeoutMs`, and `dmPolicy`. Verify behavior through the next event that consumes the policy.
-- `restartRequired`: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, and `work` remain unchanged until restart.
+- `restartRequired`: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `outboundFileRoots`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, and `work` remain unchanged until restart.
 - `ignored`: `logVerbosity` is parsed but has no consumer; neither reload nor restart gives it an effect.
 - Invalid, missing, or unreadable configuration fails reload and leaves the current policy intact. `debounceMs` and `settleWindowMs` are rejected, including channel-level variants; there is no debounce window.
 

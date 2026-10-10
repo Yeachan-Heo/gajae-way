@@ -2355,6 +2355,7 @@ async function createInboundTurnLifecycle(
 			const checked = await checkOutboundFile(requested, {
 				home: runtime.config.home,
 				workspace: join(runtime.config.home, "workspace"),
+				...(runtime.config.outboundFileRoots ? { roots: runtime.config.outboundFileRoots } : {}),
 			});
 			if (!checked.ok) {
 				console.error(
@@ -3080,7 +3081,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 			: []),
 		...(platformSupportsFiles(origin.platform)
 			? [
-					`File attachments: to upload a file into this conversation (same thread as the reply), put MEDIA:<absolute path> on a line of its own. The line is removed from the text; one line per file, at most ${OUTBOUND_FILES_PER_TURN_CAP} per reply and ${Math.floor(OUTBOUND_FILE_MAX_BYTES / (1024 * 1024))} MB each. Write the file first (your workspace or /tmp); files under the gateway home outside the workspace are refused. A file that cannot be sent shows up as a short "(file not sent: ...)" note.`,
+					`File attachments: to upload a file into this conversation (same thread as the reply), put MEDIA:<absolute path> on a line of its own. The line is removed from the text; one line per file, at most ${OUTBOUND_FILES_PER_TURN_CAP} per reply and ${Math.floor(OUTBOUND_FILE_MAX_BYTES / (1024 * 1024))} MB each. Write the file into your workspace first: only files inside the workspace (or a configured outbound root) are sent, everything else is refused. A file that cannot be sent shows up as a short "(file not sent: ...)" note.`,
 				]
 			: []),
 		// Live 2026-09-25: the persona held turns open for 13 minutes in a

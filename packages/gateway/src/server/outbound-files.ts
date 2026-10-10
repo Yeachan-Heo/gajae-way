@@ -11,8 +11,10 @@ export type OutboundFileCheck =
 export interface OutboundFileScope {
 	/** Gateway home: its secrets, databases and state never leave as an attachment. */
 	readonly home: string;
-	/** Persona workspace; the one part of the home a file may be sent from. */
+	/** Persona workspace; files inside it may always be sent. */
 	readonly workspace: string;
+	/** Extra absolute directories (config `outboundFileRoots`) whose files may be sent. */
+	readonly roots?: readonly string[];
 	readonly maxBytes?: number;
 }
 
@@ -32,12 +34,14 @@ async function canonical(target: string): Promise<string> {
 /**
  * Decides whether a `MEDIA:<path>` request may be uploaded.
  *
- * The persona can already read any file it can reach, so this is not a sandbox.
- * It keeps the obvious accidents out of a chat room: relative paths (whose base
- * the persona cannot see), directories and devices, oversized files, and the
- * gateway home itself (tokens under `secrets/`, the ledger databases), with the
- * persona workspace as the one exception. Symlinks are resolved first, so a link
- * in the workspace cannot point the check somewhere else.
+ * Reading a file into the model is not the same as posting its raw bytes to a
+ * room, so this is an allowlist: only files whose realpath lies inside the
+ * persona workspace or an explicitly configured outbound root are sent. Anything
+ * else (`~/.ssh`, cloud credentials, other agents' auth stores, `/etc`) is
+ * refused, so a prompt-injected `MEDIA:` line cannot exfiltrate it. The gateway
+ * home outside the workspace (tokens under `secrets/`, the ledger databases)
+ * stays refused even when a configured root contains it. Symlinks are resolved
+ * first, so a link in an allowed directory cannot point the check elsewhere.
  */
 export async function checkOutboundFile(requested: string, scope: OutboundFileScope): Promise<OutboundFileCheck> {
 	const name = path.basename(requested) || requested;
@@ -48,9 +52,14 @@ export async function checkOutboundFile(requested: string, scope: OutboundFileSc
 	} catch {
 		return { ok: false, name, reason: "file not found" };
 	}
-	const [home, workspace] = await Promise.all([canonical(scope.home), canonical(scope.workspace)]);
-	if (isInside(resolved, home) && !isInside(resolved, workspace))
+	const [home, workspace, ...roots] = await Promise.all(
+		[scope.home, scope.workspace, ...(scope.roots ?? []).filter((root) => path.isAbsolute(root))].map(canonical),
+	);
+	const inWorkspace = isInside(resolved, workspace);
+	if (isInside(resolved, home) && !inWorkspace)
 		return { ok: false, name, reason: "files under the gateway home (outside the workspace) are not sent" };
+	if (!inWorkspace && !roots.some((root) => isInside(resolved, root)))
+		return { ok: false, name, reason: "only files inside the workspace or a configured outbound root are sent" };
 	let stat: Stats;
 	try {
 		stat = await fs.stat(resolved);
