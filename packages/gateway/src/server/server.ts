@@ -800,13 +800,16 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		60 * 60 * 1000,
 	);
 	// Clean up expired memory operations to prevent unbounded growth (#473)
-	const memoryOpsCleanupTimer = setInterval(() => {
-		try {
-			pruneExpiredMemoryOps(runtime.memoryOps, Date.now());
-		} catch (error) {
-			console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
-		}
-	}, 5 * 60 * 1000); // Every 5 minutes
+	const memoryOpsCleanupTimer = setInterval(
+		() => {
+			try {
+				pruneExpiredMemoryOps(runtime.memoryOps, Date.now());
+			} catch (error) {
+				console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
+			}
+		},
+		5 * 60 * 1000,
+	); // Every 5 minutes
 	// History GC: bounded batches with a macrotask yield between them so a large
 	// backlog never holds the event loop (and the single writer) for long.
 	let retentionRunning = false;

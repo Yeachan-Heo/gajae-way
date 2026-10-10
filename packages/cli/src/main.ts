@@ -737,8 +737,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				// plain audit would read as a repair attempt that reproduced the failure.
 				if ((parsed.rest[0] === "audit" || parsed.rest[0] === "autolink") && parsed.rest.length > 1)
 					throw new Error(`${usage} (unknown argument: ${parsed.rest[1]})`);
-				if (parsed.rest[0] === "status" && parsed.rest.length < 2)
-					throw new Error(`${usage} (status requires opRef)`);
+				if (parsed.rest[0] === "status" && parsed.rest.length < 2) throw new Error(`${usage} (status requires opRef)`);
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {

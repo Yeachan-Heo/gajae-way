@@ -995,9 +995,17 @@ export interface VerbCatalogV01 {
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
 	"memory.autolink": {
 		params: undefined;
-		result: { readonly opRef: string; readonly filesChanged?: number; readonly linksAdded?: number; readonly aliases?: number };
+		result: {
+			readonly opRef: string;
+			readonly filesChanged?: number;
+			readonly linksAdded?: number;
+			readonly aliases?: number;
+		};
 	};
-	"memory.status": { params: { readonly opRef: string }; result: { readonly status: "pending" | "completed" | "failed"; readonly result?: unknown; readonly error?: string } };
+	"memory.status": {
+		params: { readonly opRef: string };
+		result: { readonly status: "pending" | "completed" | "failed"; readonly result?: unknown; readonly error?: string };
+	};
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };

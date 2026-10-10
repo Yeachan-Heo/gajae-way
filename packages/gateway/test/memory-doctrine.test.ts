@@ -2,6 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { autolinkCorpus } from "../src/memory/autolink";
+import { MemoryClosureQueue } from "../src/memory/closure";
 import {
 	appendDaily,
 	CorpusWriter,
@@ -11,15 +13,13 @@ import {
 	regenerateMap,
 	validateMemory,
 } from "../src/memory/doctrine";
-import { autolinkCorpus } from "../src/memory/autolink";
-import { MemoryClosureQueue } from "../src/memory/closure";
-import { getOrCreatePendingMemoryOp, pruneExpiredMemoryOps } from "../src/server/server";
 import {
 	type AxisDescriptor,
 	type AxisRegistry,
 	loadRegistry,
 	NAVIGATION_SOURCE_MAX_BYTES,
 } from "../src/memory/registry";
+import { getOrCreatePendingMemoryOp, pruneExpiredMemoryOps } from "../src/server/server";
 
 // A registry holding exactly one axis: createRegistry() would also seed every
 // built-in, and this test asserts the byte-for-byte rendering of a single axis.
@@ -462,7 +462,7 @@ test("issue #473: memory.autolink handler created flag controls sweep startup", 
 	// First autolink request: handler would start sweep only if created=true
 	const first = getOrCreatePendingMemoryOp(memoryOps, "autolink");
 	expect(first.created).toBe(true); // Signal: start the sweep
-	
+
 	// Simulate operation being registered (as real handler would)
 	const op = memoryOps.get(first.opRef);
 	expect(op?.status).toBe("pending"); // Operation is now pending

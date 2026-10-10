@@ -1269,9 +1269,7 @@ describe("memory async operations (#473)", () => {
 							);
 						} else if (frame.type === "request") {
 							if (frame.verb === "memory.autolink") {
-								socket.write(
-									`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { opRef } })}\n`,
-								);
+								socket.write(`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { opRef } })}\n`);
 							} else if (frame.verb === "memory.status") {
 								pollCount++;
 								const isComplete = pollCount > 2;
@@ -1339,9 +1337,7 @@ describe("memory async operations (#473)", () => {
 							);
 						} else if (frame.type === "request") {
 							if (frame.verb === "memory.audit") {
-								socket.write(
-									`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { opRef } })}\n`,
-								);
+								socket.write(`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { opRef } })}\n`);
 							} else if (frame.verb === "memory.status") {
 								socket.write(
 									`${JSON.stringify({
@@ -1402,9 +1398,7 @@ describe("memory async operations (#473)", () => {
 							);
 						} else if (frame.type === "request") {
 							if (frame.verb === "memory.autolink") {
-								socket.write(
-									`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { opRef } })}\n`,
-								);
+								socket.write(`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { opRef } })}\n`);
 							} else if (frame.verb === "memory.status") {
 								// Never complete; simulate long-running operation
 								socket.write(
