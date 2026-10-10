@@ -492,21 +492,21 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
 }
 
 /**
- * Resolve the lane report origin for a persona parent. If the parent is a channel root
- * origin with a triggerMessageId, route the report to a thread instead of the channel root.
+ * Resolve the lane report origin for a persona parent. A Slack channel root origin with a
+ * triggerMessageId routes the report into that message's thread: Slack opens the thread on
+ * the first reply. Discord keeps the channel root: a Discord thread exists only once someone
+ * starts it, and a mention-started thread already arrives as a thread origin, so a channel
+ * root origin means the conversation lives at the root and a thread id built from the
+ * trigger message names a channel that does not exist (Discord 10003, delivery expires).
  */
 function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
 	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
 
 	try {
 		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
-		if (origin.kind !== "channel") return admissionOriginRefJson;
-		// Slack message ids are already `<channel>:<ts>`, which is exactly the thread conversation id;
-		// a Discord thread started from a message shares that message's id.
-		if (origin.platform === "slack" && !parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) {
-			return admissionOriginRefJson;
-		}
-		if (origin.platform !== "slack" && origin.platform !== "discord") return admissionOriginRefJson;
+		if (origin.kind !== "channel" || origin.platform !== "slack") return admissionOriginRefJson;
+		// Slack message ids are already `<channel>:<ts>`, which is exactly the thread conversation id.
+		if (!parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) return admissionOriginRefJson;
 		const threadOrigin: OriginRef = {
 			platform: origin.platform,
 			kind: "thread",
