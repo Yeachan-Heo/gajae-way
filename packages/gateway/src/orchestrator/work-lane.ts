@@ -29,6 +29,7 @@ import {
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
 import {
+	BrokerAuthorityError,
 	type GatewayDatabase,
 	type LaneReportRow,
 	type WorkAttemptAdmission,
@@ -576,9 +577,14 @@ export class WorkLaneManager {
 					codingRegister: true,
 					...(input.model ? { model: input.model } : {}),
 				});
-			} catch {
-				throw new ProtocolError("verb_failed", "work lane bind failed", {
+			} catch (error) {
+				const cause = workBindFailureCause(error);
+				console.error(
+					`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${input.cwd} cause=${cause} error=${workBindFailureMessage(error)}`,
+				);
+				throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
 					reasonCode: "bind_failed",
+					cause,
 					name: input.name,
 				});
 			}
@@ -1861,6 +1867,73 @@ function workError(
 		...(clientRef ? { clientRef } : {}),
 	});
 }
+
+type WorkBindFailureCause = "broker_unavailable" | "timeout" | "cwd_rejected" | "epoch_conflict" | "unknown";
+
+function workBindFailureCause(error: unknown): WorkBindFailureCause {
+	const message = error instanceof Error ? error.message : String(error);
+	if (
+		/\b(?:timed out|timeout)\b/i.test(message) ||
+		/\bdid not complete within \d+ms\b/i.test(message) ||
+		/\bwas created but never became live\b/.test(message)
+	)
+		return "timeout";
+	if (error instanceof BrokerAuthorityError) {
+		if (error.code === "unowned_session") return "cwd_rejected";
+		if (error.code === "authority_mismatch" || error.code === "cutover_required") return "epoch_conflict";
+	}
+	const detail = error instanceof ProtocolError ? workBindErrorRecord(error.detail) : undefined;
+	const sdkCode = error instanceof GjcCliError ? envelopeErrorCode(error.details) : undefined;
+	const record = workBindErrorRecord(error);
+	for (const code of [
+		detail?.cause,
+		detail?.reasonCode,
+		detail?.code,
+		error instanceof ProtocolError ? error.code : undefined,
+		sdkCode,
+		record?.code,
+	]) {
+		const cause = workBindFailureCauseFromCode(code);
+		if (cause) return cause;
+	}
+	if (/^session bind for .+ epoch \d+ lost to (?:epoch \d+|a concurrent durable epoch change)$/.test(message))
+		return "epoch_conflict";
+	return "unknown";
+}
+
+function workBindFailureCauseFromCode(value: unknown): WorkBindFailureCause | undefined {
+	if (typeof value !== "string") return undefined;
+	switch (value) {
+		case "broker_unavailable":
+		case "unavailable":
+		case "session_unavailable":
+		case "endpoint_stale":
+		case "not_found":
+			return "broker_unavailable";
+		case "timeout":
+			return "timeout";
+		case "unowned_session":
+		case "managed_append_identity_mismatch":
+			return "cwd_rejected";
+		case "authority_mismatch":
+		case "cutover_required":
+			return "epoch_conflict";
+		default:
+			return undefined;
+	}
+}
+
+function workBindErrorRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function workBindFailureMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return sanitizeDiagnostic(message).replace(/\s+/gu, " ").slice(0, 200) || "unknown";
+}
+
 /** Bounded, secret-free error class and message for a log line. */
 function failureReason(error: unknown): string {
 	const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);

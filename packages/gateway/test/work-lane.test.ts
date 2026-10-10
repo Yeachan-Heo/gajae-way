@@ -21,7 +21,7 @@ import {
 	WorkLaneManager,
 	type WorkLaneManagerOptions,
 } from "../src/orchestrator/work-lane";
-import { GatewayDatabase, WorkAttemptStateError } from "../src/store/db";
+import { BrokerAuthorityError, GatewayDatabase, WorkAttemptStateError } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -111,6 +111,60 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	return result;
 }
 
+test("bind failures map causes and emit one redacted diagnostic each", async () => {
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const failures = [
+		["broker unavailable", "broker_unavailable", () => new GjcCliUnavailableError("broker unavailable")],
+		["timeout", "timeout", () => new GjcCliUnavailableError("request timed out after 1000ms")],
+		["session-create timeout", "timeout", () => new Error("gjc session.create did not complete within 60000ms")],
+		["cwd rejected", "cwd_rejected", () => new BrokerAuthorityError("unowned_session")],
+		["epoch conflict", "epoch_conflict", () => new BrokerAuthorityError("authority_mismatch")],
+		[
+			"ProtocolError reasonCode",
+			"broker_unavailable",
+			() => new ProtocolError("verb_failed", "bind rejected", { reasonCode: "session_unavailable" }),
+		],
+		[
+			"unknown fallback",
+			"unknown",
+			() => new Error(`authentication failed token=sk_live_123456789abcdef\n${"x".repeat(240)}`),
+		],
+	] as const;
+	for (const [label, cause, makeError] of failures) {
+		const f = await fixture();
+		f.port.bind = async () => {
+			throw makeError();
+		};
+
+		errors.mockClear();
+		let failure: unknown;
+		try {
+			await f.manager.start({ name: "a", text: "work", cwd: f.directory });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(ProtocolError);
+		expect(failure).toMatchObject({
+			code: "verb_failed",
+			message: `work lane bind failed (cause: ${cause})`,
+			detail: { reasonCode: "bind_failed", cause, name: "a" },
+		});
+
+		const lines = errors.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("work_bind_failed"));
+		expect(lines).toHaveLength(1);
+		const line = lines[0];
+		expect(line).toBeDefined();
+		if (line === undefined) throw new Error("bind failure diagnostic was not captured");
+		expect(line).toStartWith(
+			`work_bind_failed name=a origin=${workSessionKey("a")} cwd=${f.directory} cause=${cause} error=`,
+		);
+		expect(line).not.toMatch(/[\r\n]/);
+		const errorMessage = line.slice(line.indexOf(" error=") + " error=".length);
+		expect(errorMessage.length).toBeLessThanOrEqual(200);
+		if (label === "unknown fallback") expect(line).not.toContain("sk_live_123456789abcdef");
+	}
+});
 for (const model of ["startup-model", { preset: "startup-preset" }]) {
 	test(`proven startup model skips only the newly bound session's duplicate send model: ${JSON.stringify(model)}`, async () => {
 		const f = await fixture();
