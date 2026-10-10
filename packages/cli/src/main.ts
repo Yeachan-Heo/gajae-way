@@ -508,6 +508,45 @@ async function chat(socket: string): Promise<void> {
 	}
 }
 
+/**
+ * Poll for memory operation completion. Memory operations (audit, autolink) are
+ * long-running and return an opRef immediately; this function polls for the result.
+ * If the CLI wait expires before completion, report 'still running' instead of failure.
+ */
+async function pollMemoryOp(
+	client: GajaewayClient,
+	opRef: string,
+	maxWaitMs = 300_000, // 5 min default CLI timeout
+): Promise<{ status: "completed" | "failed" | "still_running"; result?: unknown; error?: string }> {
+	const startTime = Date.now();
+	const pollIntervalMs = 1_000; // Poll every 1s (not 100ms to reduce load on long ops)
+
+	while (Date.now() - startTime < maxWaitMs) {
+		const status = await client.request<{
+			status: "pending" | "completed" | "failed";
+			result?: unknown;
+			error?: string;
+		}>("memory.status", { opRef });
+
+		if (status.status === "completed") {
+			return { status: "completed", result: status.result };
+		}
+
+		if (status.status === "failed") {
+			return { status: "failed", error: status.error };
+		}
+
+		// Wait before polling again
+		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+	}
+
+	// CLI wait expired, but operation may still be running on the server
+	console.error(
+		`memory operation still running (${Math.round((Date.now() - startTime) / 1000)}s elapsed).\nCheck status: gajaeway memory status ${opRef}`,
+	);
+	return { status: "still_running" };
+}
+
 export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
 	const parsed = parseArgs(args);
 	const usage = usageFor(parsed.command);
@@ -692,24 +731,62 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "memory": {
-				const usage = "usage: gajaeway memory audit|memory autolink|memory search <query>";
+				const usage = "usage: gajaeway memory audit|autolink|search <query>|status <opRef>";
 				// An unrecognised argument is refused before the socket is opened rather
 				// than ignored: a run of `memory audit --fix` that silently degraded to a
 				// plain audit would read as a repair attempt that reproduced the failure.
 				if ((parsed.rest[0] === "audit" || parsed.rest[0] === "autolink") && parsed.rest.length > 1)
 					throw new Error(`${usage} (unknown argument: ${parsed.rest[1]})`);
+				if (parsed.rest[0] === "status" && parsed.rest.length < 2) throw new Error(`${usage} (status requires opRef)`);
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {
-						const result = await client.request<{ ok: boolean; issues: unknown[] }>("memory.audit");
-						console.log(JSON.stringify(result.issues));
-						if (!result.ok) process.exitCode = 1;
+						// Request audit operation; get opRef and poll for completion
+						const initResp = await client.request<{ opRef: string }>("memory.audit");
+						const poll = await pollMemoryOp(client, initResp.opRef);
+						if (poll.status === "failed") {
+							console.error(`audit failed: ${poll.error}`);
+							process.exitCode = 1;
+						} else if (poll.status === "still_running") {
+							// Operation is still running; exit with distinct code so it's not reported as failure
+							process.exitCode = 75;
+						} else {
+							const auditResult = poll.result as { ok?: boolean; issues?: unknown[] };
+							console.log(JSON.stringify(auditResult?.issues ?? []));
+							if (!auditResult?.ok) process.exitCode = 1;
+						}
 					} else if (parsed.rest[0] === "autolink") {
-						console.log(JSON.stringify(await client.request("memory.autolink")));
+						// Request autolink operation; get opRef and poll for completion
+						const initResp = await client.request<{ opRef: string }>("memory.autolink");
+						const poll = await pollMemoryOp(client, initResp.opRef);
+						if (poll.status === "failed") {
+							console.error(`autolink failed: ${poll.error}`);
+							process.exitCode = 1;
+						} else if (poll.status === "still_running") {
+							// Operation is still running; exit with distinct code so it's not reported as failure
+							process.exitCode = 75;
+						} else {
+							console.log(JSON.stringify(poll.result));
+						}
 					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),
 						);
+					} else if (parsed.rest[0] === "status" && parsed.rest[1]) {
+						const opRef = parsed.rest[1];
+						const result = await client.request<{
+							status: "pending" | "completed" | "failed";
+							result?: unknown;
+							error?: string;
+						}>("memory.status", { opRef });
+						if (result.status === "failed") {
+							console.error(`operation ${opRef} failed: ${result.error}`);
+							process.exitCode = 1;
+						} else if (result.status === "completed") {
+							console.log(JSON.stringify({ status: result.status, result: result.result }));
+						} else {
+							console.log(JSON.stringify({ status: result.status }));
+						}
 					} else throw new Error(usage);
 				} finally {
 					await client.close();

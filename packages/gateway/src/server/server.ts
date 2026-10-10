@@ -290,6 +290,68 @@ async function applyConfigReload(
 	return result;
 }
 
+/**
+ * Prune expired memory operations and cap the map size to prevent unbounded growth.
+ * Extracted for testability; called periodically during operation and in tests.
+ */
+export function pruneExpiredMemoryOps(memoryOps: Map<string, MemoryOpStatus>, nowMs: number): void {
+	// Remove expired operations (past their 24h TTL)
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (new Date(op.expireAt).getTime() < nowMs) {
+			memoryOps.delete(opRef);
+		}
+	}
+
+	// Cap the map size to prevent unbounded memory growth
+	if (memoryOps.size > 10_000) {
+		const entries = Array.from(memoryOps.entries()).sort(
+			([, a], [, b]) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime(),
+		);
+		while (entries.length > 5_000) {
+			const [opRef] = entries.shift()!;
+			memoryOps.delete(opRef);
+		}
+	}
+}
+
+/**
+ * Get or create a pending memory operation of a specific kind.
+ * Returns opRef and created flag: created=true means a new operation was just created
+ * and the caller should start the sweep; created=false means it's reusing an existing pending op.
+ * Ensures kind-specific deduplication: audit pending ops never dedup autolink requests and vice versa.
+ */
+export function getOrCreatePendingMemoryOp(
+	memoryOps: Map<string, MemoryOpStatus>,
+	kind: "audit" | "autolink",
+): { opRef: string; created: boolean } {
+	// Check for existing pending operation of the SAME kind
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (op.status === "pending") {
+			// Distinguish by opRef prefix: gw-ma- (audit), gw-ml- (autolink)
+			const opKind = opRef.startsWith("gw-ma-") ? "audit" : "autolink";
+			if (opKind === kind) {
+				return { opRef, created: false }; // Reuse existing pending operation of same kind
+			}
+		}
+	}
+
+	// No pending operation of this kind; create new one
+	const prefix = kind === "audit" ? "gw-ma" : "gw-ml";
+	const opRef = `${prefix}-${crypto.randomUUID()}`;
+	const started = new Date().toISOString();
+	const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+	memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+	return { opRef, created: true };
+}
+
+interface MemoryOpStatus {
+	status: "pending" | "completed" | "failed";
+	result?: unknown;
+	error?: string;
+	startedAt: string;
+	expireAt: string; // For pruning old operations
+}
+
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
@@ -301,6 +363,8 @@ interface Runtime {
 	stop?: (reason?: string) => Promise<void>;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
+	/** Tracked memory operations (autolink, audit) keyed by opRef. */
+	readonly memoryOps: Map<string, MemoryOpStatus>;
 	readonly registry: MonitorRegistry;
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
@@ -735,6 +799,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		60 * 60 * 1000,
 	);
+	// Clean up expired memory operations to prevent unbounded growth (#473)
+	const memoryOpsCleanupTimer = setInterval(
+		() => {
+			try {
+				pruneExpiredMemoryOps(runtime.memoryOps, Date.now());
+			} catch (error) {
+				console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
+			}
+		},
+		5 * 60 * 1000,
+	); // Every 5 minutes
 	// History GC: bounded batches with a macrotask yield between them so a large
 	// backlog never holds the event loop (and the single writer) for long.
 	let retentionRunning = false;
@@ -825,6 +900,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound,
 		requests: new Set(),
 		permissionPanels,
+		memoryOps: new Map(),
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1255,23 +1331,83 @@ async function handleRequest(
 			return;
 		}
 		case "memory.audit": {
-			const root = await initializeMemory(options.config.home);
-			const issues = await validateMemory(root);
+			// Track async memory operations to prevent client timeouts during long operations (#473).
+			// Kind-specific deduplication: audit requests don't dedup with autolink operations.
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "audit");
+
+			if (!created) {
+				// Already running; return existing opRef
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { opRef },
+				});
+				return;
+			}
+
+			// Start operation asynchronously; client gets opRef immediately.
+			void (async () => {
+				try {
+					const root = await initializeMemory(options.config.home);
+					const issues = await validateMemory(root);
+					const result = { ok: issues.length === 0, issues };
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = result;
+					}
+				} catch (error) {
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "failed";
+						stored.error = diagnostic(error);
+					}
+				}
+			})();
+
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { ok: issues.length === 0, issues },
+				result: { opRef },
 			});
 			return;
 		}
 		case "memory.autolink": {
+			// Track async memory operations to prevent client timeouts during long operations (#473).
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
-			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root, runtime.memory);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
+			// Kind-specific deduplication: autolink requests don't dedup with audit operations.
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "autolink");
+
+			if (!created) {
+				// Already running; return existing opRef
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
+				return;
+			}
+
+			// Start operation asynchronously; client gets opRef immediately.
+			void (async () => {
+				try {
+					const root = await initializeMemory(options.config.home);
+					const report = await autolinkCorpus(root, runtime.memory);
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = report;
+					}
+				} catch (error) {
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "failed";
+						stored.error = diagnostic(error);
+					}
+				}
+			})();
+
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 			return;
 		}
 		case "memory.search": {
@@ -1284,6 +1420,23 @@ async function handleRequest(
 				type: "response",
 				id: request.id,
 				result: { hits: await searchMemory(root, params.query, limit) },
+			});
+			return;
+		}
+		case "memory.status": {
+			const params = (request.params ?? {}) as { opRef?: unknown };
+			if (typeof params.opRef !== "string") throw new ProtocolError("invalid_params", "memory.status requires opRef");
+			const op = runtime.memoryOps.get(params.opRef);
+			if (!op) throw new ProtocolError("invalid_params", `unknown opRef: ${params.opRef}`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: {
+					status: op.status,
+					...(op.result ? { result: op.result } : {}),
+					...(op.error ? { error: op.error } : {}),
+				},
 			});
 			return;
 		}
