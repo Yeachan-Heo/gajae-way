@@ -68,6 +68,8 @@ $GAJAEWAY_HOME/
 
 Use `config.json` schema version 1. Every configured secret is a credential-file reference; a credential file may be referenced by only one configured credential.
 
+Outbound secret redaction is always on and is configured only through the gateway's environment, never `config.json`: it indexes secret-named environment variables, `$GAJAEWAY_HOME/secrets/`, the gjc `agent.db` credentials, plus `GAJAEWAY_SECRET_GUARD_FILES` (colon-separated files or directories, e.g. Kubernetes secret mounts) and `GAJAEWAY_SECRET_GUARD_ENV` (comma-separated extra variable names). See the architecture notes for what is matched.
+
 ```json
 {
   "schemaVersion": 1,
