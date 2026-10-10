@@ -638,7 +638,9 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	f.port.complete(persona.opRef, "ack");
 });
 
-test("AC-435 Discord channel root trigger routes lane report to thread", async () => {
+// A Discord channel root has no thread on the trigger message (a mention-started thread arrives
+// as a thread origin); naming one from the message id made the report undeliverable (10003).
+test("AC-435 Discord channel root trigger keeps the lane report at the channel root", async () => {
 	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
 	const f = await fixture({
 		ownerTarget: discordChannelOrigin,
@@ -657,9 +659,6 @@ test("AC-435 Discord channel root trigger routes lane report to thread", async (
 	);
 	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
-	expect(laneReportOrigin.kind).toBe("thread");
-	expect(laneReportOrigin.platform).toBe("discord");
-	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
-	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
+	expect(laneReportOrigin).toEqual(discordChannelOrigin);
 	f.port.complete(persona.opRef, "ack");
 });
