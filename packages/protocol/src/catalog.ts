@@ -1,3 +1,4 @@
+import type { FileRef } from "./files";
 import type { OriginRef } from "./origin";
 import type { ReactionAction, ReactionRef } from "./reactions";
 
@@ -280,6 +281,13 @@ export interface ChatMessagePayload {
 	 * visible acknowledgement instead of a lost delivery.
 	 */
 	readonly reaction?: ReactionRef;
+	/**
+	 * When present this delivery is a FILE UPLOAD: the adapter uploads `file.path`
+	 * into the conversation (inside `replyToMessageId`'s thread when set) and posts
+	 * no other message. `text` carries a short "📎 name" line so an adapter without
+	 * upload support degrades to a visible mention instead of a lost delivery.
+	 */
+	readonly file?: FileRef;
 	/**
 	 * When present the adapter must ALSO post this text as a spoken voice
 	 * message, in addition to delivering `text` normally.

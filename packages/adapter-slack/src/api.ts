@@ -169,6 +169,9 @@ const SLACK_FORM_ENCODED_METHODS: ReadonlySet<string> = new Set([
 	"conversations.info",
 	"users.info",
 	"reactions.get",
+	// Slack documents both upload steps as form-encoded; `files` travels as a JSON string.
+	"files.getUploadURLExternal",
+	"files.completeUploadExternal",
 ]);
 
 /** Form-encodes the flat parameter objects this client sends; undefined is omitted, not sent as "undefined". */
@@ -312,6 +315,57 @@ export class SlackWebApi {
 	async setThreadStatus(channel: string, threadTs: string, status: string): Promise<void> {
 		await this.limiter?.acquire(channel, "cosmetic");
 		await this.call("assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status });
+	}
+
+	/**
+	 * Uploads one file into a channel (or a thread of it) with Slack's external
+	 * upload flow: reserve an upload URL, send the bytes there, then complete the
+	 * upload into the conversation. Needs the `files:write` scope.
+	 *
+	 * The byte transfer goes to a Slack-issued URL, never with the bot token. A
+	 * failure before `completeUploadExternal` leaves nothing visible in the room;
+	 * only the final step can be ambiguous.
+	 */
+	async uploadFile(
+		channel: string,
+		file: { readonly name: string; readonly bytes: Uint8Array },
+		threadTs?: string,
+	): Promise<void> {
+		await this.limiter?.acquire(channel, "delivery");
+		let fileId: string;
+		try {
+			const reserved = await this.call<{ readonly upload_url?: unknown; readonly file_id?: unknown }>(
+				"files.getUploadURLExternal",
+				{ filename: file.name, length: file.bytes.byteLength },
+			);
+			if (typeof reserved.upload_url !== "string" || typeof reserved.file_id !== "string")
+				throw new SlackApiError(
+					0,
+					"invalid_upload_reservation",
+					"files.getUploadURLExternal returned no upload_url/file_id",
+				);
+			const sent = await this.fetcher(reserved.upload_url, {
+				method: "POST",
+				headers: { "content-type": "application/octet-stream" },
+				body: file.bytes,
+			});
+			if (!sent.ok) throw new SlackApiError(sent.status, `upload_http_${sent.status}`);
+			fileId = reserved.file_id;
+		} catch (error) {
+			// Nothing is in the room until the upload is completed, so a failure here
+			// is a definitive non-delivery whatever its cause.
+			if (error instanceof SlackApiError) throw error;
+			throw new SlackApiError(
+				0,
+				"upload_failed",
+				`file upload failed before completion: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		await this.call("files.completeUploadExternal", {
+			files: JSON.stringify([{ id: fileId, title: file.name }]),
+			channel_id: channel,
+			...(threadTs === undefined ? {} : { thread_ts: threadTs }),
+		});
 	}
 
 	/** Removes our own reaction; one that is already gone counts as removed. */
