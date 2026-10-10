@@ -290,6 +290,30 @@ async function applyConfigReload(
 	return result;
 }
 
+/**
+ * Prune expired memory operations and cap the map size to prevent unbounded growth.
+ * Extracted for testability; called periodically during operation and in tests.
+ */
+export function pruneExpiredMemoryOps(memoryOps: Map<string, MemoryOpStatus>, nowMs: number): void {
+	// Remove expired operations (past their 24h TTL)
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (new Date(op.expireAt).getTime() < nowMs) {
+			memoryOps.delete(opRef);
+		}
+	}
+
+	// Cap the map size to prevent unbounded memory growth
+	if (memoryOps.size > 10_000) {
+		const entries = Array.from(memoryOps.entries()).sort(
+			([, a], [, b]) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime(),
+		);
+		while (entries.length > 5_000) {
+			const [opRef] = entries.shift()!;
+			memoryOps.delete(opRef);
+		}
+	}
+}
+
 interface MemoryOpStatus {
 	status: "pending" | "completed" | "failed";
 	result?: unknown;
@@ -748,24 +772,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	// Clean up expired memory operations to prevent unbounded growth (#473)
 	const memoryOpsCleanupTimer = setInterval(() => {
 		try {
-			const now = Date.now();
-			let expired = 0;
-			for (const [opRef, op] of Array.from(runtime.memoryOps.entries())) {
-				if (new Date(op.expireAt).getTime() < now) {
-					runtime.memoryOps.delete(opRef);
-					expired++;
-				}
-			}
-			// Cap the map size to prevent unbounded memory growth
-			if (runtime.memoryOps.size > 10_000) {
-				const entries = Array.from(runtime.memoryOps.entries()).sort(
-					([, a], [, b]) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime(),
-				);
-				while (entries.length > 5_000) {
-					const [opRef] = entries.shift()!;
-					runtime.memoryOps.delete(opRef);
-				}
-			}
+			pruneExpiredMemoryOps(runtime.memoryOps, Date.now());
 		} catch (error) {
 			console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
 		}
