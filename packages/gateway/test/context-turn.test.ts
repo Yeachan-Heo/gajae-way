@@ -1,63 +1,602 @@
-import { test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { GatewayConfig } from "../src/config";
+import type { SessionPort } from "../src/orchestrator/session-port";
+import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { GatewayDatabase } from "../src/store/db";
+import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
-// This implementation must match the one in server.ts
-function clipContextBody(body: string, maxChars: number): string {
-	if (body.length <= maxChars) return body;
-	const clipped = body.slice(0, maxChars);
-	const totalChars = body.length;
-	return `${clipped}…[clipped: first ${maxChars} of ${totalChars} chars shown; the message itself is complete]`;
+const ORIGIN = { platform: "discord", kind: "channel", conversationId: "context-turn" } as const;
+const ORIGIN_KEY = "discord/channel/context-turn";
+let directory = "";
+let server: GatewayServer | undefined;
+
+afterEach(async () => {
+	await server?.stop();
+	server = undefined;
+	if (directory) await rm(directory, { recursive: true, force: true });
+	directory = "";
+});
+
+async function config(): Promise<GatewayConfig> {
+	directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-context-turn-")));
+	return {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { "context-turn": { engagement: "mention-open" } },
+	};
 }
 
-test("clipContextBody: returns text unchanged when under limit", () => {
-	const short = "hello world";
-	expect(clipContextBody(short, 100)).toBe(short);
+async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
+	const frames: any[] = [];
+	let buffered = "";
+	const socket = await Bun.connect({
+		unix: socketPath,
+		socket: {
+			data(_socket, data) {
+				buffered += Buffer.from(data).toString();
+				const lines = buffered.split("\n");
+				buffered = lines.pop() ?? "";
+				for (const line of lines) if (line) frames.push(JSON.parse(line));
+			},
+		},
+	});
+	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 400 && !predicate(); attempt++) await Bun.sleep(5);
+	expect(predicate()).toBe(true);
+}
+
+function send(client: { send(value: unknown): void }, id: string, text: string): void {
+	client.send({
+		v: "0.1",
+		type: "request",
+		id,
+		verb: "chat.send",
+		params: {
+			origin: ORIGIN,
+			text,
+			messageId: id,
+			receivedAt: new Date().toISOString(),
+			engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+		},
+	});
+}
+
+async function start(
+	gatewayConfig: GatewayConfig,
+	database: GatewayDatabase,
+	sessionPort: SessionPort,
+	seed?: () => void,
+): Promise<{ client: Awaited<ReturnType<typeof connect>> }> {
+	const { bind, resume } = sessionPort;
+	attachTestBrokerOwnership(database, sessionPort, join(gatewayConfig.home, "agent"));
+	seed?.();
+	server = await startUnixServer({
+		config: gatewayConfig,
+		database,
+		sessionPort,
+		onStop: () => {
+			// A restart reuses the fake runtime, not wrappers bound to a closed DB.
+			sessionPort.bind = bind;
+			sessionPort.resume = resume;
+			database.close();
+		},
+	});
+	const client = await connect(gatewayConfig.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitUntil(() => client.frames.length >= 1);
+	return { client };
+}
+
+test("failed turn preserves selected context; later successful text consumes it with trigger attribution once", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const turns: string[] = [];
+	let attempts = 0;
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			turns.push(text);
+			if (attempts++ === 0) throw new Error("runtime failed before reply");
+			return "success";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({
+			messageId: "context-bot",
+			originKey: ORIGIN_KEY,
+			authorId: "bot-2",
+			authorName: "helper-bot",
+			body: "current bounded bot context",
+		});
+	});
+
+	send(client, "trigger-failed", "first owner request");
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
+	expect(
+		database
+			.contextUnread(ORIGIN_KEY)
+			.map((row) => row.message_id)
+			.sort(),
+	).toEqual(["context-bot", "trigger-failed"]);
+
+	send(client, "trigger-success", "second owner request");
+	await waitUntil(() => turns.length === 2);
+	expect(turns[1]).toContain("helper-bot (author:bot-2, msg:context-bot): current bounded bot context");
+	expect(turns[1]).toContain("first owner request");
+	expect(turns[1]?.match(/second owner request/g)).toHaveLength(1);
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	client.close();
 });
 
-test("clipContextBody: returns text unchanged when at exact limit", () => {
-	const exact = "hello";
-	expect(clipContextBody(exact, 5)).toBe(exact);
+test("successful intentional silence advances the context cursor", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async () => "[SILENT]",
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "silent-trigger", "read this but stay quiet");
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
+	client.close();
 });
 
-test("clipContextBody: clips and adds marker when over limit", () => {
-	const long = "a".repeat(1000);
-	const result = clipContextBody(long, 100);
-	expect(result).toContain("…[clipped:");
-	expect(result).toContain("first 100 of 1000 chars shown");
-	expect(result.length).toBeLessThan(long.length);
+test("a delivered intermediate reply followed by runtime failure consumes the selected context and posts no failure notice", async () => {
+	// The user saw an answer; the context it was written from is read, and a
+	// "[turn failed]" after a visible reply would only be noise. (Under the
+	// former mid-work gate this text was suppressed as pre-tool and the test
+	// asserted the opposite; the gate is gone - 2026-09-18.)
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, _preamble, _progress, options) => {
+			options?.onAssistantText?.("delivered intermediate reply");
+			throw new Error("runtime failed after visible reply");
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({ messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" });
+	});
+	send(client, "intermediate-trigger", "owner request");
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	const messages = client.frames.filter((frame) => frame.event === "chat.message");
+	expect(messages.map((frame) => frame.payload.text)).toEqual(["delivered intermediate reply"]);
+	client.close();
 });
 
-test("clipContextBody: preserves text content before clip marker", () => {
-	const text = "abc".repeat(100); // 300 chars
-	const result = clipContextBody(text, 100);
-	const content = result.slice(0, 100);
-	// First 100 chars of "abcabc..." is 33 repetitions of "abc" (99 chars) + "a" (1 char)
-	expect(content).toBe("abc".repeat(33) + "a"); // First 100 chars
+test("a chatty turn past the mid-work part budget still delivers its final answer and settles", async () => {
+	// The per-turn part budget caps mid-work speech; it must never eat the
+	// terminal slot. With the interim gate gone a 12-message turn is ordinary.
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, _preamble, _progress, options) => {
+			for (let index = 1; index <= 12; index++) options?.onAssistantText?.(`progress note ${index}`);
+			return "the final answer";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "chatty-trigger", "owner request");
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text === "the final answer"),
+	);
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
+	expect(texts.filter((text) => text.startsWith("progress note"))).toHaveLength(10);
+	expect(texts.filter((text) => text === "the final answer")).toHaveLength(1);
+	expect(database.inboundTurnRow(sessionPort.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+	client.close();
 });
 
-test("clipContextBody: shows correct character count in marker", () => {
-	const text = "hello world".repeat(50); // 550 chars
-	const result = clipContextBody(text, 200);
-	expect(result).toContain("first 200 of 550 chars shown");
+test("#247: every done trigger names the delivery that closed it or why none did", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text, _preamble, _progress, options) => {
+			if (text.includes("interim then silent")) {
+				options?.onAssistantText?.("visible interim answer");
+				return "[SILENT]";
+			}
+			if (text.includes("react only")) return "[REACT:👍]";
+			if (text.includes("stay quiet")) return "[SILENT]";
+			throw new Error("runtime failed before reply");
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const settle = async (id: string, text: string) => {
+		const turn = sessionPort.sends.length;
+		send(client, id, text);
+		await waitUntil(() => sessionPort.sends.length > turn);
+		const opRef = sessionPort.sends[turn]?.opRef ?? "";
+		await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+		return database.inboundTurnRow(opRef)?.terminal_delivery_id ?? null;
+	};
+	const deliveryIdOf = (body: string) =>
+		client.frames.find((frame) => frame.event === "chat.message" && frame.payload.text === body)?.payload.deliveryId;
+
+	const interim = await settle("interim-silent", "interim then silent");
+	expect(JSON.parse(interim ?? "null")).toEqual({ 0: deliveryIdOf("visible interim answer") });
+	const reaction = await settle("react-only", "react only");
+	expect(JSON.parse(reaction ?? "null")).toEqual({ 0: deliveryIdOf("👍") });
+	expect(JSON.parse((await settle("silent", "stay quiet")) ?? "null")).toEqual({ none: "silent" });
+	expect(JSON.parse((await settle("failed", "fail please")) ?? "null")).toEqual({ none: "turn_failed" });
+	expect(database.inboundTerminalLinkAudit(new Date(0).toISOString())).toEqual({ done: 4, unlinked: 0 });
+	client.close();
 });
 
-test("clipContextBody: handles empty string", () => {
-	expect(clipContextBody("", 100)).toBe("");
+test("an answer that quotes [SILENT] in markdown code is delivered, not settled as silent", async () => {
+	// Live pilot 2026-09-29: two written answers explaining the gateway listed
+	// "`[SILENT]`(답하지 않기)" as a protocol marker; the embedded-marker check
+	// dropped the whole reply and the trigger closed as {"none":"silent"}.
+	const answer = [
+		"게이트웨이는 디스코드와 저 사이의 중계 서버예요.",
+		"```\n디스코드 ⇄ adapter-discord ⇄ 게이트웨이 ⇄ [SILENT] ⇄ 제 세션\n```",
+		"- **답장 표시**: 👀 리액션, 답글 지정, `[SILENT]`(답하지 않기) 같은 표시를 해석해요.",
+	].join("\n");
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => (text.includes("quoted marker") ? answer : "answer then [SILENT]"),
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "quoted-silent", "quoted marker please");
+	await waitUntil(() => sessionPort.sends.length === 1);
+	const opRef = sessionPort.sends[0]?.opRef ?? "";
+	await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+	const delivered = client.frames.filter((frame) => frame.event === "chat.message");
+	expect(delivered.map((frame) => frame.payload.text)).toEqual([answer]);
+	expect(JSON.parse(database.inboundTurnRow(opRef)?.terminal_delivery_id ?? "null")).toEqual({
+		0: delivered[0]?.payload.deliveryId,
+	});
+	// A bare marker outside code still silences the part.
+	send(client, "bare-silent", "bare marker");
+	await waitUntil(() => sessionPort.sends.length === 2);
+	const bareOpRef = sessionPort.sends[1]?.opRef ?? "";
+	await waitUntil(() => database.inboundTurnRow(bareOpRef)?.turn_state === "done");
+	expect(JSON.parse(database.inboundTurnRow(bareOpRef)?.terminal_delivery_id ?? "null")).toEqual({ none: "silent" });
+	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(1);
+	client.close();
 });
 
-test("clipContextBody: handles limit of 1", () => {
-	const result = clipContextBody("hello", 1);
-	expect(result).toContain("h");
-	expect(result).toContain("…[clipped:");
+test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, _preamble, _progress, options) => {
+			options?.onAssistantText?.("[REACT:👍]");
+			throw new Error("runtime failed after visible reaction");
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "reaction-trigger", "owner request");
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	const messages = client.frames.filter((frame) => frame.event === "chat.message");
+	expect(messages).toHaveLength(1);
+	expect(messages[0]?.payload.reaction).toMatchObject({ targetMessageId: "reaction-trigger", emoji: "👍" });
+	client.close();
 });
 
-test("clipContextBody: handles unicode text", () => {
-	const emoji = "👍".repeat(100); // Each emoji is multiple bytes
-	const result = clipContextBody(emoji, 50);
-	expect(result).toContain("…[clipped:");
-	expect(result).toContain("first 50");
+test("/new retires a pre-reset trigger queued behind an in-flight turn", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			turns.push(text);
+			if (turns.length === 1) await gate;
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "running-trigger", "running owner request");
+	await waitUntil(() => turns.length === 1);
+	send(client, "queued-before-reset", "must never run after reset");
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 1);
+	send(client, "reset-while-busy", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-while-busy"));
+	release?.();
+	// The retired turn settles from status once released; the queued-behind
+	// message rode into it as a steer and must never become a fresh turn.
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	expect(turns).toHaveLength(1);
+	client.close();
 });
 
-test("clipContextBody: marker indicates message is complete", () => {
-	const result = clipContextBody("very long message text".repeat(100), 50);
-	expect(result).toContain("the message itself is complete");
+test("/new persists a floor that excludes pre-reset context after gateway restart", async () => {
+	const gatewayConfig = await config();
+	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	let { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({ messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" });
+	});
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+	client.close();
+	await server?.stop();
+	server = undefined;
+
+	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	({ client } = await start(gatewayConfig, database, sessionPort));
+	send(client, "post-reset", "new session request");
+	await waitUntil(() => turns.length === 1);
+	expect(turns[0]).not.toContain("old command");
+	expect(database.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
+	client.close();
+});
+
+test("epoch bootstrap commits on first terminal success and is not repeated after restart", async () => {
+	const gatewayConfig = await config();
+	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	});
+	let { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "bootstrap-first", "first request");
+	await waitUntil(() => preambles.length === 1);
+	expect(preambles[0]).toContain("## Session bootstrap");
+	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({
+		epoch: 0,
+		lastBootstrappedEpoch: 0,
+		byteCount: expect.any(Number),
+	});
+	send(client, "bootstrap-second", "second request");
+	await waitUntil(() => preambles.length === 2);
+	expect(preambles[1]).not.toContain("## Session bootstrap");
+	client.close();
+	await server?.stop();
+	server = undefined;
+
+	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	({ client } = await start(gatewayConfig, database, sessionPort));
+	send(client, "bootstrap-after-restart", "after restart");
+	await waitUntil(() => preambles.length === 3);
+	expect(preambles[2]).not.toContain("## Session bootstrap");
+	client.close();
+});
+
+test("pre-success failure retries the same stable bootstrap and intentional silence commits it", async () => {
+	const gatewayConfig = await config();
+	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	let attempt = 0;
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			if (attempt++ === 0) throw new Error("failed before delivery");
+			return "[SILENT]";
+		},
+	});
+	let { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "bootstrap-fail", "first request");
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
+	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
+	client.close();
+	await server?.stop();
+	server = undefined;
+	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	({ client } = await start(gatewayConfig, database, sessionPort));
+	send(client, "bootstrap-retry", "retry request");
+	await waitUntil(() => preambles.length === 2);
+	const marker = /bootstrap-id: (session-bootstrap:[a-f0-9]+)/.exec(preambles[0] ?? "")?.[1];
+	expect(marker).toBeString();
+	expect(preambles[1]).toContain(`bootstrap-id: ${marker}`);
+	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
+	expect(
+		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text === "[SILENT]"),
+	).toHaveLength(0);
+	client.close();
+});
+
+test("intermediate delivery failure keeps bootstrap pending but consumes the body before stable-marker retry", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const attempts: Array<{ text: string; preamble: string }> = [];
+	let first = true;
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text, preamble, _progress, options) => {
+			attempts.push({ text, preamble: preamble ?? "" });
+			if (first) {
+				first = false;
+				options?.onAssistantText?.("visible answer");
+				throw new Error("failed after delivery");
+			}
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "bootstrap-visible-fail", "body that must not replay");
+	// The visible answer ships (no mid-work gate); the failure after it posts no
+	// notice. The turn is over once the trigger row settles.
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
+	send(client, "bootstrap-visible-retry", "next body");
+	await waitUntil(() => attempts.length === 2);
+	const marker = /bootstrap-id: (session-bootstrap:[a-f0-9]+)/.exec(attempts[0]?.preamble ?? "")?.[1];
+	expect(attempts[1]?.preamble).toContain(`bootstrap-id: ${marker}`);
+	expect(attempts[1]?.text).toContain("body that must not replay");
+	expect(attempts[1]?.text.match(/next body/g)).toHaveLength(1);
+	client.close();
+});
+
+test("/new atomically establishes a fresh floor and pending epoch bootstrap", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	send(client, "before-reset-success", "before reset");
+	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
+	send(client, "bootstrap-reset", "/new");
+	await waitUntil(() => database.getSessionRecord(ORIGIN_KEY)?.epoch === 1);
+	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({ epoch: 1, lastBootstrappedEpoch: 0 });
+	expect(database.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
+	send(client, "after-reset-success", "after reset");
+	await waitUntil(() => preambles.length === 2);
+	expect(preambles[1]).toContain("epoch: 1");
+	expect(preambles[1]).toContain("## Session bootstrap");
+	client.close();
+});
+
+test("persistent sessions do not auto-rotate on a turn count", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	for (let turn = 0; turn < 3; turn++) {
+		send(client, `persistent-${turn}`, `turn ${turn}`);
+		await waitUntil(() => preambles.length === turn + 1);
+	}
+	expect(database.getSessionRecord(ORIGIN_KEY)?.epoch).toBe(0);
+	expect(preambles.filter((preamble) => preamble.includes("## Session bootstrap"))).toHaveLength(1);
+	client.close();
+});
+
+test("gateway startup prunes old consumed context even when the database was quiet", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async () => "ok",
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		const raw = new Database(gatewayConfig.dbPath);
+		raw
+			.query(
+				"INSERT INTO conversation_context (message_id, origin_key, body, received_at, consumed_at) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(
+				"quiet-old",
+				ORIGIN_KEY,
+				"old private body",
+				new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
+				new Date().toISOString(),
+			);
+		raw.close();
+	});
+	const inspected = new Database(gatewayConfig.dbPath, { readonly: true });
+	expect(inspected.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM conversation_context").get()?.n).toBe(0);
+	inspected.close();
+	client.close();
+});
+
+function unreadBlock(text: string): string {
+	const start = text.indexOf("[Unread messages in this conversation since your last reply]");
+	if (start < 0) return "";
+	const end = text.indexOf("\n\n", start);
+	return text.slice(start, end < 0 ? undefined : end);
+}
+
+test("issue #409: /new carries the messages of turns that failed after the last answer", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			if (text.includes("will fail")) throw new Error("intentional failure");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const reset = async (id: string) => {
+		send(client, id, "/new");
+		await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === id));
+	};
+
+	send(client, "msg1", "message one - answered");
+	await waitUntil(() => texts.length === 1);
+	await reset("reset-1");
+	send(client, "msg2", "message two - will fail");
+	await waitUntil(() => texts.length === 2);
+	await waitUntil(() => client.frames.some((frame) => JSON.stringify(frame).includes("[turn failed]")));
+	await reset("reset-2");
+	send(client, "msg3", "message three - after reset");
+	await waitUntil(() => texts.length === 3);
+
+	const unread = unreadBlock(texts[2]!);
+	expect(unread).toContain("message two - will fail");
+	expect(unread).not.toContain("message one - answered");
+	expect(texts[2]).not.toContain("expired outside floor");
+	client.close();
+});
+
+test("issue #409: /new after every turn was answered carries nothing", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+
+	send(client, "msg1", "message one");
+	await waitUntil(() => texts.length === 1);
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+	send(client, "msg2", "message two - after reset");
+	await waitUntil(() => texts.length === 2);
+
+	expect(unreadBlock(texts[1]!)).toBe("");
+	client.close();
 });
