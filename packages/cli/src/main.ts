@@ -511,25 +511,40 @@ async function chat(socket: string): Promise<void> {
 /**
  * Poll for memory operation completion. Memory operations (audit, autolink) are
  * long-running and return an opRef immediately; this function polls for the result.
+ * If the CLI wait expires before completion, report 'still running' instead of failure.
  */
-async function pollMemoryOp(client: GajaewayClient, opRef: string, maxWaitMs = 600_000): Promise<unknown> {
+async function pollMemoryOp(
+	client: GajaewayClient,
+	opRef: string,
+	maxWaitMs = 300_000, // 5 min default CLI timeout
+): Promise<{ status: "completed" | "failed" | "still_running"; result?: unknown; error?: string }> {
 	const startTime = Date.now();
-	const pollIntervalMs = 100; // Poll every 100ms
+	const pollIntervalMs = 1_000; // Poll every 1s (not 100ms to reduce load on long ops)
 
 	while (Date.now() - startTime < maxWaitMs) {
-		const status = await client.request<{ status: "pending" | "completed"; result?: unknown }>("memory.status", {
-			opRef,
-		});
+		const status = await client.request<{
+			status: "pending" | "completed" | "failed";
+			result?: unknown;
+			error?: string;
+		}>("memory.status", { opRef });
 
 		if (status.status === "completed") {
-			return status.result;
+			return { status: "completed", result: status.result };
+		}
+
+		if (status.status === "failed") {
+			return { status: "failed", error: status.error };
 		}
 
 		// Wait before polling again
 		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
 	}
 
-	throw new Error(`memory operation ${opRef} timed out after ${maxWaitMs}ms`);
+	// CLI wait expired, but operation may still be running on the server
+	console.error(
+		`memory operation still running (${Math.round((Date.now() - startTime) / 1000)}s elapsed).\nCheck status: gajaeway memory.status ${opRef}`,
+	);
+	return { status: "still_running" };
 }
 
 export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
@@ -727,15 +742,31 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					if (parsed.rest[0] === "audit") {
 						// Request audit operation; get opRef and poll for completion
 						const initResp = await client.request<{ opRef: string }>("memory.audit");
-						const result = await pollMemoryOp(client, initResp.opRef);
-						const auditResult = result as { ok?: boolean; issues?: unknown[] };
-						console.log(JSON.stringify(auditResult.issues ?? []));
-						if (!auditResult.ok) process.exitCode = 1;
+						const poll = await pollMemoryOp(client, initResp.opRef);
+						if (poll.status === "failed") {
+							console.error(`audit failed: ${poll.error}`);
+							process.exitCode = 1;
+						} else if (poll.status === "still_running") {
+							// Operation is still running; exit with distinct code so it's not reported as failure
+							process.exitCode = 75;
+						} else {
+							const auditResult = poll.result as { ok?: boolean; issues?: unknown[] };
+							console.log(JSON.stringify(auditResult?.issues ?? []));
+							if (!auditResult?.ok) process.exitCode = 1;
+						}
 					} else if (parsed.rest[0] === "autolink") {
 						// Request autolink operation; get opRef and poll for completion
 						const initResp = await client.request<{ opRef: string }>("memory.autolink");
-						const result = await pollMemoryOp(client, initResp.opRef);
-						console.log(JSON.stringify(result));
+						const poll = await pollMemoryOp(client, initResp.opRef);
+						if (poll.status === "failed") {
+							console.error(`autolink failed: ${poll.error}`);
+							process.exitCode = 1;
+						} else if (poll.status === "still_running") {
+							// Operation is still running; exit with distinct code so it's not reported as failure
+							process.exitCode = 75;
+						} else {
+							console.log(JSON.stringify(poll.result));
+						}
 					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),

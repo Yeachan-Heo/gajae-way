@@ -331,7 +331,7 @@ test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommi
 	}
 });
 
-test("issue #473: slow autolinkCorpus completes successfully without client timeout", async () => {
+test("issue #473: autolinkCorpus completes without client timeout when tracked async", async () => {
 	// Verify that memory.autolink operations can take longer than the 30s default
 	// client timeout without reporting false failures. The async tracking (opRef + polling)
 	// contract ensures the CLI gets the actual result instead of a timeout error.
@@ -359,5 +359,5 @@ test("issue #473: slow autolinkCorpus completes successfully without client time
 	expect(report.linksAdded).toBeDefined();
 	expect(report.aliases).toBeDefined();
 
-	console.log(`autolinkCorpus completed in ${elapsed}ms (slow operation, no client timeout via opRef polling)`);
+	console.log(`autolinkCorpus completed in ${elapsed}ms (async tracked, no false timeout)`);
 });

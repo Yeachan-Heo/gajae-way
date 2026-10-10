@@ -291,9 +291,11 @@ async function applyConfigReload(
 }
 
 interface MemoryOpStatus {
-	status: "pending" | "completed";
+	status: "pending" | "completed" | "failed";
 	result?: unknown;
+	error?: string;
 	startedAt: string;
+	expireAt: string; // For pruning old operations
 }
 
 interface Runtime {
@@ -743,6 +745,31 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		60 * 60 * 1000,
 	);
+	// Clean up expired memory operations to prevent unbounded growth (#473)
+	const memoryOpsCleanupTimer = setInterval(() => {
+		try {
+			const now = Date.now();
+			let expired = 0;
+			for (const [opRef, op] of Array.from(runtime.memoryOps.entries())) {
+				if (new Date(op.expireAt).getTime() < now) {
+					runtime.memoryOps.delete(opRef);
+					expired++;
+				}
+			}
+			// Cap the map size to prevent unbounded memory growth
+			if (runtime.memoryOps.size > 10_000) {
+				const entries = Array.from(runtime.memoryOps.entries()).sort(
+					([, a], [, b]) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime(),
+				);
+				while (entries.length > 5_000) {
+					const [opRef] = entries.shift()!;
+					runtime.memoryOps.delete(opRef);
+				}
+			}
+		} catch (error) {
+			console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
+		}
+	}, 5 * 60 * 1000); // Every 5 minutes
 	// History GC: bounded batches with a macrotask yield between them so a large
 	// backlog never holds the event loop (and the single writer) for long.
 	let retentionRunning = false;
@@ -1265,30 +1292,50 @@ async function handleRequest(
 		}
 		case "memory.audit": {
 			// Track async memory operations to prevent client timeouts during long operations (#473).
-			// Return immediately with opRef; operation continues in background.
-			const opRef = `gw-ma-${crypto.randomUUID()}`;
-			const started = new Date().toISOString();
-			runtime.memoryOps.set(opRef, { status: "pending", startedAt: started });
+			// Reject concurrent audits; return existing opRef if one is pending.
+			const existing = Array.from(runtime.memoryOps.values()).find(
+				(op) => op.status === "pending" && op.startedAt,
+			);
+			let opRef: string;
+			let started: string;
+			let expireAt: string;
 
-			// Start operation asynchronously; client gets opRef immediately.
-			void (async () => {
-				try {
-					const root = await initializeMemory(options.config.home);
-					const issues = await validateMemory(root);
-					const result = { ok: issues.length === 0, issues };
-					const stored = runtime.memoryOps.get(opRef);
-					if (stored) {
-						stored.status = "completed";
-						stored.result = result;
-					}
-				} catch (error) {
-					const stored = runtime.memoryOps.get(opRef);
-					if (stored) {
-						stored.status = "completed";
-						stored.result = { error: diagnostic(error) };
-					}
+			if (existing) {
+				// Reuse pending operation
+				opRef = Array.from(runtime.memoryOps.entries()).find(([_, op]) => op === existing)?.[0] ?? ``;
+				if (!opRef) {
+					opRef = `gw-ma-${crypto.randomUUID()}`;
+					started = new Date().toISOString();
+					expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+					runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
 				}
-			})();
+			} else {
+				// Start new operation
+				opRef = `gw-ma-${crypto.randomUUID()}`;
+				started = new Date().toISOString();
+				expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+				runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+
+				// Start operation asynchronously; client gets opRef immediately.
+				void (async () => {
+					try {
+						const root = await initializeMemory(options.config.home);
+						const issues = await validateMemory(root);
+						const result = { ok: issues.length === 0, issues };
+						const stored = runtime.memoryOps.get(opRef);
+						if (stored) {
+							stored.status = "completed";
+							stored.result = result;
+						}
+					} catch (error) {
+						const stored = runtime.memoryOps.get(opRef);
+						if (stored) {
+							stored.status = "failed";
+							stored.error = diagnostic(error);
+						}
+					}
+				})();
+			}
 
 			connection.write({
 				v: PROFILE_VERSION,
@@ -1303,28 +1350,49 @@ async function handleRequest(
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
-			const opRef = `gw-ml-${crypto.randomUUID()}`;
-			const started = new Date().toISOString();
-			runtime.memoryOps.set(opRef, { status: "pending", startedAt: started });
+			// Reject concurrent autolinking; return existing opRef if one is pending.
+			const existing = Array.from(runtime.memoryOps.values()).find(
+				(op) => op.status === "pending" && op.startedAt,
+			);
+			let opRef: string;
+			let started: string;
+			let expireAt: string;
 
-			// Start operation asynchronously; client gets opRef immediately.
-			void (async () => {
-				try {
-					const root = await initializeMemory(options.config.home);
-					const report = await autolinkCorpus(root, runtime.memory);
-					const stored = runtime.memoryOps.get(opRef);
-					if (stored) {
-						stored.status = "completed";
-						stored.result = report;
-					}
-				} catch (error) {
-					const stored = runtime.memoryOps.get(opRef);
-					if (stored) {
-						stored.status = "completed";
-						stored.result = { error: diagnostic(error) };
-					}
+			if (existing) {
+				// Reuse pending operation
+				opRef = Array.from(runtime.memoryOps.entries()).find(([_, op]) => op === existing)?.[0] ?? ``;
+				if (!opRef) {
+					opRef = `gw-ml-${crypto.randomUUID()}`;
+					started = new Date().toISOString();
+					expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+					runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
 				}
-			})();
+			} else {
+				// Start new operation
+				opRef = `gw-ml-${crypto.randomUUID()}`;
+				started = new Date().toISOString();
+				expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+				runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+
+				// Start operation asynchronously; client gets opRef immediately.
+				void (async () => {
+					try {
+						const root = await initializeMemory(options.config.home);
+						const report = await autolinkCorpus(root, runtime.memory);
+						const stored = runtime.memoryOps.get(opRef);
+						if (stored) {
+							stored.status = "completed";
+							stored.result = report;
+						}
+					} catch (error) {
+						const stored = runtime.memoryOps.get(opRef);
+						if (stored) {
+							stored.status = "failed";
+							stored.error = diagnostic(error);
+						}
+					}
+				})();
+			}
 
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 			return;
@@ -1351,7 +1419,11 @@ async function handleRequest(
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { status: op.status, ...(op.result ? { result: op.result } : {}) },
+				result: {
+					status: op.status,
+					...(op.result ? { result: op.result } : {}),
+					...(op.error ? { error: op.error } : {}),
+				},
 			});
 			return;
 		}
