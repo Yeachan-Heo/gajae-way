@@ -195,23 +195,26 @@ test("respects sqlite journalMode configuration (issue #440)", async () => {
 		// Test default WAL mode
 		const walPath = join(directory, "wal.db");
 		const walDb = await GatewayDatabase.open(walPath);
-		const walMode = walDb.nativeDatabase.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
-		expect(walMode?.journal_mode).toBe("wal");
+		expect(walDb.getJournalMode()).toBe("wal");
 		walDb.close();
 
 		// Test DELETE mode configuration
 		const deletePath = join(directory, "delete.db");
 		const deleteDb = await GatewayDatabase.open(deletePath, { journalMode: "DELETE" });
-		const deleteMode = deleteDb.nativeDatabase.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
-		expect(deleteMode?.journal_mode).toBe("delete");
+		expect(deleteDb.getJournalMode()).toBe("delete");
 		deleteDb.close();
 
 		// Test TRUNCATE mode for NFS compatibility
 		const truncatePath = join(directory, "truncate.db");
 		const truncateDb = await GatewayDatabase.open(truncatePath, { journalMode: "TRUNCATE" });
-		const truncateMode = truncateDb.nativeDatabase.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
-		expect(truncateMode?.journal_mode).toBe("truncate");
+		expect(truncateDb.getJournalMode()).toBe("truncate");
 		truncateDb.close();
+
+		// Test PERSIST mode
+		const persistPath = join(directory, "persist.db");
+		const persistDb = await GatewayDatabase.open(persistPath, { journalMode: "PERSIST" });
+		expect(persistDb.getJournalMode()).toBe("persist");
+		persistDb.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

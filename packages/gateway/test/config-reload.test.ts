@@ -221,13 +221,13 @@ test("interim speech config parses non-negative integers and requires restart", 
 });
 
 test("sqlite journalMode is case-insensitive, accepts valid modes, and rejects invalid ones (issue #440)", async () => {
-	// Valid modes: DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF
-	for (const mode of ["DELETE", "delete", "TRUNCATE", "truncate", "PERSIST", "persist", "MEMORY", "memory", "WAL", "wal", "OFF", "off"]) {
+	// Valid modes: DELETE, TRUNCATE, PERSIST, WAL (OFF and MEMORY rejected to prevent DB corruption on crash)
+	for (const mode of ["DELETE", "delete", "TRUNCATE", "truncate", "PERSIST", "persist", "WAL", "wal"]) {
 		const config = parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: mode } });
 		expect(config.sqlite?.journalMode).toBe(mode.toUpperCase());
 	}
-	// Invalid modes should be rejected
-	for (const mode of ["INVALID", "wal2", "xyz"]) {
+	// Invalid modes should be rejected (including MEMORY and OFF which risk DB corruption)
+	for (const mode of ["INVALID", "wal2", "xyz", "MEMORY", "memory", "OFF", "off"]) {
 		expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: mode } })).toThrow(
 			/sqlite.journalMode must be one of/,
 		);

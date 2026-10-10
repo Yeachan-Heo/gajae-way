@@ -1915,7 +1915,10 @@ export class GatewayDatabase {
 		}
 	}
 
-	static async open(path: string, options: { readonly canonicalAgentDir?: string; readonly journalMode?: string } = {}): Promise<GatewayDatabase> {
+	static async open(
+		path: string,
+		options: { readonly canonicalAgentDir?: string; readonly journalMode?: string } = {},
+	): Promise<GatewayDatabase> {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
 		try {
@@ -4785,8 +4788,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		);
 	}
 
-	get nativeDatabase(): Database {
-		return this.#database;
+	getJournalMode(): string {
+		return this.#database.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode ?? "unknown";
 	}
 
 	close(): void {

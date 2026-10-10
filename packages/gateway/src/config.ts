@@ -547,10 +547,13 @@ function parseSqliteConfig(value: unknown): { readonly journalMode?: string } | 
 	if (input.journalMode !== undefined) {
 		const journalMode = optionalString(input.journalMode, "sqlite.journalMode");
 		if (journalMode) {
-			const validModes = ["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"];
+			const validModes = ["DELETE", "TRUNCATE", "PERSIST", "WAL"];
 			const upperMode = journalMode.toUpperCase();
 			if (!validModes.includes(upperMode))
-				throw new ConfigError("config_invalid", `sqlite.journalMode must be one of ${validModes.join(", ")}, got ${journalMode}`);
+				throw new ConfigError(
+					"config_invalid",
+					`sqlite.journalMode must be one of ${validModes.join(", ")}, got ${journalMode}`,
+				);
 			return { journalMode: upperMode };
 		}
 	}
@@ -581,6 +584,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const model = parseModel(input.model);
 	const serviceTier = parseServiceTier(input.serviceTier);
 	const runtime = parseRuntimeConfig(input.runtime);
+	const sqlite = parseSqliteConfig(input.sqlite);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -615,7 +619,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
-		...(parseSqliteConfig(input.sqlite) ? { sqlite: parseSqliteConfig(input.sqlite) } : {}),
+		...(sqlite ? { sqlite } : {}),
 	};
 }
 
