@@ -1597,19 +1597,33 @@ export class WorkLaneManager {
 					const hostLost = isSessionUnavailable(statusError) && (live.disowned || live.live === false);
 					if (hostLost)
 						console.error(`work_host_lost opRef=${runtime.opRef} session=${runtime.sessionId} source=recovery`);
-					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
-						terminal: {
-							kind: "local",
-							observedAt: this.#at(),
-							reasonCode: hostLost
-								? "host_lost"
-								: live.disowned || !this.#binding(runtime)
-									? "session_disowned"
-									: live.live === false
-										? "session_dead"
-										: "recovery_indeterminate",
+					const reasonCode = hostLost
+						? "host_lost"
+						: live.disowned || !this.#binding(runtime)
+							? "session_disowned"
+							: live.live === false
+								? "session_dead"
+								: "recovery_indeterminate";
+					const at = this.#at();
+					// Settle the attempt atomically with terminal evidence.
+					// This prevents torn rows where lane_jobs is closed but work_attempt_runtime is unsettled.
+					const settled = this.#db.workAttemptSettle(
+						runtime.opRef,
+						runtime.version,
+						this.#job(runtime.sessionKey.slice("work/task/".length), true)!,
+						{
+							decision: "suppressed",
+							settledAt: at,
+							terminal: {
+								kind: "local",
+								observedAt: at,
+								reasonCode,
+							},
 						},
-					});
+					);
+					if (settled) {
+						this.#finishWaiters(runtime.opRef);
+					}
 					this.#schedule(observer, 0);
 				}
 			}

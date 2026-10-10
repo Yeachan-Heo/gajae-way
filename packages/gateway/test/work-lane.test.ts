@@ -2006,7 +2006,9 @@ test("#308 restart recovery classifies a router-disowned open attempt as host_lo
 	f.port.setSessionState(result.sessionId, { live: false });
 	await f.restart();
 	await until(() => f.db.workAttemptOpen().length === 0);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	const settled = f.db.workAttemptGet(result.opRef);
+	expect(settled?.terminal?.reasonCode).toBe("host_lost");
+	expect(settled?.settledAt).toBeTruthy(); // Verify that work_attempt_runtime is properly settled (#401)
 	expect(f.job().state).toBe("attempt_ended");
 	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true });
 });
