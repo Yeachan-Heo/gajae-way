@@ -1,5 +1,7 @@
 import {
 	type ChatMessagePayload,
+	type FileRef,
+	fileFallbackText,
 	isSilentOutput,
 	type OriginRef,
 	originKey,
@@ -126,6 +128,43 @@ export class DeliveryService {
 			originKey: originKey(origin),
 			payloadJson: JSON.stringify(payload),
 		});
+		return payload;
+	}
+	/**
+	 * A file upload is a ledger delivery for the same reasons a reaction is: the
+	 * adapter settles it with delivery.confirm / delivery.fail and it survives a
+	 * restart. The caller passes a deterministic id, so a reply re-read on the
+	 * terminal pass (or replayed after a restart) cannot upload the file twice.
+	 *
+	 * Mid-turn by construction (`final: false`): the turn's text reply or final
+	 * progress tick ends the working status, not an attachment.
+	 */
+	prepareFile(
+		turnId: string,
+		origin: OriginRef,
+		file: FileRef,
+		deliveryId: string,
+		replyToMessageId?: string,
+	): ChatMessagePayload | undefined {
+		const payload: ChatMessagePayload = {
+			turnId,
+			origin,
+			role: "assistant",
+			text: fileFallbackText(file),
+			final: false,
+			deliveryId,
+			...(replyToMessageId ? { replyToMessageId } : {}),
+			file,
+		};
+		if (
+			!this.#ledger.createPending({
+				deliveryId,
+				turnId,
+				originKey: originKey(origin),
+				payloadJson: JSON.stringify(payload),
+			})
+		)
+			return undefined;
 		return payload;
 	}
 	markInflight(deliveryId: string): void {
