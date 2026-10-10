@@ -11,7 +11,6 @@ import {
 	mapListsAxis,
 	memoryGit,
 	regenerateMap,
-	validateMemory,
 } from "../src/memory/doctrine";
 import {
 	type AxisDescriptor,

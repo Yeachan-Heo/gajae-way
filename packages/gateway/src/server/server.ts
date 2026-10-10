@@ -1427,7 +1427,7 @@ async function handleRequest(
 			const params = (request.params ?? {}) as { opRef?: unknown };
 			if (typeof params.opRef !== "string") throw new ProtocolError("invalid_params", "memory.status requires opRef");
 			const op = runtime.memoryOps.get(params.opRef);
-			if (!op) throw new ProtocolError("not_found", `operation ${params.opRef} not found`);
+			if (!op) throw new ProtocolError("invalid_params", `unknown opRef: ${params.opRef}`);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
