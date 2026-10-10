@@ -3,10 +3,11 @@ import type { OriginPlatform } from "./origin";
 /**
  * Outbound file attachments for the gajaeway profile.
  *
- * A reply part may carry one or more `[FILE:<absolute path>]` tokens anywhere in
- * its text. Each token becomes its own ledger delivery (like a reaction), so an
- * upload is settled, retried and recovered exactly like a message, and the
- * tokens themselves never reach the room.
+ * A reply may carry `MEDIA:<absolute path>` directives, each on a line of its
+ * own (the Hermes Agent convention, also used by the Discord adapter's native
+ * attachments). Each directive becomes its own ledger delivery (like a
+ * reaction), so an upload is settled, retried and recovered exactly like a
+ * message, and the directive lines themselves never reach the room.
  *
  * The path names a file on the host the gateway and its adapters share. The
  * gateway checks it (absolute, a regular file, bounded size, outside the
@@ -30,10 +31,10 @@ export interface FileReply {
 
 /** Upper bound per file; Slack accepts far more, but a chat reply is not a file transfer service. */
 export const OUTBOUND_FILE_MAX_BYTES = 50 * 1024 * 1024;
-/** At most this many files per turn; extra tokens are dropped with a notice. */
+/** At most this many files per turn; extra directives are refused with a notice. */
 export const OUTBOUND_FILES_PER_TURN_CAP = 5;
 
-const FILE_TOKEN = /\[FILE:([^\]\n]+)\]/g;
+const MEDIA_PREFIX = "MEDIA:";
 
 /** Platforms whose adapter uploads `file` deliveries; others would only see the text fallback. */
 const FILE_PLATFORMS: ReadonlySet<OriginPlatform> = new Set(["slack"]);
@@ -43,22 +44,30 @@ export function platformSupportsFiles(platform: OriginPlatform): boolean {
 }
 
 /**
- * Extracts `[FILE:<path>]` tokens. Returns undefined when the text has none, so
- * the common case leaves the reply untouched.
+ * Extracts standalone `MEDIA:<path>` lines. Returns undefined when the text has
+ * none, so the common case leaves the reply untouched. A line counts only when
+ * it starts with `MEDIA:` and names a path; prose that merely mentions the word
+ * is left alone.
  */
 export function parseFileReply(text: string): FileReply | undefined {
 	const paths: string[] = [];
-	for (const match of text.matchAll(FILE_TOKEN)) {
-		const path = (match[1] ?? "").trim();
-		if (path && !paths.includes(path)) paths.push(path);
+	const kept: string[] = [];
+	for (const line of text.split(/\r?\n/)) {
+		const path = line.startsWith(MEDIA_PREFIX) ? line.slice(MEDIA_PREFIX.length).trim() : "";
+		if (!path) {
+			kept.push(line);
+			continue;
+		}
+		if (!paths.includes(path)) paths.push(path);
 	}
 	if (paths.length === 0) return undefined;
-	const body = text
-		.replace(FILE_TOKEN, "")
-		.replace(/[^\S\n]+\n/g, "\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
-	return { paths, body };
+	return {
+		paths,
+		body: kept
+			.join("\n")
+			.replace(/\n{3,}/g, "\n\n")
+			.trim(),
+	};
 }
 
 /** The visible text of a file delivery: what an adapter without upload support posts instead. */
