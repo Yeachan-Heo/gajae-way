@@ -316,20 +316,21 @@ export function pruneExpiredMemoryOps(memoryOps: Map<string, MemoryOpStatus>, no
 
 /**
  * Get or create a pending memory operation of a specific kind.
- * Returns opRef of existing pending operation (if any), or creates and returns new one.
+ * Returns opRef and created flag: created=true means a new operation was just created
+ * and the caller should start the sweep; created=false means it's reusing an existing pending op.
  * Ensures kind-specific deduplication: audit pending ops never dedup autolink requests and vice versa.
  */
 export function getOrCreatePendingMemoryOp(
 	memoryOps: Map<string, MemoryOpStatus>,
 	kind: "audit" | "autolink",
-): string {
+): { opRef: string; created: boolean } {
 	// Check for existing pending operation of the SAME kind
 	for (const [opRef, op] of Array.from(memoryOps.entries())) {
 		if (op.status === "pending") {
 			// Distinguish by opRef prefix: gw-ma- (audit), gw-ml- (autolink)
 			const opKind = opRef.startsWith("gw-ma-") ? "audit" : "autolink";
 			if (opKind === kind) {
-				return opRef; // Reuse existing pending operation of same kind
+				return { opRef, created: false }; // Reuse existing pending operation of same kind
 			}
 		}
 	}
@@ -340,7 +341,7 @@ export function getOrCreatePendingMemoryOp(
 	const started = new Date().toISOString();
 	const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 	memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
-	return opRef;
+	return { opRef, created: true };
 }
 
 interface MemoryOpStatus {
@@ -1329,12 +1330,9 @@ async function handleRequest(
 		case "memory.audit": {
 			// Track async memory operations to prevent client timeouts during long operations (#473).
 			// Kind-specific deduplication: audit requests don't dedup with autolink operations.
-			const opRef = getOrCreatePendingMemoryOp(runtime.memoryOps, "audit");
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "audit");
 
-			// Check if this is a new operation (just created)
-			const isNew = !runtime.memoryOps.get(opRef) || runtime.memoryOps.get(opRef)?.startedAt === new Date().toISOString();
-
-			if (!isNew) {
+			if (!created) {
 				// Already running; return existing opRef
 				connection.write({
 					v: PROFILE_VERSION,
@@ -1379,12 +1377,9 @@ async function handleRequest(
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
 			// Kind-specific deduplication: autolink requests don't dedup with audit operations.
-			const opRef = getOrCreatePendingMemoryOp(runtime.memoryOps, "autolink");
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "autolink");
 
-			// Check if this is a new operation (just created)
-			const isNew = !runtime.memoryOps.get(opRef) || runtime.memoryOps.get(opRef)?.startedAt === new Date().toISOString();
-
-			if (!isNew) {
+			if (!created) {
 				// Already running; return existing opRef
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 				return;

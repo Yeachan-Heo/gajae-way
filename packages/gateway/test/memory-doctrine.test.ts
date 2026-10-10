@@ -362,8 +362,8 @@ test("issue #473: autolinkCorpus completes without client timeout when tracked a
 });
 
 test("issue #473: getOrCreatePendingMemoryOp deduplicates same-kind requests", async () => {
-	// Verify the actual getOrCreatePendingMemoryOp function returns the same opRef
-	// for concurrent requests of the same kind (autolink or audit).
+	// Verify the actual getOrCreatePendingMemoryOp function returns created flag and
+	// returns the same opRef for concurrent requests of the same kind (autolink or audit).
 
 	interface MemoryOpStatus {
 		status: "pending" | "completed" | "failed";
@@ -375,25 +375,29 @@ test("issue #473: getOrCreatePendingMemoryOp deduplicates same-kind requests", a
 
 	const memoryOps = new Map<string, MemoryOpStatus>();
 
-	// First autolink request creates pending operation
-	const opRef1 = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	// First autolink request creates pending operation (created=true)
+	const { opRef: opRef1, created: created1 } = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(created1).toBe(true); // First request creates
 	expect(memoryOps.has(opRef1)).toBe(true);
 	expect(memoryOps.get(opRef1)?.status).toBe("pending");
 
-	// Second autolink request reuses the same opRef (deduplication)
-	const opRef2 = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	// Second autolink request reuses the same opRef (created=false)
+	const { opRef: opRef2, created: created2 } = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(created2).toBe(false); // Second request reuses
 	expect(opRef2).toBe(opRef1);
 	expect(memoryOps.size).toBe(1); // Still only one operation in map
 
 	// Audit request creates separate operation (not dedup'd with autolink)
-	const auditOpRef = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	const { opRef: auditOpRef, created: auditCreated } = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(auditCreated).toBe(true); // Audit creates new operation
 	expect(auditOpRef).not.toBe(opRef1); // Different opRef
 	expect(auditOpRef.startsWith("gw-ma-")).toBe(true); // Audit prefix
 	expect(opRef1.startsWith("gw-ml-")).toBe(true); // Autolink prefix
 	expect(memoryOps.size).toBe(2); // Two separate operations
 
-	// Second audit request reuses audit opRef (not the autolink one)
-	const auditOpRef2 = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	// Second audit request reuses audit opRef (created=false)
+	const { opRef: auditOpRef2, created: auditCreated2 } = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(auditCreated2).toBe(false); // Second audit reuses
 	expect(auditOpRef2).toBe(auditOpRef);
 	expect(memoryOps.size).toBe(2); // Still two operations
 });
@@ -438,4 +442,73 @@ test("issue #473: pruneExpiredMemoryOps removes settled operations past TTL", as
 	expect(memoryOps.size).toBe(sizeBefore - 1);
 	expect(memoryOps.has("expired-op")).toBe(false);
 	expect(memoryOps.has("recent-op")).toBe(true);
+});
+
+test("issue #473: memory.autolink handler created flag controls sweep startup", async () => {
+	// Handler-level test: verify the created flag correctly indicates whether to start a sweep
+	// - First request: created=true (start sweep)
+	// - Second concurrent request: created=false (reuse opRef, don't start another sweep)
+
+	interface MemoryOpStatus {
+		status: "pending" | "completed" | "failed";
+		result?: unknown;
+		error?: string;
+		startedAt: string;
+		expireAt: string;
+	}
+
+	const memoryOps = new Map<string, MemoryOpStatus>();
+
+	// First autolink request: handler would start sweep only if created=true
+	const first = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(first.created).toBe(true); // Signal: start the sweep
+	
+	// Simulate operation being registered (as real handler would)
+	const op = memoryOps.get(first.opRef);
+	expect(op?.status).toBe("pending"); // Operation is now pending
+
+	// Second concurrent autolink request: handler would skip sweep if created=false
+	const second = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(second.created).toBe(false); // Signal: don't start another sweep
+	expect(second.opRef).toBe(first.opRef); // Same opRef
+	expect(memoryOps.size).toBe(1); // Still one operation
+});
+
+test("issue #473: memory.audit and memory.autolink don't dedup each other", async () => {
+	// Handler-level test: audit and autolink operations are tracked separately
+	// First audit request creates audit op (created=true)
+	// Concurrent autolink request creates autolink op (created=true)
+	// Second audit request reuses audit op (created=false)
+
+	interface MemoryOpStatus {
+		status: "pending" | "completed" | "failed";
+		result?: unknown;
+		error?: string;
+		startedAt: string;
+		expireAt: string;
+	}
+
+	const memoryOps = new Map<string, MemoryOpStatus>();
+
+	// First audit request
+	const audit1 = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(audit1.created).toBe(true);
+
+	// First autolink request (concurrent with audit)
+	const autolink1 = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(autolink1.created).toBe(true); // Creates separate operation
+	expect(autolink1.opRef).not.toBe(audit1.opRef); // Different opRef
+
+	// Second audit request
+	const audit2 = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(audit2.created).toBe(false); // Reuses audit op
+	expect(audit2.opRef).toBe(audit1.opRef);
+
+	// Second autolink request
+	const autolink2 = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(autolink2.created).toBe(false); // Reuses autolink op
+	expect(autolink2.opRef).toBe(autolink1.opRef);
+
+	// Two separate operations in map
+	expect(memoryOps.size).toBe(2);
 });
