@@ -542,7 +542,7 @@ async function pollMemoryOp(
 
 	// CLI wait expired, but operation may still be running on the server
 	console.error(
-		`memory operation still running (${Math.round((Date.now() - startTime) / 1000)}s elapsed).\nCheck status: gajaeway memory.status ${opRef}`,
+		`memory operation still running (${Math.round((Date.now() - startTime) / 1000)}s elapsed).\nCheck status: gajaeway memory status ${opRef}`,
 	);
 	return { status: "still_running" };
 }
@@ -731,12 +731,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "memory": {
-				const usage = "usage: gajaeway memory audit|memory autolink|memory search <query>";
+				const usage = "usage: gajaeway memory audit|autolink|search <query>|status <opRef>";
 				// An unrecognised argument is refused before the socket is opened rather
 				// than ignored: a run of `memory audit --fix` that silently degraded to a
 				// plain audit would read as a repair attempt that reproduced the failure.
 				if ((parsed.rest[0] === "audit" || parsed.rest[0] === "autolink") && parsed.rest.length > 1)
 					throw new Error(`${usage} (unknown argument: ${parsed.rest[1]})`);
+				if (parsed.rest[0] === "status" && parsed.rest.length < 2)
+					throw new Error(`${usage} (status requires opRef)`);
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {
@@ -771,6 +773,21 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),
 						);
+					} else if (parsed.rest[0] === "status" && parsed.rest[1]) {
+						const opRef = parsed.rest[1];
+						const result = await client.request<{
+							status: "pending" | "completed" | "failed";
+							result?: unknown;
+							error?: string;
+						}>("memory.status", { opRef });
+						if (result.status === "failed") {
+							console.error(`operation ${opRef} failed: ${result.error}`);
+							process.exitCode = 1;
+						} else if (result.status === "completed") {
+							console.log(JSON.stringify({ status: result.status, result: result.result }));
+						} else {
+							console.log(JSON.stringify({ status: result.status }));
+						}
 					} else throw new Error(usage);
 				} finally {
 					await client.close();
