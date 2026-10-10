@@ -1915,12 +1915,13 @@ export class GatewayDatabase {
 		}
 	}
 
-	static async open(path: string, options: { readonly canonicalAgentDir?: string } = {}): Promise<GatewayDatabase> {
+	static async open(path: string, options: { readonly canonicalAgentDir?: string; readonly journalMode?: string } = {}): Promise<GatewayDatabase> {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
 		try {
+			const journalMode = options.journalMode ?? "WAL";
 			database.exec(
-				"PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;",
+				`PRAGMA journal_mode = ${journalMode}; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;`,
 			);
 			// Create schema_migrations and broker_authority tables early so they can be used before full migration.
 			database.exec(
@@ -4782,6 +4783,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			this.#database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check ??
 			"unknown"
 		);
+	}
+
+	get nativeDatabase(): Database {
+		return this.#database;
 	}
 
 	close(): void {

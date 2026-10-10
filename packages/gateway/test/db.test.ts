@@ -188,3 +188,31 @@ test("refuses a database from a newer schema", async () => {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("respects sqlite journalMode configuration (issue #440)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-journal-mode-"));
+	try {
+		// Test default WAL mode
+		const walPath = join(directory, "wal.db");
+		const walDb = await GatewayDatabase.open(walPath);
+		const walMode = walDb.nativeDatabase.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
+		expect(walMode?.journal_mode).toBe("wal");
+		walDb.close();
+
+		// Test DELETE mode configuration
+		const deletePath = join(directory, "delete.db");
+		const deleteDb = await GatewayDatabase.open(deletePath, { journalMode: "DELETE" });
+		const deleteMode = deleteDb.nativeDatabase.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
+		expect(deleteMode?.journal_mode).toBe("delete");
+		deleteDb.close();
+
+		// Test TRUNCATE mode for NFS compatibility
+		const truncatePath = join(directory, "truncate.db");
+		const truncateDb = await GatewayDatabase.open(truncatePath, { journalMode: "TRUNCATE" });
+		const truncateMode = truncateDb.nativeDatabase.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
+		expect(truncateMode?.journal_mode).toBe("truncate");
+		truncateDb.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
