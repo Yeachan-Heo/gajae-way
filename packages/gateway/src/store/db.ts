@@ -652,7 +652,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 32;
+const LATEST_SCHEMA_VERSION = 33;
 
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
@@ -3818,10 +3818,11 @@ export class GatewayDatabase {
 		modelJson: string | null;
 		serviceTier: string | null;
 		procedureFilesJson?: string | null;
+		reportToJson?: string | null;
 	}): void {
 		this.#database
 			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json, report_to_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				row.id,
@@ -3837,6 +3838,7 @@ export class GatewayDatabase {
 				row.modelJson,
 				row.serviceTier,
 				row.procedureFilesJson ?? null,
+				row.reportToJson ?? null,
 			);
 	}
 	monitorRows(): Array<{
@@ -3853,10 +3855,11 @@ export class GatewayDatabase {
 		model_json: string | null;
 		service_tier: string | null;
 		procedure_files_json: string | null;
+		report_to_json: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json, report_to_json FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -3872,6 +3875,7 @@ export class GatewayDatabase {
 			model_json: string | null;
 			service_tier: string | null;
 			procedure_files_json: string | null;
+			report_to_json: string | null;
 		}>;
 	}
 	monitorUpdate(row: {
@@ -3886,11 +3890,12 @@ export class GatewayDatabase {
 		modelJson: string | null;
 		serviceTier: string | null;
 		procedureFilesJson: string | null;
+		reportToJson?: string | null;
 	}): boolean {
 		return (
 			this.#database
 				.query(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ? WHERE monitor_id = ?",
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ?, report_to_json = ? WHERE monitor_id = ?",
 				)
 				.run(
 					row.name,
@@ -3903,6 +3908,7 @@ export class GatewayDatabase {
 					row.modelJson,
 					row.serviceTier,
 					row.procedureFilesJson,
+					row.reportToJson ?? null,
 					row.id,
 				).changes > 0
 		);
@@ -5450,6 +5456,21 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(32, new Date().toISOString());
+			});
+		}
+		if (current < 33) {
+			// Issue #474: Add reportTo field to monitor specs for injecting results as internal reports.
+			this.withTransaction(() => {
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitors)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("report_to_json")) this.#database.exec("ALTER TABLE monitors ADD COLUMN report_to_json TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(33, new Date().toISOString());
 			});
 		}
 	}

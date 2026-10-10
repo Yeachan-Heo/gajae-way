@@ -512,6 +512,13 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/**
+	 * Report monitor results as an internal report turn into the named conversation's session.
+	 * When set, after the monitor event settles, its result is injected as a lane report
+	 * into the specified conversation. The session and conversation must exist and be valid.
+	 * Unset means monitor results are only delivered to channelTarget (default behavior).
+	 */
+	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
 }
 
