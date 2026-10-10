@@ -1607,32 +1607,19 @@ export class WorkLaneManager {
 					const at = this.#at();
 					// Settle the attempt atomically with terminal evidence.
 					// This prevents torn rows where lane_jobs is closed but work_attempt_runtime is unsettled.
-				const job = this.#job(runtime.sessionKey.slice("work/task/".length), true);
-				if (!job) {
-					this.#schedule(observer, 0);
-					continue;
-				}
-				const settled = this.#db.workAttemptSettle(
-					runtime.opRef,
-					runtime.version,
-					job,
-					{
-						decision: "no_target",
-						settledAt: at,
-						terminal: {
-							kind: "local",
-							observedAt: at,
-							reasonCode,
+					const settled = this.#db.workAttemptSettle(
+						runtime.opRef,
+						runtime.version,
+						this.#job(runtime.sessionKey.slice("work/task/".length), true)!,
+						{
+							decision: "suppressed",
+							settledAt: at,
+							terminal: {
+								kind: "local",
+								observedAt: at,
+								reasonCode,
+							},
 						},
-						output: {
-							disposition: "unavailable",
-							reads: 0,
-							nextReadAt: null,
-							excerpt: null,
-							proof: null,
-							knownSilence: null,
-						},
-					},
 					);
 					if (settled) {
 						this.#finishWaiters(runtime.opRef);
