@@ -15,7 +15,7 @@ import {
 	type SessionModelChoicesResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
-import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
+import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, MessageType, Partials } from "discord.js";
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
@@ -186,6 +186,8 @@ export interface DiscordClientLike {
 export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike, AttachmentCarrier {
 	readonly id: string;
 	readonly content: string;
+	/** Discord system-message kind; 18 is the THREAD_CREATED announcement. */
+	readonly type?: number;
 	readonly createdTimestamp?: number;
 	readonly author: {
 		readonly id: string;
@@ -279,6 +281,9 @@ export function decideInbound(
 	_channels: Readonly<Record<string, ChannelEngagementPolicy>> | undefined,
 ): EngagementContext | undefined {
 	if (message.id === undefined) return undefined;
+	// Discord emits a system message in the parent channel when a thread is
+	// created. It describes the channel event, not a user-authored conversation.
+	if (message.type === MessageType.ThreadCreated) return undefined;
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	if (botId !== "" && message.author.id === botId) return undefined;
 	return engagementForMessage(message, botUser);

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { MessageType } from "discord.js";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import {
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
 	deriveThreadName,
+	decideInbound,
 	engagementForMessage,
 	type GatewayClientLike,
 	handleModelAutocomplete,
@@ -136,6 +138,18 @@ test("maps guild channels, threads, and DMs to canonical Discord origins", () =>
 		kind: "dm",
 		conversationId: "dm-1",
 		peerId: "author-1",
+	});
+});
+
+test("ignores Discord thread-created system announcements but accepts ordinary messages", () => {
+	// A thread-start notification is transport metadata, not a conversation turn; normal channel messages remain eligible.
+	const bot = { id: "bot.1" };
+	const base = { id: "message-1", content: "hello", author, channel: { id: "channel-1" } };
+	expect(decideInbound({ ...base, type: MessageType.ThreadCreated }, bot, undefined)).toBeUndefined();
+	expect(decideInbound({ ...base, type: MessageType.Default }, bot, undefined)).toEqual({
+		mentioned: false,
+		group: true,
+		authorId: "author-1",
 	});
 });
 
