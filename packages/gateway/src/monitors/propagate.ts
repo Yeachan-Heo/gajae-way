@@ -26,6 +26,7 @@ import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
 	type CompactionPort,
+	checkProofRequirement,
 	classifyAuthoringFailure,
 	classifyExecutorFailure,
 	classifyProtocolFailure,
@@ -34,7 +35,6 @@ import {
 	isAsideTimeoutFailure,
 	isAuthoredEchoSuspected,
 	isOrphanedExecutorFailure,
-	checkProofRequirement,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
@@ -960,8 +960,8 @@ export class MonitorPropagator {
 					if (isEcho) {
 						echoedEntries.push(entry);
 						// Log as authored_echo_suspected failure
-						this.#database.withTransaction(() => {
-							if (this.#database.monitorEventFencedFail(
+						if (
+							this.#database.monitorEventFencedFail(
 								entry.eventId,
 								leaseId,
 								batchId,
@@ -969,11 +969,11 @@ export class MonitorPropagator {
 								"delivery suppressed: note appears to echo instruction with no substantive evidence",
 								now(),
 								false,
-							)) {
-								// Also mark as contract_unmet terminal stage
-								this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
-							}
-						});
+							)
+						) {
+							// Also mark as contract_unmet terminal stage
+							this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
+						}
 					} else {
 						validDeliveryEntries.push(entry);
 					}
@@ -982,11 +982,11 @@ export class MonitorPropagator {
 				for (const entry of validDeliveryEntries) {
 					const eventRow = fenced.find((r) => r.event_id === entry.eventId);
 					if (!eventRow) continue;
-					const proofDetail = checkProofRequirement(null, eventRow.fired_at); // TODO: get proof_json from database
-					if (proofDetail !== null && proofDetail.startsWith("unverified")) {
+					const proofDetail = checkProofRequirement(eventRow.proof_json, eventRow.fired_at);
+					if (proofDetail?.startsWith("unverified")) {
 						// Proof requirement exists but is unverified
-						this.#database.withTransaction(() => {
-							if (this.#database.monitorEventFencedFail(
+						if (
+							this.#database.monitorEventFencedFail(
 								entry.eventId,
 								leaseId,
 								batchId,
@@ -994,11 +994,11 @@ export class MonitorPropagator {
 								proofDetail,
 								now(),
 								false,
-							)) {
-								// Mark as contract_unmet terminal stage
-								this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
-							}
-						});
+							)
+						) {
+							// Mark as contract_unmet terminal stage
+							this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "contract_unmet", batchId);
+						}
 						// Remove from delivery if proof not met
 						validDeliveryEntries.splice(validDeliveryEntries.indexOf(entry), 1);
 					}

@@ -236,6 +236,10 @@ test("#369 Issue Proposal 2: contract echo detection suppresses echo-suspected n
 			trigger: { kind: "cron", schedule: "*/5 * * * *" },
 			eventTypes: ["status.check"],
 			instruction,
+			channelTarget: {
+				origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
+				mentionUserIds: [],
+			},
 		});
 
 		const delivered: ChatMessagePayload[] = [];
@@ -282,6 +286,10 @@ test("#369 Issue Proposal 2: real work notes are delivered even if similar to in
 			trigger: { kind: "cron", schedule: "*/5 * * * *" },
 			eventTypes: ["status.check"],
 			instruction,
+			channelTarget: {
+				origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
+				mentionUserIds: [],
+			},
 		});
 
 		const delivered: ChatMessagePayload[] = [];
