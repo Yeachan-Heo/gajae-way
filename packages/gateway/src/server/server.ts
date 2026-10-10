@@ -314,6 +314,35 @@ export function pruneExpiredMemoryOps(memoryOps: Map<string, MemoryOpStatus>, no
 	}
 }
 
+/**
+ * Get or create a pending memory operation of a specific kind.
+ * Returns opRef of existing pending operation (if any), or creates and returns new one.
+ * Ensures kind-specific deduplication: audit pending ops never dedup autolink requests and vice versa.
+ */
+export function getOrCreatePendingMemoryOp(
+	memoryOps: Map<string, MemoryOpStatus>,
+	kind: "audit" | "autolink",
+): string {
+	// Check for existing pending operation of the SAME kind
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (op.status === "pending") {
+			// Distinguish by opRef prefix: gw-ma- (audit), gw-ml- (autolink)
+			const opKind = opRef.startsWith("gw-ma-") ? "audit" : "autolink";
+			if (opKind === kind) {
+				return opRef; // Reuse existing pending operation of same kind
+			}
+		}
+	}
+
+	// No pending operation of this kind; create new one
+	const prefix = kind === "audit" ? "gw-ma" : "gw-ml";
+	const opRef = `${prefix}-${crypto.randomUUID()}`;
+	const started = new Date().toISOString();
+	const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+	memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+	return opRef;
+}
+
 interface MemoryOpStatus {
 	status: "pending" | "completed" | "failed";
 	result?: unknown;
@@ -1299,50 +1328,42 @@ async function handleRequest(
 		}
 		case "memory.audit": {
 			// Track async memory operations to prevent client timeouts during long operations (#473).
-			// Reject concurrent audits; return existing opRef if one is pending.
-			const existing = Array.from(runtime.memoryOps.values()).find(
-				(op) => op.status === "pending" && op.startedAt,
-			);
-			let opRef: string;
-			let started: string;
-			let expireAt: string;
+			// Kind-specific deduplication: audit requests don't dedup with autolink operations.
+			const opRef = getOrCreatePendingMemoryOp(runtime.memoryOps, "audit");
 
-			if (existing) {
-				// Reuse pending operation
-				opRef = Array.from(runtime.memoryOps.entries()).find(([_, op]) => op === existing)?.[0] ?? ``;
-				if (!opRef) {
-					opRef = `gw-ma-${crypto.randomUUID()}`;
-					started = new Date().toISOString();
-					expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-					runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
-				}
-			} else {
-				// Start new operation
-				opRef = `gw-ma-${crypto.randomUUID()}`;
-				started = new Date().toISOString();
-				expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-				runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+			// Check if this is a new operation (just created)
+			const isNew = !runtime.memoryOps.get(opRef) || runtime.memoryOps.get(opRef)?.startedAt === new Date().toISOString();
 
-				// Start operation asynchronously; client gets opRef immediately.
-				void (async () => {
-					try {
-						const root = await initializeMemory(options.config.home);
-						const issues = await validateMemory(root);
-						const result = { ok: issues.length === 0, issues };
-						const stored = runtime.memoryOps.get(opRef);
-						if (stored) {
-							stored.status = "completed";
-							stored.result = result;
-						}
-					} catch (error) {
-						const stored = runtime.memoryOps.get(opRef);
-						if (stored) {
-							stored.status = "failed";
-							stored.error = diagnostic(error);
-						}
-					}
-				})();
+			if (!isNew) {
+				// Already running; return existing opRef
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { opRef },
+				});
+				return;
 			}
+
+			// Start operation asynchronously; client gets opRef immediately.
+			void (async () => {
+				try {
+					const root = await initializeMemory(options.config.home);
+					const issues = await validateMemory(root);
+					const result = { ok: issues.length === 0, issues };
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = result;
+					}
+				} catch (error) {
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "failed";
+						stored.error = diagnostic(error);
+					}
+				}
+			})();
 
 			connection.write({
 				v: PROFILE_VERSION,
@@ -1357,49 +1378,36 @@ async function handleRequest(
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
-			// Reject concurrent autolinking; return existing opRef if one is pending.
-			const existing = Array.from(runtime.memoryOps.values()).find(
-				(op) => op.status === "pending" && op.startedAt,
-			);
-			let opRef: string;
-			let started: string;
-			let expireAt: string;
+			// Kind-specific deduplication: autolink requests don't dedup with audit operations.
+			const opRef = getOrCreatePendingMemoryOp(runtime.memoryOps, "autolink");
 
-			if (existing) {
-				// Reuse pending operation
-				opRef = Array.from(runtime.memoryOps.entries()).find(([_, op]) => op === existing)?.[0] ?? ``;
-				if (!opRef) {
-					opRef = `gw-ml-${crypto.randomUUID()}`;
-					started = new Date().toISOString();
-					expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-					runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
-				}
-			} else {
-				// Start new operation
-				opRef = `gw-ml-${crypto.randomUUID()}`;
-				started = new Date().toISOString();
-				expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-				runtime.memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+			// Check if this is a new operation (just created)
+			const isNew = !runtime.memoryOps.get(opRef) || runtime.memoryOps.get(opRef)?.startedAt === new Date().toISOString();
 
-				// Start operation asynchronously; client gets opRef immediately.
-				void (async () => {
-					try {
-						const root = await initializeMemory(options.config.home);
-						const report = await autolinkCorpus(root, runtime.memory);
-						const stored = runtime.memoryOps.get(opRef);
-						if (stored) {
-							stored.status = "completed";
-							stored.result = report;
-						}
-					} catch (error) {
-						const stored = runtime.memoryOps.get(opRef);
-						if (stored) {
-							stored.status = "failed";
-							stored.error = diagnostic(error);
-						}
-					}
-				})();
+			if (!isNew) {
+				// Already running; return existing opRef
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
+				return;
 			}
+
+			// Start operation asynchronously; client gets opRef immediately.
+			void (async () => {
+				try {
+					const root = await initializeMemory(options.config.home);
+					const report = await autolinkCorpus(root, runtime.memory);
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = report;
+					}
+				} catch (error) {
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "failed";
+						stored.error = diagnostic(error);
+					}
+				}
+			})();
 
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 			return;

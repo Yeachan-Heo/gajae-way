@@ -13,7 +13,7 @@ import {
 } from "../src/memory/doctrine";
 import { autolinkCorpus } from "../src/memory/autolink";
 import { MemoryClosureQueue } from "../src/memory/closure";
-import { pruneExpiredMemoryOps } from "../src/server/server";
+import { getOrCreatePendingMemoryOp, pruneExpiredMemoryOps } from "../src/server/server";
 import {
 	type AxisDescriptor,
 	type AxisRegistry,
@@ -361,13 +361,10 @@ test("issue #473: autolinkCorpus completes without client timeout when tracked a
 	expect(report.aliases).toBeDefined();
 });
 
-test("issue #473: concurrent autolink requests return the same opRef (deduplication)", async () => {
-	// Verify that overlapping autolink requests return the same opRef instead of
-	// starting concurrent operations. This prevents multiple sweeps from conflicting.
-	// Test the actual server logic: two requests to memory.autolink while first is pending
-	// should return the same opRef.
+test("issue #473: getOrCreatePendingMemoryOp deduplicates same-kind requests", async () => {
+	// Verify the actual getOrCreatePendingMemoryOp function returns the same opRef
+	// for concurrent requests of the same kind (autolink or audit).
 
-	// Simulate the server's runtime.memoryOps state
 	interface MemoryOpStatus {
 		status: "pending" | "completed" | "failed";
 		result?: unknown;
@@ -378,22 +375,27 @@ test("issue #473: concurrent autolink requests return the same opRef (deduplicat
 
 	const memoryOps = new Map<string, MemoryOpStatus>();
 
-	// Simulate first autolink request: creates pending operation
-	const opRef1 = `gw-ml-${crypto.randomUUID()}`;
-	const now = new Date().toISOString();
-	const later = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-	memoryOps.set(opRef1, { status: "pending", startedAt: now, expireAt: later });
+	// First autolink request creates pending operation
+	const opRef1 = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(memoryOps.has(opRef1)).toBe(true);
+	expect(memoryOps.get(opRef1)?.status).toBe("pending");
 
-	// Simulate second concurrent autolink request: should find pending and return same opRef
-	const existing = Array.from(memoryOps.values()).find((op) => op.status === "pending");
-	let opRef2: string | undefined;
-	if (existing) {
-		opRef2 = Array.from(memoryOps.entries()).find(([_, op]) => op === existing)?.[0];
-	}
-
-	// Verify both requests get the same opRef (deduplication works)
+	// Second autolink request reuses the same opRef (deduplication)
+	const opRef2 = getOrCreatePendingMemoryOp(memoryOps, "autolink");
 	expect(opRef2).toBe(opRef1);
-	expect(memoryOps.size).toBe(1); // Only one operation in map
+	expect(memoryOps.size).toBe(1); // Still only one operation in map
+
+	// Audit request creates separate operation (not dedup'd with autolink)
+	const auditOpRef = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(auditOpRef).not.toBe(opRef1); // Different opRef
+	expect(auditOpRef.startsWith("gw-ma-")).toBe(true); // Audit prefix
+	expect(opRef1.startsWith("gw-ml-")).toBe(true); // Autolink prefix
+	expect(memoryOps.size).toBe(2); // Two separate operations
+
+	// Second audit request reuses audit opRef (not the autolink one)
+	const auditOpRef2 = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(auditOpRef2).toBe(auditOpRef);
+	expect(memoryOps.size).toBe(2); // Still two operations
 });
 
 test("issue #473: pruneExpiredMemoryOps removes settled operations past TTL", async () => {
