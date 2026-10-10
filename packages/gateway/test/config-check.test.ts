@@ -77,6 +77,16 @@ test("runtime PATH settings are validated and classified as restart-required", (
 	expect(RESTART_REQUIRED_FIELDS).toContain("runtime");
 });
 
+test("outboundFileRoots takes absolute directories and is restart-required", () => {
+	const config = parseConfigFile({ schemaVersion: CONFIG_SCHEMA_VERSION, outboundFileRoots: ["/srv/outbox"] });
+	expect(config.outboundFileRoots).toEqual(["/srv/outbox"]);
+	expect(RESTART_REQUIRED_FIELDS).toContain("outboundFileRoots");
+	for (const outboundFileRoots of [["relative/outbox"], "/srv/outbox", [""]])
+		expect(() => parseConfigFile({ schemaVersion: CONFIG_SCHEMA_VERSION, outboundFileRoots })).toThrow(
+			/outboundFileRoots/,
+		);
+});
+
 test("monitorCatchUp is a bounded, restart-required cron catch-up ceiling", () => {
 	const config = parseConfigFile({
 		schemaVersion: CONFIG_SCHEMA_VERSION,

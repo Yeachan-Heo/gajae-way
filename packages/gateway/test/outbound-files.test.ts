@@ -142,6 +142,18 @@ test("a file under the gateway home outside the workspace is refused with a visi
 	]);
 });
 
+test("a readable file outside the workspace is refused with a visible note, never uploaded", async () => {
+	const { client } = await gateway(() => "호스트 파일입니다\nMEDIA:/etc/hosts");
+	sendMessage(client, SLACK_ORIGIN, SLACK_TRIGGER);
+	await settle();
+	const delivered = messages(client.frames);
+	expect(delivered.some((frame) => frame.payload.file)).toBe(false);
+	expect(delivered.map((frame) => frame.payload.text)).toEqual([
+		"호스트 파일입니다",
+		"(file not sent: hosts - only files inside the workspace or a configured outbound root are sent)",
+	]);
+});
+
 test("on a platform without ledger uploads the MEDIA: line is passed through for the adapter", async () => {
 	const { client } = await gateway((home) => `여기요\nMEDIA:${join(home, "workspace", "report.csv")}`);
 	sendMessage(client, DISCORD_ORIGIN, "m1");
@@ -153,47 +165,80 @@ test("on a platform without ledger uploads the MEDIA: line is passed through for
 	expect(delivered.some((frame) => frame.payload.file)).toBe(false);
 });
 
-test("checkOutboundFile accepts workspace and outside files and refuses the rest", async () => {
+test("checkOutboundFile sends only workspace and configured-root files and refuses the rest", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-files-check-"));
 	const home = join(directory, "home");
 	const workspace = join(home, "workspace");
-	const outside = join(directory, "outside");
+	const outbox = join(directory, "outbox");
+	const userHome = join(directory, "user");
 	await mkdir(workspace, { recursive: true });
 	await mkdir(join(home, "secrets"), { recursive: true });
-	await mkdir(outside, { recursive: true });
+	await mkdir(outbox, { recursive: true });
+	await mkdir(join(userHome, ".ssh"), { recursive: true });
+	await mkdir(join(userHome, ".aws"), { recursive: true });
 	await writeFile(join(workspace, "a.txt"), "hello");
-	await writeFile(join(outside, "b.png"), "png-bytes");
-	await writeFile(join(outside, "empty.txt"), "");
+	await writeFile(join(workspace, "big.png"), "png-bytes");
+	await writeFile(join(workspace, "empty.txt"), "");
+	await writeFile(join(outbox, "c.csv"), "a,b");
+	await writeFile(join(userHome, ".ssh", "id_ed25519"), "key");
+	await writeFile(join(userHome, ".aws", "credentials"), "aws");
+	await writeFile(join(directory, "loose.txt"), "loose");
 	await writeFile(join(home, "secrets", "token"), "secret");
 	await writeFile(join(home, "gateway.db"), "db");
-	// A workspace symlink cannot launder a secret past the check.
+	// A workspace symlink cannot launder a file past the allowlist.
 	await symlink(join(home, "secrets", "token"), join(workspace, "innocent.txt"));
-	const scope = { home, workspace, maxBytes: 6 };
-	const ok = await checkOutboundFile(join(workspace, "a.txt"), scope);
+	await symlink(join(userHome, ".ssh", "id_ed25519"), join(workspace, "key.txt"));
+	// A configured root that contains the gateway home does not open its secrets.
+	const scope = { home, workspace, roots: [outbox, directory, "relative/root"], maxBytes: 6 };
+	const narrow = { home, workspace, maxBytes: 6 };
+	const ok = await checkOutboundFile(join(workspace, "a.txt"), narrow);
 	expect(ok.ok && ok.file.name === "a.txt" && ok.file.size === 5).toBe(true);
-	const reasons = await Promise.all(
-		[
-			"relative/a.txt",
-			join(workspace, "missing.txt"),
-			workspace,
-			join(outside, "empty.txt"),
-			join(outside, "b.png"),
-			join(home, "secrets", "token"),
-			join(home, "gateway.db"),
-			join(workspace, "innocent.txt"),
-		].map(async (requested) => {
-			const result = await checkOutboundFile(requested, scope);
-			return result.ok ? "ok" : result.reason;
-		}),
-	);
-	expect(reasons).toEqual([
+	const fromRoot = await checkOutboundFile(join(outbox, "c.csv"), { ...narrow, roots: [outbox] });
+	expect(fromRoot.ok && fromRoot.file.name === "c.csv").toBe(true);
+	const reasons = async (requests: readonly string[], within: typeof narrow) =>
+		Promise.all(
+			requests.map(async (requested) => {
+				const result = await checkOutboundFile(requested, within);
+				return result.ok ? "ok" : result.reason;
+			}),
+		);
+	const notAllowed = "only files inside the workspace or a configured outbound root are sent";
+	const homeRefusal = "files under the gateway home (outside the workspace) are not sent";
+	expect(
+		await reasons(
+			[
+				"relative/a.txt",
+				join(workspace, "missing.txt"),
+				workspace,
+				join(workspace, "empty.txt"),
+				join(workspace, "big.png"),
+				join(userHome, ".ssh", "id_ed25519"),
+				join(userHome, ".aws", "credentials"),
+				join(directory, "loose.txt"),
+				join(outbox, "c.csv"),
+				join(workspace, "key.txt"),
+				join(home, "secrets", "token"),
+				join(home, "gateway.db"),
+				join(workspace, "innocent.txt"),
+			],
+			narrow,
+		),
+	).toEqual([
 		"path must be absolute",
 		"file not found",
 		"not a regular file",
 		"file is empty",
 		"file is 9 bytes, over the 6-byte limit",
-		"files under the gateway home (outside the workspace) are not sent",
-		"files under the gateway home (outside the workspace) are not sent",
-		"files under the gateway home (outside the workspace) are not sent",
+		notAllowed,
+		notAllowed,
+		notAllowed,
+		notAllowed,
+		notAllowed,
+		homeRefusal,
+		homeRefusal,
+		homeRefusal,
 	]);
+	expect(
+		await reasons([join(directory, "loose.txt"), join(home, "secrets", "token"), join(home, "gateway.db")], scope),
+	).toEqual(["ok", homeRefusal, homeRefusal]);
 });
