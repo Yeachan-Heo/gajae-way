@@ -1250,7 +1250,7 @@ async function handleRequest(
 			rows.sort((a, b) => b.score - a.score || b.at.localeCompare(a.at));
 			const snippets = rows
 				.slice(0, limit)
-				.map((r) => ({ origin: JSON.parse(r.origin_ref_json), text: r.text.slice(0, 500), at: r.at }));
+				.map((r) => ({ origin: JSON.parse(r.origin_ref_json), text: clipByCodePoints(r.text, 500), at: r.at }));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { snippets } });
 			return;
 		}
@@ -2147,7 +2147,7 @@ async function createInboundTurnLifecycle(
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipByCodePoints(entry.body, 1000)}`,
 		);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
@@ -2173,7 +2173,9 @@ async function createInboundTurnLifecycle(
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
-			.map((entry) => `- [${entry.at}] ${entry.author}: ${redactHistoricalAttachments(entry.body).slice(0, 500)}`);
+			.map(
+				(entry) => `- [${entry.at}] ${entry.author}: ${clipByCodePoints(redactHistoricalAttachments(entry.body), 500)}`,
+			);
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
@@ -2626,7 +2628,7 @@ async function createInboundTurnLifecycle(
 				options.database.addRecall(
 					key,
 					JSON.stringify(origin),
-					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
+					`user: ${clipByCodePoints(userText, 500)}\nassistant: ${clipByCodePoints(replyText, 500)}`,
 				);
 			});
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
@@ -2965,7 +2967,7 @@ function reportDeliveryExpired(
 }
 
 function safeDiagnosticField(value: string): string {
-	return sanitizeDiagnostic(value).slice(0, 160).replace(/\s+/g, "_") || "unknown_error";
+	return clipByCodePoints(sanitizeDiagnostic(value), 160).replace(/\s+/g, "_") || "unknown_error";
 }
 
 function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
@@ -3058,6 +3060,15 @@ function ingestOrReportDrop<T>(originKey: string, messageId: string, engaged: bo
 
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+
+/**
+ * Safely clips a string to a maximum number of code points, never leaving a lone UTF-16 surrogate.
+ * Uses Array.from to iterate over code points (not code units), ensuring the result is always well-formed.
+ */
+function clipByCodePoints(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	return Array.from(text).slice(0, limit).join("");
 }
 
 function writeError(connection: Connection, error: unknown, id?: string): void {
