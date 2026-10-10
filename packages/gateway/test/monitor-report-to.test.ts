@@ -211,9 +211,7 @@ test("monitor event settling with reportTo injects exactly one internal report (
 
 		// Verify the message id is deterministic from event_id
 		const { createHash } = await import("node:crypto");
-		const expectedMessageId = `monitor-report-${createHash("sha256")
-			.update(eventId)
-			.digest("hex")}`;
+		const expectedMessageId = `monitor-report-${createHash("sha256").update(eventId).digest("hex")}`;
 		expect(message?.message_id).toBe(expectedMessageId);
 
 		propagator.dispose();
@@ -355,7 +353,7 @@ test("monitor report injection is idempotent: re-settling same event adds no dup
 		// Get the event to verify it was settled (to either delivered or authored_no_delivery)
 		const eventRow = database.monitorEventGet(eventId);
 		expect(eventRow).toBeDefined();
-		expect(["delivered", "authored_no_delivery"]).toContain(eventRow?.stage);
+		expect(["delivered", "authored_no_delivery"]).toContain(eventRow?.stage ?? "");
 
 		// Try to settle the same event again by calling the inject directly
 		// (In practice this would happen through reconcile on a retry)

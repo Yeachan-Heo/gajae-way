@@ -1328,9 +1328,7 @@ export class MonitorPropagator {
 		const output = this.#database.authoredOutput(row.event_id);
 		if (!output) return;
 		// Deterministic message ID from event_id for idempotency
-		const messageId = `monitor-report-${createHash("sha256")
-			.update(row.event_id)
-			.digest("hex")}`;
+		const messageId = `monitor-report-${createHash("sha256").update(row.event_id).digest("hex")}`;
 		const parentOriginKey = originKey(monitor.reportTo);
 		// Enqueue as an inbound message in the target conversation session
 		this.#database.inboundEnqueue({

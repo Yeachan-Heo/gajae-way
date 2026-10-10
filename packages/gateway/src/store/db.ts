@@ -1450,8 +1450,6 @@ export class GatewayDatabase {
 		});
 	}
 
-
-
 	/** Atomically append history, freeze notification intent and refresh activity before send. */
 	workAttemptPrepare(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
 		this.withTransaction(() => {
