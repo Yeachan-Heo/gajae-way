@@ -2147,7 +2147,7 @@ async function createInboundTurnLifecycle(
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(entry.body, 4000)}`,
 		);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
@@ -2173,7 +2173,10 @@ async function createInboundTurnLifecycle(
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
-			.map((entry) => `- [${entry.at}] ${entry.author}: ${redactHistoricalAttachments(entry.body).slice(0, 500)}`);
+			.map(
+				(entry) => `- [${entry.at}] ${entry.author}: ${clipContextBody(redactHistoricalAttachments(entry.body), 500)}`,
+			);
+
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
@@ -2962,6 +2965,17 @@ function reportDeliveryExpired(
 	const notice = `[delivery lost] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다. 재전송: gajaeway ops redeliver ${deliveryId}`;
 	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
 	if (payload) broadcastDelivery(runtime, payload);
+}
+
+/**
+ * Clips context body text to a maximum character length while preserving code points.
+ * When the text is clipped, appends a marker showing how many chars were shown.
+ */
+export function clipContextBody(body: string, maxChars: number): string {
+	if (body.length <= maxChars) return body;
+	const clipped = body.slice(0, maxChars);
+	const totalChars = body.length;
+	return `${clipped}\u2026[clipped: first ${maxChars} of ${totalChars} chars shown; the message itself is complete]`;
 }
 
 function safeDiagnosticField(value: string): string {
