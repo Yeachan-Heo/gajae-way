@@ -2968,8 +2968,8 @@ function reportDeliveryExpired(
 }
 
 /**
- * Clips context body text to a maximum character length while preserving code points.
- * When the text is clipped, appends a marker showing how many chars were shown.
+ * Clips context body text to maxChars UTF-16 units and, when clipped, appends a marker
+ * so the persona knows the source message itself is complete.
  */
 export function clipContextBody(body: string, maxChars: number): string {
 	if (body.length <= maxChars) return body;

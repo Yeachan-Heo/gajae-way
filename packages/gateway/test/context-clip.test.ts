@@ -1,12 +1,5 @@
-import { test, expect } from "bun:test";
-
-// This implementation must match the one in server.ts
-function clipContextBody(body: string, maxChars: number): string {
-	if (body.length <= maxChars) return body;
-	const clipped = body.slice(0, maxChars);
-	const totalChars = body.length;
-	return `${clipped}…[clipped: first ${maxChars} of ${totalChars} chars shown; the message itself is complete]`;
-}
+import { expect, test } from "bun:test";
+import { clipContextBody } from "../src/server/server";
 
 test("clipContextBody: returns text unchanged when under limit", () => {
 	const short = "hello world";
