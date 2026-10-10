@@ -520,8 +520,12 @@ export class MonitorPropagator {
 				const batch = this.#database.monitorEventsByBatch(delivery.turn_id);
 				if (!batch.some((row) => row.stage === "authored")) continue;
 				this.#database.withTransaction(() => {
-					for (const row of batch)
-						if (row.stage === "authored") this.#database.monitorEventUpdate(row.event_id, "delivered");
+					for (const row of batch) {
+						if (row.stage === "authored") {
+							this.#database.monitorEventUpdate(row.event_id, "delivered");
+							this.#injectReportToIfConfigured(row);
+						}
+					}
 				});
 			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
@@ -537,7 +541,10 @@ export class MonitorPropagator {
 				if (output && !hasMemory)
 					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
 				else if (output && row.stage === "authored" && isSilentOutput(output))
-					this.#database.withTransaction(() => this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery"));
+					this.#database.withTransaction(() => {
+						this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery");
+						this.#injectReportToIfConfigured(row);
+					});
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
 					// means the authoring turn may still complete elsewhere; a new
@@ -914,8 +921,10 @@ export class MonitorPropagator {
 				if (!target) {
 					for (const row of fenced) {
 						if (this.#database.authoredOutput(row.event_id) === undefined) continue;
-						if (this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId))
+						if (this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId)) {
 							this.#emitStage(row, "authored_no_delivery");
+							this.#injectReportToIfConfigured(row);
+						}
 					}
 					return;
 				}
@@ -945,6 +954,8 @@ export class MonitorPropagator {
 				for (const entry of silentEntries) {
 					if (this.#database.authoredOutput(entry.eventId) === undefined) continue;
 					this.#database.monitorEventFencedUpdate(entry.eventId, leaseId, "authored_no_delivery", batchId);
+					const row = fenced.find((r) => r.event_id === entry.eventId);
+					if (row) this.#injectReportToIfConfigured(row);
 				}
 				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
 				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
@@ -1304,6 +1315,21 @@ export class MonitorPropagator {
 		);
 		timer.unref?.();
 		return () => clearInterval(timer);
+	}
+	#injectReportToIfConfigured(row: {
+		event_id: string;
+		monitor_id: string;
+		event_type: string;
+		fired_at: string;
+	}): void {
+		const monitor = this.#registry.get(row.monitor_id);
+		if (!monitor?.reportTo) return;
+		const output = this.#database.authoredOutput(row.event_id);
+		if (!output) return;
+		const reportId = `monitor-report-${crypto.randomUUID()}`;
+		const parentOriginKey = originKey(monitor.reportTo);
+		const childName = `monitor-${row.monitor_id}-${row.event_type}`;
+		this.#database.monitorInjectReport(reportId, parentOriginKey, childName, output);
 	}
 	#author(
 		eventId: string,

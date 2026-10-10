@@ -25,6 +25,7 @@ const MONITOR_UPDATE_FIELDS = new Set([
 	"serviceTier",
 	"enabled",
 	"procedureFiles",
+	"reportTo",
 ]);
 /** Upper bound on a per-monitor authoring instruction, in characters. */
 export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
@@ -69,6 +70,7 @@ export class MonitorRegistry {
 				modelJson: record.model ? JSON.stringify(record.model) : null,
 				serviceTier: record.serviceTier ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
+				reportToJson: record.reportTo ? JSON.stringify(record.reportTo) : null,
 			}),
 		);
 		return record;
@@ -141,6 +143,7 @@ export class MonitorRegistry {
 				modelJson: updated.model ? JSON.stringify(updated.model) : null,
 				serviceTier: updated.serviceTier ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
+				reportToJson: updated.reportTo ? JSON.stringify(updated.reportTo) : null,
 			});
 			return persisted ? updated : undefined;
 		});
@@ -166,6 +169,7 @@ function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): M
 		model: row.model_json ? JSON.parse(row.model_json) : undefined,
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
 		procedureFiles: row.procedure_files_json ? JSON.parse(row.procedure_files_json) : undefined,
+		reportTo: row.report_to_json ? JSON.parse(row.report_to_json) : null,
 		createdAt: row.created_at,
 	};
 	validateSpec(record);
@@ -202,6 +206,9 @@ export function validateSpec(spec: MonitorSpec): void {
 	if (spec.channelTarget) {
 		validateOriginRef(spec.channelTarget.origin);
 		validateMentionUserIds(spec.channelTarget);
+	}
+	if (spec.reportTo !== undefined && spec.reportTo !== null) {
+		validateOriginRef(spec.reportTo);
 	}
 	if (spec.model !== undefined) {
 		const valid =
