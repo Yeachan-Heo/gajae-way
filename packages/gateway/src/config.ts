@@ -71,6 +71,12 @@ export interface GatewayConfigFile {
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
 	readonly stallTimeoutMs?: number;
+	/**
+	 * Idle rotation: a persona session with no activity for this long is rebound
+	 * to a fresh gjc session before its next turn, exactly as `/new` would. Undefined
+	 * disables it. Never interrupts a running turn.
+	 */
+	readonly sessionIdleResetMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
 	/**
@@ -388,6 +394,14 @@ function parseStallTimeout(value: unknown): number {
 	return value as number;
 }
 
+// Floor of one minute keeps a typo from rotating every conversation on every sweep;
+// ceiling of 30 days keeps the value in the range where rotation still means something.
+function parseSessionIdleReset(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 60_000 || (value as number) > 2_592_000_000)
+		throw new ConfigError("config_invalid", "sessionIdleResetMs must be an integer between 60000 and 2592000000");
+	return value as number;
+}
+
 function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 	const input = requireObject(value, "ownerTarget");
 	if (Object.keys(input).some((key) => key !== "origin"))
@@ -578,6 +592,9 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
+		...(input.sessionIdleResetMs === undefined
+			? {}
+			: { sessionIdleResetMs: parseSessionIdleReset(input.sessionIdleResetMs) }),
 		...(model ? { model } : {}),
 		...(serviceTier ? { serviceTier } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
@@ -702,6 +719,7 @@ export const RELOADABLE_FIELDS = [
 	"dmPolicy",
 	"botAudience",
 	"handoffTargets",
+	"sessionIdleResetMs",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */

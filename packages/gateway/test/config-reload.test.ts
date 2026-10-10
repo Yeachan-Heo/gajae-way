@@ -219,3 +219,15 @@ test("interim speech config parses non-negative integers and requires restart", 
 		"interimSpeech contains an unknown field",
 	);
 });
+
+test("sessionIdleResetMs parses when bounded, is optional, and rejects out-of-range values", () => {
+	expect(parseConfigFile({ schemaVersion: 1, sessionIdleResetMs: 6 * 60 * 60 * 1000 }).sessionIdleResetMs).toBe(
+		21_600_000,
+	);
+	expect(parseConfigFile({ schemaVersion: 1 }).sessionIdleResetMs).toBeUndefined();
+	for (const bad of [0, 59_999, 2_592_000_001, 1.5, "6h"]) {
+		expect(() => parseConfigFile({ schemaVersion: 1, sessionIdleResetMs: bad })).toThrow(
+			"sessionIdleResetMs must be an integer between 60000 and 2592000000",
+		);
+	}
+});
