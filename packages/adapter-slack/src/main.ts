@@ -291,7 +291,7 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: Pick<SlackWebApi, "postMessage" | "addReaction"> & Partial<Pick<SlackWebApi, "uploadFile">>,
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
@@ -302,6 +302,14 @@ export async function settleSlackDelivery(
 	if (message.reaction) {
 		try {
 			await settleSlackReaction(gateway, api, message);
+		} finally {
+			await settleTurnPresence(message, status);
+		}
+		return;
+	}
+	if (message.file) {
+		try {
+			await settleSlackFile(gateway, api, message);
 		} finally {
 			await settleTurnPresence(message, status);
 		}
@@ -383,6 +391,34 @@ async function settleTurnPresence(
 		return;
 	}
 	await status.clear(conversationId).catch(() => {});
+}
+
+export async function settleSlackFile(
+	gateway: Pick<GatewayClientLike, "request">,
+	api: Partial<Pick<SlackWebApi, "uploadFile">>,
+	message: ChatMessagePayload,
+): Promise<void> {
+	if (message.origin.platform !== "slack" || !message.deliveryId || !message.file) return;
+	const deliveryId = message.deliveryId;
+	try {
+		if (!api.uploadFile) throw new SlackApiError(0, "unsupported", "this Slack client cannot upload files");
+		const channel = deliveryChannel(message.origin);
+		const threadTs = replyThreadTs(message);
+		let bytes: Uint8Array;
+		try {
+			bytes = await Bun.file(message.file.path).bytes();
+		} catch (error) {
+			throw new SlackApiError(0, "file_unreadable", `cannot read ${message.file.name}: ${errorText(error)}`);
+		}
+		await api.uploadFile(channel, { name: message.file.name, bytes }, threadTs);
+		await gateway.request("delivery.confirm", { deliveryId });
+	} catch (error) {
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: errorText(error),
+			ambiguous: deliveryFailureIsAmbiguous(error),
+		});
+	}
 }
 
 export async function settleSlackReaction(

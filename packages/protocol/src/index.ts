@@ -90,6 +90,15 @@ export {
 	ProtocolError,
 	type ProtocolErrorPayload,
 } from "./errors";
+export {
+	type FileRef,
+	type FileReply,
+	fileFallbackText,
+	OUTBOUND_FILE_MAX_BYTES,
+	OUTBOUND_FILES_PER_TURN_CAP,
+	parseFileReply,
+	platformSupportsFiles,
+} from "./files";
 export { type FrameWriterSink, OrderedFrameWriter, type OrderedFrameWriterOptions } from "./frame-writer";
 export {
 	decodeFrame,

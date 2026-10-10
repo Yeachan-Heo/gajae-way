@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -22,10 +22,14 @@ import {
 	negotiate,
 	OrderedFrameWriter,
 	type OriginRef,
+	OUTBOUND_FILE_MAX_BYTES,
+	OUTBOUND_FILES_PER_TURN_CAP,
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseFileReply,
 	parseReactionReply,
+	platformSupportsFiles,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
 	REACTIONS_PER_TURN_CAP,
@@ -104,6 +108,7 @@ import {
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
+import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -2321,6 +2326,54 @@ async function createInboundTurnLifecycle(
 		}
 		deliverTerminalLine(renderHandoffPointer(handoff.target));
 	};
+	/** Requested paths this turn already handled, so the terminal pass and the cap see each file once. */
+	const filesHandled = new Set<string>();
+	/**
+	 * Uploads the reply's [FILE:<path>] attachments into the same place its text
+	 * went. Each file is its own ledger delivery under a deterministic id; a file
+	 * that cannot be sent becomes a short visible note instead of vanishing.
+	 */
+	const deliverFiles = async (paths: readonly string[], replyTo: string | undefined) => {
+		const notify = (deliveryId: string, text: string) => {
+			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, replyTo, deliveryId, false);
+			if (!payload) return;
+			deliveredIds.push(payload.deliveryId as string);
+			assistantDeliveryStarted = true;
+			broadcastDelivery(runtime, payload);
+		};
+		for (const requested of paths) {
+			if (filesHandled.has(requested)) continue;
+			filesHandled.add(requested);
+			const deliveryId = deterministicFileDeliveryId(key, input.turn.triggerMessageId, requested);
+			if (!platformSupportsFiles(origin.platform)) {
+				console.warn(`gateway file skipped for ${key}: ${origin.platform} adapter cannot upload files`);
+				continue;
+			}
+			if (filesHandled.size > OUTBOUND_FILES_PER_TURN_CAP) {
+				notify(
+					`${deliveryId}-x`,
+					`(file not sent: ${basename(requested)} - at most ${OUTBOUND_FILES_PER_TURN_CAP} files per reply)`,
+				);
+				continue;
+			}
+			const checked = await checkOutboundFile(requested, {
+				home: runtime.config.home,
+				workspace: join(runtime.config.home, "workspace"),
+			});
+			if (!checked.ok) {
+				console.error(
+					`gateway file refused origin=${key} file=${safeDiagnosticField(checked.name)}: ${checked.reason}`,
+				);
+				notify(`${deliveryId}-x`, `(file not sent: ${checked.name} - ${checked.reason})`);
+				continue;
+			}
+			const payload = runtime.delivery.prepareFile(crypto.randomUUID(), origin, checked.file, deliveryId, replyTo);
+			if (!payload) continue;
+			deliveredIds.push(payload.deliveryId as string);
+			assistantDeliveryStarted = true;
+			broadcastDelivery(runtime, payload);
+		}
+	};
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		const handoff = parseHandoffReply(rawMessage);
@@ -2368,6 +2421,9 @@ async function createInboundTurnLifecycle(
 			message = reactionReply.body;
 			if (!message) return;
 		}
+		// [FILE:<path>] tokens become their own deliveries after the text parts.
+		const fileReply = parseFileReply(message);
+		if (fileReply) message = fileReply.body;
 		// Control tokens are internal protocol, never user-visible. Models routinely
 		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
 		// part is judged by whether it CONTAINS the token, not whether it equals it:
@@ -2428,7 +2484,7 @@ async function createInboundTurnLifecycle(
 			// The per-turn part budget bounds MID-WORK speech only. The terminal
 			// answer always records its claim: with an ungated stream a chatty turn
 			// could otherwise exhaust the budget on interims and lose its final.
-			if (source === "interim" && deliveredParts.length >= maxTurnParts) return;
+			if (source === "interim" && deliveredParts.length >= maxTurnParts) break;
 			const step = planned[index] as { body: string; replyTo?: string };
 			// Interim parts are keyed on (trigger, text, part): distinct findings get
 			// distinct rows, a replayed finding (stream backfill, id-less frame after
@@ -2470,6 +2526,7 @@ async function createInboundTurnLifecycle(
 			const isLast = index === planned.length - 1;
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
+		if (fileReply) await deliverFiles(fileReply.paths, planned.at(-1)?.replyTo ?? inboundThreadRoot);
 	};
 
 	const startedAt = Date.now();
@@ -3021,6 +3078,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+				]
+			: []),
+		...(platformSupportsFiles(origin.platform)
+			? [
+					`File attachments: put [FILE:<absolute path>] anywhere in a reply to upload that file into this conversation (same thread as the reply). The token is removed from the text; each token is one file, at most ${OUTBOUND_FILES_PER_TURN_CAP} per reply and ${Math.floor(OUTBOUND_FILE_MAX_BYTES / (1024 * 1024))} MB each. Write the file first (your workspace or /tmp); files under the gateway home outside the workspace are refused. A file that cannot be sent shows up as a short "(file not sent: ...)" note.`,
 				]
 			: []),
 		// Live 2026-09-25: the persona held turns open for 13 minutes in a
