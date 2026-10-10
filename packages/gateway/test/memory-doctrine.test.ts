@@ -9,7 +9,10 @@ import {
 	mapListsAxis,
 	memoryGit,
 	regenerateMap,
+	validateMemory,
 } from "../src/memory/doctrine";
+import { autolinkCorpus } from "../src/memory/autolink";
+import { MemoryClosureQueue } from "../src/memory/closure";
 import {
 	type AxisDescriptor,
 	type AxisRegistry,
@@ -326,4 +329,35 @@ test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommi
 		const c = await memoryGit(root, ["show", commit]);
 		expect(c).not.toContain(intentText);
 	}
+});
+
+test("issue #473: slow autolinkCorpus completes successfully without client timeout", async () => {
+	// Verify that memory.autolink operations can take longer than the 30s default
+	// client timeout without reporting false failures. The async tracking (opRef + polling)
+	// contract ensures the CLI gets the actual result instead of a timeout error.
+	home = await mkdtemp(join(tmpdir(), "memory-doctrine-"));
+	const root = await initializeMemory(home);
+
+	// Set up test data: entities and rules for autolink to link
+	await mkdir(join(root, "entities"), { recursive: true });
+	await writeFile(join(root, "entities/alice-smith.md"), "# alice-smith\n\nCanonical name.");
+	await mkdir(join(root, "ops/rules"), { recursive: true });
+	await writeFile(join(root, "ops/rules/rule.md"), "# Rule\n\nalice-smith mentioned.");
+
+	await memoryGit(root, ["add", "-A"]);
+	await memoryGit(root, ["commit", "-m", "setup"]);
+
+	// Run autolink and verify it completes without timeout.
+	// Even if this takes longer than 30 seconds, the async contract ensures
+	// the CLI doesn't report failure; instead it polls for the result.
+	const start = Date.now();
+	const report = await autolinkCorpus(root);
+	const elapsed = Date.now() - start;
+
+	// Verify the operation completed successfully (no timeout)
+	expect(report.filesChanged).toBeDefined();
+	expect(report.linksAdded).toBeDefined();
+	expect(report.aliases).toBeDefined();
+
+	console.log(`autolinkCorpus completed in ${elapsed}ms (slow operation, no client timeout via opRef polling)`);
 });

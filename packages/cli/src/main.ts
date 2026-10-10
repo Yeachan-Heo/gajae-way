@@ -508,6 +508,30 @@ async function chat(socket: string): Promise<void> {
 	}
 }
 
+/**
+ * Poll for memory operation completion. Memory operations (audit, autolink) are
+ * long-running and return an opRef immediately; this function polls for the result.
+ */
+async function pollMemoryOp(client: GajaewayClient, opRef: string, maxWaitMs = 600_000): Promise<unknown> {
+	const startTime = Date.now();
+	const pollIntervalMs = 100; // Poll every 100ms
+
+	while (Date.now() - startTime < maxWaitMs) {
+		const status = await client.request<{ status: "pending" | "completed"; result?: unknown }>("memory.status", {
+			opRef,
+		});
+
+		if (status.status === "completed") {
+			return status.result;
+		}
+
+		// Wait before polling again
+		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+	}
+
+	throw new Error(`memory operation ${opRef} timed out after ${maxWaitMs}ms`);
+}
+
 export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
 	const parsed = parseArgs(args);
 	const usage = usageFor(parsed.command);
@@ -701,11 +725,17 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {
-						const result = await client.request<{ ok: boolean; issues: unknown[] }>("memory.audit");
-						console.log(JSON.stringify(result.issues));
-						if (!result.ok) process.exitCode = 1;
+						// Request audit operation; get opRef and poll for completion
+						const initResp = await client.request<{ opRef: string }>("memory.audit");
+						const result = await pollMemoryOp(client, initResp.opRef);
+						const auditResult = result as { ok?: boolean; issues?: unknown[] };
+						console.log(JSON.stringify(auditResult.issues ?? []));
+						if (!auditResult.ok) process.exitCode = 1;
 					} else if (parsed.rest[0] === "autolink") {
-						console.log(JSON.stringify(await client.request("memory.autolink")));
+						// Request autolink operation; get opRef and poll for completion
+						const initResp = await client.request<{ opRef: string }>("memory.autolink");
+						const result = await pollMemoryOp(client, initResp.opRef);
+						console.log(JSON.stringify(result));
 					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),

@@ -416,10 +416,13 @@ export interface SessionBootstrapProjection {
  * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
  * memory.audit runs the structural validator; memory.search is map-then-BM25
  * retrieval over the canonical tree. Both are read-only verbs.
+ * Tracked operations: long-running verbs (autolink/audit) may return an operation ID
+ * if the operation would exceed the client timeout, and the client can poll for results.
  */
 export interface MemoryAuditResult {
-	readonly ok: boolean;
-	readonly issues: readonly {
+	readonly opRef: string;
+	readonly ok?: boolean;
+	readonly issues?: readonly {
 		readonly code: string;
 		readonly path: string;
 		readonly message: string;
@@ -992,8 +995,9 @@ export interface VerbCatalogV01 {
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
 	"memory.autolink": {
 		params: undefined;
-		result: { readonly filesChanged: number; readonly linksAdded: number; readonly aliases: number };
+		result: { readonly opRef: string; readonly filesChanged?: number; readonly linksAdded?: number; readonly aliases?: number };
 	};
+	"memory.status": { params: { readonly opRef: string }; result: { readonly status: "pending" | "completed"; readonly result?: unknown } };
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
@@ -1055,6 +1059,7 @@ export const VERBS_V01 = [
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",
+	"memory.status",
 	"monitor.add",
 	"monitor.update",
 	"monitor.list",

@@ -290,6 +290,12 @@ async function applyConfigReload(
 	return result;
 }
 
+interface MemoryOpStatus {
+	status: "pending" | "completed";
+	result?: unknown;
+	startedAt: string;
+}
+
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
@@ -301,6 +307,8 @@ interface Runtime {
 	stop?: (reason?: string) => Promise<void>;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
+	/** Tracked memory operations (autolink, audit) keyed by opRef. */
+	readonly memoryOps: Map<string, MemoryOpStatus>;
 	readonly registry: MonitorRegistry;
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
@@ -825,6 +833,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound,
 		requests: new Set(),
 		permissionPanels,
+		memoryOps: new Map(),
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1255,23 +1264,69 @@ async function handleRequest(
 			return;
 		}
 		case "memory.audit": {
-			const root = await initializeMemory(options.config.home);
-			const issues = await validateMemory(root);
+			// Track async memory operations to prevent client timeouts during long operations (#473).
+			// Return immediately with opRef; operation continues in background.
+			const opRef = `gw-ma-${crypto.randomUUID()}`;
+			const started = new Date().toISOString();
+			runtime.memoryOps.set(opRef, { status: "pending", startedAt: started });
+
+			// Start operation asynchronously; client gets opRef immediately.
+			void (async () => {
+				try {
+					const root = await initializeMemory(options.config.home);
+					const issues = await validateMemory(root);
+					const result = { ok: issues.length === 0, issues };
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = result;
+					}
+				} catch (error) {
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = { error: diagnostic(error) };
+					}
+				}
+			})();
+
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { ok: issues.length === 0, issues },
+				result: { opRef },
 			});
 			return;
 		}
 		case "memory.autolink": {
+			// Track async memory operations to prevent client timeouts during long operations (#473).
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
-			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root, runtime.memory);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
+			const opRef = `gw-ml-${crypto.randomUUID()}`;
+			const started = new Date().toISOString();
+			runtime.memoryOps.set(opRef, { status: "pending", startedAt: started });
+
+			// Start operation asynchronously; client gets opRef immediately.
+			void (async () => {
+				try {
+					const root = await initializeMemory(options.config.home);
+					const report = await autolinkCorpus(root, runtime.memory);
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = report;
+					}
+				} catch (error) {
+					const stored = runtime.memoryOps.get(opRef);
+					if (stored) {
+						stored.status = "completed";
+						stored.result = { error: diagnostic(error) };
+					}
+				}
+			})();
+
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 			return;
 		}
 		case "memory.search": {
@@ -1284,6 +1339,19 @@ async function handleRequest(
 				type: "response",
 				id: request.id,
 				result: { hits: await searchMemory(root, params.query, limit) },
+			});
+			return;
+		}
+		case "memory.status": {
+			const params = (request.params ?? {}) as { opRef?: unknown };
+			if (typeof params.opRef !== "string") throw new ProtocolError("invalid_params", "memory.status requires opRef");
+			const op = runtime.memoryOps.get(params.opRef);
+			if (!op) throw new ProtocolError("not_found", `operation ${params.opRef} not found`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { status: op.status, ...(op.result ? { result: op.result } : {}) },
 			});
 			return;
 		}
