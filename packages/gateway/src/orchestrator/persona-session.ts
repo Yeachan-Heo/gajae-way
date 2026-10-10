@@ -2332,7 +2332,7 @@ class OriginActor {
 				const recoveredText = await this.#recoverFailedTurnAnswer(bound);
 				await bound.lifecycle.onFailure?.({
 					...bound,
-					error: terminalError(report, openTool, failedTurnEvidence?.reason),
+					error: terminalError(report, openTool, failedTurnEvidence),
 					status: report,
 					...(recoveredText ? { recoveredText } : {}),
 				});
@@ -2472,6 +2472,7 @@ class OriginActor {
 		return (
 			report.status.outcome?.phase === "submission" &&
 			evidence?.reason !== "provider_quota_exhausted" &&
+			evidence?.reason !== "provider_rate_limited" &&
 			!bound.retired &&
 			this.#current === bound &&
 			!bound.replyVisible &&
@@ -2812,7 +2813,7 @@ class OriginActor {
 		}
 	}
 
-	/** Exact context/request failures and repeated submission failures reset only the next binding. */
+	/** Exact context/request failures and repeated submission failures reset only the next binding. Quota and rate-limit failures never reset. */
 	#resetFailedTurn(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
 		if (evidence)
 			this.#manager.log(
@@ -2838,7 +2839,7 @@ class OriginActor {
 			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
-		if (evidence?.reason === "provider_quota_exhausted") {
+		if (evidence?.reason === "provider_quota_exhausted" || evidence?.reason === "provider_rate_limited") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
@@ -2894,9 +2895,19 @@ class OriginActor {
 function terminalError(
 	status: StatusReport,
 	openTool?: { readonly name: string; readonly elapsedMs: number },
-	evidenceReason?: FailedTurnEvidence["reason"],
+	evidence?: FailedTurnEvidence,
 ): GjcRuntimeError {
-	if (evidenceReason === "provider_quota_exhausted") {
+	if (evidence?.reason === "provider_rate_limited") {
+		// The reset instant rides the line so the owner is told when resending can work.
+		const terminalAt = status.status.terminalAt;
+		const retryAt =
+			evidence.retryAfterMs !== undefined && typeof terminalAt === "number" && Number.isFinite(terminalAt)
+				? new Date(terminalAt + evidence.retryAfterMs).toISOString()
+				: undefined;
+		const message = `model provider rate limit reached${retryAt ? `; retry after ${retryAt}` : ""}`;
+		return new GjcRuntimeError(`provider_rate_limited: ${message}`, { code: "provider_rate_limited", message });
+	}
+	if (evidence?.reason === "provider_quota_exhausted") {
 		const message = "model provider quota/billing is exhausted (HTTP 402); switch the model preset";
 		return new GjcRuntimeError(`provider_quota_exhausted: ${message}`, {
 			code: "provider_quota_exhausted",

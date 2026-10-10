@@ -655,6 +655,44 @@ test("provider quota exhaustion gives a safe notice and does not reset or rebind
 	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+test("a provider rate limit names its reset instant and is neither resent nor reset, even at submission", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	enqueue("provider-rate-limit", "work");
+	await activeManager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("rate-limited turn was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_rate_limited", 7_501_000);
+	const before = Date.now();
+	// A submission-phase failure is otherwise resent once; a rate limit would only fail again.
+	port.fail(first.opRef, '429 {"type":"error","error":{"type":"rate_limit_error"}}', {
+		code: "error",
+		outcome: { code: "error", phase: "submission", category: "provider_transport", provenance: "agent_failed" },
+	});
+	const after = Date.now();
+	await eventually(() => activeManager.state(KEY) === "idle", "rate-limit failure did not settle");
+
+	expect(notices).toHaveLength(1);
+	const match = /^\[turn failed\] provider_rate_limited: model provider rate limit reached; retry after (\S+)$/.exec(
+		notices[0] ?? "",
+	);
+	expect(match).not.toBeNull();
+	const retryAt = Date.parse(match?.[1] ?? "");
+	expect(retryAt).toBeGreaterThanOrEqual(before + 7_501_000);
+	expect(retryAt).toBeLessThanOrEqual(after + 7_501_000);
+	expect(notices.join("\n")).not.toContain("rate_limit_error");
+	expect(logs).toContain(`failed_turn_classified origin=${KEY} opRef=${first.opRef} reason=provider_rate_limited`);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(activeDatabase.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+	expect(activeDatabase.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
 test("two consecutive internal submission failures reset the next inbound to a new epoch", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,

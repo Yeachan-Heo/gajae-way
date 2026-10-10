@@ -3,7 +3,13 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export type FailedTurnEvidence = {
-	readonly reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted";
+	readonly reason:
+		| "unsupported_input_status"
+		| "context_exhausted"
+		| "provider_quota_exhausted"
+		| "provider_rate_limited";
+	/** provider_rate_limited only: the provider's `retry-after` header (whole seconds) in milliseconds. */
+	readonly retryAfterMs?: number;
 };
 
 export type FailedTransportCause = {
@@ -45,6 +51,10 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	if (status === 402) {
 		if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== 402)) return undefined;
 		return "provider_quota_exhausted";
+	}
+	if (status === 429) {
+		if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== 429)) return undefined;
+		return record(message.providerDiagnostic)?.category === "rate_limit" ? "provider_rate_limited" : undefined;
 	}
 	if (status !== 400 && status !== 413) return undefined;
 	if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== status)) return undefined;
@@ -257,7 +267,16 @@ export async function readFailedTurnEvidence(
 	if (!message) return undefined;
 	const failureReason = reason(message);
 	if (!failureReason) return undefined;
-	return { reason: failureReason };
+	if (failureReason !== "provider_rate_limited") return { reason: failureReason };
+	const retryAfterMs = retryAfterHeaderMs(record(record(message.transportFailure)?.headers)?.["retry-after"]);
+	return retryAfterMs === undefined ? { reason: failureReason } : { reason: failureReason, retryAfterMs };
+}
+
+/** A delta-seconds `retry-after` only (digits); an HTTP-date or anything else is no evidence. */
+function retryAfterHeaderMs(value: unknown): number | undefined {
+	const text = typeof value === "number" ? String(value) : value;
+	if (typeof text !== "string" || !/^\d{1,9}$/.test(text.trim())) return undefined;
+	return Number(text.trim()) * 1000;
 }
 
 /** Extract transport failure cause from the same session transcript. Independent of reason classification. */

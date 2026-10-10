@@ -117,6 +117,37 @@ test("HTTP 402 assistant errors classify quota exhaustion without returning prov
 	expect(await evidence()).toBeUndefined();
 });
 
+test("HTTP 429 rate_limit (2026-10-08 shape) classifies a rate limit with retry-after and no provider text", async () => {
+	const rateLimited = (fields: Row = {}) =>
+		failure("user", {
+			errorStatus: 429,
+			errorMessage:
+				'429 {"type":"error","error":{"type":"rate_limit_error","message":"anthropic-ratelimit-unified-5h-status=rejected"}}',
+			providerDiagnostic: { category: "rate_limit", code: "rate_limit_error" },
+			transportFailure: { kind: "transport", status: 429, headers: { "retry-after": "7501" } },
+			...fields,
+		});
+	await save([prompt(), rateLimited()]);
+	expect(await evidence()).toEqual({ reason: "provider_rate_limited", retryAfterMs: 7_501_000 });
+	expect(JSON.stringify(await evidence())).not.toContain("anthropic");
+	// Only delta seconds count; an HTTP-date or a missing header leaves the instant out.
+	for (const headers of [{ "retry-after": "Thu, 08 Oct 2026 11:20:00 GMT" }, {}]) {
+		await save([prompt(), rateLimited({ transportFailure: { kind: "transport", status: 429, headers } })]);
+		expect(await evidence()).toEqual({ reason: "provider_rate_limited" });
+	}
+	// A 429 the provider did not categorize as a rate limit is no evidence.
+	await save([prompt(), rateLimited({ providerDiagnostic: { category: "overloaded", code: "overloaded_error" } })]);
+	expect(await evidence()).toBeUndefined();
+	await save([prompt(), rateLimited({ providerDiagnostic: undefined })]);
+	expect(await evidence()).toBeUndefined();
+	// Conflicting status facts are no evidence either.
+	await save([prompt(), rateLimited({ transportFailure: { kind: "transport", status: 500 } })]);
+	expect(await evidence()).toBeUndefined();
+	// 402 keeps its own reason.
+	await save([prompt(), rateLimited({ errorStatus: 402, transportFailure: { kind: "transport", status: 402 } })]);
+	expect(await evidence()).toEqual({ reason: "provider_quota_exhausted" });
+});
+
 for (const errorStatus of [400, 413]) {
 	test(`HTTP ${errorStatus} request_too_large is not context exhaustion`, async () => {
 		await save([
