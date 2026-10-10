@@ -1583,6 +1583,11 @@ class OriginActor {
 		const current = this.#current;
 		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
 		if (this.#deferredSteerOpRef === current.turn.opRef) return;
+		// A turn in recovery_hold (operation_state_unknown or past stall threshold)
+		// must not absorb new inbound as steers; new inbound must remain pending so it
+		// can start a fresh trigger turn. This ensures mentions and other new messages
+		// always get a reply, not silently absorbed into a dead op (fix for #405).
+		if (this.#holdSweeps.has(current.turn.opRef)) return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
 		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
@@ -2025,6 +2030,12 @@ class OriginActor {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
+		// If turn is in recovery_hold and not already retired, retire it so pending inbound
+		// can start a fresh trigger turn in the next epoch.
+		const inRecoveryHold = !bound.retired && !retired && this.#holdSweeps.has(bound.turn.opRef);
+		if (inRecoveryHold) {
+			bound.retired = true;
+		}
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
 			this.#flushStaleOutput(bound, "stall");
@@ -2044,6 +2055,16 @@ class OriginActor {
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 				"warn",
 			);
+			this.#holdSweeps.delete(bound.turn.opRef);
+			// If we just retired a turn in recovery_hold, dispatch pending inbound as a new trigger turn.
+			if (inRecoveryHold) {
+				// Clear the current turn if this is the bound turn, and set state to idle for dispatch.
+				if (this.#current === bound) {
+					this.#current = undefined;
+					this.#state = "idle";
+				}
+				await this.#dispatchNext();
+			}
 			await this.#reconcileBound(bound);
 		}
 	}
