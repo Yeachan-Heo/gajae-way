@@ -533,7 +533,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],

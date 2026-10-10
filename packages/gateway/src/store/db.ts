@@ -845,9 +845,11 @@ export interface MemoryIntentDbRow {
 const DELIVERY_COLUMNS =
 	"delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error";
 /** Matches the partial index `monitor_events_open`; keep the two spellings identical. */
-const OPEN_MONITOR_EVENT = "stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
+const OPEN_MONITOR_EVENT =
+	"stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
 /** Terminal stages as SQL; must mirror TERMINAL_STAGES and the `monitor_events_gc` partial index predicate. */
-const TERMINAL_MONITOR_EVENT = "stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
+const TERMINAL_MONITOR_EVENT =
+	"stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet')";
 
 /**
  * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
@@ -5457,6 +5459,7 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 		}
 		if (current < 33) {
 			// Issue #369: Add proof_json column and contract_unmet stage for completion proof validation.
+			// Rebuild monitor_events because its stage CHECK constraint must widen and a new column is added.
 			this.withTransaction(() => {
 				this.#database.exec(
 					`CREATE TABLE monitor_events_v29 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped','contract_unmet')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT, proof_json TEXT);
@@ -5464,6 +5467,10 @@ INSERT INTO monitor_events_v29 (event_id, monitor_id, event_type, payload_json, 
 DROP TABLE monitor_events;
 ALTER TABLE monitor_events_v29 RENAME TO monitor_events;`,
 				);
+				for (const action of ["UPDATE", "DELETE"])
+					this.#database.exec(`CREATE TRIGGER monitor_events_quarantine_${action.toLowerCase()} BEFORE ${action} ON monitor_events
+							WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = OLD.event_id)
+							BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(33, new Date().toISOString());

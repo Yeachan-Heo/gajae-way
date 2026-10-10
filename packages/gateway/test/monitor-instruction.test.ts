@@ -243,7 +243,10 @@ test("#369 Issue Proposal 2: contract echo detection suppresses echo-suspected n
 			onSend: (input, scripted) => {
 				// Return note that echoes the instruction (contract echo)
 				const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
-				scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "Report the current status of all systems." }]));
+				scripted.complete(
+					input.opRef,
+					JSON.stringify([{ eventId: event!.eventId, note: "Report the current status of all systems." }]),
+				);
 			},
 		});
 		const testPipeline = new MonitorPropagator({
