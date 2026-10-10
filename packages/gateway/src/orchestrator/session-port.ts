@@ -1433,10 +1433,10 @@ function workerOutputCancelled(input: WorkerOutputInput): boolean {
 }
 
 function renderPrompt(systemPreamble: string | undefined, text: string): string {
-	if (!systemPreamble) return text;
+	if (!systemPreamble) return text.toWellFormed();
 	// SDK `session send` has no unproven system-prompt flag. Keep the trusted
 	// bootstrap in the same accepted turn instead of inventing a raw control API.
-	return `${systemPreamble}\n\n${text}`;
+	return `${systemPreamble}\n\n${text}`.toWellFormed();
 }
 
 type LastAssistantPage = {
