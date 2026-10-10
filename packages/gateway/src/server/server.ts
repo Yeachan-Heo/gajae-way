@@ -2173,7 +2173,9 @@ async function createInboundTurnLifecycle(
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
-			.map((entry) => `- [${entry.at}] ${entry.author}: ${clipByCodePoints(redactHistoricalAttachments(entry.body), 500)}`);
+			.map(
+				(entry) => `- [${entry.at}] ${entry.author}: ${clipByCodePoints(redactHistoricalAttachments(entry.body), 500)}`,
+			);
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
