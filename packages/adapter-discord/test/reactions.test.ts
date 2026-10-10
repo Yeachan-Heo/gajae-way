@@ -107,6 +107,52 @@ test("a deleted target message fails definitively and never confirms", async () 
 	]);
 });
 
+test("a reaction on the message that opened a thread is placed on the thread's starter message", async () => {
+	const requests: Request[] = [];
+	const reacted: string[] = [];
+	const fetched: string[] = [];
+	const thread = {
+		send: async () => {},
+		// Through the thread, its own id is not a message: Discord answers Unknown Message.
+		messages: {
+			fetch: async (id: string) => {
+				fetched.push(id);
+				if (id === "thread-1") throw Object.assign(new Error("Unknown Message"), { code: 10008 });
+				return { react: async (emoji: string) => void reacted.push(`${id}:${emoji}`) };
+			},
+		},
+		fetchStarterMessage: async () => ({ react: async (emoji: string) => void reacted.push(`starter:${emoji}`) }),
+	};
+	const discord: DiscordClientLike = { channels: { fetch: async () => thread } };
+	const inThread = (targetMessageId: string): ChatMessagePayload => ({
+		...reactionDelivery({ targetMessageId, emoji: "👍", emojiName: "thumbsup" }),
+		origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+	});
+	await settleDiscordReaction(
+		mockGateway(requests),
+		discord,
+		inThread("thread-1"),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+		silent,
+	);
+	// Any other target in the thread is still fetched through the thread.
+	await settleDiscordReaction(
+		mockGateway(requests),
+		discord,
+		inThread("reply-2"),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+		silent,
+	);
+	expect(reacted).toEqual(["starter:👍", "reply-2:👍"]);
+	expect(fetched).toEqual(["reply-2"]);
+	expect(requests).toEqual([
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+	]);
+});
+
 test("a non-snowflake target Discord rejects with 50035 fails definitively (live: UUID target replayed 19 times)", async () => {
 	const requests: Request[] = [];
 	const discord: DiscordClientLike = {

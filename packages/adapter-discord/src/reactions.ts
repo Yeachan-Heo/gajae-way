@@ -29,6 +29,8 @@ export interface DiscordReactableMessageLike {
 export interface DiscordReactionChannelLike {
 	readonly guild?: DiscordGuildLike | null;
 	readonly messages: { fetch(id: string): Promise<unknown> };
+	/** Thread channels only: the parent-channel message the thread was opened from. */
+	fetchStarterMessage?(): Promise<unknown>;
 }
 
 /**
@@ -228,7 +230,12 @@ export async function settleDiscordReaction(
 		if (!isDiscordReactionChannel(channel)) {
 			throw Object.assign(new Error(`Discord channel ${conversationId} cannot receive reactions`), { code: 10003 });
 		}
-		const target = await channel.messages.fetch(targetMessageId);
+		// A thread's id is its starter message's id, but that message lives in the
+		// parent channel: fetching it through the thread answers Unknown Message.
+		const target =
+			targetMessageId === conversationId && channel.fetchStarterMessage
+				? await channel.fetchStarterMessage()
+				: await channel.messages.fetch(targetMessageId);
 		if (!isReactableMessage(target)) {
 			throw Object.assign(new Error(`Discord message ${targetMessageId} cannot be reacted to`), { code: 10008 });
 		}
