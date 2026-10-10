@@ -3020,7 +3020,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// guidance because the persona chooses between exactly these three shapes.
 		...(isChatPlatform(origin.platform)
 			? [
-					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. Custom emoji names (Slack-valid: lowercase, digits, underscores, hyphens, 2-80 chars) are also accepted on Slack and Discord and will be validated server-side. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
 		// Live 2026-09-25: the persona held turns open for 13 minutes in a

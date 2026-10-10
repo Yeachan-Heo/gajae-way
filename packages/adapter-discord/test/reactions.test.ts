@@ -336,6 +336,66 @@ test("a DM reaction is not a group engagement and keeps the reactor as peer", ()
 	expect(described?.engagement).toEqual({ mentioned: false, group: false, authorId: "user-1" });
 });
 
+test("a custom emoji (empty unicode) from the protocol reacts with name:id when guild has it", async () => {
+	const requests: Request[] = [];
+	const owner = guild("guild-1", [{ name: "gajae-salute", id: "888" }]);
+	const harness = channelHarness(owner.guild);
+	await settleDiscordReaction(
+		mockGateway(requests),
+		harness.discord,
+		reactionDelivery({ targetMessageId: "target-1", emoji: "", emojiName: "gajae-salute" }),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+	);
+	expect(harness.reacted).toEqual(["gajae-salute:888"]);
+	expect(harness.sent).toEqual([]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a custom emoji that the guild lacks fails with a definitive error", async () => {
+	const requests: Request[] = [];
+	const lacking = guild("guild-1", [{ name: "something-else", id: "777" }]);
+	const harness = channelHarness(lacking.guild);
+	await settleDiscordReaction(
+		mockGateway(requests),
+		harness.discord,
+		reactionDelivery({ targetMessageId: "target-1", emoji: "", emojiName: "missing-emoji" }),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+		silent,
+	);
+	expect(harness.reacted).toEqual([]);
+	expect(harness.sent).toEqual([]);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]?.verb).toBe("delivery.fail");
+	expect(requests[0]?.params).toMatchObject({
+		deliveryId: "delivery-1",
+		reason: "Custom emoji 'missing-emoji' not found in this Discord server",
+		ambiguous: false,
+	});
+});
+
+test("a custom emoji in a DM fails because DMs have no guild", async () => {
+	const requests: Request[] = [];
+	const harness = channelHarness(undefined); // No guild = DM
+	await settleDiscordReaction(
+		mockGateway(requests),
+		harness.discord,
+		reactionDelivery({ targetMessageId: "target-1", emoji: "", emojiName: "custom-emoji" }),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+		silent,
+	);
+	expect(harness.reacted).toEqual([]);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]?.verb).toBe("delivery.fail");
+	expect(requests[0]?.params).toMatchObject({
+		deliveryId: "delivery-1",
+		reason: "Custom emoji 'custom-emoji' not found in this Discord server",
+		ambiguous: false,
+	});
+});
+
 type Request = { verb: string; params: unknown };
 
 function reactionDelivery(

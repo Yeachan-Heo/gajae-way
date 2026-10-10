@@ -30,9 +30,10 @@ const reverseNames = new Map(
 export function slackReactionFor(reaction: Pick<ReactionRef, "emojiName">): string {
 	const name = Object.hasOwn(SLACK_REACTION_NAMES, reaction.emojiName)
 		? SLACK_REACTION_NAMES[reaction.emojiName]
-		: undefined;
-	// Decided before any request: an unmapped name is a definitive non-delivery,
-	// never an ambiguous one, exactly like an emoji Slack itself would refuse.
+		: reaction.emojiName;
+	// Try the allowlist first, then try the custom emoji name directly.
+	// Slack will return invalid_name if the custom emoji doesn't exist in the workspace.
+	// The adapter is responsible for passing through only validated emoji names from the protocol.
 	if (!name) throw new SlackApiError(0, "invalid_name", `Slack has no reaction name for ${reaction.emojiName}`);
 	return name;
 }
@@ -41,7 +42,12 @@ export function reactionFromSlackName(
 	name: string,
 ): { readonly emoji: string; readonly emojiName: string } | undefined {
 	const base = name.replace(/::skin-tone-\d+$/, "");
-	return reverseNames.get(base === "thumbsup" ? "+1" : base === "thumbsdown" ? "-1" : base);
+	const mapped = reverseNames.get(base === "thumbsup" ? "+1" : base === "thumbsdown" ? "-1" : base);
+	if (mapped) return mapped;
+
+	// Custom emoji: not in our reverse mapping, so return with custom: prefix
+	// to match Discord convention and ensure it won't be confused with allowlisted names.
+	return { emoji: `:${base}:`, emojiName: `custom:${base}` };
 }
 
 export interface SlackReactionEvent {

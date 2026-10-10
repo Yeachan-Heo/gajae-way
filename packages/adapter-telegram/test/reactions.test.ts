@@ -97,6 +97,36 @@ test("sends the bare U+2764 heart Telegram accepts, not the U+FE0F spelling", as
 	}
 });
 
+test("reports custom emoji as unsupported without calling the API", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		await state.rememberOrigin(dmOrigin);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		let called = 0;
+		await settleTelegramReaction(
+			mockGateway(requests),
+			{
+				setMessageReaction: async () => {
+					called += 1;
+				},
+			},
+			state,
+			reactionDelivery("", "gajae-custom"), // Custom emoji with empty unicode
+		);
+		expect(called).toBe(0);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.verb).toBe("delivery.fail");
+		const params = requests[0]?.params as { deliveryId: string; reason: string; ambiguous: boolean };
+		expect(params.deliveryId).toBe("delivery-1");
+		expect(params.ambiguous).toBe(false);
+		expect(params.reason).toContain("gajae-custom");
+		expect(params.reason).toContain("Telegram");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("reports impossible emoji as a definitive delivery failure without calling the API", async () => {
 	for (const [emoji, name] of [
 		["✅", "check"],
