@@ -96,9 +96,9 @@ function messages(frames: any[]): any[] {
 	return frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 }
 
-test("a [FILE:] token becomes a file delivery in the reply's thread and leaves the text clean", async () => {
+test("a MEDIA: line becomes a file delivery in the reply's thread and leaves the text clean", async () => {
 	const { client, database } = await gateway(
-		(home) => `보고서 올립니다.\n[FILE:${join(home, "workspace", "report.csv")}]`,
+		(home) => `보고서 올립니다.\nMEDIA:${join(home, "workspace", "report.csv")}`,
 	);
 	sendMessage(client, SLACK_ORIGIN, SLACK_TRIGGER);
 	await settle();
@@ -122,7 +122,7 @@ test("a [FILE:] token becomes a file delivery in the reply's thread and leaves t
 });
 
 test("a file-only reply uploads the file and speaks no empty message", async () => {
-	const { client } = await gateway((home) => `[FILE:${join(home, "workspace", "report.csv")}]`);
+	const { client } = await gateway((home) => `MEDIA:${join(home, "workspace", "report.csv")}`);
 	sendMessage(client, SLACK_ORIGIN, SLACK_TRIGGER);
 	await settle();
 	const delivered = messages(client.frames);
@@ -131,7 +131,7 @@ test("a file-only reply uploads the file and speaks no empty message", async () 
 });
 
 test("a file under the gateway home outside the workspace is refused with a visible note, never uploaded", async () => {
-	const { client } = await gateway((home) => `토큰입니다 [FILE:${join(home, "secrets", "slack-bot-token")}]`);
+	const { client } = await gateway((home) => `토큰입니다\nMEDIA:${join(home, "secrets", "slack-bot-token")}`);
 	sendMessage(client, SLACK_ORIGIN, SLACK_TRIGGER);
 	await settle();
 	const delivered = messages(client.frames);
@@ -142,12 +142,14 @@ test("a file under the gateway home outside the workspace is refused with a visi
 	]);
 });
 
-test("a platform without upload support drops the token and keeps the text", async () => {
-	const { client } = await gateway((home) => `여기요 [FILE:${join(home, "workspace", "report.csv")}]`);
+test("on a platform without ledger uploads the MEDIA: line is passed through for the adapter", async () => {
+	const { client } = await gateway((home) => `여기요\nMEDIA:${join(home, "workspace", "report.csv")}`);
 	sendMessage(client, DISCORD_ORIGIN, "m1");
 	await settle();
 	const delivered = messages(client.frames);
-	expect(delivered.map((frame) => frame.payload.text)).toEqual(["여기요"]);
+	expect(delivered.map((frame) => frame.payload.text)).toEqual([
+		`여기요\nMEDIA:${join(directory, "workspace", "report.csv")}`,
+	]);
 	expect(delivered.some((frame) => frame.payload.file)).toBe(false);
 });
 

@@ -30,7 +30,7 @@ async function canonical(target: string): Promise<string> {
 }
 
 /**
- * Decides whether a `[FILE:<path>]` request may be uploaded.
+ * Decides whether a `MEDIA:<path>` request may be uploaded.
  *
  * The persona can already read any file it can reach, so this is not a sandbox.
  * It keeps the obvious accidents out of a chat room: relative paths (whose base
