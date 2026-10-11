@@ -52,7 +52,7 @@ export class LaneJobError extends Error {
 }
 
 /** Wire/storage version of the persisted LaneJobRecord. */
-export const LANE_JOB_SCHEMA_VERSION = 1 as const;
+export const LANE_JOB_SCHEMA_VERSION = 2 as const;
 
 /** Issue #9's exact evidence vocabulary. No synonyms. */
 export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress_uncommitted" | "no_work_produced";
@@ -109,6 +109,8 @@ export type LaneJobRecord = {
 	readonly lane: {
 		readonly branch: string;
 		readonly worktreePath: string;
+		/** Repository bound to this lane (URL or alias); used for worktree creation and push target (issue #480). */
+		readonly repository?: string;
 	};
 	/** Every runtime session this job has ever been driven through. */
 	readonly sessions: readonly string[];
@@ -136,6 +138,8 @@ export type CreateLaneJobInput = {
 	readonly sessionId?: string;
 	/** The worktree HEAD at creation; the baseline progress is measured against. */
 	readonly baselineSha?: string;
+	/** Repository binding (URL or alias); used for worktree creation and push target (issue #480). */
+	readonly repository?: string;
 	readonly now?: () => Date;
 };
 
@@ -155,13 +159,20 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 	if (input.baselineSha !== undefined && !/^[0-9a-f]{40}$/.test(input.baselineSha)) {
 		throw new LaneJobError(`baselineSha is not a full commit sha`);
 	}
+	if (input.repository !== undefined && typeof input.repository !== "string") {
+		throw new LaneJobError(`repository must be a string`);
+	}
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
 		jobId,
 		createdAt: at,
 		updatedAt: at,
 		state: "running",
-		lane: Object.freeze({ branch: input.branch, worktreePath: input.worktreePath }),
+		lane: Object.freeze({
+			branch: input.branch,
+			worktreePath: input.worktreePath,
+			...(input.repository !== undefined ? { repository: input.repository } : {}),
+		}),
 		sessions: input.sessionId ? Object.freeze([assertSessionIdShape(input.sessionId)]) : Object.freeze([]),
 		attempts: Object.freeze([]),
 		checkpoints: Object.freeze([]),
@@ -232,6 +243,9 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 	if (typeof laneObj.worktreePath !== "string" || !laneObj.worktreePath.startsWith("/")) {
 		throw new LaneJobError("lane worktreePath must be an absolute path");
 	}
+	if (laneObj.repository !== undefined && typeof laneObj.repository !== "string") {
+		throw new LaneJobError("lane repository must be a string when present");
+	}
 	const sessions = parseSessions(record.sessions);
 	const attempts = parseAttempts(record.attempts);
 	const checkpoints = parseCheckpoints(record.checkpoints);
@@ -244,7 +258,11 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		createdAt: record.createdAt as string,
 		updatedAt,
 		state: record.state as LaneJobState,
-		lane: Object.freeze({ branch: laneObj.branch as string, worktreePath: laneObj.worktreePath as string }),
+		lane: Object.freeze({
+			branch: laneObj.branch as string,
+			worktreePath: laneObj.worktreePath as string,
+			...(laneObj.repository === undefined ? {} : { repository: laneObj.repository as string }),
+		}),
 		sessions,
 		attempts,
 		checkpoints,

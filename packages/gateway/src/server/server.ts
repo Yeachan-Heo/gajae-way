@@ -674,6 +674,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		database: options.database,
 		port: sessionPort,
 		lanes,
+		gajaewayHome: options.config.home,
 		ownerTarget: () => runtime.config.ownerTarget?.origin,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		allowNested: () => runtime.config.work?.allowNested === true,

@@ -370,10 +370,16 @@ test("completed fake status reflects original operation evidence without inventi
 			outcome: { reason: "end_turn" },
 		});
 		expect(report.status.startedAt).toBeGreaterThanOrEqual(before);
-		expect(report.status.terminalAt).toBeGreaterThanOrEqual(report.status.startedAt!);
+		const startedAt = report.status.startedAt;
+		expect(startedAt).toBeDefined();
+		expect(report.status.terminalAt).toBeGreaterThanOrEqual(startedAt ?? 0);
 		// The host names the turn on accept and reports the same identity at terminal.
-		expect(report.status.commandId).toBe(receipt.commandId!);
-		expect(report.status.turnId).toBe(receipt.turnId!);
+		const commandId = receipt.commandId;
+		expect(commandId).toBeDefined();
+		expect(report.status.commandId).toBe(commandId);
+		const turnId = receipt.turnId;
+		expect(turnId).toBeDefined();
+		expect(report.status.turnId).toBe(turnId);
 		expect(await port.fetchWorkerOutput({ ...input, notBeforeMs: before, terminalIdentity: undefined })).toMatchObject({
 			status: "proven",
 			text: "original answer",

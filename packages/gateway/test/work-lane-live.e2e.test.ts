@@ -317,6 +317,7 @@ liveTest(
 				database,
 				port,
 				lanes: new LaneGovernor({ database, sessionPort: port, maxLanes: 1 }),
+				gajaewayHome: home,
 				brokerGeneration: () => broker.generation,
 				pollMs: 500,
 				waitTimeoutMs: 120_000,
