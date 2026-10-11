@@ -11,9 +11,12 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
+import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { parseWorkerOutputResponse, type WorkerOutputResult } from "../src/orchestrator/session-port";
 import {
+	type CheckStatusClient,
+	type CheckStatusSnapshot,
 	laneLastCommits,
 	laneSystemNotice,
 	reportText,
@@ -2076,6 +2079,101 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 	expect(notice).not.toContain("secret");
 	expect(notice).not.toContain("private");
 	expect(notice).not.toContain("authentication");
+});
+
+async function laneRepo(directory: string, branch: string, push: boolean) {
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const run = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (run.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${run.stderr.toString()}`);
+		return run.stdout.toString().trim();
+	};
+	const remote = `${directory}-origin.git`;
+	cleanups.push(() => rm(remote, { recursive: true, force: true }));
+	git(directory, "init", "-q", "--bare", remote);
+	git(directory, "init", "-q", "-b", branch);
+	git(directory, "remote", "add", "origin", remote);
+	git(directory, "commit", "-q", "--allow-empty", "-m", "lane head");
+	if (push) git(directory, "push", "-q", "origin", branch);
+	return git(directory, "rev-parse", "HEAD");
+}
+
+function recordingCheckClient(answer: CheckStatusSnapshot | null) {
+	const calls: Array<{ branch: string; cwd: string }> = [];
+	const client: CheckStatusClient = {
+		async getCheckStatus(branch, cwd) {
+			calls.push({ branch, cwd });
+			return answer;
+		},
+	};
+	return { calls, client };
+}
+
+async function settledReport(f: Awaited<ReturnType<typeof fixture>>) {
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.notices.some((notice) => notice.text.includes("[lane a] completed")));
+	return f.notices.find((notice) => notice.text.includes("[lane a] completed"))?.text ?? "";
+}
+
+test("#481 settled report of an unpushed lane carries its head and pushed=false without a PR lookup", async () => {
+	const { calls, client } = recordingCheckClient(null);
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/unpushed", false);
+	const text = await settledReport(f);
+	expect(text).toContain(`head=${head.slice(0, 12)}`);
+	expect(text).toContain("pushed=false");
+	expect(text).not.toContain("pr=");
+	expect(calls).toHaveLength(0);
+});
+
+test("#481 settled report of a pushed lane without an open PR says pushed=true and no checks", async () => {
+	const { calls, client } = recordingCheckClient(null);
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/no-pr", true);
+	const text = await settledReport(f);
+	expect(text).toContain(`head=${head.slice(0, 12)}`);
+	expect(text).toContain("pushed=true");
+	expect(text).not.toContain("checks=");
+	expect(calls).toEqual([{ branch: "fix/no-pr", cwd: f.directory }]);
+});
+
+test("#481 settled report of a pushed lane with a red PR names the PR and failing checks", async () => {
+	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/red", true);
+	const text = await settledReport(f);
+	expect(text).toContain("pushed=true");
+	expect(text).toContain("pr=484");
+	expect(text).toContain("checks=red(lint,test)");
+});
+
+test("#481 check rollup: any failure is red, unfinished is pending, all success is green", () => {
+	const run = (name: string, status: string, conclusion = "") => ({ __typename: "CheckRun", name, status, conclusion });
+	expect(
+		classifyCheckRollup(1, [
+			run("lint", "COMPLETED", "FAILURE"),
+			run("lint", "COMPLETED", "FAILURE"),
+			run("test", "IN_PROGRESS"),
+		]),
+	).toEqual({ prNumber: 1, status: "red", failingChecks: ["lint"] });
+	expect(classifyCheckRollup(2, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe("pending");
+	expect(classifyCheckRollup(3, []).status).toBe("pending");
+	expect(
+		classifyCheckRollup(4, [
+			run("lint", "COMPLETED", "SUCCESS"),
+			{ __typename: "StatusContext", context: "ci/x", state: "SUCCESS" },
+		]).status,
+	).toBe("green");
+	expect(
+		classifyCheckRollup(5, [{ __typename: "StatusContext", context: "ci/x", state: "ERROR" }]).failingChecks,
+	).toEqual(["ci/x"]);
 });
 
 test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {

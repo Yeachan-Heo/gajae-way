@@ -124,6 +124,20 @@ interface Waiter {
 	readonly owner: object;
 	readonly finish: (error?: Error) => void;
 }
+export interface CheckStatusSnapshot {
+	readonly prNumber: number;
+	readonly status: "pending" | "green" | "red";
+	readonly failingChecks: readonly string[];
+}
+
+export interface CheckStatusClient {
+	/**
+	 * Snapshot the checks of the open PR for `branch`: null when no PR is open,
+	 * undefined when the lookup failed or timed out. Must not throw.
+	 */
+	getCheckStatus(branch: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
+}
+
 export interface WorkLaneManagerOptions {
 	readonly database: GatewayDatabase;
 	readonly port: SessionPort;
@@ -139,6 +153,7 @@ export interface WorkLaneManagerOptions {
 	/** How long consecutive host-gone verdicts must persist before a live observer settles `host_lost`. */
 	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
+	readonly checkStatusClient?: CheckStatusClient;
 }
 interface WorkInput {
 	name: string;
@@ -285,6 +300,7 @@ export class WorkLaneManager {
 			endedAt,
 		});
 		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
+		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
 		if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -1065,7 +1081,7 @@ export class WorkLaneManager {
 		if (runtime.output.disposition !== "pending") await this.#settle(observer, runtime);
 	}
 	async #settle(observer: Observer, runtime: WorkAttemptRuntime): Promise<void> {
-		const facts = await collectRepoFacts(runtime.cwd);
+		const facts = await collectRepoFacts(runtime.cwd, this.#options.checkStatusClient);
 		const result = await this.#port.runExclusive(runtime.sessionKey, async () => {
 			if (!this.#writeCurrent(observer)) return;
 			const current = this.#db.workAttemptGet(runtime.opRef);
@@ -1129,7 +1145,7 @@ export class WorkLaneManager {
 				});
 			}
 
-			const text = reportText(name, endState, reason, runtime.opRef, output);
+			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -2016,6 +2032,7 @@ export function reportText(
 	reason: string,
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
+	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
 ): string {
 	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
@@ -2038,6 +2055,33 @@ export function reportText(
 		if (transport.endpointClass !== undefined) parts.push(`endpointClass=${transport.endpointClass}`);
 		body = parts.join(" ");
 	}
+
+	// Append repository facts if available
+	const factsLines: string[] = [];
+	if (facts?.headSha) {
+		factsLines.push(`head=${facts.headSha.slice(0, 12)}`);
+	}
+	if (facts?.pushed !== undefined) {
+		factsLines.push(`pushed=${facts.pushed}`);
+	}
+	if (facts?.checkStatus) {
+		const checks = facts.checkStatus;
+		factsLines.push(`pr=${checks.prNumber}`);
+		const checkStr =
+			checks.status === "green"
+				? "checks=green"
+				: checks.status === "red"
+					? `checks=red(${checks.failingChecks.slice(0, 3).join(",")})`
+					: "checks=pending";
+		factsLines.push(checkStr);
+	}
+
+	if (factsLines.length > 0 && body) {
+		body = body + " " + factsLines.join(" ");
+	} else if (factsLines.length > 0) {
+		body = factsLines.join(" ");
+	}
+
 	const content = utf8Prefix(body, 2048 - Buffer.byteLength(head, "utf8"));
 	const text = head + content;
 	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");
@@ -2045,7 +2089,17 @@ export function reportText(
 }
 async function collectRepoFacts(
 	worktreePath: string,
-): Promise<{ headSha?: string; dirtyFiles: number; branch?: string } | undefined> {
+	checkClient?: CheckStatusClient,
+): Promise<
+	| {
+			headSha?: string;
+			dirtyFiles: number;
+			branch?: string;
+			pushed?: boolean;
+			checkStatus?: CheckStatusSnapshot;
+	  }
+	| undefined
+> {
 	try {
 		const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
 		const branch = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -2058,14 +2112,33 @@ async function collectRepoFacts(
 		});
 		const headSha = head.stdout.toString().trim();
 		if (head.exitCode !== 0 || status.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(headSha)) return undefined;
-		return {
+
+		const branchName = branch.stdout.toString().trim() || undefined;
+		const result: Awaited<ReturnType<typeof collectRepoFacts>> = {
 			headSha,
 			dirtyFiles: status.stdout
 				.toString()
 				.split("\n")
 				.filter((line) => line.trim()).length,
-			branch: branch.stdout.toString().trim() || undefined,
+			branch: branchName,
 		};
+
+		// Check if HEAD is pushed to origin/<branch>
+		if (branchName && branchName !== "HEAD") {
+			const upstream = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", `origin/${branchName}`], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			result.pushed = upstream.exitCode === 0 && upstream.stdout.toString().trim() === headSha;
+
+			// Try to get PR number and check status via check client
+			if (result.pushed && checkClient) {
+				const checkStatus = await checkClient.getCheckStatus(branchName, worktreePath);
+				if (checkStatus) result.checkStatus = checkStatus;
+			}
+		}
+
+		return result;
 	} catch {
 		return undefined;
 	}

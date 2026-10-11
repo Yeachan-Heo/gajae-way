@@ -61,6 +61,7 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import { BrokerSpawnerGuard } from "../orchestrator/broker-spawner-guard";
+import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaBindHoldInput,
@@ -679,6 +680,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			void personaSessions.notifyInbound(originKey);
 		},
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
+		checkStatusClient: ghCheckStatusClient(),
 	});
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
