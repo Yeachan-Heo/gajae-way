@@ -374,7 +374,8 @@ export class ScriptedSessionPort implements SessionPort {
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)
 			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
-		const startedAt = this.omitStartedAt ? {} : { startedAt: operation.startedAt };
+		const shouldOmit = this.omitStartedAt || operation.omitStartedAtForOp;
+		const startedAt = shouldOmit ? {} : { startedAt: operation.startedAt };
 		return {
 			operationRef: input.opRef,
 			status:
@@ -415,6 +416,7 @@ export class ScriptedSessionPort implements SessionPort {
 		const fixture = this.#workerOutputFixtures.get(input.opRef);
 		if (fixture) return parseWorkerOutputResponse(input, fixture, Date.now());
 		const operation = this.#operations.get(input.opRef);
+		const shouldOmit = operation && (this.omitStartedAt || operation.omitStartedAtForOp);
 		const result =
 			!operation || operation.sessionId !== input.sessionId
 				? { status: "unknown" }
@@ -424,7 +426,7 @@ export class ScriptedSessionPort implements SessionPort {
 						...(operation.commandId ? { commandId: operation.commandId } : {}),
 						...(operation.turnId ? { turnId: operation.turnId } : {}),
 						status: operation.state,
-						...(this.omitStartedAt ? {} : { startedAt: operation.startedAt }),
+						...(shouldOmit ? {} : { startedAt: operation.startedAt }),
 						...(operation.terminalAt === undefined ? {} : { terminalAt: operation.terminalAt }),
 						...(operation.state === "terminal_ok"
 							? {
@@ -676,6 +678,7 @@ export class ScriptedSessionPort implements SessionPort {
 		operation.error = error;
 		if (detail.code !== undefined) operation.errorCode = detail.code;
 		if (detail.outcome !== undefined) operation.failureOutcome = detail.outcome;
+		if (detail.omitStartedAt !== undefined) operation.omitStartedAtForOp = detail.omitStartedAt;
 		operation.terminalAt = Date.now();
 		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_failed",
@@ -879,6 +882,7 @@ export function sessionPortFromScript(script: {
 export type ScriptedFailureDetail = {
 	readonly code?: string;
 	readonly outcome?: Record<string, string>;
+	readonly omitStartedAt?: boolean;
 };
 
 type Operation = {
@@ -892,6 +896,7 @@ type Operation = {
 	terminalAt?: number;
 	readonly commandId?: string;
 	readonly turnId?: string;
+	omitStartedAtForOp?: boolean;
 };
 
 /** Same fencing as ManagedTailHandle: only frames correlated to the turn it was told about are delivered. */

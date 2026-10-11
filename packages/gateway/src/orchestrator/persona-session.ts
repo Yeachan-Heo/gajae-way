@@ -2818,6 +2818,16 @@ class OriginActor {
 			this.#manager.log(
 				`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
 			);
+		const { startedAt, terminalAt } = report.status;
+		const isSubmissionPhaseFailure = report.status.outcome?.phase === "submission";
+		// The SDK reports no startedAt for a prompt that never started (#477), so a
+		// submission-phase failure is fenced by its terminalAt instead.
+		const turnFloor =
+			typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0
+				? startedAt
+				: isSubmissionPhaseFailure
+					? terminalAt
+					: undefined;
 		if (
 			report.status.status !== "failed" ||
 			report.operationRef !== bound.turn.opRef ||
@@ -2827,24 +2837,21 @@ class OriginActor {
 			bound.brokerGeneration !== this.#manager.brokerGeneration ||
 			this.#stopped ||
 			this.#manager.stopped ||
-			typeof report.status.startedAt !== "number" ||
-			!Number.isFinite(report.status.startedAt) ||
-			report.status.startedAt <= 0 ||
-			typeof report.status.terminalAt !== "number" ||
-			!Number.isFinite(report.status.terminalAt) ||
-			report.status.terminalAt < report.status.startedAt ||
-			report.status.terminalAt > this.#manager.now() ||
+			typeof terminalAt !== "number" ||
+			!Number.isFinite(terminalAt) ||
+			typeof turnFloor !== "number" ||
+			terminalAt < turnFloor ||
+			terminalAt > this.#manager.now() ||
 			bound.dispatchedAtMs === undefined ||
-			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
+			turnFloor + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
 		if (evidence?.reason === "provider_quota_exhausted") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
-		const submissionFailure = report.status.outcome?.phase === "submission";
 		let repeatedSubmissionFailure = false;
-		if (submissionFailure) {
+		if (isSubmissionPhaseFailure) {
 			const count = Math.min(2, (this.#submissionFailures.get(bound.sessionId) ?? 0) + 1);
 			this.#submissionFailures.set(bound.sessionId, count);
 			repeatedSubmissionFailure = count >= 2;
