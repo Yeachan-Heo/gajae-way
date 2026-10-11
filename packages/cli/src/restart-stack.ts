@@ -146,23 +146,30 @@ async function capture(command: readonly string[]): Promise<string | undefined> 
 	return (await child.exited) === 0 ? output : undefined;
 }
 
+export interface ServiceProbeOptions {
+	readonly capture?: (command: readonly string[]) => Promise<string | undefined>;
+	readonly readlink?: (path: string) => Promise<string>;
+}
+
 /** Reads the live pid from the service manager, then its start time and executable from `ps`. */
-export function defaultServiceProbe(platform: ServicePlatform): ServiceProbe {
+export function defaultServiceProbe(platform: ServicePlatform, options?: ServiceProbeOptions): ServiceProbe {
+	const doCapture = options?.capture ?? capture;
+	const doReadlink = options?.readlink ?? readlink;
 	return async (label) => {
 		const spec = serviceSpecs().find((candidate) => candidate.label === label);
 		if (spec === undefined) throw new Error(`unknown service label: ${label}`);
 		let pid: number | undefined;
 		if (platform === "darwin") {
-			const listed = await capture(["launchctl", "list", label]);
+			const listed = await doCapture(["launchctl", "list", label]);
 			const match = listed?.match(/"PID"\s*=\s*(\d+);/);
 			pid = match ? Number(match[1]) : undefined;
 		} else {
-			const shown = await capture(["systemctl", "--user", "show", "-p", "MainPID", "--value", systemdUnitName(spec)]);
+			const shown = await doCapture(["systemctl", "--user", "show", "-p", "MainPID", "--value", systemdUnitName(spec)]);
 			pid = shown === undefined ? undefined : Number(shown.trim());
 		}
 		if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return undefined;
-		const lstart = await capture(["ps", "-o", "lstart=", "-p", String(pid)]);
-		const args = await capture(["ps", "-ww", "-o", "args=", "-p", String(pid)]);
+		const lstart = await doCapture(["ps", "-o", "lstart=", "-p", String(pid)]);
+		const args = await doCapture(["ps", "-ww", "-o", "args=", "-p", String(pid)]);
 		if (lstart === undefined || args === undefined) return undefined;
 		const startedAt = Date.parse(lstart.trim());
 		if (!Number.isFinite(startedAt)) return undefined;
@@ -172,7 +179,11 @@ export function defaultServiceProbe(platform: ServicePlatform): ServiceProbe {
 		let binary: string | undefined;
 		if (platform === "linux") {
 			try {
-				binary = await readlink(`/proc/${pid}/exe`);
+				binary = await doReadlink(`/proc/${pid}/exe`);
+				// Strip " (deleted)" suffix which appears when the binary has been removed
+				if (binary.endsWith(" (deleted)")) {
+					binary = binary.slice(0, -10); // " (deleted)".length === 10
+				}
 			} catch {
 				// Fall through to use ps args
 			}
