@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/main";
 import {
+	defaultServiceProbe,
 	effectiveRestartState,
 	launchRestartStack,
 	readRestartReceipt,
@@ -417,4 +418,123 @@ test("default check skips services not in the unit dir", async () => {
 		await cleanupGajaeway();
 		await cleanupUnitDir();
 	}
+});
+
+test("on linux, a probe whose first ps args sample is bracketed [comm] retries and reports ok", async () => {
+	const { home, cleanup } = await tempHome();
+	try {
+		let clock = DEPLOYED_AT + 60_000;
+		let probeCallCount = 0;
+		const receipt = await runRestartStack({
+			home,
+			id: "r9",
+			platform: "linux",
+			now: () => clock,
+			sleep: async (ms: number) => {
+				clock += ms;
+			},
+			verifyTimeoutMs: 5_000,
+			pollMs: 1_000,
+			runner: async () => 0,
+			probe: async (label: string) => {
+				probeCallCount++;
+				// First probe call: simulate ps returning [gajaeway-gatewa] by returning undefined
+				// This causes the probe to retry
+				if (probeCallCount === 1) {
+					return undefined;
+				}
+				// Second probe call: return valid process info
+				return {
+					pid: 9000,
+					startedAt: clock + 1_000,
+					binary: label === "dev.gajaeway.gateway" ? "/opt/bin/gajaeway-gateway" : `/opt/bin/${label}`,
+				};
+			},
+			binaryModifiedAt: async () => DEPLOYED_AT,
+			isServiceInstalled: async () => true,
+		});
+		// The receipt should be ok even though the first probe call returned undefined
+		expect(receipt.state).toBe("ok");
+		// Gateway should be ok
+		const gateway = receipt.steps[0];
+		expect(gateway?.result).toBe("ok");
+		expect(gateway?.pid).toBe(9000);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("defaultServiceProbe with injectable readlink: returns undefined on readlink failure (bracketed [comm])", async () => {
+	const probe = defaultServiceProbe("linux", {
+		capture: async (command: readonly string[]) => {
+			const cmd = command.join(" ");
+			if (cmd.includes("systemctl")) return "1234"; // pid
+			if (cmd.includes("lstart")) return "Sun Oct 11 09:47:00 2026"; // lstart
+			if (cmd.includes("args=")) return "[gajaeway-gatewa]"; // bracketed comm (transient state)
+			return undefined;
+		},
+		readlink: async (path: string) => {
+			if (path === "/proc/1234/exe") throw new Error("readlink failed");
+			return "";
+		},
+	});
+	// When readlink fails and ps returns bracketed [comm], probe returns undefined to trigger retry
+	const result = await probe("dev.gajaeway.gateway");
+	expect(result).toBeUndefined();
+});
+
+test("defaultServiceProbe with injectable readlink: returns /proc exe path when available", async () => {
+	const probe = defaultServiceProbe("linux", {
+		capture: async (command: readonly string[]) => {
+			const cmd = command.join(" ");
+			if (cmd.includes("systemctl")) return "5678"; // pid
+			if (cmd.includes("lstart")) return "Sun Oct 11 09:47:00 2026"; // lstart
+			if (cmd.includes("args=")) return "/some/path/binary"; // fallback
+			return undefined;
+		},
+		readlink: async (path: string) => {
+			if (path === "/proc/5678/exe") return "/opt/bin/gajaeway-gateway";
+			return "";
+		},
+	});
+	const result = await probe("dev.gajaeway.gateway");
+	expect(result).toBeDefined();
+	expect(result?.pid).toBe(5678);
+	expect(result?.binary).toBe("/opt/bin/gajaeway-gateway");
+});
+
+test("defaultServiceProbe with injectable readlink: strips '(deleted)' suffix from /proc exe path", async () => {
+	const probe = defaultServiceProbe("linux", {
+		capture: async (command: readonly string[]) => {
+			const cmd = command.join(" ");
+			if (cmd.includes("systemctl")) return "9012"; // pid
+			if (cmd.includes("lstart")) return "Sun Oct 11 09:47:00 2026"; // lstart
+			if (cmd.includes("args=")) return "/fallback/binary"; // fallback
+			return undefined;
+		},
+		readlink: async (path: string) => {
+			if (path === "/proc/9012/exe") return "/opt/bin/gajaeway-gateway (deleted)";
+			return "";
+		},
+	});
+	const result = await probe("dev.gajaeway.gateway");
+	expect(result).toBeDefined();
+	expect(result?.pid).toBe(9012);
+	// Should have (deleted) suffix stripped
+	expect(result?.binary).toBe("/opt/bin/gajaeway-gateway");
+});
+
+test("defaultServiceProbe without injectable options uses built-in readlink", async () => {
+	const mockCapture = async (command: readonly string[]) => {
+		const cmd = command.join(" ");
+		if (cmd.includes("launchctl")) return '{ "PID" = 1111; }'; // darwin format
+		if (cmd.includes("lstart")) return "Sun Oct 11 09:47:00 2026";
+		if (cmd.includes("args=")) return "/opt/bin/admin serve"; // admin service has args: ["serve"]
+		return undefined;
+	};
+	const darwinProbe = defaultServiceProbe("darwin", { capture: mockCapture });
+	const result = await darwinProbe("dev.gajaeway.admin");
+	expect(result).toBeDefined();
+	expect(result?.pid).toBe(1111);
+	expect(result?.binary).toBe("/opt/bin/admin");
 });
