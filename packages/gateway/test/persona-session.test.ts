@@ -720,6 +720,32 @@ test("two consecutive internal submission failures reset the next inbound to a n
 	expect(third).toMatchObject({ sessionId: "session-e1", text: "submission-3" });
 });
 
+test("two consecutive internal submission failures without startedAt (real SDK behavior) reset the next inbound to a new epoch", async () => {
+	const port = new ScriptedSessionPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) =>
+			scripted.fail(input.opRef, "Prompt submission failed.", {
+				code: "internal",
+				outcome: { code: "internal", phase: "submission", category: "agent_runtime", provenance: "agent_failed" },
+				omitStartedAt: true,
+			}),
+	});
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+
+	const first = await settleFailedInbound(port, "submission-1");
+	const second = await settleFailedInbound(port, "submission-2");
+	expect(first.sessionId).toBe("session-e0");
+	expect(second.sessionId).toBe(first.sessionId);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(logs).toContain(
+		`session_reset_after_failed_turn origin=${KEY} epoch=0 nextEpoch=1 opRef=${second.opRef} reason=repeated_submission_failure`,
+	);
+
+	const third = await settleFailedInbound(port, "submission-3");
+	expect(third).toMatchObject({ sessionId: "session-e1", text: "submission-3" });
+});
+
 test("a healthy turn clears consecutive internal submission failures", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,
