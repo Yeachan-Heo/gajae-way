@@ -504,6 +504,7 @@ test("RT13 fifty synchronous frames preserve order through a slow asynchronous c
 
 test("RT14 work start survives observer spawn failure, sends once without relay and settles by status", async () => {
 	const { db, home } = await database();
+	const gajaewayHome = join(home, "gajaeway");
 	const port = new ScriptedSessionPort({ sessionIdForBind: () => crypto.randomUUID() });
 	attachTestBrokerOwnership(db, port, join(home, "agent"));
 	port.attachTail = async () => {
@@ -513,6 +514,7 @@ test("RT14 work start survives observer spawn failure, sends once without relay 
 		database: db,
 		port,
 		lanes: new LaneGovernor({ database: db, sessionPort: port, maxLanes: 1 }),
+		gajaewayHome,
 		pollMs: 5,
 		waitTimeoutMs: 1000,
 	});

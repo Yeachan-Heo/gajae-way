@@ -293,6 +293,42 @@ export class LaneGovernor {
 					"error",
 				);
 			}
+			// Clean up runtime-created worktree if it exists
+			if (record?.lane.worktreePath && record.lane.repository) {
+				try {
+					// Remove the worktree using git worktree remove --force
+					const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", record.lane.worktreePath], {
+						cwd: record.lane.repository,
+						stdout: "ignore",
+						stderr: "ignore",
+					});
+
+					// Delete the branch using git branch -D
+					if (removeResult.exitCode === 0) {
+						const branchName = `work/${name.toLowerCase()}`;
+						const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
+							cwd: record.lane.repository,
+							stdout: "ignore",
+							stderr: "ignore",
+						});
+						if (branchResult.exitCode !== 0) {
+							this.#log(
+								`lane_branch_delete_failed name=${name} session=${lane.sessionId} branch=${branchName}`,
+								"warn",
+							);
+						}
+					} else {
+						this.#log(
+							`lane_worktree_remove_failed name=${name} session=${lane.sessionId} path=${record.lane.worktreePath}`,
+							"warn",
+						);
+					}
+				} catch (error) {
+					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
+					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "warn");
+				}
+			}
+
 			this.#database.rebindEpoch(sessionKey);
 			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${reason} closed=${closed}`, "info");
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed };
