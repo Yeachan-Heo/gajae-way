@@ -398,3 +398,47 @@ test("default check skips services not in the unit dir", async () => {
 		await cleanupUnitDir();
 	}
 });
+
+test("on linux, a probe whose first ps args sample is bracketed [comm] retries and reports ok", async () => {
+	const { home, cleanup } = await tempHome();
+	try {
+		let clock = DEPLOYED_AT + 60_000;
+		let probeCallCount = 0;
+		const receipt = await runRestartStack({
+			home,
+			id: "r9",
+			platform: "linux",
+			now: () => clock,
+			sleep: async (ms: number) => {
+				clock += ms;
+			},
+			verifyTimeoutMs: 5_000,
+			pollMs: 1_000,
+			runner: async () => 0,
+			probe: async (label: string) => {
+				probeCallCount++;
+				// First probe call: simulate ps returning [gajaeway-gatewa] by returning undefined
+				// This causes the probe to retry
+				if (probeCallCount === 1) {
+					return undefined;
+				}
+				// Second probe call: return valid process info
+				return {
+					pid: 9000,
+					startedAt: clock + 1_000,
+					binary: label === "dev.gajaeway.gateway" ? "/opt/bin/gajaeway-gateway" : `/opt/bin/${label}`,
+				};
+			},
+			binaryModifiedAt: async () => DEPLOYED_AT,
+			isServiceInstalled: async () => true,
+		});
+		// The receipt should be ok even though the first probe call returned undefined
+		expect(receipt.state).toBe("ok");
+		// Gateway should be ok
+		const gateway = receipt.steps[0];
+		expect(gateway?.result).toBe("ok");
+		expect(gateway?.pid).toBe(9000);
+	} finally {
+		await cleanup();
+	}
+});

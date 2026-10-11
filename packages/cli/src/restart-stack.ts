@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readlink, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -166,11 +166,32 @@ export function defaultServiceProbe(platform: ServicePlatform): ServiceProbe {
 		if (lstart === undefined || args === undefined) return undefined;
 		const startedAt = Date.parse(lstart.trim());
 		if (!Number.isFinite(startedAt)) return undefined;
-		// The service definitions exec `<bin-dir>/<binary> <fixed args>`; stripping
-		// the known arguments keeps a bin dir containing spaces intact.
-		const suffix = spec.args.length > 0 ? ` ${spec.args.join(" ")}` : "";
-		const line = args.trim();
-		const binary = suffix && line.endsWith(suffix) ? line.slice(0, -suffix.length) : line;
+
+		// On Linux, prefer reading from /proc/<pid>/exe which is more reliable than ps args.
+		// ps may return bracketed [comm] when the process is exiting/zombie or mid-exec.
+		let binary: string | undefined;
+		if (platform === "linux") {
+			try {
+				binary = await readlink(`/proc/${pid}/exe`);
+			} catch {
+				// Fall through to use ps args
+			}
+		}
+
+		// Fall back to ps args. Reject bracketed values like [gajaeway-gatewa]
+		// which indicate the process is in a transient state (exiting/zombie/mid-exec).
+		if (binary === undefined) {
+			const line = args.trim();
+			if (line.startsWith("[") && line.endsWith("]")) {
+				// Process is in transient state; return undefined to trigger retry
+				return undefined;
+			}
+			// The service definitions exec `<bin-dir>/<binary> <fixed args>`; stripping
+			// the known arguments keeps a bin dir containing spaces intact.
+			const suffix = spec.args.length > 0 ? ` ${spec.args.join(" ")}` : "";
+			binary = suffix && line.endsWith(suffix) ? line.slice(0, -suffix.length) : line;
+		}
+
 		return { pid, startedAt, binary };
 	};
 }
