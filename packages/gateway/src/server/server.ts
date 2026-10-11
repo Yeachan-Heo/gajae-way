@@ -537,20 +537,23 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
  * dragging days of stale context. Loopback and monitor origins are exempt (the
  * console is the operator's own tool; monitor sessions are event-scoped already).
  * A running turn is never touched; it is picked up on a later sweep.
+ * A conversation with no gjc session bound since its last rotation (empty
+ * gjc_session_id) is already clean: rotating it again only bumps the epoch and
+ * drops the room context it has collected for its next turn.
  */
 /** A row whose stored origin ref names another conversation is logged once, not on every sweep. */
 const idleResetMismatchesLogged = new Set<string>();
 
 export async function sweepIdleSessions(
 	runtime: Pick<Runtime, "config" | "personaSessions">,
-	database: Pick<GatewayDatabase, "sessionRows">,
+	database: Pick<GatewayDatabase, "sessionIdentityRows">,
 	now: number = Date.now(),
 ): Promise<readonly string[]> {
 	const idleMs = runtime.config.sessionIdleResetMs;
 	if (idleMs === undefined) return [];
 	const rotated: string[] = [];
-	for (const row of database.sessionRows()) {
-		if (!row.origin_ref_json) continue;
+	for (const row of database.sessionIdentityRows()) {
+		if (!row.origin_ref_json || row.gjc_session_id === "") continue;
 		let origin: OriginRef;
 		try {
 			origin = validateOriginRef(JSON.parse(row.origin_ref_json) as OriginRef);
