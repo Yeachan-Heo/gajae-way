@@ -610,6 +610,8 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
+	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
+	readonly repo?: string;
 	/**
 	 * Explicit operator acknowledgement that lets a new attempt start while
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
@@ -677,6 +679,12 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/** Repository binding information (issue #480) */
+	readonly repository?: {
+		readonly url: string;
+		readonly branch: string;
+		readonly base?: string;
+	};
 }
 
 export interface WorkSteerParams {
