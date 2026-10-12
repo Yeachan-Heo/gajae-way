@@ -85,7 +85,7 @@ Discord / Telegram / Slack ──> gajaeway gateway ──> your persona (gjc)
    dist/gajaeway-gateway daemon
    ```
 
-   호스트는 또한 외부 `gjc` 실행 파일이 필요하며, `PATH`에 있거나 절대 `GJC_EXECUTABLE`로 고정되어야 합니다; 모든 턴에 대한 AI 런타임을 제공합니다.
+   게이트웨이와 브로커는 `gajaeway update`가 `$GAJAEWAY_HOME/gjc`에 설치하는 고정 버전의 `gjc`를 사용합니다; 모든 턴에 대한 AI 런타임을 제공합니다.
 
 5. Discord 어댑터를 시작한 다음 당신의 봇에 DM을 보내세요:
 
