@@ -32,6 +32,7 @@ test("trips once every probe has failed for the unresponsive window", async () =
 			signal: new AbortController().signal,
 			intervalMs: 15,
 			unresponsiveMs: 90,
+			startupMs: 90,
 			probe: async (pid) => {
 				probed.push(pid);
 				return false;
@@ -55,12 +56,33 @@ test("one answered probe restarts the window, so a slow broker is not killed", a
 			signal: new AbortController().signal,
 			intervalMs: 15,
 			unresponsiveMs: 90,
+			startupMs: 90,
 			probe: async () => ++calls === 5,
 			...time,
 		}),
 	);
 	expect(reason).toContain("6 failed probes");
 	expect(time.now()).toBe(75 + 90);
+});
+
+test("before its first answer a broker gets the startup budget, then the shorter window", async () => {
+	const time = clock();
+	let calls = 0;
+	const reason = await quiet(() =>
+		watchBrokerLiveness({
+			childPid: 9,
+			discoveryPath: "/unused",
+			signal: new AbortController().signal,
+			intervalMs: 10,
+			unresponsiveMs: 30,
+			startupMs: 100,
+			// First answer at t=80 (8th probe), past the steady-state window but inside startup.
+			probe: async () => ++calls === 8,
+			...time,
+		}),
+	);
+	expect(time.now()).toBe(80 + 30);
+	expect(reason).toContain("3 failed probes");
 });
 
 test("a throwing probe counts as a failure and abort stops the watch quietly", async () => {
@@ -72,6 +94,7 @@ test("a throwing probe counts as a failure and abort stops the watch quietly", a
 			signal: new AbortController().signal,
 			intervalMs: 50,
 			unresponsiveMs: 100,
+			startupMs: 100,
 			probe: async () => {
 				throw new Error("socket exploded");
 			},

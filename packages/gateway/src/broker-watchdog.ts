@@ -10,6 +10,11 @@ export const BROKER_WATCHDOG_PROBE_TIMEOUT_MS = 10_000;
  * the gateway's live-outage exit so recovery happens before clients give up.
  */
 export const BROKER_WATCHDOG_UNRESPONSIVE_MS = 90_000;
+/**
+ * Budget before the first answered probe. Broker recovery after a host reboot
+ * can take minutes (#182); restarting it at 90s would loop instead of recover.
+ */
+export const BROKER_WATCHDOG_STARTUP_MS = 300_000;
 
 export type BrokerWatchdogOptions = {
 	/** The broker process this host spawned; a discovery record for any other pid does not count. */
@@ -18,6 +23,7 @@ export type BrokerWatchdogOptions = {
 	readonly signal: AbortSignal;
 	readonly intervalMs?: number;
 	readonly unresponsiveMs?: number;
+	readonly startupMs?: number;
 	/** Returns true when the broker answered a request. Tests replace the network probe. */
 	readonly probe?: (childPid: number, discoveryPath: string) => Promise<boolean>;
 	readonly now?: () => number;
@@ -33,11 +39,14 @@ export type BrokerWatchdogOptions = {
 export async function watchBrokerLiveness(options: BrokerWatchdogOptions): Promise<string | undefined> {
 	const intervalMs = options.intervalMs ?? BROKER_WATCHDOG_INTERVAL_MS;
 	const unresponsiveMs = options.unresponsiveMs ?? BROKER_WATCHDOG_UNRESPONSIVE_MS;
+	const startupMs = options.startupMs ?? BROKER_WATCHDOG_STARTUP_MS;
 	const probe = options.probe ?? probeOwnBroker;
 	const now = options.now ?? Date.now;
 	const sleep = options.sleep ?? abortableSleep;
-	// Startup counts toward the window: a broker that never starts answering is wedged too.
+	// A broker that never starts answering is wedged too, but it gets the longer
+	// startup budget until its first answer.
 	let failingSince = now();
+	let answered = false;
 	let failures = 0;
 	while (!options.signal.aborted) {
 		await sleep(intervalMs, options.signal);
@@ -50,6 +59,7 @@ export async function watchBrokerLiveness(options: BrokerWatchdogOptions): Promi
 		}
 		if (options.signal.aborted) return undefined;
 		if (healthy) {
+			answered = true;
 			if (failures > 0) console.log(`broker_watchdog_recovered pid=${options.childPid} failures=${failures}`);
 			failingSince = now();
 			failures = 0;
@@ -58,7 +68,7 @@ export async function watchBrokerLiveness(options: BrokerWatchdogOptions): Promi
 		failures++;
 		const elapsed = now() - failingSince;
 		console.error(`broker_watchdog_probe_failed pid=${options.childPid} failures=${failures} elapsedMs=${elapsed}`);
-		if (elapsed >= unresponsiveMs)
+		if (elapsed >= (answered ? unresponsiveMs : startupMs))
 			return `broker pid ${options.childPid} unresponsive for ${Math.floor(elapsed / 1000)}s (${failures} failed probes)`;
 	}
 	return undefined;
