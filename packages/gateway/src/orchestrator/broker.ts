@@ -128,7 +128,7 @@ export interface GlobalGjcClientOptions {
 	 * Process kill seam for testing: sends signal to a process.
 	 * Default: process.kill. Must verify broker identity before killing.
 	 */
-	readonly killPid?: (pid: number, signal?: string) => boolean | undefined;
+	readonly killPid?: (pid: number, signal: NodeJS.Signals) => void;
 	/**
 	 * Broker process identity check: returns true if the pid is a gjc sdk broker.
 	 * Default: checks command line for 'sdk' and 'serve' or 'session'.
@@ -809,7 +809,11 @@ export class GlobalGjcClient {
 			}
 
 			// Send SIGTERM
-			const killPid = this.#options.killPid ?? ((p: number, sig?: string) => process.kill(p, sig || "SIGTERM"));
+			const killPid =
+				this.#options.killPid ??
+				((p: number, sig: NodeJS.Signals) => {
+					process.kill(p, sig);
+				});
 			try {
 				killPid(pid, "SIGTERM");
 				this.#log(`broker_recycle_sigterm pid=${pid}`);
