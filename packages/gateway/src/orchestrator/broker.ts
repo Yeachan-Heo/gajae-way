@@ -110,6 +110,40 @@ export interface GlobalGjcClientOptions {
 	 */
 	readonly liveOutageLimitMs?: number;
 	/**
+	 * Consecutive failed endpoint probes against a live broker after which
+	 * to recycle it. Default: 3. Set to 0 to disable recycling.
+	 */
+	readonly recycleWedgedBrokerStrikeThreshold?: number;
+	/**
+	 * Heartbeat staleness in milliseconds after which a live broker is recycled.
+	 * Default: 45000 (3x BROKER_HEARTBEAT_TTL_MS). Set to 0 to disable.
+	 */
+	readonly recycleWedgedBrokerStaleMs?: number;
+	/**
+	 * Cooldown in milliseconds between broker recycle attempts.
+	 * Default: 900000 (15 minutes).
+	 */
+	readonly recycleWedgedBrokerCooldownMs?: number;
+	/**
+	 * Process kill seam for testing: sends signal to a process.
+	 * Default: process.kill. Must verify broker identity before killing.
+	 */
+	readonly killPid?: (pid: number, signal?: string) => boolean | undefined;
+	/**
+	 * Broker process identity check: returns true if the pid is a gjc sdk broker.
+	 * Default: checks command line for 'sdk' and 'serve' or 'session'.
+	 */
+	readonly isBrokerProcess?: (pid: number) => boolean | Promise<boolean>;
+	/**
+	 * Clock for broker recycle cooldown and grace-period timing.
+	 */
+	readonly recycleClock?: () => number;
+	/**
+	 * Grace period in milliseconds before sending SIGKILL during broker recycle.
+	 * Default: 5000 (5 seconds). Set lower for faster testing.
+	 */
+	readonly recycleGracePeriodMs?: number;
+	/**
 	 * The broker is up but this process has not reached it for
 	 * `liveOutageLimitMs`: the fault is on the gateway side, so the owner should
 	 * exit and let the service manager restart it (#246). A dead or absent broker
@@ -270,8 +304,18 @@ export async function preflightGjcRuntime(
 	// A failed session list is the broker not answering yet (host reboot, stale
 	// lock being cleared), not a wrong runtime: it is classed as unavailable so
 	// boot waits it out instead of exiting into a restart loop (#182).
-	if (sdk && !isHealthySessionList(await sdk(brokerHealthArgs(), { timeoutMs: COMMAND_TIMEOUT_MS }))) {
-		throw new GjcCliUnavailableError("gjc runtime preflight failed: invalid session-list envelope");
+	if (sdk) {
+		const sessionListResult = await sdk(brokerHealthArgs(), { timeoutMs: COMMAND_TIMEOUT_MS });
+		if (!isHealthySessionList(sessionListResult)) {
+			// Log bounded tail of stderr/stdout to help diagnose boot failures
+			const combined = `${sessionListResult.stderr}\n${sessionListResult.stdout}`;
+			const lines = combined.split("\n").filter((l) => l.trim());
+			const tail = lines.slice(-5).join("; "); // Last 5 non-empty lines
+			const message = tail
+				? `invalid session-list envelope: ${tail.substring(0, 200)}`
+				: "invalid session-list envelope";
+			throw new GjcCliUnavailableError(`gjc runtime preflight failed: ${message}`);
+		}
 	}
 	// The relay argv contract is boot-gated: a usage rejection (exit 2) here
 	// means EVERY tail stream would die at spawn and the gateway would silently
@@ -350,6 +394,16 @@ export class GlobalGjcClient {
 	readonly #NUDGE_BACKOFF_MS = 45_000;
 	/** Guard nudge execution to avoid stalling observe loop. */
 	#nudgeInFlight = false;
+	/** Count of consecutive failed probes against a live broker discovery. */
+	#consecutiveLiveProbeFailures = 0;
+	/** Timestamp of last broker recycle attempt (for cooldown). */
+	#lastBrokerRecycleAt: number | undefined;
+	/** Config: strikes before recycling wedged broker. */
+	readonly #recycleStrikeThreshold: number;
+	/** Config: heartbeat staleness threshold before recycling. */
+	readonly #recycleStaleMs: number;
+	/** Config: cooldown between recycle attempts. */
+	readonly #recycleCooldownMs: number;
 
 	constructor(options: GlobalGjcClientOptions = {}) {
 		this.#options = options;
@@ -391,6 +445,9 @@ export class GlobalGjcClient {
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
+		this.#recycleStrikeThreshold = integer(options.recycleWedgedBrokerStrikeThreshold, 3, 0);
+		this.#recycleStaleMs = integer(options.recycleWedgedBrokerStaleMs, 45_000, 0);
+		this.#recycleCooldownMs = integer(options.recycleWedgedBrokerCooldownMs, 900_000, 0);
 		this.cli = (args, commandOptions) =>
 			this.#run(
 				bindAgentDir(args, this.agentDir),
@@ -590,6 +647,7 @@ export class GlobalGjcClient {
 				return false;
 			}
 			this.#observedLiveBroker = true;
+			const now = Date.now();
 			const healthy = await bounded(
 				this.#options.healthProbe
 					? Promise.resolve(
@@ -608,13 +666,22 @@ export class GlobalGjcClient {
 			this.#assertAgentDirIdentity();
 			this.#available = healthy;
 			if (!healthy) {
+				this.#consecutiveLiveProbeFailures++;
 				this.#unavailableReason = `endpoint probe failed for live discovery pid ${discovery.pid}`;
+				// Attempt to recycle the broker if it's wedged
+				if (epoch === this.#epoch && !this.#stopped) {
+					this.#recycleBrokerIfWedged(discovery, now);
+				}
 				return false;
 			}
+			// Reset failure counter on successful probe
+			this.#consecutiveLiveProbeFailures = 0;
 			const identity = `${discovery.pid}|${discovery.url}|${discovery.token}`;
 			if (identity !== this.#identity) {
 				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
+				// Reset failure counter on broker identity change
+				this.#consecutiveLiveProbeFailures = 0;
 				await this.#releaseBroker(discovery.pid);
 				this.#generation++;
 				for (const listener of this.#listeners) {
@@ -697,6 +764,106 @@ export class GlobalGjcClient {
 			this.#log(`broker_nudge_error: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
+	/**
+	 * Recycles a live broker that appears wedged: SIGTERM -> SIGKILL -> nudge autostart.
+	 * Fire-and-forget to avoid stalling the observe loop.
+	 */
+	#recycleBrokerIfWedged(discovery: BrokerDiscovery, now: number): void {
+		const shouldRecycleByStrikes =
+			this.#recycleStrikeThreshold > 0 && this.#consecutiveLiveProbeFailures >= this.#recycleStrikeThreshold;
+		const shouldRecycleByStale = this.#recycleStaleMs > 0 && now - discovery.heartbeatAt > this.#recycleStaleMs;
+
+		if (!shouldRecycleByStrikes && !shouldRecycleByStale) return;
+
+		// Check cooldown
+		const clock = this.#options.recycleClock ?? Date.now;
+		const recycleClock = clock();
+		if (this.#lastBrokerRecycleAt !== undefined && recycleClock - this.#lastBrokerRecycleAt < this.#recycleCooldownMs) {
+			return;
+		}
+
+		this.#lastBrokerRecycleAt = recycleClock;
+		// Fire-and-forget to avoid stalling observe
+		void this.#executeBrokerRecycle(discovery.pid);
+	}
+
+	/**
+	 * Executes broker recycle: verify pid is broker, SIGTERM, wait, SIGKILL, nudge autostart.
+	 */
+	async #executeBrokerRecycle(pid: number): Promise<void> {
+		const pidAlive = this.#options.isPidAlive ?? defaultPidAlive;
+		const isBrokerProcess = this.#options.isBrokerProcess ?? (await createDefaultIsBrokerProcess(this.agentDir));
+		const clock = this.#options.recycleClock ?? Date.now;
+
+		try {
+			// Verify pid is still alive
+			if (!(await bounded(Promise.resolve(pidAlive(pid)), 100))) {
+				this.#log(`broker_recycle_noop pid=${pid} verdict=already_dead`);
+				return;
+			}
+
+			// Verify pid is actually a broker process (fail closed)
+			if (!(await bounded(Promise.resolve(isBrokerProcess(pid)), 200))) {
+				this.#log(`broker_recycle_refused pid=${pid} reason=identity_check_failed`);
+				return;
+			}
+
+			// Send SIGTERM
+			const killPid = this.#options.killPid ?? ((p: number, sig?: string) => process.kill(p, sig || "SIGTERM"));
+			try {
+				killPid(pid, "SIGTERM");
+				this.#log(`broker_recycle_sigterm pid=${pid}`);
+			} catch (error) {
+				this.#log(
+					`broker_recycle_sigterm_failed pid=${pid} error=${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+
+			// Grace period: wait for graceful shutdown
+			const gracePeriodMs = this.#options.recycleGracePeriodMs ?? 5_000;
+			const graceDeadline = clock() + gracePeriodMs;
+			let attempts = 0;
+			while (attempts < 10 && clock() < graceDeadline) {
+				if (!(await bounded(Promise.resolve(pidAlive(pid)), 100))) {
+					const elapsed = clock() - (graceDeadline - gracePeriodMs);
+					this.#log(`broker_recycle_terminated pid=${pid} gracePeriodMs=${elapsed}`);
+					// Reset failure counter after successful recycle
+					this.#consecutiveLiveProbeFailures = 0;
+					this.#nudgeBrokerAutostart();
+					return;
+				}
+				attempts++;
+				await delay(Math.min(500, gracePeriodMs / (attempts + 1)));
+			}
+
+			// Grace period expired, verify broker is still alive before SIGKILL
+			if (!(await bounded(Promise.resolve(pidAlive(pid)), 100))) {
+				this.#log(`broker_recycle_terminated pid=${pid} gracePeriodMs=${gracePeriodMs}`);
+				this.#consecutiveLiveProbeFailures = 0;
+				this.#nudgeBrokerAutostart();
+				return;
+			}
+
+			// Send SIGKILL
+			try {
+				killPid(pid, "SIGKILL");
+				this.#log(`broker_recycle_sigkill pid=${pid}`);
+			} catch (error) {
+				this.#log(
+					`broker_recycle_sigkill_failed pid=${pid} error=${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+
+			// Reset failure counter and nudge autostart
+			this.#consecutiveLiveProbeFailures = 0;
+			this.#nudgeBrokerAutostart();
+		} catch (error) {
+			this.#log(`broker_recycle_error pid=${pid} error=${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	/**
 	 * Low-level command execution (spawn/track/terminate). Used by both #run
 	 * (with availability checks) and #executeNudge (without).
@@ -1116,6 +1283,67 @@ async function bounded<T>(promise: Promise<T>, timeout: number): Promise<T> {
 		if (timer) clearTimeout(timer);
 	}
 }
+/**
+ * Pure argv matcher: checks if argv array represents a broker process.
+ * Broker argv signature: [... "bun" ... "cli.ts" "sdk" "broker-internal" "--agent-dir" "<agentDir>" ...]
+ * Exported for testing.
+ */
+export function isBrokerArgv(argv: readonly string[], expectedAgentDir: string): boolean {
+	const hasSdk = argv.includes("sdk");
+	const hasBrokerInternal = argv.includes("broker-internal");
+	if (!hasSdk || !hasBrokerInternal) return false;
+
+	// Find --agent-dir and check its value matches expectedAgentDir
+	for (let i = 0; i < argv.length - 1; i++) {
+		if (argv[i] === "--agent-dir" && argv[i + 1] === expectedAgentDir) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Default broker process identity check: verifies the pid's command line matches
+ * the expected broker argv (bun ... sdk broker-internal --agent-dir <agentDir>).
+ * Fails CLOSED if identity cannot be proven, to avoid signaling unrelated processes.
+ * Uses /proc on Linux, ps command on macOS, returns false elsewhere.
+ */
+async function createDefaultIsBrokerProcess(agentDir: string) {
+	return async (pid: number): Promise<boolean> => {
+		const { readFileSync } = await import("node:fs");
+		let argv: string[] = [];
+
+		try {
+			if (process.platform === "linux") {
+				// Linux: /proc/<pid>/cmdline is NUL-separated
+				const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+				argv = cmdline.split("\0").filter((s) => s);
+			} else if (process.platform === "darwin") {
+				// macOS: spawn ps to get command line with bounded timeout
+				const { execSync } = await import("node:child_process");
+				try {
+					const cmdline = execSync(`ps -o command= -p ${pid}`, {
+						timeout: 500, // 500ms timeout
+						encoding: "utf8",
+					}).trim();
+					argv = cmdline.split(" ");
+				} catch {
+					// ps failed (pid not found, permission denied, etc): fail closed
+					return false;
+				}
+			} else {
+				// Windows, BSD, etc: cannot safely verify, fail closed
+				return false;
+			}
+
+			return isBrokerArgv(argv, agentDir);
+		} catch {
+			// Any error (permission, missing /proc, etc): fail CLOSED
+			return false;
+		}
+	};
+}
+
 async function terminateChild(child: ReturnType<SpawnFn>): Promise<void> {
 	// Signal errors alone do not establish failure: a concurrently exiting child
 	// can reject a signal while its exit promise still supplies definitive proof.

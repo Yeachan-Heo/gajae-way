@@ -484,10 +484,9 @@ test("each unavailable observation names why the broker was rejected", async () 
 	await eventually(() => logs.some((line) => line.endsWith("observing without repair: discovery absent)")));
 });
 
-test("a live broker the gateway cannot reach past the bound asks the owner to exit (#246)", async () => {
-	// 2026-09-21: a current, healthy broker, yet every request failed
-	// broker_unavailable for 37 minutes while service_alive kept ticking; only a
-	// gateway restart recovered it.
+test("live broker with failed probe eventually exits if recycle is disabled or fails (#246 fallback)", async () => {
+	// When broker is live but endpoint probe fails, attempt recycle.
+	// If recycle is disabled (threshold=0) and outage exceeds limit, exit as last resort.
 	let probeOk = true;
 	const exceeded: string[] = [];
 	const value = client({
@@ -496,10 +495,12 @@ test("a live broker the gateway cannot reach past the bound asks the owner to ex
 		reconnectBackoff: { initialMs: 2, maxMs: 2 },
 		liveOutageLimitMs: 40,
 		onLiveOutageExceeded: (detail) => exceeded.push(detail),
+		recycleWedgedBrokerStrikeThreshold: 0, // Disable recycle
 	});
 	await value.start();
 	expect(value.outage()).toBeUndefined();
 	probeOk = false;
+	// Wait for live outage timeout
 	await eventually(() => exceeded.length > 0);
 	expect(exceeded[0]).toMatch(/^live broker unreachable for \d+s: endpoint probe failed for live discovery pid 12345$/);
 	expect(value.outage()).toMatch(
