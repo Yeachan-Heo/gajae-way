@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
+import { type TelegramAttachmentSaver, TelegramAttachmentStore } from "../src/attachments";
 import { loadTelegramAdapterConfig, TelegramAdapterStartupError } from "../src/config";
 import {
 	chunkTelegramMessage,
@@ -91,14 +92,20 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} });
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		const update: TelegramUpdate = { update_id: 81, message: topicMessage };
 		expect(await adapter.handleUpdate(gateway, update)).toBe(true);
 		expect(await adapter.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
-		const restarted = new TelegramAdapter(await TelegramAdapterState.load(home), "agent", "900", { chats: {} });
+		const restarted = new TelegramAdapter(
+			await TelegramAdapterState.load(home),
+			"agent",
+			"900",
+			{ chats: {} },
+			noAttachments,
+		);
 		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
 		expect(requests[0]?.params).toEqual({
@@ -106,6 +113,94 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 			text: "hello @agent",
 			engagement: { mentioned: true, group: true, authorId: "42" },
 		});
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("forwards a captioned photo with the downloaded local path and never the token url", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const fetched: string[] = [];
+		const bot = new TelegramBotApi("secret-token", async (url, init) => {
+			fetched.push(String(url));
+			if (String(url).endsWith("/getFile")) {
+				expect(JSON.parse(String(init?.body))).toEqual({ file_id: "big" });
+				return Response.json({ ok: true, result: { file_path: "photos/file_3.jpg" } });
+			}
+			return new Response(new Uint8Array([0xff, 0xd8, 0xff]));
+		});
+		const directory = join(home, "attachments", "telegram");
+		const adapter = new TelegramAdapter(
+			state,
+			"agent",
+			"900",
+			{ chats: {} },
+			new TelegramAttachmentStore(directory, bot),
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await adapter.handleUpdate(mockGateway(requests), {
+			update_id: 5,
+			message: {
+				message_id: 31,
+				chat: { id: -20, type: "group" },
+				from: { id: 42 },
+				caption: "what is this @agent",
+				photo: [
+					{ file_id: "small", file_unique_id: "u-small", width: 90, height: 60, file_size: 900 },
+					{ file_id: "big", file_unique_id: "u-big", width: 1280, height: 853, file_size: 125_000 },
+				],
+			},
+		});
+		const path = join(directory, "-20", "31-u-big.jpg");
+		expect(fetched).toEqual([
+			"https://api.telegram.org/botsecret-token/getFile",
+			"https://api.telegram.org/file/botsecret-token/photos/file_3.jpg",
+		]);
+		expect(requests).toEqual([
+			{
+				verb: "chat.send",
+				params: {
+					origin: { platform: "telegram", kind: "channel", conversationId: "-20" },
+					text: `what is this @agent\n[image · 122.1 KB · ${path}]`,
+					engagement: { mentioned: true, group: true, authorId: "42" },
+				},
+			},
+		]);
+		expect(JSON.stringify(requests)).not.toContain("secret-token");
+		expect([...(await readFile(path))]).toEqual([0xff, 0xd8, 0xff]);
+		expect((await stat(path)).mode & 0o777).toBe(0o600);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("still forwards an attachment-only message when the download fails", async () => {
+	const home = await temporaryHome();
+	try {
+		const adapter = new TelegramAdapter(
+			await TelegramAdapterState.load(home),
+			"agent",
+			"900",
+			{ chats: {} },
+			{
+				save: async () => ({ unavailable: "download failed" }),
+			},
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await adapter.handleUpdate(mockGateway(requests), {
+			update_id: 6,
+			message: {
+				message_id: 32,
+				chat: { id: 22, type: "private" },
+				from: { id: 44 },
+				document: { file_id: "d", file_unique_id: "ud", file_name: "scan.png", mime_type: "image/png" },
+			},
+		});
+		expect(requests.map((request) => (request.params as { text: string }).text)).toEqual([
+			"[image · scan.png · not downloaded: download failed]",
+		]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -217,6 +312,10 @@ test("the delivery subscription routes a reaction to setMessageReaction and neve
 async function temporaryHome(): Promise<string> {
 	return mkdtemp(join(tmpdir(), "gajaeway-telegram-adapter-"));
 }
+
+const noAttachments: TelegramAttachmentSaver = {
+	save: async () => Promise.reject(new Error("a text message never carries an attachment")),
+};
 
 function delivery(origin: ChatMessagePayload["origin"], text: string): ChatMessagePayload {
 	return { turnId: "turn-1", origin, role: "assistant", text, final: true, deliveryId: "delivery-1" };

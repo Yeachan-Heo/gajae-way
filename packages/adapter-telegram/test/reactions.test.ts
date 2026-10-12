@@ -238,7 +238,13 @@ test("handleUpdate reports an inbound reaction as engagement and never as a turn
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: { "-100123": { engagement: "open" } } });
+		const adapter = new TelegramAdapter(
+			state,
+			"agent",
+			"900",
+			{ chats: { "-100123": { engagement: "open" } } },
+			{ save: async () => Promise.reject(new Error("a reaction never carries an attachment")) },
+		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const accepted = await adapter.handleUpdate(mockGateway(requests), {
 			update_id: 5,

@@ -54,6 +54,7 @@ $GAJAEWAY_HOME/
   adapter-discord.pid        # single-instance lock, held by the running Discord adapter
   adapter-slack.pid          # same, for the Slack adapter
   adapters/slack/recovery-cursor.json  # Slack missed-message watermarks
+  attachments/telegram/<chat>/  # inbound Telegram photos/files (owner-only, pruned after 7 days)
   gateway.sock
   gateway.db
   workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory

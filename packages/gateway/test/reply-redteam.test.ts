@@ -716,7 +716,7 @@ describe("G2 C6 source-text guarantees and full divergence enumeration", () => {
 		const expression = source.slice(source.indexOf("const mentioned =")).split(";")[0]?.replace(/\s+/g, " ").trim();
 		expect(expression).toBe(
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: asserts the adapter's source text verbatim
-			"const mentioned = message.text?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true || replyTo?.fromSelf === true",
+			"const mentioned = (message.text ?? message.caption)?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true || replyTo?.fromSelf === true",
 		);
 		// Same identity value feeds both halves (C4): one botUserId, one resolve call.
 		expect(source).toContain("const replyTo = resolveTelegramReplyContext(message.reply_to_message, botUserId);");
