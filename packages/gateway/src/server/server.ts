@@ -1541,6 +1541,12 @@ async function handleRequest(
 					"invalid_params",
 					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist: ${reactionAllowlistDescription(origin.platform)}`,
 				);
+			// Personas cannot request custom emoji: the protocol only knows the allowlisted emoji.
+			if (resolved.isCustom === true)
+				throw new ProtocolError(
+					"invalid_params",
+					`custom emoji ${resolved.name} are not supported in the persona protocol; use: ${reactionAllowlistDescription(origin.platform)}`,
+				);
 			// Allowlisted is not the same as deliverable: Telegram accepts only its own
 			// reaction set, so asking for one it cannot express would be a guaranteed dead
 			// delivery. Refuse it here instead of letting the persona believe it acknowledged.
@@ -3215,7 +3221,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");
-		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
+		if (!eyes || eyes.isCustom === true || !platformSupportsReaction(origin.platform, eyes.name)) return;
 		const key = originKey(origin);
 		const rejection = runtime.reactions.claim({
 			...(turnId ? { turnId } : {}),
