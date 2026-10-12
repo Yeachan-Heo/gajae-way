@@ -293,8 +293,10 @@ export class LaneGovernor {
 					"error",
 				);
 			}
-			// Clean up runtime-created worktree if it exists
-			if (record?.lane.worktreePath && record.lane.repository) {
+			// Only an operator retirement deletes the runtime-created worktree and
+			// branch. A sweep (`expected` set) is unattended: the lane must stay
+			// resumable and its unpushed commits must survive.
+			if (!expected && record?.lane.worktreePath && record.lane.repository) {
 				try {
 					// Remove the worktree using git worktree remove --force
 					const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", record.lane.worktreePath], {

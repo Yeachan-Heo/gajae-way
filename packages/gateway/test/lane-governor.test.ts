@@ -1,4 +1,8 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ProtocolError } from "@gajae-gateway/protocol";
 import {
 	appendAttempt,
@@ -294,6 +298,63 @@ test("sweep retires idle and terminal jobs but preserves fresh lanes and open at
 	expect(logs).toContain("lane_retired name=done session=sess-done reason=job_done closed=true");
 	expect(logs).toContain("lane_retired name=idle session=sess-idle reason=idle closed=true");
 	expect(await governor.sweep()).toBe(0);
+});
+
+test("only operator retirement deletes a repo-bound lane worktree; the sweep keeps it resumable", async () => {
+	const root = await mkdtemp(join(tmpdir(), "governor-worktree-"));
+	try {
+		const repo = join(root, "repo");
+		const git = (cwd: string, ...args: string[]) => {
+			const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "t",
+					GIT_AUTHOR_EMAIL: "t@t",
+					GIT_COMMITTER_NAME: "t",
+					GIT_COMMITTER_EMAIL: "t@t",
+				},
+				stdout: "ignore",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		};
+		Bun.spawnSync(["git", "init", "-q", repo]);
+		git(repo, "commit", "-q", "--allow-empty", "-m", "initial");
+		database = await Store.open(":memory:");
+		const port = new ScriptedSessionPort();
+		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => NOW });
+		const lane = async (name: string) => {
+			const worktreePath = join(root, name);
+			git(repo, "worktree", "add", "-q", "-b", `work/${name}`, worktreePath);
+			git(worktreePath, "commit", "-q", "--allow-empty", "-m", "unpushed work");
+			const record = createLaneJobRecord({
+				jobId: laneJobIdentity(name).jobId,
+				branch: `work/${name}`,
+				worktreePath,
+				repository: repo,
+				now: () => new Date(NOW),
+			});
+			database.transaction((tx) =>
+				database.work.putLaneJob(tx, {
+					...record,
+					laneKey: laneJobIdentity(name).laneKey,
+					json: JSON.stringify(record),
+				}),
+			);
+			bind(name, NOW - 10 * 60_000);
+			return worktreePath;
+		};
+
+		const swept = await lane("swept");
+		expect(await governor.sweep()).toBe(1);
+		expect(existsSync(swept)).toBe(true);
+
+		const operator = await lane("operator");
+		expect(await governor.retire("operator", "operator")).toMatchObject({ retired: true });
+		expect(existsSync(operator)).toBe(false);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("a ledger `failed` attempt is local evidence only: retirement waits for broker terminality", async () => {
