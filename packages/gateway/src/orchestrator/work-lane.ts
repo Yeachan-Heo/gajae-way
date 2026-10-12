@@ -1962,59 +1962,6 @@ export class WorkLaneManager {
 		);
 		this.#observers.clear();
 	}
-	/**
-	 * Retire a work lane and clean up its runtime-created worktree directory.
-	 * Only removes worktrees that were created by the WorkLaneManager (in <laneRoot>/lanes/<name>).
-	 */
-	async retire(name: string): Promise<void> {
-		this.#live();
-		const job = this.#job(name, true);
-		if (!job) {
-			throw new ProtocolError("invalid_params", "unknown work lane", {
-				reasonCode: "unknown_work_lane",
-				name,
-			});
-		}
-
-		// Only remove worktrees created by the WorkLaneManager in the lanes directory
-		const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
-		const lanesDir = join(laneRoot, "lanes");
-
-		// Check if the worktree path is under the managed lanes directory
-		if (job.lane.worktreePath.startsWith(lanesDir)) {
-			try {
-				// If the lane has a repository binding, clean up the worktree using git commands
-				if (job.lane.repository) {
-					// Remove the worktree using git worktree remove --force
-					const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", job.lane.worktreePath], {
-						cwd: job.lane.repository,
-						stdout: "ignore",
-						stderr: "ignore",
-					});
-
-					// Delete the branch using git branch -D
-					if (removeResult.exitCode === 0) {
-						const branchName = `work/${name.toLowerCase()}`;
-						Bun.spawnSync(["git", "branch", "-D", branchName], {
-							cwd: job.lane.repository,
-							stdout: "ignore",
-							stderr: "ignore",
-						});
-					}
-				} else {
-					// For pre-existing worktrees without repository binding, just remove the directory
-					const { rm } = await import("node:fs/promises");
-					await rm(job.lane.worktreePath, { recursive: true, force: true });
-				}
-			} catch (error) {
-				console.error(`work_retire_cleanup_failed name=${name} path=${job.lane.worktreePath} error=${error}`);
-				throw new ProtocolError("verb_failed", "failed to retire lane worktree", {
-					reasonCode: "retire_cleanup_failed",
-					name,
-				});
-			}
-		}
-	}
 
 	stop(): Promise<void> {
 		if (this.#stopPromise) return this.#stopPromise;

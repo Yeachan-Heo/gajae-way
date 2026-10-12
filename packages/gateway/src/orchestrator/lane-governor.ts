@@ -293,8 +293,8 @@ export class LaneGovernor {
 					"error",
 				);
 			}
-			// Only an operator retirement deletes the runtime-created worktree and
-			// branch. A sweep (`expected` set) is unattended: the lane must stay
+			// Only a non-forced operator retirement (no sweep nomination) deletes the
+			// runtime-created worktree and branch. A sweep is unattended: the lane must stay
 			// resumable and its unpushed commits must survive.
 			if (!expected && record?.lane.worktreePath && record.lane.repository) {
 				try {
