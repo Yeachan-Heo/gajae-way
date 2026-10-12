@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SlackWebApi } from "../../adapter-slack/src/api";
-import { settleSlackDelivery } from "../../adapter-slack/src/main";
+import { ReconnectingGateway, settleSlackDelivery } from "../../adapter-slack/src/main";
 import { slackMessageId, slackMessageOrigin } from "../../adapter-slack/src/origin";
 import { liveGateway, stopLiveGatewaysAfterEach } from "../../adapter-slack/test/live-gateways";
 import type { GatewayConfig } from "../src/config";
