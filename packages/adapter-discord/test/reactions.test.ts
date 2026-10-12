@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { ChatMessagePayload } from "@gajae-gateway/protocol";
+import type { ChatMessagePayload, ReactionAction } from "@gajae-gateway/protocol";
 import type { DiscordClientLike, GatewayClientLike } from "../src/main";
 import {
 	type DiscordInboundReaction,
@@ -25,6 +25,24 @@ test("reacts with the allowlist unicode and never posts a message", async () => 
 		instantLimiter(),
 	);
 	expect(harness.reacted).toEqual(["👍"]);
+	expect(harness.removed).toEqual([]);
+	expect(harness.sent).toEqual([]);
+	expect(harness.fetchedMessages).toEqual(["target-1"]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("removes a reaction by calling message.reactions.resolve(...).users.remove(botId) and never calls react", async () => {
+	const requests: Request[] = [];
+	const harness = channelHarness();
+	await settleDiscordReaction(
+		mockGateway(requests),
+		harness.discord,
+		reactionDelivery({ targetMessageId: "target-1", emoji: "👍", emojiName: "thumbsup", action: "remove" }),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+	);
+	expect(harness.removed).toEqual(["👍"]);
+	expect(harness.reacted).toEqual([]);
 	expect(harness.sent).toEqual([]);
 	expect(harness.fetchedMessages).toEqual(["target-1"]);
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
@@ -339,7 +357,7 @@ test("a DM reaction is not a group engagement and keeps the reactor as peer", ()
 type Request = { verb: string; params: unknown };
 
 function reactionDelivery(
-	reaction: { targetMessageId: string; emoji: string; emojiName: string } = {
+	reaction: { targetMessageId: string; emoji: string; emojiName: string; action?: ReactionAction } = {
 		targetMessageId: "target-1",
 		emoji: "👍",
 		emojiName: "thumbsup",
@@ -409,16 +427,20 @@ function guild(
 function channelHarness(
 	owner?: { id: string; emojis: { readonly cache: Iterable<{ name: string | null; id: string }> } },
 	react?: (emoji: string) => Promise<unknown>,
+	botId: string = "bot-1",
 ): {
 	discord: DiscordClientLike;
 	readonly reacted: string[];
+	readonly removed: string[];
 	readonly sent: string[];
 	readonly fetchedMessages: string[];
 } {
 	const reacted: string[] = [];
+	const removed: string[] = [];
 	const sent: string[] = [];
 	const fetchedMessages: string[] = [];
 	const discord: DiscordClientLike = {
+		user: { id: botId },
 		channels: {
 			fetch: async () => ({
 				...(owner ? { guild: owner } : {}),
@@ -431,13 +453,24 @@ function channelHarness(
 								reacted.push(emoji);
 								if (react) await react(emoji);
 							},
+							reactions: {
+								resolve(emoji: string) {
+									return {
+										users: {
+											async remove(userId: string) {
+												removed.push(emoji);
+											},
+										},
+									};
+								},
+							},
 						};
 					},
 				},
 			}),
 		},
 	};
-	return { discord, reacted, sent, fetchedMessages };
+	return { discord, reacted, removed, sent, fetchedMessages };
 }
 
 function inboundReaction(name: string, id?: string): DiscordInboundReaction {

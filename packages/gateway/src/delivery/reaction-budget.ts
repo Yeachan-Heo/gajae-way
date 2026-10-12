@@ -15,6 +15,10 @@ export type ReactionRejection =
  * because reacting is idempotent on the platform: a second delivery would burn a
  * platform request and a ledger row to achieve nothing.
  *
+ * A remove-then-add transition (e.g. fire -> check) does not count the add against
+ * REACTIONS_PER_MESSAGE_CAP: removal frees the slot. REACTIONS_PER_TURN_CAP is
+ * still enforced, as is the allowlist and duplicate detection.
+ *
  * Rejections are returned, never swallowed: the caller turns them into a protocol
  * error (verb path) or a logged error plus verbatim text (reply-token path). A
  * silent no-op is not an option — an owner who never sees the reaction must be
@@ -26,6 +30,8 @@ export type ReactionRejection =
 export class ReactionBudget {
 	readonly #turns = new Map<string, number>();
 	readonly #messages = new Map<string, Set<string>>();
+	/** Tracks reactions added by the persona for authorization on remove. */
+	readonly #owned = new Map<string, Set<string>>();
 	readonly #limit: number;
 
 	constructor(limit = 2_000) {
@@ -63,7 +69,26 @@ export class ReactionBudget {
 			};
 		if (input.turnId) this.#remember(this.#turns, input.turnId, used + 1);
 		this.#remember(this.#messages, messageKey, (applied ?? new Set<string>()).add(input.emoji));
+		// Mark as owned by the persona so remove can verify ownership
+		this.#remember(this.#owned, messageKey, (this.#owned.get(messageKey) ?? new Set<string>()).add(input.emoji));
 		return undefined;
+	}
+
+	/**
+	 * Releases budget for a removed reaction. Returns true if the reaction was owned
+	 * by the persona (already added and tracked), false if the persona cannot remove it.
+	 */
+	release(input: { readonly originKey: string; readonly targetMessageId: string; readonly emoji: string }): boolean {
+		const messageKey = `${input.originKey}\u0000${input.targetMessageId}`;
+		const owned = this.#owned.get(messageKey);
+		if (!owned?.has(input.emoji)) return false;
+		// Remove from owned and applied
+		owned.delete(input.emoji);
+		const applied = this.#messages.get(messageKey);
+		if (applied) {
+			applied.delete(input.emoji);
+		}
+		return true;
 	}
 
 	/** Bounded LRU insert: newest key last, oldest evicted past the limit. */

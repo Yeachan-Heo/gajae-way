@@ -292,7 +292,7 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction">,
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
@@ -388,7 +388,7 @@ async function settleTurnPresence(
 
 export async function settleSlackReaction(
 	gateway: Pick<GatewayClientLike, "request">,
-	api: Pick<SlackWebApi, "addReaction">,
+	api: Pick<SlackWebApi, "addReaction" | "removeReaction">,
 	message: ChatMessagePayload,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId || !message.reaction) return;
@@ -398,7 +398,12 @@ export async function settleSlackReaction(
 		if (!target) throw new SlackApiError(0, "invalid_target", "Slack reaction target has a malformed message id");
 		if (target.channel !== deliveryChannel(message.origin))
 			throw new SlackApiError(0, "invalid_target", "Slack reaction target belongs to a foreign channel");
-		await api.addReaction(target.channel, target.ts, slackReactionFor(message.reaction));
+		const action = message.reaction.action ?? "add";
+		if (action === "remove") {
+			await api.removeReaction(target.channel, target.ts, slackReactionFor(message.reaction));
+		} else {
+			await api.addReaction(target.channel, target.ts, slackReactionFor(message.reaction));
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
@@ -411,7 +416,7 @@ export async function settleSlackReaction(
 
 export function subscribeSlackDeliveries(
 	gateway: GatewayClientLike,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction">,
 	log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
@@ -481,7 +486,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 
 	constructor(
 		readonly socketPath: string,
-		readonly api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+		readonly api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction">,
 		initialClient?: GatewayClientLike,
 		readonly status?: WorkingStatus,
 		readonly mentions?: MentionDirectory,

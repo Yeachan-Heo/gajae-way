@@ -175,7 +175,7 @@ test("the delivery subscription routes a reaction to setMessageReaction and neve
 		await state.rememberOrigin(origin);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const sent: string[] = [];
-		const reacted: Array<{ chatId: string; messageId: string; emoji: string }> = [];
+		const reacted: Array<{ chatId: string; messageId: string; emoji: string | undefined }> = [];
 		let handler: ((message: ChatMessagePayload) => void) | undefined;
 		const gateway: GatewayClientLike = {
 			request: async <T>(verb: string, params?: unknown) => {
@@ -191,7 +191,8 @@ test("the delivery subscription routes a reaction to setMessageReaction and neve
 			gateway,
 			{
 				sendMessage: async (_chatId, text) => void sent.push(text),
-				setMessageReaction: async (chatId, messageId, emoji) => void reacted.push({ chatId, messageId, emoji }),
+				setMessageReaction: async (chatId, messageId, emoji?: string) =>
+					void reacted.push({ chatId, messageId, emoji }),
 			},
 			state,
 		);

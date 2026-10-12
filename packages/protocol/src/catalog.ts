@@ -824,11 +824,15 @@ export type ConfigReloadResult =
  * refuses an emoji that origin cannot express rather than queueing a delivery
  * that can only fail. `reactionAllowlistFor(platform)` is what a caller should
  * offer.
+ *
+ * `action` defaults to "add"; removal is only allowed for reactions the persona
+ * itself added (tracked by the gateway). Removal frees budget entries.
  */
 export interface ChatReactParams {
 	readonly origin: OriginRef;
 	readonly targetMessageId: string;
 	readonly emoji: string;
+	readonly action?: ReactionAction;
 }
 
 export interface ChatReactResult {

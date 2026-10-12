@@ -112,14 +112,15 @@ export class TelegramBotApi {
 		});
 	}
 
-	setMessageReaction(chatId: string, messageId: string, emoji: string): Promise<unknown> {
+	setMessageReaction(chatId: string, messageId: string, emoji?: string): Promise<unknown> {
 		// setMessageReaction sets the bot's chosen reactions on one message and returns
 		// True; a single-element array is exactly one reaction, and bots may not use
-		// paid reactions. https://core.telegram.org/bots/api (fetched 2026-08-27)
+		// paid reactions. An empty array removes all reactions.
+		// https://core.telegram.org/bots/api (fetched 2026-08-27)
 		return this.call("setMessageReaction", {
 			chat_id: chatId,
 			message_id: Number(messageId),
-			reaction: [{ type: "emoji", emoji }],
+			reaction: emoji ? [{ type: "emoji", emoji }] : [],
 		});
 	}
 }
@@ -180,15 +181,21 @@ export async function settleTelegramReaction(
 	if (message.origin.platform !== "telegram" || !message.deliveryId || !message.reaction) return;
 	const deliveryId = message.deliveryId;
 	const reaction = message.reaction;
+	const action = reaction.action ?? "add";
 	try {
-		const mapped = telegramReactionFor(reaction);
-		// TelegramApiError keeps `deliveryFailureIsAmbiguous` honest: an emoji Telegram
-		// refuses is definitively not delivered, exactly like a rejected API call.
-		if ("unsupported" in mapped) throw new TelegramApiError(400, mapped.unsupported);
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
-		await bot.setMessageReaction(route.chatId, reaction.targetMessageId, mapped.emoji);
+		if (action === "remove") {
+			// Remove the reaction by passing no emoji
+			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, undefined);
+		} else {
+			const mapped = telegramReactionFor(reaction);
+			// TelegramApiError keeps `deliveryFailureIsAmbiguous` honest: an emoji Telegram
+			// refuses is definitively not delivered, exactly like a rejected API call.
+			if ("unsupported" in mapped) throw new TelegramApiError(400, mapped.unsupported);
+			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, mapped.emoji);
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {

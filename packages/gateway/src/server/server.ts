@@ -1490,7 +1490,9 @@ async function handleRequest(
 			// React to ONE named message. The target id is mandatory: "react to the last
 			// message" is unimplementable without racing whoever spoke next, so it is not
 			// expressible in the params at all.
-			const params = request.params as { origin?: unknown; targetMessageId?: unknown; emoji?: unknown } | undefined;
+			const params = request.params as
+				| { origin?: unknown; targetMessageId?: unknown; emoji?: unknown; action?: unknown }
+				| undefined;
 			let origin: ReturnType<typeof validateOriginRef>;
 			try {
 				origin = validateOriginRef(params?.origin as typeof LOOPBACK_ORIGIN);
@@ -1507,6 +1509,12 @@ async function handleRequest(
 					"chat.react requires targetMessageId to be a platform message id ([A-Za-z0-9._:-], 1-64 chars)",
 				);
 			if (typeof params.emoji !== "string") throw new ProtocolError("invalid_params", "chat.react requires an emoji");
+			const action = (params?.action as string | undefined) ?? "add";
+			if (action !== "add" && action !== "remove")
+				throw new ProtocolError(
+					"invalid_params",
+					`chat.react action must be "add" or "remove", not ${JSON.stringify(action)}`,
+				);
 			const resolved = resolveReactionEmoji(params.emoji);
 			if (!resolved)
 				throw new ProtocolError(
@@ -1525,16 +1533,31 @@ async function handleRequest(
 				targetMessageId: params.targetMessageId.trim(),
 				emoji: resolved.unicode,
 				emojiName: resolved.name,
+				action,
 			};
-			const rejection = runtime.reactions.claim({
-				originKey: originKey(origin),
-				targetMessageId: reaction.targetMessageId,
-				emoji: reaction.emoji,
-			});
-			// Cap violations are reported, never silently dropped: the caller must be able
-			// to tell "not sent" from "sent and invisible".
-			if (rejection)
-				throw new ProtocolError("invalid_params", `reaction rejected (${rejection.reason}): ${rejection.detail}`);
+			if (action === "remove") {
+				// Verify the persona owns this reaction before removing it
+				const owned = runtime.reactions.release({
+					originKey: originKey(origin),
+					targetMessageId: reaction.targetMessageId,
+					emoji: reaction.emoji,
+				});
+				if (!owned)
+					throw new ProtocolError(
+						"invalid_params",
+						`cannot remove ${resolved.unicode}: the persona did not add this reaction`,
+					);
+			} else {
+				const rejection = runtime.reactions.claim({
+					originKey: originKey(origin),
+					targetMessageId: reaction.targetMessageId,
+					emoji: reaction.emoji,
+				});
+				// Cap violations are reported, never silently dropped: the caller must be able
+				// to tell "not sent" from "sent and invisible".
+				if (rejection)
+					throw new ProtocolError("invalid_params", `reaction rejected (${rejection.reason}): ${rejection.detail}`);
+			}
 			const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, reaction);
 			broadcastDelivery(runtime, payload);
 			connection.write({
@@ -2466,26 +2489,55 @@ async function createInboundTurnLifecycle(
 					);
 					continue;
 				}
-				if (laneReport && wanted.targetMessageId === undefined) {
-					console.error(`gateway reaction skipped for internal lane report origin=${key} reason=no_trigger_message`);
-					continue;
+				if (wanted.action === "remove") {
+					// Removal path: release from budget and send remove delivery
+					if (wanted.targetMessageId === undefined) {
+						console.error(`gateway reaction remove skipped for ${key}: target message id required for remove action`);
+						continue;
+					}
+					const released = runtime.reactions.release({
+						originKey: key,
+						targetMessageId: wanted.targetMessageId,
+						emoji: wanted.emoji,
+					});
+					if (!released) {
+						console.error(
+							`gateway reaction remove rejected for ${key} message ${wanted.targetMessageId}: persona did not add this reaction`,
+						);
+						continue;
+					}
+					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+						targetMessageId: wanted.targetMessageId,
+						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
+						action: "remove",
+					});
+					assistantDeliveryStarted = true;
+					deliveredIds.push(payload.deliveryId as string);
+					broadcastDelivery(runtime, payload);
+				} else {
+					// Add path: claim budget and send add delivery
+					if (laneReport && wanted.targetMessageId === undefined) {
+						console.error(`gateway reaction skipped for internal lane report origin=${key} reason=no_trigger_message`);
+						continue;
+					}
+					const targetMessageId = wanted.targetMessageId ?? row.message_id;
+					const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
+					if (rejection) {
+						console.error(
+							`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+						);
+						continue;
+					}
+					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+						targetMessageId,
+						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
+					});
+					assistantDeliveryStarted = true;
+					deliveredIds.push(payload.deliveryId as string);
+					broadcastDelivery(runtime, payload);
 				}
-				const targetMessageId = wanted.targetMessageId ?? row.message_id;
-				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
-				if (rejection) {
-					console.error(
-						`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
-					);
-					continue;
-				}
-				const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-					targetMessageId,
-					emoji: wanted.emoji,
-					emojiName: wanted.emojiName,
-				});
-				assistantDeliveryStarted = true;
-				deliveredIds.push(payload.deliveryId as string);
-				broadcastDelivery(runtime, payload);
 			}
 			message = reactionReply.body;
 			if (!message) return;
@@ -3172,7 +3224,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// guidance because the persona chooses between exactly these three shapes.
 		...(isChatPlatform(origin.platform)
 			? [
-					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. Remove a reaction you added earlier with [UNREACT:<emoji>@<message id>]; removal frees up your reaction budget and allows you to add a different emoji to the same message (e.g. change 🔥 to ✅). With nothing after the tokens you acknowledge with a reaction and say nothing; text after the tokens is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
 		// Live 2026-09-25: the persona held turns open for 13 minutes in a

@@ -67,6 +67,9 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 		async addReaction(...args: [string, string, string]) {
 			reactions.push(args);
 		},
+		async removeReaction(_channel: string, _ts: string, _name: string) {
+			// Mock remove
+		},
 	});
 	await adapter.connect();
 	client = await GajaewayClient.connectSocket(config.socketPath);

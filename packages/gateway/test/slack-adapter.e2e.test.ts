@@ -37,7 +37,7 @@ async function settle(): Promise<void> {
 
 /** Records every Slack Web API call the delivery path makes; never talks to Slack. */
 function fakeSlackApi(): {
-	readonly api: Pick<SlackWebApi, "postMessage" | "addReaction">;
+	readonly api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction">;
 	readonly posts: Array<{ channel: string; text: string; threadTs?: string }>;
 	readonly reactions: Array<{ channel: string; ts: string; name: string }>;
 } {
@@ -53,6 +53,9 @@ function fakeSlackApi(): {
 			},
 			async addReaction(channel, ts, name) {
 				reactions.push({ channel, ts, name });
+			},
+			async removeReaction(_channel, _ts, _name) {
+				// Mock remove - in a real implementation would track removals
 			},
 		},
 	};
@@ -186,11 +189,12 @@ test("a delivery the adapter cannot settle is a failed ledger row, not a silent 
 	const slack = fakeSlackApi();
 	// The gateway hands the adapter a reaction whose target is not a channel:ts id;
 	// the adapter must refuse it definitively rather than guess a channel.
-	const failing: Pick<SlackWebApi, "postMessage" | "addReaction"> = {
+	const failing: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction"> = {
 		postMessage: slack.api.postMessage,
 		addReaction: async () => {
 			throw new TypeError("fetch failed");
 		},
+		removeReaction: slack.api.removeReaction,
 	};
 	const adapter = liveGateway(config.socketPath, failing);
 	await adapter.connect();
@@ -246,6 +250,7 @@ test("a delivery pending in the ledger before the adapter connects is replayed a
 			throw new TypeError("link died mid-post");
 		},
 		addReaction: seedApi.api.addReaction,
+		removeReaction: seedApi.api.removeReaction,
 	});
 	await seedAdapter.connect();
 	await seedAdapter.requestInbound(slackMessageId("C1", "1726543210.000600"), CHANNEL_ORIGIN, "hello?", {

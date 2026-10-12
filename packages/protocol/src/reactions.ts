@@ -63,6 +63,8 @@ export interface ReactionRef {
 	readonly emoji: string;
 	/** Allowlist short name, so an adapter can prefer a same-named custom guild emoji. */
 	readonly emojiName: string;
+	/** Add or remove the reaction. Defaults to add. */
+	readonly action?: ReactionAction;
 }
 
 const BY_UNICODE = new Map(REACTION_ALLOWLIST.map((entry) => [entry.unicode, entry]));
@@ -127,11 +129,12 @@ export function reactionAllowlistDescription(platform: OriginPlatform): string {
 /**
  * The reaction reply mode (third mode next to text and the silence token).
  *
- * A reply may open with one or more `[REACT:<emoji-or-name>]` tokens, optionally
- * targeting a specific message with `@<message id>`:
+ * A reply may open with one or more `[REACT:<emoji-or-name>]` or `[UNREACT:<emoji-or-name>]`
+ * tokens, optionally targeting a specific message with `@<message id>`:
  *
  *   [REACT:👍]                      react to the message that triggered the turn
  *   [REACT:thumbsup@123456789]      react to one named message
+ *   [UNREACT:👍@123456789]           remove a reaction you added earlier from that message
  *   [REACT:👀] still looking into it  react AND say something
  *
  * With nothing left after the tokens, the turn acknowledges with a reaction and
@@ -144,6 +147,8 @@ export interface ReactionReply {
 		readonly emoji: string;
 		readonly emojiName: string;
 		readonly targetMessageId?: string;
+		/** Add (default) or remove the reaction. */
+		readonly action?: ReactionAction;
 	}[];
 	/** Reply text after the tokens; empty means reaction-only (no message). */
 	readonly body: string;
@@ -163,7 +168,7 @@ export function isPlatformMessageId(value: string): boolean {
 	return PLATFORM_MESSAGE_ID.test(value);
 }
 
-const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
+const REACT_TOKEN = /^\s*\[(REACT|UNREACT):([^\]\n]*)\]/i;
 
 /**
  * Parses leading reaction tokens. Returns undefined when the reply carries no
@@ -172,20 +177,27 @@ const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
  */
 export function parseReactionReply(text: string): ReactionReply | undefined {
 	let rest = text;
-	const reactions: { emoji: string; emojiName: string; targetMessageId?: string }[] = [];
+	const reactions: { emoji: string; emojiName: string; targetMessageId?: string; action?: ReactionAction }[] = [];
 	for (let match = rest.match(REACT_TOKEN); match; match = rest.match(REACT_TOKEN)) {
-		const [token, argument = ""] = match;
+		const [token, action = "REACT", argument = ""] = match;
 		const at = argument.lastIndexOf("@");
 		const emojiPart = at === -1 ? argument : argument.slice(0, at);
 		const targetMessageId = at === -1 ? undefined : argument.slice(at + 1).trim();
 		const resolved = resolveReactionEmoji(emojiPart);
-		// Malformed: unknown emoji, an explicit `@` with no target id after it, or a
-		// target that cannot be a platform message id.
-		if (!resolved || (at !== -1 && !isPlatformMessageId(targetMessageId ?? ""))) return undefined;
+		const reactionAction: ReactionAction = action.toLowerCase() === "unreact" ? "remove" : "add";
+		// Malformed: unknown emoji, an explicit `@` with no target id after it, a
+		// target that cannot be a platform message id, or UNREACT without a target.
+		if (
+			!resolved ||
+			(at !== -1 && !isPlatformMessageId(targetMessageId ?? "")) ||
+			(reactionAction === "remove" && !targetMessageId)
+		)
+			return undefined;
 		reactions.push({
 			emoji: resolved.unicode,
 			emojiName: resolved.name,
 			...(targetMessageId ? { targetMessageId } : {}),
+			...(reactionAction === "remove" ? { action: "remove" } : {}),
 		});
 		rest = rest.slice(token.length);
 	}

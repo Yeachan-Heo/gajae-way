@@ -82,11 +82,11 @@ test("sends the bare U+2764 heart Telegram accepts, not the U+FE0F spelling", as
 	try {
 		const state = await TelegramAdapterState.load(home);
 		await state.rememberOrigin(dmOrigin);
-		const sent: Array<{ chatId: string; messageId: string; emoji: string }> = [];
+		const sent: Array<{ chatId: string; messageId: string; emoji: string | undefined }> = [];
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await settleTelegramReaction(
 			mockGateway(requests),
-			{ setMessageReaction: async (chatId, messageId, emoji) => void sent.push({ chatId, messageId, emoji }) },
+			{ setMessageReaction: async (chatId, messageId, emoji?: string) => void sent.push({ chatId, messageId, emoji }) },
 			state,
 			reactionDelivery("\u2764\uFE0F", "heart"),
 		);

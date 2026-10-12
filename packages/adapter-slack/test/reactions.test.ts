@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
+import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { REACTION_ALLOWLIST } from "@gajae-gateway/protocol";
+import type { GatewayClientLike } from "../src/main";
+import { settleSlackReaction } from "../src/main";
 import {
 	describeSlackReaction,
 	reactionFromSlackName,
@@ -73,4 +76,80 @@ test("Slack reactions describe routing, unknown emoji, engagement, and removal",
 		{ ...event.item, ts: "" },
 	])
 		expect(describeSlackReaction({ ...event, item }, "BOT")).toBeUndefined();
+});
+
+test("settleSlackReaction with action 'add' calls api.addReaction", async () => {
+	const requests: { verb: string; args: unknown[] }[] = [];
+	const api = {
+		addReaction: async (channel: string, ts: string, name: string) => {
+			requests.push({ verb: "addReaction", args: [channel, ts, name] });
+		},
+		removeReaction: async (_channel: string, _ts: string, _name: string) => {
+			requests.push({ verb: "removeReaction", args: [_channel, _ts, _name] });
+		},
+	};
+	const gatewayRequests: { verb: string; params: unknown }[] = [];
+	const gateway: Pick<GatewayClientLike, "request"> = {
+		request: async (verb: string, params?: unknown) => {
+			gatewayRequests.push({ verb, params });
+			return {} as unknown;
+		},
+	};
+	const message: ChatMessagePayload = {
+		turnId: "turn-1",
+		origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+		role: "assistant",
+		text: "👍",
+		final: true,
+		deliveryId: "delivery-1",
+		reaction: {
+			targetMessageId: "C1:1.2",
+			emoji: "👍",
+			emojiName: "thumbsup",
+			action: "add",
+		},
+	};
+
+	await settleSlackReaction(gateway, api, message);
+
+	expect(requests).toEqual([{ verb: "addReaction", args: ["C1", "1.2", "+1"] }]);
+	expect(gatewayRequests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("settleSlackReaction with action 'remove' calls api.removeReaction and not addReaction", async () => {
+	const requests: { verb: string; args: unknown[] }[] = [];
+	const api = {
+		addReaction: async (_channel: string, _ts: string, _name: string) => {
+			requests.push({ verb: "addReaction", args: [_channel, _ts, _name] });
+		},
+		removeReaction: async (channel: string, ts: string, name: string) => {
+			requests.push({ verb: "removeReaction", args: [channel, ts, name] });
+		},
+	};
+	const gatewayRequests: { verb: string; params: unknown }[] = [];
+	const gateway: Pick<GatewayClientLike, "request"> = {
+		request: async (verb: string, params?: unknown) => {
+			gatewayRequests.push({ verb, params });
+			return {} as unknown;
+		},
+	};
+	const message: ChatMessagePayload = {
+		turnId: "turn-1",
+		origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+		role: "assistant",
+		text: "👍",
+		final: true,
+		deliveryId: "delivery-1",
+		reaction: {
+			targetMessageId: "C1:1.2",
+			emoji: "👍",
+			emojiName: "thumbsup",
+			action: "remove",
+		},
+	};
+
+	await settleSlackReaction(gateway, api, message);
+
+	expect(requests).toEqual([{ verb: "removeReaction", args: ["C1", "1.2", "+1"] }]);
+	expect(gatewayRequests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
