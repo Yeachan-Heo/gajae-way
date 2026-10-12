@@ -3,15 +3,15 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
-import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { originKey, WORK_JOBS_DEFAULT_LIMIT, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
+import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import { memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -655,19 +655,23 @@ test("a mention-less /new inside an engaged thread is authorised", async () => {
 		parentId: "C1",
 	};
 	const originKey = "slack/thread/C1:1700000000.000100/parent=C1";
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "thread-opening",
-		originKey,
-		originRefJson: JSON.stringify(origin),
-		body: "@persona start",
-	}));
-	database.transaction((tx) => database.inbox.bindTurn(tx, {
-		messageId: "thread-opening",
-		originKey,
-		epoch: 0,
-		opRef: "thread-opening-op",
-		sessionId: "thread-opening-session",
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "thread-opening",
+			originKey,
+			originRefJson: JSON.stringify(origin),
+			body: "@persona start",
+		}),
+	);
+	database.transaction((tx) =>
+		database.inbox.bindTurn(tx, {
+			messageId: "thread-opening",
+			originKey,
+			epoch: 0,
+			opRef: "thread-opening-op",
+			sessionId: "thread-opening-session",
+		}),
+	);
 	database.transaction((tx) => database.inbox.turnAccept(tx, "thread-opening-op"));
 	expect(database.transaction((tx) => database.inbox.turnComplete(tx, "thread-opening-op"))).toBe(1);
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -1292,13 +1296,15 @@ test("a backlog left pending across an outage is answered on boot, never expired
 	// never seen by the model, so it must reach the session now (live: four DMs
 	// were deleted behind an 85-minute wedge by the old 10-minute floor).
 	expect(
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "stale-1",
-			originKey: key,
-			originRefJson: JSON.stringify(origin),
-			body: "from before the outage",
-			receivedAt: old,
-		})),
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "stale-1",
+				originKey: key,
+				originRefJson: JSON.stringify(origin),
+				body: "from before the outage",
+				receivedAt: old,
+			}),
+		),
 	).toBe(true);
 	const logs: string[] = [];
 	const original = console.error;
@@ -1603,15 +1609,20 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 
 	// Reopening a settled tombstone by editing history is corruption, not a
 	// crash predecessor. Neither an ordinary request nor resume may repair it.
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: parsed.jobId,
-		laneKey: "work-Repo.Fix-2",
-		state: "running",
-		createdAt: parsed.createdAt,
-		updatedAt: new Date().toISOString(),
-		lane: parsed.lane,
-		json: JSON.stringify({ ...parsed, attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }] }),
-	}));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: parsed.jobId,
+			laneKey: "work-Repo.Fix-2",
+			state: "running",
+			createdAt: parsed.createdAt,
+			updatedAt: new Date().toISOString(),
+			lane: parsed.lane,
+			json: JSON.stringify({
+				...parsed,
+				attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }],
+			}),
+		}),
+	);
 	const damaged = database.work.laneJobJson(jobId);
 	for (const resume of [false, true]) {
 		const id = `corrupt-${resume}`;
@@ -1630,6 +1641,70 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	}
 	expect(database.work.laneJobJson(jobId)).toBe(damaged);
 	expect(sessionPort.sends).toHaveLength(1);
+	client.close();
+});
+
+test("work.jobs pages newest-first so a home with many jobs stays under the frame cap", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await Store.open(config.dbPath);
+	// Each projected job is ~700 bytes, so 1600 of them exceed the 1 MiB frame unpaged.
+	const total = 1600;
+	database.transaction((tx) => {
+		for (let index = 0; index < total; index++) {
+			const at = new Date(Date.UTC(2026, 0, 1) + index * 1000);
+			const record = createLaneJobRecord({
+				jobId: `lanejob-${index.toString(16).padStart(4, "0")}`,
+				branch: "main",
+				worktreePath: join(directory, "missing-worktree"),
+				now: () => at,
+			});
+			database.work.putLaneJob(tx, { ...record, laneKey: `work-job${index}`, json: JSON.stringify(record) });
+		}
+	});
+	const sessionPort = sessionPortFromResponder({
+		bind: async () => ({ sessionId: "unused" }),
+		respond: async () => "",
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const request = async (id: string, params?: unknown) => {
+		client.send({ v: "0.1", type: "request", id, verb: "work.jobs", ...(params === undefined ? {} : { params }) });
+		await waitFor(client.frames, client.frames.length + 1);
+		return client.frames.find((frame) => frame.id === id);
+	};
+
+	const first = await request("default");
+	expect(first.type).toBe("response");
+	expect(first.result.total).toBe(total);
+	expect(first.result.offset).toBe(0);
+	expect(first.result.jobs).toHaveLength(WORK_JOBS_DEFAULT_LIMIT);
+	expect(first.result.jobs[0].lane_key).toBe(`work-job${total - 1}`);
+
+	const tail = await request("tail", { limit: WORK_JOBS_MAX_LIMIT, offset: total - 2 });
+	expect(tail.result.jobs.map((job: { lane_key: string }) => job.lane_key)).toEqual(["work-job1", "work-job0"]);
+	expect(tail.result.offset).toBe(total - 2);
+
+	for (const [id, params] of [
+		["zero", { limit: 0 }],
+		["over", { limit: WORK_JOBS_MAX_LIMIT + 1 }],
+		["negative", { offset: -1 }],
+		["fraction", { limit: 1.5 }],
+	] as const) {
+		const refused = await request(id, params);
+		expect(refused.type).toBe("error");
+		expect(refused.error.code).toBe("invalid_params");
+	}
 	client.close();
 });
 
@@ -1757,15 +1832,17 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const first = parseLaneJobRecord(
 		database.work.laneJobJson(`lanejob-${Buffer.from("stall-out", "utf8").toString("hex")}`) as string,
 	);
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: first.jobId,
-		laneKey: `work-stall-out`,
-		state: "stalled",
-		createdAt: first.createdAt,
-		updatedAt: new Date().toISOString(),
-		lane: first.lane,
-		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
-	}));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: first.jobId,
+			laneKey: `work-stall-out`,
+			state: "stalled",
+			createdAt: first.createdAt,
+			updatedAt: new Date().toISOString(),
+			lane: first.lane,
+			json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+		}),
+	);
 	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
 	async function waitId2(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
@@ -1830,15 +1907,17 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 
 	// Force the stalled hold, as reconciliation would after repeat stalls.
 	const first = parseLaneJobRecord(database.work.laneJobJson(jobId) as string);
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: first.jobId,
-		laneKey: "work-stall-clear",
-		state: "stalled",
-		createdAt: first.createdAt,
-		updatedAt: new Date().toISOString(),
-		lane: first.lane,
-		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
-	}));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: first.jobId,
+			laneKey: "work-stall-clear",
+			state: "stalled",
+			createdAt: first.createdAt,
+			updatedAt: new Date().toISOString(),
+			lane: first.lane,
+			json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+		}),
+	);
 
 	// Ordinary call: held.
 	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
@@ -2131,22 +2210,26 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	const key = "discord/dm/d-hist/peer=owner";
 	for (let i = 1; i <= 3; i++)
-		database.transaction((tx) => database.inbox.contextRecord(tx, {
-			messageId: `old-${i}`,
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, {
+				messageId: `old-${i}`,
+				originKey: key,
+				authorId: "owner",
+				authorName: "bellman",
+				body: `earlier message ${i}`,
+				receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString(),
+			}),
+		);
+	database.transaction((tx) =>
+		database.inbox.contextRecord(tx, {
+			messageId: "old-img",
 			originKey: key,
 			authorId: "owner",
 			authorName: "bellman",
-			body: `earlier message ${i}`,
-			receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString(),
-		}));
-	database.transaction((tx) => database.inbox.contextRecord(tx, {
-		messageId: "old-img",
-		originKey: key,
-		authorId: "owner",
-		authorName: "bellman",
-		body: "[image · shot.png · 20.1 KB · https://cdn.discordapp.com/attachments/1/2/shot.png]",
-		receivedAt: new Date(Date.now() - 30_000).toISOString(),
-	}));
+			body: "[image · shot.png · 20.1 KB · https://cdn.discordapp.com/attachments/1/2/shot.png]",
+			receivedAt: new Date(Date.now() - 30_000).toISOString(),
+		}),
+	);
 	database.transaction((tx) => database.inbox.contextCommitWindow(tx, key, ["old-1", "old-2", "old-3", "old-img"], 0));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

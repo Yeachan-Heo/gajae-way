@@ -8,10 +8,11 @@ import type {
 	MonitorScheduleProjection,
 	MonitorSpec,
 	OpsCycleResult,
-	OpsSloParams,
-	OpsSloResult,
 	OpsDeliveriesParams,
 	OpsDeliveriesResult,
+	OpsSloParams,
+	OpsSloResult,
+	WorkJobsParams,
 	WorkJobsResult,
 	WorkRetireResult,
 	WorkRunResult,
@@ -83,8 +84,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
-
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -337,8 +337,7 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	if (cycle.brokerAgent !== null) {
 		lines.push(`broker_agent: ${cycle.brokerAgent.status}`);
 		for (const entry of cycle.brokerAgent.entries)
-			if (entry.state !== "in_sync")
-				lines.push(`broker_agent ${entry.name}: kind=${entry.kind} state=${entry.state}`);
+			if (entry.state !== "in_sync") lines.push(`broker_agent ${entry.name}: kind=${entry.kind} state=${entry.state}`);
 	}
 	const sloState = cycle.slo.ok
 		? "ok"
@@ -403,7 +402,7 @@ export function sloExitCode(result: OpsSloResult): number {
 }
 
 const OPS_USAGE =
-"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--json]|integrity|restart-stack [--status]";
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--json]|integrity|restart-stack [--status]";
 function parseOpsSloArgs(args: readonly string[]): { params: OpsSloParams; json: boolean } {
 	let days = 7;
 	let json = false;
@@ -424,7 +423,6 @@ function parseOpsSloArgs(args: readonly string[]): { params: OpsSloParams; json:
 	}
 	return { params: { days }, json };
 }
-
 
 function parseOpsDeliveriesArgs(args: readonly string[]): { params: OpsDeliveriesParams; json: boolean } {
 	const params: { since?: string; state?: string; limit?: number } = {};
@@ -456,6 +454,20 @@ function parseOpsDeliveriesArgs(args: readonly string[]): { params: OpsDeliverie
 	return { params, json };
 }
 
+/** `work jobs [--limit N] [--offset N]`; the gateway enforces the limit ceiling. */
+function parseWorkJobsArgs(args: readonly string[], usage: string): WorkJobsParams {
+	const params: { limit?: number; offset?: number } = {};
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		const value = args[++index];
+		if ((flag !== "--limit" && flag !== "--offset") || value === undefined || !/^\d+$/.test(value))
+			throw new Error(usage);
+		const key = flag === "--limit" ? "limit" : "offset";
+		if (params[key] !== undefined) throw new Error(usage);
+		params[key] = Number(value);
+	}
+	return params;
+}
 
 export function renderDeliveries(result: OpsDeliveriesResult): string[] {
 	if (result.rows.length === 0) return ["deliveries: none"];
@@ -627,12 +639,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "ops": {
 				const [command, path] = parsed.rest;
-				if (command === undefined || !["backup", "deliveries", "redeliver", "integrity", "slo", "cycle", "restart-stack"].includes(command))
+				if (
+					command === undefined ||
+					!["backup", "deliveries", "redeliver", "integrity", "slo", "cycle", "restart-stack"].includes(command)
+				)
 					throw new Error(`unknown ops command: ${command ?? "(missing)"}\n${OPS_USAGE}`);
 				const deliveries = command === "deliveries" ? parseOpsDeliveriesArgs(parsed.rest.slice(1)) : undefined;
 				const slo = command === "slo" ? parseOpsSloArgs(parsed.rest.slice(1)) : undefined;
 				if (command === "restart-stack") {
-
 					// Deliberately socket-free: the reason to run this is a gateway that
 					// has to come back, so it must not need the gateway to answer first.
 					// It also runs detached: restarting the gateway kills a persona turn that
@@ -681,7 +695,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						const result = await client.opsDeliveries(deliveries.params);
 						if (deliveries.json) console.log(JSON.stringify(result));
 						else for (const line of renderDeliveries(result)) console.log(line);
-					} else if (redeliverParams) console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
+					} else if (redeliverParams)
+						console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
 					else if (command === "cycle") {
 						const cycle = await client.opsCycle();
@@ -809,6 +824,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					let force = false;
 					let allDead = false;
 					let name: string | undefined;
+					let jobsPage: WorkJobsParams | undefined;
 					if (command === "retire") {
 						for (let i = 0; i < args.length; i++) {
 							const arg = args[i];
@@ -826,7 +842,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						if (!allDead && !name) throw new Error(usage);
 						if (allDead && name) throw new Error(usage);
 					} else if (args.length !== 0) {
-						throw new Error(usage);
+						jobsPage = parseWorkJobsArgs(args, usage);
 					}
 					const client = await connectGatewaySocket(parsed.socket);
 					try {
@@ -847,7 +863,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								);
 							}
 						} else {
-							const result = await client.request<WorkJobsResult>("work.jobs");
+							const result = await client.request<WorkJobsResult>("work.jobs", jobsPage);
 							for (const job of result.jobs) {
 								// lane_key is the stored `work-<name>`; print the name work.retire accepts.
 								const name = job.lane_key.startsWith("work-") ? job.lane_key.slice("work-".length) : job.lane_key;
@@ -872,6 +888,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 									}`,
 								);
 							}
+							const shownEnd = result.offset + result.jobs.length;
+							if (result.offset > 0 || shownEnd < result.total)
+								console.error(
+									`jobs ${result.jobs.length === 0 ? 0 : result.offset + 1}-${shownEnd} of ${result.total}${shownEnd < result.total ? ` (next: --offset ${shownEnd})` : ""}`,
+								);
 						}
 					} finally {
 						await client.close();

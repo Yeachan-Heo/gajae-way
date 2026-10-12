@@ -1,11 +1,9 @@
-
 import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OpsCycleResult } from "@gajae-gateway/protocol";
-import type { OpsSloResult } from "@gajae-gateway/protocol";
+import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -298,7 +296,7 @@ describe("cli arguments", () => {
 			expect(output).toEqual([
 				JSON.stringify({ rows: [row] }),
 				"deliveries: 1",
-				"2026-10-01T00:00:00.000Z confirmed delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 text=\"delivery text\"",
+				'2026-10-01T00:00:00.000Z confirmed delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 text="delivery text"',
 			]);
 			expect(CLI_USAGE).toContain("ops deliveries [--since ISO]");
 			expect(CLI_USAGE).not.toContain("ops restore");
@@ -493,7 +491,6 @@ describe("service installation", () => {
 	});
 
 	test("install and repair each rewrite exactly five safe LaunchAgent plists", async () => {
-
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-"));
 		try {
 			await writeFile(
@@ -748,7 +745,7 @@ describe("cycle rendering", () => {
 				phase: "degraded",
 				gates: ["memory_git_index_locked"],
 				memoryGitIndexLock: { path, ageMs: 1234 },
-				}),
+			}),
 		).join("\n");
 		expect(lines).toContain("gates: memory_git_index_locked");
 		expect(lines).toContain(`memory_git_index_lock: ${path} age=1234ms`);
@@ -1202,6 +1199,36 @@ describe("work operator commands", () => {
 		]);
 		expect(output.errors).toEqual([]);
 		expect(output.closed).toBe(true);
+	});
+	test("work jobs pages with --limit/--offset and reports where the page sits", async () => {
+		const job = {
+			lane_key: "work-a",
+			state: "attempt_ended",
+			session_id: "",
+			last_activity_at: null,
+			worktree_path: "/repo/a",
+		};
+		const middle = await run(["jobs", "--limit", "1", "--offset", "1"], { total: 3, offset: 1, jobs: [job] });
+		expect(middle.requests).toEqual([{ verb: "work.jobs", params: { limit: 1, offset: 1 } }]);
+		expect(middle.lines).toEqual(["a attempt_ended session=- accepted=- op=- last=- head=- /repo/a"]);
+		expect(middle.errors).toEqual(["jobs 2-2 of 3 (next: --offset 2)"]);
+		const last = await run(["jobs", "--offset", "2"], { total: 3, offset: 2, jobs: [job] });
+		expect(last.errors).toEqual(["jobs 3-3 of 3"]);
+		const whole = await run(["jobs"], { total: 1, offset: 0, jobs: [job] });
+		expect(whole.errors).toEqual([]);
+	});
+	test("work jobs rejects malformed paging flags before connecting", async () => {
+		for (const args of [
+			["--limit"],
+			["--limit", "-1"],
+			["--offset", "x"],
+			["--limit", "1", "--limit", "2"],
+			["--all"],
+		]) {
+			const output = await run(["jobs", ...args], {});
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+		}
 	});
 	test("--notify is a usage error on start and run", async () => {
 		for (const command of ["start", "run"] as const) {

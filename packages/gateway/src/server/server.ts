@@ -34,6 +34,8 @@ import {
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
 	validateOriginRef,
+	WORK_JOBS_DEFAULT_LIMIT,
+	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
@@ -1142,7 +1144,17 @@ async function handleRequest(
 					.workLaneRows()
 					.map((lane) => [`work-${lane.origin_key.slice("work/task/".length)}`, lane]),
 			);
-			const jobRows = options.database.work.laneJobRows(true);
+			const value = request.params ?? {};
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new ProtocolError("invalid_params", "work.jobs parameters must be an object");
+			const { limit = WORK_JOBS_DEFAULT_LIMIT, offset = 0 } = value as { limit?: unknown; offset?: unknown };
+			if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > WORK_JOBS_MAX_LIMIT)
+				throw new ProtocolError("invalid_params", `limit must be an integer from 1 to ${WORK_JOBS_MAX_LIMIT}`);
+			if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0)
+				throw new ProtocolError("invalid_params", "offset must be a non-negative integer");
+			const allRows = options.database.work.laneJobRows(true);
+			// Page before the per-row git and record reads: their cost scales with the page.
+			const jobRows = allRows.slice(offset, offset + limit);
 			const commits = await laneLastCommits(jobRows.map((row) => row.worktree_path));
 			const jobs = jobRows.map((row) => {
 				const lane = laneByKey.get(row.lane_key);
@@ -1191,7 +1203,7 @@ async function handleRequest(
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { jobs },
+				result: { total: allRows.length, offset, jobs },
 			});
 			return;
 		}

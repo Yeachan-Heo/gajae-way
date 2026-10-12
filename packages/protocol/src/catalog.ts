@@ -748,8 +748,25 @@ export type WorkRunResult =
 			readonly opRef: string;
 	  };
 
+/**
+ * One page of `work.jobs`, newest `updated_at` first. Paged because a home
+ * accumulates lane jobs without bound and the full projection outgrows the
+ * 1 MiB frame.
+ */
+export interface WorkJobsParams {
+	/** 1..WORK_JOBS_MAX_LIMIT; defaults to WORK_JOBS_DEFAULT_LIMIT. */
+	readonly limit?: number;
+	/** Rows to skip; defaults to 0. */
+	readonly offset?: number;
+}
+export const WORK_JOBS_DEFAULT_LIMIT = 100;
+export const WORK_JOBS_MAX_LIMIT = 500;
+
 /** Operator projection over durable lane jobs (issue #10). */
 export interface WorkJobsResult {
+	/** Every lane job in the home, not just this page. */
+	readonly total: number;
+	readonly offset: number;
 	readonly jobs: Array<{
 		readonly job_id: string;
 		readonly lane_key: string;
@@ -1115,7 +1132,7 @@ export interface VerbCatalogV01 {
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
-	"work.jobs": { result: WorkJobsResult };
+	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
