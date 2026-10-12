@@ -2360,7 +2360,9 @@ if (import.meta.main) {
 			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
 			console.error(error instanceof Error ? error.message : String(error));
 			disposeLogging();
-			process.exitCode = 1;
+			// Startup may already own recovery/monitor timers. Exit now so the service
+			// manager can retry login rather than keeping a permanently offline process.
+			process.exit(1);
 		});
 	}
 }
