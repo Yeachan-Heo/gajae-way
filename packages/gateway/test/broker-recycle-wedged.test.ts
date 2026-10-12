@@ -19,12 +19,15 @@ function discovery(pid: number, heartbeatAt = Date.now()): BrokerDiscovery {
 }
 
 function client(options: ConstructorParameters<typeof GlobalGjcClient>[0] = {}): GlobalGjcClient {
+	const FAKE_EXECUTABLE = "/tmp/fake-gjc-broker-recycle";
+
 	const agentDir = options.agentDir || "/tmp/fake-agent-dir";
 	const value = new GlobalGjcClient({
 		command: async () => healthy,
 		healthProbe: async () => true,
 		log: () => {},
 		agentDir,
+		executable: FAKE_EXECUTABLE,
 		...options,
 	});
 	clients.push(value);
