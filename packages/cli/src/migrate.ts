@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { detectHermes, readHermes } from "./migrate/hermes";
 import { detectOpenClaw, readOpenClaw } from "./migrate/openclaw";
@@ -109,7 +110,21 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 	for (const file of extract.files) {
 		const filePath = join(targetHome, file.target);
 		await mkdir(join(filePath, ".."), { recursive: true });
-		await writeFile(filePath, file.content);
+		if (file.secret) {
+			// Atomic 0600 write for secrets
+			const temporary = `${filePath}.${randomUUID()}.tmp`;
+			try {
+				await writeFile(temporary, file.content, { flag: "wx", mode: 0o600 });
+				await chmod(temporary, 0o600);
+				await rename(temporary, filePath);
+			} catch (error) {
+				// Clean up temporary file on error
+				await rm(temporary, { force: true });
+				throw error;
+			}
+		} else {
+			await writeFile(filePath, file.content);
+		}
 	}
 
 	// Write merged JSON files
