@@ -885,8 +885,8 @@ export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
 	message: ChatMessagePayload,
-	typing?: TypingPort,
-	status?: WorkingStatus,
+	_typing?: TypingPort,
+	_status?: WorkingStatus,
 	reactions: DiscordReactionPorts = createReactionPorts(),
 	speech?: DiscordSpeechPorts,
 ): Promise<void> {
@@ -894,11 +894,7 @@ export async function settleDiscordDelivery(
 	const deliveryId = message.deliveryId;
 	// A reaction delivery reacts and posts nothing; it settles on the same ledger.
 	if (message.reaction) {
-		try {
-			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
-		} finally {
-			await settleTurnPresence(message, typing, status);
-		}
+		await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		return;
 	}
 	try {
@@ -930,29 +926,7 @@ export async function settleDiscordDelivery(
 			reason: error instanceof Error ? error.message : String(error),
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
-	} finally {
-		await settleTurnPresence(message, typing, status);
 	}
-}
-
-/**
- * Only the turn's final reply ends its working status. Mid-turn speech and
- * reactions arrive with `final: false` while the persona is still streaming:
- * tearing presence down on them left the room looking idle for the rest of the
- * turn. Posting a message does clear Discord's typing hint, so it is re-sent
- * at once instead of waiting for the next refresh tick.
- */
-async function settleTurnPresence(
-	message: ChatMessagePayload,
-	typing: TypingPort | undefined,
-	status: WorkingStatus | undefined,
-): Promise<void> {
-	if (!message.final) {
-		if (!message.reaction) typing?.refresh(message.origin.conversationId);
-		return;
-	}
-	await status?.clear(message.origin.conversationId);
-	typing?.end(message.origin.conversationId);
 }
 
 interface ArchivableThreadLike {
