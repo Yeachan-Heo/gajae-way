@@ -7,13 +7,12 @@ import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import type { SessionPort } from "../src/orchestrator/session-port";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 
 test("bind failure includes operation details in error report", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-bind-fail-"));
 	try {
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "bind-fail-test",
@@ -35,7 +34,7 @@ test("bind failure includes operation details in error report", async () => {
 			registry,
 			sessionPort: failingPort as SessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 			repo: join(home, "workspace"),
 			model: undefined,
@@ -46,13 +45,13 @@ test("bind failure includes operation details in error report", async () => {
 
 		// Let dispatch attempt and fail
 		for (let i = 0; i < 100; i++) {
-			const row = database.monitorEventRows().find((r) => r.event_id === eventId);
+			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
 			if (row?.stage === "failed") break;
 			await Bun.sleep(10);
 		}
 
 		// Verify failure was recorded
-		const failure = database.monitorFailure(eventId);
+		const failure = database.monitors.failure(eventId);
 		expect(failure).toBeDefined();
 		expect(failure?.code).toBe("session_bind_failed");
 
@@ -95,7 +94,7 @@ test("bind failure includes operation details in error report", async () => {
 test("bind failure events are marked as failed (not failed_no_retry) for re-dispatch", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-refirer-"));
 	try {
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "refirer-test",
@@ -116,7 +115,7 @@ test("bind failure events are marked as failed (not failed_no_retry) for re-disp
 			registry,
 			sessionPort: failingPort as SessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 			repo: join(home, "workspace"),
 			model: undefined,
@@ -127,19 +126,19 @@ test("bind failure events are marked as failed (not failed_no_retry) for re-disp
 
 		// Wait for first dispatch attempt to fail
 		for (let i = 0; i < 100; i++) {
-			const row = database.monitorEventRows().find((r) => r.event_id === eventId);
+			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
 			if (row?.stage === "failed") break;
 			await Bun.sleep(10);
 		}
 
-		const failedRow = database.monitorEventRows().find((r) => r.event_id === eventId);
+		const failedRow = database.monitors.eventRows().find((r) => r.event_id === eventId);
 		// The critical check: dispatch-phase failures mark event as "failed", not "failed_no_retry"
 		// This means reconcile WILL re-fire the event
 		expect(failedRow?.stage).toBe("failed");
 		// dispatch_attempts starts at 0, incremented when dispatch is retried
 		expect((failedRow?.dispatch_attempts ?? -1) >= 0).toBe(true);
 		// Verify failure is recorded with operation details
-		const failure = database.monitorFailure(eventId);
+		const failure = database.monitors.failure(eventId);
 		expect(failure?.code).toBe("session_bind_failed");
 		expect(failure?.detail).toContain("operation");
 
@@ -152,7 +151,7 @@ test("bind failure events are marked as failed (not failed_no_retry) for re-disp
 test("setModel failure includes operation details in error report", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-setmodel-fail-"));
 	try {
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "setmodel-fail-test",
@@ -181,7 +180,7 @@ test("setModel failure includes operation details in error report", async () => 
 			registry,
 			sessionPort: failingPort as SessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 			repo: join(home, "workspace"),
 			model: undefined,
@@ -192,13 +191,13 @@ test("setModel failure includes operation details in error report", async () => 
 
 		// Let dispatch attempt and fail
 		for (let i = 0; i < 100; i++) {
-			const row = database.monitorEventRows().find((r) => r.event_id === eventId);
+			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
 			if (row?.stage === "failed") break;
 			await Bun.sleep(10);
 		}
 
 		// Verify failure was recorded
-		const failure = database.monitorFailure(eventId);
+		const failure = database.monitors.failure(eventId);
 		expect(failure).toBeDefined();
 		expect(failure?.code).toBe("session_bind_failed");
 

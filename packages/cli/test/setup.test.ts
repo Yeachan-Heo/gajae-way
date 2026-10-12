@@ -345,6 +345,79 @@ describe("setup writing", () => {
 		});
 	});
 
+	test("setup --broker-agent provisions through the gateway with optional --from and relays output and exit status", async () => {
+		await withHome(async (home) => {
+			const previousExit = process.exitCode;
+			const previousStdout = process.stdout.write;
+			const output: string[] = [];
+			let command: readonly string[] = [];
+			process.stdout.write = ((chunk: string | Uint8Array) => {
+				output.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
+				return true;
+			}) as typeof process.stdout.write;
+			try {
+				await runSetup(["--broker-agent", "--from", "/tmp/gjc-source"], {
+					home,
+					binDir: "/opt/gajaeway/bin",
+					runBrokerAgent: async (argv) => {
+						command = argv;
+						return { exitCode: 3, stdout: "provision rolled back", stderr: "" };
+					},
+				});
+				expect(command).toEqual([
+					"/opt/gajaeway/bin/gajaeway-gateway",
+					"broker-agent",
+					"provision",
+					"--mode",
+					"force",
+					"--from",
+					"/tmp/gjc-source",
+				]);
+				expect(output.join("")).toBe("provision rolled back");
+				expect(process.exitCode).toBe(3);
+				expect(await allFiles(home)).toEqual([]);
+			} finally {
+				process.stdout.write = previousStdout;
+				process.exitCode = previousExit ?? 0;
+			}
+		});
+	});
+
+	test("setup --broker-agent reports the broker lease stop hint for lease_held", async () => {
+		await withHome(async (home) => {
+			const previousExit = process.exitCode;
+			const previousStderr = process.stderr.write;
+			const stderr: string[] = [];
+			const lines: string[] = [];
+			process.stderr.write = ((chunk: string | Uint8Array) => {
+				stderr.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
+				return true;
+			}) as typeof process.stderr.write;
+			try {
+				await runSetup(["--broker-agent"], {
+					home,
+					binDir: "/opt/gajaeway/bin",
+					log: (line) => lines.push(line),
+					runBrokerAgent: async () => ({
+						exitCode: 1,
+						stdout: "",
+						stderr: "lease_held name=broker",
+					}),
+				});
+				expect(stderr.join("")).toBe("lease_held name=broker");
+				expect(process.exitCode).toBe(1);
+				expect(lines).toContain("broker lease is held; stop it with: systemctl --user stop gajaeway-broker");
+			} finally {
+				process.stderr.write = previousStderr;
+				process.exitCode = previousExit ?? 0;
+			}
+		});
+	});
+
+	test("broker-agent mode rejects adapter setup flags", () => {
+		expect(() => parseSetupArgs(["--broker-agent", "--from-env"])).toThrow("standalone");
+		expect(() => parseSetupArgs(["--broker-agent", "--adapters", "slack"])).toThrow("standalone");
+	});
 	test("the CLI entry reports a rejected token on stderr, exits 1, and leaks nothing", async () => {
 		await withHome(async (home) => {
 			const previousHome = process.env.GAJAEWAY_HOME;

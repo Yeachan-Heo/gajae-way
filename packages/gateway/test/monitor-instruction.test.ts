@@ -6,14 +6,13 @@ import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 
 import { ScriptedSessionPort } from "./session-port.fake";
 
 /** Real registry + generic SessionPort harness honoring the JSON authoring contract. */
 async function harness(directory: string) {
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const prompts: string[] = [];
 	const sessionPort = new ScriptedSessionPort({
@@ -35,7 +34,7 @@ async function harness(directory: string) {
 		registry,
 		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-		delivery: new DeliveryService(new DeliveryLedger(database)),
+		delivery: new DeliveryService(database),
 		emit: () => {},
 	});
 	return { database, registry, pipeline, prompts };
@@ -189,7 +188,7 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 			database.close();
 		}
 		// Gateway restart: a fresh database handle and registry over the same file.
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const restored = registry.get(monitorId)!;
 		expect(restored.instruction).toBe(instruction);
@@ -209,7 +208,7 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 				},
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 			deliver: (payload) => delivered.push(payload),
 		});

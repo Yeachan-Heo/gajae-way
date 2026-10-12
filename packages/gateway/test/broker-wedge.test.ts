@@ -16,7 +16,7 @@ import {
 	type SessionBindInput,
 } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { initializeTestBrokerAuthority, noRelay, ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-18T00:00:00.000Z");
@@ -24,7 +24,7 @@ const REPO = "/tmp/gajaeway-broker-wedge-repo";
 const ORIGIN = "discord/channel/broker-wedge";
 
 const directories: string[] = [];
-const databases: GatewayDatabase[] = [];
+const databases: Store[] = [];
 
 afterEach(async () => {
 	for (const database of databases.splice(0)) database.close();
@@ -155,7 +155,7 @@ test("bind hold notices explicitly identify broker index lock blocks from exit r
 test("poisoned create-key rotation stops at exactly three rotations and rethrows on the fourth", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-rotation-"));
 	directories.push(home);
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	databases.push(database);
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const errorSpy = spyOn(console, "error").mockImplementation(() => {});
@@ -180,14 +180,14 @@ test("poisoned create-key rotation stops at exactly three rotations and rethrows
 	});
 	try {
 		for (let rotation = 0; rotation < MAX_POISONED_CREATE_ROTATIONS; rotation++) {
-			const epoch = database.getSessionRecord(ORIGIN)?.epoch ?? 0;
+			const epoch = database.bindings.getSessionRecord(ORIGIN)?.epoch ?? 0;
 			await expect(port.bind({ originKey: ORIGIN, epoch, repo: REPO })).rejects.toThrow("terminal_uncertain");
 		}
-		const cappedEpoch = database.getSessionRecord(ORIGIN)?.epoch ?? 0;
+		const cappedEpoch = database.bindings.getSessionRecord(ORIGIN)?.epoch ?? 0;
 		await expect(port.bind({ originKey: ORIGIN, epoch: cappedEpoch, repo: REPO })).rejects.toThrow(
 			"terminal_uncertain",
 		);
-		expect(database.getSessionRecord(ORIGIN)?.epoch).toBe(cappedEpoch);
+		expect(database.bindings.getSessionRecord(ORIGIN)?.epoch).toBe(cappedEpoch);
 		expect(
 			errorSpy.mock.calls.filter(([line]) => String(line).includes("session_create_rotation_capped")),
 		).toHaveLength(1);
@@ -200,7 +200,7 @@ test("poisoned create-key rotation stops at exactly three rotations and rethrows
 test("a successful bind resets the durable poisoned-create rotation counter", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-reset-"));
 	directories.push(home);
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	databases.push(database);
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	let fail = true;
@@ -238,23 +238,23 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 		sleep: async () => {},
 	});
 	await expect(port.bind({ originKey: ORIGIN, epoch: 0, repo: REPO })).rejects.toThrow();
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("1");
+	expect(database.core.metaGet(`create_rotation:${ORIGIN}`)).toBe("1");
 	fail = false;
-	const recoveredEpoch = database.getSessionRecord(ORIGIN)?.epoch ?? 0;
+	const recoveredEpoch = database.bindings.getSessionRecord(ORIGIN)?.epoch ?? 0;
 	await expect(port.bind({ originKey: ORIGIN, epoch: recoveredEpoch, repo: REPO })).resolves.toMatchObject({
 		sessionId: "recovered",
 	});
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
-	database.metaSet(`create_rotation:${ORIGIN}`, String(MAX_POISONED_CREATE_ROTATIONS));
+	expect(database.core.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
+	database.core.metaSet(`create_rotation:${ORIGIN}`, String(MAX_POISONED_CREATE_ROTATIONS));
 	live = false;
 	await expect(
 		port.resume({ sessionId: "recovered", repo: REPO, originKey: ORIGIN, epoch: recoveredEpoch }),
 	).resolves.toMatchObject({ sessionId: "recovered" });
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
+	expect(database.core.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
 	fail = true;
-	const laterEpoch = database.rebindEpoch(ORIGIN);
+	const laterEpoch = database.transaction((tx) => database.bindings.rotateEpoch(tx, ORIGIN));
 	await expect(port.bind({ originKey: ORIGIN, epoch: laterEpoch, repo: REPO })).rejects.toThrow();
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("1");
+	expect(database.core.metaGet(`create_rotation:${ORIGIN}`)).toBe("1");
 });
 
 class FailingBindPort extends ScriptedSessionPort {
@@ -271,7 +271,7 @@ class FailingBindPort extends ScriptedSessionPort {
 test("admissionHold is broker_wedged after BIND_WEDGE_PROBE_STRIKES and clears after a successful bind", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-persona-"));
 	directories.push(home);
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	databases.push(database);
 	const port = new FailingBindPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "recovered") });
 	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
@@ -302,13 +302,13 @@ test("admissionHold is broker_wedged after BIND_WEDGE_PROBE_STRIKES and clears a
 		},
 		log: () => {},
 	});
-	database.inboundEnqueue({
+	database.transaction((tx) => database.inbox.enqueue(tx, {
 		messageId: "m-broker-wedge",
 		originKey: ORIGIN,
 		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
 		body: "hello",
 		receivedAt: new Date(NOW).toISOString(),
-	});
+	}));
 	try {
 		await manager.notifyInbound(ORIGIN);
 		await eventually(() => port.bindAttempts === 1, "first bind did not run");
@@ -334,7 +334,7 @@ test("admissionHold is broker_wedged after BIND_WEDGE_PROBE_STRIKES and clears a
 test("admissionHold reflects an emitted non-wedged bind hold reason", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-hold-reason-"));
 	directories.push(home);
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	databases.push(database);
 	const port = new FailingBindPort();
 	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
@@ -356,13 +356,13 @@ test("admissionHold reflects an emitted non-wedged bind hold reason", async () =
 		},
 		log: () => {},
 	});
-	database.inboundEnqueue({
+	database.transaction((tx) => database.inbox.enqueue(tx, {
 		messageId: "m-sdk-hold",
 		originKey: ORIGIN,
 		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
 		body: "hello",
 		receivedAt: new Date(NOW).toISOString(),
-	});
+	}));
 	try {
 		await manager.notifyInbound(ORIGIN);
 		await eventually(() => port.bindAttempts === 1, "first bind did not run");

@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { isSessionGoneCode, isVerifiedGjcVersion, VERIFIED_GJC_THROUGH } from "../src/orchestrator/gjc-contract";
+import { superviseLiveBroker } from "./live-broker";
 
 /**
  * Contract check against the INSTALLED gjc. Run it before raising
@@ -20,21 +22,31 @@ async function failureCode(client: GlobalGjcClient, args: string[]): Promise<unk
 liveTest(
 	"the installed gjc is inside the verified contract and reports a dropped session with a session-gone code",
 	async () => {
-		const client = new GlobalGjcClient();
-		await client.preflight();
-		const version = client.gjcVersion ?? "";
-		expect({ version, verified: isVerifiedGjcVersion(version) }).toEqual({ version, verified: true });
-		const missing = randomUUID();
-		for (const args of [
-			["sdk", "session", "inspect", missing],
-			["sdk", "session", "status", missing, "gw-p-contract-probe"],
-		]) {
-			const code = await failureCode(client, args);
-			expect({ args: args.slice(2, 3), code, gone: isSessionGoneCode(code) }).toEqual({
-				args: args.slice(2, 3),
-				code,
-				gone: true,
-			});
+		const executable = process.env.GJC_EXECUTABLE;
+		const agentDir = process.env.GJC_CODING_AGENT_DIR;
+		if (!executable || !agentDir || !isAbsolute(executable) || !isAbsolute(agentDir)) {
+			throw new Error("live GJC contract test requires explicit absolute GJC_EXECUTABLE and GJC_CODING_AGENT_DIR");
+		}
+		const supervisor = await superviseLiveBroker(executable, agentDir);
+		try {
+			const client = new GlobalGjcClient({ executable, agentDir });
+			await client.preflight();
+			const version = client.gjcVersion ?? "";
+			expect({ version, verified: isVerifiedGjcVersion(version) }).toEqual({ version, verified: true });
+			const missing = randomUUID();
+			for (const args of [
+				["sdk", "session", "inspect", missing],
+				["sdk", "session", "status", missing, "gw-p-contract-probe"],
+			]) {
+				const code = await failureCode(client, args);
+				expect({ args: args.slice(2, 3), code, gone: isSessionGoneCode(code) }).toEqual({
+					args: args.slice(2, 3),
+					code,
+					gone: true,
+				});
+			}
+		} finally {
+			await supervisor.stop();
 		}
 	},
 	120_000,

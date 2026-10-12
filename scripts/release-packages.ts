@@ -16,7 +16,8 @@
  * does not.
  */
 
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
+import { join } from "node:path";
 
 const RELEASE_ORDER = ["protocol", "sdk", "cli"] as const;
 
@@ -66,13 +67,18 @@ async function main(): Promise<void> {
 		const manifest = await Bun.file(`${root}packages/${pkg}/package.json`).json();
 		versions.set(manifest.name, manifest.version);
 	}
+	const workspacePackages = await readWorkspacePackages(root);
+	const releasePackageNames = new Set(versions.keys());
 
 	for (const pkg of RELEASE_ORDER) {
 		const dir = `${root}packages/${pkg}`;
 		await run(["bun", "run", "build"], dir);
 		const tarball = `${packedDir}/gajae-gateway-${pkg}.tgz`;
 		await run(["bun", "pm", "pack", "--filename", tarball], dir);
-		await assertPinnedWorkspaceDeps(tarball, versions);
+		const packedManifest = await readPackedManifest(tarball);
+		assertPinnedWorkspaceDeps(packedManifest, versions);
+		assertNoPrivateWorkspaceDeps(packedManifest, workspacePackages, releasePackageNames);
+
 		if (publish) {
 			const publishCmd = ["npm", "publish", tarball, "--access", "public"];
 			if (tag) publishCmd.push("--tag", tag);
@@ -84,15 +90,12 @@ async function main(): Promise<void> {
 	else console.log(`\nDry-run packed tarballs written to dist-packed/. Inspect them, then re-run with --publish.`);
 }
 
-await main();
+if (import.meta.main) await main();
 
 // `bun pm pack` rewrites `workspace:*` from bun.lock, which can hold a stale
 // workspace version after a package.json bump. Refuse a tarball that would pin
 // a sibling package to anything but the version being released alongside it.
-async function assertPinnedWorkspaceDeps(tarball: string, versions: Map<string, string>): Promise<void> {
-	const proc = Bun.spawn(["tar", "-xOzf", tarball, "package/package.json"], { stdout: "pipe", stderr: "inherit" });
-	const manifest = JSON.parse(await new Response(proc.stdout).text());
-	if ((await proc.exited) !== 0) throw new Error(`could not read package.json from ${tarball}`);
+function assertPinnedWorkspaceDeps(manifest: PackedPackageManifest, versions: Map<string, string>): void {
 	for (const [dep, pinned] of Object.entries<string>(manifest.dependencies ?? {})) {
 		const expected = versions.get(dep);
 		if (expected !== undefined && pinned !== expected) {
@@ -101,4 +104,53 @@ async function assertPinnedWorkspaceDeps(tarball: string, versions: Map<string, 
 			);
 		}
 	}
+}
+
+interface PackedPackageManifest {
+	readonly name: string;
+	readonly dependencies?: Record<string, string>;
+	readonly optionalDependencies?: Record<string, string>;
+	readonly peerDependencies?: Record<string, string>;
+}
+
+interface WorkspacePackage {
+	readonly name: string;
+	readonly private?: boolean;
+}
+
+async function readWorkspacePackages(root: string): Promise<Map<string, WorkspacePackage>> {
+	const workspacePackages = new Map<string, WorkspacePackage>();
+	for (const entry of await readdir(join(root, "packages"), { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		const manifestPath = join(root, "packages", entry.name, "package.json");
+		const file = Bun.file(manifestPath);
+		if (!(await file.exists())) continue;
+		const manifest = (await file.json()) as WorkspacePackage;
+		workspacePackages.set(manifest.name, manifest);
+	}
+	return workspacePackages;
+}
+
+export function assertNoPrivateWorkspaceDeps(
+	manifest: PackedPackageManifest,
+	workspacePackages: ReadonlyMap<string, WorkspacePackage>,
+	releasePackageNames: ReadonlySet<string>,
+): void {
+	for (const section of ["dependencies", "optionalDependencies", "peerDependencies"] as const) {
+		for (const dependency of Object.keys(manifest[section] ?? {})) {
+			const workspacePackage = workspacePackages.get(dependency);
+			if (workspacePackage === undefined) continue;
+			if (workspacePackage.private === true || !releasePackageNames.has(dependency)) {
+				const reason = workspacePackage.private === true ? "private" : "not in the release map";
+				throw new Error(`${manifest.name} lists ${dependency} in ${section}, but the workspace package is ${reason}`);
+			}
+		}
+	}
+}
+
+async function readPackedManifest(tarball: string): Promise<PackedPackageManifest> {
+	const proc = Bun.spawn(["tar", "-xOzf", tarball, "package/package.json"], { stdout: "pipe", stderr: "inherit" });
+	const text = await new Response(proc.stdout).text();
+	if ((await proc.exited) !== 0) throw new Error(`could not read package.json from ${tarball}`);
+	return JSON.parse(text) as PackedPackageManifest;
 }

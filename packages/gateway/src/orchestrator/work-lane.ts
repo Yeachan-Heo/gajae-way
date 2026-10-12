@@ -31,25 +31,30 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
+import type { Store } from "../store";
 import {
-	type GatewayDatabase,
 	type LaneReportRow,
+	resolveLaneReportOrigin,
 	type WorkAttemptAdmission,
+	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
+	type WorkAttemptSettlement,
 	type WorkAttemptSettleResult,
 	type WorkAttemptTerminalEvidence,
 	type WorkParent,
 	type WorkReportRoot,
+	workAssert,
 	workAttemptDeliveryId,
 	workAttemptReportId,
-} from "../store/db";
+} from "../store/groups/work";
+import type { WriteTx } from "../store/tx";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
 
-const owners = new WeakSet<GatewayDatabase>();
+const owners = new WeakSet<Store>();
 /** Consecutive failed reconciliations between authority re-checks through recovery. */
 const FAILURES_PER_READOPTION = 8;
 /** Ceiling for the failure backoff between reconciliation polls. */
@@ -142,7 +147,7 @@ export interface CheckStatusClient {
 }
 
 export interface WorkLaneManagerOptions {
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly port: SessionPort;
 	readonly lanes: LaneGovernor;
 	readonly gajaewayHome: string;
@@ -201,7 +206,7 @@ function getServiceDirectory(): string {
 /** Attempt ownership is independent of sockets, response deadlines and broker generations. */
 export class WorkLaneManager {
 	readonly #options: WorkLaneManagerOptions;
-	readonly #db: GatewayDatabase;
+	readonly #db: Store;
 	readonly #port: SessionPort;
 	readonly #observers = new Map<string, Observer>();
 	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
@@ -233,13 +238,13 @@ export class WorkLaneManager {
 		if (this.#stopped) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
 	}
 	#binding(runtime: WorkAttemptRuntime): boolean {
-		const binding = this.#db.getSessionRecord(runtime.sessionKey);
-		return binding?.sessionId === runtime.sessionId && binding.epoch === runtime.epoch;
+		const binding = this.#db.bindings.getSessionRecord(runtime.sessionKey);
+		return binding?.sessionId === runtime.sessionId && binding?.epoch === runtime.epoch;
 	}
 	#current(observer: Observer): boolean {
 		return (
 			!this.#stopped &&
-			!this.#db.isBrokerQuarantined("work", observer.runtime.jobId) &&
+			!this.#db.bindings.isQuarantined("work", observer.runtime.jobId) &&
 			!observer.abort.signal.aborted &&
 			this.#observers.get(observer.runtime.opRef) === observer &&
 			observer.generation === (this.#options.brokerGeneration?.() ?? 0)
@@ -247,20 +252,127 @@ export class WorkLaneManager {
 	}
 	#writeCurrent(observer: Observer): boolean {
 		if (!this.#current(observer)) return false;
-		const binding = this.#db.getSessionRecord(observer.runtime.sessionKey);
+		const binding = this.#db.bindings.getSessionRecord(observer.runtime.sessionKey);
 		return (
 			this.#current(observer) &&
 			binding?.sessionId === observer.binding?.sessionId &&
 			binding?.epoch === observer.binding?.epoch
 		);
 	}
+	#refreshWorkSession(tx: WriteTx, runtime: WorkAttemptRuntime, at: string): void {
+		this.#db.bindings.touchWorkSession(
+			tx,
+			runtime.sessionKey,
+			runtime.sessionId,
+			runtime.epoch,
+			at,
+			JSON.stringify({
+				platform: "work",
+				kind: "task",
+				conversationId: runtime.sessionKey.slice("work/task/".length),
+			}),
+		);
+	}
+
+	#prepareAttempt(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
+		this.#db.transaction((tx) => {
+			const binding = this.#db.bindings.getSessionRecord(runtime.sessionKey);
+			const bindingMatches = binding?.sessionId === runtime.sessionId && binding.epoch === runtime.epoch;
+			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
+			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
+		});
+	}
+
+	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
+		return this.#db.transaction((tx) => {
+			const current = this.#db.work.workAttemptGet(opRef);
+			const updated = this.#db.work.workAttemptUpdate(tx, opRef, expectedVersion, patch);
+			if (
+				current &&
+				updated &&
+				!hasAcceptanceEvidence(current) &&
+				hasAcceptanceEvidence(updated) &&
+				updated.noticeHash !== null
+			) {
+				this.#db.core.metaSet(
+					`lane-notice:${updated.sessionKey}`,
+					JSON.stringify({ epoch: updated.epoch, hash: updated.noticeHash }),
+				);
+			}
+			return updated;
+		});
+	}
+
+	#settleAttempt(
+		opRef: string,
+		expectedVersion: number,
+		record: LaneJobRecord,
+		patch: WorkAttemptSettlement,
+		admission?: WorkAttemptAdmission,
+	): WorkAttemptSettleResult | undefined {
+		return this.#db.transaction((tx) => {
+			const current = this.#db.work.workAttemptGet(opRef);
+			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
+			const checks = {
+				...(admission?.kind === "persona"
+					? {
+							personaSessionExists: this.#db.bindings.getSessionRecord(admission.row.originKey) !== undefined,
+							personaMessageExists: this.#db.inbox.messageExists(admission.row.messageId),
+						}
+					: {}),
+				...(admission?.kind === "lane"
+					? { laneParentAvailable: this.#db.work.laneParentAvailable(admission.report.parentName) }
+					: {}),
+			};
+			const settled = this.#db.work.workAttemptSettle(tx, opRef, expectedVersion, record, patch, admission, checks);
+			if (!settled) return undefined;
+			this.#refreshWorkSession(tx, settled.runtime, settled.runtime.settledAt!);
+			if (settled.runtime.decision === "reported" && admission?.kind === "persona") {
+				workAssert(
+					this.#db.inbox.enqueue(tx, {
+						messageId: admission.row.messageId,
+						originKey: admission.row.originKey,
+						originRefJson: resolveLaneReportOrigin(settled.runtime.parent, admission.row.originRefJson),
+						body: admission.row.body,
+						receivedAt: settled.runtime.settledAt!,
+						source: "lane_report",
+					}),
+				);
+			}
+			for (const payload of [settled.fallbackPayload, settled.childFallback]) {
+				if (!payload) continue;
+				workAssert(typeof payload.deliveryId === "string");
+				this.#db.outbox.enqueue(tx, {
+					deliveryId: payload.deliveryId,
+					turnId: payload.turnId,
+					originKey: originKey(payload.origin),
+					payloadJson: JSON.stringify(payload),
+				});
+			}
+			return settled;
+		});
+	}
+
+	#touchAttemptActivity(opRef: string, at: string): boolean {
+		return this.#db.transaction((tx) => {
+			const runtime = this.#db.work.workAttemptGet(opRef);
+			if (!runtime || runtime.settledAt !== null) return false;
+			this.#assertNotQuarantined(runtime.jobId);
+			return this.#db.bindings.touchBoundSession(tx, runtime.sessionKey, runtime.sessionId, runtime.epoch, at);
+		});
+	}
+
+	#reportMutation<T>(operation: (tx: WriteTx) => T): T {
+		return this.#db.transaction(operation);
+	}
+
 	#job(name: string, required = false): LaneJobRecord | undefined {
 		const { jobId } = laneJobIdentity(name);
 		this.#assertNotQuarantined(jobId, name);
 		try {
 			const { jobId, laneKey } = laneJobIdentity(name);
-			const byId = this.#db.laneJobJson(jobId);
-			const byLane = this.#db.laneJobJsonByLaneKey(laneKey);
+			const byId = this.#db.work.laneJobJson(jobId);
+			const byLane = this.#db.work.laneJobJsonByLaneKey(laneKey);
 			if (byId !== byLane) throw new Error("identity mismatch");
 			if (byId === undefined) {
 				if (required)
@@ -270,7 +382,7 @@ export class WorkLaneManager {
 			const job = parseLaneJobRecord(byId);
 			if (job.jobId !== jobId) throw new Error("identity mismatch");
 			const last = job.attempts.at(-1);
-			const saved = last && this.#db.workAttemptGet(last.opRef);
+			const saved = last && this.#db.work.workAttemptGet(last.opRef);
 			if (
 				last &&
 				saved &&
@@ -282,7 +394,7 @@ export class WorkLaneManager {
 					saved.settledAt !== (last.endedAt ?? null))
 			)
 				throw new Error("runtime/history mismatch");
-			const open = this.#db.workAttemptOpenByLane(laneKey);
+			const open = this.#db.work.workAttemptOpenByLane(laneKey);
 			if (open && (job.attempts.at(-1)?.opRef !== open.opRef || job.attempts.at(-1)?.endedAt !== undefined))
 				throw new Error("runtime mismatch");
 			return job;
@@ -300,7 +412,7 @@ export class WorkLaneManager {
 		if (!record) return false;
 		const attempt = record.attempts.at(-1);
 		if (!attempt || attempt.opRef !== opRef) return false;
-		const runtime = this.#db.workAttemptGet(opRef);
+		const runtime = this.#db.work.workAttemptGet(opRef);
 		if (!runtime) return false;
 		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
 		if (attempt.endedAt !== undefined) return false;
@@ -374,13 +486,14 @@ export class WorkLaneManager {
 				};
 			}
 		}
-		const settled: WorkAttemptSettleResult | undefined = this.#db.workAttemptSettle(
+		const settled = this.#settleAttempt(
 			opRef,
 			runtime.version,
 			closed,
 			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
 			admission,
 		);
+
 		if (!settled) return false;
 		this.#finishWaiters(opRef);
 		for (const payload of [settled.fallbackPayload, settled.childFallback]) {
@@ -408,7 +521,7 @@ export class WorkLaneManager {
 		return true;
 	}
 	#assertNotQuarantined(jobId: string, name?: string): void {
-		if (this.#db.isBrokerQuarantined("work", jobId))
+		if (this.#db.bindings.isQuarantined("work", jobId))
 			throw new ProtocolError("verb_failed", "work lane belongs to a quarantined broker authority", {
 				reasonCode: "broker_authority_quarantined",
 				jobId,
@@ -417,7 +530,7 @@ export class WorkLaneManager {
 	}
 	#latestRuntime(name: string): WorkAttemptRuntime | undefined {
 		const opRef = this.#job(name)?.attempts.at(-1)?.opRef;
-		return opRef ? this.#db.workAttemptGet(opRef) : undefined;
+		return opRef ? this.#db.work.workAttemptGet(opRef) : undefined;
 	}
 	#rootForLane(name: string): WorkReportRoot | null {
 		const parent = this.#latestRuntime(name)?.parent;
@@ -448,7 +561,7 @@ export class WorkLaneManager {
 	}
 	#resolveCaller(input: WorkInput, mode: "start" | "run"): WorkParent | null {
 		let callerOrigin: string | undefined;
-		if (input.callerSessionId) callerOrigin = this.#db.originForSessionId(input.callerSessionId);
+		if (input.callerSessionId) callerOrigin = this.#db.bindings.originForSessionId(input.callerSessionId);
 		const lanePrefix = "work/task/";
 		const callerLane = callerOrigin?.startsWith(lanePrefix) ? callerOrigin.slice(lanePrefix.length) : undefined;
 		let callerPersona: OriginRef | undefined;
@@ -459,7 +572,7 @@ export class WorkLaneManager {
 				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) {
 					callerPersona = origin;
 					// Capture trigger message ID from the current nonterminal turn for threading
-					const nonterminalTurns = this.#db.inboundNonterminalTurns(callerOrigin);
+					const nonterminalTurns = this.#db.inbox.nonterminalTurns(callerOrigin);
 					if (nonterminalTurns.length > 0) {
 						triggerMessageId = nonterminalTurns[0]?.triggerMessageId;
 					}
@@ -507,7 +620,7 @@ export class WorkLaneManager {
 					// Capture trigger message ID from the ownerTarget's origin for threading
 					let ownerTriggerMessageId: string | undefined;
 					const ownerOriginKey = originKey(owner);
-					const ownerNonterminalTurns = this.#db.inboundNonterminalTurns(ownerOriginKey);
+					const ownerNonterminalTurns = this.#db.inbox.nonterminalTurns(ownerOriginKey);
 					if (ownerNonterminalTurns.length > 0) {
 						ownerTriggerMessageId = ownerNonterminalTurns[0]?.triggerMessageId;
 					}
@@ -535,7 +648,7 @@ export class WorkLaneManager {
 		const allowNested = this.#options.allowNested?.() === true;
 		const text = laneSystemNotice({ name, parent, allowNested });
 		const hash = createHash("sha256").update(text).digest("hex");
-		const stored = this.#db.metaGet(`lane-notice:${workSessionKey(name)}`);
+		const stored = this.#db.core.metaGet(`lane-notice:${workSessionKey(name)}`);
 		if (stored) {
 			try {
 				const previous = JSON.parse(stored) as { epoch?: unknown; hash?: unknown };
@@ -556,7 +669,7 @@ export class WorkLaneManager {
 			return held;
 		}
 		await this.#wait(started.opRef, owner, signal);
-		const runtime = this.#db.workAttemptGet(started.opRef)!;
+		const runtime = this.#db.work.workAttemptGet(started.opRef)!;
 		const reason = runtime.terminal?.reasonCode ?? "terminal_uncertain";
 		if (reason !== "end_turn") throw workError("work attempt did not complete", reason, runtime);
 		const text = this.#observers.get(runtime.opRef)?.text;
@@ -674,7 +787,7 @@ export class WorkLaneManager {
 			try {
 				return await this.#port.bind({
 					originKey: sessionKey,
-					epoch: this.#db.getSessionRecord(sessionKey)?.epoch ?? 0,
+					epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
 					repo: input.cwd,
 					codingRegister: true,
 					...(input.model ? { model: input.model } : {}),
@@ -703,7 +816,8 @@ export class WorkLaneManager {
 			notice?.hash ?? null,
 		);
 		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
-		this.#db.workAttemptPrepare(runtime, job);
+		this.#prepareAttempt(runtime, job);
+
 		const observer = this.#register(runtime);
 		this.#attach(observer);
 		await observer.attaching;
@@ -741,7 +855,7 @@ export class WorkLaneManager {
 			this.#live();
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
-		let latest = this.#db.workAttemptGet(opRef)!;
+		let latest = this.#db.work.workAttemptGet(opRef)!;
 		if (!accepted && !rejected) {
 			try {
 				accepted = provesAcceptance(await this.#query(latest));
@@ -758,7 +872,7 @@ export class WorkLaneManager {
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
 		latest =
-			this.#db.workAttemptUpdate(
+			this.#updateAttempt(
 				opRef,
 				latest.version,
 				accepted
@@ -779,7 +893,7 @@ export class WorkLaneManager {
 		const name = parseName(params);
 		const job = this.#job(name, true)!;
 		const key = workSessionKey(name);
-		const binding = this.#db.getSessionRecord(key);
+		const binding = this.#db.bindings.getSessionRecord(key);
 		const attempt = job.attempts.at(-1);
 		let op: PromptStatusBody | null = null;
 		if (attempt && binding?.sessionId === attempt.sessionId) {
@@ -795,14 +909,14 @@ export class WorkLaneManager {
 				if (attempt.endedAt === undefined || !isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
-			const current = this.#db.getSessionRecord(key);
+			const current = this.#db.bindings.getSessionRecord(key);
 			if (current?.sessionId !== binding.sessionId || current.epoch !== binding.epoch) op = null;
 		}
 		return {
 			jobId: job.jobId,
 			state: job.state,
-			sessionId: this.#db.getSessionRecord(key)?.sessionId ?? "",
-			lastActivityAt: this.#db.workLaneRows().find((row) => row.origin_key === key)?.last_activity_at ?? null,
+			sessionId: this.#db.bindings.getSessionRecord(key)?.sessionId ?? "",
+			lastActivityAt: this.#db.bindings.workLaneRows().find((row) => row.origin_key === key)?.last_activity_at ?? null,
 			attempt: attempt
 				? {
 						opRef: attempt.opRef,
@@ -847,7 +961,7 @@ export class WorkLaneManager {
 					reasonCode: "no_open_attempt",
 					jobId: job.jobId,
 				});
-			const runtime = this.#db.workAttemptGet(open.opRef);
+			const runtime = this.#db.work.workAttemptGet(open.opRef);
 			const clientRef = newOpRef("work-steer");
 			if (!runtime || !this.#binding(runtime) || runtime.terminal)
 				throw workError(
@@ -885,7 +999,7 @@ export class WorkLaneManager {
 	#register(runtime: WorkAttemptRuntime): Observer {
 		const existing = this.#observers.get(runtime.opRef);
 		if (existing && this.#current(existing)) return existing;
-		const binding = this.#db.getSessionRecord(runtime.sessionKey);
+		const binding = this.#db.bindings.getSessionRecord(runtime.sessionKey);
 		const observer: Observer = {
 			runtime,
 			generation: this.#options.brokerGeneration?.() ?? 0,
@@ -920,7 +1034,7 @@ export class WorkLaneManager {
 				.finally(() => {
 					observer.task = undefined;
 					if (!this.#current(observer)) return;
-					if (this.#db.workAttemptGet(opRef)?.settledAt !== null) {
+					if (this.#db.work.workAttemptGet(opRef)?.settledAt !== null) {
 						this.#observers.delete(opRef);
 						this.#failures.delete(opRef);
 						return;
@@ -988,7 +1102,7 @@ export class WorkLaneManager {
 			if (
 				!this.#stopped &&
 				(!current || current.abort.signal.aborted) &&
-				this.#db.workAttemptGet(opRef)?.settledAt === null
+				this.#db.work.workAttemptGet(opRef)?.settledAt === null
 			)
 				await this.recover();
 		})().catch(() => {
@@ -1017,7 +1131,7 @@ export class WorkLaneManager {
 			}
 			observer.tail = tail;
 			await tail.ready;
-			if (this.#writeCurrent(observer) && this.#db.workAttemptGet(runtime.opRef)?.settledAt === null) {
+			if (this.#writeCurrent(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt === null) {
 				tail.beginTurn(runtime.opRef);
 				tail.setTurnRunning(true);
 			}
@@ -1041,7 +1155,7 @@ export class WorkLaneManager {
 		if (observer.touchedAt !== undefined && now - observer.touchedAt < ACTIVITY_TOUCH_MS) return;
 		observer.touchedAt = now;
 		try {
-			this.#db.workAttemptActivity(observer.runtime.opRef, new Date(now).toISOString());
+			this.#touchAttemptActivity(observer.runtime.opRef, new Date(now).toISOString());
 		} catch {
 			console.error(`work activity update unavailable opRef=${observer.runtime.opRef}`);
 		}
@@ -1063,7 +1177,7 @@ export class WorkLaneManager {
 	}
 	async #tick(observer: Observer): Promise<void> {
 		if (!this.#writeCurrent(observer)) return;
-		let runtime = this.#db.workAttemptGet(observer.runtime.opRef)!;
+		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
 		if (!runtime.terminal) {
 			this.#attach(observer);
@@ -1088,7 +1202,7 @@ export class WorkLaneManager {
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
 			runtime =
-				this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+				this.#updateAttempt(runtime.opRef, runtime.version, {
 					...(status && provesAcceptance(status)
 						? {
 								sendPhase: "accepted" as const,
@@ -1100,7 +1214,7 @@ export class WorkLaneManager {
 			if (!runtime.terminal) return;
 		}
 		if (runtime.output.disposition === "pending" && runtime.output.knownSilence) {
-			const silent = this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+			const silent = this.#updateAttempt(runtime.opRef, runtime.version, {
 				output: { ...runtime.output, disposition: "silent", nextReadAt: null },
 			});
 			if (!silent) return;
@@ -1110,12 +1224,12 @@ export class WorkLaneManager {
 			if (runtime.output.nextReadAt && this.#now() < Date.parse(runtime.output.nextReadAt)) return;
 			if (runtime.output.reads >= 3 || runtime.terminal?.kind === "local") {
 				runtime =
-					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+					this.#updateAttempt(runtime.opRef, runtime.version, {
 						output: { ...runtime.output, disposition: "unavailable", nextReadAt: null },
 					}) ?? runtime;
 			} else {
 				const reads = runtime.output.reads + 1;
-				const claimed = this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+				const claimed = this.#updateAttempt(runtime.opRef, runtime.version, {
 					output: {
 						...runtime.output,
 						reads,
@@ -1153,7 +1267,7 @@ export class WorkLaneManager {
 						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
 							? terminalEvidence({ ...terminal.status, receiptState: "present" }, terminal.observedAt)
 							: undefined;
-					const updated = this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+					const updated = this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(reconciled ? { terminal: reconciled } : {}),
 						output: {
 							...runtime.output,
@@ -1169,7 +1283,7 @@ export class WorkLaneManager {
 					if (runtime.mode === "run" && this.#waiters.has(runtime.opRef)) observer.text = result.text;
 				} else if (result.status === "unavailable" || reads >= 3) {
 					runtime =
-						this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+						this.#updateAttempt(runtime.opRef, runtime.version, {
 							output: { ...runtime.output, disposition: "unavailable", nextReadAt: null },
 						}) ?? runtime;
 				} else return;
@@ -1181,7 +1295,7 @@ export class WorkLaneManager {
 		const facts = await collectRepoFacts(runtime.cwd, this.#options.checkStatusClient);
 		const result = await this.#port.runExclusive(runtime.sessionKey, async () => {
 			if (!this.#writeCurrent(observer)) return;
-			const current = this.#db.workAttemptGet(runtime.opRef);
+			const current = this.#db.work.workAttemptGet(runtime.opRef);
 			if (!current || current.version !== runtime.version || current.settledAt) return;
 			const name = runtime.sessionKey.slice("work/task/".length);
 			const at = this.#at();
@@ -1286,13 +1400,14 @@ export class WorkLaneManager {
 					};
 				}
 			}
-			const settled = this.#db.workAttemptSettle(
+			const settled = this.#settleAttempt(
 				runtime.opRef,
 				runtime.version,
 				job,
 				{ decision, settledAt: at, ...(output !== runtime.output ? { output } : {}) },
 				admission,
 			);
+
 			if (!settled) return undefined;
 			this.#finishWaiters(runtime.opRef);
 			return settled;
@@ -1316,7 +1431,7 @@ export class WorkLaneManager {
 			if (settled.parent?.kind === "lane" && settled.decision === "no_target")
 				console.error(`lane_report_undeliverable id=${settled.reportId} parent=${settled.parent.name}`);
 			if (settled.decision === "wake_unaccepted") {
-				const child = this.#db.laneReportGet(settled.wakeReportId!)!;
+				const child = this.#db.work.laneReportGet(settled.wakeReportId!)!;
 				const outcome = ["fallback", "undeliverable", "pending"].includes(child.state) ? "refused" : "ambiguous";
 				console.error(
 					`work_report decision=wake_unaccepted reportId=${settled.wakeReportId} childReportId=${child.report_id} outcome=${outcome}`,
@@ -1348,7 +1463,7 @@ export class WorkLaneManager {
 			await drain(settled.sessionKey.slice("work/task/".length));
 			if (result.requeuedParent) await drain(result.requeuedParent);
 		}
-		if (this.#current(observer) && this.#db.workAttemptGet(runtime.opRef)?.settledAt) {
+		if (this.#current(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt) {
 			observer.tail?.setTurnRunning(false);
 			await observer.tail?.close();
 			observer.tail = undefined;
@@ -1362,7 +1477,7 @@ export class WorkLaneManager {
 		await this.#port.runExclusive(workSessionKey(parentName), async () => {
 			if (this.#stopped) return;
 			let job: LaneJobRecord | undefined;
-			let unavailable = this.#db.isBrokerQuarantined("work", laneJobIdentity(parentName).jobId);
+			let unavailable = this.#db.bindings.isQuarantined("work", laneJobIdentity(parentName).jobId);
 			if (!unavailable) {
 				try {
 					job = this.#job(parentName, true);
@@ -1370,7 +1485,7 @@ export class WorkLaneManager {
 					unavailable = true;
 				}
 			}
-			for (let row of this.#db.laneReportsByParent(parentName)) {
+			for (let row of this.#db.work.laneReportsByParent(parentName)) {
 				if (this.#stopped) return;
 				if (["consumed", "fallback", "undeliverable"].includes(row.state)) continue;
 				if (unavailable || !job) {
@@ -1380,7 +1495,11 @@ export class WorkLaneManager {
 				if (row.state === "held") {
 					if (row.claim_kind === "wake") {
 						const runtime = this.#attemptByOpRef(row.claim_ref);
-						if (runtime && hasAcceptanceEvidence(runtime) && this.#db.laneReportConsume(row.report_id, row.claim_ref!))
+						if (
+							runtime &&
+							hasAcceptanceEvidence(runtime) &&
+							this.#reportMutation((tx) => this.#db.work.laneReportConsume(tx, row.report_id, row.claim_ref!))
+						)
 							this.#logLaneReportTransition(row, "held", "consumed", "wake_acceptance_proven");
 					} else if (row.claim_kind === "steer") {
 						await this.#replayLaneSteer(row, job);
@@ -1391,9 +1510,10 @@ export class WorkLaneManager {
 					if (this.#attemptByOpRef(row.claim_ref)) continue;
 					const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
 					if (open) {
-						if (!this.#db.laneReportRequeue(row.report_id, row.claim_ref!)) continue;
+						if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!)))
+							continue;
 						this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_open");
-						row = this.#db.laneReportGet(row.report_id)!;
+						row = this.#db.work.laneReportGet(row.report_id)!;
 					} else {
 						await this.#wakeLaneReport(row, job);
 						try {
@@ -1435,7 +1555,7 @@ export class WorkLaneManager {
 	#attemptByOpRef(opRef: string | null): WorkAttemptRuntime | undefined {
 		if (opRef === null) return undefined;
 		try {
-			return this.#db.workAttemptGet(opRef);
+			return this.#db.work.workAttemptGet(opRef);
 		} catch {
 			return undefined;
 		}
@@ -1470,11 +1590,22 @@ export class WorkLaneManager {
 	#fallbackLaneReport(row: LaneReportRow, reason: string): void {
 		const payload = this.#laneFallbackPayload(row);
 		if (payload === undefined) {
-			if (this.#db.laneReportUndeliverable(row.report_id))
+			if (this.#reportMutation((tx) => this.#db.work.laneReportUndeliverable(tx, row.report_id)))
 				this.#logLaneReportTransition(row, row.state, "undeliverable", reason);
 			return;
 		}
-		if (!this.#db.laneReportFallback(row.report_id, payload)) return;
+		const committed = this.#db.transaction((tx) => {
+			if (!this.#db.work.laneReportFallback(tx, row.report_id, payload)) return false;
+			workAssert(typeof payload.deliveryId === "string");
+			this.#db.outbox.enqueue(tx, {
+				deliveryId: payload.deliveryId,
+				turnId: payload.turnId,
+				originKey: originKey(payload.origin),
+				payloadJson: JSON.stringify(payload),
+			});
+			return true;
+		});
+		if (!committed) return;
 		this.#logLaneReportTransition(row, row.state, "fallback", reason);
 		try {
 			this.#options.deliverFallback?.(payload);
@@ -1491,26 +1622,32 @@ export class WorkLaneManager {
 		if (row.state === "held") {
 			if (row.claim_kind === "wake") {
 				const runtime = this.#attemptByOpRef(row.claim_ref);
-				if (runtime && hasAcceptanceEvidence(runtime) && this.#db.laneReportConsume(row.report_id, row.claim_ref!))
+				if (
+					runtime &&
+					hasAcceptanceEvidence(runtime) &&
+					this.#reportMutation((tx) => this.#db.work.laneReportConsume(tx, row.report_id, row.claim_ref!))
+				)
 					this.#logLaneReportTransition(row, "held", "consumed", "wake_acceptance_proven");
 			}
 			return;
 		}
 		if (row.state !== "claimed") return;
 		if (row.claim_kind === "wake" && !this.#attemptByOpRef(row.claim_ref)) {
-			if (!this.#db.laneReportRequeue(row.report_id, row.claim_ref!)) return;
+			if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!))) return;
 			this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_quarantined");
-			this.#fallbackLaneReport(this.#db.laneReportGet(row.report_id)!, "parent_quarantined");
+			this.#fallbackLaneReport(this.#db.work.laneReportGet(row.report_id)!, "parent_quarantined");
 			return;
 		}
-		if (this.#db.laneReportHold(row.report_id, "parent_quarantined_ambiguous"))
+		if (this.#reportMutation((tx) => this.#db.work.laneReportHold(tx, row.report_id, "parent_quarantined_ambiguous")))
 			this.#logLaneReportTransition(row, "claimed", "held", "parent_quarantined_ambiguous");
 	}
 
 	async #claimAndSteerLaneReport(row: LaneReportRow, job: LaneJobRecord, runtime: WorkAttemptRuntime): Promise<void> {
 		const claimSeq = row.claim_seq + 1;
 		const clientRef = laneSteerClientRef(row.report_id, claimSeq);
-		const claimed = this.#db.laneReportClaim(row.report_id, "steer", clientRef, runtime.opRef);
+		const claimed = this.#reportMutation((tx) =>
+			this.#db.work.laneReportClaim(tx, row.report_id, "steer", clientRef, runtime.opRef),
+		);
 		if (!claimed) return;
 		this.#logLaneReportTransition(row, "pending", "claimed", "steer_claimed");
 		await this.#sendLaneSteer(claimed, job, runtime);
@@ -1519,7 +1656,7 @@ export class WorkLaneManager {
 	async #replayLaneSteer(row: LaneReportRow, job: LaneJobRecord): Promise<void> {
 		const runtime = this.#attemptByOpRef(row.claim_target_op_ref);
 		if (!runtime) {
-			if (this.#db.laneReportHold(row.report_id, "steer_acceptance_uncertain"))
+			if (this.#reportMutation((tx) => this.#db.work.laneReportHold(tx, row.report_id, "steer_acceptance_uncertain")))
 				this.#logLaneReportTransition(row, row.state, "held", "steer_acceptance_uncertain");
 			return;
 		}
@@ -1535,16 +1672,18 @@ export class WorkLaneManager {
 				text: this.#laneReportText(row),
 				clientRef,
 			});
-			if (this.#db.laneReportConsume(row.report_id, clientRef))
+			if (this.#reportMutation((tx) => this.#db.work.laneReportConsume(tx, row.report_id, clientRef)))
 				this.#logLaneReportTransition(row, row.state, "consumed", "steer_accepted");
 		} catch (error) {
 			if (definitiveSteerRefusal(error)) {
 				if (safeRefusal(error) === "session_not_found") {
-					if (this.#db.laneReportHold(row.report_id, "steer_acceptance_uncertain"))
+					if (
+						this.#reportMutation((tx) => this.#db.work.laneReportHold(tx, row.report_id, "steer_acceptance_uncertain"))
+					)
 						this.#logLaneReportTransition(row, row.state, "held", "steer_acceptance_uncertain");
 					return;
 				}
-				if (this.#db.laneReportRequeue(row.report_id, clientRef))
+				if (this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, clientRef)))
 					this.#logLaneReportTransition(row, row.state, "pending", "steer_refused");
 				return;
 			}
@@ -1557,7 +1696,9 @@ export class WorkLaneManager {
 		let opRef = row.claim_ref;
 		if (row.state === "pending") {
 			opRef = laneWakeOpRef(row.parent_name, row.report_id, row.claim_seq + 1);
-			const result = this.#db.laneReportClaim(row.report_id, "wake", opRef, null);
+			const result = this.#reportMutation((tx) =>
+				this.#db.work.laneReportClaim(tx, row.report_id, "wake", opRef!, null),
+			);
 			if (!result) return;
 			claimed = result;
 			this.#logLaneReportTransition(row, "pending", "claimed", "wake_claimed");
@@ -1581,13 +1722,13 @@ export class WorkLaneManager {
 			if (this.#attemptByOpRef(opRef)) return;
 		}
 		if (this.#attemptByOpRef(opRef)) return;
-		const fresh = this.#db.laneReportGet(row.report_id);
+		const fresh = this.#db.work.laneReportGet(row.report_id);
 		if (!fresh || fresh.state !== "claimed") return;
-		if (!this.#db.laneReportRequeue(row.report_id, opRef)) return;
+		if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, opRef))) return;
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
 		if (parentJob && (parentJob.state === "awaiting_operator" || parentJob.state === "stalled"))
-			this.#fallbackLaneReport(this.#db.laneReportGet(row.report_id)!, "parent_held");
+			this.#fallbackLaneReport(this.#db.work.laneReportGet(row.report_id)!, "parent_held");
 	}
 
 	/** Registers recovery work, never waits for a worker's terminal transition. */
@@ -1602,7 +1743,7 @@ export class WorkLaneManager {
 		return recovery;
 	}
 	async #recover(): Promise<void> {
-		for (const row of this.#db.laneJobRows()) {
+		for (const row of this.#db.work.laneJobRows()) {
 			if (this.#stopped) return;
 			if (!row.lane_key.startsWith("work-")) continue;
 			const name = row.lane_key.slice(5);
@@ -1615,13 +1756,13 @@ export class WorkLaneManager {
 					return;
 				}
 				const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
-				if (!job || !open || this.#db.workAttemptGet(open.opRef)) return;
-				this.#db.workAttemptPrepare(
+				if (!job || !open || this.#db.work.workAttemptGet(open.opRef)) return;
+				this.#prepareAttempt(
 					makeRuntime(
 						this.#db,
 						name,
 						open.sessionId,
-						this.#db.getSessionRecord(workSessionKey(name))?.epoch ?? 0,
+						this.#db.bindings.getSessionRecord(workSessionKey(name))?.epoch ?? 0,
 						job.lane.worktreePath,
 						open.startedAt,
 						open.opRef,
@@ -1637,7 +1778,7 @@ export class WorkLaneManager {
 		let after = "";
 		while (!this.#stopped) {
 			let invalidAfter = after;
-			const rows = this.#db.workAttemptOpen(100, after, (error) => {
+			const rows = this.#db.work.workAttemptOpen(100, after, (error, jobId) => {
 				if (error.opRef && error.opRef > invalidAfter) invalidAfter = error.opRef;
 				// Log and quarantine the invalid attempt once, excluding it from future recovery sweeps (issue #407)
 				if (error.opRef && !reportedInvalidAttempts.has(error.opRef)) {
@@ -1646,8 +1787,7 @@ export class WorkLaneManager {
 					);
 					reportedInvalidAttempts.add(error.opRef);
 					// Quarantine the job to exclude it from future recovery iterations
-					const jobId = this.#db.workAttemptJobId(error.opRef);
-					if (jobId) this.#db.workAttemptQuarantineInvalid(jobId);
+					this.#db.transaction((tx) => this.#db.bindings.quarantineInvalidWork(tx, jobId));
 				}
 			});
 			const lastValid = rows.at(-1)?.opRef ?? after;
@@ -1680,7 +1820,7 @@ export class WorkLaneManager {
 				if (!this.#current(observer)) continue;
 				const terminal = status && terminalEvidence(status, this.#at());
 				if (terminal && this.#writeCurrent(observer)) {
-					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+					this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(provesAcceptance(status!)
 							? {
 									sendPhase: "accepted" as const,
@@ -1710,7 +1850,7 @@ export class WorkLaneManager {
 					const hostLost = isSessionUnavailable(statusError) && (live.disowned || live.live === false);
 					if (hostLost)
 						console.error(`work_host_lost opRef=${runtime.opRef} session=${runtime.sessionId} source=recovery`);
-					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
+					this.#updateAttempt(runtime.opRef, runtime.version, {
 						terminal: {
 							kind: "local",
 							observedAt: this.#at(),
@@ -1730,8 +1870,8 @@ export class WorkLaneManager {
 		}
 		if (this.#stopped) return;
 		const parents = new Set([
-			...this.#db.laneReportParentNames(),
-			...this.#db
+			...this.#db.work.laneReportParentNames(),
+			...this.#db.work
 				.laneJobRows(true)
 				.filter((row) => row.lane_key.startsWith("work-"))
 				.map((row) => row.lane_key.slice("work-".length)),
@@ -1764,7 +1904,7 @@ export class WorkLaneManager {
 	#wait(opRef: string, owner: object, signal?: AbortSignal): Promise<void> {
 		this.#live();
 		if (this.#detachedOwners.has(owner)) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
-		if (this.#db.workAttemptGet(opRef)?.settledAt) return Promise.resolve();
+		if (this.#db.work.workAttemptGet(opRef)?.settledAt) return Promise.resolve();
 		return new Promise<void>((resolve, reject) => {
 			const set = this.#waiters.get(opRef) ?? new Set<Waiter>();
 			this.#waiters.set(opRef, set);
@@ -1792,7 +1932,7 @@ export class WorkLaneManager {
 						workError(
 							"work wait timed out; attempt remains observable",
 							"work_wait_timeout",
-							this.#db.workAttemptGet(opRef)!,
+							this.#db.work.workAttemptGet(opRef)!,
 						),
 					),
 				this.#options.waitTimeoutMs ?? 30 * 60_000,
@@ -1913,7 +2053,7 @@ export function laneSystemNotice(input: {
 	].join("\n");
 }
 function makeRuntime(
-	db: GatewayDatabase,
+	db: Store,
 	name: string,
 	sessionId: string,
 	epoch: number,

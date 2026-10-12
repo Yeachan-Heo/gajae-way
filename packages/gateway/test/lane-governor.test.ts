@@ -8,22 +8,22 @@ import {
 	newOpRef,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
-import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
+import { BrokerAuthorityError, Store } from "../src/store";
 import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
 const SESSION_ID = "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0";
-let database: GatewayDatabase;
+let database: Store;
 afterEach(() => {
 	setSystemTime();
 	database?.close();
 });
 
 function bind(name: string, activityAt: number, sessionId = `sess-${name}`): void {
-	database.putSession(`work/task/${name}`, sessionId);
+	database.transaction((tx) => database.bindings.bind(tx, `work/task/${name}`, sessionId));
 	try {
 		setSystemTime(new Date(activityAt));
-		database.updateActivity(`work/task/${name}`, "{}");
+		database.transaction((tx) => database.bindings.touch(tx, `work/task/${name}`, "{}"));
 	} finally {
 		setSystemTime();
 	}
@@ -45,16 +45,16 @@ function persistJob(name: string, state: "done" | "aborted" | "running", open = 
 		});
 	}
 	record = { ...record, state };
-	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
 }
 
 test("activeLanes includes only bound work origins and derives idle time from activity", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 30_000);
 	bind("future", NOW + 1_000);
-	database.putSession("work/task/no-activity", "sess-no-activity");
-	database.putSession("work/task/unbound", "");
-	database.putSession("discord/channel/a", "sess-other");
+	database.transaction((tx) => database.bindings.bind(tx, "work/task/no-activity", "sess-no-activity"));
+	database.transaction((tx) => database.bindings.bind(tx, "work/task/unbound", ""));
+	database.transaction((tx) => database.bindings.bind(tx, "discord/channel/a", "sess-other"));
 	const governor = new LaneGovernor({ database, sessionPort: new ScriptedSessionPort(), now: () => NOW });
 	const lanes = governor.activeLanes();
 	expect(lanes.map((lane) => lane.name).sort()).toEqual(["a", "future", "no-activity"]);
@@ -72,7 +72,7 @@ test("activeLanes includes only bound work origins and derives idle time from ac
 });
 
 test("admission admits existing lanes at capacity and reports new-name candidates idlest first", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	const governor = new LaneGovernor({ database, sessionPort: new ScriptedSessionPort(), maxLanes: 2, now: () => NOW });
 	bind("fresh", NOW - 1_000);
 	expect(() => governor.assertAdmission("old")).not.toThrow();
@@ -99,10 +99,10 @@ test("admission admits existing lanes at capacity and reports new-name candidate
 });
 
 test("retire closes the session in its job repo, clears the binding, bumps epoch, and logs", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW);
 	persistJob("a", "done");
-	const before = database.getSessionRecord("work/task/a");
+	const before = database.bindings.getSessionRecord("work/task/a");
 	const port = new ScriptedSessionPort();
 	const logs: string[] = [];
 	const governor = new LaneGovernor({ database, sessionPort: port, now: () => NOW, log: (line) => logs.push(line) });
@@ -113,16 +113,16 @@ test("retire closes the session in its job repo, clears the binding, bumps epoch
 		closed: true,
 	});
 	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
-	expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=true");
 });
 
 test("retire refuses unknown names and open attempts without closing or changing epochs", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("busy", NOW - 120_000, SESSION_ID);
 	persistJob("busy", "running", true);
-	const before = database.getSessionRecord("work/task/busy");
+	const before = database.bindings.getSessionRecord("work/task/busy");
 	const port = new ScriptedSessionPort();
 	const governor = new LaneGovernor({ database, sessionPort: port, now: () => NOW });
 	expect(await governor.retire("missing", "operator")).toMatchObject({
@@ -135,14 +135,14 @@ test("retire refuses unknown names and open attempts without closing or changing
 		reason: expect.stringContaining("attempt still open"),
 	});
 	expect(port.closes).toEqual([]);
-	expect(database.getSessionRecord("work/task/busy")).toEqual(before);
-	expect(database.getSessionRecord("work/task/missing")).toBeUndefined();
+	expect(database.bindings.getSessionRecord("work/task/busy")).toEqual(before);
+	expect(database.bindings.getSessionRecord("work/task/missing")).toBeUndefined();
 });
 
 test("a failed close keeps the lane bound unless the broker proves the session gone", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW);
-	const before = database.getSessionRecord("work/task/a");
+	const before = database.bindings.getSessionRecord("work/task/a");
 	class FailingClosePort extends ScriptedSessionPort {
 		override async close(input: { sessionId: string; repo: string }): Promise<void> {
 			this.closes.push(input);
@@ -157,7 +157,7 @@ test("a failed close keeps the lane bound unless the broker proves the session g
 	const retained = await governor.retire("a", "operator");
 	expect(retained.retired).toBe(false);
 	expect(retained.retired === false && retained.reason).toMatch(/not proven gone/);
-	expect(database.getSessionRecord("work/task/a")).toEqual(before);
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual(before);
 	expect(governor.activeLanes().map((lane) => lane.name)).toEqual(["a"]);
 	expect(logs.some((line) => line.startsWith("lane_close_failed name=a") && line.endsWith("action=retained"))).toBe(
 		true,
@@ -172,16 +172,16 @@ test("a failed close keeps the lane bound unless the broker proves the session g
 		closed: false,
 	});
 	expect(port.closes).toHaveLength(2);
-	expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=false");
 });
 
 test("a corrupt lane-job record fails closed: counted, never retired", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000);
 	const identity = laneJobIdentity("a");
-	database.putLaneJob({
+	database.transaction((tx) => database.work.putLaneJob(tx, {
 		jobId: identity.jobId,
 		laneKey: identity.laneKey,
 		state: "running",
@@ -189,7 +189,7 @@ test("a corrupt lane-job record fails closed: counted, never retired", async () 
 		updatedAt: new Date(NOW).toISOString(),
 		lane: { branch: "work/a", worktreePath: "/tmp/worker-repo" },
 		json: "{not json",
-	});
+	}));
 	const port = new ScriptedSessionPort();
 	// Set session as live to prevent sweep second pass from releasing it
 	port.setSessionState("sess-a", { live: true });
@@ -202,11 +202,11 @@ test("a corrupt lane-job record fails closed: counted, never retired", async () 
 	expect(outcome.retired === false && outcome.reason).toMatch(/corrupt/);
 	expect(await governor.sweep()).toBe(0);
 	expect(port.closes).toEqual([]);
-	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("sess-a");
+	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).toBe("sess-a");
 });
 
 test("an attempt the ledger ended without broker proof is retired only once the broker reports it terminal", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000, SESSION_ID);
 	const identity = laneJobIdentity("a");
 	const opRef = newOpRef("governor-reaped");
@@ -224,7 +224,7 @@ test("an attempt the ledger ended without broker proof is retired only once the 
 		errorCode: "gateway_turn_reaped",
 		endedAt: new Date(NOW - 120_000).toISOString(),
 	});
-	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
 	const port = new ScriptedSessionPort();
 	port.setSessionState(SESSION_ID, { live: true, repo: "/tmp/worker-repo" });
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => NOW });
@@ -240,7 +240,7 @@ test("an attempt the ledger ended without broker proof is retired only once the 
 });
 
 test("sweep leaves a lane alone when it was rebound between nomination and the lock", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000, "sess-old");
 	const port = new ScriptedSessionPort();
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => NOW });
@@ -249,11 +249,11 @@ test("sweep leaves a lane alone when it was rebound between nomination and the l
 	expect(outcome.retired).toBe(false);
 	expect(outcome.retired === false && outcome.reason).toMatch(/rebound/);
 	expect(port.closes).toEqual([]);
-	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("sess-old");
+	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).toBe("sess-old");
 });
 
 test("sweep retires idle and terminal jobs but preserves fresh lanes and open attempts", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("idle", NOW - 60_001);
 	bind("boundary", NOW - 60_000);
 	bind("fresh", NOW - 59_999);
@@ -291,7 +291,7 @@ test("sweep retires idle and terminal jobs but preserves fresh lanes and open at
 });
 
 test("a ledger `failed` attempt is local evidence only: retirement waits for broker terminality", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000, SESSION_ID);
 	const identity = laneJobIdentity("a");
 	const opRef = newOpRef("governor-failed");
@@ -305,7 +305,7 @@ test("a ledger `failed` attempt is local evidence only: retirement waits for bro
 	// The gateway recorded `failed` because its status poll threw after an
 	// accepted send; the broker operation itself may still be running.
 	record = closeAttempt({ record, opRef, endState: "failed", endedAt: new Date(NOW - 120_000).toISOString() });
-	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
 	class InFlightPort extends ScriptedSessionPort {
 		override async status(input: { sessionId: string; repo: string; opRef: string }) {
 			return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
@@ -322,10 +322,10 @@ test("a ledger `failed` attempt is local evidence only: retirement waits for bro
 });
 
 test("an existing lane-job row with an empty body is corrupt, not absent", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000);
 	const identity = laneJobIdentity("a");
-	database.putLaneJob({
+	database.transaction((tx) => database.work.putLaneJob(tx, {
 		jobId: identity.jobId,
 		laneKey: identity.laneKey,
 		state: "running",
@@ -333,7 +333,7 @@ test("an existing lane-job row with an empty body is corrupt, not absent", async
 		updatedAt: new Date(NOW).toISOString(),
 		lane: { branch: "work/a", worktreePath: "/tmp/worker-repo" },
 		json: "",
-	});
+	}));
 	const port = new ScriptedSessionPort();
 	// Set session as live to prevent sweep second pass from releasing it
 	port.setSessionState("sess-a", { live: true });
@@ -345,7 +345,7 @@ test("an existing lane-job row with an empty body is corrupt, not absent", async
 });
 
 test("sweep leaves a lane alone when it was reused on the same session between nomination and the lock", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000, "sess-a");
 	const port = new ScriptedSessionPort();
 	// Set session as live to prevent sweep second pass from releasing it
@@ -361,27 +361,27 @@ test("sweep leaves a lane alone when it was reused on the same session between n
 	const holder = port.runExclusive("work/task/a", async () => {
 		await gate;
 		clock = NOW + 1_000;
-		database.updateActivity("work/task/a", "{}");
+		database.transaction((tx) => database.bindings.touch(tx, "work/task/a", "{}"));
 	});
 	const sweeping = governor.sweep(NOW);
 	release();
 	await holder;
 	expect(await sweeping).toBe(0);
 	expect(port.closes).toEqual([]);
-	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("sess-a");
+	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).toBe("sess-a");
 });
 
 test("quarantined historical names refuse admission and retirement before recovery or SDK controls", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("old", NOW, SESSION_ID);
 	persistJob("old", "running", true);
-	const history = database.laneJobJson(laneJobIdentity("old").jobId);
-	database.cutoverBrokerAuthority({
+	const history = database.work.laneJobJson(laneJobIdentity("old").jobId);
+	database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
 		expectedAuthority: null,
 		targetAuthority: { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" },
 		evidence: "test operator quarantined old work",
 		disposition: "quarantine",
-	});
+	}));
 	const port = new ScriptedSessionPort();
 	let recoveryCalls = 0;
 	let lockCalls = 0;
@@ -414,15 +414,15 @@ test("quarantined historical names refuse admission and retirement before recove
 	expect(recoveryCalls).toBe(0);
 	expect(lockCalls).toBe(0);
 	expect(port.closes).toEqual([]);
-	expect(database.laneJobJson(laneJobIdentity("old").jobId)).toBe(history);
+	expect(database.work.laneJobJson(laneJobIdentity("old").jobId)).toBe(history);
 	expect(() => governor.assertAdmission("fresh")).not.toThrow();
 });
 
 test("#340: broker mode - lane with no job record must use binding repo from workLaneRepoBySessionId", async () => {
 	// Broker mode setup
 	const AUTHORITY = { canonicalAgentDir: "/broker/agent", identity: "test-broker" };
-	database = await GatewayDatabase.open(":memory:");
-	database.assertBrokerAuthority(AUTHORITY, { initializeEmpty: true });
+	database = await Store.open(":memory:");
+	database.transaction((tx) => database.bindings.initializeAuthority(tx, AUTHORITY, database.inspectBrokerAuthority().populated));
 
 	// Lane A: no job record in broker mode - CRITICAL #340 case
 	const LANE_A_REPO = "/binding/repo/a";
@@ -434,7 +434,7 @@ test("#340: broker mode - lane with no job record must use binding repo from wor
 		repo: LANE_A_REPO,
 		authority: AUTHORITY,
 	};
-	database.recordOwnedBinding(bindingA);
+	database.transaction((tx) => database.bindings.recordOwnedBinding(tx, bindingA));
 
 	// Lane B: with job record in broker mode
 	const LANE_B_REPO = "/binding/repo/b";
@@ -446,12 +446,12 @@ test("#340: broker mode - lane with no job record must use binding repo from wor
 		repo: LANE_B_REPO,
 		authority: AUTHORITY,
 	};
-	database.recordOwnedBinding(bindingB);
+	database.transaction((tx) => database.bindings.recordOwnedBinding(tx, bindingB));
 
 	// Add activity to both (update sessions created by recordOwnedBinding)
 	setSystemTime(new Date(NOW - 70_000));
-	database.updateActivity("work/task/a", "{}");
-	database.updateActivity("work/task/b", "{}");
+	database.transaction((tx) => database.bindings.touch(tx, "work/task/a", "{}"));
+	database.transaction((tx) => database.bindings.touch(tx, "work/task/b", "{}"));
 	setSystemTime();
 
 	// Add job record for lane B ONLY (lane A has NO job - the critical #340 case)
@@ -463,7 +463,7 @@ test("#340: broker mode - lane with no job record must use binding repo from wor
 		now: () => new Date(NOW),
 	});
 	recB = { ...recB, state: "done" };
-	database.putLaneJob({ ...recB, laneKey: idB.laneKey, json: JSON.stringify(recB) });
+	database.transaction((tx) => database.work.putLaneJob(tx, { ...recB, laneKey: idB.laneKey, json: JSON.stringify(recB) }));
 
 	// Port that enforces broker authority: throws if close() repo doesn't match binding
 	class BrokerEnforcingPort extends ScriptedSessionPort {
@@ -512,7 +512,7 @@ test("#340: broker mode - lane with no job record must use binding repo from wor
 });
 
 test("#340: per-lane error handling continues sweep for remaining lanes", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 
 	// Lane A: will fail during lock
 	bind("a", NOW - 70_000);
@@ -550,16 +550,16 @@ test("#340: per-lane error handling continues sweep for remaining lanes", async 
 	expect(port.closes[0].sessionId).toBe("sess-b");
 
 	// A stays bound because lock failed and session is live
-	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
 	// B is retired
-	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+	expect(database.bindings.getSessionRecord("work/task/b")?.sessionId).toBe("");
 
 	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
 
 test("#340: per-lane error handling continues sweep when retire() throws", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 
 	// Lane A: will fail during lock acquisition
 	bind("a", NOW - 70_000);
@@ -595,16 +595,16 @@ test("#340: per-lane error handling continues sweep when retire() throws", async
 	expect(port.closes[0].sessionId).toBe("sess-b");
 
 	// A stays bound (lock failed, live session)
-	expect(database.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
+	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).not.toBe("");
 	// B is retired
-	expect(database.getSessionRecord("work/task/b")?.sessionId).toBe("");
+	expect(database.bindings.getSessionRecord("work/task/b")?.sessionId).toBe("");
 
 	expect(logs.some((line) => line.includes("lane_retire_failed name=a"))).toBe(true);
 	expect(logs.some((line) => line.includes("lane_retired name=b"))).toBe(true);
 });
 
 test("#360: session_unavailable status error is treated like unknown: settled when session dead/disowned", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000, SESSION_ID);
 	const identity = laneJobIdentity("a");
 	const opRef = newOpRef("governor-session-unavail");
@@ -622,7 +622,7 @@ test("#360: session_unavailable status error is treated like unknown: settled wh
 		errorCode: "gateway_turn_reaped",
 		endedAt: new Date(NOW - 120_000).toISOString(),
 	});
-	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
 
 	class SessionUnavailablePort extends ScriptedSessionPort {
 		override async status(): Promise<any> {
@@ -648,7 +648,7 @@ test("#360: session_unavailable status error is treated like unknown: settled wh
 });
 
 test("#360: session_unavailable with live session does not settle", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000, SESSION_ID);
 	const identity = laneJobIdentity("a");
 	const opRef = newOpRef("governor-session-unavail-live");
@@ -666,7 +666,7 @@ test("#360: session_unavailable with live session does not settle", async () => 
 		errorCode: "gateway_turn_reaped",
 		endedAt: new Date(NOW - 120_000).toISOString(),
 	});
-	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
 
 	class SessionUnavailablePort2 extends ScriptedSessionPort {
 		override async status(): Promise<any> {
@@ -692,7 +692,7 @@ test("#360: session_unavailable with live session does not settle", async () => 
 });
 
 test("#360: forceRetire refuses live sessions but closes dead ones", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("live", NOW, "sess-live");
 	persistJob("live", "running", false);
 	bind("dead", NOW, "sess-dead");
@@ -728,7 +728,7 @@ test("#360: forceRetire refuses live sessions but closes dead ones", async () =>
 });
 
 test("forceRetire catches and logs recovery-gate rejection instead of leaking a rejected promise", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 	bind("dead", NOW, "sess-dead");
 	const logs: string[] = [];
 	const governor = new LaneGovernor({
@@ -749,7 +749,7 @@ test("forceRetire catches and logs recovery-gate rejection instead of leaking a 
 });
 
 test("#360: sweep releases dead lanes and quarantined lanes don't count toward capacity", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 
 	// Lane 1: dead session
 	bind("dead-lane", NOW - 120_000, "sess-dead");
@@ -794,7 +794,7 @@ test("#360: sweep releases dead lanes and quarantined lanes don't count toward c
 });
 
 test("#360: retireAllDead retires only dead lanes, skipping live and quarantined", async () => {
-	database = await GatewayDatabase.open(":memory:");
+	database = await Store.open(":memory:");
 
 	// Lane 1: dead
 	bind("dead1", NOW - 120_000, "sess-dead1");

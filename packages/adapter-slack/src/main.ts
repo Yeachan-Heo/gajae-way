@@ -1,3 +1,5 @@
+import { acquireLease, exitOnLeaseHeld, LeaseHeldError, type Lease } from "@gajae-gateway/home";
+
 import { join } from "node:path";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import type {
@@ -16,7 +18,7 @@ import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
 import { LiveReplyTracker } from "./live-reply";
-import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
+
 import { type MentionDirectory, repairMentions } from "./mentions";
 import { chunkSlackMessage, markdownToMrkdwn } from "./mrkdwn";
 import {
@@ -542,10 +544,25 @@ export class ReconnectingGateway implements GatewayClientLike {
 	}
 
 	async connect(): Promise<void> {
+		await this.#connect(false);
+	}
+
+	async connectInitial(): Promise<void> {
+		await this.#connect(true);
+	}
+
+	async #connect(initial: boolean): Promise<void> {
 		if (this.#stopped) return;
 		const generation = ++this.#connectionGeneration;
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-slack" });
+			const options = {
+				clientName: "adapter-slack",
+				onRetry: (attempt: number, delayMs: number, error: unknown) =>
+					console.warn(`gateway_socket_waiting client=adapter-slack path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${errorText(error)}`),
+			};
+			const client = initial
+				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
+				: await GajaewayClient.connectSocket(this.socketPath, options);
 			if (generation !== this.#connectionGeneration || this.#stopped) {
 				await client.close();
 				return;
@@ -556,6 +573,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 			if (generation === this.#connectionGeneration && !this.#stopped) this.scheduleReconnect();
 		}
 	}
+
 
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		const client = this.#client;
@@ -767,6 +785,8 @@ export async function startSlackAdapter(
 		log?: Pick<Console, "log" | "error">;
 		recoveryCursorPath?: string;
 		now?: () => number;
+		connectGateway?: (gateway: ReconnectingGateway) => Promise<void>;
+
 	} = {},
 ): Promise<{
 	readonly socket: SlackSocketMode;
@@ -1215,7 +1235,7 @@ export async function startSlackAdapter(
 	};
 	gateway.onConnected = () => reconnected("gateway");
 	gateway.onDisconnected = () => noteDisconnected("gateway");
-	await gateway.connect();
+	await (ports.connectGateway ?? ((current) => current.connectInitial()))(gateway);
 	const socket = new SlackSocketMode(
 		() => api.connectionsOpen(config.appToken),
 		{
@@ -1254,6 +1274,25 @@ function timestamp(ts: string): string {
 }
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+export async function runSlackAdapterWithLease<T>(
+	home: string,
+	start: (lease: Lease) => Promise<T>,
+): Promise<T> {
+	let lease: Lease;
+	try {
+		lease = await acquireLease(home, "adapter-slack");
+		console.info(`lease_acquired name=adapter-slack pid=${process.pid}`);
+	} catch (error) {
+		if (!(error instanceof LeaseHeldError)) console.error(`lease_failed name=adapter-slack detail=${errorText(error)}`);
+		throw error;
+	}
+	try {
+		return await start(lease);
+	} finally {
+		await lease.release();
+	}
 }
 
 export const SLACK_USAGE = [
@@ -1299,7 +1338,7 @@ export type SlackArgv =
 	| { readonly kind: "version" }
 	| { readonly kind: "usage"; readonly message: string };
 
-/** Resolve before taking a lock or opening either connection. */
+/** Resolve before taking a lease or opening either connection. */
 export function parseSlackArgs(args: readonly string[]): SlackArgv {
 	if (args.length === 0) return { kind: "run" };
 	if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { kind: "help" };
@@ -1316,23 +1355,29 @@ if (import.meta.main) {
 		process.exit(USAGE_EXIT_CODE);
 	} else {
 		const disposeLogging = installStructuredLogging({ path: join(adapterHome(), "adapter-slack.log") });
-		// Refuse a second instance before config or connections can affect the resident one.
-		AdapterLock.acquire(adapterHome())
-			.then(async (lock) => {
-				// Signal handlers suppress default termination, so release and exit explicitly.
-				const release = (): void =>
-					void lock.release().finally(() => {
+		void runSlackAdapterWithLease(adapterHome(), async (lease) => {
+			const shutdown = (): void => {
+				void lease.release().then(
+					() => {
 						disposeLogging();
 						process.exit(0);
-					});
-				process.once("SIGINT", release);
-				process.once("SIGTERM", release);
-				await startSlackAdapter(await loadSlackAdapterConfig());
-			})
-			.catch((error) => {
-				console.error(`Slack adapter startup failed: ${errorText(error)}`);
-				disposeLogging();
-				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
-			});
+					},
+					(error) => {
+						console.error(`Slack adapter lease release failed: ${errorText(error)}`);
+						disposeLogging();
+						process.exit(1);
+					},
+				);
+			};
+			process.once("SIGINT", shutdown);
+			process.once("SIGTERM", shutdown);
+			await startSlackAdapter(await loadSlackAdapterConfig());
+			await new Promise<void>(() => {});
+		}).catch((error) => {
+			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
+			console.error(`Slack adapter startup failed: ${errorText(error)}`);
+			disposeLogging();
+			process.exitCode = 1;
+		});
 	}
 }

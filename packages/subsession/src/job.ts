@@ -51,8 +51,13 @@ export class LaneJobError extends Error {
 	}
 }
 
-/** Wire/storage version of the persisted LaneJobRecord. */
+/**
+ * Wire/storage version of the persisted LaneJobRecord. Version 2 added the
+ * optional `lane.repository`; a version-1 record is a valid version-2 record
+ * without it, so both parse and every record is written back as version 2.
+ */
 export const LANE_JOB_SCHEMA_VERSION = 2 as const;
+const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, LANE_JOB_SCHEMA_VERSION];
 
 /** Issue #9's exact evidence vocabulary. No synonyms. */
 export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress_uncommitted" | "no_work_produced";
@@ -221,7 +226,7 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		throw new LaneJobError("lane job state must be a JSON object");
 	}
 	const record = value as Record<string, unknown>;
-	if (record.schemaVersion !== LANE_JOB_SCHEMA_VERSION) {
+	if (!READABLE_LANE_JOB_SCHEMA_VERSIONS.includes(record.schemaVersion)) {
 		throw new LaneJobError(
 			`unknown lane job schemaVersion ${JSON.stringify(record.schemaVersion)}; refusing to guess across versions`,
 		);

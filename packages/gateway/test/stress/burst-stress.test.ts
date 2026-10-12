@@ -6,8 +6,7 @@ import { DeliveryService } from "../../src/delivery/delivery";
 import { MemoryClosureQueue } from "../../src/memory/closure";
 import { MonitorPropagator } from "../../src/monitors/propagate";
 import { MonitorRegistry } from "../../src/monitors/registry";
-import { GatewayDatabase } from "../../src/store/db";
-import { DeliveryLedger } from "../../src/store/ledger";
+import { Store } from "../../src/store";
 import { sessionPortFromScript } from "../session-port.fake";
 
 const stress = process.env.GAJAEWAY_STRESS === "1";
@@ -19,7 +18,7 @@ if (!stress) {
 		const started = performance.now();
 		const directory = await mkdtemp(join(tmpdir(), "gajaeway-burst-stress-"));
 		try {
-			const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+			const database = await Store.open(join(directory, "gateway.db"));
 			const registry = new MonitorRegistry(database);
 			const monitor = registry.add({
 				name: "contractual-burst",
@@ -45,7 +44,7 @@ if (!stress) {
 					},
 				}),
 				memory,
-				delivery: new DeliveryService(new DeliveryLedger(database)),
+				delivery: new DeliveryService(database),
 				emit: () => {},
 			});
 
@@ -56,14 +55,14 @@ if (!stress) {
 			}
 			for (
 				let attempt = 0;
-				attempt < 600 && database.monitorEventRows().filter((event) => event.stage === "authored").length !== 200;
+				attempt < 600 && database.monitors.eventRows().filter((event) => event.stage === "authored").length !== 200;
 				attempt++
 			)
 				await Bun.sleep(100);
 			await memory.drain();
-			const monitorEvents = database.monitorEventRows().length;
+			const monitorEvents = database.monitors.eventRows().length;
 			const receipted = database
-				.memoryIntentRows()
+				.memory.rows()
 				.filter((intent) => intent.kind === "monitor-event" && intent.state === "receipted").length;
 			const elapsedMs = Math.round(performance.now() - started);
 			console.log(JSON.stringify({ stress: "burst", monitorEvents, receipted, turns, elapsedMs }));

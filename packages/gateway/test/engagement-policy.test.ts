@@ -5,6 +5,7 @@ import { decideEngagement } from "../src/engagement/policy";
 const config: GatewayConfig = {
 	schemaVersion: 1,
 	home: "/tmp/home",
+	gjc: { agentDir: "/tmp/home/agent" },
 	configPath: "/tmp/home/config.json",
 	socketPath: "/tmp/home/gateway.sock",
 	dbPath: "/tmp/home/gateway.db",

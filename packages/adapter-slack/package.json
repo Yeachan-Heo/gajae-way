@@ -11,6 +11,7 @@
 		"test": "bun test"
 	},
 	"dependencies": {
+		"@gajae-gateway/home": "workspace:*",
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
 		"@gajae-gateway/sdk": "workspace:*"

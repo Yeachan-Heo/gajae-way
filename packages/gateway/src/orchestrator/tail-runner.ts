@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
 import type { SessionRelayStream } from "./broker";
 import { isSessionGoneCode } from "./gjc-contract";
-import { sanitizeDiagnostic } from "./rebind";
+import { runtimeErrorOfLine, sanitizeDiagnostic } from "./rebind";
 
 /**
  * Relay-owned session transport.
@@ -660,6 +660,20 @@ class ManagedTailHandle implements TailHandle {
 	#receiveLine(line: string): void {
 		const trimmed = line.trim();
 		if (!trimmed) return;
+		// gjc >= 0.18 renders the serve refusal in text mode as
+		// `ERROR {"code":"broker_unavailable",…}` on stderr, then exits.
+		const rendered = trimmed.startsWith("ERROR {") ? runtimeErrorOfLine(trimmed) : undefined;
+		if (rendered) {
+			if (!this.#connectionId && !this.#refusal) {
+				this.#refusal = new RelayRefusedError(
+					this.sessionId,
+					sanitizeDiagnostic(rendered.code ?? "") || "relay_refused",
+					rendered.message ? sanitizeDiagnostic(rendered.message).slice(0, 200) : undefined,
+				);
+				this.#helloResolve?.();
+			}
+			return;
+		}
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(trimmed);

@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 afterEach(async () => {
 	await server?.stop();
 	server = undefined;
@@ -23,7 +23,7 @@ async function startWithMonitor(): Promise<{
 	send: (value: unknown) => void;
 	frames: Array<Record<string, unknown>>;
 	close: () => void;
-	db: GatewayDatabase;
+	db: Store;
 	monitorId: string;
 	batchId: string;
 	eventIds: [string, string];
@@ -33,12 +33,13 @@ async function startWithMonitor(): Promise<{
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 	};
-	const db = await GatewayDatabase.open(config.dbPath);
+	const db = await Store.open(config.dbPath);
 	database = db;
 	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
 	server = await startUnixServer({ config, database: db, sessionPort, onStop: () => db.close() });
@@ -55,21 +56,22 @@ async function startWithMonitor(): Promise<{
 	});
 	const batchId = crypto.randomUUID();
 	const eventIds: [string, string] = [crypto.randomUUID(), crypto.randomUUID()];
-	for (const eventId of eventIds) {
-		db.monitorEventCreate({
-			eventId,
-			monitorId: monitor.monitorId,
-			eventType: "memory.canonicalize",
-			payloadJson: "{}",
-			firedAt: new Date().toISOString(),
-		});
-		db.monitorEventUpdate(eventId, "authored", batchId);
-	}
+	db.transaction((tx) => {
+		for (const eventId of eventIds) {
+			db.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "memory.canonicalize",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			db.monitors.eventUpdate(tx, eventId, "authored", batchId);
+		}
+	});
 	// A prepared ledger delivery whose turn_id is the monitor batch id — exactly
 	// what the real dispatch path produces.
 	const { DeliveryService } = await import("../src/delivery/delivery");
-	const { DeliveryLedger } = await import("../src/store/ledger");
-	const delivery = new DeliveryService(new DeliveryLedger(db));
+	const delivery = new DeliveryService(db);
 	const payload = delivery.prepare(
 		batchId,
 		{ platform: "loopback", kind: "loopback", conversationId: "loopback" },
@@ -122,7 +124,7 @@ test("delivery.confirm on a monitor batch advances authored events to delivered 
 	});
 	const res = await response(ctx.frames, "confirm");
 	expect(res.result).toEqual({ settled: true });
-	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
+	const stages = ctx.db.monitors.eventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	// The REAL handler settled both events — not a manual DB update.
 	expect(stages.map((row) => row.stage)).toEqual(["delivered", "delivered"]);
 	const deliveredEvents = ctx.frames
@@ -153,7 +155,7 @@ test("late delivery.fail cannot regress a delivered monitor event (server protoc
 		params: { deliveryId: ctx.deliveryId, reason: "adapter flake", ambiguous: true },
 	});
 	await response(ctx.frames, "fail");
-	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
+	const stages = ctx.db.monitors.eventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	// Monotonic: delivered stays delivered.
 	expect(stages.map((row) => row.stage)).toEqual(["delivered", "delivered"]);
 });
@@ -165,7 +167,7 @@ test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", asyn
 	await response(ctx.frames, "c1");
 	expect(
 		ctx.db
-			.monitorEventRows()
+		.monitors.eventRows()
 			.filter((row) => ctx.eventIds.includes(row.event_id))
 			.map((row) => row.stage),
 	).toEqual(["delivered", "delivered"]);
@@ -175,7 +177,7 @@ test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", asyn
 	expect(dup.result).toEqual({ settled: true });
 	expect(
 		ctx.db
-			.monitorEventRows()
+		.monitors.eventRows()
 			.filter((row) => ctx.eventIds.includes(row.event_id))
 			.map((row) => row.stage),
 	).toEqual(["delivered", "delivered"]);
@@ -192,10 +194,10 @@ test("delivery.fail before confirmation keeps authored events authored (server p
 		params: { deliveryId: ctx.deliveryId, reason: "adapter down", ambiguous: false },
 	});
 	await response(ctx.frames, "fail");
-	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
+	const stages = ctx.db.monitors.eventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	// Distinguishable, not delivered, not silently dropped.
 	expect(stages.map((row) => row.stage)).toEqual(["authored", "authored"]);
-	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("pending");
+	expect(ctx.db.outbox.rows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("pending");
 });
 
 test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the ledger row", async () => {
@@ -209,7 +211,7 @@ test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the led
 		params: { deliveryId: ctx.deliveryId },
 	});
 	await response(ctx.frames, "confirm");
-	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("confirmed");
+	expect(ctx.db.outbox.rows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("confirmed");
 	// Adapter retries a stale failure AFTER the confirm landed:
 	ctx.send({
 		v: "0.1",
@@ -221,7 +223,7 @@ test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the led
 	const lateFail = await response(ctx.frames, "late-fail");
 	// Terminal duplicate gets an idempotent SUCCESS ack (not invalid_params)...
 	expect(lateFail.result).toEqual({ recorded: true });
-	const row = ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId);
+	const row = ctx.db.outbox.rows().find((row) => row.delivery_id === ctx.deliveryId);
 	// ...while the terminal confirmed state is never rewritten.
 	expect(row?.state).toBe("confirmed");
 	// And the monitor events stay delivered (already covered by the other test).
@@ -241,7 +243,7 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 		});
 		await response(ctx.frames, id);
 	}
-	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
+	expect(ctx.db.outbox.rows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
 	// A late confirm cannot resurrect an expired delivery:
 	ctx.send({
 		v: "0.1",
@@ -253,13 +255,13 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	const lateConfirm = await response(ctx.frames, "late-confirm");
 	// Expired is terminal: idempotent success ack, state unchanged.
 	expect(lateConfirm.result).toEqual({ settled: true });
-	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
+	expect(ctx.db.outbox.rows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
 	// Round-4 blocker 3: the late confirm on an EXPIRED delivery must NOT settle
 	// the batch's monitor events to delivered — expiry already failed them
 	// terminally with delivery evidence (#94).
-	const stagesAfter = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
+	const stagesAfter = ctx.db.monitors.eventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	expect(stagesAfter.map((row) => row.stage)).toEqual(["failed_no_retry", "failed_no_retry"]);
-	for (const eventId of ctx.eventIds) expect(ctx.db.monitorFailure(eventId)?.code).toBe("delivery_expired");
+	for (const eventId of ctx.eventIds) expect(ctx.db.monitors.failure(eventId)?.code).toBe("delivery_expired");
 	// An UNKNOWN delivery id is still invalid_params (an error frame):
 	ctx.send({ v: "0.1", type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
 	for (let attempt = 0; attempt < 400; attempt++) {

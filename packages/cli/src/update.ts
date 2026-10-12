@@ -3,7 +3,6 @@ import {
 	copyFile,
 	mkdir,
 	mkdtemp,
-	open,
 	readdir,
 	readFile,
 	realpath,
@@ -12,6 +11,16 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
+import { homeLayout, LeaseHeldError, acquireLease, type Lease } from "@gajae-gateway/home";
+import { installPinnedGjc, type GjcInstallRunner } from "./gjc-install";
+import {
+	installServices,
+	serviceSpecs,
+	systemdUnitName,
+	type InstallServicesOptions,
+	type ServicePlatform,
+} from "./services";
+
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import pkg from "../package.json";
@@ -127,7 +136,7 @@ const MIN_BINARY_BYTES = 1_048_576;
 const MAX_ASSET_BYTES = 512 * 1024 * 1024;
 
 const RELEASE_MARKER = ".gajaeway-release";
-const LOCK_FILE = ".gajaeway-update.lock";
+
 
 export function releaseMarkerPath(binDir: string): string {
 	return join(binDir, RELEASE_MARKER);
@@ -168,6 +177,7 @@ export interface UpdateResult {
 	readonly installed: readonly string[];
 	readonly backupDir?: string;
 	readonly restartQueued?: string;
+	readonly brokerNotEnabled?: boolean;
 	readonly restartSkipped?: boolean;
 }
 
@@ -191,6 +201,7 @@ export function renderUpdate(result: UpdateResult): string[] {
 	if (result.restartQueued !== undefined)
 		lines.push(`restart: queued ${result.restartQueued} — check with: gajaeway ops restart-stack --status`);
 	else if (result.restartSkipped) lines.push("restart: skipped (--no-restart)");
+	if (result.brokerNotEnabled) lines.push("broker unit installed, not enabled: run gajaeway setup --broker-agent");
 	return lines;
 }
 
@@ -202,7 +213,13 @@ export interface RestartQueueReceipt {
 export type ReleaseFetcher = (repo: string) => Promise<ReleaseInfo>;
 export type AssetDownloader = (asset: ReleaseAsset) => Promise<Uint8Array>;
 export type TarballExtractor = (tarball: Uint8Array, intoDir: string) => Promise<void>;
-export type RestartQueuer = (home: string) => Promise<RestartQueueReceipt>;
+export type RestartQueuer = (home: string, binDir: string, trigger: "update") => Promise<RestartQueueReceipt>;
+export type UpdateCommandRunner = (command: readonly string[]) => Promise<number>;
+
+type UpdateServiceOptions = Pick<
+	InstallServicesOptions,
+	"launchAgentsDir" | "unitDir" | "loginPathRunner" | "writeFile"
+>;
 
 export interface UpdateDeps {
 	readonly fetchLatestRelease?: ReleaseFetcher;
@@ -214,6 +231,9 @@ export interface UpdateDeps {
 	readonly env?: NodeJS.ProcessEnv;
 	readonly execPath?: string;
 	readonly now?: () => number;
+	readonly gjcInstallRunner?: GjcInstallRunner;
+	readonly serviceRunner?: UpdateCommandRunner;
+	readonly serviceOptions?: UpdateServiceOptions;
 }
 
 export interface RunUpdateOptions {
@@ -222,6 +242,75 @@ export interface RunUpdateOptions {
 	readonly deps?: UpdateDeps;
 }
 
+async function readPinnedGjcVersion(path: string): Promise<string> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await readFile(path, "utf8"));
+	} catch (error) {
+		throw new Error(`could not read pinned gjc version from ${path}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		throw new Error(`invalid release package metadata at ${path}`);
+	const gjc = (parsed as { gjc?: unknown }).gjc;
+	if (typeof gjc !== "object" || gjc === null || Array.isArray(gjc))
+		throw new Error(`release package metadata at ${path} has no gjc.version`);
+	const version = (gjc as { version?: unknown }).version;
+	if (typeof version !== "string" || version.trim() === "")
+		throw new Error(`release package metadata at ${path} has no gjc.version`);
+	return version;
+}
+
+async function defaultUpdateCommandRunner(command: readonly string[]): Promise<number> {
+	const child = Bun.spawn([...command], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+	const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+	if (exitCode !== 0) {
+		const detail = stderr.trim();
+		throw new Error(`${command.join(" ")} exited with status ${exitCode}${detail.length === 0 ? "" : `: ${detail}`}`);
+	}
+	return exitCode;
+}
+
+async function installUpdatedServices(options: {
+	readonly home: string;
+	readonly binDir: string;
+	readonly platform: ServicePlatform;
+	readonly noRestart: boolean;
+	readonly deps: UpdateDeps;
+}): Promise<boolean> {
+	const { home, binDir, platform, noRestart, deps } = options;
+	const brokerProvisioned = await exists(homeLayout(home).brokerProvisionManifest);
+	const env = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	await installServices({
+		binDir,
+		platform,
+		env,
+		configuredAdaptersOnly: true,
+		compareAndWrite: true,
+		...deps.serviceOptions,
+	});
+	if (platform === "linux") {
+		const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
+		const execute = async (command: readonly string[]): Promise<void> => {
+			const exitCode = await run(command);
+			if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
+		};
+		await execute(["systemctl", "--user", "daemon-reload"]);
+		if (!noRestart) {
+			const enableUnits: string[] = [];
+			for (const spec of serviceSpecs()) {
+				if (spec.id === "broker" && !brokerProvisioned) continue;
+				if (
+					spec.id.startsWith("adapter-") &&
+					!(await Bun.file(join(home, `adapter-${spec.id.slice(8)}.json`)).exists())
+				)
+					continue;
+				enableUnits.push(systemdUnitName(spec));
+			}
+			if (enableUnits.length > 0) await execute(["systemctl", "--user", "enable", ...enableUnits]);
+		}
+	}
+	return !brokerProvisioned;
+}
 export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult> {
 	const deps = options.deps ?? {};
 	const platform = deps.platform ?? process.platform;
@@ -247,45 +336,66 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 		return { current, latest, tag: release.tag, repo, checkedOnly: true, upToDate: false, installed: [] };
 	if (binDir === undefined) throw new Error("run the update from a compiled gajaeway binary, or pass --bin-dir DIR");
 
-	const unlock = await acquireUpdateLock(binDir);
+	let lease: Lease;
 	try {
-		const staged = await stageRelease(asset, deps);
-		const installedNames = await knownBinariesIn(binDir);
-		const toInstall = binariesToInstall(staged.names, installedNames);
-		const missingCore = CORE_BINARIES.filter((name) => !toInstall.includes(name));
-		if (missingCore.length > 0) throw new Error(`release tarball is missing core binaries: ${missingCore.join(", ")}`);
-		await assertStagedBinariesUsable(staged, toInstall);
-
-		const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, "").slice(0, 15);
-		const backupDir = join(binDir, `backup-${current}-${stamp}Z`);
-		await mkdir(backupDir, { recursive: false });
-		for (const name of toInstall) {
-			const target = join(binDir, name);
-			if (await exists(target)) await copyFile(target, join(backupDir, name));
+		lease = await acquireLease(options.home, "update");
+		console.info(`lease_acquired name=update pid=${process.pid}`);
+	} catch (error) {
+		if (error instanceof LeaseHeldError) {
+			console.error(error.message);
+			throw new Error(`another gajaeway update is running (${error.message})`, { cause: error });
 		}
-		for (const name of toInstall) {
-			const stagedPath = join(staged.dir, name);
-			const tempPath = join(binDir, `.update-${name}`);
-			await copyFile(stagedPath, tempPath);
-			await chmod(tempPath, 0o755);
-			await rename(tempPath, join(binDir, name));
-		}
-		await writeFile(releaseMarkerPath(binDir), `${latest}\n`, "utf8");
-		await rm(staged.dir, { recursive: true, force: true });
+		console.error(`lease_failed name=update detail=${error instanceof Error ? error.message : String(error)}`);
+		throw error;
+	}
 
-		if (options.args.noRestart)
-			return {
-				current,
-				latest,
-				tag: release.tag,
-				repo,
-				checkedOnly: false,
-				upToDate: false,
-				installed: toInstall,
-				backupDir,
-				restartSkipped: true,
-			};
-		const receipt = await (deps.queueRestart ?? defaultQueueRestart)(options.home);
+	const installed = await (async () => {
+		let staged: StagedRelease | undefined;
+		try {
+			staged = await stageRelease(asset, deps);
+			const installedNames = await knownBinariesIn(binDir);
+			const toInstall = binariesToInstall(staged.names, installedNames);
+			const missingCore = CORE_BINARIES.filter((name) => !toInstall.includes(name));
+			if (missingCore.length > 0) throw new Error(`release tarball is missing core binaries: ${missingCore.join(", ")}`);
+			await assertStagedBinariesUsable(staged, toInstall);
+
+			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, "package.json"));
+			await installPinnedGjc({
+				home: options.home,
+				version: gjcVersion,
+				...(deps.gjcInstallRunner === undefined ? {} : { runner: deps.gjcInstallRunner }),
+			});
+
+			const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, "").slice(0, 15);
+			const backupDir = join(binDir, `backup-${current}-${stamp}Z`);
+			await mkdir(backupDir, { recursive: false });
+			for (const name of toInstall) {
+				const target = join(binDir, name);
+				if (await exists(target)) await copyFile(target, join(backupDir, name));
+			}
+			for (const name of toInstall) {
+				const stagedPath = join(staged.dir, name);
+				const tempPath = join(binDir, `.update-${name}`);
+				await copyFile(stagedPath, tempPath);
+				await chmod(tempPath, 0o755);
+				await rename(tempPath, join(binDir, name));
+			}
+			await writeFile(releaseMarkerPath(binDir), `${latest}\n`, "utf8");
+			const brokerNotEnabled = await installUpdatedServices({
+				home: options.home,
+				binDir,
+				platform,
+				noRestart: options.args.noRestart,
+				deps,
+			});
+			return { toInstall, backupDir, brokerNotEnabled };
+		} finally {
+			if (staged !== undefined) await rm(staged.dir, { recursive: true, force: true });
+			await lease.release();
+		}
+	})();
+
+	if (options.args.noRestart)
 		return {
 			current,
 			latest,
@@ -293,13 +403,25 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			repo,
 			checkedOnly: false,
 			upToDate: false,
-			installed: toInstall,
-			backupDir,
-			restartQueued: receipt.receiptId,
+			installed: installed.toInstall,
+			backupDir: installed.backupDir,
+			brokerNotEnabled: installed.brokerNotEnabled,
+			restartSkipped: true,
 		};
-	} finally {
-		await unlock();
-	}
+	const receipt = await (deps.queueRestart ?? defaultQueueRestart)(options.home, binDir, "update");
+
+	return {
+		current,
+		latest,
+		tag: release.tag,
+		repo,
+		checkedOnly: false,
+		upToDate: false,
+		installed: installed.toInstall,
+		backupDir: installed.backupDir,
+		brokerNotEnabled: installed.brokerNotEnabled,
+		restartQueued: receipt.receiptId,
+	};
 }
 
 function binariesToInstall(stagedNames: readonly string[], installedNames: readonly string[]): string[] {
@@ -393,58 +515,7 @@ async function defaultExtractTarball(tarball: Uint8Array, intoDir: string): Prom
 	await rm(tarballPath, { force: true });
 }
 
-async function defaultQueueRestart(home: string): Promise<RestartQueueReceipt> {
-	const { receipt, supervisorPid } = await launchRestartStack({ home });
+async function defaultQueueRestart(home: string, binDir: string, trigger: "update"): Promise<RestartQueueReceipt> {
+	const { receipt, supervisorPid } = await launchRestartStack({ home, binDir, trigger });
 	return { receiptId: receipt.id, supervisorPid };
-}
-
-/**
- * One update at a time per bin dir. A lock naming a live pid refuses; a lock
- * naming a dead one is stale and taken over.
- */
-export async function acquireUpdateLock(binDir: string): Promise<() => Promise<void>> {
-	const lockPath = join(binDir, LOCK_FILE);
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const handle = await open(lockPath, "wx");
-			try {
-				await handle.write(`${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
-			} finally {
-				await handle.close();
-			}
-			return async () => {
-				await rm(lockPath, { force: true });
-			};
-		} catch (error) {
-			if (!isFileExistsError(error)) throw error;
-			const holder = await readLockHolder(lockPath);
-			if (holder !== undefined && isProcessAlive(holder)) {
-				throw new Error(`another gajaeway update is running (pid ${holder}); refusing to run concurrently`);
-			}
-			await rm(lockPath, { force: true });
-		}
-	}
-	throw new Error(`could not acquire the update lock at ${lockPath}`);
-}
-
-function isFileExistsError(error: unknown): boolean {
-	return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST";
-}
-
-async function readLockHolder(lockPath: string): Promise<number | undefined> {
-	try {
-		const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
-		return typeof parsed.pid === "number" ? parsed.pid : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as { code?: unknown }).code === "EPERM";
-	}
 }

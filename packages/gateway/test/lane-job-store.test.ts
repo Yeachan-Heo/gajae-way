@@ -13,7 +13,7 @@ import {
 	parseLaneJobRecord,
 	planContinuation,
 } from "@gajae-gateway/subsession";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 const NOW = new Date("2026-08-27T13:00:00.000Z").toISOString();
 const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
@@ -25,15 +25,15 @@ afterAll(async () => {
 });
 
 /** Opens a database in a persistent directory so repeated calls simulate restarts of the SAME deployment. */
-async function openDatabase(): Promise<GatewayDatabase> {
+async function openDatabase(): Promise<Store> {
 	if (directories.length === 0) {
 		directories.push(await mkdtemp(join(tmpdir(), "gajaeway-lanejob-")));
 	}
-	return GatewayDatabase.open(join(directories[0], "gateway.db"));
+	return Store.open(join(directories[0], "gateway.db"));
 }
 
-function storeJob(database: GatewayDatabase, record: LaneJobRecord, laneKey = "project-issue-10-lane-jobs"): void {
-	database.putLaneJob({
+function storeJob(database: Store, record: LaneJobRecord, laneKey = "project-issue-10-lane-jobs"): void {
+	database.transaction((tx) => database.work.putLaneJob(tx, {
 		jobId: record.jobId,
 		laneKey,
 		state: record.state,
@@ -41,7 +41,7 @@ function storeJob(database: GatewayDatabase, record: LaneJobRecord, laneKey = "p
 		updatedAt: record.updatedAt,
 		lane: record.lane,
 		json: JSON.stringify(record),
-	});
+	}));
 }
 
 describe("lane_jobs store (migration v10)", () => {
@@ -49,8 +49,8 @@ describe("lane_jobs store (migration v10)", () => {
 		const database = await openDatabase();
 		try {
 			expect(database.schemaVersion).toBe(32);
-			expect(database.laneJobRows()).toEqual([]);
-			expect(database.laneJobJson("lanejob-none")).toBeUndefined();
+			expect(database.work.laneJobRows()).toEqual([]);
+			expect(database.work.laneJobJson("lanejob-none")).toBeUndefined();
 		} finally {
 			database.close();
 		}
@@ -86,7 +86,7 @@ describe("lane_jobs store (migration v10)", () => {
 
 		const second = await openDatabase();
 		try {
-			const storedJson = second.laneJobJson("lanejob-project-issue-10-lane-jobs");
+			const storedJson = second.work.laneJobJson("lanejob-project-issue-10-lane-jobs");
 			expect(typeof storedJson).toBe("string");
 			const revived = parseLaneJobRecord(storedJson as string);
 			expect(revived.checkpoints).toHaveLength(1);
@@ -119,7 +119,7 @@ describe("lane_jobs store (migration v10)", () => {
 			});
 			storeJob(second, continued);
 
-			const rows = second.laneJobRows();
+			const rows = second.work.laneJobRows();
 			expect(rows).toHaveLength(1);
 			expect(rows[0].state).toBe("running");
 		} finally {
@@ -138,7 +138,7 @@ describe("lane_jobs store (migration v10)", () => {
 			});
 			storeJob(database, valid);
 			// Simulate on-disk corruption of the stored authority.
-			database.putLaneJob({
+			database.transaction((tx) => database.work.putLaneJob(tx, {
 				jobId: valid.jobId,
 				laneKey: "project-issue-10-lane-jobs",
 				state: valid.state,
@@ -146,8 +146,8 @@ describe("lane_jobs store (migration v10)", () => {
 				updatedAt: valid.updatedAt,
 				lane: valid.lane,
 				json: '{"schemaVersion":1,"jobId":',
-			});
-			const corrupted = database.laneJobJson(valid.jobId);
+			}));
+			const corrupted = database.work.laneJobJson(valid.jobId);
 			expect(typeof corrupted).toBe("string");
 			expect(() => parseLaneJobRecord(corrupted as string)).toThrow(LaneJobError);
 		} finally {

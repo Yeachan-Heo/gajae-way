@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { BrokerSessionPort, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, MAX_POISONED_CREATE_ROTATIONS, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
+import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	createOwnedSessionFixture,
@@ -18,11 +18,11 @@ import {
 } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 
 test("opt-in fake ownership records only successful binds and refuses unknown saved sessions", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-fake-ownership-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const agentDir = join(home, "agent");
 	const repo = join(home, "workspace");
 	const fake = new ScriptedSessionPort({ onBind: ({ epoch }) => `owned-${epoch}` });
@@ -34,13 +34,13 @@ test("opt-in fake ownership records only successful binds and refuses unknown sa
 	);
 	expect(fake.resumes).toHaveLength(0);
 	await port.bind({ originKey: "origin", epoch: 0, repo });
-	database.rebindEpoch("origin");
+	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, "origin"));
 	await port.bind({ originKey: "origin", epoch: 1, repo });
 	fake.setSessionState("owned-0", { live: false });
 	await port.resume({ sessionId: "owned-0", repo, originKey: "origin", epoch: 0 });
-	expect(database.getSessionRecord("origin")).toMatchObject({ sessionId: "owned-1", epoch: 1 });
+	expect(database.bindings.getSessionRecord("origin")).toMatchObject({ sessionId: "owned-1", epoch: 1 });
 	const authority = initializeTestBrokerAuthority(database, agentDir);
-	expect(database.assertOwnedSession("owned-0", repo, authority)).toMatchObject({ originKey: "origin", epoch: 0 });
+	expect(database.bindings.assertOwnedSession("owned-0", repo, authority)).toMatchObject({ originKey: "origin", epoch: 0 });
 	const failing = attachTestBrokerOwnership(
 		database,
 		new ScriptedSessionPort({
@@ -51,7 +51,7 @@ test("opt-in fake ownership records only successful binds and refuses unknown sa
 		agentDir,
 	);
 	await expect(failing.bind({ originKey: "failed", epoch: 0, repo })).rejects.toThrow("fixture refused");
-	expect(database.getSessionRecord("failed")).toBeUndefined();
+	expect(database.bindings.getSessionRecord("failed")).toBeUndefined();
 });
 
 afterEach(async () => {
@@ -61,9 +61,207 @@ afterEach(async () => {
 	home = "";
 });
 
+async function brokerPortFixture(cli: CliRunner, instanceId = "session-port-rebind") {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-rebind-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const repo = join(home, "workspace");
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli,
+		instanceId,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		sleep: async () => {},
+	});
+	return { port, repo, database, agentDir };
+}
+
+function createFailure(code: string, message: string) {
+	return {
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: false, error: { code, message } }),
+		stderr: "",
+	};
+}
+
+function createSuccess(sessionId: string) {
+	return {
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { sessionId } }),
+		stderr: "",
+	};
+}
+
+test("poisoned create failures stop rotating epochs at the durable per-origin cap", async () => {
+	let createCalls = 0;
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		createCalls++;
+		return createFailure("resource_gone", "saved session no longer exists");
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const originKey = "discord/dm/poisoned-cap";
+
+	for (let epoch = 0; epoch < MAX_POISONED_CREATE_ROTATIONS; epoch++) {
+		await expect(port.bind({ originKey, epoch, repo })).rejects.toMatchObject({
+			details: { code: "resource_gone" },
+		});
+	}
+	await expect(port.bind({ originKey, epoch: MAX_POISONED_CREATE_ROTATIONS, repo })).rejects.toMatchObject({
+		details: { code: "resource_gone" },
+	});
+
+	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(MAX_POISONED_CREATE_ROTATIONS);
+	expect(createCalls).toBe(MAX_POISONED_CREATE_ROTATIONS * 2 + 1);
+});
+
+test("a successful owned binding clears the poisoned-create rotation budget", async () => {
+	let mode: "fail" | "success" = "fail";
+	let inspectGone = false;
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			return mode === "fail"
+				? createFailure("resource_gone", "saved session no longer exists")
+				: createSuccess("recovered-binding");
+		}
+		if (args.includes("inspect")) {
+			return inspectGone
+				? createFailure("session_unavailable", "session is no longer indexed")
+				: {
+						exitCode: 0,
+						stdout: JSON.stringify({
+							ok: true,
+							result: { session: { sessionId: args.at(-1), live: true } },
+						}),
+						stderr: "",
+					};
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const originKey = "discord/dm/poisoned-reset";
+
+	for (let epoch = 0; epoch < MAX_POISONED_CREATE_ROTATIONS; epoch++) {
+		await expect(port.bind({ originKey, epoch, repo })).rejects.toMatchObject({
+			details: { code: "resource_gone" },
+		});
+	}
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBe(String(MAX_POISONED_CREATE_ROTATIONS));
+
+	mode = "success";
+	await expect(port.bind({ originKey, epoch: MAX_POISONED_CREATE_ROTATIONS, repo })).resolves.toMatchObject({
+		sessionId: "recovered-binding",
+	});
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBe("0");
+
+	mode = "fail";
+	inspectGone = true;
+	await expect(
+		port.bind({ originKey, epoch: MAX_POISONED_CREATE_ROTATIONS, repo }),
+	).rejects.toMatchObject({ details: { code: "resource_gone" } });
+	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(MAX_POISONED_CREATE_ROTATIONS + 2);
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBe("1");
+});
+
+test("poisoned-create rotation counts survive replacement SessionPort instances", async () => {
+	let createCalls = 0;
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		createCalls++;
+		return createFailure("resource_gone", "saved session no longer exists");
+	};
+	const fixture = await brokerPortFixture(run);
+	const originKey = "discord/dm/durable-rotation";
+
+	for (let epoch = 0; epoch < 2; epoch++) {
+		await expect(fixture.port.bind({ originKey, epoch, repo: fixture.repo })).rejects.toMatchObject({
+			details: { code: "resource_gone" },
+		});
+	}
+	expect(fixture.database.core.metaGet(`create_rotation:${originKey}`)).toBe("2");
+
+	const afterRestart = new BrokerSessionPort({
+		authority: fixture.database.inspectBrokerAuthority().authority!,
+		database: fixture.database,
+		cli: run,
+		instanceId: "session-port-rebind-after-restart",
+		tailRunner: new TailRunner({ stream: noRelay, repo: fixture.repo }),
+		sleep: async () => {},
+	});
+	await expect(afterRestart.bind({ originKey, epoch: 2, repo: fixture.repo })).rejects.toMatchObject({
+		details: { code: "resource_gone" },
+	});
+	await expect(afterRestart.bind({ originKey, epoch: 3, repo: fixture.repo })).rejects.toMatchObject({
+		details: { code: "resource_gone" },
+	});
+
+	expect(fixture.database.bindings.getSessionRecord(originKey)?.epoch).toBe(MAX_POISONED_CREATE_ROTATIONS);
+	expect(fixture.database.core.metaGet(`create_rotation:${originKey}`)).toBe(String(MAX_POISONED_CREATE_ROTATIONS));
+	expect(createCalls).toBe(MAX_POISONED_CREATE_ROTATIONS * 2 + 1);
+});
+
+test("concurrent equivalent binds share one non-rebindable session.create request", async () => {
+	const gate = Promise.withResolvers<void>();
+	const started = Promise.withResolvers<void>();
+	let createCalls = 0;
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		createCalls++;
+		started.resolve();
+		await gate.promise;
+		return createFailure("invalid_params", "caller input is invalid");
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const input = { originKey: "discord/dm/concurrent-bind", epoch: 0, repo };
+	const first = port.bind(input);
+	const second = port.bind(input);
+	await started.promise;
+	expect(createCalls).toBe(1);
+	gate.resolve();
+	const results = await Promise.allSettled([first, second]);
+
+	expect(results.every((result) => result.status === "rejected")).toBe(true);
+	expect(createCalls).toBe(1);
+	expect(database.bindings.getSessionRecord(input.originKey)).toBeUndefined();
+});
+
+test("a message that resembles a poisoned key does not rotate for a non-rebindable code", async () => {
+	let createCalls = 0;
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		createCalls++;
+		return createFailure("invalid_params", "session endpoint record is gone");
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const originKey = "discord/dm/non-rebindable-lookalike";
+
+	await expect(port.bind({ originKey, epoch: 0, repo })).rejects.toMatchObject({
+		details: { code: "invalid_params" },
+	});
+	expect(createCalls).toBe(1);
+	expect(database.bindings.getSessionRecord(originKey)).toBeUndefined();
+});
+
+test("session.create diagnostics are sanitized before failures reach callers", async () => {
+	const secret = "sk-live-session-port-never-log-this";
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		return createFailure("invalid_params", `Authorization: Bearer ${secret}; api_key=${secret}`);
+	};
+	const { port, repo } = await brokerPortFixture(run);
+	const failure = await port.bind({ originKey: "discord/dm/redacted-bind", epoch: 0, repo }).catch((error: unknown) => error);
+
+	expect(failure).toBeInstanceOf(GjcCliError);
+	expect(String((failure as Error).message)).not.toContain(secret);
+	expect(JSON.stringify((failure as GjcCliError).details)).not.toContain(secret);
+	expect((failure as GjcCliError).details).toMatchObject({ code: "invalid_params" });
+});
+
 test("a binding recorded under a symlinked workspace stays owned when the runtime asks with the resolved path", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-symlink-repo-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const agentDir = join(home, "agent");
 	const real = join(home, "real-workspace");
 	const link = join(home, "workspace");
@@ -78,19 +276,19 @@ test("a binding recorded under a symlinked workspace stays owned when the runtim
 		repo: link,
 	});
 
-	expect(database.assertOwnedSession("legacy-link", real, authority)).toMatchObject({ originKey: "origin" });
-	expect(database.assertOwnedSession("legacy-link", link, authority)).toMatchObject({ originKey: "origin" });
+	expect(database.bindings.assertOwnedSession("legacy-link", real, authority)).toMatchObject({ originKey: "origin" });
+	expect(database.bindings.assertOwnedSession("legacy-link", link, authority)).toMatchObject({ originKey: "origin" });
 
 	// A different directory is still refused.
 	const other = join(home, "other");
 	await mkdir(other);
 	const db = database;
-	expect(() => db.assertOwnedSession("legacy-link", other, authority)).toThrow(BrokerAuthorityError);
+	expect(() => db.bindings.assertOwnedSession("legacy-link", other, authority)).toThrow(BrokerAuthorityError);
 });
 
 test("failed-turn evidence comes from the owned shared session file without exposing provider text", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-failure-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const repo = join(home, "workspace");
 	const agentDir = join(home, "agent");
 	const authority = initializeTestBrokerAuthority(database, agentDir);
@@ -148,7 +346,7 @@ test("failed-turn evidence comes from the owned shared session file without expo
 
 test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort preserves op-ref, model, terminal status, and transcript", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
@@ -246,7 +444,7 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
@@ -283,7 +481,7 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 
 test("broker SessionPort rebinds a saved binding on an explicit session_unavailable envelope", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-public-error-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	const calls: string[][] = [];
@@ -330,7 +528,7 @@ test("broker SessionPort rebinds a saved binding on an explicit session_unavaila
 
 test("generic inspect errors preserve saved authority and do not trigger a replacement session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-generic-error-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	const calls: string[][] = [];
@@ -363,12 +561,12 @@ test("generic inspect errors preserve saved authority and do not trigger a repla
 		epoch: 0,
 	});
 	expect(calls).toHaveLength(1);
-	expect(database.getSessionRecord("generic-inspect-error")).toMatchObject({ sessionId: "saved-1", epoch: 0 });
+	expect(database.bindings.getSessionRecord("generic-inspect-error")).toMatchObject({ sessionId: "saved-1", epoch: 0 });
 });
 
 test("structured nonzero session failures survive normalization at the global lifecycle route", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-envelope-error-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	const publicFailure = {
@@ -405,7 +603,7 @@ test("structured nonzero session failures survive normalization at the global li
 
 test("broker SessionPort resumes saved dead authority through the SDK control before returning the same binding", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const calls: string[][] = [];
 	let live = false;
@@ -454,7 +652,7 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 
 test("broker SessionPort preserves a structured client-ref conflict emitted with a non-zero CLI status", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const run: CliRunner = async (args) => {
 		throw new Error(`unexpected command ${args.join(" ")}`);
@@ -483,7 +681,7 @@ test("broker SessionPort preserves a structured client-ref conflict emitted with
 
 test("broker SessionPort retries a terminal-uncertain lifecycle create with the same idempotency key", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	let createCalls = 0;
 	const createKeys: string[] = [];
@@ -525,11 +723,11 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 	const { mkdtemp, rm } = await import("node:fs/promises");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
-	const { GatewayDatabase } = await import("../src/store/db");
+	const { Store } = await import("../src/store");
 	const { BrokerSessionPort } = await import("../src/orchestrator/session-port");
 	const { TailRunner } = await import("../src/orchestrator/tail-runner");
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-bind-dead-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	try {
 		const repo = join(home, "workspace");
@@ -569,7 +767,7 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
 		expect(binding.sessionId).toBe("fresh-session");
 		expect(binding.epoch).toBe(2);
-		expect(database.getSessionRecord("monitor/eventtype/x")).toMatchObject({ epoch: 2, sessionId: "fresh-session" });
+		expect(database.bindings.getSessionRecord("monitor/eventtype/x")).toMatchObject({ epoch: 2, sessionId: "fresh-session" });
 	} finally {
 		database.close();
 		await rm(home, { recursive: true, force: true });
@@ -578,7 +776,7 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 
 test("a recovered answer is the full body, never the 500-character summary", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-body-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const body = `${"가".repeat(700)} 끝.`;
 	const run: CliRunner = async (args) => {
@@ -624,7 +822,7 @@ test("a recovered answer is the full body, never the 500-character summary", asy
 
 test("fetchAssistantSince follows transcript continuation pages and returns the newest turn-scoped assistant", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-pages-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const floor = Date.now();
 	const cursors: Array<string | undefined> = [];
@@ -683,7 +881,7 @@ test("fetchAssistantSince follows transcript continuation pages and returns the 
 
 test("close uses the global lifecycle route: the per-session control route prohibits session.close for the daemon CLI", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
@@ -728,7 +926,7 @@ test("close uses the global lifecycle route: the per-session control route prohi
 
 test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any SDK surface", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-ownership-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	const ownedId = "11111111-2222-3333-4444-555555555555";
@@ -777,8 +975,8 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 
 test("legacy private bindings cannot initialize a global port or be resumed and rebound", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-legacy-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	database.putSessionAtEpoch("legacy", "private-session", 0);
+	database = await Store.open(join(home, "gateway.db"));
+	database!.transaction((tx) => database!.bindings.bindAtEpoch(tx, "legacy", "private-session", 0));
 	const authority = { canonicalAgentDir: join(home, "global"), identity: `gjc:${join(home, "global")}` };
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
@@ -795,21 +993,21 @@ test("legacy private bindings cannot initialize a global port or be resumed and 
 				tailRunner: new TailRunner({ stream: noRelay, repo: home }),
 			}),
 	).toThrow(BrokerAuthorityError);
-	expect(() => database!.assertBrokerAuthority(authority, { initializeEmpty: true })).toThrow(BrokerAuthorityError);
-	expect(database.getSessionRecord("legacy")).toMatchObject({ sessionId: "private-session", epoch: 0 });
+	expect(() => database!.transaction((tx) => database!.bindings.initializeAuthority(tx, authority, database!.inspectBrokerAuthority().populated))).toThrow(BrokerAuthorityError);
+	expect(database.bindings.getSessionRecord("legacy")).toMatchObject({ sessionId: "private-session", epoch: 0 });
 	expect(calls).toEqual([]);
 });
 
 test("bind rejects an unowned persisted ID before inspect and without epoch rotation", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-unowned-binding-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
-	const record = database.getSessionRecord("origin")!;
+	const record = database.bindings.getSessionRecord("origin")!;
 	// Corrupt the read boundary deliberately: no production adoption API is used.
-	const getSessionRecord = database.getSessionRecord.bind(database);
-	database.getSessionRecord = () => ({ ...record, sessionId: "private-session" });
+	const getSessionRecord = database!.bindings.getSessionRecord.bind(database!.bindings);
+	database!.bindings.getSessionRecord = () => ({ ...record, sessionId: "private-session" });
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
@@ -826,14 +1024,14 @@ test("bind rejects an unowned persisted ID before inspect and without epoch rota
 		await expect(port.bind({ originKey: "origin", epoch: 0, repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
 		expect(calls).toEqual([]);
 	} finally {
-		database.getSessionRecord = getSessionRecord;
+		database!.bindings.getSessionRecord = getSessionRecord;
 	}
-	expect(database.getSessionRecord("origin")).toEqual(record);
+	expect(database.bindings.getSessionRecord("origin")).toEqual(record);
 });
 
 test("historical owned bindings remain readable after epoch retirement but fail after authority cutover", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-history-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, {
@@ -843,9 +1041,9 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		repo,
 	});
 	database.close();
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	database.assertBrokerAuthority(authority);
-	database.rebindEpoch("origin");
+	database = await Store.open(join(home, "gateway.db"));
+	database.bindings.assertAuthority(authority);
+	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, "origin"));
 	await createOwnedSessionFixture(database, authority, {
 		sessionId: "current-owned",
 		originKey: "origin",
@@ -869,7 +1067,7 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	expect((await port.fetchLastAssistant({ sessionId: "retired-owned", repo })).text).toBe("historical answer");
-	expect(database.assertOwnedSession("retired-owned", repo, authority)).toMatchObject({
+	expect(database.bindings.assertOwnedSession("retired-owned", repo, authority)).toMatchObject({
 		originKey: "origin",
 		epoch: 0,
 	});
@@ -877,7 +1075,7 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		canonicalAgentDir: join(home, "other-agent"),
 		identity: `gjc:${join(home, "other-agent")}`,
 	};
-	database.cutoverBrokerAuthority({ expectedAuthority: authority, targetAuthority, evidence: "test fixture cutover" });
+	database!.transaction((tx) => database!.bindings.cutoverBrokerAuthority(tx, { expectedAuthority: authority, targetAuthority, evidence: "test fixture cutover" }));
 	await expect(port.bind({ originKey: "origin", epoch: 2, repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
 	await expect(port.fetchLastAssistant({ sessionId: "retired-owned", repo })).rejects.toBeInstanceOf(
 		BrokerAuthorityError,
@@ -887,7 +1085,7 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 
 test("authority failures propagate through recovery catches without rebind or replay", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-authority-error-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
@@ -914,8 +1112,8 @@ test("authority failures propagate through recovery catches without rebind or re
 		() => port.fetchWorkerOutput({ ...target, opRef: "gw-owned", notBeforeMs: 0 }),
 	])
 		await expect(operation()).rejects.toBe(refusal);
-	expect(database.getSessionRecord("origin")).toMatchObject({ sessionId: "owned", epoch: 0 });
-	expect(database.getSessionRecord("new-origin")).toBeUndefined();
+	expect(database.bindings.getSessionRecord("origin")).toMatchObject({ sessionId: "owned", epoch: 0 });
+	expect(database.bindings.getSessionRecord("new-origin")).toBeUndefined();
 	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
 	expect(calls.some((args) => args.includes("session.resume") || args.includes("send"))).toBe(false);
 });
@@ -923,7 +1121,7 @@ test("authority failures propagate through recovery catches without rebind or re
 test("owned SDK reads and controls ignore unrelated corrupt lane history without hiding census failures", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-isolated-history-"));
 	const path = join(home, "gateway.db");
-	database = await GatewayDatabase.open(path);
+	database = await Store.open(path);
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
@@ -971,14 +1169,14 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 	expect(await port.setModel({ sessionId: "owned", repo, selection: "model" })).toEqual({ changed: true });
 	expect(calls).toHaveLength(2);
 	expect(() => database!.inspectBrokerAuthority()).toThrow();
-	expect(database.laneJobJson("lanejob-unrelated")).toBe("{");
+	expect(database.work.laneJobJson("lanejob-unrelated")).toBe("{");
 	expect(() =>
-		database!.cutoverBrokerAuthority({
+		database!.transaction((tx) => database!.bindings.cutoverBrokerAuthority(tx, {
 			expectedAuthority: authority,
 			targetAuthority: { ...authority, identity: "different" },
 			evidence: "must validate history",
 			disposition: "quarantine",
-		}),
+		})),
 	).toThrow();
 	await expect(port.fetchLastAssistant({ sessionId: "foreign", repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
 	await expect(port.setModel({ sessionId: "foreign", repo, selection: "model" })).rejects.toBeInstanceOf(
@@ -1018,7 +1216,7 @@ for (const fixture of [
 ] as const)
 	test(`steer preserves authoritative rejection versus ambiguity: ${JSON.stringify(fixture)}`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 		await createOwnedSessionFixture(database, authority, {
 			sessionId: "sdk-1",
@@ -1058,7 +1256,7 @@ for (const fixture of [
 
 test("a relay that dies before the steer reply is ambiguity, never a definitive rejection", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	await createOwnedSessionFixture(database, authority, {
 		sessionId: "sdk-1",
@@ -1087,7 +1285,7 @@ test("a relay that dies before the steer reply is ambiguity, never a definitive 
 
 test("send waits out a `busy` refusal and resends under the same op-ref once the turn is free", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	await createOwnedSessionFixture(database, authority, {
@@ -1130,7 +1328,7 @@ test("send waits out a `busy` refusal and resends under the same op-ref once the
 
 test("send surfaces `busy` once the bounded wait is exhausted, never having sent", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	await createOwnedSessionFixture(database, authority, {
@@ -1169,7 +1367,7 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "torn", epoch: 0 });
@@ -1234,7 +1432,7 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 for (const progressing of [true, false]) {
 	test(`request wait is an activity lease: a turn that keeps emitting ${progressing ? "survives past" : "is not spared when silent for"} waitTimeoutMs`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 		const repo = join(home, "workspace");
 		await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "lease", epoch: 0 });

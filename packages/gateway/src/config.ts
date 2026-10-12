@@ -1,6 +1,7 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { homeLayout } from "@gajae-gateway/home";
 import {
 	type ChannelEngagementPolicy,
 	describeChatPlatforms,
@@ -104,7 +105,7 @@ export interface GatewayConfigFile {
 	readonly interimSpeech?: InterimSpeechConfig;
 	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
-	/** Absolute path to gjc agent directory; overrides GJC_CODING_AGENT_DIR. Defaults to $GAJAEWAY_HOME/gjc-agent for fresh homes; existing homes keep their established directory. */
+	/** Optional absolute path override for the broker agent directory. */
 	readonly gjc?: { readonly agentDir?: string } | undefined;
 }
 
@@ -145,6 +146,7 @@ export interface BotAudienceConfig {
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
+	readonly gjc: { readonly agentDir: string };
 	readonly home: string;
 	readonly configPath: string;
 	readonly socketPath: string;
@@ -614,7 +616,7 @@ export async function loadConfig(
 		readonly requireFile?: boolean;
 	} = {},
 ): Promise<GatewayConfig> {
-	const home = options.home ?? gatewayHome(options.env);
+	const home = resolve(options.home ?? gatewayHome(options.env));
 	const configPath = join(home, "config.json");
 	let fileConfig: GatewayConfigFile = { schemaVersion: CONFIG_SCHEMA_VERSION };
 	let raw: string | undefined;
@@ -652,6 +654,7 @@ export async function loadConfig(
 	const overrides = options.overrides ?? {};
 	return {
 		...fileConfig,
+		gjc: { ...fileConfig.gjc, agentDir: fileConfig.gjc?.agentDir ?? homeLayout(home).brokerAgentDir },
 		home,
 		configPath,
 		socketPath: overrides.socketPath ?? fileConfig.socketPath ?? join(home, "gateway.sock"),

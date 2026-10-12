@@ -1,10 +1,18 @@
 import { join } from "node:path";
+import { exitOnLeaseHeld, LeaseError, LeaseHeldError } from "@gajae-gateway/home";
+
 import { installStructuredLogging } from "@gajae-gateway/log";
 import { type BootedGateway, bootGateway } from "./boot";
-import { gatewayHome } from "./config";
+import { gatewayHome, loadConfig } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { DEFAULT_EXIT_WRITER, installExitReporter } from "./exit-report";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
+import { runBrokerHost } from "./broker-host";
+import { runBrokerAgentCommand } from "./broker-agent/command";
+import { runCensus } from "./ops/census";
+import { runCutover } from "./ops/cutover";
+import { runRestore } from "./ops/restore";
+import { assertNoRestoreJournal } from "./offline";
 
 /**
  * Hard ceiling on an ordered stop. Below the 30s `TimeoutStopSec` the service
@@ -20,10 +28,62 @@ if (command === "config" && args[0] === "check") {
 	const result = await checkConfigFile(args[1] ?? defaultConfigPath());
 	for (const line of renderConfigCheck(result)) console.log(line);
 	process.exitCode = configCheckExitCode(result);
-} else if (command !== "daemon") {
-	console.error("usage: gajaeway-gateway daemon [--stdio] [--only-new] | config check [path]");
-	process.exitCode = 2;
-} else {
+} else if (command === "broker") {
+	if (args.length > 0) {
+		console.error("usage: gajaeway-gateway broker");
+		process.exitCode = 2;
+	} else {
+		try {
+			process.exitCode = await runBrokerHost(await loadConfig());
+		} catch (error) {
+			console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+			process.exitCode = 1;
+		}
+	}
+} else if (command === "broker-agent") {
+	try {
+		const config = await loadConfig();
+		await assertNoRestoreJournal(config.home);
+		process.exitCode = await runBrokerAgentCommand(args, config);
+	} catch (error) {
+		console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+		process.exitCode = 1;
+	}
+} else if (command === "cutover") {
+	if (args.length !== 2 || args[0] !== "--agent-dir") {
+		console.error("usage: gajaeway-gateway cutover --agent-dir <dir>");
+		process.exitCode = 2;
+	} else {
+		try {
+			process.exitCode = await runCutover({ config: await loadConfig(), agentDir: args[1] as string });
+		} catch (error) {
+			console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+			process.exitCode = 1;
+		}
+	}
+} else if (command === "census") {
+	if (args.length !== 0) {
+		console.error("usage: gajaeway-gateway census");
+		process.exitCode = 2;
+	} else {
+		try {
+			await runCensus(await loadConfig());
+			process.exitCode = 0;
+		} catch (error) {
+			console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+			process.exitCode = 1;
+		}
+	}
+} else if (command === "restore") {
+	const abort = args.includes("--abort");
+	const backup = args.filter((arg) => arg !== "--abort");
+	if (backup.length > 1 || args.filter((arg) => arg === "--abort").length > 1) {
+		console.error("usage: gajaeway-gateway restore <backup> [--abort]");
+		process.exitCode = 2;
+	} else {
+		process.exitCode = await runRestore(backup[0], { home: gatewayHome(), abort });
+	}
+} else if (command === "daemon") {
 	let booted: BootedGateway | undefined;
 	const disposeLogging = installStructuredLogging({
 		path: join(gatewayHome(), "gateway.log"),
@@ -59,7 +119,6 @@ if (command === "config" && args[0] === "check") {
 	try {
 		const server = await bootGateway({
 			stdio: args.includes("--stdio"),
-			onlyNew: args.includes("--only-new"),
 			broker: { onLiveOutageExceeded },
 		});
 		booted = server;
@@ -92,12 +151,16 @@ if (command === "config" && args[0] === "check") {
 		process.once("SIGINT", () => shutdown("SIGINT"));
 		process.once("SIGTERM", () => shutdown("SIGTERM"));
 	} catch (error) {
-		reporter.report(
-			"boot_failure",
-			sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error",
-			1,
-		);
+		if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
+		const detail =
+			error instanceof LeaseError
+				? error.message
+				: sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+		reporter.report("boot_failure", detail, 1);
 		disposeLogging();
 		process.exit(1);
 	}
+} else {
+	console.error("usage: gajaeway-gateway daemon [--stdio] | broker | broker-agent ... | cutover --agent-dir <dir> | census | restore <backup> [--abort] | config check [path]");
+	process.exitCode = 2;
 }

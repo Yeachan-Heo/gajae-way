@@ -42,7 +42,7 @@ import { TELEGRAM_REACTION_SET, telegramReactionFor } from "../../adapter-telegr
 import { TelegramAdapterState } from "../../adapter-telegram/src/state";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
@@ -135,7 +135,7 @@ async function settle(): Promise<void> {
 
 interface Harness {
 	readonly client: Client;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly config: GatewayConfig;
 	/** Turn texts the gateway dispatched to the session port: a reaction must add none. */
 	readonly turns: string[];
@@ -152,6 +152,7 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -163,7 +164,7 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 		mentionAllowlist: ["human-1"],
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const calls = { bind: 0, respond: 0 };
 	let index = 0;
@@ -274,18 +275,18 @@ test("RT-INBOUND-01 an add/remove storm on an open, allowlisted channel never be
 	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
 	expect(chatMessages(client.frames)).toHaveLength(0);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 	// RT-INBOUND-01b (was a blocker, now fixed): the synthetic context id ends in a
 	// random suffix as well as an ISO timestamp, so a storm inside one millisecond no
 	// longer collides on ON CONFLICT(message_id) DO NOTHING and silently loses history.
 	// Every one of the 20 events is kept, in both directions.
-	const bodies = database.contextUnread(ORIGIN_KEY, 200).map((entry) => entry.body);
+	const bodies = database.inbox.contextUnread(ORIGIN_KEY, 200).map((entry) => entry.body);
 	expect(bodies).toHaveLength(20);
 	// Both directions survive: a removal is never rewritten into an add.
 	expect(bodies.filter((body) => body.startsWith("[reaction] reacted"))).toHaveLength(10);
 	expect(bodies.filter((body) => body.startsWith("[reaction] removed"))).toHaveLength(10);
 	expect(new Set(bodies).size).toBeGreaterThanOrEqual(4);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("RT-INBOUND-05 the same storm spaced past the millisecond keeps every add and removal", async () => {
@@ -300,14 +301,14 @@ test("RT-INBOUND-05 the same storm spaced past the millisecond keeps every add a
 	await settle();
 	// Same input, spaced out: still 20 rows, matching RT-INBOUND-01 exactly, which is
 	// what proves the id is unique per event rather than per millisecond.
-	const bodies = database.contextUnread(ORIGIN_KEY, 200).map((entry) => entry.body);
+	const bodies = database.inbox.contextUnread(ORIGIN_KEY, 200).map((entry) => entry.body);
 	expect(bodies).toHaveLength(20);
 	expect(bodies.filter((body) => body.startsWith("[reaction] reacted"))).toHaveLength(10);
 	expect(bodies.filter((body) => body.startsWith("[reaction] removed"))).toHaveLength(10);
 	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
 	expect(chatMessages(client.frames)).toHaveLength(0);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("RT-INBOUND-02 reactions arriving mid-turn do not spawn a second turn", async () => {
@@ -330,8 +331,8 @@ test("RT-INBOUND-02 reactions arriving mid-turn do not spawn a second turn", asy
 	expect(calls.respond).toBe(1);
 	expect(turns).toHaveLength(1);
 	expect(chatMessages(client.frames)).toHaveLength(0);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 	for (let index = 0; index < 10; index++)
 		expect(response(client.frames, `r${index}`).result).toEqual({ recorded: true, engaged: false });
 });
@@ -352,8 +353,8 @@ test("RT-INBOUND-03 injection through reaction metadata is bounded context, not 
 	for (const [id] of payloads) expect(response(client.frames, id).result).toEqual({ recorded: true, engaged: false });
 	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(chatMessages(client.frames)).toHaveLength(0);
-	expect(database.deliveryRows()).toHaveLength(0);
-	const rows = database.contextUnread(ORIGIN_KEY, 200);
+	expect(database.outbox.rows()).toHaveLength(0);
+	const rows = database.inbox.contextUnread(ORIGIN_KEY, 200);
 	expect(rows).toHaveLength(payloads.length);
 	// Every recorded emoji is bounded to 64 chars, so a 5000-character emoji cannot
 	// flood the next turn's context window.
@@ -370,7 +371,7 @@ test("RT-INBOUND-03 injection through reaction metadata is bounded context, not 
 	expect(turns[0]).toContain("[Unread messages in this conversation since your last reply]");
 	// Reply was [SILENT], so nothing is spoken and no reaction leaks out.
 	expect(chatMessages(client.frames)).toHaveLength(0);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("RT-INBOUND-04 engagement.reaction rejects every malformed shape with a typed error", async () => {
@@ -405,8 +406,8 @@ test("RT-INBOUND-04 engagement.reaction rejects every malformed shape with a typ
 		expect(response(client.frames, id)).toBeUndefined();
 	}
 	expect(calls).toEqual({ bind: 0, respond: 0 });
-	expect(database.contextUnread(ORIGIN_KEY, 200)).toHaveLength(0);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.inbox.contextUnread(ORIGIN_KEY, 200)).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -434,7 +435,7 @@ test("RT-REACT-01 chat.react refuses every spelling of a missing target message 
 		expect(failure?.error.message).toContain("targetMessageId");
 	}
 	expect(reactionEvents(client.frames)).toHaveLength(0);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("RT-REACT-02 'react to the last message' is inexpressible in chat.react", async () => {
@@ -452,7 +453,7 @@ test("RT-REACT-02 'react to the last message' is inexpressible in chat.react", a
 	await settle();
 	for (const [id] of cases) expect(errorFrame(client.frames, id)?.error.message).toContain("targetMessageId");
 	expect(response(client.frames, "l5").result.emoji).toBe("👍");
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
 	// The protocol catalog carries no "latest"/"last" verb either.
 	expect(VERBS_V01).toContain("chat.react");
 	expect(VERBS_V01).toContain("engagement.reaction");
@@ -502,7 +503,7 @@ test("RT-REACT-03 chat.react emoji fuzzing stays inside the allowlist and writes
 	}
 	// "👍 " trims to an allowlisted emoji, which is a legitimate accept.
 	expect(response(client.frames, "a7")?.result.emoji).toBe("👍");
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
 	expect(reactionEvents(client.frames)).toHaveLength(1);
 });
 
@@ -542,7 +543,7 @@ test("RT-REACT-04 chat.react rejects malformed and unroutable origins", async ()
 		expect(failure?.error.code).toBe("invalid_params");
 	}
 	expect(errorFrame(client.frames, "o9").error.message).toContain("requires a discord, telegram or slack origin");
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 	// RT-REACT-04b (was a finding, now fixed): a `monitor` origin is a structurally
 	// valid OriginRef, but no chat adapter subscribes to it, so accepting one would
 	// strand an inflight ledger row nobody can ever settle. The verb rejects it the
@@ -550,7 +551,7 @@ test("RT-REACT-04 chat.react rejects malformed and unroutable origins", async ()
 	await request(client, "o10", "chat.react", { origin: MONITOR_ORIGIN, targetMessageId: "m1", emoji: "👍" });
 	await settle();
 	expect(errorFrame(client.frames, "o10")?.error.message).toContain("requires a discord, telegram or slack origin");
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("RT-REACT-05 accepted emoji spellings canonicalize to one allowlist entry", async () => {
@@ -571,7 +572,7 @@ test("RT-REACT-05 accepted emoji spellings canonicalize to one allowlist entry",
 		"thumbsup",
 		"fire",
 	]);
-	expect(database.deliveryRows()).toHaveLength(4);
+	expect(database.outbox.rows()).toHaveLength(4);
 	// The canonical emoji is always the allowlist unicode, never the input spelling.
 	for (const event of reactionEvents(client.frames)) {
 		const entry = REACTION_ALLOWLIST.find((candidate) => candidate.name === event.payload.reaction.emojiName);
@@ -589,7 +590,7 @@ test("RT-LEDGER-01 a reaction is never confirmed without an explicit confirm", a
 	await request(client, "k1", "chat.react", { origin: ORIGIN, targetMessageId: "m1", emoji: "👍" });
 	await settle();
 	const deliveryId = response(client.frames, "k1").result.deliveryId as string;
-	expect(database.deliveryRows()[0]?.state).toBe("inflight");
+	expect(database.outbox.rows()[0]?.state).toBe("inflight");
 	await request(client, "s1", "gateway.status", {});
 	await settle();
 	expect(response(client.frames, "s1").result.delivery.pending).toBe(1);
@@ -600,13 +601,13 @@ test("RT-LEDGER-01 a reaction is never confirmed without an explicit confirm", a
 	await request(client, "x4", "delivery.fail", { deliveryId, reason: 500 });
 	await settle();
 	for (const id of ["x1", "x2", "x3", "x4"]) expect(errorFrame(client.frames, id)?.error.code).toBe("invalid_params");
-	expect(database.deliveryRows()[0]?.state).toBe("inflight");
-	expect(database.deliveryRows()[0]?.attempts).toBe(0);
+	expect(database.outbox.rows()[0]?.state).toBe("inflight");
+	expect(database.outbox.rows()[0]?.attempts).toBe(0);
 	// Only the real confirm settles it.
 	await request(client, "x5", "delivery.confirm", { deliveryId });
 	await settle();
 	expect(response(client.frames, "x5").result).toEqual({ settled: true });
-	expect(database.deliveryRows()[0]?.state).toBe("confirmed");
+	expect(database.outbox.rows()[0]?.state).toBe("confirmed");
 });
 
 test("RT-LEDGER-02 an ambiguous reaction failure survives and is re-emitted on reconnect", async () => {
@@ -617,8 +618,8 @@ test("RT-LEDGER-02 an ambiguous reaction failure survives and is re-emitted on r
 	await request(client, "f1", "delivery.fail", { deliveryId, reason: "socket hang up", ambiguous: true });
 	await settle();
 	expect(response(client.frames, "f1").result).toEqual({ recorded: true });
-	expect(database.deliveryRows()[0]?.state).toBe("failed_ambiguous");
-	expect(database.deliveryRows()[0]?.last_error).toBe("network");
+	expect(database.outbox.rows()[0]?.state).toBe("failed_ambiguous");
+	expect(database.outbox.rows()[0]?.last_error).toBe("network");
 	// Ambiguous rows obey the two-second first-retry backoff, then a fresh adapter
 	// connection must be told about it again, reaction intact.
 	await Bun.sleep(2_050);
@@ -642,13 +643,13 @@ test("RT-LEDGER-03 a definitive reaction failure is retried five times, then exp
 		await request(client, id, "delivery.fail", { deliveryId, reason: "Unknown Message", ambiguous: false });
 		await settle();
 		expect(response(client.frames, id).result).toEqual({ recorded: true });
-		const row = database.deliveryRows()[0];
+		const row = database.outbox.rows()[0];
 		expect(row?.attempts).toBe(index + 1);
 		expect(row?.state).toBe(index + 1 >= 5 ? "expired" : "pending");
 	}
 	// Expired means the gateway stops re-offering an impossibility, and it never
 	// pretends the reaction happened.
-	expect(database.deliveryRows()[0]?.state).toBe("expired");
+	expect(database.outbox.rows()[0]?.state).toBe("expired");
 	const reconnected = await connect(config.socketPath);
 	await reconnected.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await settle();
@@ -669,7 +670,7 @@ test("RT-WIRE-01 a 12000-character targetMessageId is rejected before it can bec
 	expect(failure?.error.message).toContain("targetMessageId");
 	expect(client.badLines).toBe(0);
 	// Nothing was written to the ledger for a rejected call.
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -688,7 +689,7 @@ test("RT-TOKEN-01 fifty repeated tokens emit at most the per-turn cap and lose n
 			"t2",
 		]);
 		expect(textEvents(client.frames)).toHaveLength(0);
-		expect(database.deliveryRows()).toHaveLength(REACTIONS_PER_TURN_CAP);
+		expect(database.outbox.rows()).toHaveLength(REACTIONS_PER_TURN_CAP);
 		// Every one of the 47 rejections is logged, never a silent nothing.
 		expect(lines.filter((line) => line.includes("reaction rejected (turn_cap)"))).toHaveLength(47);
 	});
@@ -705,7 +706,7 @@ test("RT-TOKEN-02 a token in the middle of a reply is plain text", async () => {
 		"확인 [REACT:👍] 했습니다",
 		"본문 [REACT:🔥@9] 끝",
 	]);
-	expect(database.deliveryRows()).toHaveLength(2);
+	expect(database.outbox.rows()).toHaveLength(2);
 });
 
 test("RT-TOKEN-03 every malformed token sends the reply verbatim exactly once", async () => {
@@ -730,7 +731,7 @@ test("RT-TOKEN-03 every malformed token sends the reply verbatim exactly once", 
 	// speaks the remainder; the other seven are verbatim.
 	expect(texts).toEqual([...malformed.slice(0, 7), "@1 발사합니다"]);
 	expect(reactionEvents(client.frames)).toHaveLength(1);
-	expect(database.deliveryRows()).toHaveLength(malformed.length + 1);
+	expect(database.outbox.rows()).toHaveLength(malformed.length + 1);
 	// Pure-parser cross-check: the same inputs at protocol level.
 	for (const reply of malformed.slice(0, 7)) expect(parseReactionReply(reply)).toBeUndefined();
 	expect(parseReactionReply("[REACT:👍]@1 발사합니다")?.body).toBe("@1 발사합니다");
@@ -772,7 +773,7 @@ test("RT-TOKEN-04 the silence-token contract is byte-identical next to reaction 
 	// control tokens are never delivered verbatim (live leak, 2026-09-02).
 	// Turn 3: silence suppresses everything. Turn 4: reaction only.
 	expect(observed).toEqual(["R:👍@m0", "R:🔥@m3"]);
-	expect(database.deliveryRows()).toHaveLength(2);
+	expect(database.outbox.rows()).toHaveLength(2);
 });
 
 test("RT-TOKEN-05 reaction tokens on a loopback origin are never parsed", async () => {
@@ -787,7 +788,7 @@ test("RT-TOKEN-05 reaction tokens on a loopback origin are never parsed", async 
 		"[REACT:👍]",
 	]);
 	// Loopback delivery is direct, so it writes no ledger rows at all.
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("RT-TOKEN-06 a reaction plus [BREAK] parts keeps every part of the reply", async () => {
@@ -802,7 +803,7 @@ test("RT-TOKEN-06 a reaction plus [BREAK] parts keeps every part of the reply", 
 		"둘째 문장",
 		"[REACT:🔥] 셋째",
 	]);
-	expect(database.deliveryRows()).toHaveLength(4);
+	expect(database.outbox.rows()).toHaveLength(4);
 });
 
 test("RT-TOKEN-07 a 10000-character @id is a malformed token, so the reply ships verbatim", async () => {
@@ -815,7 +816,7 @@ test("RT-TOKEN-07 a 10000-character @id is a malformed token, so the reply ships
 	// be a platform message id makes the whole token malformed, and requirement 4 says
 	// a malformed token sends the text VERBATIM rather than dropping the reply. So no
 	// reaction is emitted and the one delivery carries the original text, token and all.
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(1);
 	const payloads = rows.map((row) => JSON.parse(row.payload_json) as ChatMessagePayload);
 	expect(payloads[0]?.reaction).toBeUndefined();
@@ -837,7 +838,7 @@ test("RT-CAP-01 the caps hold across separate turns and every rejection is logge
 		await settle();
 		// Exactly one reaction ever lands on `same`, across three separate turns.
 		expect(reactionEvents(client.frames).map((frame) => frame.payload.reaction.emoji)).toEqual(["👍"]);
-		expect(database.deliveryRows()).toHaveLength(1);
+		expect(database.outbox.rows()).toHaveLength(1);
 		const rejections = lines.filter((line) => line.includes("reaction rejected"));
 		expect(rejections).toHaveLength(2);
 		expect(rejections[0]).toContain("duplicate");
@@ -864,7 +865,7 @@ test("RT-CAP-02 chat.react reports cap violations as protocol errors", async () 
 	// A different spelling of an already applied emoji is still a duplicate.
 	expect(errorFrame(client.frames, "k4").error.message).toContain("reaction rejected (duplicate)");
 	for (const id of ["k2", "k3", "k4"]) expect(errorFrame(client.frames, id).error.code).toBe("invalid_params");
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
 });
 
 test("RT-CAP-03 the per-turn cap does not bound chat.react, which has no turn", async () => {
@@ -883,7 +884,7 @@ test("RT-CAP-03 the per-turn cap does not bound chat.react, which has no turn", 
 	// so a caller may react once to each of arbitrarily many distinct messages. The
 	// per-message cap still holds, and every call is an auditable ledger row.
 	for (let index = 0; index < 5; index++) expect(response(client.frames, `k${index}`).result.emoji).toBe("👍");
-	expect(database.deliveryRows()).toHaveLength(5);
+	expect(database.outbox.rows()).toHaveLength(5);
 	expect(reactionEvents(client.frames)).toHaveLength(5);
 });
 
@@ -1138,8 +1139,8 @@ test("RT-DISCORD-04 an inbound custom emoji is custom:name metadata that never b
 	expect(response(client.frames, "r1").result).toEqual({ recorded: true, engaged: false });
 	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
-	expect(database.deliveryRows()).toHaveLength(0);
-	expect(database.contextUnread(ORIGIN_KEY, 10)[0]?.body).toBe("[reaction] reacted custom:lobster to message target-1");
+	expect(database.outbox.rows()).toHaveLength(0);
+	expect(database.inbox.contextUnread(ORIGIN_KEY, 10)[0]?.body).toBe("[reaction] reacted custom:lobster to message target-1");
 	// The exact metadata spelling cannot round-trip into an outbound reaction: feed
 	// back what describeInboundReaction actually produced, not a hand-written string,
 	// or the assertion proves nothing about the spelling under test.
@@ -1352,7 +1353,7 @@ test("RT-CAPABILITY-01 the whole allowlist swept through chat.react on telegram 
 	}
 	// A refusal is decided BEFORE the budget claim and the ledger row: exactly the
 	// deliverable entries produced a row, and no row carries an undeliverable emoji.
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(REACTION_ALLOWLIST.length - TELEGRAM_UNDELIVERABLE.length);
 	for (const entry of TELEGRAM_UNDELIVERABLE)
 		expect(
@@ -1386,7 +1387,7 @@ test("RT-CAPABILITY-02 the same sweep on discord refuses nothing for capability 
 		expect(errorFrame(client.frames, `cap2-${index}`), entry.name).toBeUndefined();
 		expect(response(client.frames, `cap2-${index}`)?.result.emoji, entry.name).toBe(entry.unicode);
 	}
-	expect(database.deliveryRows()).toHaveLength(REACTION_ALLOWLIST.length);
+	expect(database.outbox.rows()).toHaveLength(REACTION_ALLOWLIST.length);
 	expect(reactionEvents(client.frames)).toHaveLength(REACTION_ALLOWLIST.length);
 });
 
@@ -1420,7 +1421,7 @@ test("RT-CAPABILITY-05 no spelling of an undeliverable emoji gets through chat.r
 		expect(error.error.message, label).toContain("telegram cannot react with");
 		expect(response(client.frames, `cap5-${index}`), label).toBeUndefined();
 	}
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 	// Door 2: the reply token path, one turn per entry.
 	const skipped = await withCapturedLog(async (lines) => {
 		for (let index = 0; index < TELEGRAM_UNDELIVERABLE.length; index++) {
@@ -1443,7 +1444,7 @@ test("RT-CAPABILITY-05 no spelling of an undeliverable emoji gets through chat.r
 	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(
 		TELEGRAM_UNDELIVERABLE.map((entry) => `본문-${entry.name}`),
 	);
-	expect(database.deliveryRows()).toHaveLength(TELEGRAM_UNDELIVERABLE.length);
+	expect(database.outbox.rows()).toHaveLength(TELEGRAM_UNDELIVERABLE.length);
 });
 
 test("RT-CAPABILITY-03 undeliverable reply tokens on telegram are logged, never delivered, and never cost the text", async () => {
@@ -1501,7 +1502,7 @@ test("RT-CAPABILITY-04 a mixed reply on telegram lands the deliverable reaction,
 	});
 	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["본문"]);
 	// Two ledger rows: the surviving reaction and the text. Nothing for the skip.
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(2);
 	expect(rows.some((row) => row.payload_json.includes("✅"))).toBe(false);
 });
@@ -1517,6 +1518,7 @@ async function preambleGateway(): Promise<{ client: Client; preambles: string[] 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1528,7 +1530,7 @@ async function preambleGateway(): Promise<{ client: Client; preambles: string[] 
 		mentionAllowlist: ["human-1"],
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (originKey, epoch) => ({ sessionId: `session-${originKey}-${epoch}` }),

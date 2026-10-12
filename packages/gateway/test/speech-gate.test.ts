@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { draftScore, speechGateApplies } from "../src/engagement/speech-gate";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 const OWNER = "owner-1";
@@ -107,6 +107,7 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -114,7 +115,7 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 		channels: { "chan-1": { engagement: "open" } },
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: OWNER } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
 		respond: async () => reply,

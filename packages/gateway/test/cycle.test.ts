@@ -12,7 +12,7 @@ import {
 	RuntimeCycleProjector,
 	type RuntimeCycleSources,
 } from "../src/ops/cycle";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 const generatedAt = "2026-08-26T00:00:00.000Z";
 
@@ -38,6 +38,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		unknownDeliveryStates: [],
 		unsettledByOrigin: new Map(),
 		memoryIntents: new Map(),
+		memoryGitIndexLock: null,
 		monitorStages: new Map(),
 		monitorAuthoringLost: [],
 		memoryClosing: false,
@@ -50,6 +51,8 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		monitorTerminalStreak: 0,
 		brokerRespawnChurn: false,
 		brokerExitRecord: undefined,
+		brokerAgent: null,
+		slo: { days: [], windows: [], ok: false },
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -81,6 +84,26 @@ describe("runtime cycle projection", () => {
 		);
 		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(
 			"gjc_unverified_version",
+		);
+	});
+	test("broker-agent drift is reported without gating, while missing authority blocks the cycle", () => {
+		const agent = (status: "provisioned" | "unprovisioned" | "interrupted", state: "source_changed" | "missing_copy") => ({
+			status,
+			provisionedAt: status === "provisioned" ? "2026-09-01T00:00:00.000Z" : null,
+			genId: status === "provisioned" ? "generation-1" : null,
+			source: status === "provisioned" ? "/operator/.gjc/agent" : null,
+			entries: [{ name: "agent.db" as const, kind: "credentials", state }],
+		});
+		const changed = projectRuntimeCycle(sources({ brokerAgent: agent("provisioned", "source_changed") }), generatedAt);
+		expect(changed.brokerAgent?.entries[0]?.state).toBe("source_changed");
+		expect(changed.gates).not.toContain("broker_agent_unprovisioned");
+		for (const status of ["unprovisioned", "interrupted"] as const) {
+			expect(projectRuntimeCycle(sources({ brokerAgent: agent(status, "missing_copy") }), generatedAt).gates).toContain(
+				"broker_agent_unprovisioned",
+			);
+		}
+		expect(projectRuntimeCycle(sources({ brokerAgent: agent("provisioned", "missing_copy") }), generatedAt).gates).toContain(
+			"broker_agent_unprovisioned",
 		);
 	});
 
@@ -234,7 +257,7 @@ describe("runtime cycle projection", () => {
 
 	test("runtime-cycle snapshot reads the broker exit file from agentDir without changing GJC state", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-broker-exit-"));
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		try {
 			const agentDir = join(directory, "agent");
 			const sdkDir = join(agentDir, "sdk");
@@ -413,6 +436,13 @@ describe("runtime cycle projection", () => {
 	test("quarantined memory intent gates memory_closure_blocked and degrades", () => {
 		const result = projectRuntimeCycle(sources({ memoryIntents: new Map([["quarantined", 1]]) }), generatedAt);
 		expect(result.gates).toContain("memory_closure_blocked");
+		expect(result.phase).toBe("degraded");
+	});
+	test("memory git index lock gates the projection and preserves its observation", () => {
+		const lock = { path: "/memory/.git/index.lock", ageMs: 60_000 };
+		const result = projectRuntimeCycle(sources({ memoryGitIndexLock: lock }), generatedAt);
+		expect(result.gates).toContain("memory_git_index_locked");
+		expect(result.memoryGitIndexLock).toEqual(lock);
 		expect(result.phase).toBe("degraded");
 	});
 

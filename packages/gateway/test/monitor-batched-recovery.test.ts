@@ -6,13 +6,12 @@ import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 afterEach(async () => {
 	database?.close();
 	database = undefined;
@@ -22,7 +21,7 @@ afterEach(async () => {
 
 async function harness(respond: SessionPortResponder) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const monitor = registry.add({
 		name: "canonicalize",
@@ -36,13 +35,13 @@ async function harness(respond: SessionPortResponder) {
 		registry,
 		sessionPort: sessionPortFromScript({ bind: async () => ({ sessionId: "s1" }), respond }),
 		memory: new MemoryClosureQueue(database, home),
-		delivery: new DeliveryService(new DeliveryLedger(database)),
+		delivery: new DeliveryService(database),
 		emit: () => {},
 	});
 	return { propagator, monitor, database };
 }
 
-const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
+const stage = (db: Store, id: string) => db.monitors.eventRows().find((row) => row.event_id === id)?.stage;
 
 test("an event stranded at batched by a dead process is recovered by reconcile", async () => {
 	const {
@@ -54,16 +53,18 @@ test("an event stranded at batched by a dead process is recovered by reconcile",
 	// Simulate the crash: the row is left at `batched` with no authored output, exactly the
 	// state a gateway restart mid-dispatch leaves behind.
 	const eventId = crypto.randomUUID();
-	db.monitorEventCreate({
-		eventId,
-		monitorId: monitor.monitorId,
-		eventType: "memory.canonicalize",
-		payloadJson: JSON.stringify({ at: new Date().toISOString() }),
-		firedAt: new Date().toISOString(),
+	db.transaction((tx) => {
+		db.monitors.eventCreate(tx, {
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "memory.canonicalize",
+			payloadJson: JSON.stringify({ at: new Date().toISOString() }),
+			firedAt: new Date().toISOString(),
+		});
+		db.monitors.eventUpdate(tx, eventId, "batched", crypto.randomUUID());
 	});
-	db.monitorEventUpdate(eventId, "batched", crypto.randomUUID());
 	expect(stage(db, eventId)).toBe("batched");
-	expect(db.authoredOutput(eventId)).toBeUndefined();
+	expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
 
 	await propagator.reconcile();
 

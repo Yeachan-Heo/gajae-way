@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GjcClient } from "../src/orchestrator/gjc-client";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import {
 	extractRuntimeError,
@@ -13,24 +12,15 @@ import {
 	rebindableCodeOf,
 	redactSecrets,
 } from "../src/orchestrator/rebind";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 
-function child(stdout: string, stderr = "", exitCode = 0): ReturnType<typeof Bun.spawn> {
-	return {
-		stdout: new Response(stdout).body,
-		stderr: new Response(stderr).body,
-		exited: Promise.resolve(exitCode),
-		kill: () => {},
-	} as unknown as ReturnType<typeof Bun.spawn>;
-}
-
-async function openDatabase(): Promise<GatewayDatabase> {
+async function openDatabase(): Promise<Store> {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-bind-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	return database;
 }
 
@@ -80,6 +70,14 @@ test("runtime parsing accepts only declared SDK error envelopes", () => {
 		extractRuntimeError('{"type":"tool_execution_end","error":{"code":"spawn_failed","message":"tool failed"}}'),
 	).toBeUndefined();
 	expect(extractRuntimeError('{"ok":true,"error":{"code":"resource_gone","message":"not a failure"}}')).toBeUndefined();
+
+	expect(
+		extractRuntimeError(
+			'COMMAND ["sdk","serve"]\nERROR {"code":"broker_unavailable","message":"The SDK broker is unavailable."}\nCOMPLETE true',
+		),
+	).toEqual({ code: "broker_unavailable", message: "The SDK broker is unavailable." });
+	expect(extractRuntimeError('note ERROR {"code":"broker_unavailable"}')).toBeUndefined();
+	expect(extractRuntimeError("ERROR {not json")).toBeUndefined();
 });
 
 test("bind diagnostics preserve codes while redacting credential-bearing details", () => {
@@ -96,75 +94,6 @@ test("bind diagnostics preserve codes while redacting credential-bearing details
 	expect(redactSecrets('{"secrets":["first","second"]}')).toBe('{"secrets":[redacted]}');
 });
 
-test("bind-time condemned session.create rebinds exactly once with the next epoch", async () => {
-	const db = await openDatabase();
-	const commands: string[][] = [];
-	const spawn = ((options: { readonly cmd: readonly string[] }) => {
-		commands.push([...options.cmd]);
-		return commands.length === 1
-			? child(
-					JSON.stringify({ ok: false, error: { code: "resource_gone", message: "saved session no longer exists" } }) +
-						"\n",
-					"",
-					1,
-				)
-			: child(JSON.stringify({ ok: true, result: { sessionId: "session-e1" } }) + "\n");
-	}) as unknown as typeof Bun.spawn;
-	const client = new GjcClient(db, home, { spawn, log: () => {} });
-
-	await expect(client.ensureSession("discord/dm/rebind", 0)).resolves.toEqual({ sessionId: "session-e1" });
-	expect(db.getSessionRecord("discord/dm/rebind")).toEqual({ sessionId: "session-e1", epoch: 1 });
-	expect(commands).toHaveLength(2);
-	expect(commands.every((command) => command.includes("session.create"))).toBe(true);
-});
-
-test("prose-only create failure never triggers a bind-time rebind", async () => {
-	const db = await openDatabase();
-	let calls = 0;
-	const client = new GjcClient(db, home, {
-		spawn: (() => {
-			calls++;
-			return child("not JSON\n", 'Error: Session "dead-beef" not found\n', 1);
-		}) as unknown as typeof Bun.spawn,
-		log: () => {},
-	});
-
-	await expect(client.ensureSession("discord/dm/prose", 0)).rejects.toThrow("gjc session.create exited 1");
-	expect(calls).toBe(1);
-	expect(db.getSessionRecord("discord/dm/prose")).toBeUndefined();
-});
-
-test("concurrent bind callers share one in-flight session.create", async () => {
-	const db = await openDatabase();
-	let release!: () => void;
-	const exited = new Promise<number>((resolve) => {
-		release = () => resolve(0);
-	});
-	let calls = 0;
-	const client = new GjcClient(db, home, {
-		spawn: (() => {
-			calls++;
-			return {
-				stdout: new Response(JSON.stringify({ ok: true, result: { sessionId: "shared-session" } }) + "\n").body,
-				stderr: new Response("").body,
-				exited,
-				kill: () => release(),
-			} as unknown as ReturnType<typeof Bun.spawn>;
-		}) as unknown as typeof Bun.spawn,
-		log: () => {},
-	});
-
-	const first = client.ensureSession("discord/dm/shared", 0);
-	const second = client.ensureSession("discord/dm/shared", 0);
-	await Bun.sleep(1);
-	expect(calls).toBe(1);
-	release();
-	await expect(Promise.all([first, second])).resolves.toEqual([
-		{ sessionId: "shared-session" },
-		{ sessionId: "shared-session" },
-	]);
-});
-
 test("missing recovery evidence holds a bound turn instead of replaying it", async () => {
 	const db = await openDatabase();
 	const port = new ScriptedSessionPort();
@@ -172,19 +101,23 @@ test("missing recovery evidence holds a bound turn instead of replaying it", asy
 	const origin = { platform: "loopback", kind: "loopback", conversationId: "tail-evidence" } as const;
 	const repo = join(home, "workspace");
 	const binding = await port.bind({ originKey, epoch: 0, repo });
-	expect(db.putSessionAtEpoch(originKey, binding.sessionId, 0)).toBe(true);
+	expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, originKey, binding.sessionId, 0))).toBe(true);
 	const receivedAt = new Date().toISOString();
 	const opRef = personaTurnOpRef("bind-test", originKey, 0, "m-1");
 	expect(
-		db.inboundEnqueue({
-			messageId: "m-1",
-			originKey,
-			originRefJson: JSON.stringify(origin),
-			body: "never replay this without evidence",
-			receivedAt,
-		}),
+		db.transaction((tx) =>
+			db.inbox.enqueue(tx, {
+				messageId: "m-1",
+				originKey,
+				originRefJson: JSON.stringify(origin),
+				body: "never replay this without evidence",
+				receivedAt,
+			}),
+		),
 	).toBe(true);
-	db.inboundBindTurn({ messageId: "m-1", originKey, epoch: 0, opRef, sessionId: binding.sessionId });
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "m-1", originKey, epoch: 0, opRef, sessionId: binding.sessionId }),
+	);
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,
@@ -195,7 +128,7 @@ test("missing recovery evidence holds a bound turn instead of replaying it", asy
 	try {
 		await manager.recover();
 		expect(port.sendAttempts).toEqual([]);
-		expect(db.inboundTurnRow(opRef)).toMatchObject({
+		expect(db.inbox.turnRow(opRef)).toMatchObject({
 			turn_state: "bound",
 			bound_session_id: binding.sessionId,
 		});

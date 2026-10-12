@@ -7,7 +7,7 @@ import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 /**
@@ -20,7 +20,7 @@ import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.f
 
 let directory = "";
 let server: GatewayServer | undefined;
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 
 afterEach(async () => {
 	await server?.stop();
@@ -52,13 +52,14 @@ async function startGateway(port: ScriptedSessionPort) {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
 	};
-	database = await GatewayDatabase.open(config.dbPath);
+	database = await Store.open(config.dbPath);
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const runtime = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	server = runtime;
@@ -100,7 +101,7 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 	// ledger, and the ledger id is the trigger, so one onTerminal == one post.
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-fence-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	database = await Store.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
@@ -121,13 +122,13 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 	});
 	try {
 		expect(
-			database.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId: "m-fence",
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body: "왜 두 번 말해?",
 				receivedAt: new Date().toISOString(),
-			}),
+			})),
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
@@ -145,7 +146,7 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 		await Bun.sleep(50);
 		expect(terminals).toEqual([{ trigger: "m-fence", text: "한 번만 말할게" }]);
 		expect(
-			database.inboundTurnRows(database.inboundNonterminalTurns("discord/channel/chan-1")[0]?.opRef ?? ""),
+			database.inbox.turnRows(database.inbox.nonterminalTurns("discord/channel/chan-1")[0]?.opRef ?? ""),
 		).toEqual([]);
 	} finally {
 		await manager.stop();
@@ -165,7 +166,7 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	port.emitTool(send.sessionId);
 	port.emitAssistant(send.sessionId, "재시작해도 한 번만", "evt-final-1", send.opRef);
 	await eventually(() => messages(client).length === 1, "tail answer was not delivered");
-	const before = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const before = database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(before).toHaveLength(1);
 	expect(before[0]!.delivery_id.startsWith("gw-i-")).toBe(true);
 	// The gateway dies before the batch completes; the daemon finishes the op.
@@ -175,13 +176,14 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "재시작해도 한 번만");
 	// A fresh gateway on the same database recovers the accepted batch with no
 	// lifecycle memory and reconciles it from status + original operation result.
-	database = await GatewayDatabase.open(dbPath);
+	database = await Store.open(dbPath);
 	port.bind = bind;
 	port.resume = resume;
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath,
@@ -190,11 +192,11 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	};
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	await eventually(
-		() => database!.inboundNonterminalTurns("discord/channel/chan-1").length === 0,
+		() => database!.inbox.nonterminalTurns("discord/channel/chan-1").length === 0,
 		"recovered batch never completed",
 		2_000,
 	);
-	const after = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const after = database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(after.map((row) => row.delivery_id)).toEqual(before.map((row) => row.delivery_id));
 }, 20_000);
 
@@ -206,7 +208,7 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 	const send = port.sends[0]!;
 	port.complete(send.opRef, "하나\n[BREAK]\n둘\n[BREAK]\n셋");
 	await eventually(() => messages(client).length === 3, "three parts were not delivered");
-	const rows = () => database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const rows = () => database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(rows().map((row) => JSON.parse(row.payload_json).text)).toEqual(["하나", "둘", "셋"]);
 	// Each part landed exactly once. The finalized text reached the gateway on
 	// the tail first, so the rows are the interim ones; the terminal path then
@@ -219,7 +221,7 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 	// part. Exercise the real claim with the real op-ref.
 	for (let part = 0; part < 3; part++) {
 		const regenerated = deterministicTerminalDeliveryId("discord/channel/chan-1", "m-b1", part);
-		const owner = database!.inboundTurnClaimTerminal(send.opRef, part, regenerated);
+		const owner = database!.transaction((tx) => database!.inbox.claimTerminal(tx, send.opRef, part, regenerated));
 		expect(owner).not.toBe(regenerated);
 		expect(rows().some((row) => row.delivery_id === owner)).toBe(true);
 	}
@@ -235,7 +237,7 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 		return { text: last, pages: 1, complete: true };
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-backlog-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	database = await Store.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const manager = new PersonaSessionManager({
@@ -253,13 +255,13 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 	});
 	const enqueue = (messageId: string, body: string, receivedAt: string) =>
 		expect(
-			database!.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId,
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body,
 				receivedAt,
-			}),
+			})),
 		).toBe(true);
 	try {
 		// Turn 1 is running when message 2 arrives (steer fails, row stays pending).
@@ -296,13 +298,14 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
 	};
-	database = await GatewayDatabase.open(config.dbPath);
+	database = await Store.open(config.dbPath);
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
@@ -321,12 +324,12 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 	port.emitAssistant(send.sessionId, "첫 번째 발견: 500이 3분마다 찍힘", null, send.opRef);
 	port.emitAssistant(send.sessionId, "두 번째 발견: 토큰 갱신이 실패함", null, send.opRef);
 	await eventually(() => messages(client).length === 2, "two interim findings were not delivered");
-	const rows = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const rows = database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(new Set(rows.map((row) => row.delivery_id)).size).toBe(2);
 	// Replaying the first interim text (e.g. after a stream reopen backfill) is a ledger no-op.
 	port.emitAssistant(send.sessionId, "첫 번째 발견: 500이 3분마다 찍힘", null, send.opRef);
 	await Bun.sleep(100);
-	expect(database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1")).toHaveLength(2);
+	expect(database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1")).toHaveLength(2);
 	port.complete(send.opRef, "끝");
 });
 
@@ -343,7 +346,7 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 		return { text: last, pages: 1, complete: true };
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-repost-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	database = await Store.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const manager = new PersonaSessionManager({
@@ -361,13 +364,13 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
-			database!.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId,
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body,
 				receivedAt: new Date().toISOString(),
-			}),
+			})),
 		).toBe(true);
 	try {
 		enqueue("m-a1", "첫 질문");
@@ -405,7 +408,7 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 		return { text: last, pages: 1, complete: true };
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-requeue-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	database = await Store.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
@@ -429,19 +432,19 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 	let recovered: PersonaSessionManager | undefined;
 	try {
 		expect(
-			database.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId: "m-q1",
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body: "재시도",
 				receivedAt: new Date().toISOString(),
-			}),
+			})),
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first attempt was not sent");
 		const first = port.sends[0]!;
-		const firstBatch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
-		const firstFloor = database.inboundTurnDispatchedAt(firstBatch.opRef);
+		const firstBatch = database.inbox.nonterminalTurns("discord/channel/chan-1")[0]!;
+		const firstFloor = database.inbox.turnDispatchedAt(firstBatch.opRef);
 		expect(firstFloor).toBeDefined();
 		// The gateway dies mid-turn. The daemon writes an assistant row for the
 		// attempt and then the attempt FAILS.
@@ -455,26 +458,26 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 		await Bun.sleep(400);
 		await recovered.reconcile("discord/channel/chan-1");
 		await eventually(
-			() => database!.inboundNonterminalTurns("discord/channel/chan-1").length === 0,
+			() => database!.inbox.nonterminalTurns("discord/channel/chan-1").length === 0,
 			"failed turn did not settle",
 		);
 		expect(port.sends).toHaveLength(1);
 		expect(terminals).toEqual([]);
 		expect(
-			database.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId: "m-q2",
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body: "new input after failure",
 				receivedAt: new Date().toISOString(),
-			}),
+			})),
 		).toBe(true);
 		await recovered.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "new input was not sent");
 		const second = port.sends[1]!;
 		expect(second.opRef).not.toBe(first.opRef);
-		const secondBatch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
-		const secondFloor = database.inboundTurnDispatchedAt(secondBatch.opRef);
+		const secondBatch = database.inbox.nonterminalTurns("discord/channel/chan-1")[0]!;
+		const secondFloor = database.inbox.turnDispatchedAt(secondBatch.opRef);
 		expect(secondFloor).toBeDefined();
 		expect(Date.parse(secondFloor!)).toBeGreaterThan(Date.parse(firstFloor!));
 		// New input has its own dispatch floor: the failed attempt's stale row
@@ -495,7 +498,7 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	port.omitStartedAt = true;
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-legacy-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	database = await Store.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: string[] = [];
 	const logs: string[] = [];
@@ -516,18 +519,18 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 	});
 	try {
 		expect(
-			database.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId: "m-l1",
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body: "업그레이드 전 질문",
 				receivedAt: new Date().toISOString(),
-			}),
+			})),
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
 		const send = port.sends[0]!;
-		const batch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
+		const batch = database.inbox.nonterminalTurns("discord/channel/chan-1")[0]!;
 		await manager.stop();
 		// Model a row whose dispatch floor was lost (hand-edited / corrupt): no
 		// floor was ever recorded.
@@ -561,7 +564,7 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 			await Bun.sleep(100);
 			expect(terminals).toEqual([]);
 			expect(logs.some((line) => line.includes("reason=no_turn_floor"))).toBe(true);
-			expect(database.inboundNonterminalTurns("discord/channel/chan-1")).toHaveLength(1);
+			expect(database.inbox.nonterminalTurns("discord/channel/chan-1")).toHaveLength(1);
 		} finally {
 			await recovered.stop();
 		}
@@ -573,7 +576,7 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 test("a foreign turn's answer cannot replace the current turn's result-only terminal reply", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-offbyone-"));
-	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	database = await Store.open(join(directory, "gateway.db"));
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const manager = new PersonaSessionManager({
@@ -591,13 +594,13 @@ test("a foreign turn's answer cannot replace the current turn's result-only term
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
-			database!.inboundEnqueue({
+			database!.transaction((tx) => database!.inbox.enqueue(tx, {
 				messageId,
 				originKey: "discord/channel/chan-1",
 				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
 				body,
 				receivedAt: new Date().toISOString(),
-			}),
+			})),
 		).toBe(true);
 	try {
 		enqueue("m-o1", "야");

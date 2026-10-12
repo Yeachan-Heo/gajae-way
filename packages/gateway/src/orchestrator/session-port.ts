@@ -22,7 +22,8 @@ import {
 	TranscriptIncompleteError,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
-import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
+import { BrokerAuthorityError, type Store } from "../store";
+import type { BrokerAuthority } from "../store/groups/bindings";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -292,7 +293,7 @@ export class SessionTerminalError extends Error {
 }
 
 export interface BrokerSessionPortOptions {
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly cli: CliRunner;
 	readonly instanceId: string;
 	readonly tailRunner: TailRunner;
@@ -329,23 +330,24 @@ const BUSY_POLL_MS = 2_000;
  * transport: it neither discovers an endpoint nor opens an authenticated socket.
  */
 export class BrokerSessionPort implements SessionPort {
-	readonly #database: GatewayDatabase;
+	readonly #database: Store;
 	readonly #cli: CliRunner;
 	readonly #instanceId: string;
 	readonly #tailRunner: TailRunner;
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
+	readonly #bindings = new Map<string, Promise<SessionBinding>>();
 	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
 		this.#database = options.database;
 		this.#authority = { ...options.authority };
-		this.#database.assertBrokerAuthority(this.#authority);
+		this.#database.bindings.assertAuthority(this.#authority);
 		this.#cli = async (args, commandOptions) => {
-			this.#database.assertBrokerAuthority(this.#authority);
+			this.#database.bindings.assertAuthority(this.#authority);
 			const result = await options.cli(args, commandOptions);
-			this.#database.assertBrokerAuthority(this.#authority);
+			this.#database.bindings.assertAuthority(this.#authority);
 			// Steering requires an unambiguous control receipt: do not promote a
 			// failed transport to a definitive rejection merely because stdout is JSON.
 			return args.includes("turn.steer") ? result : normalizeSdkEnvelopeFailure(result);
@@ -371,11 +373,22 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	async bind(input: SessionBindInput): Promise<SessionBinding> {
-		this.#database.assertBrokerAuthority(this.#authority);
+	bind(input: SessionBindInput): Promise<SessionBinding> {
+		const key = `${input.originKey}#${input.epoch}`;
+		const existing = this.#bindings.get(key);
+		if (existing) return existing;
+		const pending = this.#bind(input).finally(() => {
+			if (this.#bindings.get(key) === pending) this.#bindings.delete(key);
+		});
+		this.#bindings.set(key, pending);
+		return pending;
+	}
+
+	async #bind(input: SessionBindInput): Promise<SessionBinding> {
+		this.#database.bindings.assertAuthority(this.#authority);
 		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0)
 			throw new Error("session epoch must be a non-negative integer");
-		const existing = this.#database.getSessionRecord(input.originKey);
+		const existing = this.#database.bindings.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
 			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
 			// Only owned bindings may be inspected, resumed, or replaced.
@@ -416,7 +429,7 @@ export class BrokerSessionPort implements SessionPort {
 				this.#resetCreateRotations(input.originKey);
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 			}
-			const rebound = this.#database.rebindEpoch(input.originKey);
+			const rebound = this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, input.originKey));
 			console.info(
 				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
 			);
@@ -437,28 +450,29 @@ export class BrokerSessionPort implements SessionPort {
 				);
 				throw error;
 			}
-			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
-			const nextEpoch = this.#database.rebindEpoch(input.originKey);
+			this.#database.core.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
+			const nextEpoch = this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, input.originKey));
 			console.info(
 				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key code=${poisonedCode}`,
 			);
 			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
 		}
-		if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
+		const sessionId = created.sessionId;
+		if (typeof sessionId !== "string" || sessionId.length === 0) {
 			throw new Error("session.create succeeded without a sessionId");
 		}
-		const persistedEpoch = this.#database.getSessionRecord(input.originKey)?.epoch;
+		const persistedEpoch = this.#database.bindings.getSessionRecord(input.originKey)?.epoch;
 		if (persistedEpoch !== undefined && persistedEpoch > input.epoch) {
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
 		if (
-			!this.#database.recordOwnedBinding({
+			!this.#database.transaction((tx) => this.#database.bindings.recordOwnedBinding(tx, {
 				authority: this.#authority,
-				sessionId: created.sessionId,
+				sessionId,
 				originKey: input.originKey,
 				epoch: input.epoch,
 				repo: input.repo,
-			})
+			}))
 		) {
 			throw new Error(
 				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,
@@ -467,10 +481,10 @@ export class BrokerSessionPort implements SessionPort {
 		// session.create returns once the host is admitted; the Router indexes it
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
-		await this.#awaitIndexed(created.sessionId, input.repo);
+		await this.#awaitIndexed(sessionId, input.repo);
 		this.#resetCreateRotations(input.originKey);
 		return {
-			sessionId: created.sessionId,
+			sessionId,
 			originKey: input.originKey,
 			epoch: input.epoch,
 			repo: input.repo,
@@ -479,13 +493,13 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	#createRotations(originKey: string): number {
-		const raw = this.#database.metaGet(createRotationMetaKey(originKey));
+		const raw = this.#database.core.metaGet(createRotationMetaKey(originKey));
 		const value = raw === undefined ? Number.NaN : Number(raw);
 		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 	}
 
 	#resetCreateRotations(originKey: string): void {
-		this.#database.metaSet(createRotationMetaKey(originKey), "0");
+		this.#database.core.metaSet(createRotationMetaKey(originKey), "0");
 	}
 
 	#createChain: Promise<unknown> = Promise.resolve();
@@ -649,8 +663,7 @@ export class BrokerSessionPort implements SessionPort {
 		if (pid === undefined || live === false) return { outcome: "already_gone" };
 		const command = await processCommand(pid);
 		if (command === undefined) return { outcome: "already_gone" };
-		// The only process shape this gateway may end. Broker (`broker-internal`),
-		// daemon (`daemon-internal`) and anything else are someone else's.
+		// The only process shape this gateway may end. The broker, daemon, and anything else are someone else's.
 		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
 			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
 		try {
@@ -706,9 +719,9 @@ export class BrokerSessionPort implements SessionPort {
 			const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 			let waited = false;
 			for (;;) {
-				this.#database.assertBrokerAuthority(this.#authority);
+				this.#database.bindings.assertAuthority(this.#authority);
 				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
-				this.#database.assertBrokerAuthority(this.#authority);
+				this.#database.bindings.assertAuthority(this.#authority);
 				if (response.ok) {
 					const result = recordOf(response.result) ?? {};
 					const receipt = recordOf(result.receipt) ?? result;
@@ -748,9 +761,9 @@ export class BrokerSessionPort implements SessionPort {
 			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
 		let response: RelayResponse;
 		try {
-			this.#database.assertBrokerAuthority(this.#authority);
+			this.#database.bindings.assertAuthority(this.#authority);
 			response = await relay.control("turn.steer", { text: input.text, clientRef: input.clientRef });
-			this.#database.assertBrokerAuthority(this.#authority);
+			this.#database.bindings.assertAuthority(this.#authority);
 		} finally {
 			if (!input.relay) await relay.close();
 		}
@@ -843,9 +856,9 @@ export class BrokerSessionPort implements SessionPort {
 		// `session status` performs the identical `turn.result` query.
 		if (!input.relay)
 			return await fetchOpState(this.#controller(input.repo, input.priority), input.sessionId, input.opRef);
-		this.#database.assertBrokerAuthority(this.#authority);
+		this.#database.bindings.assertAuthority(this.#authority);
 		const response = await input.relay.query("turn.result", { kind: "prompt", clientRef: input.opRef });
-		this.#database.assertBrokerAuthority(this.#authority);
+		this.#database.bindings.assertAuthority(this.#authority);
 		if (!response.ok) throw relayFailure("turn.result", response);
 		const status = recordOf(response.result) ?? {};
 		const raw = typeof status.status === "string" ? status.status : "unknown";
@@ -1168,7 +1181,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	#assertOwned(input: { sessionId: string; repo: string }): void {
-		this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
+		this.#database.bindings.assertOwnedSession(input.sessionId, input.repo, this.#authority);
 	}
 
 	/**
@@ -1225,12 +1238,12 @@ export class BrokerSessionPort implements SessionPort {
 	#relayTransport(relay: TailHandle): SdkTransport {
 		return async (kind, name, input, options) => {
 			const requestOptions = options?.cursor ? { cursor: options.cursor } : {};
-			this.#database.assertBrokerAuthority(this.#authority);
+			this.#database.bindings.assertAuthority(this.#authority);
 			const response =
 				kind === "control"
 					? await relay.control(name, input ?? {}, requestOptions)
 					: await relay.query(name, input ?? {}, requestOptions);
-			this.#database.assertBrokerAuthority(this.#authority);
+			this.#database.bindings.assertAuthority(this.#authority);
 			return {
 				exitCode: 0,
 				stdout: JSON.stringify({

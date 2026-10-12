@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /**
  * `gajaeway setup`: guided credential setup for the platform adapters.
@@ -30,7 +31,7 @@ export const SETUP_ENV = {
 } as const;
 
 export const SETUP_USAGE =
-	"usage: gajaeway setup [--from-env] [--adapters discord,slack,telegram] [--owner ID[,ID...]] [--discord-app-id ID] | setup --status";
+	"usage: gajaeway setup [--from-env] [--adapters discord,slack,telegram] [--owner ID[,ID...]] [--discord-app-id ID] | setup --status | setup --broker-agent [--from DIR]";
 
 /** Secret file names under `$GAJAEWAY_HOME/secrets`, matching docs/deployment.md. */
 export const SECRET_FILES = {
@@ -59,16 +60,19 @@ export function redact(text: string, secrets: Iterable<string>): string {
 }
 
 export interface ParsedSetupArgs {
-	readonly mode: "setup" | "status";
+	readonly mode: "setup" | "status" | "broker-agent";
 	readonly fromEnv: boolean;
 	readonly adapters?: readonly SetupPlatform[];
 	readonly owners: readonly string[];
 	readonly discordAppId?: string;
+	readonly from?: string;
 }
 
 export function parseSetupArgs(args: readonly string[]): ParsedSetupArgs {
 	let fromEnv = false;
 	let status = false;
+	let brokerAgent = false;
+	let from: string | undefined;
 	let adapters: SetupPlatform[] | undefined;
 	const owners: string[] = [];
 	let discordAppId: string | undefined;
@@ -76,7 +80,13 @@ export function parseSetupArgs(args: readonly string[]): ParsedSetupArgs {
 		const flag = args[i] as string;
 		if (flag === "--from-env") fromEnv = true;
 		else if (flag === "--status") status = true;
-		else if (flag === "--adapters" || flag === "--owner" || flag === "--discord-app-id") {
+		else if (flag === "--broker-agent") brokerAgent = true;
+		else if (flag === "--from") {
+			const value = args[++i];
+			if (value === undefined || value.trim() === "" || value.startsWith("--"))
+				throw new SetupError(`${flag} expects a value\n${SETUP_USAGE}`);
+			from = value;
+		} else if (flag === "--adapters" || flag === "--owner" || flag === "--discord-app-id") {
 			const value = args[++i];
 			if (value === undefined || value.trim() === "" || value.startsWith("--"))
 				throw new SetupError(`${flag} expects a value\n${SETUP_USAGE}`);
@@ -89,14 +99,18 @@ export function parseSetupArgs(args: readonly string[]): ParsedSetupArgs {
 			);
 		} else throw new SetupError(`unknown option: ${flag.split("=")[0]}\n${SETUP_USAGE}`);
 	}
-	if (status && (fromEnv || adapters || owners.length > 0 || discordAppId))
+	if (status && (fromEnv || brokerAgent || from !== undefined || adapters || owners.length > 0 || discordAppId))
 		throw new SetupError(`--status takes no other options\n${SETUP_USAGE}`);
+	if (brokerAgent && (fromEnv || adapters || owners.length > 0 || discordAppId))
+		throw new SetupError(`--broker-agent is standalone and cannot be combined with adapter setup options\n${SETUP_USAGE}`);
+	if (from !== undefined && !brokerAgent) throw new SetupError(`--from requires --broker-agent\n${SETUP_USAGE}`);
 	return {
-		mode: status ? "status" : "setup",
+		mode: status ? "status" : brokerAgent ? "broker-agent" : "setup",
 		fromEnv,
 		...(adapters ? { adapters } : {}),
 		owners,
 		...(discordAppId ? { discordAppId } : {}),
+		...(from === undefined ? {} : { from }),
 	};
 }
 
@@ -554,12 +568,40 @@ export function terminalPrompter(): Prompter {
 	};
 }
 
+export interface BrokerAgentRunResult {
+	readonly exitCode: number;
+	readonly stdout: string;
+	readonly stderr: string;
+}
+
+export type BrokerAgentRunner = (command: readonly string[]) => Promise<BrokerAgentRunResult>;
+
+async function defaultBrokerAgentRunner(command: readonly string[]): Promise<BrokerAgentRunResult> {
+	const child = Bun.spawn([...command], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	return { exitCode, stdout, stderr };
+}
+
+async function setupBinDir(options: RunSetupOptions): Promise<string> {
+	if (options.binDir !== undefined) return options.binDir;
+	const env = options.env ?? process.env;
+	if (env.GAJAEWAY_BIN_DIR) return env.GAJAEWAY_BIN_DIR;
+	const executable = await realpath(process.execPath).catch(() => undefined);
+	if (executable !== undefined && basename(executable).startsWith("gajaeway")) return dirname(executable);
+	throw new SetupError("setup --broker-agent requires the installed gajaeway binary or an explicit bin directory");
+}
 export interface RunSetupOptions {
 	readonly home: string;
+	readonly binDir?: string;
 	readonly env?: NodeJS.ProcessEnv;
 	readonly fetch?: FetchLike;
 	readonly prompter?: () => Prompter;
 	readonly log?: (line: string) => void;
+	readonly runBrokerAgent?: BrokerAgentRunner;
 }
 
 /** The whole command. Returns the lines it printed so tests can assert nothing secret escaped. */
@@ -568,6 +610,23 @@ export async function runSetup(args: readonly string[], options: RunSetupOptions
 	const parsed = parseSetupArgs(args);
 	if (parsed.mode === "status") {
 		log((await enabledAdapters(options.home)).join(","));
+		return;
+	}
+	if (parsed.mode === "broker-agent") {
+		const command = [
+			join(await setupBinDir(options), "gajaeway-gateway"),
+			"broker-agent",
+			"provision",
+			"--mode",
+			"force",
+			...(parsed.from === undefined ? [] : ["--from", parsed.from]),
+		];
+		const result = await (options.runBrokerAgent ?? defaultBrokerAgentRunner)(command);
+		if (result.stdout.length > 0) process.stdout.write(result.stdout);
+		if (result.stderr.length > 0) process.stderr.write(result.stderr);
+		if (result.exitCode === 1 && /lease_held name=broker/.test(`${result.stdout}\n${result.stderr}`))
+			log("broker lease is held; stop it with: systemctl --user stop gajaeway-broker");
+		process.exitCode = result.exitCode;
 		return;
 	}
 	let tokens: SetupTokens;

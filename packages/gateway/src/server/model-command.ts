@@ -1,11 +1,15 @@
 import { join } from "node:path";
-import type { GjcModelSelection } from "../store/db";
+import type { GjcModelSelection } from "../store/groups/bindings";
+import type { WriteTx } from "../store/tx";
 
 /** The store surface `/model` needs; narrowed so tests need no real database. */
 export interface ModelOverrideStore {
-	conversationModelGet(originKey: string): { readonly selection: GjcModelSelection } | undefined;
-	conversationModelSet(originKey: string, selection: GjcModelSelection, setBy?: string): void;
-	conversationModelClear(originKey: string): boolean;
+	readonly bindings: {
+		modelGet(originKey: string): { readonly selection: GjcModelSelection } | undefined;
+		modelSet(tx: WriteTx, originKey: string, selection: GjcModelSelection, setBy?: string): void;
+		modelClear(tx: WriteTx, originKey: string): boolean;
+	};
+	transaction<T>(operation: (tx: WriteTx) => T): T;
 }
 
 export type ModelRebindIntent =
@@ -82,7 +86,7 @@ export function applyModelCommand(
 	const rest = text.slice("/model".length).trim();
 	const [head = "", ...tail] = rest.split(/\s+/).filter((part) => part !== "");
 	const showEffective = (): string => {
-		const override = store.conversationModelGet(originKey)?.selection;
+		const override = store.bindings.modelGet(originKey)?.selection;
 		if (override) return `🦞 model: **${describeSelection(override)}** (this conversation)`;
 		if (configModel) return `🦞 model: **${describeSelection(configModel)}** (gateway default)`;
 		return "🦞 model: **gjc default** (no gateway setting, no conversation override)";
@@ -91,13 +95,13 @@ export function applyModelCommand(
 	if (rest === "" || head === "show") return { text: showEffective() };
 
 	if (head === "clear" || head === "reset" || head === "default") {
-		const existing = store.conversationModelGet(originKey)?.selection;
+		const existing = store.bindings.modelGet(originKey)?.selection;
 		if (!existing) return { text: `no conversation override to clear. ${showEffective()}` };
 		if (!configModel)
 			return {
 				text: "cannot live-clear this override because no gateway default model is configured. Set a gateway model or choose an explicit model instead.",
 			};
-		store.conversationModelClear(originKey);
+		store.transaction((tx) => store.bindings.modelClear(tx, originKey));
 		return {
 			text: `🦞 cleared this conversation's override. ${showEffective()} The model applies from the next turn on this same session.`,
 			rebind: { kind: "clear" },
@@ -110,7 +114,7 @@ export function applyModelCommand(
 		return {
 			text: `could not read that selection (${parsed.error}). usage: \`/model\`, \`/model set <preset-or-selector>\`, \`/model clear\``,
 		};
-	store.conversationModelSet(originKey, parsed, setBy);
+	store.transaction((tx) => store.bindings.modelSet(tx, originKey, parsed, setBy));
 	const scope = origin.platform === "loopback" ? "this session" : "this conversation";
 	return {
 		text: `🦞 model set to **${describeSelection(parsed)}** for ${scope}. It applies from the next turn on this same session.`,

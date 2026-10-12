@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
@@ -48,7 +48,7 @@ async function settle(): Promise<void> {
 
 interface Harness {
 	readonly client: Client;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	/** Turn texts the gateway actually dispatched to gjc: a reaction must add none. */
 	readonly turns: string[];
 	/** Messages the gateway steered into a running turn. */
@@ -61,6 +61,7 @@ async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -72,7 +73,7 @@ async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 			"slack:C1": { engagement: "open" },
 		},
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	// `hold` keeps the turn running (accepted, no terminal) so later messages are steered.
 	const sessionPort = (hold ? sessionPortFromScript : sessionPortFromResponder)({
@@ -138,7 +139,7 @@ test("an accepted steer is acknowledged with 👀 on the steered message at once
 		expect(reactions).toHaveLength(1);
 		expect(reactions[0].payload.reaction).toEqual({ targetMessageId: "m2", emoji: "👀", emojiName: "eyes" });
 		// A real, settleable ledger row like every other reaction.
-		expect(database.deliveryRows().some((row) => row.delivery_id === reactions[0].payload.deliveryId)).toBe(true);
+		expect(database.outbox.rows().some((row) => row.delivery_id === reactions[0].payload.deliveryId)).toBe(true);
 	} finally {
 		finish();
 	}
@@ -213,9 +214,9 @@ test("an inbound reaction is metadata: it never creates a turn", async () => {
 	// The three ways a turn could exist, all absent.
 	expect(turns).toEqual([]);
 	expect(client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")).toBe(false);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 	// It is recorded as conversation context instead.
-	const unread = database.contextUnread(ORIGIN_KEY);
+	const unread = database.inbox.contextUnread(ORIGIN_KEY);
 	expect(unread).toHaveLength(1);
 	expect(unread[0]?.body).toBe("[reaction] reacted 👍 to message m-ours");
 	expect(unread[0]?.author_name).toBe("형님");
@@ -244,7 +245,7 @@ test("a removed reaction is recorded as its own retraction, not as an erased add
 	}
 	await settle();
 	expect(turns).toEqual([]);
-	const bodies = database.contextUnread(ORIGIN_KEY).map((entry) => entry.body);
+	const bodies = database.inbox.contextUnread(ORIGIN_KEY).map((entry) => entry.body);
 	expect(bodies).toEqual([
 		"[reaction] reacted 👍 to message m-ours",
 		"[reaction] removed their 👍 reaction from message m-ours",
@@ -318,7 +319,7 @@ test("a reaction-only reply acknowledges without speaking, as a ledger delivery"
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "d1").result).toEqual({
 		settled: true,
 	});
-	expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)?.state).toBe("confirmed");
+	expect(database.outbox.rows().find((row) => row.delivery_id === deliveryId)?.state).toBe("confirmed");
 });
 
 test("a reaction that fails on the platform is a reportable ledger failure, never a silent drop", async () => {
@@ -337,7 +338,7 @@ test("a reaction that fails on the platform is a reportable ledger failure, neve
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "d1").result).toEqual({
 		recorded: true,
 	});
-	const row = database.deliveryRows().find((entry) => entry.delivery_id === deliveryId);
+	const row = database.outbox.rows().find((entry) => entry.delivery_id === deliveryId);
 	expect(row?.attempts).toBe(1);
 	expect(row?.state).toBe("pending");
 });
@@ -378,8 +379,8 @@ test("the silence token still suppresses everything, with no reaction leaking ou
 	sendMessage(client, "c1");
 	await settle();
 	expect(client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")).toBe(false);
-	expect(database.deliveryRows()).toHaveLength(0);
-	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database.outbox.rows()).toHaveLength(0);
+	expect(database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 });
 
 test("the per-turn cap bounds how many reactions one reply can emit", async () => {
@@ -412,7 +413,7 @@ test("chat.react reacts to one named message and returns its ledger delivery id"
 	const event = reactionEvents(client.frames)[0];
 	expect(event.payload.reaction).toEqual({ targetMessageId: "1418812345678", emoji: "🦞", emojiName: "lobster" });
 	expect(event.payload.deliveryId).toBe(response.result.deliveryId);
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
 });
 
 test("chat.react rejects a disallowed emoji with an error that names the allowlist", async () => {
@@ -526,7 +527,7 @@ test("the reaction verbs refuse an origin no chat adapter can settle", async () 
 		expect(client.frames.find((frame) => frame.type === "error" && frame.id === id).error.message).toContain(
 			"requires a discord, telegram or slack origin",
 		);
-	expect(database.deliveryRows()).toHaveLength(0);
+	expect(database.outbox.rows()).toHaveLength(0);
 });
 
 test("a reaction storm in one millisecond keeps every event instead of colliding on one id", async () => {
@@ -547,7 +548,7 @@ test("a reaction storm in one millisecond keeps every event instead of colliding
 		});
 	await settle();
 	expect(turns).toEqual([]);
-	expect(database.contextUnread(ORIGIN_KEY, 100)).toHaveLength(6);
+	expect(database.inbox.contextUnread(ORIGIN_KEY, 100)).toHaveLength(6);
 });
 
 test("a reactor cannot forge context lines through the emoji field", async () => {
@@ -566,7 +567,7 @@ test("a reactor cannot forge context lines through the emoji field", async () =>
 		},
 	});
 	await settle();
-	const body = database.contextUnread(ORIGIN_KEY)[0]?.body ?? "";
+	const body = database.inbox.contextUnread(ORIGIN_KEY)[0]?.body ?? "";
 	expect(body).not.toContain("\n");
 	expect(body.length).toBeLessThan(120);
 });
@@ -598,7 +599,7 @@ test("a reaction Telegram cannot express is refused, not queued as a dead delive
 	expect(refused.error.message.split("it accepts:")[1]).not.toContain("✅");
 	// The same verb on the same message with a deliverable emoji still works.
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "k2").result.emoji).toBe("👍");
-	expect(database.deliveryRows()).toHaveLength(1);
+	expect(database.outbox.rows()).toHaveLength(1);
 });
 
 test("a reaction token Telegram cannot express is skipped while the reply still speaks", async () => {
@@ -674,6 +675,6 @@ test("a slack channel origin is a chat platform: send, react, and inbound reacti
 		engaged: false,
 	});
 	// Text reply + reply reaction + explicit chat.react: three rows, all settleable.
-	expect(database.deliveryRows()).toHaveLength(3);
+	expect(database.outbox.rows()).toHaveLength(3);
 	expect(turns).toHaveLength(1);
 });

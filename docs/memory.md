@@ -121,17 +121,21 @@ These are seeded automatically on a database's first boot (removals are never re
 
 Canonicalization reads daily captures, consolidates durable facts into the relevant canonical axes, and keeps `MEMORY.md` as a generated map. The audit then reports the structural state to the owner channel. Review changes as ordinary Markdown and Git changes; daily capture remains the source material rather than an invisible side channel.
 
+## Memory lease and Git lock gate
+
+The gateway acquires the `gateway` lease and then the `memory` lease at startup, holding both for its lifetime. The kernel-backed `memory` lease serializes access to the corpus with offline memory administration; the CLI memory import also acquires it. A Git index lock is a separate condition: when Git reports that `.git/index.lock` blocks a write, the operation raises `MemoryGitLockedError` and leaves the durable intent for recovery rather than quarantining it. `gajaeway ops cycle` reports `memory_git_index_locked` while the lock path exists. Identify and resolve the Git operation that owns the lock; do not remove it based on its age alone.
+
 ## Closure ladder and recovery
 
 Memory writes use a durable closure ladder so a reply does not have to wait for Git work:
 
 1. Store an intent in the gateway database (the acceptance boundary).
 2. Write the daily Markdown capture and regenerate `MEMORY.md`.
-3. Commit the whole corpus in the memory repository with `Gajaeway-Mutation-Id: <id>` in the commit message. Staging is not limited to the capture axis: every registered axis is committed, so a reflection or an `ops` rule written by hand between two captures enters the same reviewable history instead of sitting untracked.
-4. Append a receipt containing the mutation ID, commit hash, and timestamp to `$GAJAEWAY_HOME/memory-receipts.jsonl`.
-5. On startup, resume queued, written, or committed intents. If the evidence cannot be recovered, mark the intent **quarantined**; do not erase the intent, receipt, or Git history to hide it.
+3. Commit the whole corpus in the memory repository with `Gajaeway-Mutation-Id: <id>` in the commit message. Staging is not limited to the capture axis: every registered axis is committed, so hand-written changes in other axes enter the same reviewable history.
+4. Mark the intent `receipted` in the gateway database. There is no separate filesystem receipt; recovery verifies the commit by its mutation-id trailer and durable intent state.
+5. On startup, resume queued, written, or committed intents. If the evidence cannot be recovered, mark the intent **quarantined**; do not erase the intent or Git history to hide it.
 
-This is why a crash can leave a repeatable recovery record instead of a half-explained note. The queue serializes closure work. It checks existing commits and receipts before repeating a step.
+The queue serializes closure work and checks for an existing commit before repeating a step. A Git index lock keeps the intent retryable; after the blocking Git process finishes, the cycle gate clears and normal recovery can proceed.
 
 ## Audit gate
 

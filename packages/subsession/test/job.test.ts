@@ -144,6 +144,13 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		expect(() => parseLaneJobRecord(raw)).toThrow(/schemaVersion/);
 	});
 
+	test("reads a version-1 record as version 2 (v2 only added optional lane.repository)", () => {
+		const raw = JSON.stringify({ ...JSON.parse(JSON.stringify(record())), schemaVersion: 1 });
+		const parsed = parseLaneJobRecord(raw);
+		expect(parsed.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
+		expect(parsed.lane.repository).toBeUndefined();
+	});
+
 	test("refuses corrupt JSON and structural garbage instead of coercing", () => {
 		expect(() => parseLaneJobRecord("{not json")).toThrow(LaneJobError);
 		expect(() => parseLaneJobRecord("42")).toThrow(/JSON object/);

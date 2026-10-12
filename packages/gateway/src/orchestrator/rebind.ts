@@ -5,13 +5,14 @@
  * Measured problem: the gateway derives ONE idempotency key per origin+epoch
  * (`gajaeway-<instanceId>-<originKey>-e<epoch>`). When the runtime condemns that
  * key, the session.create op fails identically forever and the host goes mute;
- * recovery used to require hand-editing `gateway.db` to bump `epoch`. A poisoned
+ * recovery used to require hand-editing the gateway database to bump `epoch`. A poisoned
  * key is not a broken conversation, so the codes below are classified as
  * REBINDABLE: the remedy is a new key (epoch bump), not a retry.
  *
  * Classification is strictly code-based. Human-readable message text is never
  * matched, because message wording is not a contract.
  */
+import type { Store } from "../store";
 
 /**
  * Codes that are permanent for the poisoned idempotency key and absent for a
@@ -24,7 +25,7 @@
  * - `resume_unusable`: the runtime no longer holds the bound session id, so the
  *   session cannot be re-attached from here (measured on the former per-turn
  *   process path, where the runtime raised an uncaught exception with no
- *   structured code and every monitor tick failed identically until `gateway.db`
+ *   structured code and every monitor tick failed identically until the gateway database
  *   was hand-edited). Kept as a bind-time classification; it is never inferred
  *   from message text.
  */
@@ -138,23 +139,37 @@ function stripControl(text: string, keepWhitespace = false): string {
 
 /**
  * Pulls the runtime's structured error out of a gjc stdout/stderr blob. Only a
- * declared error frame counts: the gjc SDK envelope `{"ok":false,…}` or an
- * ndjson `{"type":"error",…}`. Non-JSON noise lines are skipped.
+ * declared error frame counts: the gjc SDK envelope `{"ok":false,…}`, an ndjson
+ * `{"type":"error",…}`, or gjc's text-mode `ERROR {…}` line. Other lines are
+ * skipped.
  */
 export function extractRuntimeError(text: string): RuntimeErrorDetail | undefined {
 	for (const line of text.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed.startsWith("{")) continue;
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(trimmed);
-		} catch {
-			continue;
-		}
-		const detail = runtimeErrorOfEnvelope(parsed);
+		const detail = runtimeErrorOfLine(line);
 		if (detail) return detail;
 	}
 	return undefined;
+}
+
+/**
+ * Reads a declared gjc error from one output line. Commands run without
+ * `--json` (notably `gjc sdk serve --stdio`) render their refusal as
+ * `ERROR {"code":…,"message":…}`: the prefix declares the error and the object
+ * is the error itself. JSON lines must be a declared error envelope.
+ */
+export function runtimeErrorOfLine(line: string): RuntimeErrorDetail | undefined {
+	const trimmed = line.trim();
+	const textual = trimmed.startsWith("ERROR {");
+	if (!textual && !trimmed.startsWith("{")) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(textual ? trimmed.slice("ERROR ".length) : trimmed);
+	} catch {
+		return undefined;
+	}
+	if (!textual) return runtimeErrorOfEnvelope(parsed);
+	if (typeof parsed !== "object" || parsed === null) return undefined;
+	return runtimeErrorOfEnvelope({ ok: false, error: parsed });
 }
 
 /**
@@ -467,23 +482,12 @@ export function formatFailureNotice(error: unknown): string {
 	return `[turn failed] ${described.text}${hint}`;
 }
 
-/**
- * The subset of the gateway store a rebind needs. `metaGet`/`metaSet` are
- * optional durable counters: when the store provides them the budget survives
- * a gateway restart; when absent the rebinder degrades to process-local
- * counting (correct, just less conservative).
- */
-export interface RebindStore {
-	withTransaction<T>(run: () => T): T;
-	rebindEpoch(originKey: string): number;
-	metaGet?(key: string): string | undefined;
-	metaSet?(key: string, value: string): void;
-}
+/** Durable Store surfaces used to commit a rebind epoch and its counters atomically. */
+export type RebindStore = Pick<Store, "bindings" | "core" | "transaction">;
 
 /**
  * Owns the epoch-bump budget for rebindable failures. One instance per
- * GjcClient (so one per gateway process), which means the counter spans every
- * attempt for a session/origin rather than resetting per call.
+ * SessionPort keeps counters across attempts for each session/origin rather than resetting per call.
  *
  * The budget is cleared ONLY by a proven-good TURN, never by a successful
  * create. A fresh idempotency key always creates successfully, so clearing on
@@ -498,11 +502,8 @@ export interface RebindStore {
  * rebind, so that pattern is visible instead of silent; "nobody notices" is the
  * actual harm the guard exists to prevent.
  *
- * The consecutive budget is DURABLE when the store exposes meta counters: it
- * survives a gateway restart, so a restart cannot act as an unauthorized cap
- * reset; only a proven-good turn or `/new` restores it. Lifetime totals are
- * durable for the same reason. Without meta support the counters degrade to
- * process-local (documented degradation, never silently claimed as durable).
+ * The consecutive budget is durable across gateway restarts so a restart cannot
+ * act as an unauthorized cap reset; only a proven-good turn or `/new` restores it.
  */
 export class SessionRebinder {
 	readonly #store: RebindStore;
@@ -511,7 +512,7 @@ export class SessionRebinder {
 	readonly #used = new Map<string, number>();
 	/** Never cleared by health: the total this process has ever spent per origin. */
 	readonly #lifetime = new Map<string, number>();
-	/** Origins hydrated from durable counters so far (unused when the store has no meta). */
+	/** Origins whose durable counter has been hydrated. */
 	readonly #hydrated = new Set<string>();
 	/**
 	 * Origins whose durable counter is corrupted: rebinds are refused (the
@@ -525,18 +526,17 @@ export class SessionRebinder {
 		this.#log = log;
 	}
 	#durable(originKey: string, used: number, lifetime: number): void {
-		if (!this.#store.metaSet) return;
-		this.#store.metaSet(`rebind_budget:${originKey}`, JSON.stringify({ used, lifetime }));
+		this.#store.core.metaSet(`rebind_budget:${originKey}`, JSON.stringify({ used, lifetime }));
 	}
 
 	#countersFor(originKey: string): { used: number; lifetime: number } {
-		if (this.#store.metaGet && !this.#hydrated.has(originKey)) {
+		if (!this.#hydrated.has(originKey)) {
 			this.#hydrated.add(originKey);
 			try {
 				// Absence (`undefined`) is the only clean "no counter yet" state: an
 				// EMPTY or malformed stored value is corruption, not absence, and must
 				// fail closed rather than reset the budget to zero.
-				const raw = this.#store.metaGet(`rebind_budget:${originKey}`);
+				const raw = this.#store.core.metaGet(`rebind_budget:${originKey}`);
 				if (raw !== undefined) {
 					const parsed = JSON.parse(raw) as { used?: unknown; lifetime?: unknown };
 					if (
@@ -588,8 +588,8 @@ export class SessionRebinder {
 		// ONE durable transition: the epoch bump and its counter commit together,
 		// so a crash can never spend an epoch whose counter was not incremented
 		// (that split would let a restart allocate another rebind past the cap).
-		const toEpoch = this.#store.withTransaction(() => {
-			const epoch = this.#store.rebindEpoch(originKey);
+		const toEpoch = this.#store.transaction((tx) => {
+			const epoch = this.#store.bindings.rotateEpoch(tx, originKey);
 			this.#durable(originKey, used, lifetime);
 			return epoch;
 		});

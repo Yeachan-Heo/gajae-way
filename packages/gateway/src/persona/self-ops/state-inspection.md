@@ -10,11 +10,6 @@ gajaeway ops cycle --json
 gajaeway memory audit
 ```
 
-When direct SQLite inspection is required, stop at read-only queries against `$GAJAEWAY_HOME/gateway.db`. Inspect schema before assuming column names. Useful state includes:
-
-- unsettled delivery rows and their last error
-- per-origin engagement and session epoch
-- bootstrap byte count, truncation flag, and diagnostics
-- schema version
+Use supported read-only projections: `gajaeway ops cycle|deliveries|integrity` while the gateway is online, and `gajaeway-gateway census` while it is stopped. Do not inspect the database file directly.
 
 Do not edit ledger, session, or migration rows by hand to make an incident look resolved. Preserve the evidence and repair through the owning runtime operation.

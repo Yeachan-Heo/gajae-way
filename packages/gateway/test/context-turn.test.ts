@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "context-turn" } as const;
@@ -26,6 +26,7 @@ async function config(): Promise<GatewayConfig> {
 	return {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -74,7 +75,7 @@ function send(client: { send(value: unknown): void }, id: string, text: string):
 
 async function start(
 	gatewayConfig: GatewayConfig,
-	database: GatewayDatabase,
+	database: Store,
 	sessionPort: SessionPort,
 	seed?: () => void,
 ): Promise<{ client: Awaited<ReturnType<typeof connect>> }> {
@@ -100,7 +101,7 @@ async function start(
 
 test("failed turn preserves selected context; later successful text consumes it with trigger attribution once", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const turns: string[] = [];
 	let attempts = 0;
 	const sessionPort = sessionPortFromScript({
@@ -112,13 +113,13 @@ test("failed turn preserves selected context; later successful text consumes it 
 		},
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort, () => {
-		database.contextRecord({
+		database.transaction((tx) => database.inbox.contextRecord(tx, {
 			messageId: "context-bot",
 			originKey: ORIGIN_KEY,
 			authorId: "bot-2",
 			authorName: "helper-bot",
 			body: "current bounded bot context",
-		});
+		}));
 	});
 
 	send(client, "trigger-failed", "first owner request");
@@ -126,8 +127,7 @@ test("failed turn preserves selected context; later successful text consumes it 
 		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
 	);
 	expect(
-		database
-			.contextUnread(ORIGIN_KEY)
+		database.inbox.contextUnread(ORIGIN_KEY)
 			.map((row) => row.message_id)
 			.sort(),
 	).toEqual(["context-bot", "trigger-failed"]);
@@ -137,20 +137,20 @@ test("failed turn preserves selected context; later successful text consumes it 
 	expect(turns[1]).toContain("helper-bot (author:bot-2, msg:context-bot): current bounded bot context");
 	expect(turns[1]).toContain("first owner request");
 	expect(turns[1]?.match(/second owner request/g)).toHaveLength(1);
-	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	await waitUntil(() => database.inbox.contextUnread(ORIGIN_KEY).length === 0);
 	client.close();
 });
 
 test("successful intentional silence advances the context cursor", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async () => "[SILENT]",
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "silent-trigger", "read this but stay quiet");
-	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	await waitUntil(() => database.inbox.contextUnread(ORIGIN_KEY).length === 0);
 	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
 	client.close();
 });
@@ -161,7 +161,7 @@ test("a delivered intermediate reply followed by runtime failure consumes the se
 	// former mid-work gate this text was suppressed as pre-tool and the test
 	// asserted the opposite; the gate is gone - 2026-09-18.)
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, _preamble, _progress, options) => {
@@ -170,11 +170,11 @@ test("a delivered intermediate reply followed by runtime failure consumes the se
 		},
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort, () => {
-		database.contextRecord({ messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" });
+		database.transaction((tx) => database.inbox.contextRecord(tx, { messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" }));
 	});
 	send(client, "intermediate-trigger", "owner request");
 	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
-	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	await waitUntil(() => database.inbox.contextUnread(ORIGIN_KEY).length === 0);
 	const messages = client.frames.filter((frame) => frame.event === "chat.message");
 	expect(messages.map((frame) => frame.payload.text)).toEqual(["delivered intermediate reply"]);
 	client.close();
@@ -184,7 +184,7 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	// The per-turn part budget caps mid-work speech; it must never eat the
 	// terminal slot. With the interim gate gone a 12-message turn is ordinary.
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, _preamble, _progress, options) => {
@@ -197,17 +197,17 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	await waitUntil(() =>
 		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text === "the final answer"),
 	);
-	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	await waitUntil(() => database.inbox.pendingCount(ORIGIN_KEY) === 0);
 	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
 	expect(texts.filter((text) => text.startsWith("progress note"))).toHaveLength(10);
 	expect(texts.filter((text) => text === "the final answer")).toHaveLength(1);
-	expect(database.inboundTurnRow(sessionPort.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+	expect(database.inbox.turnRow(sessionPort.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
 	client.close();
 });
 
 test("#247: every done trigger names the delivery that closed it or why none did", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text, _preamble, _progress, options) => {
@@ -226,8 +226,8 @@ test("#247: every done trigger names the delivery that closed it or why none did
 		send(client, id, text);
 		await waitUntil(() => sessionPort.sends.length > turn);
 		const opRef = sessionPort.sends[turn]?.opRef ?? "";
-		await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
-		return database.inboundTurnRow(opRef)?.terminal_delivery_id ?? null;
+		await waitUntil(() => database.inbox.turnRow(opRef)?.turn_state === "done");
+		return database.inbox.turnRow(opRef)?.terminal_delivery_id ?? null;
 	};
 	const deliveryIdOf = (body: string) =>
 		client.frames.find((frame) => frame.event === "chat.message" && frame.payload.text === body)?.payload.deliveryId;
@@ -238,7 +238,7 @@ test("#247: every done trigger names the delivery that closed it or why none did
 	expect(JSON.parse(reaction ?? "null")).toEqual({ 0: deliveryIdOf("👍") });
 	expect(JSON.parse((await settle("silent", "stay quiet")) ?? "null")).toEqual({ none: "silent" });
 	expect(JSON.parse((await settle("failed", "fail please")) ?? "null")).toEqual({ none: "turn_failed" });
-	expect(database.inboundTerminalLinkAudit(new Date(0).toISOString())).toEqual({ done: 4, unlinked: 0 });
+	expect(database.inbox.terminalLinkAudit(new Date(0).toISOString())).toEqual({ done: 4, unlinked: 0 });
 	client.close();
 });
 
@@ -252,7 +252,7 @@ test("an answer that quotes [SILENT] in markdown code is delivered, not settled 
 		"- **답장 표시**: 👀 리액션, 답글 지정, `[SILENT]`(답하지 않기) 같은 표시를 해석해요.",
 	].join("\n");
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text) => (text.includes("quoted marker") ? answer : "answer then [SILENT]"),
@@ -261,25 +261,25 @@ test("an answer that quotes [SILENT] in markdown code is delivered, not settled 
 	send(client, "quoted-silent", "quoted marker please");
 	await waitUntil(() => sessionPort.sends.length === 1);
 	const opRef = sessionPort.sends[0]?.opRef ?? "";
-	await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+	await waitUntil(() => database.inbox.turnRow(opRef)?.turn_state === "done");
 	const delivered = client.frames.filter((frame) => frame.event === "chat.message");
 	expect(delivered.map((frame) => frame.payload.text)).toEqual([answer]);
-	expect(JSON.parse(database.inboundTurnRow(opRef)?.terminal_delivery_id ?? "null")).toEqual({
+	expect(JSON.parse(database.inbox.turnRow(opRef)?.terminal_delivery_id ?? "null")).toEqual({
 		0: delivered[0]?.payload.deliveryId,
 	});
 	// A bare marker outside code still silences the part.
 	send(client, "bare-silent", "bare marker");
 	await waitUntil(() => sessionPort.sends.length === 2);
 	const bareOpRef = sessionPort.sends[1]?.opRef ?? "";
-	await waitUntil(() => database.inboundTurnRow(bareOpRef)?.turn_state === "done");
-	expect(JSON.parse(database.inboundTurnRow(bareOpRef)?.terminal_delivery_id ?? "null")).toEqual({ none: "silent" });
+	await waitUntil(() => database.inbox.turnRow(bareOpRef)?.turn_state === "done");
+	expect(JSON.parse(database.inbox.turnRow(bareOpRef)?.terminal_delivery_id ?? "null")).toEqual({ none: "silent" });
 	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(1);
 	client.close();
 });
 
 test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, _preamble, _progress, options) => {
@@ -290,7 +290,7 @@ test("a delivered intermediate reaction followed by runtime failure consumes the
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "reaction-trigger", "owner request");
 	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
-	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	await waitUntil(() => database.inbox.contextUnread(ORIGIN_KEY).length === 0);
 	const messages = client.frames.filter((frame) => frame.event === "chat.message");
 	expect(messages).toHaveLength(1);
 	expect(messages[0]?.payload.reaction).toMatchObject({ targetMessageId: "reaction-trigger", emoji: "👍" });
@@ -299,7 +299,7 @@ test("a delivered intermediate reaction followed by runtime failure consumes the
 
 test("/new retires a pre-reset trigger queued behind an in-flight turn", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	let release: (() => void) | undefined;
 	const gate = new Promise<void>((resolve) => {
 		release = resolve;
@@ -317,20 +317,20 @@ test("/new retires a pre-reset trigger queued behind an in-flight turn", async (
 	send(client, "running-trigger", "running owner request");
 	await waitUntil(() => turns.length === 1);
 	send(client, "queued-before-reset", "must never run after reset");
-	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 1);
+	await waitUntil(() => database.inbox.pendingCount(ORIGIN_KEY) === 1);
 	send(client, "reset-while-busy", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-while-busy"));
 	release?.();
 	// The retired turn settles from status once released; the queued-behind
 	// message rode into it as a steer and must never become a fresh turn.
-	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
+	await waitUntil(() => database.inbox.pendingCount(ORIGIN_KEY) === 0);
 	expect(turns).toHaveLength(1);
 	client.close();
 });
 
 test("/new persists a floor that excludes pre-reset context after gateway restart", async () => {
 	const gatewayConfig = await config();
-	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	let database = await Store.open(gatewayConfig.dbPath);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
@@ -340,7 +340,7 @@ test("/new persists a floor that excludes pre-reset context after gateway restar
 		},
 	});
 	let { client } = await start(gatewayConfig, database, sessionPort, () => {
-		database.contextRecord({ messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" });
+		database.transaction((tx) => database.inbox.contextRecord(tx, { messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" }));
 	});
 	send(client, "reset-command", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
@@ -348,18 +348,18 @@ test("/new persists a floor that excludes pre-reset context after gateway restar
 	await server?.stop();
 	server = undefined;
 
-	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database = await Store.open(gatewayConfig.dbPath);
 	({ client } = await start(gatewayConfig, database, sessionPort));
 	send(client, "post-reset", "new session request");
 	await waitUntil(() => turns.length === 1);
 	expect(turns[0]).not.toContain("old command");
-	expect(database.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
+	expect(database.inbox.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
 	client.close();
 });
 
 test("epoch bootstrap commits on first terminal success and is not repeated after restart", async () => {
 	const gatewayConfig = await config();
-	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	let database = await Store.open(gatewayConfig.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
@@ -372,7 +372,7 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 	send(client, "bootstrap-first", "first request");
 	await waitUntil(() => preambles.length === 1);
 	expect(preambles[0]).toContain("## Session bootstrap");
-	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({
+	expect(database.bindings.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({
 		epoch: 0,
 		lastBootstrappedEpoch: 0,
 		byteCount: expect.any(Number),
@@ -384,7 +384,7 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 	await server?.stop();
 	server = undefined;
 
-	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database = await Store.open(gatewayConfig.dbPath);
 	({ client } = await start(gatewayConfig, database, sessionPort));
 	send(client, "bootstrap-after-restart", "after restart");
 	await waitUntil(() => preambles.length === 3);
@@ -394,7 +394,7 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 
 test("pre-success failure retries the same stable bootstrap and intentional silence commits it", async () => {
 	const gatewayConfig = await config();
-	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	let database = await Store.open(gatewayConfig.dbPath);
 	const preambles: string[] = [];
 	let attempt = 0;
 	const sessionPort = sessionPortFromScript({
@@ -410,18 +410,18 @@ test("pre-success failure retries the same stable bootstrap and intentional sile
 	await waitUntil(() =>
 		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
 	);
-	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
+	expect(database.bindings.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
 	client.close();
 	await server?.stop();
 	server = undefined;
-	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database = await Store.open(gatewayConfig.dbPath);
 	({ client } = await start(gatewayConfig, database, sessionPort));
 	send(client, "bootstrap-retry", "retry request");
 	await waitUntil(() => preambles.length === 2);
 	const marker = /bootstrap-id: (session-bootstrap:[a-f0-9]+)/.exec(preambles[0] ?? "")?.[1];
 	expect(marker).toBeString();
 	expect(preambles[1]).toContain(`bootstrap-id: ${marker}`);
-	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
+	await waitUntil(() => database.bindings.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
 	expect(
 		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text === "[SILENT]"),
 	).toHaveLength(0);
@@ -430,7 +430,7 @@ test("pre-success failure retries the same stable bootstrap and intentional sile
 
 test("intermediate delivery failure keeps bootstrap pending but consumes the body before stable-marker retry", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const attempts: Array<{ text: string; preamble: string }> = [];
 	let first = true;
 	const sessionPort = sessionPortFromScript({
@@ -450,8 +450,8 @@ test("intermediate delivery failure keeps bootstrap pending but consumes the bod
 	// The visible answer ships (no mid-work gate); the failure after it posts no
 	// notice. The turn is over once the trigger row settles.
 	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
-	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
-	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
+	await waitUntil(() => database.inbox.pendingCount(ORIGIN_KEY) === 0);
+	expect(database.bindings.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
 	send(client, "bootstrap-visible-retry", "next body");
 	await waitUntil(() => attempts.length === 2);
 	const marker = /bootstrap-id: (session-bootstrap:[a-f0-9]+)/.exec(attempts[0]?.preamble ?? "")?.[1];
@@ -463,7 +463,7 @@ test("intermediate delivery failure keeps bootstrap pending but consumes the bod
 
 test("/new atomically establishes a fresh floor and pending epoch bootstrap", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
@@ -474,11 +474,11 @@ test("/new atomically establishes a fresh floor and pending epoch bootstrap", as
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "before-reset-success", "before reset");
-	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
+	await waitUntil(() => database.bindings.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
 	send(client, "bootstrap-reset", "/new");
-	await waitUntil(() => database.getSessionRecord(ORIGIN_KEY)?.epoch === 1);
-	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({ epoch: 1, lastBootstrappedEpoch: 0 });
-	expect(database.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
+	await waitUntil(() => database.bindings.getSessionRecord(ORIGIN_KEY)?.epoch === 1);
+	expect(database.bindings.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({ epoch: 1, lastBootstrappedEpoch: 0 });
+	expect(database.inbox.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
 	send(client, "after-reset-success", "after reset");
 	await waitUntil(() => preambles.length === 2);
 	expect(preambles[1]).toContain("epoch: 1");
@@ -488,7 +488,7 @@ test("/new atomically establishes a fresh floor and pending epoch bootstrap", as
 
 test("persistent sessions do not auto-rotate on a turn count", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
@@ -502,14 +502,14 @@ test("persistent sessions do not auto-rotate on a turn count", async () => {
 		send(client, `persistent-${turn}`, `turn ${turn}`);
 		await waitUntil(() => preambles.length === turn + 1);
 	}
-	expect(database.getSessionRecord(ORIGIN_KEY)?.epoch).toBe(0);
+	expect(database.bindings.getSessionRecord(ORIGIN_KEY)?.epoch).toBe(0);
 	expect(preambles.filter((preamble) => preamble.includes("## Session bootstrap"))).toHaveLength(1);
 	client.close();
 });
 
 test("gateway startup prunes old consumed context even when the database was quiet", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async () => "ok",
@@ -544,7 +544,7 @@ function unreadBlock(text: string): string {
 
 test("issue #409: /new carries the messages of turns that failed after the last answer", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const texts: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
@@ -579,7 +579,7 @@ test("issue #409: /new carries the messages of turns that failed after the last 
 
 test("issue #409: /new after every turn was answered carries nothing", async () => {
 	const gatewayConfig = await config();
-	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const database = await Store.open(gatewayConfig.dbPath);
 	const texts: string[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),

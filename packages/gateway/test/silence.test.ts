@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { isSilenceToken } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
@@ -39,18 +39,19 @@ async function settle(): Promise<void> {
 }
 
 /** An open channel: the adapter promotes human messages here, so every one reaches a turn. */
-async function openChannelGateway(reply: string): Promise<{ frames: any[]; database: GatewayDatabase }> {
+async function openChannelGateway(reply: string): Promise<{ frames: any[]; database: Store }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-silence-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
 		respond: async () => reply,
@@ -108,5 +109,5 @@ test("a spoken turn in the same open channel does deliver", async () => {
 
 test("a silent turn still marks its inbound message done so the queue does not stall", async () => {
 	const { database } = await openChannelGateway("[SILENT]");
-	expect(database.inboundPendingCount("discord/channel/chan-1")).toBe(0);
+	expect(database.inbox.pendingCount("discord/channel/chan-1")).toBe(0);
 });

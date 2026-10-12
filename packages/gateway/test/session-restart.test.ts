@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BrokerSession, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	createOwnedSessionFixture,
@@ -16,7 +16,7 @@ const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "restar
 const KEY = "loopback/loopback/restart";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let manager: PersonaSessionManager | undefined;
 
 class AuthorityShiftingPort extends ScriptedSessionPort {
@@ -61,13 +61,13 @@ function makeManager(port: ScriptedSessionPort, logs: string[], terminal: string
 
 function enqueue(messageId: string, body: string, receivedAt = new Date().toISOString()): void {
 	expect(
-		database?.inboundEnqueue({
+		database?.transaction((tx) => database?.inbox.enqueue(tx, {
 			messageId,
 			originKey: KEY,
 			originRefJson: JSON.stringify(ORIGIN),
 			body,
 			receivedAt,
-		}),
+		})),
 	).toBe(true);
 }
 
@@ -77,7 +77,7 @@ async function startAccepted(port: ScriptedSessionPort, logs: string[]): Promise
 	await manager.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "initial turn did not reach an accepted send");
 	const send = port.sends[0]!;
-	const turn = database!.inboundNonterminalTurns(KEY)[0]!;
+	const turn = database!.inbox.nonterminalTurns(KEY)[0]!;
 	expect(turn).toMatchObject({ state: "accepted", opRef: send.opRef, sessionId: send.sessionId });
 	return { opRef: send.opRef, sessionId: send.sessionId };
 }
@@ -93,7 +93,7 @@ afterEach(async () => {
 
 test("restart observes an accepted nonterminal turn on the same live session without another send", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -105,10 +105,10 @@ test("restart observes an accepted nonterminal turn on the same live session wit
 	await manager.recover();
 	expect(port.sends).toHaveLength(1);
 	expect(port.inspections.filter((entry) => entry.sessionId === accepted.sessionId)).toHaveLength(2);
-	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(database.inbox.turnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 	port.complete(accepted.opRef, "transcript survived restart");
 	await eventually(
-		() => database?.inboundTurnRows(accepted.opRef)[0]?.turn_state === "done",
+		() => database?.inbox.turnRows(accepted.opRef)[0]?.turn_state === "done",
 		"observed turn did not reach terminal completion",
 	);
 	expect(terminal).toEqual(["transcript survived restart"]);
@@ -116,7 +116,7 @@ test("restart observes an accepted nonterminal turn on the same live session wit
 
 test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -137,7 +137,7 @@ test("client_ref_conflict reconciles the same deterministic op-ref without a sec
 		() => logs.includes(`recovery_client_ref_conflict origin=${KEY} epoch=0 opRef=${opRef}`),
 		"client_ref_conflict was not reconciled through status",
 	);
-	const turn = database.inboundNonterminalTurns(KEY)[0]!;
+	const turn = database.inbox.nonterminalTurns(KEY)[0]!;
 	expect(turn).toMatchObject({ opRef, state: "accepted", sessionId: "session-1" });
 	await manager.stop();
 	manager = makeManager(port, logs);
@@ -146,33 +146,33 @@ test("client_ref_conflict reconciles the same deterministic op-ref without a sec
 	expect(port.sends).toHaveLength(1);
 	port.complete(opRef, "conflict reconciled");
 	await eventually(
-		() => database?.inboundTurnRows(turn.opRef)[0]?.turn_state === "done",
+		() => database?.inbox.turnRows(turn.opRef)[0]?.turn_state === "done",
 		"conflict-reconciled turn did not complete",
 	);
 });
 
 test("a bound turn whose operation is unknown stays held and is never resent", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
 	const repo = join(home, "workspace");
 	const binding = await port.bind({ originKey: KEY, epoch: 0, repo });
-	expect(database.getSessionRecord(KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
+	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
 	const opRef = personaTurnOpRef("restart-test", KEY, 0, "m-unknown");
 	enqueue("m-unknown", "do not replay unknown");
-	database.inboundBindTurn({
+	database!.transaction((tx) => database!.inbox.bindTurn(tx, {
 		messageId: "m-unknown",
 		originKey: KEY,
 		epoch: 0,
 		opRef,
 		sessionId: binding.sessionId,
-	});
+	}));
 	manager = makeManager(port, logs);
 	await manager.recover();
 	expect(port.sendAttempts).toEqual([]);
-	expect(database.inboundTurnRows(opRef)[0]).toMatchObject({
+	expect(database.inbox.turnRows(opRef)[0]).toMatchObject({
 		turn_state: "bound",
 		bound_session_id: binding.sessionId,
 	});
@@ -181,7 +181,7 @@ test("a bound turn whose operation is unknown stays held and is never resent", a
 
 test("dead plus active is a sticky hold and never silently resumes or resends", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -193,7 +193,7 @@ test("dead plus active is a sticky hold and never silently resumes or resends", 
 	await manager.recover();
 	expect(port.resumes).toEqual([]);
 	expect(port.sends).toHaveLength(1);
-	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(database.inbox.turnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(logs.some((line) => line.startsWith(`recovery_hold origin=${KEY} epoch=0 opRef=${accepted.opRef}`))).toBe(
 		true,
 	);
@@ -201,7 +201,7 @@ test("dead plus active is a sticky hold and never silently resumes or resends", 
 
 test("an inspect authority shift holds the turn rather than trusting a stale active operation", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new AuthorityShiftingPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -213,13 +213,13 @@ test("an inspect authority shift holds the turn rather than trusting a stale act
 	await manager.recover();
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumes).toEqual([]);
-	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(database.inbox.turnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(logs.some((line) => line.includes("reason=broker authority is ambiguous"))).toBe(true);
 });
 
 test("dead terminal saved authority resumes, holds once, then reconciles from status when tail evidence is unavailable", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -238,20 +238,20 @@ test("dead terminal saved authority resumes, holds once, then reconciles from st
 	expect(port.sends).toHaveLength(1);
 	// A verified terminal operation no longer waits for a live tail connection.
 	await eventually(
-		() => database?.inboundTurnRows(accepted.opRef)[0]?.turn_state === "done",
+		() => database?.inbox.turnRows(accepted.opRef)[0]?.turn_state === "done",
 		"saved terminal turn did not reconcile from its original operation result",
 	);
 	expect(port.workerOutputReads.some((read) => read.opRef === accepted.opRef)).toBe(true);
 	expect(
 		logs.some((line) => line.includes("terminal_status_reconciled") && line.includes("tail_evidence=unavailable")),
 	).toBe(true);
-	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database.inbox.turnRows(accepted.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 	expect(terminal).toEqual(["saved transcript"]);
 });
 
 test("resume-impossible remains an explicit hold without terminal tail evidence", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -263,14 +263,14 @@ test("resume-impossible remains an explicit hold without terminal tail evidence"
 	manager = makeManager(port, logs);
 
 	await manager.recover();
-	expect(database.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: accepted.sessionId });
-	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(database.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: accepted.sessionId });
+	expect(database.inbox.turnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
 });
 
 test("a retired hold reattaches after restart and does not block the new epoch", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -280,7 +280,7 @@ test("a retired hold reattaches after restart and does not block the new epoch",
 	manager = makeManager(port, logs);
 
 	await manager.recover();
-	expect(database.inboundNonterminalTurns(KEY)[0]).toMatchObject({
+	expect(database.inbox.nonterminalTurns(KEY)[0]).toMatchObject({
 		epoch: 0,
 		state: "accepted",
 		sessionId: accepted.sessionId,
@@ -292,14 +292,14 @@ test("a retired hold reattaches after restart and does not block the new epoch",
 	port.complete(newSend.opRef, "new epoch reply");
 	port.complete(accepted.opRef, "retired reply");
 	await eventually(
-		() => database?.inboundNonterminalTurns(KEY).length === 0,
+		() => database?.inbox.nonterminalTurns(KEY).length === 0,
 		"retired turn did not reconcile after its reattached tail reached terminal",
 	);
 });
 
 test("a recovered failed operation settles without replay and accepts genuinely new input", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -310,10 +310,10 @@ test("a recovered failed operation settles without replay and accepts genuinely 
 	manager = makeManager(port, logs, terminal);
 
 	await manager.recover();
-	await eventually(() => database!.inboundNonterminalTurns(KEY).length === 0, "failed turn did not settle");
+	await eventually(() => database!.inbox.nonterminalTurns(KEY).length === 0, "failed turn did not settle");
 	expect(port.sends).toHaveLength(1);
-	expect(database.inboundPendingCount(KEY)).toBe(0);
-	expect(database.inboundTurnRow(accepted.opRef)?.turn_state).toBe("done");
+	expect(database.inbox.pendingCount(KEY)).toBe(0);
+	expect(database.inbox.turnRow(accepted.opRef)?.turn_state).toBe("done");
 	expect(terminal).toEqual([]);
 
 	enqueue("new-input", "new work after the failed turn");
@@ -342,7 +342,7 @@ class UnreadableStorePort extends ScriptedSessionPort {
 
 test("a bound, unaccepted turn on a session the runtime cannot answer for is released and re-fired on a fresh session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new UnreadableStorePort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -356,13 +356,13 @@ test("a bound, unaccepted turn on a session the runtime cannot answer for is rel
 	});
 	const opRef = personaTurnOpRef("restart-test", KEY, 0, "m-1");
 	enqueue("m-1", "hello after cutover");
-	database.inboundBindTurn({
+	database!.transaction((tx) => database!.inbox.bindTurn(tx, {
 		messageId: "m-1",
 		originKey: KEY,
 		epoch: 0,
 		opRef,
 		sessionId: "pre-cutover-session",
-	});
+	}));
 	manager = makeManager(port, logs);
 
 	await manager.recover();
@@ -384,7 +384,7 @@ class ColdBindFlakyPort extends ScriptedSessionPort {
 
 test("a dispatch whose bind initially fails is retried after a backoff without stranding the pending row", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ColdBindFlakyPort({
 		onBind: (input) => `session-${input.epoch + 1}`,
 		onSend: (input, scripted) => scripted.complete(input.opRef, "bound later"),
@@ -405,8 +405,8 @@ test("a dispatch whose bind initially fails is retried after a backoff without s
 	await eventually(() => port.sends.length === 1, "turn was not dispatched after the bind retry", 1_000);
 	expect(port.bindAttempts).toBe(2);
 	await eventually(() => terminal.length === 1, "retried turn did not complete");
-	expect(database.inboundPendingCount(KEY)).toBe(0);
-	expect(database.inboundNonterminalTurns(KEY)).toEqual([]);
+	expect(database.inbox.pendingCount(KEY)).toBe(0);
+	expect(database.inbox.nonterminalTurns(KEY)).toEqual([]);
 });
 
 class DisownedButInspectablePort extends ScriptedSessionPort {
@@ -424,7 +424,7 @@ class DisownedButInspectablePort extends ScriptedSessionPort {
 
 test("a bound turn whose id the Router disowns is released and re-fired even when inspect still answers", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new DisownedButInspectablePort({ onBind: (input) => `session-${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -432,22 +432,22 @@ test("a bound turn whose id the Router disowns is released and re-fired even whe
 	// then leave its durable record pointing at it as a pre-reboot binding.
 	const first = await port.bind({ originKey: KEY, epoch: 0, repo: join(home, "workspace") });
 	const staleId = first.sessionId;
-	expect(database.getSessionRecord(KEY)).toEqual({ sessionId: staleId, epoch: 0 });
+	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: staleId, epoch: 0 });
 	const opRef = personaTurnOpRef("restart-test", KEY, 0, "m-1");
 	enqueue("m-1", "hello");
-	database.inboundBindTurn({
+	database!.transaction((tx) => database!.inbox.bindTurn(tx, {
 		messageId: "m-1",
 		originKey: KEY,
 		epoch: 0,
 		opRef,
 		sessionId: staleId,
-	});
+	}));
 	manager = makeManager(port, logs);
 	await manager.recover();
 	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
 	await eventually(() => port.sends.length === 1, "disowned turn was not re-fired");
 	// The origin was rebound (epoch bumped) and the release re-fired under a fresh ref.
-	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(port.sends[0]!.opRef).not.toBe(opRef);
 });
 
@@ -474,7 +474,7 @@ class PoisonedBindEpochPort extends ScriptedSessionPort {
 
 test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burst; the pending row is sent once on the new epoch", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new PoisonedBindEpochPort();
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -514,8 +514,8 @@ test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burs
 	// advances epoch 0 -> 1, leaves the row pending, and returns to the base delay.
 	timers[1]!.work();
 	await eventually(() => port.bindAttempts === 3, "third bind did not run");
-	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "poisoned", turn_state: null });
+	expect(database.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "poisoned", turn_state: null });
 	expect(port.sends).toEqual([]);
 	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000, 4_000, 2_000]);
 	expect(
@@ -533,7 +533,7 @@ test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burs
 	expect(port.sends[0]!.text).toBe("must survive the poisoned session-create key");
 	await eventually(() => terminal.length === 1, "recovered turn did not complete");
 	expect(terminal).toEqual(["recovered after epoch rotation"]);
-	expect(database.inboundPendingCount(KEY)).toBe(0);
+	expect(database.inbox.pendingCount(KEY)).toBe(0);
 });
 
 class ModelSetFlakyPort extends ScriptedSessionPort {
@@ -555,7 +555,7 @@ class ModelSetFlakyPort extends ScriptedSessionPort {
 
 test("model.set failure happens before send: the row returns to pending and retries instead of becoming an ambiguous bound hold", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ModelSetFlakyPort();
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -585,8 +585,8 @@ test("model.set failure happens before send: the row returns to pending and retr
 	await manager.notifyInbound(KEY);
 	expect(port.modelAttempts).toBe(1);
 	expect(port.sendAttempts).toEqual([]);
-	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "model-failure", turn_state: null });
-	expect(database.inboundNonterminalTurns(KEY)).toEqual([]);
+	expect(database.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "model-failure", turn_state: null });
+	expect(database.inbox.nonterminalTurns(KEY)).toEqual([]);
 	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
 	expect(logs.some((line) => line.startsWith(`persona_model_failed origin=${KEY}`))).toBe(true);
 
@@ -595,7 +595,7 @@ test("model.set failure happens before send: the row returns to pending and retr
 	expect(port.modelAttempts).toBe(2);
 	expect(port.sends[0]!.text).toBe("do not strand me behind model.set");
 	await eventually(() => terminal.length === 1, "model-recovered turn did not complete");
-	expect(database.inboundPendingCount(KEY)).toBe(0);
+	expect(database.inbox.pendingCount(KEY)).toBe(0);
 });
 
 class ModelSetSessionGonePort extends ScriptedSessionPort {
@@ -621,7 +621,7 @@ class ModelSetSessionGonePort extends ScriptedSessionPort {
 
 test("model.set session_unavailable rotates the epoch immediately before retrying the still-pending row", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ModelSetSessionGonePort();
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
@@ -651,8 +651,8 @@ test("model.set session_unavailable rotates the epoch immediately before retryin
 	await manager.notifyInbound(KEY);
 	expect(port.binds.map((bind) => bind.epoch)).toEqual([0]);
 	expect(port.sendAttempts).toEqual([]);
-	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "model-session-gone", turn_state: null });
+	expect(database.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "model-session-gone", turn_state: null });
 	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
 	expect(
 		logs.some(
@@ -667,5 +667,5 @@ test("model.set session_unavailable rotates the epoch immediately before retryin
 	expect(port.binds.map((bind) => bind.epoch)).toEqual([0, 1]);
 	expect(port.sends[0]!.text).toBe("retry me on a fresh session");
 	await eventually(() => terminal.length === 1, "fresh session turn did not complete");
-	expect(database.inboundPendingCount(KEY)).toBe(0);
+	expect(database.inbox.pendingCount(KEY)).toBe(0);
 });

@@ -1,10 +1,10 @@
 import { join } from "node:path";
 import { MemoryClosureQueue } from "../../src/memory/closure";
-import { GatewayDatabase } from "../../src/store/db";
+import { Store } from "../../src/store";
 
 const home = process.env.GAJAEWAY_HOME;
 if (!home) throw new Error("GAJAEWAY_HOME is required");
-const database = await GatewayDatabase.open(join(home, "gateway.db"));
+const database = await Store.open(join(home, "gateway.db"));
 const queue = new MemoryClosureQueue(database, home);
 await queue.initialize();
 if (process.env.GAJAEWAY_MEMORY_RUNNER_MODE !== "recover") {

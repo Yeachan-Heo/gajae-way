@@ -1,6 +1,5 @@
 import { readFileSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import {
 	type BrokerDiscovery,
@@ -9,9 +8,8 @@ import {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 } from "./broker-liveness";
-import { type BrokerRelease, type BrokerReleaser, createBrokerReleaser } from "./broker-scope";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
-import { sanitizeDiagnostic } from "./rebind";
+import { extractRuntimeError, sanitizeDiagnostic } from "./rebind";
 
 export {
 	BROKER_HEARTBEAT_TTL_MS,
@@ -22,6 +20,8 @@ export {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 } from "./broker-liveness";
+export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
+
 
 /**
  * Candidate locations for the pinned GJC version, in priority order.
@@ -82,8 +82,8 @@ export interface BrokerHealthContext {
 }
 export type BrokerHealthProbe = (context: BrokerHealthContext) => boolean | Promise<boolean>;
 export interface GlobalGjcClientOptions {
-	readonly executable?: string;
-	readonly agentDir?: string;
+	readonly executable: string;
+	readonly agentDir: string;
 	readonly cwd?: string;
 	readonly spawn?: SpawnFn;
 	readonly command?: GjcCommandRunner;
@@ -94,8 +94,6 @@ export interface GlobalGjcClientOptions {
 	readonly healthProbeTimeoutMs?: number;
 	readonly readinessAttempts?: number;
 	readonly readinessDelayMs?: number;
-	/** Clock for the autostart nudge backoff; command deadlines remain wall-clock bounded. */
-	readonly nudgeClock?: () => number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
@@ -116,8 +114,8 @@ export interface GlobalGjcClientOptions {
 	 * never fires this; restarting the gateway would not bring it back.
 	 */
 	readonly onLiveOutageExceeded?: (detail: string) => void;
-	/** Moves a broker found in the gateway's own systemd unit into its own scope; `null` disables. */
-	readonly releaseBrokerScope?: BrokerReleaser | null;
+	/** Broker-unavailable refusals are counted by the gateway SLO journal. */
+	readonly onUnavailable?: (at: number) => void;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -298,7 +296,7 @@ export function isUsageRejection(result: CliResult): boolean {
 	);
 }
 
-/** A client of the user's global runtime. No directory, daemon, lock, or session ownership. */
+/** A client of the broker host's pinned GJC runtime; it does not own broker lifecycle. */
 export class GlobalGjcClient {
 	readonly executable: string;
 	readonly agentDir: string;
@@ -306,7 +304,6 @@ export class GlobalGjcClient {
 	readonly cli: CliRunner;
 	readonly #options: GlobalGjcClientOptions;
 	readonly #spawn: SpawnFn;
-	readonly #releaseBrokerScope: BrokerReleaser | undefined;
 	readonly #cwd: string;
 	readonly #env: Record<string, string>;
 	readonly #timeout: number;
@@ -344,46 +341,23 @@ export class GlobalGjcClient {
 	/** Observation times of incarnation changes after the first; bounded by the churn window. */
 	#respawns: number[] = [];
 	#churnAlerted = false;
-	/** Timestamp of last nudge attempt (when broker was absent or pid_dead). */
-	#lastNudgeAttemptAt: number | undefined;
-	/** Nudge backoff constant: 45 seconds between attempts. */
-	readonly #NUDGE_BACKOFF_MS = 45_000;
-	/** Guard nudge execution to avoid stalling observe loop. */
-	#nudgeInFlight = false;
 
-	constructor(options: GlobalGjcClientOptions = {}) {
+	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
 		this.#cwd = resolve(options.cwd ?? process.cwd());
 		const trusted = trustedEnvironment(this.#cwd);
-		const executable = options.executable ?? trusted.GJC_EXECUTABLE ?? Bun.which("gjc");
-		if (!executable || !isAbsolute(executable)) throw new Error("GJC executable must resolve to an absolute path");
+		const executable = options.executable;
+		if (!isAbsolute(executable)) throw new Error("GJC executable must be an absolute path");
 		this.executable = executable;
-		const configName = validConfigName(trusted.GJC_CONFIG_DIR) ?? validConfigName(trusted.PI_CONFIG_DIR) ?? ".gjc";
-		if (!options.agentDir && !trusted.GJC_CODING_AGENT_DIR && !trusted.PI_CODING_AGENT_DIR && !trusted.HOME) {
-			throw new Error("Cannot establish trusted GJC user home; provide an explicit agentDir");
-		}
-		this.agentDir = canonicalAgentDir(
-			resolve(
-				this.#cwd,
-				options.agentDir ??
-					trusted.GJC_CODING_AGENT_DIR ??
-					trusted.PI_CODING_AGENT_DIR ??
-					join(trusted.HOME ?? homedir(), configName, "agent"),
-			),
-		);
+		if (!isAbsolute(options.agentDir)) throw new Error("GJC agent directory must be an absolute path");
+		this.agentDir = canonicalAgentDir(options.agentDir);
 		this.discoveryPath = join(this.agentDir, "sdk", "broker.json");
 		this.#env = {
 			...trusted,
-			GJC_EXECUTABLE: this.executable,
 			GJC_CODING_AGENT_DIR: this.agentDir,
-			PI_CODING_AGENT_DIR: this.agentDir,
-			GJC_AGENT_DIR: this.agentDir,
+			[GJC_ATTACH_ONLY_ENV]: "0",
 		};
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
-		this.#releaseBrokerScope =
-			options.releaseBrokerScope === null
-				? undefined
-				: (options.releaseBrokerScope ?? (process.platform === "linux" ? createBrokerReleaser() : undefined));
 		this.#timeout = integer(options.healthProbeTimeoutMs, COMMAND_TIMEOUT_MS, 1);
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
@@ -478,9 +452,8 @@ export class GlobalGjcClient {
 	}
 	async #start(epoch: number): Promise<void> {
 		const attempts = this.#options.readinessAttempts ?? 20;
-		// This one read-only SDK request may auto-start GJC through GJC's own normal lifecycle.
-		// Recovery observation may repeat this probe with backoff for dead/absent brokers,
-		// but never repairs shared daemon state or nudges a live, stale-heartbeat owner.
+		// This read-only SDK request checks broker availability without starting or repairing a broker.
+		// Recovery observation probes discovery with backoff and leaves lifecycle ownership to the broker host.
 		const discovery = await this.#discovery();
 		if (!discovery) {
 			const result = await this.cli(brokerHealthArgs(), { timeoutMs: this.#timeout });
@@ -579,14 +552,6 @@ export class GlobalGjcClient {
 				const verdict = await this.judgeLiveness();
 				this.#observedLiveBroker = verdict.state === "live";
 				this.#unavailableReason = describeDiscoveryFailure(verdict);
-				// Nudge GJC to autostart the broker if it's absent or dead, with backoff.
-				if (
-					(verdict.state === "absent" || (verdict.state === "wedged" && verdict.reason === "pid_dead")) &&
-					epoch === this.#epoch &&
-					!this.#stopped
-				) {
-					this.#nudgeBrokerAutostart();
-				}
 				return false;
 			}
 			this.#observedLiveBroker = true;
@@ -615,7 +580,6 @@ export class GlobalGjcClient {
 			if (identity !== this.#identity) {
 				if (this.#identity !== undefined) this.#noteRespawn(discovery.pid);
 				this.#identity = identity;
-				await this.#releaseBroker(discovery.pid);
 				this.#generation++;
 				for (const listener of this.#listeners) {
 					try {
@@ -635,72 +599,7 @@ export class GlobalGjcClient {
 			return false;
 		}
 	}
-	/** A broker our own SDK command autostarted must not share the gateway unit's stop (#183). */
-	async #releaseBroker(pid: number): Promise<void> {
-		if (!this.#releaseBrokerScope) return;
-		let result: BrokerRelease;
-		try {
-			result = await this.#releaseBrokerScope(pid);
-		} catch (error) {
-			result = {
-				outcome: "skipped",
-				reason: `scope_failed: ${error instanceof Error ? error.message : String(error)}`,
-			};
-		}
-		if (result.outcome === "released")
-			this.#log(`broker_scope_released pid=${pid} scope=${result.scope} processes=${result.pids.length}`);
-		else if (result.reason.startsWith("scope_failed"))
-			this.#log(`broker_scope_release_failed pid=${pid} reason=${result.reason}`);
-	}
-	/**
-	 * Sends a read-only health-check command to trigger GJC's autostart of the broker.
-	 * Fires and forgets to avoid stalling the observe loop; guarded to prevent concurrent nudges.
-	 * This bypasses the normal availability check and is only sent when the broker is
-	 * discovered to be absent or dead, with backoff to avoid hammering.
-	 */
-	#nudgeBrokerAutostart(): void {
-		const now = (this.#options.nudgeClock ?? Date.now)();
-		// Every attempt retains its backoff, even if the launcher command succeeds.
-		if (this.#lastNudgeAttemptAt !== undefined && now - this.#lastNudgeAttemptAt < this.#NUDGE_BACKOFF_MS) {
-			return;
-		}
-		// Avoid concurrent nudge executions
-		if (this.#nudgeInFlight) {
-			return;
-		}
-		this.#nudgeInFlight = true;
-		this.#lastNudgeAttemptAt = now;
-		// Fire-and-forget: do not await, do not stall observe
-		void this.#executeNudge().finally(() => {
-			this.#nudgeInFlight = false;
-		});
-	}
-	/**
-	 * Executes the nudge command, invoked fire-and-forget by #nudgeBrokerAutostart.
-	 */
-	async #executeNudge(): Promise<void> {
-		try {
-			// Send read-only session list command that bypasses availability check.
-			// This is a safe probe that triggers GJC's normal autostart mechanism.
-			const result = await this.#executeCommand(
-				bindAgentDir(brokerHealthArgs(), this.agentDir),
-				this.#timeout,
-				"background",
-			);
-			if (result.exitCode === 0 && isHealthySessionList(result)) {
-				this.#log(`broker_nudge_success triggered autostart`);
-			} else {
-				this.#log(`broker_nudge_failed exitCode=${result.exitCode}`);
-			}
-		} catch (error) {
-			// Failure retains the backoff (lastNudgeAttemptAt was already set).
-			this.#log(`broker_nudge_error: ${error instanceof Error ? error.message : String(error)}`);
-		}
-	}
-	/**
-	 * Low-level command execution (spawn/track/terminate). Used by both #run
-	 * (with availability checks) and #executeNudge (without).
-	 */
+	/** Low-level command execution for the supervised SDK client. */
 	async #executeCommand(
 		args: readonly string[],
 		timeout: number,
@@ -812,7 +711,7 @@ export class GlobalGjcClient {
 		requestedTimeout?: number,
 		priority: "interactive" | "background" = "interactive",
 	): Promise<CliResult> {
-		this.#assertAgentDirIdentity();
+		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
 		// Interactive waiters always have headroom. Background can max 2 in flight, interactive can max 2.
@@ -841,16 +740,17 @@ export class GlobalGjcClient {
 					if (i >= 0) this.#queue.splice(i, 1);
 				}
 			}
-			if (Date.now() >= deadline) throw new GjcCliUnavailableError("command queue timed out");
+			if (Date.now() >= deadline) this.#unavailable("command queue timed out");
 		}
-		this.#assertAgentDirIdentity();
+		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available))
-			throw new GjcCliUnavailableError("client stopped or broker unavailable");
+			this.#unavailable("client stopped or broker unavailable");
 		this.#inflight++;
 		if (priority === "background") this.#backgroundInFlight++;
 		try {
 			const remaining = Math.max(1, deadline - Date.now());
-			return await this.#executeCommand(args, remaining, priority);
+			const result = await this.#executeCommand(args, remaining, priority);
+			return this.#checkUnavailable(result);
 		} finally {
 			this.#inflight--;
 			if (priority === "background") this.#backgroundInFlight--;
@@ -865,12 +765,27 @@ export class GlobalGjcClient {
 			}
 		}
 	}
-	#assertAgentDirIdentity(): void {
-		if (canonicalAgentDir(this.agentDir) !== this.agentDir) {
-			throw new GjcCliUnavailableError(
-				"agent directory canonical identity changed; recreate the client before binding authority",
-			);
+	#checkUnavailable(result: CliResult): CliResult {
+		const detail = extractRuntimeError(`${result.stdout}\n${result.stderr}`);
+		if (detail?.code === "broker_unavailable")
+			this.#unavailable(sanitizeDiagnostic(detail.message ?? "") || "broker unavailable");
+		return result;
+	}
+
+	#unavailable(reason: string): never {
+		try {
+			this.#options.onUnavailable?.(Date.now());
+		} catch (error) {
+			this.#log(error);
 		}
+		throw new GjcCliUnavailableError(sanitizeDiagnostic(reason) || "broker unavailable");
+	}
+
+	#assertAgentDirIdentity(recordUnavailable = false): void {
+		if (canonicalAgentDir(this.agentDir) === this.agentDir) return;
+		const reason = "agent directory canonical identity changed; recreate the client before binding authority";
+		if (recordUnavailable) this.#unavailable(reason);
+		throw new GjcCliUnavailableError(reason);
 	}
 	/**
 	 * One resident `gjc sdk serve --stdio` relay for a session: JSONL frames go
@@ -879,9 +794,9 @@ export class GlobalGjcClient {
 	 * never their GJC daemon or session host.
 	 */
 	openStream(sessionId: string): SessionRelayStream {
-		this.#assertAgentDirIdentity();
+		this.#assertAgentDirIdentity(true);
 		if (!sessionId || sessionId.startsWith("-") || /[\r\n\0]/.test(sessionId)) throw new Error("invalid session ID");
-		if (this.#stopped || !this.#available) throw new GjcCliUnavailableError("broker unavailable");
+		if (this.#stopped || !this.#available) this.#unavailable("broker unavailable");
 		// `gjc sdk serve` takes no `--agent-dir` (gjc 0.16.7: "unknown argument",
 		// exit 2 after the hello frame). It binds through GJC_CODING_AGENT_DIR,
 		// which #env already pins to this.agentDir. Passing the flag made every
@@ -1058,11 +973,13 @@ function trustedEnvironment(cwd: string): Record<string, string> {
 					throw new Error(`Cannot trust project-declared ${key}; launch from a clean service directory`);
 			}
 		}
+	delete env.GJC_EXECUTABLE;
+	delete env.GJC_CODING_AGENT_DIR;
+	delete env.PI_CODING_AGENT_DIR;
+	delete env.GJC_AGENT_DIR;
 	return env;
 }
-/** Preserve GJC autostart for a missing profile, resolving existing ancestor aliases first.
- * A later alias replacement is rejected rather than silently changing database authority.
- */
+/** Canonicalize the configured agent directory, resolving existing ancestor aliases first. */
 function canonicalAgentDir(path: string): string {
 	try {
 		return realpathSync(path);
@@ -1081,11 +998,7 @@ function describeDiscoveryFailure(verdict: BrokerLivenessVerdict): string {
 		? `discovery pid ${verdict.pid} is dead`
 		: `discovery pid ${verdict.pid} stopped heartbeating at ${new Date(verdict.heartbeatAt).toISOString()}`;
 }
-function validConfigName(value: string | undefined): string | undefined {
-	const name = value?.trim();
-	return name && !normalize(name).split(/[\\/]/).includes("..") ? name : undefined;
-}
-function defaultPidAlive(pid: number): boolean {
+export function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;

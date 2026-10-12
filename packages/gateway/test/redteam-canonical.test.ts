@@ -12,7 +12,7 @@ import {
 import type { SessionBindInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const DIRECT_ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "canonical-redteam" } as const;
@@ -49,7 +49,7 @@ type DirectFixtureOptions = {
 
 type DirectFixture = LifecycleCapture & {
 	readonly home: string;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly port: ScriptedSessionPort;
 	readonly manager: PersonaSessionManager;
 	readonly logs: string[];
@@ -59,7 +59,7 @@ type DirectFixture = LifecycleCapture & {
 
 async function directFixture(options: DirectFixtureOptions = {}): Promise<DirectFixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-redteam-canonical-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const port =
 		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
@@ -117,13 +117,13 @@ function enqueue(
 	receivedAt = new Date().toISOString(),
 ): void {
 	expect(
-		fixture.database.inboundEnqueue({
+		fixture.database.transaction((tx) => fixture.database.inbox.enqueue(tx, {
 			messageId,
 			originKey: DIRECT_ORIGIN_KEY,
 			originRefJson: JSON.stringify(DIRECT_ORIGIN),
 			body,
 			receivedAt,
-		}),
+		})),
 	).toBe(true);
 }
 
@@ -377,10 +377,10 @@ test("C2a: a 20-message burst has one send, nineteen ordered steers, and no unbo
 		);
 		expect(fixture.port.sends[0]?.text).toBe("message 0");
 		expect(steerBodies(fixture.port)).toEqual(Array.from({ length: 19 }, (_, index) => `message ${index + 1}`));
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toBeUndefined();
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toBeUndefined();
 		fixture.port.complete(required(fixture.port.sends[0], "burst trigger missing").opRef, "burst answer");
 		await eventually(
-			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"burst turn did not complete",
 		);
 		expect(fixture.terminals).toEqual([{ trigger: "burst-0", text: "burst answer" }]);
@@ -423,7 +423,7 @@ test("C2b: a message accepted after terminal observation but before dispatchNext
 		const second = required(fixture.port.sends[1], "next turn missing");
 		fixture.port.complete(second.opRef, "next answer");
 		await eventually(
-			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"window sequence did not drain",
 		);
 	} finally {
@@ -440,7 +440,7 @@ test("C2c: a bind failure preserves the row and dispatches it exactly once throu
 		await admit(fixture, "bind-retry", "retry me");
 		// A failed bind waits for the retry seam; admissions never re-bind synchronously (this was the red-team C2c finding).
 		expect(port.sends).toEqual([]);
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "bind-retry" });
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "bind-retry" });
 		const retry = required(
 			timers.find((timer) => timer.delayMs === 2_000),
 			"bind retry was not scheduled at 2s",
@@ -451,7 +451,7 @@ test("C2c: a bind failure preserves the row and dispatches it exactly once throu
 		expect(port.sends[0]?.text).toBe("retry me");
 		fixture.port.complete(required(port.sends[0], "retried send missing").opRef, "retried answer");
 		await eventually(
-			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"retried turn did not complete",
 		);
 	} finally {
@@ -472,7 +472,7 @@ test("C2d: /new discards only an undispatched row; the already-running turn stil
 			new Date(Date.now() + 1_000).toISOString(),
 		);
 		expect(fixture.discarded).toEqual(["reset-pending"]);
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toBeUndefined();
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toBeUndefined();
 		await eventually(
 			() => port.tailInputs.length >= 2,
 			"retired running turn did not reattach for terminal observation",
@@ -481,13 +481,13 @@ test("C2d: /new discards only an undispatched row; the already-running turn stil
 		// The reopened relay did not submit this operation; status settles the retired turn.
 		await fixture.manager.reconcile(DIRECT_ORIGIN_KEY);
 		await eventually(
-			() => fixture.database.inboundTurnRow(running.opRef)?.turn_state === "done",
+			() => fixture.database.inbox.turnRow(running.opRef)?.turn_state === "done",
 			"retired running turn did not reconcile terminal state",
 		);
 		expect(port.sends).toHaveLength(1);
 		// /new explicitly discards stale output while still closing its trigger.
 		expect(fixture.terminals).toEqual([]);
-		expect(fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY)).toBe(0);
+		expect(fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY)).toBe(0);
 	} finally {
 		await fixture.close();
 	}
@@ -502,8 +502,8 @@ test("C3a: a refused steer preserves the current turn and sends the pending mess
 		await admit(fixture, "steer-refused", "refused prompt");
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
-		expect(fixture.database.inboundTurnRow(old.opRef)?.turn_state).toBe("accepted");
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "steer-refused" });
+		expect(fixture.database.inbox.turnRow(old.opRef)?.turn_state).toBe("accepted");
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "steer-refused" });
 		port.complete(old.opRef, "old answer");
 		await eventually(() => port.sends.length === 2, "refused steer was not sent after terminal");
 		const replacement = required(port.sends[1], "pending turn missing");
@@ -530,15 +530,15 @@ test("C3b: consecutive refusals each wait for the current terminal without rotat
 		await admit(fixture, "twice-old", "old");
 		await admit(fixture, "twice-first", "first refusal");
 		expect(port.sends).toHaveLength(1);
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "twice-first" });
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "twice-first" });
 		port.complete(required(port.sends[0], "old send missing").opRef, "answer 0");
 		await eventually(() => port.sends.length === 2, "first refused message was not sent after terminal");
 		await admit(fixture, "twice-second", "second refusal");
 		await admit(fixture, "twice-new", "new row behind refusal");
 		expect(port.sends).toHaveLength(2);
 		expect(port.steerAttempts).toBe(2);
-		expect(fixture.database.inboundNonterminalTurns(DIRECT_ORIGIN_KEY)).toHaveLength(1);
-		expect(fixture.database.inboundTurnRow(port.sends[1]!.opRef)?.turn_state).toBe("accepted");
+		expect(fixture.database.inbox.nonterminalTurns(DIRECT_ORIGIN_KEY)).toHaveLength(1);
+		expect(fixture.database.inbox.turnRow(port.sends[1]!.opRef)?.turn_state).toBe("accepted");
 		port.complete(port.sends[1]!.opRef, "answer 1");
 		await eventually(
 			() => port.sends.length === 3 && port.steers.length === 1,
@@ -551,7 +551,7 @@ test("C3b: consecutive refusals each wait for the current terminal without rotat
 		expect(new Set(port.sends.map((send) => send.opRef)).size).toBe(3);
 		port.complete(port.sends[2]!.opRef, "answer 2");
 		await eventually(
-			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"consecutive-refusal turns did not drain",
 		);
 		expect(fixture.terminals).toEqual([
@@ -575,8 +575,8 @@ test("C3c: steer refusal never attempts unavailable replacement binds; explicit 
 		const old = required(port.sends[0], "old turn missing");
 		expect(port.bindAttempts).toBe(1);
 		expect(port.sends).toHaveLength(1);
-		expect(fixture.database.inboundTurnRow(old.opRef)?.turn_state).toBe("accepted");
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({
+		expect(fixture.database.inbox.turnRow(old.opRef)?.turn_state).toBe("accepted");
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({
 			message_id: "unavailable-pending",
 		});
 		port.complete(old.opRef, "old answer");
@@ -585,7 +585,7 @@ test("C3c: steer refusal never attempts unavailable replacement binds; explicit 
 		expect(port.bindAttempts).toBe(1);
 		port.complete(port.sends[1]!.opRef, "pending answer");
 		await eventually(
-			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"refusal sequence did not drain",
 		);
 		await fixture.manager.reset(DIRECT_ORIGIN_KEY, JSON.stringify(DIRECT_ORIGIN));
@@ -611,10 +611,10 @@ test("C3c: steer refusal never attempts unavailable replacement binds; explicit 
 		expect(timers.filter((timer) => timer.delayMs >= 2_000).map((timer) => timer.delayMs)).toEqual([
 			2_000, 4_000, 8_000,
 		]);
-		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({
+		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({
 			message_id: "unavailable-new",
 		});
-		expect(fixture.database.inboundTurnRow(old.opRef)?.turn_state).toBe("done");
+		expect(fixture.database.inbox.turnRow(old.opRef)?.turn_state).toBe("done");
 		// The bound is an operator signal, not an abandonment: the row is still
 		// pending and a retry is still armed (this was the red-team C3c finding).
 		expect(
@@ -650,7 +650,7 @@ test("C4: a three-hour-old durable inbound row survives a manager restart and is
 		expect(fixture.logs.some((line) => line.includes("inbound_expired"))).toBe(false);
 		fixture.port.complete(required(fixture.port.sends[0], "old row send missing").opRef, "old row answer");
 		await eventually(
-			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"three-hour-old row did not complete",
 		);
 	} finally {
@@ -694,7 +694,7 @@ async function connect(socketPath: string): Promise<SocketClient> {
 
 type ServerFixture = {
 	readonly home: string;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly port: ScriptedSessionPort;
 	readonly server: GatewayServer;
 	readonly client: SocketClient;
@@ -712,6 +712,7 @@ async function serverFixture(
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
@@ -719,7 +720,7 @@ async function serverFixture(
 		...(options.channels ? { channels: options.channels } : {}),
 		...(options.dmPolicy ? { dmPolicy: options.dmPolicy } : {}),
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port =
 		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
@@ -783,7 +784,7 @@ test("C5a: an edit sent in the same socket packet as chat.send is admitted after
 		expect(fixture.port.steers[0]?.text).toContain("[MESSAGE POINTER: race-message]");
 		expect(fixture.port.steers[0]?.text).toContain("edited before acknowledgement");
 		fixture.port.complete(required(fixture.port.sends[0], "race send missing").opRef, "done");
-		await eventually(() => fixture.database.inboundPendingCount(DM_ORIGIN_KEY) === 0, "race turn did not complete");
+		await eventually(() => fixture.database.inbox.pendingCount(DM_ORIGIN_KEY) === 0, "race turn did not complete");
 	} finally {
 		await fixture.close();
 	}
@@ -819,7 +820,7 @@ test("C5b: two distinct edits during one running turn are steered in edit arriva
 		expect(steerBodies(fixture.port)).toEqual(["version two", "version three"]);
 		expect(fixture.port.steers.every((steer) => steer.text.includes("[MESSAGE POINTER: edit-target]"))).toBe(true);
 		fixture.port.complete(required(fixture.port.sends[0], "original send missing").opRef, "done");
-		await eventually(() => fixture.database.inboundPendingCount(DM_ORIGIN_KEY) === 0, "edit turn did not complete");
+		await eventually(() => fixture.database.inbox.pendingCount(DM_ORIGIN_KEY) === 0, "edit turn did not complete");
 	} finally {
 		await fixture.close();
 	}
@@ -859,7 +860,7 @@ test("C5c: an edit of context-only intake becomes a pointer turn once the open-c
 		expect(fixture.port.sends[0]?.text).toContain("context now needs correction");
 		fixture.port.complete(required(fixture.port.sends[0], "context pointer send missing").opRef, "done");
 		await eventually(
-			() => fixture.database.inboundPendingCount(originKey) === 0,
+			() => fixture.database.inbox.pendingCount(originKey) === 0,
 			"context pointer turn did not complete",
 		);
 	} finally {
@@ -910,7 +911,7 @@ test("C5d: malformed edits and loopback-origin edits must be rejected without an
 		expect(fixture.port.steers).toHaveLength(1);
 		fixture.port.complete(required(fixture.port.sends[0], "loopback original send missing").opRef, "done");
 		await eventually(
-			() => fixture.database.inboundPendingCount(loopbackKey) === 0,
+			() => fixture.database.inbox.pendingCount(loopbackKey) === 0,
 			"loopback sequence did not complete",
 		);
 	} finally {
@@ -981,7 +982,7 @@ test("C6b: an accepted operation on a broker-disowned dead session is closed at 
 		// The model may already have run and acted: the accepted trigger is closed,
 		// not replayed into a fresh session.
 		await eventually(
-			() => fixture.database.inboundTurnRow(first.opRef)?.turn_state === "done",
+			() => fixture.database.inbox.turnRow(first.opRef)?.turn_state === "done",
 			"disowned accepted operation was not closed",
 		);
 		expect(fixture.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
@@ -1050,7 +1051,7 @@ test("D4: bind failures back off 2s,4s,8s,16s with one unrecoverable log at the 
 		expect(timers.filter((t) => t.delayMs >= 2_000).map((t) => t.delayMs)).toEqual([2_000, 4_000, 8_000, 16_000]);
 		expect(fixture.logs.filter((line) => line.startsWith("persona_send_unrecoverable"))).toHaveLength(1);
 		port.complete(required(port.sends[0], "send missing").opRef, "ok");
-		await eventually(() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0, "turn did not complete");
+		await eventually(() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0, "turn did not complete");
 		// Counter reset: after /new (which forces a fresh bind) the next failure
 		// starts the ladder again at 2s, not 32s.
 		await fixture.manager.reset(DIRECT_ORIGIN_KEY, JSON.stringify(DIRECT_ORIGIN));
@@ -1158,7 +1159,7 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-redteam-migrate-"));
 	const path = join(home, "gateway.db");
 	try {
-		(await GatewayDatabase.open(path)).close();
+		(await Store.open(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
@@ -1189,19 +1190,19 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
  ('old-steer', 'o', '{}', 'd', NULL, 'done', '2026-09-01T00:00:01.000Z', 'b0', 'steer', 1, 'done', 'gw-p-old', NULL, NULL, NULL, NULL);
 `);
 		raw.close();
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;
 		expect(count).toBe(4);
-		expect(upgraded.inboundNonterminalTurns("o").map((turn) => turn.opRef)).toEqual(["gw-p-live"]);
-		expect(upgraded.inboundTurnRows("gw-p-old").map((row) => [row.message_id, row.turn_role, row.state])).toEqual([
+		expect(upgraded.inbox.nonterminalTurns("o").map((turn) => turn.opRef)).toEqual(["gw-p-live"]);
+		expect(upgraded.inbox.turnRows("gw-p-old").map((row) => [row.message_id, row.turn_role, row.state])).toEqual([
 			["old-trigger", "trigger", "done"],
 			["old-steer", "steer", "done"],
 			["collision-member", "steer", "done"],
 		]);
-		expect(upgraded.inboundPendingCount("o")).toBe(1);
+		expect(upgraded.inbox.pendingCount("o")).toBe(1);
 		upgraded.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });

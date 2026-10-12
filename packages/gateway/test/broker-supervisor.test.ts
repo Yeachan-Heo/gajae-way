@@ -14,6 +14,7 @@ import {
 	probeBrokerEndpoint,
 	readBrokerDiscovery,
 	type SpawnFn,
+	GJC_ATTACH_ONLY_ENV,
 } from "../src/orchestrator/broker";
 
 const directories: string[] = [];
@@ -84,7 +85,8 @@ test("the stdio relay binds its agent directory through the environment, never a
 		expect(cmd.some((arg) => arg.startsWith("--agent-dir"))).toBe(false);
 		// The binding still happens - through the trusted environment.
 		expect(env.GJC_CODING_AGENT_DIR).toBe(value.agentDir);
-		expect(env.PI_CODING_AGENT_DIR).toBe(value.agentDir);
+		expect(env[GJC_ATTACH_ONLY_ENV]).toBe("0");
+		expect(env.PI_CODING_AGENT_DIR).toBeUndefined();
 	} finally {
 		relay.close();
 	}
@@ -238,7 +240,7 @@ const discovery = (): BrokerDiscovery => ({
 	token: "fake-incarnation",
 	heartbeatAt: Date.now(),
 });
-function client(options: ConstructorParameters<typeof GlobalGjcClient>[0] = {}): GlobalGjcClient {
+function client(options: Partial<ConstructorParameters<typeof GlobalGjcClient>[0]> = {}): GlobalGjcClient {
 	const value = new GlobalGjcClient({
 		executable: "/fake/nondefault/bin/gjc",
 		agentDir: "/fake/global/agent",
@@ -259,6 +261,20 @@ async function eventually(predicate: () => boolean): Promise<void> {
 	expect(predicate()).toBe(true);
 }
 
+
+test("broker-unavailable CLI and relay refusals share the SLO recorder callback", async () => {
+	const timestamps: number[] = [];
+	const value = client({
+		command: async () => ({ exitCode: 1, stdout: "", stderr: '{"ok":false,"error":{"code":"broker_unavailable","message":"offline"}}' }),
+		onUnavailable: (at) => timestamps.push(at),
+	});
+	await value.start();
+	await expect(value.cli(["sdk", "session", "list"])).rejects.toMatchObject({ code: "broker_unavailable" });
+	expect(timestamps).toHaveLength(1);
+	await value.stop();
+	expect(() => value.openStream("owned-session")).toThrow("broker_unavailable");
+	expect(timestamps).toHaveLength(2);
+});
 test("symlink profile aliases share canonical authority, CLI and relay environment without config writes", async () => {
 	const root = await directory();
 	const profile = join(root, "user-agent");
@@ -302,8 +318,9 @@ test("symlink profile aliases share canonical authority, CLI and relay environme
 	]);
 	for (const invocation of invocations) {
 		expect(invocation.env.GJC_CODING_AGENT_DIR).toBe(direct.agentDir);
-		expect(invocation.env.PI_CODING_AGENT_DIR).toBe(direct.agentDir);
-		expect(invocation.env.GJC_AGENT_DIR).toBe(direct.agentDir);
+		expect(invocation.env[GJC_ATTACH_ONLY_ENV]).toBe("0");
+		expect(invocation.env.GJC_AGENT_DIR).toBeUndefined();
+		expect(invocation.env.PI_CODING_AGENT_DIR).toBeUndefined();
 	}
 	expect(await readFile(join(profile, "config.yml"), "utf8")).toBe("steeringMode: one-at-a-time\n");
 	expect(await readdir(profile)).toEqual(["config.yml"]);
@@ -577,7 +594,7 @@ test("CLI, version preflight and stdio relay use exactly one executable, cwd and
 		return {
 			exited,
 			stdout: new Blob([
-				options.cmd.includes("--version") ? "gjc/0.16.3\n" : relay ? "event\n" : healthy.stdout,
+				options.cmd.includes("--version") ? "gjc/0.18.9\n" : relay ? "event\n" : healthy.stdout,
 			]).stream(),
 			stderr: new Blob([]).stream(),
 			kill: () => {
@@ -594,7 +611,7 @@ test("CLI, version preflight and stdio relay use exactly one executable, cwd and
 	for await (const line of stream.lines) lines.push(line);
 	await value.stop();
 	expect(lines).toEqual(["event"]);
-	expect(value.gjcVersion).toBe("0.16.3");
+	expect(value.gjcVersion).toBe("0.18.9");
 	expect(invocations.length).toBe(4);
 	const probe = invocations.find((invocation) => invocation.cmd.includes(HEALTH_PROBE_SESSION_ID));
 	expect(probe?.cmd.slice(1)).toEqual(["sdk", "serve", "--stdio", "--session", HEALTH_PROBE_SESSION_ID]);
@@ -603,7 +620,9 @@ test("CLI, version preflight and stdio relay use exactly one executable, cwd and
 		expect(invocation.cwd).toBe(cwd);
 		expect(invocation.env).toEqual(invocations[0]!.env);
 		expect(invocation.env.GJC_CODING_AGENT_DIR).toBe(agentDir);
-		expect(invocation.env.PI_CODING_AGENT_DIR).toBe(agentDir);
+		expect(invocation.env[GJC_ATTACH_ONLY_ENV]).toBe("0");
+		expect(invocation.env.PI_CODING_AGENT_DIR).toBeUndefined();
+		expect(invocation.env.GJC_AGENT_DIR).toBeUndefined();
 	}
 	expect(relayKills).toBeGreaterThan(0);
 });
@@ -738,15 +757,15 @@ test("discovery refuses stale, future, foreign endpoints and dead PIDs without d
 test("runtime capability requires a real session envelope and explicit all scope", async () => {
 	expect(brokerHealthArgs()).toEqual(["sdk", "session", "list", "--scope", "all"]);
 	expect(isHealthySessionList({ ...healthy, stdout: "USAGE gjc sdk" })).toBe(false);
-	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.15.6" }))).rejects.toThrow(
-		"requires gjc >= 0.16.0",
+	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.18.8" }))).rejects.toThrow(
+		"requires gjc >= 0.18.9",
 	);
-	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.16.0" }))).resolves.toEqual({
-		version: "0.16.0",
+	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.18.9" }))).resolves.toEqual({
+		version: "0.18.9",
 	});
 	await expect(
 		preflightGjcRuntime(
-			async () => ({ ...healthy, stdout: "gjc/0.16.3" }),
+			async () => ({ ...healthy, stdout: "gjc/0.18.10" }),
 			undefined,
 			async () => ({ ...healthy, stdout: "{}" }),
 		),
@@ -772,40 +791,6 @@ test("rejects relative executable and untrusted project dotenv path selection", 
 	expect(() => client({ cwd })).toThrow("project-declared");
 });
 
-test("resolves trusted user environment and home-relative config names without a private fallback", async () => {
-	const cwd = await directory();
-	const names = [
-		"HOME",
-		"GJC_EXECUTABLE",
-		"GJC_CODING_AGENT_DIR",
-		"PI_CODING_AGENT_DIR",
-		"GJC_CONFIG_DIR",
-		"PI_CONFIG_DIR",
-	] as const;
-	const before = Object.fromEntries(names.map((name) => [name, process.env[name]]));
-	try {
-		process.env.HOME = cwd;
-		process.env.GJC_EXECUTABLE = "/mnt/offloading/.bun/bin/gjc";
-		process.env.GJC_CODING_AGENT_DIR = join(cwd, "user-global-agent");
-		process.env.PI_CODING_AGENT_DIR = join(cwd, "legacy-agent");
-		process.env.GJC_CONFIG_DIR = "/custom-config";
-		delete process.env.PI_CONFIG_DIR;
-		const direct = client({ cwd, executable: undefined, agentDir: undefined });
-		expect(direct.executable).toBe("/mnt/offloading/.bun/bin/gjc");
-		expect(direct.agentDir).toBe(join(cwd, "user-global-agent"));
-		delete process.env.GJC_CODING_AGENT_DIR;
-		expect(client({ cwd, agentDir: undefined }).agentDir).toBe(join(cwd, "legacy-agent"));
-		delete process.env.PI_CODING_AGENT_DIR;
-		expect(client({ cwd, agentDir: undefined }).agentDir).toBe(join(cwd, "custom-config", "agent"));
-		process.env.GJC_CONFIG_DIR = "../escape";
-		expect(client({ cwd, agentDir: undefined }).agentDir).toBe(join(cwd, ".gjc", "agent"));
-	} finally {
-		for (const name of names) {
-			if (before[name] === undefined) delete process.env[name];
-			else process.env[name] = before[name];
-		}
-	}
-});
 
 test("preflight fails closed when the stream relay rejects its argv (usage exit 2)", async () => {
 	const run = async (args: readonly string[]) =>

@@ -7,7 +7,7 @@ import type { SessionRelayStream } from "../src/orchestrator/broker";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "tail-liveness" } as const;
@@ -63,7 +63,7 @@ class FakeRelay implements SessionRelayStream {
 
 test("persona state stays running until a terminal tail event is injected", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-tail-state-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const manager = new PersonaSessionManager({
@@ -75,17 +75,17 @@ test("persona state stays running until a terminal tail event is injected", asyn
 	});
 	try {
 		expect(
-			database.inboundEnqueue({
+			database.transaction((tx) => database.inbox.enqueue(tx, {
 				messageId: "m-1",
 				originKey: ORIGIN_KEY,
 				originRefJson: JSON.stringify(ORIGIN),
 				body: "wait for tail evidence",
-			}),
+			})),
 		).toBe(true);
 		await manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "persistent send did not start");
 		const send = port.sends[0]!;
-		const batch = database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
+		const batch = database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 
 		// Status can become terminal before a tail arrives, but that fact alone is
 		// intentionally not a persona state transition.
@@ -98,14 +98,14 @@ test("persona state stays running until a terminal tail event is injected", asyn
 		await manager.tick(ORIGIN_KEY);
 		port.status = status;
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
+		expect(database.inbox.turnRows(batch.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 
 		port.emitTool(send.sessionId, { toolName: "read" });
 		await Bun.sleep(0);
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
 		port.complete(send.opRef, "terminal tail evidence");
 		await eventually(() => manager.state(ORIGIN_KEY) === "idle", "agent_end tail frame did not end the actor turn");
-		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
+		expect(database.inbox.turnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 	} finally {
 		await manager.stop();
 		database.close();
@@ -220,12 +220,13 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
@@ -289,7 +290,7 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 		expect(counterFrames.length).toBeGreaterThan(0);
 		expect(counterFrames[counterFrames.length - 1]).toMatchObject({ payload: { toolCalls: 3, outputTokens: 77 } });
 		port.complete(send.opRef, "done");
-		await eventually(() => database.inboundPendingCount(ORIGIN_KEY) === 0, "completed turn did not settle");
+		await eventually(() => database.inbox.pendingCount(ORIGIN_KEY) === 0, "completed turn did not settle");
 	} finally {
 		socket?.end();
 		await server.stop();

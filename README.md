@@ -70,7 +70,7 @@ For how memory, monitors, and the gateway work end to end, see [the documentatio
 
    This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, `dist/gajaeway-slack`, `dist/gajaeway-admin`, and `dist/gajaeway`.
 
-2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
+2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the full layout and to install the release-pinned GJC package, provision the private broker agent with `gajaeway setup --broker-agent`, and install the broker service before starting the gateway.
 
 3. Create `$GAJAEWAY_HOME/adapter-discord.json` with its own `tokenFile` reference for Discord. Create the analogous Telegram adapter configuration when using Telegram, or `adapter-slack.json` with `botTokenFile` and `appTokenFile` references when using Slack.
 
@@ -80,7 +80,7 @@ For how memory, monitors, and the gateway work end to end, see [the documentatio
    dist/gajaeway-gateway daemon
    ```
 
-   The host also needs the external `gjc` executable, either resolvable on `PATH` or pinned with an absolute `GJC_EXECUTABLE`; it supplies the AI runtime for every turn.
+   The gateway connects to the separately supervised broker service and uses the private `$GAJAEWAY_HOME/broker/agent` directory. It does not use a system-wide executable or the operator's source agent directory as its runtime authority; see [deployment](docs/deployment.md) for pin and service setup.
 
 5. Start the Discord adapter, then send your bot a DM:
 

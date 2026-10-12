@@ -40,16 +40,12 @@ if (usageFor(process.argv.slice(2)) !== undefined) {
 const socket = socketPath();
 const port = adminPort();
 
-let client: GajaewayClient;
-try {
-	client = await GajaewayClient.connectSocket(socket);
-} catch (error) {
-	console.error(
-		`Unable to connect to gateway socket ${socket}: ${error instanceof Error ? error.message : String(error)}`,
-	);
-	console.error("Start the daemon out-of-band first.");
-	process.exit(1);
-}
+const client = await GajaewayClient.connectSocketWithBackoff(socket, {
+	onRetry: (attempt, delayMs, error) =>
+		console.error(
+			`Gateway socket ${socket} unavailable; retry ${attempt} in ${delayMs}ms: ${error instanceof Error ? error.message : String(error)}`,
+		),
+});
 
 const server = startAdminServer({
 	request: (method, params) => client.request(method, params),

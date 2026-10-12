@@ -24,7 +24,8 @@ import {
 	WorkLaneManager,
 	type WorkLaneManagerOptions,
 } from "../src/orchestrator/work-lane";
-import { GatewayDatabase, WorkAttemptStateError } from "../src/store/db";
+import { Store } from "../src/store";
+import { WorkAttemptStateError } from "../src/store/groups/work";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -51,12 +52,12 @@ async function fixture(
 	const gajaewayHome = join(directory, "gajaeway");
 	// Create gajaewayHome directory for service directory validation tests
 	await mkdir(gajaewayHome, { recursive: true });
-	const db = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const db = await Store.open(join(directory, "gateway.db"));
 	const port = new ScriptedSessionPort({
 		...portOptions,
 		onBind: (input) => {
-			const sessionId = db.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID();
-			db.putSession(input.originKey, sessionId);
+			const sessionId = db.bindings.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID();
+			db.transaction((tx) => db.bindings.bind(tx, input.originKey, sessionId));
 			return sessionId;
 		},
 	});
@@ -82,7 +83,7 @@ async function fixture(
 		db.close();
 		await rm(directory, { recursive: true, force: true });
 	});
-	const job = (name = "a") => parseLaneJobRecord(db.laneJobJson(laneJobIdentity(name).jobId)!);
+	const job = (name = "a") => parseLaneJobRecord(db.work.laneJobJson(laneJobIdentity(name).jobId)!);
 	return {
 		db,
 		port,
@@ -131,7 +132,7 @@ for (const model of ["startup-model", { preset: "startup-preset" }]) {
 		expect(f.port.sends).toHaveLength(1);
 		expect(Object.hasOwn(f.port.sends[0]!, "model")).toBe(false);
 		f.port.complete(first.opRef, "done");
-		await until(() => f.db.workAttemptGet(first.opRef)?.settledAt !== null);
+		await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 
 		const bind = f.port.bind.bind(f.port);
 		f.port.bind = async (input) => ({ ...(await bind(input)), startupModelApplied: false });
@@ -173,14 +174,14 @@ test("failed send after proven startup model remains uncertain without retry or 
 		f.manager.start({ name: "a", text: "work", cwd: f.directory, model: "startup-model" }),
 	).rejects.toMatchObject({ detail: { reasonCode: "send_acceptance_uncertain" } });
 	const opRef = f.job().attempts[0]!.opRef;
-	expect(f.db.workAttemptGet(opRef)?.sendPhase).toBe("uncertain");
+	expect(f.db.work.workAttemptGet(opRef)?.sendPhase).toBe("uncertain");
 	await f.manager.recover();
 	await f.restart();
 	expect(attempts).toBe(1);
 	expect(Object.hasOwn(f.port.sendAttempts[0]!, "model")).toBe(false);
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
-	expect(f.db.workAttemptGet(opRef)?.sendEvidence).toBeNull();
+	expect(f.db.work.workAttemptGet(opRef)?.sendEvidence).toBeNull();
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
@@ -198,15 +199,15 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 	await until(() => attaches === 1);
 	await Promise.all([f.manager.recover(), f.manager.recover()]);
 	expect(attaches).toBe(1);
-	const activity = f.db.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
 	await Bun.sleep(10);
 	f.port.complete(result.opRef, "done");
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
-	expect(f.db.workLaneRows()[0]!.last_activity_at! > activity!).toBe(true);
+	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at! > activity!).toBe(true);
 	expect(f.notices).toHaveLength(1);
 	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[lane a] completed: done" });
-	expect(f.db.deliveryRows()).toHaveLength(1);
+	expect(f.db.outbox.rows()).toHaveLength(1);
 	await f.manager.recover();
 	expect(f.notices).toHaveLength(1);
 });
@@ -234,12 +235,12 @@ test("status is pure during a run wait and steer returns the exact supplied clie
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, owner);
 	await until(() => f.port.sends.length === 1);
 	const op = f.port.sends[0]!.opRef;
-	const before = f.db.laneJobJson(laneJobIdentity("a").jobId);
-	const activity = f.db.workLaneRows()[0]!.last_activity_at;
+	const before = f.db.work.laneJobJson(laneJobIdentity("a").jobId);
+	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
 	const snapshot = await f.manager.status({ name: "a" });
 	expect(snapshot).toMatchObject({ attempt: { opRef: op }, op: { status: "in_flight" } });
-	expect(f.db.laneJobJson(snapshot.jobId)).toBe(before);
-	expect(f.db.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.work.laneJobJson(snapshot.jobId)).toBe(before);
+	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
 	const steer = await f.manager.steer({ name: "a", text: "correction" });
 	expect(steer.steered).toBe(true);
 	if (steer.steered) expect(f.port.steers[0]?.clientRef).toBe(steer.clientRef);
@@ -255,7 +256,7 @@ test("status is pure during a run wait and steer returns the exact supplied clie
 test("status unknown, malformed and changed-binding edges never rewrite durable evidence", async () => {
 	const f = await fixture();
 	const result = await started(f);
-	const before = f.db.laneJobJson(result.jobId);
+	const before = f.db.work.laneJobJson(result.jobId);
 	f.port.status = async (input) => ({
 		operationRef: input.opRef,
 		status: { status: "unknown" },
@@ -264,8 +265,8 @@ test("status unknown, malformed and changed-binding edges never rewrite durable 
 	expect((await f.manager.status({ name: "a" })).op?.status).toBe("unknown");
 	f.port.status = async () => ({ operationRef: "wrong", status: { status: "terminal_ok" }, summaryCompleted: true });
 	await expect(f.manager.status({ name: "a" })).rejects.toMatchObject({ detail: { reasonCode: "status_unavailable" } });
-	expect(f.db.laneJobJson(result.jobId)).toBe(before);
-	f.db.rebindEpoch(workSessionKey("a"));
+	expect(f.db.work.laneJobJson(result.jobId)).toBe(before);
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey("a")));
 	expect(await f.manager.status({ name: "a" })).toMatchObject({ sessionId: "", op: null });
 	await expect(f.manager.status({ name: "missing" })).rejects.toMatchObject({
 		detail: { reasonCode: "unknown_work_lane" },
@@ -313,7 +314,7 @@ test("caller timeout only detaches and a later completion settles the same opera
 	const op = f.port.sends[0]!.opRef;
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 	f.port.complete(op, "late answer");
-	await until(() => f.db.workAttemptGet(op)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(op)?.settledAt !== null);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.notices).toHaveLength(0);
 });
@@ -332,7 +333,7 @@ test("disconnect and AbortSignal release only their own waits, not worker observ
 	abort.abort();
 	expect(await b).toBeInstanceOf(ProtocolError);
 	for (const send of f.port.sends) f.port.complete(send.opRef, "finished after caller left");
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.port.sends).toHaveLength(2);
 });
 
@@ -366,25 +367,25 @@ test("notification target is immutable across owner reload; no-target remains no
 	const second = await started(f, "b");
 	owner = origin;
 	f.port.complete(second.opRef, "second");
-	await until(() => f.db.workAttemptGet(second.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(second.opRef)?.settledAt !== null);
 	expect(f.notices).toHaveLength(1);
-	expect(f.db.workAttemptGet(second.opRef)?.decision).toBe("no_target");
+	expect(f.db.work.workAttemptGet(second.opRef)?.decision).toBe("no_target");
 });
 
 test("proven original silence suppresses before prefix and UTF8 clipping, and survives restart", async () => {
 	const f = await fixture();
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "[SILENT]");
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
-	expect(f.db.workAttemptGet(result.opRef)?.output.knownSilence).toMatchObject({
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.output.knownSilence).toMatchObject({
 		opRef: result.opRef,
 		source: "turn.result",
 		fullness: "original",
 	});
-	expect(f.db.workAttemptGet(result.opRef)?.decision).toBe("suppressed");
+	expect(f.db.work.workAttemptGet(result.opRef)?.decision).toBe("suppressed");
 	await f.restart();
 	expect(f.notices).toHaveLength(0);
-	expect(f.db.deliveryRows()).toHaveLength(0);
+	expect(f.db.outbox.rows()).toHaveLength(0);
 	expect(utf8Prefix("HEAD" + "가".repeat(1000) + "TAIL")).toBe("HEAD" + "가".repeat(681));
 	expect(utf8Prefix("😀가tail", 6)).toBe("😀");
 	expect(utf8Prefix("😀가tail", 7)).toBe("😀가");
@@ -399,8 +400,8 @@ for (const [label, text] of [
 		const f = await fixture();
 		const result = await started(f, "a", origin);
 		f.port.complete(result.opRef, text);
-		await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
-		const runtime = f.db.workAttemptGet(result.opRef)!;
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+		const runtime = f.db.work.workAttemptGet(result.opRef)!;
 		expect(runtime.output.disposition).toBe("silent");
 		expect(runtime.output.knownSilence).toMatchObject({
 			opRef: result.opRef,
@@ -417,11 +418,11 @@ for (const [label, text] of [
 		if (label === "beyond excerpt") expect(runtime.output.excerpt).not.toContain("[SILENT]");
 		expect(runtime.decision).toBe("suppressed");
 		expect(f.notices).toHaveLength(0);
-		expect(f.db.deliveryRows()).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
 		await f.restart();
-		expect(f.db.workAttemptGet(result.opRef)?.output.knownSilence).toEqual(runtime.output.knownSilence);
+		expect(f.db.work.workAttemptGet(result.opRef)?.output.knownSilence).toEqual(runtime.output.knownSilence);
 		expect(f.notices).toHaveLength(0);
-		expect(f.db.deliveryRows()).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
 	});
 
 	test(`run returns full original ${label} silence body without a completion notification`, async () => {
@@ -431,7 +432,7 @@ for (const [label, text] of [
 		const opRef = f.port.sends[0]!.opRef;
 		f.port.complete(opRef, text);
 		expect(await run).toMatchObject({ held: false, text, opRef });
-		const runtime = f.db.workAttemptGet(opRef)!;
+		const runtime = f.db.work.workAttemptGet(opRef)!;
 		expect(runtime.mode).toBe("run");
 		expect(runtime.parent).toBeNull();
 		expect(runtime.output.knownSilence).toMatchObject({
@@ -442,7 +443,7 @@ for (const [label, text] of [
 		expect(runtime.output.disposition).toBe("silent");
 		expect(runtime.decision).toBe("suppressed");
 		expect(f.notices).toHaveLength(0);
-		expect(f.db.deliveryRows()).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
 	});
 }
 
@@ -471,18 +472,18 @@ test("three durable output read claims retain 1s/5s eligibility across restart",
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "not published");
 	await until(() => reads === 1);
-	expect(f.db.workAttemptGet(result.opRef)?.output.reads).toBe(1);
+	expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(1);
 	await f.restart();
 	await Bun.sleep(20);
 	expect(reads).toBe(1);
 	now += 1000;
 	await until(() => reads === 2);
-	expect(f.db.workAttemptGet(result.opRef)?.output.reads).toBe(2);
+	expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(2);
 	now += 4999;
 	await Bun.sleep(20);
 	expect(reads).toBe(2);
 	now += 1;
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(reads).toBe(3);
 	expect(f.notices[0]?.text).toBe("[lane a] completed: output_unavailable");
 });
@@ -503,7 +504,7 @@ for (const [reason, state] of [
 			status: { status: "terminal_ok", receiptState: "present", outcome: { reason } },
 			summaryCompleted: true,
 		});
-		await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 		expect(f.job().attempts[0]?.endState).toBe(state);
 		const suffix = f.notices[0]!.text.slice("[lane a] attempt_ended: ".length);
 		expect(suffix.startsWith(`${reason === "unknown_reason" ? "stopped_incomplete" : reason}: `)).toBe(true);
@@ -537,7 +538,7 @@ test("failing status reads back off and log one diagnostic per distinct reason (
 	message = "offline";
 	await until(() => lines().length === 2);
 	expect(lines()[1]).toContain("reason=Error: offline");
-	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
 });
 
 test("a rebound lane stops the observer and settles the attempt as session_disowned (#262)", async () => {
@@ -549,9 +550,9 @@ test("a rebound lane stops the observer and settles the attempt as session_disow
 		throw new Error("invalid status identity");
 	};
 	await until(() => queries > 0);
-	f.db.rebindEpoch(result.sessionKey);
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_disowned");
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, result.sessionKey));
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_disowned");
 	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
 	expect(f.job().state).toBe("awaiting_operator");
 	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: session_disowned: output_unavailable");
@@ -573,9 +574,9 @@ test("persistently failing status without liveness proof settles instead of poll
 	f.port.liveness = async () => {
 		throw new Error("offline");
 	};
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(queries).toBeLessThanOrEqual(10);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("recovery_indeterminate");
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("recovery_indeterminate");
 	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
 	const settledQueries = queries;
 	await Bun.sleep(50);
@@ -595,7 +596,7 @@ test("live restart reattaches exact session/op without bind, resume or replay", 
 		detail: { reasonCode: "attempt_open" },
 	});
 	f.port.complete(result.opRef, "recovered");
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 });
 
@@ -609,7 +610,7 @@ test("live unknown restart observes without replay or false acceptance", async (
 	});
 	await f.restart();
 	await Bun.sleep(20);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
@@ -620,10 +621,10 @@ test("dead restart settles uncertainty into a sticky hold, never replacement bin
 	const result = await started(f, "a", origin);
 	f.port.setSessionState(result.sessionId, { live: false });
 	await f.restart();
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().state).toBe("awaiting_operator");
 	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(1);
@@ -640,14 +641,14 @@ test("force-retiring an open dead lane settles its runtime and permits later wor
 	f.port.setSessionState(result.sessionId, { live: false });
 
 	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
-	const runtime = f.db.workAttemptGet(result.opRef);
+	const runtime = f.db.work.workAttemptGet(result.opRef);
 	const attempt = f.job().attempts[0];
 	expect(runtime).toBeDefined();
 	expect(attempt).toBeDefined();
 	expect(runtime?.settledAt).toBe(attempt?.endedAt);
 	expect(runtime?.terminal).toMatchObject({ kind: "local", reasonCode: "session_dead" });
 	expect(attempt).toMatchObject({ endState: "attempt_ended", errorCode: "host_lost" });
-	expect(f.db.workAttemptOpen()).toHaveLength(0);
+	expect(f.db.work.workAttemptOpen()).toHaveLength(0);
 
 	const next = await f.manager.start({ name: "a", text: "again", cwd: f.directory, resume: true });
 	expect(next.started).toBe(true);
@@ -677,13 +678,13 @@ test("force retirement preserves a recorded terminal outcome in lane history", a
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "durable result");
 	await until(() => {
-		const runtime = f.db.workAttemptGet(result.opRef);
+		const runtime = f.db.work.workAttemptGet(result.opRef);
 		return runtime?.terminal?.reasonCode === "end_turn" && runtime.output.reads > 0;
 	});
 	f.port.setSessionState(result.sessionId, { live: false });
 
 	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
-	const runtime = f.db.workAttemptGet(result.opRef);
+	const runtime = f.db.work.workAttemptGet(result.opRef);
 	const attempt = f.job().attempts[0];
 	expect(runtime?.terminal).toMatchObject({ kind: "broker", reasonCode: "end_turn" });
 	expect(attempt).toMatchObject({ endState: "completed" });
@@ -696,7 +697,7 @@ test("force-retiring a disowned lane records a session_disowned terminal", async
 	f.port.liveness = async () => ({ live: undefined, disowned: true });
 
 	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
-	const runtime = f.db.workAttemptGet(result.opRef);
+	const runtime = f.db.work.workAttemptGet(result.opRef);
 	const attempt = f.job().attempts[0];
 	expect(runtime?.settledAt).toBe(attempt?.endedAt);
 	expect(runtime?.terminal).toMatchObject({ kind: "local", reasonCode: "session_disowned" });
@@ -715,7 +716,9 @@ test("one inconsistent runtime is logged with its opRef and does not block other
 		endedAt: new Date(Date.now() + 1_000).toISOString(),
 	});
 	const identity = laneJobIdentity("a");
-	f.db.putLaneJob({ ...closed, laneKey: identity.laneKey, json: JSON.stringify(closed) });
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, { ...closed, laneKey: identity.laneKey, json: JSON.stringify(closed) }),
+	);
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(async () => errors.mockRestore());
 	let recoveredOther = false;
@@ -740,10 +743,10 @@ test("one inconsistent runtime is logged with its opRef and does not block other
 	expect(errorLogged).toBe(true);
 
 	// Verify that the attempt is quarantined: it should not be queried in recovery
-	const isQuarantined = f.db.isBrokerQuarantined("work", f.db.workAttemptJobId(bad.opRef)!);
+	const isQuarantined = f.db.bindings.isQuarantined("work", f.db.work.workAttemptJobId(bad.opRef)!);
 	expect(isQuarantined).toBe(true);
 	f.port.complete(good.opRef, "recovered other lane");
-	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(good.opRef)?.settledAt !== null);
 });
 
 test("an inconsistent runtime is quarantined and not re-logged on subsequent recovery calls (issue #407)", async () => {
@@ -760,7 +763,9 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 		endedAt,
 	});
 	const identity = laneJobIdentity("a");
-	f.db.putLaneJob({ ...closed, laneKey: identity.laneKey, json: JSON.stringify(closed) });
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, { ...closed, laneKey: identity.laneKey, json: JSON.stringify(closed) }),
+	);
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(async () => errors.mockRestore());
 	let recoveredOther = false;
@@ -784,9 +789,9 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 	});
 	expect(errorLogged).toBe(true);
 
-	const badJobId = f.db.workAttemptJobId(bad.opRef)!;
+	const badJobId = f.db.work.workAttemptJobId(bad.opRef)!;
 	// Verify that the attempt's job was quarantined
-	expect(f.db.isBrokerQuarantined("work", badJobId)).toBe(true);
+	expect(f.db.bindings.isQuarantined("work", badJobId)).toBe(true);
 
 	// Verify that recovery doesn't re-log the same error on subsequent calls
 	const errorCountBefore = errors.mock.calls.length;
@@ -800,7 +805,7 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 	expect(newInvalidLogs.length).toBe(0);
 
 	f.port.complete(good.opRef, "recovered other lane");
-	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(good.opRef)?.settledAt !== null);
 });
 
 test("a lane row torn under a live observer is logged and dropped, not an unhandled rejection (#401)", async () => {
@@ -824,8 +829,10 @@ test("a lane row torn under a live observer is logged and dropped, not an unhand
 		errorCode: "host_lost",
 		endedAt: new Date(Date.now() + 1_000).toISOString(),
 	});
-	f.db.putLaneJob({ ...closed, laneKey: laneJobIdentity("a").laneKey, json: JSON.stringify(closed) });
-	expect(() => f.db.workAttemptGet(torn.opRef)).toThrow(WorkAttemptStateError);
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, { ...closed, laneKey: laneJobIdentity("a").laneKey, json: JSON.stringify(closed) }),
+	);
+	expect(() => f.db.work.workAttemptGet(torn.opRef)).toThrow(WorkAttemptStateError);
 
 	await until(() =>
 		errors.mock.calls.some((call) => {
@@ -837,7 +844,7 @@ test("a lane row torn under a live observer is logged and dropped, not an unhand
 	await Bun.sleep(50);
 	expect(rejections).toEqual([]);
 	f.port.complete(healthy.opRef, "other lane still served");
-	await until(() => f.db.workAttemptGet(healthy.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(healthy.opRef)?.settledAt !== null);
 	expect(rejections).toEqual([]);
 });
 
@@ -848,7 +855,7 @@ test("saved terminal proof wins over dead liveness and output recovery consumes 
 	f.port.fetchWorkerOutput = async () => ({ status: "absent", code: "output_pending" });
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "durable result");
-	await until(() => f.db.workAttemptGet(result.opRef)?.output.reads === 1);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.output.reads === 1);
 	f.port.setSessionState(result.sessionId, { live: false });
 	f.port.status = async () => {
 		throw new Error("offline");
@@ -856,7 +863,7 @@ test("saved terminal proof wins over dead liveness and output recovery consumes 
 	f.port.fetchWorkerOutput = original;
 	now += 1000;
 	await f.restart();
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.notices[0]?.text).toBe("[lane a] completed: durable result");
 });
@@ -865,17 +872,17 @@ test("historical open attempt recovery uses no current notification target and n
 	const f = await fixture({ ownerTarget: () => origin });
 	const { jobId, laneKey } = laneJobIdentity("old");
 	const sessionId = crypto.randomUUID();
-	f.db.putSession(workSessionKey("old"), sessionId);
+	f.db.transaction((tx) => f.db.bindings.bind(tx, workSessionKey("old"), sessionId));
 	f.port.setSessionState(sessionId, { repo: f.directory, live: false });
 	const job = appendAttempt(createLaneJobRecord({ jobId, branch: "work/old", worktreePath: f.directory }), {
 		opRef: "old-open-attempt",
 		sessionId,
 		startedAt: new Date().toISOString(),
 	});
-	f.db.putLaneJob({ ...job, laneKey, json: JSON.stringify(job) });
+	f.db.transaction((tx) => f.db.work.putLaneJob(tx, { ...job, laneKey, json: JSON.stringify(job) }));
 	await f.manager.recover();
-	await until(() => f.db.workAttemptGet("old-open-attempt")?.settledAt != null);
-	expect(f.db.workAttemptGet("old-open-attempt")).toMatchObject({
+	await until(() => f.db.work.workAttemptGet("old-open-attempt")?.settledAt != null);
+	expect(f.db.work.workAttemptGet("old-open-attempt")).toMatchObject({
 		mode: "historical",
 		parent: null,
 		decision: "no_target",
@@ -898,14 +905,14 @@ test("late output from an obsolete generation cannot settle or fan out", async (
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "answer");
 	await until(() => reading);
-	const before = f.db.workAttemptGet(result.opRef)!;
+	const before = f.db.work.workAttemptGet(result.opRef)!;
 	generation++;
 	const recovery = f.manager.onBrokerGeneration();
 	gate.resolve({ status: "unavailable", code: "output_unavailable" });
 	await recovery;
-	expect(f.db.workAttemptGet(result.opRef)?.output.disposition).toBe("pending");
+	expect(f.db.work.workAttemptGet(result.opRef)?.output.disposition).toBe("pending");
 	expect(f.notices).toHaveLength(0);
-	expect(f.db.workAttemptGet(result.opRef)?.version).toBe(before.version);
+	expect(f.db.work.workAttemptGet(result.opRef)?.version).toBe(before.version);
 	f.port.fetchWorkerOutput = original;
 });
 
@@ -920,11 +927,11 @@ test("binding epoch fences an already-running output read", async () => {
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "answer");
 	await until(() => reading);
-	const before = f.db.workAttemptGet(result.opRef)!;
-	f.db.rebindEpoch(result.sessionKey);
+	const before = f.db.work.workAttemptGet(result.opRef)!;
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, result.sessionKey));
 	gate.resolve({ status: "unavailable", code: "output_unavailable" });
 	await Bun.sleep(20);
-	expect(f.db.workAttemptGet(result.opRef)?.version).toBe(before.version);
+	expect(f.db.work.workAttemptGet(result.opRef)?.version).toBe(before.version);
 	expect(f.notices).toHaveLength(0);
 });
 
@@ -946,8 +953,8 @@ test("stop releases run before draining a blocked finite output read and preserv
 	gate.resolve({ status: "unavailable", code: "cancelled" });
 	await stop;
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
-	expect(f.db.workAttemptGet(op)?.output.reads).toBe(1);
-	expect(f.db.workAttemptGet(op)?.output.disposition).toBe("pending");
+	expect(f.db.work.workAttemptGet(op)?.output.reads).toBe(1);
+	expect(f.db.work.workAttemptGet(op)?.output.disposition).toBe("pending");
 	expect(f.notices).toHaveLength(0);
 });
 
@@ -997,7 +1004,7 @@ test("start and run nested refusal happens before recover and bind", async () =>
 		code: "unauthorized",
 		detail: { reasonCode: "nested_lane_forbidden", verb: "start", parent: "parent" },
 	});
-	expect(f.db.laneJobJson(laneJobIdentity("child").jobId)).toBeUndefined();
+	expect(f.db.work.laneJobJson(laneJobIdentity("child").jobId)).toBeUndefined();
 	expect(recoverCalls).toBe(0);
 	expect(f.port.binds).toHaveLength(binds);
 	expect(f.port.sendAttempts).toHaveLength(sends);
@@ -1107,10 +1114,10 @@ test("run from a lane with nesting allowed remains response-only", async () => {
 	const opRef = f.port.sends[1]!.opRef;
 	f.port.complete(opRef, "response only");
 	expect(await run).toMatchObject({ held: false, text: "response only", opRef });
-	const runtime = f.db.workAttemptGet(opRef)!;
+	const runtime = f.db.work.workAttemptGet(opRef)!;
 	expect(runtime).toMatchObject({ mode: "run", parent: null, decision: "no_target" });
-	expect(f.db.laneReportsByParent("parent")).toEqual([]);
-	expect(f.db.deliveryRows()).toHaveLength(0);
+	expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+	expect(f.db.outbox.rows()).toHaveLength(0);
 	expect(f.port.steers).toHaveLength(0);
 });
 // receiptState=missing is covered by the #248 late-receipt/held tests below:
@@ -1125,7 +1132,7 @@ for (const [receiptState, reasonCode, endState] of [["unknown", "terminal_uncert
 			status: { status: "terminal_ok", receiptState, outcome: { reason: "end_turn" } },
 			summaryCompleted: true,
 		});
-		await until(() => f.db.workAttemptOpen().length === 0);
+		await until(() => f.db.work.workAttemptOpen().length === 0);
 		expect(f.job().attempts[0]?.endState).toBe(endState);
 		expect(f.job().state).toBe("awaiting_operator");
 		expect(f.notices[0]?.text).toBe(`[lane a] attempt_ended: ${reasonCode}: partial answer`);
@@ -1174,12 +1181,12 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 		return original(input);
 	};
 	await until(() => reads === 1);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("terminal_missing_receipt");
-	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("terminal_missing_receipt");
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
 	now += 1000;
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	expect(reads).toBe(2);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("end_turn");
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("end_turn");
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.job().state).not.toBe("awaiting_operator");
 	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] completed: PR opened"]);
@@ -1227,7 +1234,7 @@ test("a receipt still missing after the output budget stays held with a non-loss
 	now += 1000;
 	await until(() => reads === 2);
 	now += 5000;
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(reads).toBe(3);
 	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 	expect(f.job().state).toBe("awaiting_operator");
@@ -1246,9 +1253,9 @@ test("broker deadline ends the attempt but caller timeout never does", async () 
 		summaryCompleted: true,
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.status?.error).toEqual({ code: "prompt_deadline_exceeded" });
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.status?.error).toEqual({ code: "prompt_deadline_exceeded" });
 	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: prompt_deadline_exceeded: output_unavailable");
 });
 
@@ -1260,7 +1267,7 @@ test("torn send accepts only same-op status evidence; unknown remains open with 
 		throw new Error("lost receipt secret");
 	};
 	const result = await started(f);
-	expect(f.db.workAttemptGet(result.opRef)?.sendEvidence?.source).toBe("status");
+	expect(f.db.work.workAttemptGet(result.opRef)?.sendEvidence?.source).toBe("status");
 	f.port.send = async () => {
 		throw new Error("lost receipt secret");
 	};
@@ -1269,7 +1276,7 @@ test("torn send accepts only same-op status evidence; unknown remains open with 
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
 	const pending = f.job("b").attempts[0]!;
-	expect(f.db.workAttemptGet(pending.opRef)?.sendPhase).toBe("uncertain");
+	expect(f.db.work.workAttemptGet(pending.opRef)?.sendPhase).toBe("uncertain");
 	await f.manager.recover();
 	expect(f.job("b").attempts[0]?.endedAt).toBeUndefined();
 	expect(f.port.sends).toHaveLength(1);
@@ -1284,70 +1291,70 @@ test("definitive send rejection atomically holds and enqueues one safe start-onl
 	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
 		detail: { reasonCode: "send_rejected" },
 	});
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("failed");
 	expect(f.job().state).toBe("awaiting_operator");
 	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable");
-	expect(f.db.deliveryRows()).toHaveLength(1);
+	expect(f.db.outbox.rows()).toHaveLength(1);
 });
 
 test("CAS loss does not fan out or perform a separate history/activity update", async () => {
 	const f = await fixture();
-	const settle = f.db.workAttemptSettle.bind(f.db);
+	const settle = f.db.work.workAttemptSettle.bind(f.db.work);
 	let calls = 0;
-	f.db.workAttemptSettle = () => {
+	f.db.work.workAttemptSettle = () => {
 		calls++;
 		return undefined;
 	};
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "answer");
-	const history = f.db.laneJobJson(result.jobId);
+	const history = f.db.work.laneJobJson(result.jobId);
 	await until(() => calls > 0);
 	// Streamed frames may refresh activity before settlement; a lost settlement
 	// CAS must not write it (or history) again on any later retry.
-	const activity = f.db.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
 	const seen = calls;
 	await until(() => calls > seen);
-	expect(f.db.laneJobJson(result.jobId)).toBe(history);
-	expect(f.db.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.work.laneJobJson(result.jobId)).toBe(history);
+	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
 	expect(f.notices).toHaveLength(0);
-	expect(f.db.deliveryRows()).toHaveLength(0);
-	f.db.workAttemptSettle = settle;
-	await until(() => f.db.workAttemptOpen().length === 0);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	f.db.work.workAttemptSettle = settle;
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.notices).toHaveLength(1);
 });
 
 test("persisted original silence survives a crash between output staging and settlement", async () => {
 	const f = await fixture();
-	const settle = f.db.workAttemptSettle.bind(f.db);
-	f.db.workAttemptSettle = () => {
+	const settle = f.db.work.workAttemptSettle.bind(f.db.work);
+	f.db.work.workAttemptSettle = () => {
 		throw new Error("injected pre-transaction crash");
 	};
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "[SILENT]");
-	await until(() => f.db.workAttemptGet(result.opRef)?.output.knownSilence != null);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.output.knownSilence != null);
 	await f.manager.stop();
-	f.db.workAttemptSettle = settle;
+	f.db.work.workAttemptSettle = settle;
 	f.port.fetchWorkerOutput = async () => {
 		throw new Error("original output no longer accessible");
 	};
 	await f.restart();
-	await until(() => f.db.workAttemptOpen().length === 0);
-	expect(f.db.workAttemptGet(result.opRef)?.decision).toBe("suppressed");
-	expect(f.db.workAttemptGet(result.opRef)?.output.reads).toBe(1);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	expect(f.db.work.workAttemptGet(result.opRef)?.decision).toBe("suppressed");
+	expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(1);
 	expect(f.notices).toHaveLength(0);
-	expect(f.db.deliveryRows()).toHaveLength(0);
+	expect(f.db.outbox.rows()).toHaveLength(0);
 });
 
 test("reopening SQLite recovers the same live operation and immutable notification intent", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-work-reopen-"));
 	const path = join(directory, "gateway.db");
-	let db = await GatewayDatabase.open(path);
+	let db = await Store.open(path);
 	const gajaewayHome = join(directory, "gajaeway");
 	const port = new ScriptedSessionPort({
 		onBind: (input) => {
 			const id = crypto.randomUUID();
-			db.putSession(input.originKey, id);
+			db.transaction((tx) => db.bindings.bind(tx, input.originKey, id));
 			return id;
 		},
 	});
@@ -1370,7 +1377,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	if (!result.started) throw new Error("unexpected hold");
 	await manager.stop();
 	db.close();
-	db = await GatewayDatabase.open(path);
+	db = await Store.open(path);
 	manager = new WorkLaneManager({
 		database: db,
 		port,
@@ -1381,11 +1388,11 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 		deliverFallback: (payload) => notices.push(payload),
 	});
 	await manager.recover();
-	expect(db.workAttemptOpen()).toHaveLength(1);
+	expect(db.work.workAttemptOpen()).toHaveLength(1);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumes).toHaveLength(0);
 	port.complete(result.opRef, "after database reopen");
-	await until(() => db.workAttemptOpen().length === 0);
+	await until(() => db.work.workAttemptOpen().length === 0);
 	expect(notices).toHaveLength(1);
 	expect(notices[0]?.origin).toEqual(origin);
 	expect(notices[0]?.turnId).toBe(result.opRef);
@@ -1425,8 +1432,8 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
 				const opRef = f.job().attempts[0]!.opRef;
-				await until(() => f.db.workAttemptGet(opRef)?.settledAt != null);
-				const runtime = f.db.workAttemptGet(opRef)!;
+				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
+				const runtime = f.db.work.workAttemptGet(opRef)!;
 				expect(runtime.sendPhase).toBe(receiptState === "present" ? "accepted" : "uncertain");
 				if (receiptState === "present") expect(runtime.sendEvidence?.source).toBe("status");
 				else expect(runtime.sendEvidence).toBeNull();
@@ -1447,10 +1454,10 @@ test("completion excerpt retains the leading marker and scalar-safe prefix, not 
 	const result = await started(f, "a", origin);
 	const source = "HEAD:" + "😀".repeat(1000) + ":TAIL";
 	f.port.complete(result.opRef, source);
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	const head = "[lane a] completed: ";
 	const excerpt = utf8Prefix(source);
-	expect(f.db.workAttemptGet(result.opRef)?.output.excerpt).toBe(excerpt);
+	expect(f.db.work.workAttemptGet(result.opRef)?.output.excerpt).toBe(excerpt);
 	expect(f.notices[0]?.text).toBe(head + utf8Prefix(source, 2048 - Buffer.byteLength(head, "utf8")));
 	expect(f.notices[0]?.text.includes(":TAIL")).toBe(false);
 });
@@ -1474,8 +1481,8 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 	const f = await fixture();
 	const result = await started(f, name, origin);
 	f.port.complete(result.opRef, "界".repeat(1000));
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
-	const runtime = f.db.workAttemptGet(result.opRef)!;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(f.notices[0]?.text).toBe(reportText(name, "completed", "end_turn", result.opRef, runtime.output));
 	expect(Buffer.byteLength(f.notices[0]!.text, "utf8")).toBeLessThanOrEqual(2048);
 });
@@ -1512,15 +1519,15 @@ test("AC-K first accepted send per epoch carries notice; same-epoch same-parent 
 	const first = await started(f);
 	const firstNotice = f.port.sends[0]?.systemPreamble;
 	expect(firstNotice).toContain(`persona conversation ${originKey(origin)}`);
-	expect(JSON.parse(f.db.metaGet(`lane-notice:${workSessionKey("a")}`)!).hash).toBe(
-		f.db.workAttemptGet(first.opRef)?.noticeHash,
+	expect(JSON.parse(f.db.core.metaGet(`lane-notice:${workSessionKey("a")}`)!).hash).toBe(
+		f.db.work.workAttemptGet(first.opRef)?.noticeHash,
 	);
 	f.port.complete(first.opRef, "first done");
-	await until(() => f.db.workAttemptGet(first.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 	const second = await started(f);
 	expect(f.port.sends[1]?.systemPreamble).toBeUndefined();
 	f.port.complete(second.opRef, "second done");
-	await until(() => f.db.workAttemptGet(second.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(second.opRef)?.settledAt !== null);
 });
 
 test("AC-K parent change in the same epoch re-prepends the notice", async () => {
@@ -1528,7 +1535,7 @@ test("AC-K parent change in the same epoch re-prepends the notice", async () => 
 	f.setOwnerTarget(origin);
 	const first = await started(f);
 	f.port.complete(first.opRef, "first done");
-	await until(() => f.db.workAttemptGet(first.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 	const changedOrigin = { ...origin, conversationId: "different-parent" };
 	f.setOwnerTarget(changedOrigin);
 	const second = await started(f);
@@ -1541,7 +1548,7 @@ test("AC-K nested-refused notice is prepended to start sends and run sends carry
 	expect(f.port.sends[0]?.systemPreamble).toContain("Nested work.start and work.run are refused");
 	expect(f.port.sends[0]?.systemPreamble).toContain("Parent: none (status-only).");
 	f.port.complete(start.opRef, "finished");
-	await until(() => f.db.workAttemptGet(start.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(start.opRef)?.settledAt !== null);
 	const run = f.manager.run({ name: "a", text: "run text", cwd: f.directory }, {});
 	await until(() => f.port.sends.length === 2);
 	expect(f.port.sends[1]?.systemPreamble).toBeUndefined();
@@ -1562,7 +1569,7 @@ test("AC-K uncertain send acceptance re-prepends on the next send", async () => 
 	const first = f.job().attempts[0]!;
 	f.port.setSessionState(first.sessionId, { live: false });
 	await f.restart();
-	await until(() => f.db.workAttemptGet(first.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 	f.port.send = send;
 	const retry = await f.manager.start({ name: "a", text: "retry", cwd: f.directory, resume: true });
 	if (!retry.started) throw new Error("retry was held");
@@ -1573,12 +1580,12 @@ test("personaHold broker_wedged selects fallback inside the settlement transacti
 	const f = await fixture({ ownerTarget: () => origin, personaHold: () => "broker_wedged" });
 	const result = await started(f);
 	f.port.complete(result.opRef, "held persona result");
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
-	const runtime = f.db.workAttemptGet(result.opRef)!;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(runtime.decision).toBe("fallback");
-	expect(f.db.deliveryRows()).toHaveLength(1);
-	expect(f.db.deliveryRows()[0]?.delivery_id).toBe(runtime.deliveryId);
-	expect(f.db.inboundPendingOldest(originKey(origin))).toBeUndefined();
+	expect(f.db.outbox.rows()).toHaveLength(1);
+	expect(f.db.outbox.rows()[0]?.delivery_id).toBe(runtime.deliveryId);
+	expect(f.db.inbox.pendingOldest(originKey(origin))).toBeUndefined();
 	expect(f.notices).toHaveLength(1);
 });
 
@@ -1586,9 +1593,9 @@ test("personaHold emitted hold reason selects fallback", async () => {
 	const f = await fixture({ ownerTarget: () => origin, personaHold: () => "sdk_unavailable" });
 	const result = await started(f);
 	f.port.complete(result.opRef, "held persona result");
-	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
-	expect(f.db.workAttemptGet(result.opRef)?.decision).toBe("fallback");
-	expect(f.db.deliveryRows()).toHaveLength(1);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.decision).toBe("fallback");
+	expect(f.db.outbox.rows()).toHaveLength(1);
 	expect(f.notices[0]?.text).toBe("[lane a] completed: held persona result");
 });
 test("lane inbox steers an open nested parent and consumes only after acceptance", async () => {
@@ -1606,8 +1613,8 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	expect(f.port.sends[1]?.systemPreamble).toContain("Parent: work lane parent.");
 	expect(f.port.sends[1]?.systemPreamble).toContain("Nested work.start and work.run are allowed");
 	f.port.complete(child.opRef, "child result");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "consumed");
-	const report = f.db.laneReportsByParent("parent")[0]!;
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "consumed");
+	const report = f.db.work.laneReportsByParent("parent")[0]!;
 	expect(report).toMatchObject({ state: "consumed", claim_kind: "steer", consumed_op_ref: report.claim_ref });
 	expect(report.body).toBe("[lane child] completed: child result");
 	expect(f.port.steers).toHaveLength(1);
@@ -1639,15 +1646,15 @@ test("torn nested steer replays with the same clientRef after restart and consum
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
 	await until(() => refs.length === 1);
-	const claimed = f.db.laneReportsByParent("parent")[0]!;
+	const claimed = f.db.work.laneReportsByParent("parent")[0]!;
 	expect(claimed).toMatchObject({ state: "claimed", claim_kind: "steer" });
 	torn = false;
 	await f.restart();
-	await until(() => f.db.laneReportGet(claimed.report_id)?.state === "consumed");
+	await until(() => f.db.work.laneReportGet(claimed.report_id)?.state === "consumed");
 	const claimRef = claimed.claim_ref;
 	if (!claimRef) throw new Error("claimed lane report has no claim_ref");
 	expect(new Set(refs)).toEqual(new Set([claimRef]));
-	expect(f.db.laneReportGet(claimed.report_id)?.consumed_op_ref).toBe(claimRef);
+	expect(f.db.work.laneReportGet(claimed.report_id)?.consumed_op_ref).toBe(claimRef);
 	expect(f.port.sendAttempts.filter((attempt) => attempt.opRef.includes("-lr-"))).toHaveLength(0);
 });
 
@@ -1657,14 +1664,14 @@ test("AC-K wake send in a new epoch carries its lane notice", async () => {
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
 	f.port.complete(parent.opRef, "parent first result");
-	await until(() => f.db.workAttemptGet(parent.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
 	let rebound = false;
-	const claim = f.db.laneReportClaim.bind(f.db);
-	f.db.laneReportClaim = (reportId, kind, ref, targetOpRef) => {
-		const row = claim(reportId, kind, ref, targetOpRef);
+	const claim = f.db.work.laneReportClaim.bind(f.db.work);
+	f.db.work.laneReportClaim = (tx, reportId, kind, ref, targetOpRef) => {
+		const row = claim(tx, reportId, kind, ref, targetOpRef);
 		if (row?.claim_kind === "wake" && !rebound) {
 			rebound = true;
-			f.db.rebindEpoch(workSessionKey("parent"));
+			f.db.bindings.rotateEpoch(tx, workSessionKey("parent"));
 		}
 		return row;
 	};
@@ -1676,7 +1683,7 @@ test("AC-K wake send in a new epoch carries its lane notice", async () => {
 	});
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child report");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "consumed");
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "consumed");
 	expect(rebound).toBe(true);
 	expect(f.port.sendAttempts[2]?.systemPreamble).toContain("You are work lane parent.");
 	expect(f.port.sendAttempts[2]?.systemPreamble).toContain(
@@ -1687,11 +1694,11 @@ test("AC-K wake send in a new epoch carries its lane notice", async () => {
 test("idle lane parent wake completes without lock re-entry", async () => {
 	const f = await fixture({ allowNested: () => true });
 	f.setOwnerTarget(origin);
-	f.db.putSession(originKey(origin), crypto.randomUUID());
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
 	f.port.complete(parent.opRef, "parent first result");
-	await until(() => f.db.workAttemptGet(parent.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
 	const child = await f.manager.start({
 		name: "child",
 		text: "child work",
@@ -1703,7 +1710,7 @@ test("idle lane parent wake completes without lock re-entry", async () => {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		await Promise.race([
-			until(() => f.db.laneReportsByParent("parent")[0]?.state === "consumed"),
+			until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "consumed"),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new Error("lane parent wake timed out")), 2000);
 			}),
@@ -1711,8 +1718,8 @@ test("idle lane parent wake completes without lock re-entry", async () => {
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
-	const report = f.db.laneReportsByParent("parent")[0]!;
-	const wake = f.db.workAttemptGet(report.consumed_op_ref!)!;
+	const report = f.db.work.laneReportsByParent("parent")[0]!;
+	const wake = f.db.work.workAttemptGet(report.consumed_op_ref!)!;
 	expect(wake).toMatchObject({ wakeReportId: report.report_id, parent: { kind: "persona" } });
 	expect(report).toMatchObject({ state: "consumed", claim_kind: "wake", consumed_op_ref: report.claim_ref });
 	expect(f.port.sendAttempts).toHaveLength(3);
@@ -1723,12 +1730,12 @@ test("idle lane parent wake completes without lock re-entry", async () => {
 test("rejected nested wake settles wake_unaccepted and falls back the child exactly once", async () => {
 	const f = await fixture({ allowNested: () => true });
 	f.setOwnerTarget(origin);
-	f.db.putSession(originKey(origin), crypto.randomUUID());
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
 	f.port.complete(parent.opRef, "parent first result");
-	await until(() => f.db.workAttemptGet(parent.opRef)?.settledAt !== null);
-	const rootInboundBefore = f.db.inboundPendingCount(originKey(origin));
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
+	const rootInboundBefore = f.db.inbox.pendingCount(originKey(origin));
 	let wakeSendAttempts = 0;
 	f.notices.length = 0;
 	const send = f.port.send.bind(f.port);
@@ -1747,32 +1754,32 @@ test("rejected nested wake settles wake_unaccepted and falls back the child exac
 	});
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "fallback");
-	const report = f.db.laneReportsByParent("parent")[0]!;
-	const wake = f.db.workAttemptGet(report.claim_ref!)!;
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "fallback");
+	const report = f.db.work.laneReportsByParent("parent")[0]!;
+	const wake = f.db.work.workAttemptGet(report.claim_ref!)!;
 	expect(wake.decision).toBe("wake_unaccepted");
 	expect(report.state).toBe("fallback");
-	expect(f.db.workAttemptGet(wake.opRef)?.reportId).toBe(wake.reportId);
-	expect(f.db.deliveryRows()).toHaveLength(1);
-	expect(f.db.deliveryRows()[0]?.turn_id).toBe(child.opRef);
-	expect(f.db.deliveryRows()[0]?.delivery_id).not.toBe(wake.deliveryId);
+	expect(f.db.work.workAttemptGet(wake.opRef)?.reportId).toBe(wake.reportId);
+	expect(f.db.outbox.rows()).toHaveLength(1);
+	expect(f.db.outbox.rows()[0]?.turn_id).toBe(child.opRef);
+	expect(f.db.outbox.rows()[0]?.delivery_id).not.toBe(wake.deliveryId);
 	expect(f.notices).toHaveLength(1);
-	expect(f.notices[0]?.deliveryId).toBe(f.db.deliveryRows()[0]?.delivery_id);
-	expect(f.db.inboundPendingCount(originKey(origin))).toBe(rootInboundBefore);
+	expect(f.notices[0]?.deliveryId).toBe(f.db.outbox.rows()[0]?.delivery_id);
+	expect(f.db.inbox.pendingCount(originKey(origin))).toBe(rootInboundBefore);
 	await f.manager.recover();
-	expect(f.db.laneReportsByParent("parent")[0]?.state).toBe("fallback");
-	expect(f.db.deliveryRows()).toHaveLength(1);
+	expect(f.db.work.laneReportsByParent("parent")[0]?.state).toBe("fallback");
+	expect(f.db.outbox.rows()).toHaveLength(1);
 	expect(wakeSendAttempts).toBe(1);
 });
 
 test("uncertain nested wake keeps its claim and consumes after status acceptance without resend", async () => {
 	const f = await fixture({ allowNested: () => true });
 	f.setOwnerTarget(origin);
-	f.db.putSession(originKey(origin), crypto.randomUUID());
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
 	f.port.complete(parent.opRef, "parent first result");
-	await until(() => f.db.workAttemptGet(parent.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
 	let wakeSendAttempts = 0;
 	const send = f.port.send.bind(f.port);
 	f.port.send = async (input) => {
@@ -1790,8 +1797,8 @@ test("uncertain nested wake keeps its claim and consumes after status acceptance
 	});
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "claimed");
-	const claimed = f.db.laneReportsByParent("parent")[0]!;
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "claimed");
+	const claimed = f.db.work.laneReportsByParent("parent")[0]!;
 	const wakeOpRef = claimed.claim_ref!;
 	f.port.status = async (input) => ({
 		operationRef: input.opRef,
@@ -1799,19 +1806,19 @@ test("uncertain nested wake keeps its claim and consumes after status acceptance
 		summaryCompleted: false,
 	});
 	await f.restart();
-	await until(() => f.db.laneReportGet(claimed.report_id)?.state === "consumed");
-	expect(f.db.workAttemptGet(wakeOpRef)?.sendPhase).toBe("accepted");
+	await until(() => f.db.work.laneReportGet(claimed.report_id)?.state === "consumed");
+	expect(f.db.work.workAttemptGet(wakeOpRef)?.sendPhase).toBe("accepted");
 	expect(f.port.sendAttempts.filter((attempt) => attempt.opRef.includes("-lr-")).length).toBe(0);
 	expect(wakeSendAttempts).toBe(1);
 });
 test("recovered terminal status with receipt present proves wake acceptance without output proof", async () => {
 	const f = await fixture({ allowNested: () => true });
 	f.setOwnerTarget(origin);
-	f.db.putSession(originKey(origin), crypto.randomUUID());
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
 	f.port.complete(parent.opRef, "parent first result");
-	await until(() => f.db.workAttemptGet(parent.opRef)?.settledAt !== null);
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
 	const send = f.port.send.bind(f.port);
 	f.port.send = async (input) => {
 		if (input.opRef.includes("-lr-")) throw new Error("wake send receipt lost");
@@ -1825,8 +1832,8 @@ test("recovered terminal status with receipt present proves wake acceptance with
 	});
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "claimed");
-	const claimed = f.db.laneReportsByParent("parent")[0]!;
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "claimed");
+	const claimed = f.db.work.laneReportsByParent("parent")[0]!;
 	const wakeOpRef = claimed.claim_ref!;
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "identity_mismatch" });
 	f.port.status = async (input) => ({
@@ -1840,16 +1847,16 @@ test("recovered terminal status with receipt present proves wake acceptance with
 		summaryCompleted: true,
 	});
 	await f.restart();
-	await until(() => f.db.workAttemptGet(wakeOpRef)?.settledAt != null);
-	const wake = f.db.workAttemptGet(wakeOpRef)!;
+	await until(() => f.db.work.workAttemptGet(wakeOpRef)?.settledAt != null);
+	const wake = f.db.work.workAttemptGet(wakeOpRef)!;
 	expect(wake.sendPhase).toBe("accepted");
 	expect(wake.decision).not.toBe("wake_unaccepted");
-	expect(f.db.laneReportGet(claimed.report_id)?.state).toBe("consumed");
+	expect(f.db.work.laneReportGet(claimed.report_id)?.state).toBe("consumed");
 });
 test("open-parent steer refusal requeues and the idle parent receives one wake", async () => {
 	const f = await fixture({ allowNested: () => true });
 	f.setOwnerTarget(origin);
-	f.db.putSession(originKey(origin), crypto.randomUUID());
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
 	let steerAttempts = 0;
@@ -1867,11 +1874,11 @@ test("open-parent steer refusal requeues and the idle parent receives one wake",
 	});
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "pending");
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "pending");
 	expect(steerAttempts).toBe(1);
 	f.port.complete(parent.opRef, "parent completed");
-	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "consumed");
-	expect(f.db.laneReportsByParent("parent")[0]).toMatchObject({ claim_kind: "wake" });
+	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "consumed");
+	expect(f.db.work.laneReportsByParent("parent")[0]).toMatchObject({ claim_kind: "wake" });
 	expect(steerAttempts).toBe(1);
 	expect(f.port.sendAttempts).toHaveLength(3);
 });
@@ -1897,7 +1904,7 @@ test("a queued steer captured for A refuses after A settles and B starts", async
 	try {
 		await entered.promise;
 		f.port.complete(a.opRef, "A complete");
-		await until(() => f.db.workAttemptGet(a.opRef)?.settledAt != null);
+		await until(() => f.db.work.workAttemptGet(a.opRef)?.settledAt != null);
 		const b = await started(f);
 		expect(b.opRef).not.toBe(a.opRef);
 		const binds = f.port.binds.length;
@@ -1908,7 +1915,7 @@ test("a queued steer captured for A refuses after A settles and B starts", async
 		expect(f.port.binds).toHaveLength(binds);
 		expect(f.port.sends).toHaveLength(sends);
 		expect(sends).toBe(2);
-		expect(f.db.workAttemptGet(b.opRef)?.settledAt).toBeNull();
+		expect(f.db.work.workAttemptGet(b.opRef)?.settledAt).toBeNull();
 	} finally {
 		release.resolve();
 		await steer;
@@ -1921,15 +1928,17 @@ test("quarantined accepted work reserves its name without querying the shared br
 	const f = await fixture();
 	const old = await started(f, "old", origin);
 	await f.manager.stop();
-	const history = f.db.laneJobJson(old.jobId);
-	const runtime = f.db.workAttemptGet(old.opRef);
+	const history = f.db.work.laneJobJson(old.jobId);
+	const runtime = f.db.work.workAttemptGet(old.opRef);
 	const authority = { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" };
-	f.db.cutoverBrokerAuthority({
-		expectedAuthority: null,
-		targetAuthority: authority,
-		evidence: "test operator quarantined private broker work",
-		disposition: "quarantine",
-	});
+	f.db.transaction((tx) =>
+		f.db.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: null,
+			targetAuthority: authority,
+			evidence: "test operator quarantined private broker work",
+			disposition: "quarantine",
+		}),
+	);
 	// The shared broker may answer the same old ID; it must never be asked.
 	f.port.setSessionState(old.sessionId, { repo: f.directory, live: true });
 	const calls: string[] = [];
@@ -1977,14 +1986,14 @@ test("quarantined accepted work reserves its name without querying the shared br
 	expect(calls).toEqual([]);
 	expect(f.port.binds).toHaveLength(binds);
 	expect(f.port.sends).toHaveLength(sends);
-	expect(f.db.laneJobJson(old.jobId)).toBe(history);
-	expect(f.db.workAttemptGet(old.opRef)).toEqual(runtime);
-	expect(f.db.laneJobRows()).toEqual([]);
-	expect(f.db.laneJobRows(true).map((row) => row.job_id)).toEqual([old.jobId]);
+	expect(f.db.work.laneJobJson(old.jobId)).toBe(history);
+	expect(f.db.work.workAttemptGet(old.opRef)).toEqual(runtime);
+	expect(f.db.work.laneJobRows()).toEqual([]);
+	expect(f.db.work.laneJobRows(true).map((row) => row.job_id)).toEqual([old.jobId]);
 	// Explicit test-only provenance models a successful shared SDK bind.
 	f.port.bind = async (input) => {
 		const binding = { ...input, sessionId: crypto.randomUUID() };
-		f.db.recordOwnedBinding({ ...binding, authority });
+		f.db.transaction((tx) => f.db.bindings.recordOwnedBinding(tx, { ...binding, authority }));
 		return binding;
 	};
 	const fresh = await started(f, "fresh");
@@ -2006,8 +2015,8 @@ test("#308 host loss settles the open attempt as host_lost; resume and retire th
 		throw sessionUnavailable();
 	};
 	f.port.setSessionState(result.sessionId, { live: false });
-	await until(() => f.db.workAttemptOpen().length === 0);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.job().attempts[0]?.errorCode).toBe("host_lost");
 	expect(f.job().state).toBe("attempt_ended");
@@ -2033,7 +2042,7 @@ test("#308 open attempt resumes after host loss without retiring first", async (
 		throw sessionUnavailable();
 	};
 	f.port.setSessionState(result.sessionId, { live: false });
-	await until(() => f.db.workAttemptOpen().length === 0);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
 	const resumed = await f.manager.start({ name: "a", text: "continue", cwd: f.directory, resume: true });
 	expect(resumed).toMatchObject({ started: true });
 });
@@ -2053,7 +2062,7 @@ for (const [label, failure, live] of [
 		};
 		f.port.setSessionState(result.sessionId, { live });
 		await until(() => reads >= 5);
-		expect(f.db.workAttemptGet(result.opRef)?.terminal).toBeNull();
+		expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
 		expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 		expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: false });
 	});
@@ -2070,10 +2079,10 @@ test("#308 host loss must persist across the grace window before settling", asyn
 	};
 	f.port.setSessionState(result.sessionId, { live: false });
 	await until(() => reads >= 3);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
 	now += 60_000;
-	await until(() => f.db.workAttemptOpen().length === 0);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
 });
 
 test("#308 restart recovery classifies a router-disowned open attempt as host_lost", async () => {
@@ -2085,8 +2094,8 @@ test("#308 restart recovery classifies a router-disowned open attempt as host_lo
 	};
 	f.port.setSessionState(result.sessionId, { live: false });
 	await f.restart();
-	await until(() => f.db.workAttemptOpen().length === 0);
-	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
 	expect(f.job().state).toBe("attempt_ended");
 	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true });
 });
@@ -2095,12 +2104,12 @@ test("#308 streamed turn frames advance lane activity past the attempt start", a
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
 	const result = await started(f);
-	const startedAt = f.db.workLaneRows()[0]!.last_activity_at!;
-	expect(startedAt).toBe(f.db.workAttemptGet(result.opRef)!.startedAt);
+	const startedAt = f.db.bindings.workLaneRows()[0]!.last_activity_at!;
+	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)!.startedAt);
 	now += 5_000;
 	f.port.emitTool(result.sessionId, { toolName: "bash" });
-	await until(() => f.db.workLaneRows()[0]!.last_activity_at !== startedAt);
-	expect(f.db.workLaneRows()[0]!.last_activity_at).toBe(new Date(now).toISOString());
+	await until(() => f.db.bindings.workLaneRows()[0]!.last_activity_at !== startedAt);
+	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(new Date(now).toISOString());
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
@@ -2121,8 +2130,8 @@ test("transport failure ECONNRESET without errorStatus yields transport cause in
 		endpointClass: "custom",
 		retryMaxAttempts: 1,
 	});
-	await until(() => f.db.workAttemptOpen().length === 0);
-	const attempt = f.db.workAttemptGet(result.opRef);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	const attempt = f.db.work.workAttemptGet(result.opRef);
 	expect(attempt?.terminal?.reasonCode).toBe("terminal_missing_receipt");
 	expect(attempt?.output?.transportCause).toEqual({
 		kind: "transport",
@@ -2149,8 +2158,8 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 		summaryCompleted: true,
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
-	await until(() => f.db.workAttemptOpen().length === 0);
-	const attempt = f.db.workAttemptGet(result.opRef);
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	const attempt = f.db.work.workAttemptGet(result.opRef);
 	const notice = f.notices[0]?.text ?? "";
 	// Private error messages must never appear in lane notice
 	expect(notice).not.toContain("secret");
@@ -2356,7 +2365,7 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 	});
 
 	// Verify no worktree was created
-	const job = f.db.laneJobJson(laneJobIdentity("bad-repo").jobId);
+	const job = f.db.work.laneJobJson(laneJobIdentity("bad-repo").jobId);
 	expect(job).toBeUndefined();
 });
 

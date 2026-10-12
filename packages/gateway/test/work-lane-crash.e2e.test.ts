@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
+import { DeliveryService } from "../src/delivery/delivery";
 import { type Barrier, eventually, noticeOrigin, WorkFixture } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];
@@ -451,9 +451,9 @@ test("delivery replay keeps one logical identity; confirm and real ledger prunin
 	expect(new Set([original.payload.deliveryId, duplicate.payload.deliveryId]).size).toBe(1);
 	expect((await replay.request("delivery.confirm", { deliveryId: original.payload.deliveryId })).error).toBeUndefined();
 	await f.kill();
-	const database = await GatewayDatabase.open(`${f.home}/gateway.db`);
+	const database = await Store.open(`${f.home}/gateway.db`);
 	try {
-		expect(new DeliveryLedger(database).prune(0, Date.now() + 1_000)).toBe(1);
+		expect(new DeliveryService(database).prune(0, Date.now() + 1_000)).toBe(1);
 	} finally {
 		database.close();
 	}

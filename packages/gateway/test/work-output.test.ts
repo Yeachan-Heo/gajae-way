@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type CliResult, type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { BrokerSessionPort, parseWorkerOutputResponse, type WorkerOutputInput } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
@@ -61,7 +61,7 @@ async function broker(
 	relay?: (request: ScriptedRelayRequest) => ScriptedRelayReply | Promise<ScriptedRelayReply>,
 ): Promise<BrokerSessionPort> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-work-output-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	cleanup.push(async () => {
 		database.close();
 		await rm(home, { recursive: true, force: true });

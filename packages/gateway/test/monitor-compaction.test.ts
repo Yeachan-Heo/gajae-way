@@ -22,8 +22,7 @@ import {
 } from "../src/monitors/compaction";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 /**
@@ -80,7 +79,7 @@ async function harness(
 		now?: () => number;
 	} = {},
 ) {
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const turns: Array<{ sessionId: string; prompt: string }> = [];
 	const sessionPort = sessionPortFromScript({
@@ -104,7 +103,7 @@ async function harness(
 		registry,
 		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-		delivery: new DeliveryService(new DeliveryLedger(database)),
+		delivery: new DeliveryService(database),
 		emit: () => {},
 		...(options.compaction === undefined ? {} : { compaction: options.compaction }),
 		...(options.contextFailureRollThreshold === undefined
@@ -278,18 +277,18 @@ test("a healthy 10-minute monitor is never rolled, however far past any turn thr
 		expect(turns).toHaveLength(ticks);
 		// One session, one epoch: not a single roll while the monitor was answering.
 		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
 		// Native compaction was never even asked: nothing failed.
 		expect(compaction.calls).toHaveLength(0);
 		// Turn count is still recorded — it is the observational signal.
-		expect(database.sessionTurnCount(sessionKey)).toBe(ticks);
+		expect(database.bindings.sessionTurnCount(sessionKey)).toBe(ticks);
 		const state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.turns).toBe(ticks);
 		expect(state.contextFailures).toBe(0);
 		expect(state.lastRoll).toBeUndefined();
 		// And every turn authored its event.
-		for (const eventId of eventIds) expect(database.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		for (const eventId of eventIds) expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -332,9 +331,9 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		// One failure is not enough; two in a row with an unavailable port arms the net.
 		expect(compaction.calls).toEqual(["event-session-e0", "event-session-e0"]);
 		for (const eventId of failedIds) {
-			const row = database.monitorEventRows(monitor.monitorId).find((candidate) => candidate.event_id === eventId);
+			const row = database.monitors.eventRows(monitor.monitorId).find((candidate) => candidate.event_id === eventId);
 			expect(row?.stage).toBe("failed");
-			expect(database.monitorFailure(eventId)?.code).toBe("authoring_context_exhausted");
+			expect(database.monitors.failure(eventId)?.code).toBe("authoring_context_exhausted");
 		}
 		const armed = pipeline.sessionSafetyState(sessionKey);
 		expect(armed.contextFailures).toBe(2);
@@ -342,12 +341,12 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		expect(armed.pendingRoll).toBe("context_failures_native_compaction_unavailable");
 		// Still epoch 0: the roll happens at the next dispatch boundary, never
 		// mid-batch.
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		empty = false;
 		await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick: 200 });
 		const rolled = turns.at(-1)!;
 		expect(rolled.sessionId).toBe("event-session-e1");
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		expect(rolled.prompt).toContain("Context compaction");
 		// The digest carries (a) the standing contract and (b) recent authored notes.
 		expect(rolled.prompt).toContain(`Standing instruction: ${instruction}`);
@@ -355,7 +354,7 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		// The response contract is still the last thing in the prompt.
 		expect(rolled.prompt).toContain('Respond ONLY with a JSON array containing exactly one {"eventId","note"}');
 		const rolledEventId = rolled.prompt.match(/"eventId":"([^"]+)"/)![1]!;
-		expect(database.authoredOutput(rolledEventId)).toBe(`note for ${rolledEventId}`);
+		expect(database.monitors.authoredOutput(rolledEventId)).toBe(`note for ${rolledEventId}`);
 		// Armed state consumed exactly once: the next healthy turn does not roll again.
 		const after = pipeline.sessionSafetyState(sessionKey);
 		expect(after.pendingRoll).toBeUndefined();
@@ -390,7 +389,7 @@ test("a compaction port that reports success keeps the session, however long the
 		// Native compaction was asked every time and said it handled it, so the
 		// safety net stays holstered.
 		expect(compaction.calls).toHaveLength(6);
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
 		const state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.contextFailures).toBe(6);
@@ -423,7 +422,7 @@ test("a native compaction that fails outright rolls with its own structured reas
 		expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_failures_native_compaction_failed");
 		empty = false;
 		await pipeline.submitAwaitable(monitor.monitorId, "nf.tick", { tick: 1 });
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		expect(pipeline.sessionSafetyState(sessionKey).lastRoll).toBe("context_failures_native_compaction_failed");
 		database.close();
 	} finally {
@@ -460,7 +459,7 @@ test("a protocol-class failure names the violated rule and rolls only after its 
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "bad.tick", { tick }));
 		// Below its own threshold nothing is touched: a single off-contract answer
 		// is not proof the session is broken.
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		let state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.protocolFailures).toBe(2);
 		expect(state.pendingRoll).toBeUndefined();
@@ -471,7 +470,7 @@ test("a protocol-class failure names the violated rule and rolls only after its 
 		// Every attempt is still reported as a contract failure, and context-class
 		// machinery is never engaged.
 		for (const eventId of eventIds) {
-			expect(database.monitorFailure(eventId)?.code).toBe("authoring_response_invalid");
+			expect(database.monitors.failure(eventId)?.code).toBe("authoring_response_invalid");
 		}
 		expect(compaction.calls).toHaveLength(0);
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
@@ -482,7 +481,7 @@ test("a protocol-class failure names the violated rule and rolls only after its 
 		expect(state.pendingRoll).toBe("protocol_failures_off_contract");
 		// The roll itself lands at the next dispatch boundary, never mid-batch.
 		await pipeline.submitAwaitable(monitor.monitorId, "bad.tick", { tick: 3 });
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		expect(pipeline.sessionSafetyState(sessionKey).lastRoll).toBe("protocol_failures_off_contract");
 		database.close();
 	} finally {
@@ -518,10 +517,10 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 		// only the events that actually failed.
 		for (let tick = 0; tick < 3; tick += 1)
 			healthy.push(await pipeline.submitAwaitable(monitor.monitorId, "boundary.tick", { tick: 200 + tick }));
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		await pipeline.reconcile();
 		// No loss: every event, including the two that failed, ends with its note.
-		for (const eventId of [...healthy, ...failed]) expect(database.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		for (const eventId of [...healthy, ...failed]) expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
 		// No duplicate: a successful event is requested exactly once, and a failed
 		// one exactly twice (its failure plus its single recovery). Only the event
 		// PAYLOAD counts as a request; a rolled session's digest legitimately
@@ -530,7 +529,7 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 			expect(turns.filter((turn) => turn.prompt.includes(`"eventId":"${eventId}"`))).toHaveLength(1);
 		for (const eventId of failed)
 			expect(turns.filter((turn) => turn.prompt.includes(`"eventId":"${eventId}"`))).toHaveLength(2);
-		expect(database.monitorEventRows(monitor.monitorId)).toHaveLength(healthy.length + failed.length);
+		expect(database.monitors.eventRows(monitor.monitorId)).toHaveLength(healthy.length + failed.length);
 		expect(turns).toHaveLength(healthy.length + failed.length * 2);
 		database.close();
 	} finally {
@@ -605,7 +604,7 @@ test("a healthy answer resets the streak, so isolated context failures never rol
 		// Both failures were treated as real context failures (native compaction
 		// was asked each time) — they simply never became a streak.
 		expect(compaction.calls).toHaveLength(2);
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
 		const state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.contextFailures).toBe(0);
@@ -643,15 +642,15 @@ test("a context failure on a replayed stale event does not feed the current sess
 		// Park an event at `failed` with an executor failure: retryable, and no
 		// context evidence on the books.
 		const staleId = await pipeline.submitAwaitable(monitor.monitorId, "stale.tick", { tick: 0 });
-		expect(database.monitorFailure(staleId)?.code).toBe("executor_failed");
+		expect(database.monitors.failure(staleId)?.code).toBe("executor_failed");
 		expect(pipeline.sessionSafetyState(sessionKey).contextFailures).toBe(0);
 		// Now the session starts answering with a context rejection, and reconcile
 		// replays that old event into it.
 		mode = "context";
 		await pipeline.reconcile();
-		const replayRow = database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === staleId);
+		const replayRow = database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === staleId);
 		expect(replayRow?.dispatch_attempts).toBeGreaterThan(0);
-		expect(database.monitorFailure(staleId)?.code).toBe("authoring_context_exhausted");
+		expect(database.monitors.failure(staleId)?.code).toBe("authoring_context_exhausted");
 		// The replayed failure is recorded, but as stale: no streak, no arm, no roll.
 		const afterReplay = pipeline.sessionSafetyState(sessionKey);
 		expect(afterReplay.staleContextFailures).toBe(1);
@@ -659,7 +658,7 @@ test("a context failure on a replayed stale event does not feed the current sess
 		expect(afterReplay.pendingRoll).toBeUndefined();
 		// No session row is even written when every turn throws, so "epoch 0" is
 		// the absence of a roll; the bound session id says the same thing directly.
-		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
 		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
 		// A native compaction is never requested on behalf of a stale event either.
 		expect(compaction.calls).toHaveLength(0);
@@ -699,9 +698,9 @@ test("an aside-worker timeout streak never rolls: an executor failure is not con
 		for (let tick = 0; tick < 5; tick += 1)
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "aside.tick", { tick }));
 		// Its own failure code, never aggregated with context exhaustion.
-		for (const eventId of eventIds) expect(database.monitorFailure(eventId)?.code).toBe("aside_timeout");
+		for (const eventId of eventIds) expect(database.monitors.failure(eventId)?.code).toBe("aside_timeout");
 		expect(compaction.calls).toHaveLength(0);
-		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
 		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
 		const state = pipeline.sessionSafetyState(sessionKey);
@@ -742,10 +741,10 @@ test("an orphaned-executor streak never rolls and never touches the context stre
 		for (let tick = 0; tick < 5; tick += 1)
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "orphan.tick", { tick }));
 		// Its own code, never aggregated with the plain timeout or with context.
-		for (const eventId of eventIds) expect(database.monitorFailure(eventId)?.code).toBe("orphaned_executor");
+		for (const eventId of eventIds) expect(database.monitors.failure(eventId)?.code).toBe("orphaned_executor");
 		// The session is left completely alone: no compaction request, no roll.
 		expect(compaction.calls).toHaveLength(0);
-		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
 		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
 		const state = pipeline.sessionSafetyState(sessionKey);
@@ -800,7 +799,7 @@ test("interleaved orphaned-executor and context failures advance only the contex
 		// The threshold was reached by context evidence alone, so the net is armed.
 		expect(state.pendingRoll).toBe("context_failures_native_compaction_unavailable");
 		// Still not rolled: that happens at the next dispatch boundary.
-		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
 		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
 		database.close();
 	} finally {
@@ -830,7 +829,7 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "threads.tick"));
 		expect(MONITOR_BUSY_FAILURE_ROLL_THRESHOLD).toBe(2);
 		const first = await pipeline.submitAwaitable(monitor.monitorId, "threads.tick", { tick: 0 });
-		expect(database.monitorFailure(first)?.code).toBe("session_busy");
+		expect(database.monitors.failure(first)?.code).toBe("session_busy");
 		let state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.busyFailures).toBe(1);
 		expect(state.pendingRoll).toBeUndefined();
@@ -838,7 +837,7 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		// again. A replay still counts: the refusal is about the session, not the
 		// payload, and this is exactly the retry loop that burned every slot.
 		await pipeline.reconcile();
-		expect(database.monitorFailure(first)?.code).toBe("session_busy");
+		expect(database.monitors.failure(first)?.code).toBe("session_busy");
 		state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.busyFailures).toBe(2);
 		expect(state.pendingRoll).toBe("session_busy_stalled");
@@ -852,11 +851,11 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		// The next slot rolls at the dispatch boundary, binds a fresh session and
 		// delivers, instead of aiming at the stalled session again.
 		const next = await pipeline.submitAwaitable(monitor.monitorId, "threads.tick", { tick: 1 });
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.lastRoll).toBe("session_busy_stalled");
 		expect(state.busyFailures).toBe(0);
-		expect(database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === next)?.stage).toBe(
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === next)?.stage).toBe(
 			"authored_no_delivery",
 		);
 		expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e1"]);
@@ -867,7 +866,7 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		// retry backoff has elapsed (#179: the second retry waits 10 minutes).
 		clock += 10 * 60_000 + 1;
 		await pipeline.reconcile();
-		expect(database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
 			"authored_no_delivery",
 		);
 		database.close();

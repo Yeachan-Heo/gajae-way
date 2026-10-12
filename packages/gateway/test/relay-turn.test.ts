@@ -587,6 +587,21 @@ test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: â
 	expect((error as RelayRefusedError).code).toBe("session_unavailable");
 });
 
+test("a gjc 0.18 text-mode refusal ('ERROR {â€¦}') rejects attach with its code instead of waiting for hello", async () => {
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+	relay.hostLine('COMMAND ["sdk","serve"]');
+	relay.hostLine(
+		'ERROR {"code":"broker_unavailable","category":"unavailable","message":"The SDK broker is unavailable.","retryability":"unknown"}',
+	);
+	relay.hostLine("COMPLETE true");
+	relay.end();
+	const error = await attach.catch((e: unknown) => e);
+	expect(error).toBeInstanceOf(RelayRefusedError);
+	expect((error as RelayRefusedError).code).toBe("broker_unavailable");
+	expect((error as RelayRefusedError).message).toContain("The SDK broker is unavailable.");
+});
+
 test("stream ending without hello fails fast (#410)", async () => {
 	const relay = new FakeRelay("connection:1", { hello: false });
 	const runner$1 = runner(() => relay, { helloTimeoutMs: 5_000 });

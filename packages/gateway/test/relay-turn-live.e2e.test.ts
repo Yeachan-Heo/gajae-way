@@ -3,10 +3,12 @@ import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { GlobalGjcClient } from "../src/orchestrator/broker";
+import { isSessionGoneCode } from "../src/orchestrator/gjc-contract";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
-import { type TailFrame, TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { RelayRefusedError, type TailFrame, TailRunner } from "../src/orchestrator/tail-runner";
+import { Store } from "../src/store";
+import { superviseLiveBroker } from "./live-broker";
 
 const liveTest = process.env.GAJAEWAY_E2E_GJC === "1" ? test : test.skip;
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "relay-live" } as const;
@@ -38,10 +40,13 @@ liveTest(
 		const repo = join(home, "workspace");
 		await mkdir(repo, { mode: 0o700 });
 		expect(await Bun.spawn(["git", "init", "--quiet", repo], { stdout: "ignore", stderr: "pipe" }).exited).toBe(0);
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const canonicalAgentDir = await realpath(agentDir);
 		const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-		database.assertBrokerAuthority(authority, { initializeEmpty: true });
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+		);
+		const supervisor = await superviseLiveBroker(executable, agentDir);
 		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000 });
 		const cliCalls: string[][] = [];
 		const logs: string[] = [];
@@ -84,18 +89,20 @@ liveTest(
 				log: (line) => logs.push(line),
 			});
 			expect(
-				database.inboundEnqueue({
-					messageId: "relay-live-1",
-					originKey: KEY,
-					originRefJson: JSON.stringify(ORIGIN),
-					body: [
-						"Do exactly this, in order, and nothing else:",
-						"1. Reply with exactly one short sentence: RELAY_LIVE_INTERIM.",
-						`2. Run the bash tool with the command: ls ${repo}`,
-						"3. Reply with exactly one short sentence: RELAY_LIVE_FINAL.",
-					].join("\n"),
-					receivedAt: new Date().toISOString(),
-				}),
+				database.transaction((tx) =>
+					database.inbox.enqueue(tx, {
+						messageId: "relay-live-1",
+						originKey: KEY,
+						originRefJson: JSON.stringify(ORIGIN),
+						body: [
+							"Do exactly this, in order, and nothing else:",
+							"1. Reply with exactly one short sentence: RELAY_LIVE_INTERIM.",
+							`2. Run the bash tool with the command: ls ${repo}`,
+							"3. Reply with exactly one short sentence: RELAY_LIVE_FINAL.",
+						].join("\n"),
+						receivedAt: new Date().toISOString(),
+					}),
+				),
 			).toBe(true);
 			await manager.notifyInbound(KEY);
 			await eventually(() => terminal.length === 1, `turn did not settle; logs:\n${logs.slice(-40).join("\n")}`);
@@ -147,6 +154,7 @@ liveTest(
 				}
 			}
 			await broker.stop();
+			await supervisor.stop();
 			database.close();
 			await rm(home, { recursive: true, force: true });
 		}
@@ -155,7 +163,7 @@ liveTest(
 );
 
 liveTest(
-	"the real serve CLI's refusal for an unknown session rejects attach as session_unavailable, not a hello timeout",
+	"the real serve CLI's refusal for an unknown session rejects attach with a typed refusal, and the broker reports the session gone",
 	async () => {
 		const executable = process.env.GJC_EXECUTABLE;
 		const agentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -163,21 +171,30 @@ liveTest(
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-relay-refusal-"));
 		const repo = join(home, "workspace");
 		await mkdir(repo, { mode: 0o700 });
+		const supervisor = await superviseLiveBroker(executable, agentDir);
 		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000 });
 		try {
 			await broker.preflight();
 			await broker.start();
 			const runner = new TailRunner({ stream: (id) => broker.openStream(id), repo });
+			const sessionId = "00000000-0000-4000-8000-00000000dead";
 			const startedAt = Date.now();
-			const error = await runner
-				.attach({ sessionId: "00000000-0000-4000-8000-00000000dead", brokerGeneration: 1, repo })
-				.catch((e: unknown) => e);
-			expect(error).toBeInstanceOf(Error);
-			expect((error as { code?: string }).code).toBe("session_unavailable");
-			// The refusal envelope is read from the CLI's stderr; no 15 s hello wait.
+			const error = await runner.attach({ sessionId, brokerGeneration: 1, repo }).catch((e: unknown) => e);
+			// gjc 0.18 serve renders an unknown session as a public `unavailable`
+			// refusal, read from the CLI's stderr: a typed refusal, no 15 s hello wait.
+			expect(error).toBeInstanceOf(RelayRefusedError);
+			expect((error as RelayRefusedError).code).not.toBe("broker_unavailable");
 			expect(Date.now() - startedAt).toBeLessThan(10_000);
+			// The session-gone decision belongs to the broker's own inspect verdict.
+			const inspected = JSON.parse((await broker.cli(["sdk", "session", "inspect", sessionId])).stdout) as {
+				ok?: unknown;
+				error?: { code?: unknown };
+			};
+			expect(inspected.ok).toBe(false);
+			expect(isSessionGoneCode(inspected.error?.code)).toBe(true);
 		} finally {
 			await broker.stop();
+			await supervisor.stop();
 			await rm(home, { recursive: true, force: true });
 		}
 	},

@@ -5,7 +5,10 @@ import {
 	originKey,
 	type ReactionRef,
 } from "@gajae-gateway/protocol";
-import type { DeliveryLedger, ExpiredDeliveryRow, LedgerOutcome } from "../store/ledger";
+import type { ExpiredDeliveryRow, LedgerOutcome } from "../store/groups/outbox";
+import type { WriteTx } from "../store/tx";
+import type { Store } from "../store/store";
+export { ACK_TIMEOUT_MS, classifyDeliveryError } from "../store/groups/outbox";
 
 const DELIVERY_FRESHNESS_MS = 24 * 60 * 60 * 1_000;
 
@@ -47,9 +50,9 @@ export function buildDeliveryPayload(
 }
 
 export class DeliveryService {
-	readonly #ledger: DeliveryLedger;
-	constructor(ledger: DeliveryLedger) {
-		this.#ledger = ledger;
+	readonly #store: Store;
+	constructor(store: Store) {
+		this.#store = store;
 	}
 	prepare(
 		turnId: string,
@@ -61,54 +64,51 @@ export class DeliveryService {
 	): ChatMessagePayload | undefined {
 		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId, final);
 		if (!payload) return undefined;
-		if (
-			!this.#ledger.createPending({
-				deliveryId,
-				turnId,
-				originKey: originKey(origin),
-				payloadJson: JSON.stringify(payload),
-			})
-		)
-			return undefined;
+		if (!this.#store.transaction((tx) => this.#store.outbox.create(tx, {
+			deliveryId,
+			turnId,
+			originKey: originKey(origin),
+			payloadJson: JSON.stringify(payload),
+		}))) return undefined;
 		return payload;
 	}
-	/** Caller owns the transaction; never opens a nested createPending transaction. */
-	persistInTransaction(payload: ChatMessagePayload): boolean {
+
+	persistInTransaction(tx: WriteTx, payload: ChatMessagePayload): boolean {
 		if (isSilentOutput(payload.text)) throw new Error("silent payload cannot be persisted");
 		if (!payload.deliveryId) throw new Error("delivery id is required");
-		return this.#ledger.createPendingInTransaction({
+		return this.#store.outbox.enqueue(tx, {
 			deliveryId: payload.deliveryId,
 			turnId: payload.turnId,
 			originKey: originKey(payload.origin),
 			payloadJson: JSON.stringify(payload),
 		});
 	}
-	/** A ledger row by id; used to recognise a terminal reply that already shipped under its interim id. */
+
 	get(deliveryId: string) {
-		return this.#ledger.get(deliveryId);
+		return this.#store.outbox.get(deliveryId);
 	}
-	/**
-	 * A reaction is a LEDGER DELIVERY, not a separate class of work.
-	 *
-	 * Justification from this repo's actual delivery path: `delivery.confirm` /
-	 * `delivery.fail` are the only mechanism an adapter has to report an outcome,
-	 * and `DeliveryLedger.listUndelivered` is the only mechanism that survives a
-	 * restart. A reaction outside the ledger could only fail silently — the exact
-	 * failure mode we must avoid — and would vanish on crash. The ledger's
-	 * at-least-once redelivery is safe here precisely because reacting is
-	 * idempotent on both platforms: re-applying the same emoji to the same message
-	 * is a no-op, unlike re-posting text. A recovered reaction still carries the
-	 * ledger's duplicateWarning flag, but adapters ignore it on the reaction path
-	 * instead of prefixing the "[recovered - may be a duplicate]" label a message
-	 * needs — there is no duplicate to warn about.
-	 *
-	 * `text` is the bare unicode emoji: an adapter that ignores `reaction` degrades
-	 * to a visible acknowledgement instead of dropping the delivery.
-	 *
-	 * A reaction never ends a turn (`final: false`): a mid-turn reaction or the
-	 * 👀 steer acknowledgement must not tear down the working status of a turn
-	 * that is still running. Turn end is signalled by the final progress tick.
-	 */
+	list(filters: { readonly since?: string; readonly state?: string; readonly limit?: number } = {}) {
+		return this.#store.outbox.list(filters);
+	}
+	getMany(deliveryIds: readonly string[]) {
+		return this.#store.outbox.getMany(deliveryIds);
+	}
+	listUndelivered(freshnessMs: number, now = Date.now(), ignoreBackoff = false) {
+		return this.#store.outbox.listUndelivered(freshnessMs, now, ignoreBackoff);
+	}
+	createPending(row: { deliveryId: string; turnId: string; originKey: string; payloadJson: string }): boolean {
+		return this.#store.transaction((tx) => this.#store.outbox.create(tx, row));
+	}
+	createPendingInTransaction(tx: WriteTx, row: {
+		deliveryId: string;
+		turnId: string;
+		originKey: string;
+		payloadJson: string;
+	}): boolean {
+		return this.#store.outbox.enqueue(tx, row);
+	}
+
+	/** A reaction is a durable delivery; reconnects replay it and adapter settlement is idempotent. */
 	prepareReaction(turnId: string, origin: OriginRef, reaction: ReactionRef): ChatMessagePayload {
 		const deliveryId = crypto.randomUUID();
 		const payload: ChatMessagePayload = {
@@ -120,67 +120,66 @@ export class DeliveryService {
 			deliveryId,
 			reaction,
 		};
-		this.#ledger.createPending({
-			deliveryId,
-			turnId,
-			originKey: originKey(origin),
-			payloadJson: JSON.stringify(payload),
-		});
+		this.createPending({ deliveryId, turnId, originKey: originKey(origin), payloadJson: JSON.stringify(payload) });
 		return payload;
 	}
+
 	markInflight(deliveryId: string): void {
-		this.#ledger.markInflight(deliveryId);
+		this.#store.transaction((tx) => this.#store.outbox.markInflight(tx, deliveryId));
 	}
 	confirm(deliveryId: string): LedgerOutcome {
-		return this.#ledger.confirm(deliveryId);
+		return this.#store.transaction((tx) => this.#store.outbox.confirm(tx, deliveryId));
 	}
-	fail(deliveryId: string, ambiguous?: boolean, reason?: string): LedgerOutcome {
-		return this.#ledger.fail(deliveryId, ambiguous, reason);
+	fail(deliveryId: string, ambiguous = false, reason?: string): LedgerOutcome {
+		return this.#store.transaction((tx) => this.#store.outbox.fail(tx, deliveryId, ambiguous, reason));
 	}
-	/**
-	 * Always applies the age TTL. `onConnect`: replay every unsettled row to a
-	 * newly negotiated adapter, ignoring retry backoff. `redeliver = false`
-	 * (no adapter connected) only expires.
-	 */
+	expireStale(freshnessMs: number, now = Date.now()): ExpiredDeliveryRow[] {
+		return this.#store.transaction((tx) => this.#store.outbox.expireStale(tx, freshnessMs, now));
+	}
+	requeueById(deliveryId: string): string[] {
+		return this.#store.transaction((tx) => this.#store.outbox.requeue(tx, deliveryId));
+	}
+	requeueSince(since: string): string[] {
+		const timestamp = Date.parse(since);
+		if (!Number.isFinite(timestamp)) throw new TypeError("since must be an ISO timestamp");
+		return this.#store.transaction((tx) => this.#store.outbox.requeueSince(tx, new Date(timestamp).toISOString()));
+	}
+	pruneOlderThan(deliveredOlderThanMs: number, now = Date.now()): number {
+		return this.#store.transaction((tx) => this.#store.outbox.prune(tx, deliveredOlderThanMs, now));
+	}
+	counts(now = Date.now()) {
+		return this.#store.outbox.counts(now);
+	}
+
+	/** Applies the age TTL, then returns replay candidates under the ledger retry and ACK policy. */
 	sweep(now = Date.now(), onConnect = false, redeliver = true): DeliverySweep {
-		const expired = this.#ledger.expireStale(DELIVERY_FRESHNESS_MS, now);
-		return {
-			payloads: redeliver ? this.#redeliveries(now, onConnect) : [],
-			expired,
-		};
+		const expired = this.expireStale(DELIVERY_FRESHNESS_MS, now);
+		return { payloads: redeliver ? this.#redeliveries(now, onConnect) : [], expired };
 	}
 	requeue(deliveryId?: string, since?: string): DeliveryRequeue {
 		if ((deliveryId === undefined) === (since === undefined))
 			throw new TypeError("exactly one of deliveryId or since is required");
-		const requeued =
-			deliveryId === undefined ? this.#ledger.requeueSince(since as string) : this.#ledger.requeue(deliveryId);
-		const rows = new Map(this.#ledger.getMany(requeued).map((row) => [row.deliveryId, row]));
+		const requeued = deliveryId === undefined ? this.requeueSince(since as string) : this.requeueById(deliveryId);
+		const rows = new Map(this.getMany(requeued).map((row) => [row.deliveryId, row]));
 		return {
 			requeued,
 			payloads: requeued.flatMap((id) => {
 				const row = rows.get(id);
-				if (!row) return [];
-				return [
-					{
-						...(JSON.parse(row.payloadJson) as ChatMessagePayload),
-						redelivered: true,
-						duplicateWarning: true,
-					},
-				];
+				return row ? [{ ...(JSON.parse(row.payloadJson) as ChatMessagePayload), redelivered: true, duplicateWarning: true }] : [];
 			}),
 		};
 	}
 	redeliveries(): ChatMessagePayload[] {
 		return this.#redeliveries();
 	}
-	prune(): number {
-		return this.#ledger.prune(7 * 24 * 60 * 60 * 1000);
+	prune(deliveredOlderThanMs = 7 * 24 * 60 * 60 * 1000, now = Date.now()): number {
+		return this.pruneOlderThan(deliveredOlderThanMs, now);
 	}
 	status() {
-		return this.#ledger.counts();
+		return this.counts();
 	}
 	#redeliveries(now = Date.now(), ignoreBackoff = false): ChatMessagePayload[] {
-		return this.#ledger.listUndelivered(DELIVERY_FRESHNESS_MS, now, ignoreBackoff).map((row) => ({
+		return this.listUndelivered(DELIVERY_FRESHNESS_MS, now, ignoreBackoff).map((row) => ({
 			...(JSON.parse(row.payloadJson) as ChatMessagePayload),
 			redelivered: true,
 			...(row.state === "inflight" || row.state === "failed_ambiguous" ? { duplicateWarning: true } : {}),

@@ -1,10 +1,14 @@
-import { Database } from "bun:sqlite";
+
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajae-gateway/protocol";
+import type { OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import pkg from "../package.json";
+
 import {
 	CLI_USAGE,
 	COMMANDS,
@@ -13,19 +17,137 @@ import {
 	parseArgs,
 	parseServicesArgs,
 	renderCycle,
-	restoreDatabase,
-	restoreTargetPath,
+	renderSlo,
+	sloExitCode,
 	socketPath,
 	USAGE_EXIT_CODE,
 	usageFor,
-	verifyBackupIntegrity,
 } from "../src/main";
-import { installServices, resolvePath } from "../src/services";
+import { installServices, resolvePath, serviceSpecs } from "../src/services";
 
+async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-slo-"));
+	const path = join(home, "gateway.sock");
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const output: string[] = [];
+	const errors: string[] = [];
+	const originalLog = console.log;
+	const originalError = console.error;
+	const previousExit = process.exitCode;
+	console.log = (line: unknown) => output.push(String(line));
+	console.error = (line: unknown) => errors.push(String(line));
+	process.exitCode = 0;
+	const listener = Bun.listen<{ buffer: string }>({
+		unix: path,
+		socket: {
+			open(socket) {
+				socket.data = { buffer: "" };
+			},
+			data(socket, data) {
+				socket.data.buffer += Buffer.from(data).toString("utf8");
+				let newline = socket.data.buffer.indexOf("\n");
+				while (newline >= 0) {
+					const line = socket.data.buffer.slice(0, newline);
+					socket.data.buffer = socket.data.buffer.slice(newline + 1);
+					const frame = JSON.parse(line) as { type: string; id?: string; verb?: string; params?: unknown };
+					if (frame.type === "hello")
+						socket.write(`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`);
+					else if (frame.type === "request") {
+						requests.push({ verb: frame.verb!, params: frame.params });
+						socket.write(`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result })}\n`);
+					}
+					newline = socket.data.buffer.indexOf("\n");
+				}
+			},
+		},
+	});
+	try {
+		await main(["--socket", path, "ops", "slo", ...args]);
+		return { requests, output, errors, exitCode: process.exitCode ?? 0 };
+	} finally {
+		console.log = originalLog;
+		console.error = originalError;
+		process.exitCode = previousExit;
+		listener.stop(true);
+		await rm(home, { recursive: true, force: true });
+	}
+}
+
+function sampleSloResult(status: "ok" | "failed" | "insufficient" | "pending"): OpsSloResult {
+	return {
+		days: [
+			{
+				date: "2026-10-09",
+				status,
+				complete: status !== "insufficient",
+				aliveMs: 86_400_000,
+				maxUncoveredGapMs: 0,
+				broker_unavailable: status === "failed" ? 1 : 0,
+				persona_bind_failed: 0,
+				excluded: 0,
+			},
+		],
+		windows: [
+			{
+				id: "update-1",
+				trigger: "update",
+				state: "ok",
+				requestedAt: "2026-10-09T10:00:00.000Z",
+				finishedAt: "2026-10-09T10:31:00.000Z",
+				verified: true,
+				eligibleStart: "2026-10-09T10:00:00.000Z",
+				eligibleEnd: "2026-10-09T10:30:00.000Z",
+				overCapMs: 60_000,
+			},
+		],
+		ok: status === "ok",
+	};
+}
+
+describe("ops slo exit contract", () => {
+	test("sends --days, renders provenance, and exits zero only for an ok result", async () => {
+		const result = sampleSloResult("ok");
+		const run = await runOpsSloCli(result, ["--days", "1", "--json"]);
+		expect(run.requests).toEqual([{ verb: "ops.slo", params: { days: 1 } }]);
+		expect(run.exitCode).toBe(0);
+		expect(JSON.parse(run.output[0]!)).toEqual(result);
+		expect(sloExitCode(result)).toBe(0);
+		expect(renderSlo(result).join("\\n")).toContain("verified=true");
+		expect(renderSlo(result).join("\\n")).toContain("over_cap_ms=60000");
+	});
+
+	test("pending has a rerun-later message and a nonzero exit", async () => {
+		const run = await runOpsSloCli(sampleSloResult("pending"), ["--days", "1"]);
+		expect(run.exitCode).toBe(1);
+		expect(run.output[0]).toContain("SLO pending");
+		expect(run.output[0]).toContain("rerun later");
+	});
+
+	test("failed and insufficient are distinct nonzero outcomes", async () => {
+		const failed = await runOpsSloCli(sampleSloResult("failed"), []);
+		const insufficient = await runOpsSloCli(sampleSloResult("insufficient"), []);
+		expect(failed.exitCode).toBe(1);
+		expect(failed.output[0]).toContain("SLO failed");
+		expect(insufficient.exitCode).toBe(1);
+		expect(insufficient.output[0]).toContain("SLO insufficient");
+	});
+});
 describe("cli arguments", () => {
 	test("resolves home and socket override", () => {
 		expect(socketPath("/tmp/gajae")).toBe("/tmp/gajae/gateway.sock");
 		expect(parseArgs(["--socket", "/tmp/x", "status"])).toEqual({ command: "status", rest: [], socket: "/tmp/x" });
+	});
+
+	test("--version prints the package version without requiring a gateway", async () => {
+		const output: string[] = [];
+		const originalLog = console.log;
+		console.log = (line: unknown) => output.push(String(line));
+		try {
+			await main(["--version"]);
+			expect(output).toEqual([pkg.version]);
+		} finally {
+			console.log = originalLog;
+		}
 	});
 
 	test("an unknown memory-audit argument is refused instead of degrading to a plain audit", async () => {
@@ -94,6 +216,96 @@ describe("cli arguments", () => {
 			expect(CLI_USAGE).toContain("ops redeliver --since <iso>");
 		} finally {
 			console.log = originalLog;
+			listener.stop(true);
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+	test("ops restore is unknown and ops deliveries filters and renders the SDK projection", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-deliveries-"));
+		const path = join(home, "fake.sock");
+		const received: Array<{ verb: string; params: unknown }> = [];
+		const errors: string[] = [];
+		const output: string[] = [];
+		const originalLog = console.log;
+		const originalError = console.error;
+		const previousExit = process.exitCode;
+		const row = {
+			deliveryId: "delivery-42",
+			turnId: "turn-42",
+			originKey: "discord:channel:channel-42",
+			conversationId: "channel-42",
+			state: "confirmed",
+			createdAt: "2026-10-01T00:00:00.000Z",
+			textPrefix: "delivery text",
+		};
+		console.log = (line: unknown) => output.push(String(line));
+		console.error = (line: unknown) => errors.push(String(line));
+		const listener = Bun.listen<{ buffer: string }>({
+			unix: path,
+			socket: {
+				open(socket) {
+					socket.data = { buffer: "" };
+				},
+				data(socket, data) {
+					socket.data.buffer += Buffer.from(data).toString("utf8");
+					let newline = socket.data.buffer.indexOf("\n");
+					while (newline >= 0) {
+						const line = socket.data.buffer.slice(0, newline);
+						socket.data.buffer = socket.data.buffer.slice(newline + 1);
+						const frame = JSON.parse(line) as { type: string; id?: string; verb?: string; params?: unknown };
+						if (frame.type === "hello")
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`,
+							);
+						else if (frame.type === "request") {
+							received.push({ verb: frame.verb as string, params: frame.params });
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result: { rows: [row] } })}\n`,
+							);
+						}
+						newline = socket.data.buffer.indexOf("\n");
+					}
+				},
+			},
+		});
+		try {
+			await main(["--socket", path, "ops", "restore", "/tmp/backup.db"]);
+			expect(errors.join("\n")).toContain("unknown ops command: restore");
+			expect(received).toEqual([]);
+			process.exitCode = previousExit ?? 0;
+
+			await main([
+				"--socket",
+				path,
+				"ops",
+				"deliveries",
+				"--since",
+				"2026-10-01T00:00:00.000Z",
+				"--state",
+				"confirmed",
+				"--limit",
+				"25",
+				"--json",
+			]);
+			await main(["--socket", path, "ops", "deliveries"]);
+			expect(received).toEqual([
+				{
+					verb: "ops.deliveries",
+					params: { since: "2026-10-01T00:00:00.000Z", state: "confirmed", limit: 25 },
+				},
+				{ verb: "ops.deliveries", params: {} },
+			]);
+			expect(output).toEqual([
+				JSON.stringify({ rows: [row] }),
+				"deliveries: 1",
+				"2026-10-01T00:00:00.000Z confirmed delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 text=\"delivery text\"",
+			]);
+			expect(CLI_USAGE).toContain("ops deliveries [--since ISO]");
+			expect(CLI_USAGE).not.toContain("ops restore");
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = previousExit ?? 0;
 			listener.stop(true);
 			await rm(home, { recursive: true, force: true });
 		}
@@ -280,7 +492,8 @@ describe("service installation", () => {
 		]);
 	});
 
-	test("install and repair each rewrite exactly four safe LaunchAgent plists", async () => {
+	test("install and repair each rewrite exactly five safe LaunchAgent plists", async () => {
+
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-"));
 		try {
 			await writeFile(
@@ -307,8 +520,9 @@ describe("service installation", () => {
 				writeFile: writer,
 			};
 			const installed = await installServices(options);
-			expect(installed).toHaveLength(4);
-			expect(writes).toHaveLength(4);
+			expect(installed).toHaveLength(serviceSpecs().length);
+			expect(writes).toHaveLength(serviceSpecs().length);
+
 			expect(writes.map(({ path }) => path)).toEqual([...installed]);
 			for (const { contents } of writes) {
 				expect(contents).not.toContain("TOP_SECRET");
@@ -327,9 +541,12 @@ describe("service installation", () => {
 			const slack = writes.find(({ path }) => path.endsWith("dev.gajaeway.adapter-slack.plist"))?.contents ?? "";
 			expect(slack).toContain("gajaeway-slack</string>");
 			expect(slack).toContain("adapter-slack.stdout.log");
+			const telegram = writes.find(({ path }) => path.endsWith("dev.gajaeway.adapter-telegram.plist"))?.contents ?? "";
+			expect(telegram).toContain("gajaeway-telegram</string>");
+			expect(telegram).toContain("adapter-telegram.stdout.log");
 			writes.length = 0;
 			await installServices(options);
-			expect(writes).toHaveLength(4);
+			expect(writes).toHaveLength(serviceSpecs().length);
 		} finally {
 			await rm(home, { recursive: true, force: true });
 		}
@@ -393,7 +610,8 @@ describe("monitor update", () => {
 			return { monitorId: "monitor-42" } as T;
 		};
 		client.close = async () => {};
-		const connect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(client);
+		const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(client);
+
 		const log = spyOn(console, "log").mockImplementation((line) => {
 			lines.push(String(line));
 		});
@@ -457,257 +675,6 @@ describe("monitor update", () => {
 		});
 });
 
-/** A real, well-formed SQLite file with one marker row. */
-function writeSqlite(path: string, marker: string): void {
-	const database = new Database(path);
-	try {
-		database.exec("CREATE TABLE marker(value TEXT NOT NULL)");
-		database.query("INSERT INTO marker(value) VALUES (?)").run(marker);
-	} finally {
-		database.close();
-	}
-}
-
-test("offline restore preserves the current database then copies an integrity-checked backup", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-"));
-	const previousHome = process.env.GAJAEWAY_HOME;
-	process.env.GAJAEWAY_HOME = home;
-	try {
-		const databasePath = join(home, "gateway.db");
-		const backupPath = join(home, "backup.db");
-		await writeFile(databasePath, "current database");
-		writeSqlite(backupPath, "backup");
-		await restoreDatabase(join(home, "gateway.sock"), backupPath);
-		expect(await readFile(databasePath)).toEqual(await readFile(backupPath));
-		const preserved = (await Array.fromAsync(new Bun.Glob("gateway.db.pre-restore-*").scan({ cwd: home })))[0];
-		expect(preserved).toBeString();
-		expect(await Bun.file(join(home, preserved as string)).text()).toBe("current database");
-	} finally {
-		if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
-		else process.env.GAJAEWAY_HOME = previousHome;
-		await rm(home, { recursive: true, force: true });
-	}
-});
-
-describe("verifyBackupIntegrity", () => {
-	async function withHome(run: (home: string) => Promise<void>): Promise<void> {
-		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-verify-"));
-		try {
-			await run(home);
-		} finally {
-			await rm(home, { recursive: true, force: true });
-		}
-	}
-
-	test("a well-formed database passes and is left closed", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "good.db");
-			writeSqlite(path, "ok");
-			expect(() => verifyBackupIntegrity(path)).not.toThrow();
-			// Still openable afterwards: the verifier held no lock and left no journal.
-			const database = new Database(path, { readonly: true });
-			try {
-				expect(database.query<{ value: string }, []>("SELECT value FROM marker").get()?.value).toBe("ok");
-			} finally {
-				database.close();
-			}
-		});
-	});
-
-	test("a file that is only the 16-byte SQLite header is refused", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "header-only.db");
-			await writeFile(path, Buffer.concat([Buffer.from("SQLite format 3\0"), Buffer.alloc(64, 0xff)]));
-			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is not a readable SQLite database: .*header-only\.db/);
-		});
-	});
-
-	test("a truncated copy of a real database is refused", async () => {
-		await withHome(async (home) => {
-			const good = join(home, "good.db");
-			writeSqlite(good, "x".repeat(4096));
-			const bytes = await readFile(good);
-			const truncated = join(home, "truncated.db");
-			await writeFile(truncated, bytes.subarray(0, Math.floor(bytes.length / 2)));
-			expect(() => verifyBackupIntegrity(truncated)).toThrow(
-				/Backup is not a readable SQLite database: .*truncated\.db/,
-			);
-		});
-	});
-
-	test("a zero-length file is refused even though SQLite calls it a valid empty database", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "empty.db");
-			await writeFile(path, "");
-			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is an empty SQLite database: .*empty\.db/);
-		});
-	});
-
-	test("a file of zero bytes with a non-zero length is refused", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "zeros.db");
-			await writeFile(path, Buffer.alloc(200));
-			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is not a readable SQLite database: .*zeros\.db/);
-		});
-	});
-
-	test("a WAL-mode backup passes and any sidecars land beside the backup, not elsewhere", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "wal.db");
-			const database = new Database(path);
-			try {
-				database.exec("PRAGMA journal_mode = WAL; CREATE TABLE marker(value TEXT NOT NULL)");
-				database.query("INSERT INTO marker(value) VALUES (?)").run("wal");
-			} finally {
-				database.close();
-			}
-			const before = await readFile(path);
-			expect(() => verifyBackupIntegrity(path)).not.toThrow();
-			expect(await readFile(path)).toEqual(before);
-			const entries = await readdir(home);
-			for (const entry of entries) expect(entry.startsWith("wal.db")).toBe(true);
-		});
-	});
-
-	test("a database whose integrity_check reports problems is refused with the report", async () => {
-		await withHome(async (home) => {
-			const good = join(home, "good.db");
-			const source = new Database(good);
-			try {
-				source.exec("PRAGMA page_size = 4096; CREATE TABLE m(v TEXT); CREATE INDEX i ON m(v)");
-				for (let index = 0; index < 40; index++)
-					source.query("INSERT INTO m(v) VALUES (?)").run(`row-${index}-${"x".repeat(200)}`);
-			} finally {
-				source.close();
-			}
-			// Zero the body of the index root page but keep the file header and page
-			// count intact. The page number comes from the schema rather than being
-			// assumed. Which refusal fires is a SQLite build detail: some builds let
-			// integrity_check report the missing index entries, others raise
-			// SQLITE_CORRUPT while the pragma runs. Both must refuse the backup and
-			// name the file, and neither may be silently restored.
-			const inspect = new Database(good, { readonly: true });
-			let rootPage: number;
-			try {
-				rootPage =
-					inspect.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_schema WHERE name = 'i'").get()
-						?.rootpage ?? 0;
-			} finally {
-				inspect.close();
-			}
-			expect(rootPage).toBeGreaterThan(1);
-			const bytes = Buffer.from(await readFile(good));
-			bytes.fill(0, 4096 * (rootPage - 1) + 100, 4096 * rootPage);
-			const damaged = join(home, "damaged.db");
-			await writeFile(damaged, bytes);
-			expect(() => verifyBackupIntegrity(damaged)).toThrow(
-				/Backup (?:failed SQLite integrity_check|is not a readable SQLite database): .*damaged\.db \(/,
-			);
-		});
-	});
-
-	test("a non-database file is refused", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "text.db");
-			await writeFile(path, "not a database at all");
-			expect(() => verifyBackupIntegrity(path)).toThrow(/Backup is not a readable SQLite database: .*text\.db/);
-		});
-	});
-
-	test("a missing file is refused as unreadable", async () => {
-		await withHome(async (home) => {
-			expect(() => verifyBackupIntegrity(join(home, "absent.db"))).toThrow(/Backup is not readable/);
-		});
-	});
-});
-
-test("offline restore targets the configured dbPath, not the default gateway.db", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-dbpath-"));
-	const previousHome = process.env.GAJAEWAY_HOME;
-	process.env.GAJAEWAY_HOME = home;
-	try {
-		const databasePath = join(home, "custom", "live.db");
-		await mkdir(join(home, "custom"));
-		await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, dbPath: databasePath }));
-		await writeFile(databasePath, "configured database");
-		const backupPath = join(home, "backup.db");
-		writeSqlite(backupPath, "backup");
-		await restoreDatabase(join(home, "gateway.sock"), backupPath);
-		expect(await readFile(databasePath)).toEqual(await readFile(backupPath));
-		expect(await Bun.file(join(home, "gateway.db")).exists()).toBe(false);
-		const preserved = (
-			await Array.fromAsync(new Bun.Glob("live.db.pre-restore-*").scan({ cwd: join(home, "custom") }))
-		)[0];
-		expect(preserved).toBeString();
-		expect(await Bun.file(join(home, "custom", preserved as string)).text()).toBe("configured database");
-	} finally {
-		if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
-		else process.env.GAJAEWAY_HOME = previousHome;
-		await rm(home, { recursive: true, force: true });
-	}
-});
-
-describe("restoreTargetPath", () => {
-	async function withHome(run: (home: string) => Promise<void>): Promise<void> {
-		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-target-"));
-		try {
-			await run(home);
-		} finally {
-			await rm(home, { recursive: true, force: true });
-		}
-	}
-
-	test("missing config.json falls back to <home>/gateway.db like gateway boot", async () => {
-		await withHome(async (home) => {
-			expect(await restoreTargetPath(home)).toBe(join(home, "gateway.db"));
-		});
-	});
-
-	test("config.json without dbPath falls back to <home>/gateway.db", async () => {
-		await withHome(async (home) => {
-			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
-			expect(await restoreTargetPath(home)).toBe(join(home, "gateway.db"));
-		});
-	});
-
-	test("malformed config.json refuses instead of guessing the default", async () => {
-		await withHome(async (home) => {
-			await writeFile(join(home, "config.json"), "{ not json");
-			await expect(restoreTargetPath(home)).rejects.toThrow(/Cannot parse .*config\.json; refusing restore/);
-		});
-	});
-
-	test("empty dbPath refuses with the gateway's non-empty-string rule", async () => {
-		await withHome(async (home) => {
-			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, dbPath: "" }));
-			await expect(restoreTargetPath(home)).rejects.toThrow(/dbPath must be a non-empty string; refusing restore/);
-		});
-	});
-
-	test("config.json whose root is not an object refuses", async () => {
-		await withHome(async (home) => {
-			await writeFile(join(home, "config.json"), "[]");
-			await expect(restoreTargetPath(home)).rejects.toThrow(/config must be an object; refusing restore/);
-		});
-	});
-
-	test("a config.json that exists but cannot be read refuses instead of defaulting", async () => {
-		await withHome(async (home) => {
-			// A directory in place of the file: readFile fails with EISDIR, not ENOENT.
-			await mkdir(join(home, "config.json"));
-			await expect(restoreTargetPath(home)).rejects.toThrow(/Cannot read .*config\.json; refusing restore/);
-		});
-	});
-
-	test("a dangling config.json symlink is unreadable, not absent", async () => {
-		await withHome(async (home) => {
-			// readFile reports ENOENT here, exactly like a missing file; only lstat
-			// tells the two apart. The gateway refuses to boot on this layout.
-			await symlink(join(home, "moved-away.json"), join(home, "config.json"));
-			await expect(restoreTargetPath(home)).rejects.toThrow(/Cannot read .*config\.json; refusing restore/);
-		});
-	});
-});
 function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 	return {
 		phase: "idle",
@@ -717,6 +684,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		memoryClosing: false,
 		sessions: [],
 		memoryIntents: { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 },
+		memoryGitIndexLock: null,
 		monitorEvents: [],
 		monitorAuthoringLost: [],
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
@@ -732,6 +700,8 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		},
 		lanes: { active: 0, max: 8 },
 		agentDisk: null,
+		brokerAgent: null,
+		slo: { days: [], windows: [], ok: false },
 		...overrides,
 	};
 }
@@ -743,12 +713,45 @@ describe("cycle rendering", () => {
 		expect(lines).toContain("gates: none");
 		expect(lines.join("\n")).not.toContain("sessions:");
 	});
+	test("broker-agent drift renders only entries that are not in sync", () => {
+		const lines = renderCycle(
+			cycleResult({
+				brokerAgent: {
+					status: "provisioned",
+					provisionedAt: "2026-10-09T00:00:00.000Z",
+					genId: "gen-1",
+					source: "/home/operator/.gjc/agent",
+					entries: [
+						{ name: "agent.db", kind: "credentials", state: "in_sync" },
+						{ name: "models.yml", kind: "model-config", state: "source_changed" },
+						{ name: "config.yml", kind: "model-config", state: "missing_copy" },
+					],
+				},
+			}),
+		);
+		expect(lines).toContain("broker_agent: provisioned");
+		expect(lines).toContain("broker_agent models.yml: kind=model-config state=source_changed");
+		expect(lines).toContain("broker_agent config.yml: kind=model-config state=missing_copy");
+		expect(lines.join("\n")).not.toContain("agent.db: kind=credentials");
+	});
 
 	test("gates render visibly with every reason named", () => {
 		const lines = renderCycle(
 			cycleResult({ phase: "degraded", gates: ["stale_session_identity", "memory_closure_blocked"] }),
 		).join("\n");
 		expect(lines).toContain("gates: stale_session_identity, memory_closure_blocked");
+	});
+	test("memory git index lock renders its path and age", () => {
+		const path = "/memory/.git/index.lock";
+		const lines = renderCycle(
+			cycleResult({
+				phase: "degraded",
+				gates: ["memory_git_index_locked"],
+				memoryGitIndexLock: { path, ageMs: 1234 },
+				}),
+		).join("\n");
+		expect(lines).toContain("gates: memory_git_index_locked");
+		expect(lines).toContain(`memory_git_index_lock: ${path} age=1234ms`);
 	});
 
 	test("mid-rebind session renders the rebinding marker instead of a session id", () => {
@@ -916,7 +919,7 @@ describe("work operator commands", () => {
 		client.close = async () => {
 			closed = true;
 		};
-		const connect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(client);
+		const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(client);
 		const log = spyOn(console, "log").mockImplementation((line) => {
 			lines.push(String(line));
 		});
@@ -985,7 +988,8 @@ describe("work operator commands", () => {
 				},
 			]);
 			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
-			expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000 });
+			expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000, deadlineMs: 30_000 });
+
 			expect(output.closed).toBe(true);
 		});
 	}
@@ -1044,7 +1048,7 @@ describe("work operator commands", () => {
 	test("work run remains response-only with a caller wait budget", async () => {
 		const output = await run(["run", "fix", "task"], { held: false, text: "answer" });
 		expect(output.requests).toEqual([{ verb: "work.run", params: { name: "fix", text: "task" } }]);
-		expect(output.connectOptions).toEqual({ requestTimeoutMs: 3_600_000 });
+		expect(output.connectOptions).toEqual({ requestTimeoutMs: 3_600_000, deadlineMs: 30_000 });
 		expect(output.lines).toEqual(["answer"]);
 	});
 

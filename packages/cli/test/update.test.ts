@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homeLayout, acquireLease, leaseHeld } from "@gajae-gateway/home";
+
 import pkg from "../package.json";
 import { main } from "../src/main";
 import {
 	type AssetDownloader,
-	acquireUpdateLock,
 	CORE_BINARIES,
 	isNewer,
 	KNOWN_BINARIES,
@@ -21,9 +22,42 @@ import {
 	runUpdate,
 	selectReleaseAsset,
 	UPDATE_USAGE,
+	type RunUpdateOptions,
 	type UpdateDeps,
 } from "../src/update";
 
+const PINNED_GJC = "0.18.9";
+
+async function homeWithConfig(): Promise<string> {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-update-home-"));
+	await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }), "utf8");
+	return home;
+}
+
+const gjcInstallRunner: NonNullable<UpdateDeps["gjcInstallRunner"]> = async (command, cwd) => {
+	if (command[0] === "bun") {
+		const bin = join(cwd, "node_modules", ".bin");
+		await mkdir(bin, { recursive: true });
+		await writeFile(join(bin, "gjc"), "test gjc executable");
+		return { exitCode: 0, stdout: "", stderr: "" };
+	}
+	const manifest = JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+		dependencies: { "gajae-code": string };
+	};
+	return { exitCode: 0, stdout: `gjc/${manifest.dependencies["gajae-code"]}`, stderr: "" };
+};
+
+function serviceOptions(
+	home: string,
+	write: NonNullable<UpdateDeps["serviceOptions"]>["writeFile"] = async () => {},
+): NonNullable<UpdateDeps["serviceOptions"]> {
+	return {
+		unitDir: join(home, "units"),
+		launchAgentsDir: join(home, "agents"),
+		loginPathRunner: async () => "/usr/bin:/bin",
+		writeFile: write,
+	};
+}
 const DARWIN_ASSET = "gajaeway-darwin-arm64.tar.gz";
 
 function release(tag: string, assetNames: readonly string[]): ReleaseInfo {
@@ -41,8 +75,12 @@ async function stagedBinary(dir: string, name: string, marker: string): Promise<
 const noBytes: AssetDownloader = async () => new Uint8Array(0);
 
 /** Stages the given binaries the way a real tarball extraction would. */
-function extractorFor(binaries: readonly { name: string; marker: string }[]): UpdateDeps["extractTarball"] {
+function extractorFor(
+	binaries: readonly { name: string; marker: string }[],
+	gjcVersion = PINNED_GJC,
+): UpdateDeps["extractTarball"] {
 	return async (_tarball, intoDir) => {
+		await writeFile(join(intoDir, "package.json"), JSON.stringify({ gjc: { version: gjcVersion } }), "utf8");
 		for (const binary of binaries) await stagedBinary(intoDir, binary.name, binary.marker);
 	};
 }
@@ -184,78 +222,87 @@ describe("runUpdate", () => {
 			expect(result.checkedOnly).toBe(true);
 			expect(renderUpdate(result)).toEqual(["update available: 0.1.1 → 0.2.0 (release v0.2.0)"]);
 			// A check never stages, backs up, or marks anything.
-			expect(await readdir(dir)).not.toContain(".gajaeway-update.lock");
+
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
 
-	test("an install replaces installed binaries, backs them up, marks the release, and queues the restart", async () => {
-		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
-		const calls = recorder();
-		const extractor = extractorFor(KNOWN_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
-		try {
-			const result = await runUpdate({
-				args: { check: false, force: false, noRestart: false, binDir: dir },
-				home: "/tmp/gajaeway-home",
-				deps: {
-					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
-					downloadAsset: async (asset) => {
-						calls.downloads.push(asset.name);
-						return new Uint8Array(0);
-					},
-					extractTarball: extractor,
-					queueRestart: async (home) => {
-						calls.restarts.push(home);
-						return { receiptId: "r-1", supervisorPid: 42 };
-					},
-					platform: "darwin",
-					arch: "arm64",
+test("an install replaces installed binaries, backs them up, marks the release, and queues the restart", async () => {
+	const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
+	const home = await homeWithConfig();
+	const calls = recorder();
+	const extractor = extractorFor(KNOWN_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
+	try {
+		const result = await runUpdate({
+			args: { check: false, force: false, noRestart: false, binDir: dir },
+			home,
+			deps: {
+				fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
+				downloadAsset: async (asset) => {
+					calls.downloads.push(asset.name);
+					return new Uint8Array(0);
 				},
-			});
-			// Adapters the host never installed stay uninstalled; the core pair is refreshed.
-			expect(result.installed).toEqual(["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
-			expect(result.restartQueued).toBe("r-1");
-			expect(result.upToDate).toBe(false);
-			expect(calls.downloads).toEqual([DARWIN_ASSET]);
-			expect(calls.restarts).toEqual(["/tmp/gajaeway-home"]);
-			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]) {
-				const body = await readFile(join(dir, name), "utf8");
-				expect(body.startsWith(`staged-${name}\n`)).toBe(true);
-				expect((await stat(join(dir, name))).mode & 0o777).toBe(0o755);
-			}
-			expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
-			const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
-			expect(backups).toHaveLength(1);
-			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
-				expect(await readFile(join(dir, backups[0], name), "utf8")).toBe(`old-${name}`);
-			// No half-applied temp files or locks survive the run.
-			for (const entry of await readdir(dir))
-				expect(entry.startsWith(".update-") || entry === ".gajaeway-update.lock").toBe(false);
-			expect(await readdir(dir)).not.toContain("gajaeway-admin");
-			const lines = renderUpdate(result);
-			expect(lines[0]).toBe("updated 0.1.1 → 0.2.0 from Yeachan-Heo/gajae-way (v0.2.0)");
-			expect(lines[1]).toBe("installed: gajaeway, gajaeway-gateway, gajaeway-slack");
-			expect(lines[2]).toBe(`backup: ${join(dir, backups[0])}`);
-			expect(lines[3]).toBe("restart: queued r-1 — check with: gajaeway ops restart-stack --status");
-		} finally {
-			await rm(dir, { recursive: true, force: true });
+				extractTarball: extractor,
+				gjcInstallRunner,
+				serviceOptions: serviceOptions(home),
+				queueRestart: async (restartHome, _binDir, trigger) => {
+					calls.restarts.push(restartHome);
+					expect(trigger).toBe("update");
+					expect(await leaseHeld(restartHome, "update")).toBe(false);
+					return { receiptId: "r-1", supervisorPid: 42 };
+				},
+				platform: "darwin",
+				arch: "arm64",
+			},
+		});
+		// Adapters the host never installed stay uninstalled; the core pair is refreshed.
+		expect(result.installed).toEqual(["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
+		expect(result.restartQueued).toBe("r-1");
+		expect(result.upToDate).toBe(false);
+		expect(calls.downloads).toEqual([DARWIN_ASSET]);
+		expect(calls.restarts).toEqual([home]);
+		expect(await leaseHeld(home, "update")).toBe(false);
+		for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]) {
+			const body = await readFile(join(dir, name), "utf8");
+			expect(body.startsWith(`staged-${name}\n`)).toBe(true);
+			expect((await stat(join(dir, name))).mode & 0o777).toBe(0o755);
 		}
-	});
+		expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
+		expect(await readlink(homeLayout(home).gjcCurrent)).toBe(PINNED_GJC);
+		const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
+		expect(backups).toHaveLength(1);
+		for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
+			expect(await readFile(join(dir, backups[0], name), "utf8")).toBe(`old-${name}`);
+		for (const entry of await readdir(dir)) expect(entry.startsWith(".update-")).toBe(false);
+		expect(await readdir(dir)).not.toContain("gajaeway-admin");
+		const lines = renderUpdate(result);
+		expect(lines[0]).toBe("updated 0.1.1 → 0.2.0 from Yeachan-Heo/gajae-way (v0.2.0)");
+		expect(lines[1]).toBe("installed: gajaeway, gajaeway-gateway, gajaeway-slack");
+		expect(lines[2]).toBe(`backup: ${join(dir, backups[0])}`);
+		expect(lines[3]).toBe("restart: queued r-1 — check with: gajaeway ops restart-stack --status");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
+});
 
 	test("--no-restart replaces binaries without touching the service manager", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const home = await homeWithConfig();
 		const calls = recorder();
 		try {
 			const result = await runUpdate({
 				args: { check: false, force: false, noRestart: true, binDir: dir },
-				home: "/tmp/gajaeway-home",
+				home,
 				deps: {
 					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
 					downloadAsset: noBytes,
 					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
-					queueRestart: async (home) => {
-						calls.restarts.push(home);
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home),
+					queueRestart: async (restartHome) => {
+						calls.restarts.push(restartHome);
 						return { receiptId: "r-1", supervisorPid: 42 };
 					},
 					platform: "darwin",
@@ -265,22 +312,124 @@ describe("runUpdate", () => {
 			expect(result.restartSkipped).toBe(true);
 			expect(result.restartQueued).toBeUndefined();
 			expect(calls.restarts).toHaveLength(0);
-			expect(renderUpdate(result).at(-1)).toBe("restart: skipped (--no-restart)");
+			expect(renderUpdate(result)).toContain("restart: skipped (--no-restart)");
+			expect(renderUpdate(result)).toContain("broker unit installed, not enabled: run gajaeway setup --broker-agent");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
 		}
 	});
 
+	test("systemd update writes only configured adapter units and no-start refresh is daemon-reload only", async () => {
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const home = await homeWithConfig();
+		const unitFiles = new Map<string, string>();
+		const serviceCommands: string[][] = [];
+		try {
+			await writeFile(join(home, "adapter-discord.json"), "{}", "utf8");
+			const result = await runUpdate({
+				args: { check: false, force: false, noRestart: true, binDir: dir },
+				home,
+				deps: {
+					fetchLatestRelease: async () => release("v0.2.0", [releaseAssetName("linux", "arm64")]),
+					downloadAsset: noBytes,
+					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })), "0.19.2"),
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home, async (path: string, contents: string) => {
+						unitFiles.set(path, contents);
+					}),
+					serviceRunner: async (command: readonly string[]) => {
+						serviceCommands.push([...command]);
+						return 0;
+					},
+					platform: "linux",
+					arch: "arm64",
+				},
+			});
+			expect(result.restartSkipped).toBe(true);
+			expect(result.brokerNotEnabled).toBe(true);
+			expect(renderUpdate(result)).toContain("broker unit installed, not enabled: run gajaeway setup --broker-agent");
+			expect(serviceCommands).toEqual([["systemctl", "--user", "daemon-reload"]]);
+			expect([...unitFiles.keys()]).toContain(join(home, "units", "gajaeway-broker.service"));
+			expect([...unitFiles.keys()]).toContain(join(home, "units", "gajaeway-adapter-discord.service"));
+			expect([...unitFiles.keys()]).not.toContain(join(home, "units", "gajaeway-adapter-slack.service"));
+			expect(await readlink(homeLayout(home).gjcCurrent)).toBe("0.19.2");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("systemd update enables broker only with its provisioning manifest", async () => {
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const home = await homeWithConfig();
+		const serviceCommands: string[][] = [];
+		try {
+			await writeFile(join(home, "adapter-slack.json"), "{}", "utf8");
+			const options: RunUpdateOptions = {
+				args: { check: false, force: false, noRestart: false, binDir: dir },
+				home,
+				deps: {
+					fetchLatestRelease: async () => release("v0.2.0", [releaseAssetName("linux", "arm64")]),
+					downloadAsset: noBytes,
+					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home),
+					serviceRunner: async (command: readonly string[]) => {
+						serviceCommands.push([...command]);
+						return 0;
+					},
+					queueRestart: async (_home: string, _binDir: string, trigger: "update") => {
+						expect(trigger).toBe("update");
+						return { receiptId: "update-receipt", supervisorPid: 1 };
+					},
+					platform: "linux",
+					arch: "arm64",
+				},
+			};
+			const notProvisioned = await runUpdate(options);
+			expect(notProvisioned.brokerNotEnabled).toBe(true);
+			expect(renderUpdate(notProvisioned)).toContain("broker unit installed, not enabled: run gajaeway setup --broker-agent");
+			expect(serviceCommands[0]).toEqual(["systemctl", "--user", "daemon-reload"]);
+			expect(serviceCommands[1]).toEqual([
+				"systemctl",
+				"--user",
+				"enable",
+				"gajaeway-gateway.service",
+				"gajaeway-adapter-slack.service",
+				"gajaeway-admin.service",
+			]);
+			await mkdir(join(home, "broker", "provision"), { recursive: true });
+			await writeFile(join(home, "broker", "provision", "manifest.json"), "{}", "utf8");
+			serviceCommands.length = 0;
+			await runUpdate({ ...options, args: { ...options.args, force: true } });
+			expect(serviceCommands[1]).toEqual([
+				"systemctl",
+				"--user",
+				"enable",
+				"gajaeway-broker.service",
+				"gajaeway-gateway.service",
+				"gajaeway-adapter-slack.service",
+				"gajaeway-admin.service",
+			]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
+		}
+	});
 	test("--force reinstalls even when the latest release is already installed", async () => {
 		const dir = await binDirWith("0.2.0", ["gajaeway", "gajaeway-gateway"]);
+		const home = await homeWithConfig();
 		try {
 			const result = await runUpdate({
 				args: { check: false, force: true, noRestart: true, binDir: dir },
-				home: "/tmp/gajaeway-home",
+				home,
 				deps: {
 					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
 					downloadAsset: noBytes,
 					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `again-${name}` }))),
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home),
 					platform: "darwin",
 					arch: "arm64",
 				},
@@ -289,6 +438,7 @@ describe("runUpdate", () => {
 			expect((await readFile(join(dir, "gajaeway"), "utf8")).startsWith("again-gajaeway\n")).toBe(true);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -354,13 +504,14 @@ describe("runUpdate", () => {
 		}
 	});
 
-	test("an undersized staged binary is treated as a broken extraction", async () => {
+	test("a staging failure releases the update lease", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-update-failed-stage-"));
 		try {
 			await expect(
 				runUpdate({
 					args: { check: false, force: false, noRestart: false, binDir: dir },
-					home: "/tmp/gajaeway-home",
+					home,
 					deps: {
 						fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
 						downloadAsset: noBytes,
@@ -373,58 +524,10 @@ describe("runUpdate", () => {
 					},
 				}),
 			).rejects.toThrow("refusing a broken extraction");
+			expect(await leaseHeld(home, "update")).toBe(false);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	test("a lock naming a live pid refuses a concurrent update and downloads nothing", async () => {
-		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
-		await writeFile(join(dir, ".gajaeway-update.lock"), `${JSON.stringify({ pid: process.pid })}\n`);
-		try {
-			await expect(
-				runUpdate({
-					args: { check: false, force: false, noRestart: false, binDir: dir },
-					home: "/tmp/gajaeway-home",
-					deps: {
-						fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
-						downloadAsset: async () => {
-							throw new Error("a fenced update must not download");
-						},
-						extractTarball: async () => {
-							throw new Error("a fenced update must not extract");
-						},
-						platform: "darwin",
-						arch: "arm64",
-					},
-				}),
-			).rejects.toThrow(`pid ${process.pid}`);
-			expect((await readFile(join(dir, "gajaeway"), "utf8")).startsWith("old-")).toBe(true);
-		} finally {
-			await rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	test("a lock naming a dead pid is stale and taken over", async () => {
-		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
-		// PID 2^22-1 is outside any real pid space but parses as a number.
-		await writeFile(join(dir, ".gajaeway-update.lock"), `${JSON.stringify({ pid: 4_194_303 })}\n`);
-		try {
-			const result = await runUpdate({
-				args: { check: false, force: true, noRestart: true, binDir: dir },
-				home: "/tmp/gajaeway-home",
-				deps: {
-					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
-					downloadAsset: noBytes,
-					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
-					platform: "darwin",
-					arch: "arm64",
-				},
-			});
-			expect(result.installed).toEqual(["gajaeway", "gajaeway-gateway"]);
-			expect(await readdir(dir)).not.toContain(".gajaeway-update.lock");
-		} finally {
-			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -452,16 +555,30 @@ describe("runUpdate", () => {
 		}
 	});
 
-	test("the update lock is a plain pid file that releases cleanly", async () => {
-		const dir = await mkdtemp(join(tmpdir(), "gajaeway-update-lock-"));
+	test("an update refuses while the update lease is held", async () => {
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-update-held-"));
+		const holder = await acquireLease(home, "update");
 		try {
-			const unlock = await acquireUpdateLock(dir);
-			expect(JSON.parse(await readFile(join(dir, ".gajaeway-update.lock"), "utf8")).pid).toBe(process.pid);
-			await expect(acquireUpdateLock(dir)).rejects.toThrow(`pid ${process.pid}`);
-			await unlock();
-			expect(await readdir(dir)).toEqual([]);
+			await expect(
+				runUpdate({
+					args: { check: false, force: false, noRestart: false, binDir: dir },
+					home,
+					deps: {
+						fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
+						downloadAsset: async () => {
+							throw new Error("a fenced update must not download");
+						},
+						platform: "darwin",
+						arch: "arm64",
+					},
+				}),
+			).rejects.toThrow("another gajaeway update is running (lease_held name=update");
+			expect((await readFile(join(dir, "gajaeway"), "utf8")).startsWith("old-")).toBe(true);
 		} finally {
+			await holder.release();
 			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
 		}
 	});
 });
@@ -498,6 +615,37 @@ describe("update dispatch through main", () => {
 		} finally {
 			console.error = originalError;
 			process.exitCode = previousExit ?? 0;
+		}
+	});
+	test("the update command exits nonzero when another update owns the lease", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "gajaeway-update-cli-bin-"));
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-update-cli-held-"));
+		const previousHome = process.env.GAJAEWAY_HOME;
+		const previousExitCode = process.exitCode;
+		const originalError = console.error;
+		const errors: string[] = [];
+		const holder = await acquireLease(home, "update");
+		try {
+			process.env.GAJAEWAY_HOME = home;
+			console.error = (message: unknown) => errors.push(String(message));
+			await main(["update", "--bin-dir", dir], {
+				update: {
+					fetchLatestRelease: async () => release("v99.0.0", [DARWIN_ASSET]),
+					platform: "darwin",
+					arch: "arm64",
+				},
+			});
+			expect(process.exitCode).toBe(1);
+			expect(errors.join("\n")).toContain("another gajaeway update is running (lease_held name=update");
+			expect(await readdir(dir)).toEqual([]);
+		} finally {
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+			if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
+			else process.env.GAJAEWAY_HOME = previousHome;
+			await holder.release();
+			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
 		}
 	});
 });

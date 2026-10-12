@@ -884,6 +884,7 @@ export type CycleGateReason =
 	| "stale_session_identity"
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
+	| "memory_git_index_locked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
 	| "monitor_authoring_lost"
@@ -893,7 +894,8 @@ export type CycleGateReason =
 	| "gjc_unverified_version"
 	| "monitor_dispatch_failing"
 	| "broker_respawn_churn"
-	| "broker_index_lock_blocked";
+	| "broker_index_lock_blocked"
+	| "broker_agent_unprovisioned";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -931,6 +933,40 @@ export interface CycleSessionView {
 	/** Durable metadata-only bootstrap projection; source bodies are never exposed. */
 	readonly bootstrap: SessionBootstrapProjection;
 }
+export type SloDayStatus = "ok" | "failed" | "insufficient" | "pending";
+
+export interface SloDayResult {
+	readonly date: string;
+	readonly status: SloDayStatus;
+	readonly complete: boolean;
+	readonly aliveMs: number;
+	readonly maxUncoveredGapMs: number;
+	readonly broker_unavailable: number;
+	readonly persona_bind_failed: number;
+	readonly excluded: number;
+}
+
+export interface OpsSloWindow {
+	readonly id: string;
+	readonly trigger: string;
+	readonly state: string;
+	readonly requestedAt: string;
+	readonly finishedAt: string | null;
+	readonly verified: boolean;
+	readonly eligibleStart: string | null;
+	readonly eligibleEnd: string | null;
+	readonly overCapMs: number;
+}
+
+export interface OpsSloResult {
+	readonly days: readonly SloDayResult[];
+	readonly windows: readonly OpsSloWindow[];
+	readonly ok: boolean;
+}
+
+export interface OpsSloParams {
+	readonly days?: number;
+}
 
 export interface OpsCycleResult {
 	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
@@ -954,6 +990,8 @@ export interface OpsCycleResult {
 		readonly receipted: number;
 		readonly quarantined: number;
 	};
+	/** Observation-only memory git lock path and age; null when no lock is present. */
+	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
 	/**
@@ -983,6 +1021,47 @@ export interface OpsCycleResult {
 	readonly lanes: { readonly active: number; readonly max: number };
 	/** Agent-directory disk headroom; null when no broker agent directory is bound. */
 	readonly agentDisk: AgentDiskView | null;
+	/** Broker-owned copy of the operator's allowlisted GJC agent inputs. */
+	readonly brokerAgent: {
+		readonly status: "provisioned" | "unprovisioned" | "interrupted";
+		readonly provisionedAt: string | null;
+		readonly genId: string | null;
+		readonly source: string | null;
+		readonly entries: readonly {
+			readonly name: string;
+			readonly kind: string;
+			readonly state:
+				| "in_sync"
+				| "source_changed"
+				| "copy_changed"
+				| "diverged"
+				| "missing_source"
+				| "missing_copy"
+				| "absent";
+		}[];
+	} | null;
+	/** Durable seven-day broker/persona SLO projection from meta evidence. */
+	readonly slo: OpsSloResult;
+}
+
+export interface OpsDeliveryRow {
+	readonly deliveryId: string;
+	readonly turnId: string;
+	readonly originKey: string;
+	readonly conversationId: string;
+	readonly state: string;
+	readonly createdAt: string;
+	readonly textPrefix: string;
+}
+
+export interface OpsDeliveriesParams {
+	readonly since?: string;
+	readonly state?: string;
+	readonly limit?: number;
+}
+
+export interface OpsDeliveriesResult {
+	readonly rows: readonly OpsDeliveryRow[];
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
@@ -1030,7 +1109,9 @@ export interface VerbCatalogV01 {
 	};
 	"ops.redeliver": { params: OpsRedeliverParams; result: { readonly requeued: readonly string[] } };
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
+	"ops.deliveries": { params: OpsDeliveriesParams; result: OpsDeliveriesResult };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
@@ -1039,6 +1120,8 @@ export interface VerbCatalogV01 {
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
+	"ops.slo": { params: OpsSloParams; result: OpsSloResult };
+
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
 }
 
@@ -1072,6 +1155,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.redeliver",
 	"ops.integrity",
+	"ops.deliveries",
 	"work.run",
 	"work.start",
 	"work.status",
@@ -1082,6 +1166,7 @@ export const VERBS_V01 = [
 	"engagement.reaction",
 	"engagement.panel_response",
 	"gateway.reloadConfig",
+	"ops.slo",
 	"ops.cycle",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;

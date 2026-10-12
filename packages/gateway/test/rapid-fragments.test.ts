@@ -3,14 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "coalesce" } as const;
 const ORIGIN_KEY = "loopback/loopback/coalesce";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let manager: PersonaSessionManager | undefined;
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
@@ -23,14 +23,14 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 
 function enqueue(messageId: string, authorName: string, body: string, receivedAt: string): void {
 	expect(
-		database?.inboundEnqueue({
+		database?.transaction((tx) => database?.inbox.enqueue(tx, {
 			messageId,
 			originKey: ORIGIN_KEY,
 			originRefJson: JSON.stringify(ORIGIN),
 			body,
 			engagementJson: JSON.stringify({ authorName }),
 			receivedAt,
-		}),
+		})),
 	).toBe(true);
 }
 
@@ -45,7 +45,7 @@ afterEach(async () => {
 
 test("rapid fragments are never coalesced: the first is sent at once and every later one is steered into that turn with its speaker label", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-rapid-fragments-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const base = Date.now();
@@ -74,15 +74,15 @@ test("rapid fragments are never coalesced: the first is sent at once and every l
 	expect(send.text).toBe("[speaker:Ari message:m-1] first fragment");
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers.map((steer) => steer.text.split("\n").at(-1))).toEqual(["second fragment", "third fragment"]);
-	const turn = database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
+	const turn = database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 	expect(turn.triggerMessageId).toBe("m-1");
-	expect(database.inboundTurnRows(turn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual([
+	expect(database.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual([
 		["m-1", "trigger", "accepted"],
 		["m-2", "steer", "done"],
 		["m-3", "steer", "done"],
 	]);
 
 	port.complete(send.opRef, "done");
-	await eventually(() => database?.inboundPendingCount(ORIGIN_KEY) === 0, "trigger remained pending after terminal");
+	await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "trigger remained pending after terminal");
 	expect(port.sends).toHaveLength(1);
 });

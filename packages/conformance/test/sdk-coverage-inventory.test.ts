@@ -49,9 +49,8 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
 function harvest(pattern: RegExp): Set<string> {
 	const found = new Set<string>();
 	for (const file of collectSourceFiles(GATEWAY_SRC)) {
-		// The gjc vendor adapter speaks gjc's own SDK protocol (session.create
-		// ops etc.), not the gajaeway profile; it is outside the inventory.
-		if (file.endsWith("gjc-client.ts") || file.endsWith("session-port.ts") || file.endsWith("test-broker.ts")) continue;
+		// SessionPort and the test broker speak the SDK transport outside the profile inventory.
+		if (file.endsWith("session-port.ts") || file.endsWith("test-broker.ts")) continue;
 		// Monitor EVENT TYPE names (memory.canonicalize etc.) are data flowing through
 		// the monitor pipeline, not protocol verbs/events; the seeded defaults and the
 		// per-type authoring guidance reference them as plain strings.

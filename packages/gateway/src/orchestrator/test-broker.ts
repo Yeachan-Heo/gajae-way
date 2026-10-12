@@ -30,7 +30,7 @@ type Relay = {
  * `agent_start`, `event/message_end` and `agent_end` frames, stamped with the
  * turn's commandId/turnId — exactly what `gjc sdk serve --stdio` forwards.
  */
-export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
+export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, "agentDir"> {
 	const sessions = new Map<string, string>();
 	const repositories = new Map<string, string>();
 	const operations = new Map<string, StubOperation>();
@@ -254,7 +254,6 @@ export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
 		spawn: spawn as unknown as SpawnFn,
 		healthProbe: async () => true,
 		executable: "/test-only/gjc",
-		agentDir: "/test-only/gjc-agent",
 		discovery: async () => ({ pid: 1, url: "ws://127.0.0.1:1", token: "test-only", heartbeatAt: Date.now() }),
 	};
 }

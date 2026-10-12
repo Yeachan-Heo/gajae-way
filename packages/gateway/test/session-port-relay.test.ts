@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { type CliResult, type CliRunner, TranscriptIncompleteError } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
@@ -19,7 +19,7 @@ import {
 } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 
 afterEach(async () => {
 	database?.close();
@@ -36,7 +36,7 @@ async function fixture(options: {
 	readonly cliReply: (args: readonly string[]) => CliResult;
 }) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-relay-control-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "relay", epoch: 0 });

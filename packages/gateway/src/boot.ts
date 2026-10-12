@@ -1,6 +1,10 @@
 import { chmod, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
+import { acquireLease, homeLayout, LeaseHeldError, type Lease } from "@gajae-gateway/home";
+
 import { type ConfigOverrides, loadConfig } from "./config";
+import { assertNoRestoreJournal } from "./offline";
+
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import {
@@ -13,28 +17,19 @@ import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
 import { PersonaLoader } from "./persona/persona";
+import { SloRecorder } from "./ops/slo";
 import { type GatewayServer, startStdioServer, startUnixServer } from "./server/server";
-import { GatewayDatabase } from "./store/db";
-import { DeliveryLedger } from "./store/ledger";
-import {
-	acquireGatewayHome,
-	claimGatewayHome,
-	defaultTakeoverPorts,
-	releaseGatewayHome,
-	type TakeoverPorts,
-} from "./takeover";
+import { Store } from "./store";
+import { DeliveryService } from "./delivery/delivery";
 
 export interface BootGatewayOptions {
 	readonly stdio?: boolean;
 	readonly overrides?: ConfigOverrides;
 	/** Test/deployment seam for the shared user's SDK client. */
-	readonly broker?: GlobalGjcClientDependencies;
+	readonly broker?: Partial<Omit<GlobalGjcClientDependencies, "agentDir">>;
 	/** Explicit home is useful for isolated boot tests; normal startup uses GAJAEWAY_HOME. */
 	readonly home?: string;
-	/** `--only-new`: refuse to start while a live same-home gateway exists instead of waiting for it to exit. */
-	readonly onlyNew?: boolean;
-	/** Test seam for the pid-record/liveness ports; production reads the process table. */
-	readonly takeover?: TakeoverPorts;
+
 	/** How long boot waits for an unavailable shared broker before exiting; see {@link waitForBroker}. */
 	readonly brokerWait?: BrokerWaitOptions;
 }
@@ -51,35 +46,6 @@ export interface BrokerWaitOptions {
 
 export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
 
-/**
- * Resolve the gateway's gjc agent directory through proper precedence:
- * 1. explicit (test seam)
- * 2. config.json gjc.agentDir
- * 3. GJC_CODING_AGENT_DIR environment variable
- * 4. Recorded broker_authority canonicalAgentDir from existing home database
- * 5. Default $GAJAEWAY_HOME/gjc-agent
- *
- * This is a pure function used to resolve the agent directory before full database initialization.
- */
-export function resolveGatewayAgentDir(options: {
-	explicit?: string;
-	configAgentDir?: string;
-	env: Record<string, string | undefined>;
-	recordedAgentDir?: string | null;
-	home: string;
-}): string {
-	// 1. Explicit override (test/deployment seam)
-	if (options.explicit) return options.explicit;
-	// 2. config.json gjc.agentDir
-	if (options.configAgentDir) return options.configAgentDir;
-	// 3. GJC_CODING_AGENT_DIR or PI_CODING_AGENT_DIR env variable
-	const envAgentDir = options.env.GJC_CODING_AGENT_DIR ?? options.env.PI_CODING_AGENT_DIR;
-	if (envAgentDir) return envAgentDir;
-	// 4. Recorded broker_authority canonicalAgentDir (for established homes)
-	if (options.recordedAgentDir) return options.recordedAgentDir;
-	// 5. Default $GAJAEWAY_HOME/gjc-agent
-	return join(options.home, "gjc-agent");
-}
 
 /**
  * The persona workspace, created if missing and resolved through any symlink.
@@ -141,46 +107,83 @@ export interface BootedGateway extends GatewayServer {
 }
 
 export async function bootGateway(options: BootGatewayOptions = {}): Promise<BootedGateway> {
+	if (options.stdio) {
+		// stdout carries protocol frames in stdio mode; every log line goes to stderr.
+		console.log = console.error;
+		console.info = console.error;
+	}
 	const config = await loadConfig({ home: options.home, overrides: options.overrides });
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);
-	// Fence both boot and offline administration before database/recovery/socket
-	// access. The service manager owns all predecessor lifecycle decisions.
-	const lease = await acquireGatewayHome(config.home);
-	let claimed = false;
+	// Acquire in a fixed order so gateway boot and offline memory administration
+	// share the same gateway-then-memory ownership boundary.
+	let gatewayLease: Lease;
 	try {
-		await claimGatewayHome(
-			config.home,
-			{ onlyNew: options.onlyNew === true },
-			options.takeover ?? defaultTakeoverPorts(),
-		);
-		claimed = true;
+		gatewayLease = await acquireLease(config.home, "gateway");
+		console.info(`lease_acquired name=gateway pid=${process.pid}`);
+	} catch (error) {
+		logLeaseFailure("gateway", error);
+		throw error;
+	}
+	let memoryLease: Lease;
+	try {
+		memoryLease = await acquireLease(config.home, "memory");
+		console.info(`lease_acquired name=memory pid=${process.pid}`);
+	} catch (error) {
+		logLeaseFailure("memory", error);
+		try {
+			await gatewayLease.release();
+		} catch (releaseError) {
+			console.error(`gateway lease cleanup after memory lease failure failed: ${diagnostic(releaseError)}`);
+		}
+		throw error;
+	}
+	const releaseLeases = async () => {
+		try {
+			await memoryLease.release();
+		} finally {
+			await gatewayLease.release();
+		}
+	};
+	try {
+		await assertNoRestoreJournal(config.home);
 		const personaWorkspace = await resolvePersonaWorkspace(config.home);
+		const layout = homeLayout(config.home);
+		let executable = options.broker?.executable;
+		if (executable === undefined) {
+			const path = layout.gjcExecutable();
+			try {
+				executable = await realpath(path);
+			} catch (error) {
+				throw new Error(
+					`Pinned gjc executable cannot be resolved at ${path}: ${diagnostic(error)}`,
+					{ cause: error },
+				);
+			}
+		}
 		const pinnedVersion = readPinnedGjcVersion();
-		// Peek at recorded authority from existing database (before full initialization)
-		const recordedAgentDir = GatewayDatabase.peekRecordedAuthority(config.dbPath);
-		// Resolve agent directory with proper precedence: explicit -> config -> env -> recorded -> default
-		const resolvedAgentDir = resolveGatewayAgentDir({
-			explicit: options.broker?.agentDir,
-			configAgentDir: config.gjc?.agentDir,
-			env: process.env,
-			recordedAgentDir,
-			home: config.home,
-		});
-		// Create broker client with resolved agent directory
+		let sloRecorder: SloRecorder | undefined;
 		const broker = new GlobalGjcClient({
 			...options.broker,
+			executable,
 			cwd: personaWorkspace,
-			agentDir: resolvedAgentDir,
+			agentDir: config.gjc.agentDir,
 			pinnedVersion,
+			onUnavailable: (at) => {
+				sloRecorder?.note("broker_unavailable", at);
+				options.broker?.onUnavailable?.(at);
+			},
 		});
-		const database = await GatewayDatabase.open(config.dbPath, {
+		const database = await Store.open(config.dbPath, {
 			canonicalAgentDir: broker.agentDir,
+			backupsDir: layout.backupsDir,
 		});
+		const slo = new SloRecorder(database.core, { home: config.home });
+		sloRecorder = slo;
 		try {
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
-			// Authority already checked in GatewayDatabase.open(); this assertion confirms immutability.
-			database.assertBrokerAuthority(authority, { initializeEmpty: false });
+			// Authority already checked in Store.open(); this assertion confirms immutability.
+			database.bindings.assertAuthority(authority);
 			// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 			const client = broker;
 			await waitForBroker("preflight", () => client.preflight(), options.brokerWait);
@@ -189,7 +192,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			// Generic product default: memory maintenance crons exist on every fresh
 			// deployment (seeded once; operator removals are never resurrected).
 			seedDefaultMonitors(new MonitorRegistry(database), database);
-			const ledger = new DeliveryLedger(database);
+			const ledger = new DeliveryService(database);
 			const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
 			const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;
 			// The process start, not this line: preflight and database open take
@@ -216,12 +219,16 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			});
 			const close = async () => {
 				try {
-					database.close();
-					await releaseGatewayHome(config.home);
+					await slo.stop();
 				} finally {
-					await lease.release();
+					try {
+						database.close();
+					} finally {
+						await releaseLeases();
+					}
 				}
 			};
+
 			const server = options.stdio
 				? startStdioServer({
 						config,
@@ -229,6 +236,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						sessionPort,
 						persona,
 						broker,
+						slo,
 						startedAt,
 						onStop: close,
 						overrides: options.overrides,
@@ -241,12 +249,14 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						sessionPort,
 						persona,
 						broker,
+						slo,
 						startedAt,
 						onStop: close,
 						overrides: options.overrides,
 						interimSpeech: config.interimSpeech,
 						workspace: personaWorkspace,
 					});
+			if (!options.stdio) await slo.start();
 			console.info(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 			return { stop: (reason) => server.stop(reason), broker: supervisor };
 		} catch (error) {
@@ -256,19 +266,18 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 				console.error(`broker cleanup after failed boot failed: ${diagnostic(stopError)}`);
 			}
 			database.close();
-			await releaseGatewayHome(config.home);
 			throw error;
 		}
 	} catch (error) {
-		try {
-			if (claimed) await releaseGatewayHome(config.home);
-		} finally {
-			await lease.release();
-		}
+		await releaseLeases();
 		throw error;
 	}
 }
 
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+function logLeaseFailure(name: "gateway" | "memory", error: unknown): void {
+	if (error instanceof LeaseHeldError) console.error(error.message);
+	else console.error(`lease_failed name=${name} detail=${diagnostic(error)}`);
 }

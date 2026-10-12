@@ -3,14 +3,15 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "Gajaeway Gateway (requires gjc >= 0.17.5; handles 0.17.5+ mirrored lifecycle frames per #324)",
+	"description": "Gajaeway Gateway (requires the pinned gjc; attach-only clients need gjc >= 0.18.9)",
 	"bin": {
 		"gajaeway-gateway": "./src/main.ts"
 	},
 	"gjc": {
-		"version": "0.18.8"
+		"version": "0.18.9"
 	},
 	"dependencies": {
+		"@gajae-gateway/home": "workspace:*",
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
 		"@gajae-gateway/subsession": "workspace:*",

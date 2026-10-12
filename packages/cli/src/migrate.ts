@@ -11,6 +11,7 @@ import {
 	type SourceExtract,
 } from "./migrate/plan";
 import { expandHome, SourceTree } from "./migrate/source-fs";
+import { LeaseHeldError, acquireLease, type Lease } from "@gajae-gateway/home";
 
 export interface MigrateOptions {
 	source?: string;
@@ -23,9 +24,26 @@ export interface MigrateOptions {
  * reads its configuration, and writes the gajae-way-compatible output.
  */
 export async function migrate(options: MigrateOptions): Promise<void> {
-	const sourceRoot = expandHome(options.source ?? ".");
-	const targetHome = expandHome(options.target ?? `${process.env.HOME ?? "~"}/.gajaeway`);
+	const targetHome = expandHome(options.target ?? process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`);
+	if (options.dryRun) return migrateUnlocked(options, targetHome);
 
+	let lease: Lease;
+	try {
+		lease = await acquireLease(targetHome, "memory");
+	} catch (error) {
+		if (error instanceof LeaseHeldError)
+			throw new Error(`${error.message}; stop the gateway first before importing memory data`, { cause: error });
+		throw error;
+	}
+	try {
+		await migrateUnlocked(options, targetHome);
+	} finally {
+		await lease.release();
+	}
+}
+
+async function migrateUnlocked(options: MigrateOptions, targetHome: string): Promise<void> {
+	const sourceRoot = expandHome(options.source ?? ".");
 	// Detect source type
 	let sourceType: MigrationSource | undefined;
 	if (await detectHermes(sourceRoot)) {

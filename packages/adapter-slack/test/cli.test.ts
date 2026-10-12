@@ -16,7 +16,8 @@ test("Slack argv is resolved before connection work", () => {
 });
 
 for (const flag of ["--help", "--version", "--boot-now"]) {
-	test(`Slack ${flag} exits without writing a pidfile`, async () => {
+	test(`Slack ${flag} exits without writing a lease`, async () => {
+
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-slack-cli-"));
 		try {
 			const child = Bun.spawn(["bun", join(import.meta.dir, "../src/main.ts"), flag], {
@@ -29,7 +30,7 @@ for (const flag of ["--help", "--version", "--boot-now"]) {
 				new Response(child.stderr).text(),
 				child.exited,
 			]);
-			expect(await Bun.file(join(home, "adapter-slack.pid")).exists()).toBe(false);
+			expect(await Bun.file(join(home, "leases", "adapter-slack")).exists()).toBe(false);
 			expect(code).toBe(flag === "--boot-now" ? USAGE_EXIT_CODE : 0);
 			if (flag === "--help") expect(stdout.trim()).toBe(SLACK_USAGE);
 			else if (flag === "--version") expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);

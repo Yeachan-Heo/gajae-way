@@ -50,7 +50,7 @@ import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engage
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
-import { initializeMemory } from "../memory/doctrine";
+import { initializeMemory, memoryRoot } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
@@ -59,8 +59,8 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
+import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
-import { BrokerSpawnerGuard } from "../orchestrator/broker-spawner-guard";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
@@ -80,14 +80,10 @@ import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from 
 import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
-import {
-	type GatewayDatabase,
-	type InboundMessageRow,
-	type MonitorEventStage,
-	type TerminalUnlinkedReason,
-	terminalDeliveryIds,
-} from "../store/db";
-import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
+import type { Store } from "../store";
+import { type InboundMessageRow, type TerminalUnlinkedReason, terminalDeliveryIds } from "../store/groups/inbox";
+import type { MonitorEventStage } from "../store/groups/monitors";
+import type { ExpiredDeliveryRow } from "../store/groups/outbox";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import {
@@ -220,7 +216,7 @@ async function settleConnection(connection: Connection, timeoutMs: number): Prom
 
 export interface GatewayServerOptions {
 	readonly config: GatewayConfig;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	/** Production and tests both inject the sole broker-backed turn transport. */
 	readonly sessionPort: SessionPort;
 	/** Canonical persona workspace (symlinks resolved); defaults to `<home>/workspace`. */
@@ -228,6 +224,8 @@ export interface GatewayServerOptions {
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
+	/** Durable SLO recorder started only after the Unix socket is listening. */
+	readonly slo?: SloRecorder;
 	/** Only gateway-owned SDK commands and relays are closed after runtime work drains. */
 	readonly broker?: GlobalGjcClient;
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
@@ -545,8 +543,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
 	const connections = new Set<Connection>();
 	const inbound = new Map<string, InboundContext>();
-	const delivery = new DeliveryService(new DeliveryLedger(options.database));
-	const botAudienceTurns = new BotAudienceTurnGuard(options.database);
+	const delivery = new DeliveryService(options.database);
+	const botAudienceTurns = new BotAudienceTurnGuard(options.database.core);
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
 	let runtime!: Runtime;
@@ -612,7 +610,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			for (const messageId of messageIds) inbound.delete(messageId);
 		},
 		onReverseRequest: async ({ originKey, triggerAuthorId, tail, input }) => {
-			const origin = options.database.getOriginByKey(originKey);
+			const origin = options.database.bindings.getOriginByKey(originKey);
 			await permissionPanels.open({
 				origin: origin ? validateOriginRef(origin as unknown as OriginRef) : undefined,
 				triggerAuthorId,
@@ -620,10 +618,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				request: input,
 			});
 		},
+		onSloEvent: (code, at) => options.slo?.note(code, at),
 	});
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {
-			if (options.database.withTransaction(() => runtime.delivery.persistInTransaction(payload))) {
+			if (options.database.transaction((tx) => runtime.delivery.persistInTransaction(tx, payload))) {
 				if (payload.deliveryId) runtime.delivery.markInflight(payload.deliveryId);
 				broadcastDelivery(runtime, payload);
 			}
@@ -659,7 +658,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 		},
 	});
-	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors, options.database, {
+	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors, {
 		catchUp: { ...DEFAULT_CRON_CATCH_UP, ...options.config.monitorCatchUp },
 	});
 	const lanes = new LaneGovernor({
@@ -725,12 +724,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			console.error(`persona stall check failed: ${diagnostic(error)}`);
 		}
 	}, options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS);
-	options.database.contextMaintain();
+	options.database.transaction((tx) => options.database.inbox.contextMaintain(tx));
 	reportTerminalLinkAudit(options.database);
 	const contextMaintenanceTimer = setInterval(
 		() => {
 			try {
-				options.database.contextMaintain();
+				options.database.transaction((tx) => options.database.inbox.contextMaintain(tx));
 			} catch (error) {
 				console.error(`gateway context maintenance failed: ${diagnostic(error)}`);
 			}
@@ -747,13 +746,13 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		retentionRunning = true;
 		try {
 			for (let pass = 0; pass < 200 && !retentionStopped; pass++) {
-				const result = options.database.retentionSweep();
+				const result = options.database.sweep();
 				const total = Object.values(result.deleted).reduce((sum, n) => sum + n, 0);
 				if (total > 0) console.error(JSON.stringify({ retention: result.deleted }));
 				if (!result.more) break;
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
-			if (!retentionStopped) options.database.maintain();
+			if (!retentionStopped) options.database.core.maintain();
 		} catch (error) {
 			if (!retentionStopped) console.error(`gateway retention sweep failed: ${diagnostic(error)}`);
 		} finally {
@@ -770,10 +769,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
 		| undefined;
-	const spawnerGuard =
-		brokerWithGeneration?.agentDir && brokerWithGeneration.executable
-			? new BrokerSpawnerGuard({ agentDir: brokerWithGeneration.agentDir, executable: brokerWithGeneration.executable })
-			: undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
 			? brokerWithGeneration.onGeneration((generation) => {
@@ -785,15 +780,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 						.catch((error: unknown) =>
 							console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
 						);
-					// A new broker is the first observable sign of a gjc upgrade: re-check
-					// the runtime version and whether a pre-upgrade process is killing brokers.
+					// A new broker is the first observable sign of a gjc upgrade; re-check its version.
 					if (typeof brokerWithGeneration.refreshVersion === "function")
 						void brokerWithGeneration
 							.refreshVersion()
 							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
-					void spawnerGuard
-						?.observe()
-						.catch((error: unknown) => console.error(`broker spawner guard failed: ${diagnostic(error)}`));
 				})
 			: undefined;
 	runtime = {
@@ -818,7 +809,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		botAudienceTurns,
 		cycle: new RuntimeCycleProjector(options.database, memory, {
 			maxLanes: lanes.maxLanes,
-			agentDir: options.broker?.agentDir,
+			agentDir: options.config.gjc.agentDir,
+			home: options.config.home,
+			memoryRoot: memoryRoot(options.config.home),
 			gjcVersion: () => options.broker?.gjcVersion,
 			brokerRespawnChurn: () =>
 				typeof options.broker?.respawnChurn === "function" ? options.broker.respawnChurn() : false,
@@ -843,14 +836,51 @@ function createRuntime(options: GatewayServerOptions): Runtime {
  * delivery.fail the events stay `authored` (distinguishable, operator-visible)
  * while the ledger row itself records failed/ambiguous.
  */
-function settleMonitorBatch(database: GatewayDatabase, deliveryId: string, stage: MonitorEventStage): void {
-	const delivery = database.deliveryGet(deliveryId);
+function settleMonitorBatch(database: Store, deliveryId: string, stage: MonitorEventStage): void {
+	const delivery = database.outbox.get(deliveryId);
 	if (!delivery) return;
-	const batchId = delivery.turn_id;
-	const events = database.monitorEventsByBatch(batchId);
+	const batchId = delivery.turnId;
+	const events = database.monitors.eventsByBatch(batchId);
 	if (!events.length) return;
-	database.withTransaction(() => {
-		for (const event of events) database.monitorEventSettle(event.event_id, stage as "delivered" | "authored");
+	database.transaction((tx) => {
+		for (const event of events) database.monitors.eventSettle(tx, event.event_id, stage as "delivered" | "authored");
+	});
+}
+
+function recentConversation(
+	store: Store,
+	originKey: string,
+	conversationId: string,
+	limit: number,
+	sinceIso: string,
+): Array<{ id?: string; at: string; author: string; body: string }> {
+	const inbound = store.inbox.recentInbound(originKey, limit, sinceIso);
+	const floorAt = [store.inbox.contextFloorAt(originKey) ?? "", sinceIso].sort().at(-1) ?? sinceIso;
+	const replies = store.outbox
+		.confirmedConversation(conversationId, floorAt, limit)
+		.map((row) => {
+			const text = (JSON.parse(row.payload_json) as { text?: unknown }).text;
+			return { at: row.created_at, author: "you", body: typeof text === "string" ? text : "" };
+		})
+		.filter((row) => row.body.length > 0);
+	return [...inbound, ...replies].sort((a, b) => a.at.localeCompare(b.at)).slice(-limit);
+}
+
+function confirmAndSettleMonitorDelivery(
+	store: Store,
+	deliveryId: string,
+	stage: "delivered" | "authored",
+): "unknown" | "transitioned" | "already_terminal" {
+	return store.transaction((tx) => {
+		const delivery = store.outbox.get(deliveryId);
+		if (!delivery) return "unknown";
+		if (delivery.state === "confirmed" || delivery.state === "expired") {
+			if (delivery.state === "confirmed") store.monitors.settleForTurn(tx, delivery.turnId, stage);
+			return "already_terminal";
+		}
+		store.outbox.confirm(tx, deliveryId);
+		store.monitors.settleForTurn(tx, delivery.turnId, stage);
+		return "transitioned";
 	});
 }
 
@@ -956,9 +986,9 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
-					sessions: { active: options.database.activeSessionCount },
+					sessions: { active: options.database.bindings.activeSessionCount },
 					delivery: runtime.delivery.status(),
-					contextDiff: options.database.contextDiagnostics(),
+					contextDiff: options.database.inbox.contextDiagnostics(),
 					engagement: {
 						botAudienceDeclines: runtime.botAudienceTurns.botAudienceDeclines(),
 						botAudienceRateLimited: runtime.botAudienceTurns.botAudienceRateLimited(),
@@ -988,18 +1018,18 @@ async function handleRequest(
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
-			const delivery = options.database.deliveryGet(id);
+			const delivery = options.database.outbox.get(id);
 			const authoredEvents = delivery
-				? options.database
-						.monitorEventsByBatch(delivery.turn_id)
+				? options.database.monitors
+						.eventsByBatch(delivery.turnId)
 						.filter((row) => row.stage === "authored")
 						.map((row) => row.event_id)
 				: [];
-			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
+			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
 				const authoredEventIds = new Set(authoredEvents);
-				for (const row of options.database.monitorEventsByIds(authoredEvents)) {
+				for (const row of options.database.monitors.eventsByIds(authoredEvents)) {
 					if (authoredEventIds.has(row.event_id) && row.stage === "delivered") {
 						broadcastMonitorEvent(runtime, {
 							eventId: row.event_id,
@@ -1053,7 +1083,7 @@ async function handleRequest(
 		case "ops.backup": {
 			try {
 				const result = await backupDatabase(
-					options.database,
+					options.database.core,
 					options.config.dbPath,
 					(request.params as { path?: unknown } | undefined)?.path,
 				);
@@ -1108,9 +1138,11 @@ async function handleRequest(
 			// corrupt row is flagged as corrupt for the operator, never shown as
 			// healthy and never silently dropped.
 			const laneByKey = new Map(
-				options.database.workLaneRows().map((lane) => [`work-${lane.origin_key.slice("work/task/".length)}`, lane]),
+				options.database.bindings
+					.workLaneRows()
+					.map((lane) => [`work-${lane.origin_key.slice("work/task/".length)}`, lane]),
 			);
-			const jobRows = options.database.laneJobRows(true);
+			const jobRows = options.database.work.laneJobRows(true);
 			const commits = await laneLastCommits(jobRows.map((row) => row.worktree_path));
 			const jobs = jobRows.map((row) => {
 				const lane = laneByKey.get(row.lane_key);
@@ -1122,14 +1154,14 @@ async function handleRequest(
 					// moved is progressing; it is read from the worktree, not the record.
 					last_commit: commits.get(row.worktree_path) ?? null,
 					reports: row.lane_key.startsWith("work-")
-						? options.database.laneReportCounts(row.lane_key.slice("work-".length))
+						? options.database.work.laneReportCounts(row.lane_key.slice("work-".length))
 						: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },
-					...(options.database.isBrokerQuarantined("work", row.job_id)
+					...(options.database.bindings.isQuarantined("work", row.job_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				};
 				try {
-					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
+					const record = parseLaneJobRecord(options.database.work.laneJobJson(row.job_id) ?? "");
 					const attempt = record.attempts.at(-1);
 					return {
 						...bound,
@@ -1207,6 +1239,54 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
 			return;
 		}
+		case "ops.deliveries": {
+			const value = request.params ?? {};
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new ProtocolError("invalid_params", "ops.deliveries parameters must be an object");
+			const params = value as { since?: unknown; state?: unknown; limit?: unknown };
+			const since = parseReceivedAt(params.since);
+			if (params.state !== undefined && typeof params.state !== "string")
+				throw new ProtocolError("invalid_params", "state must be a string");
+			const limit = params.limit === undefined ? 50 : params.limit;
+			if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 500)
+				throw new ProtocolError("invalid_params", "limit must be an integer from 1 to 500");
+			const state = params.state as string | undefined;
+
+			const rows = runtime.delivery
+				.list({
+					...(since === undefined ? {} : { since }),
+					...(state === undefined ? {} : { state }),
+					limit,
+				})
+				.map((row) => {
+					const projection = deliveryProjection(row.payloadJson);
+					return {
+						deliveryId: row.deliveryId,
+						turnId: row.turnId,
+						originKey: row.originKey,
+						conversationId: projection.conversationId,
+						state: row.state,
+						createdAt: row.createdAt,
+						textPrefix: projection.text.slice(0, 80),
+					};
+				});
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { rows } });
+			return;
+		}
+		case "ops.slo": {
+			const value = request.params ?? {};
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new ProtocolError("invalid_params", "ops.slo parameters must be an object");
+			const days = (value as { days?: unknown }).days ?? DEFAULT_SLO_DAYS;
+			if (typeof days !== "number" || !Number.isSafeInteger(days) || days < 1 || days > 3_650)
+				throw new ProtocolError("invalid_params", "days must be an integer from 1 to 3650");
+			const now = new Date();
+			const result = options.slo
+				? await options.slo.evaluate(days, now)
+				: evaluateSlo(options.database.core, days, now);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "ops.cycle":
 			connection.write({
 				v: PROFILE_VERSION,
@@ -1220,11 +1300,11 @@ async function handleRequest(
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: integrityDatabase(options.database),
+				result: integrityDatabase(options.database.core),
 			});
 			return;
 		case "session.list": {
-			const sessions = options.database.sessionRows().map((row) => ({
+			const sessions = options.database.bindings.sessionRows().map((row) => ({
 				origin: row.origin_ref_json ? JSON.parse(row.origin_ref_json) : LOOPBACK_ORIGIN,
 				createdAt: row.created_at,
 				lastActivityAt: row.last_activity_at,
@@ -1246,7 +1326,7 @@ async function handleRequest(
 				: undefined;
 			const query = typeof params.query === "string" ? params.query.toLowerCase().split(/\s+/).filter(Boolean) : [];
 			const limit = Math.min(10, Math.max(0, typeof params.limit === "number" ? Math.floor(params.limit) : 10));
-			const rows = options.database
+			const rows = options.database.inbox
 				.recallRows()
 				.filter((r) => r.origin_key !== requesting)
 				.map((r) => ({ ...r, score: query.length ? query.filter((t) => r.text.toLowerCase().includes(t)).length : 0 }));
@@ -1340,8 +1420,8 @@ async function handleRequest(
 			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
 			const monitor = runtime.registry.get(monitorId);
 			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
-			const recentEvents = options.database.monitorEventRows(monitorId, "newest", true, 100).map((row) => {
-				const recovery = options.database.monitorEventRecovery(row.event_id);
+			const recentEvents = options.database.monitors.eventRows(monitorId, "newest", true, 100).map((row) => {
+				const recovery = options.database.monitors.eventRecovery(row.event_id);
 				return {
 					eventId: row.event_id,
 					monitorId: row.monitor_id,
@@ -1351,12 +1431,12 @@ async function handleRequest(
 					...(recovery ? { recovery } : {}),
 					...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
 					...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
-					...(options.database.isBrokerQuarantined("monitor", row.event_id)
+					...(options.database.bindings.isQuarantined("monitor", row.event_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				};
 			});
-			const catchUp = options.database.monitorCronState(monitorId);
+			const catchUp = runtime.registry.cronState(monitorId);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1500,16 +1580,18 @@ async function handleRequest(
 			// in the same millisecond (a reaction storm, or an add/remove/add burst) would
 			// otherwise collide on the primary key and the later ones would be dropped by
 			// the ON CONFLICT DO NOTHING insert, silently losing reaction history.
-			options.database.contextRecord({
-				messageId: `reaction/${params.action}/${targetMessageId}/${authorId}/${emoji}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
-				originKey: originKey(origin),
-				authorId,
-				...(actor ? { authorName: actor } : {}),
-				body:
-					params.action === "add"
-						? `[reaction] reacted ${emoji} to message ${targetMessageId}`
-						: `[reaction] removed their ${emoji} reaction from message ${targetMessageId}`,
-			});
+			options.database.transaction((tx) =>
+				options.database.inbox.contextRecord(tx, {
+					messageId: `reaction/${params.action}/${targetMessageId}/${authorId}/${emoji}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
+					originKey: originKey(origin),
+					authorId,
+					...(actor ? { authorName: actor } : {}),
+					body:
+						params.action === "add"
+							? `[reaction] reacted ${emoji} to message ${targetMessageId}`
+							: `[reaction] removed their ${emoji} reaction from message ${targetMessageId}`,
+				}),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1589,13 +1671,15 @@ async function handleRequest(
 					? `[panel] answered question ${panelId} with option ${selectedOptionId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`
 					: `[panel] ${responseKind} panel ${panelId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`;
 
-			options.database.contextRecord({
-				messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
-				originKey: originKey(origin),
-				authorId,
-				...(actor ? { authorName: actor } : {}),
-				body: responseBody,
-			});
+			options.database.transaction((tx) =>
+				options.database.inbox.contextRecord(tx, {
+					messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
+					originKey: originKey(origin),
+					authorId,
+					...(actor ? { authorName: actor } : {}),
+					body: responseBody,
+				}),
+			);
 
 			// Report result to adapter
 			if (coordinatorError) {
@@ -1648,7 +1732,7 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
-	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
 	// `/model` is a privileged control path. Apply the same direct-message and
 	// group authorisation policy as ordinary engagement before inspecting or
 	// mutating the durable override.
@@ -1837,14 +1921,16 @@ async function sendChat(
 	if (nonLoopback && inboundMessageId) {
 		const engagement = params.engagement as { authorId?: string; authorName?: unknown } | undefined;
 		ingestOrReportDrop(key, inboundMessageId, engagementDecision.engaged, () =>
-			options.database.contextRecord({
-				messageId: inboundMessageId,
-				originKey: key,
-				authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
-				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
-				body: userText,
-				...(receivedAt ? { receivedAt } : {}),
-			}),
+			options.database.transaction((tx) =>
+				options.database.inbox.contextRecord(tx, {
+					messageId: inboundMessageId,
+					originKey: key,
+					authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
+					authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+					body: userText,
+					...(receivedAt ? { receivedAt } : {}),
+				}),
+			),
 		);
 	}
 	if (!engaged) {
@@ -1888,7 +1974,7 @@ async function sendChat(
 		// its own replies are walls of text and including them cost 5 of 14 real
 		// owner messages a false skip (#243).
 		const earlier = nonLoopback
-			? options.database
+			? options.database.inbox
 					.recentInbound(
 						key,
 						KEV_SHADOW_CONTEXT_TURNS,
@@ -1927,17 +2013,19 @@ async function sendChat(
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
 	// per-origin actor receives the notification only after this transaction wins.
 	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.inboundEnqueue({
-			messageId,
-			originKey: key,
-			originRefJson: JSON.stringify(origin),
-			body: userText,
-			// The delivery-side gate needs the same bypass decision after a restart,
-			// so it travels with the durable row.
-			engagementJson: params.engagement
-				? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
-				: undefined,
-		}),
+		options.database.transaction((tx) =>
+			options.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: key,
+				originRefJson: JSON.stringify(origin),
+				body: userText,
+				// The delivery-side gate needs the same bypass decision after a restart,
+				// so it travels with the durable row.
+				engagementJson: params.engagement
+					? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
+					: undefined,
+			}),
+		),
 	);
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
@@ -2029,15 +2117,17 @@ async function editChat(
 			id: request.id,
 			result: { turnId: null, engaged: false },
 		});
-	if (!options.database.inboundKnownMessage(key, params.messageId)) {
+	if (!options.database.inbox.knownMessage(key, params.messageId)) {
 		// Never ingested: nothing to point at. Not context either - a message the
 		// gateway never saw must not appear by way of its edit.
 		declined();
 		return;
 	}
 	// The recorded body now says what the message says now.
-	options.database.contextUpdateBody(key, params.messageId, params.text);
-	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
+	options.database.transaction((tx) =>
+		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
+	);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
 	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
@@ -2062,14 +2152,16 @@ async function editChat(
 	const turnId = crypto.randomUUID();
 	const { messageId: editedId, text: edit } = params;
 	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.inboundEnqueue({
-			messageId,
-			originKey: key,
-			originRefJson: JSON.stringify(origin),
-			body: renderMessageEdit(editedId, edit),
-			engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
-			...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
-		}),
+		options.database.transaction((tx) =>
+			options.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: key,
+				originRefJson: JSON.stringify(origin),
+				body: renderMessageEdit(editedId, edit),
+				engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+				...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
+			}),
+		),
 	);
 	if (!accepted) {
 		// The same edit event delivered twice: acknowledged once, dispatched once.
@@ -2126,7 +2218,7 @@ async function createInboundTurnLifecycle(
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
-	const bootstrapState = options.database.getSessionBootstrap(key);
+	const bootstrapState = options.database.bindings.getSessionBootstrap(key);
 	const bootstrapPending = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
 	const agentsMdSnapshot = await readWorkspaceAgentsMd(runtime.config.home);
 	const hasAgentsMdBaseline = bootstrapState?.agentsMdEpoch === input.epoch;
@@ -2135,13 +2227,17 @@ async function createInboundTurnLifecycle(
 		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
 		: legacyBootstrappedSession;
 	if (!hasAgentsMdBaseline || agentsMdChanged)
-		options.database.recordSessionAgentsBaseline(key, input.epoch, agentsMdSnapshot.digest);
+		options.database.transaction((tx) =>
+			options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest),
+		);
 	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
 	if (nonLoopback) {
-		const prepared = options.database.contextWindow(key, row.message_id);
+		const prepared = options.database.transaction((tx) =>
+			options.database.inbox.contextWindow(tx, key, row.message_id),
+		);
 		// A pointer-update turn reads its ORIGINAL message's row (the edited body
 		// lives there); commit that id, not the synthetic edit row.
 		contextMessageIds = laneReport
@@ -2166,7 +2262,8 @@ async function createInboundTurnLifecycle(
 		// conversation had just started.
 		const isFreshSession = bootstrapPending;
 		const recent = isFreshSession
-			? options.database.recentConversation(
+			? recentConversation(
+					options.database,
 					key,
 					origin.conversationId,
 					RECENT_HISTORY_MAX,
@@ -2207,7 +2304,7 @@ async function createInboundTurnLifecycle(
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 	].join("\n\n");
-	const modelOverride = options.database.conversationModelGet(key)?.selection;
+	const modelOverride = options.database.bindings.modelGet(key)?.selection;
 	const effectiveModel = modelOverride ?? runtime.config.model;
 
 	const deliveredParts: string[] = [];
@@ -2221,11 +2318,12 @@ async function createInboundTurnLifecycle(
 	 */
 	const closeTerminalLink = (reason: TerminalUnlinkedReason) => {
 		const last = deliveredIds.at(-1);
-		if (last === undefined) options.database.inboundTurnMarkUnlinked(input.turn.opRef, reason);
+		if (last === undefined)
+			options.database.transaction((tx) => options.database.inbox.markUnlinked(tx, input.turn.opRef, reason));
 		else if (
-			terminalDeliveryIds(options.database.inboundTurnRow(input.turn.opRef)?.terminal_delivery_id ?? null).length === 0
+			terminalDeliveryIds(options.database.inbox.turnRow(input.turn.opRef)?.terminal_delivery_id ?? null).length === 0
 		)
-			options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, last);
+			options.database.transaction((tx) => options.database.inbox.claimTerminal(tx, input.turn.opRef, 0, last));
 	};
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
@@ -2259,7 +2357,12 @@ async function createInboundTurnLifecycle(
 	 */
 	const deliverTerminalLine = (text: string) => {
 		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
-		if (options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, deliveryId) !== deliveryId) return;
+		if (
+			options.database.transaction((tx) =>
+				options.database.inbox.claimTerminal(tx, input.turn.opRef, 0, deliveryId),
+			) !== deliveryId
+		)
+			return;
 		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
 		if (!payload) return;
 		deliveredParts.push(text);
@@ -2299,7 +2402,8 @@ async function createInboundTurnLifecycle(
 			at: row.received_at,
 		};
 		const digest = buildHandoffDigest(
-			options.database.recentConversation(
+			recentConversation(
+				options.database,
 				key,
 				origin.conversationId,
 				RECENT_HISTORY_MAX,
@@ -2308,13 +2412,15 @@ async function createInboundTurnLifecycle(
 		);
 		// No author identity on the relayed row: nobody in the target conversation
 		// sent it, so it must not read (or authorise) as the requester speaking there.
-		const accepted = options.database.inboundEnqueue({
-			messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
-			originKey: resolved.originKey,
-			originRefJson: JSON.stringify(resolved.origin),
-			body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
-			engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
-		});
+		const accepted = options.database.transaction((tx) =>
+			options.database.inbox.enqueue(tx, {
+				messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
+				originKey: resolved.originKey,
+				originRefJson: JSON.stringify(resolved.origin),
+				body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
+				engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
+			}),
+		);
 		if (accepted) {
 			console.error(`gateway handoff enqueued origin=${key} target=${resolved.originKey} chain=${hop.chain.length}`);
 			// Not awaited: the target actor runs its own turn under its own serialization.
@@ -2447,10 +2553,8 @@ async function createInboundTurnLifecycle(
 				// slot; the durable claim makes that survive a gateway restart.
 				const interimId = deterministicInterimDeliveryId(key, input.turn.triggerMessageId, step.body, index);
 				const priorRow = runtime.delivery.get(interimId);
-				const owner = options.database.inboundTurnClaimTerminal(
-					input.turn.opRef,
-					index,
-					priorRow ? interimId : deliveryId,
+				const owner = options.database.transaction((tx) =>
+					options.database.inbox.claimTerminal(tx, input.turn.opRef, index, priorRow ? interimId : deliveryId),
 				);
 				if (owner !== deliveryId) continue;
 			}
@@ -2615,18 +2719,20 @@ async function createInboundTurnLifecycle(
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
 		let threw = false;
 		try {
-			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
-			if (bootstrap)
-				options.database.markSessionBootstrapped(key, input.epoch, {
-					includedSections: bootstrap.includedSections,
-					byteCount: bootstrap.byteCount,
-					truncated: bootstrap.truncated,
-					diagnostics: bootstrap.diagnostics,
-				});
 			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
-			options.database.withTransaction(() => {
-				options.database.updateActivity(key, JSON.stringify(origin));
-				options.database.addRecall(
+			options.database.transaction((tx) => {
+				if (nonLoopback)
+					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision);
+				if (bootstrap)
+					options.database.bindings.markSessionBootstrapped(tx, key, input.epoch, {
+						includedSections: bootstrap.includedSections,
+						byteCount: bootstrap.byteCount,
+						truncated: bootstrap.truncated,
+						diagnostics: bootstrap.diagnostics,
+					});
+				options.database.bindings.touch(tx, key, JSON.stringify(origin));
+				options.database.inbox.addRecall(
+					tx,
 					key,
 					JSON.stringify(origin),
 					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
@@ -2693,14 +2799,16 @@ async function createInboundTurnLifecycle(
 			console.error(failureNotice);
 			// Nothing answered this turn: a later `/new` must carry its messages (#409).
 			if (nonLoopback && !recoveredText && !assistantDeliveryStarted)
-				options.database.markTurnFailed(key, input.turn.opRef);
+				options.database.core.metaSet(`turn-failed:${key}:${input.turn.opRef}`, new Date().toISOString());
 			// The turn wrote its answer before it failed (#210): deliver it through
 			// the ordinary terminal slot. It then counts as a visible reply, and the
 			// failure stays in the operator log instead of replacing the answer.
 			if (nonLoopback && recoveredText && !assistantDeliveryStarted)
 				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
-				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
+				options.database.transaction((tx) =>
+					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision),
+				);
 			if (nonLoopback && !assistantDeliveryStarted) {
 				// Recovery can observe the same failed terminal after the notice was
 				// persisted but before the trigger was settled. Reuse the trigger's
@@ -2773,9 +2881,9 @@ async function createInboundTurnLifecycle(
  * the reason none did. Reports the last 24 h at startup and hourly, so a
  * dispatch path that drops the link is visible without a manual ledger audit.
  */
-function reportTerminalLinkAudit(database: GatewayDatabase): void {
+function reportTerminalLinkAudit(database: Store): void {
 	try {
-		const { done, unlinked } = database.inboundTerminalLinkAudit(
+		const { done, unlinked } = database.inbox.terminalLinkAudit(
 			new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
 		);
 		if (unlinked > 0)
@@ -2790,6 +2898,26 @@ function reportTerminalLinkAudit(database: GatewayDatabase): void {
 function laneReportTriggerText(body: string): string {
 	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
 }
+function deliveryProjection(payloadJson: string): { readonly conversationId: string; readonly text: string } {
+	try {
+		const payload: unknown = JSON.parse(payloadJson);
+		if (typeof payload !== "object" || payload === null || Array.isArray(payload))
+			return { conversationId: "", text: "" };
+		const value = payload as { origin?: unknown; text?: unknown };
+		const origin = value.origin;
+		const conversationId =
+			typeof origin === "object" && origin !== null
+				? (origin as { conversationId?: unknown }).conversationId
+				: undefined;
+		return {
+			conversationId: typeof conversationId === "string" ? conversationId : "",
+			text: typeof value.text === "string" ? value.text : "",
+		};
+	} catch {
+		return { conversationId: "", text: "" };
+	}
+}
+
 function parseReceivedAt(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || !value)
@@ -2942,7 +3070,7 @@ function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): v
 
 function reportDeliveryExpired(
 	runtime: Runtime,
-	database: GatewayDatabase,
+	database: Store,
 	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
 	reason: string,
 ): void {
@@ -2955,9 +3083,17 @@ function reportDeliveryExpired(
 	// A monitor batch riding on this delivery can never be confirmed now: fail its
 	// events terminally with the delivery evidence instead of leaving them
 	// `authored` forever (#94).
-	database.withTransaction(() =>
-		database.monitorEventsFailExpiredDelivery(expired.deliveryId, safeDiagnosticField(reason)),
-	);
+	database.transaction((tx) => {
+		const current = database.outbox.get(expired.deliveryId);
+		if (current?.state !== "expired") return;
+		database.monitors.eventsFailExpiredDelivery(
+			tx,
+			current.turnId,
+			current.deliveryId,
+			current.attempts,
+			safeDiagnosticField(reason),
+		);
+	});
 	if (expired.deliveryId.startsWith("gw-x-")) return;
 	const ownerTarget = runtime.config.ownerTarget?.origin;
 	if (!ownerTarget) return;

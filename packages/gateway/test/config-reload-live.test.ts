@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, UNCONSUMED_FIELDS } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { sessionPortFromResponder } from "./session-port.fake";
 
 /**
@@ -86,7 +86,7 @@ async function daemon(initial: Record<string, unknown>): Promise<{ client: Clien
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
 	await writeConfig(directory, { schemaVersion: 1, ...initial });
 	const config = await loadConfig({ home: directory });
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

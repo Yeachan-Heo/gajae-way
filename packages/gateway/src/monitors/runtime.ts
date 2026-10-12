@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import type { GatewayConfig } from "../config";
-import type { GatewayDatabase } from "../store/db";
 import type { MonitorPropagator } from "./propagate";
 import type { MonitorRegistry } from "./registry";
 import { type CronCatchUpPolicy, startCron } from "./triggers/cron";
@@ -18,7 +17,6 @@ export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
 	readonly #propagator: MonitorPropagator;
-	readonly #database: GatewayDatabase;
 	#stops: Stop[] = [];
 	readonly #clock?: () => Date;
 	readonly #catchUp?: CronCatchUpPolicy;
@@ -26,13 +24,11 @@ export class MonitorRuntime {
 		config: GatewayConfig,
 		registry: MonitorRegistry,
 		propagator: MonitorPropagator,
-		database: GatewayDatabase,
 		options: { now?: () => Date; catchUp?: CronCatchUpPolicy } = {},
 	) {
 		this.#config = config;
 		this.#registry = registry;
 		this.#propagator = propagator;
-		this.#database = database;
 		this.#clock = options.now;
 		this.#catchUp = options.catchUp;
 	}
@@ -53,7 +49,7 @@ export class MonitorRuntime {
 							// an old slot-ledger row somehow does.
 							cursor: () => {
 								const created = Date.parse(monitor.createdAt);
-								const stored = this.#database.monitorCronCursor(monitor.monitorId);
+								const stored = this.#registry.cronCursor(monitor.monitorId);
 								return new Date(stored === undefined ? created : Math.max(created, Date.parse(stored)));
 							},
 							// submitSlot returns an id for both admitted and overlap-skipped
@@ -64,7 +60,7 @@ export class MonitorRuntime {
 							skipped: (skip) => {
 								const oldest = skip.oldest.toISOString();
 								const newest = skip.newest.toISOString();
-								this.#database.monitorCronRecordSkip(
+								this.#registry.recordCronSkip(
 									monitor.monitorId,
 									{ count: skip.count, oldest, newest },
 									(this.#clock?.() ?? new Date()).toISOString(),

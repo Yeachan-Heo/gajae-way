@@ -8,7 +8,7 @@ import { slackMessageId, slackMessageOrigin } from "../../adapter-slack/src/orig
 import { liveGateway, stopLiveGatewaysAfterEach } from "../../adapter-slack/test/live-gateways";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 stopLiveGatewaysAfterEach();
@@ -63,13 +63,14 @@ async function gateway(
 	engagement: "open" | "mention-open" = "open",
 ): Promise<{
 	readonly config: GatewayConfig;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly turns: string[];
 }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-slack-e2e-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -77,7 +78,7 @@ async function gateway(
 		channels: { "slack:C1": { engagement } },
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
@@ -113,7 +114,7 @@ test("a Slack channel message becomes a turn and its reply is posted as mrkdwn a
 	expect(slack.posts).toEqual([
 		{ channel: "C1", text: "*done* — see <https://x.test/d|the doc> &amp; more", threadTs: "1726543210.000100" },
 	]);
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(1);
 	expect(rows[0]?.origin_key).toBe("slack/channel/C1");
 	expect(rows[0]?.state).toBe("confirmed");
@@ -132,7 +133,7 @@ test("a [REACT:👍] reply reacts by Slack emoji name and settles the same ledge
 	await settle();
 	expect(slack.posts).toEqual([]);
 	expect(slack.reactions).toEqual([{ channel: "C1", ts: "1726543210.000200", name: "+1" }]);
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(1);
 	expect(rows[0]?.state).toBe("confirmed");
 	expect(JSON.parse(rows[0]?.payload_json ?? "{}").reaction.emojiName).toBe("thumbsup");
@@ -168,7 +169,7 @@ test("a human's thread reply is its own session and the answer stays in that thr
 	await settle();
 	expect(turns).toHaveLength(2);
 	// Two origins, two sessions: the thread does not share the channel's head.
-	const sessions = database.sessionRows().map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId);
+	const sessions = database.bindings.sessionRows().map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId);
 	expect(sessions.sort()).toEqual(["C1", "C1:1726543210.000300"]);
 	// Different origins run concurrently, so the two replies may land in either
 	// order. Both live in thread 000300: the channel turn opens it under the
@@ -177,7 +178,7 @@ test("a human's thread reply is its own session and the answer stays in that thr
 		{ channel: "C1", text: "in thread", threadTs: "1726543210.000300" },
 		{ channel: "C1", text: "root answer", threadTs: "1726543210.000300" },
 	]);
-	expect(database.deliveryRows().map((row) => row.state)).toEqual(["confirmed", "confirmed"]);
+	expect(database.outbox.rows().map((row) => row.state)).toEqual(["confirmed", "confirmed"]);
 });
 
 test("a delivery the adapter cannot settle is a failed ledger row, not a silent drop", async () => {
@@ -199,7 +200,7 @@ test("a delivery the adapter cannot settle is a failed ledger row, not a silent 
 		authorId: "U1",
 	});
 	await settle();
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(1);
 	// A transport error is ambiguous: the row is retained for redelivery, never confirmed.
 	expect(rows[0]?.state).not.toBe("confirmed");
@@ -253,7 +254,7 @@ test("a delivery pending in the ledger before the adapter connects is replayed a
 		authorId: "U1",
 	});
 	await settle();
-	expect(database.deliveryRows().map((row) => row.state)).not.toEqual(["confirmed"]);
+	expect(database.outbox.rows().map((row) => row.state)).not.toEqual(["confirmed"]);
 	// A fresh adapter connects; the replay arrives with negotiation.
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
@@ -262,7 +263,7 @@ test("a delivery pending in the ledger before the adapter connects is replayed a
 	expect(slack.posts).toEqual([
 		{ channel: "C1", text: "[recovered - may be a duplicate] answer", threadTs: "1726543210.000600" },
 	]);
-	expect(database.deliveryRows().map((row) => row.state)).toEqual(["confirmed"]);
+	expect(database.outbox.rows().map((row) => row.state)).toEqual(["confirmed"]);
 });
 
 test("a plain answer to a threaded DM stays in that DM thread without a [REPLY] token", async () => {
@@ -282,7 +283,7 @@ test("a plain answer to a threaded DM stays in that DM thread without a [REPLY] 
 	});
 	await settle();
 	expect(slack.posts).toEqual([{ channel: "D1", text: "in your thread", threadTs: "1726543200.000001" }]);
-	expect(database.deliveryRows().map((row) => row.state)).toEqual(["confirmed"]);
+	expect(database.outbox.rows().map((row) => row.state)).toEqual(["confirmed"]);
 });
 
 test("an edited channel message is answered in the ORIGINAL message's thread, never at a synthetic edit id", async () => {
@@ -307,7 +308,7 @@ test("an edited channel message is answered in the ORIGINAL message's thread, ne
 	});
 	await settle();
 	expect(slack.posts).toEqual([{ channel: "C1", text: "answer to the edit", threadTs: "1726543210.000800" }]);
-	expect(database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+	expect(database.outbox.rows().every((row) => row.state === "confirmed")).toBe(true);
 });
 
 test("a mention steered into a busy turn still opens its thread for unmentioned follow-ups", async () => {

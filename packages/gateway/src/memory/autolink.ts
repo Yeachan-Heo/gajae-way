@@ -260,8 +260,9 @@ export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue)
 		return { filesChanged, linksAdded, aliases: index.length };
 	}
 
-	// With closure: write + stage + commit inside lock (#341 fix)
-	await closure.coordinateCommit(root, async () => {
+	// With closure, run the full write, map regeneration, stage and commit transaction
+	// through the same FIFO as intents.
+	await closure.enqueueWork(async () => {
 		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
 		await regenerateMap(root, registry);
 		const writer = closure.getWriter(root);
