@@ -145,6 +145,7 @@ interface WorkInput {
 	text: string;
 	cwd: string;
 	resume: boolean;
+	repo?: string;
 	model?: GjcModelSelection;
 	callerSessionId?: string;
 }
@@ -572,7 +573,7 @@ export class WorkLaneManager {
 				return await this.#port.bind({
 					originKey: sessionKey,
 					epoch: this.#db.getSessionRecord(sessionKey)?.epoch ?? 0,
-					repo: input.cwd,
+					repo: input.repo ?? input.cwd,
 					codingRegister: true,
 					...(input.model ? { model: input.model } : {}),
 				});
@@ -1805,7 +1806,7 @@ function laneWakeOpRef(parentName: string, reportId: string, claimSeq: number): 
 	return `gw-work-${slug}-lr-${laneReportClaimHash(reportId, claimSeq).slice(0, 24)}`;
 }
 function parseInput(params: unknown): WorkInput {
-	const inputFields = ["name", "text", "cwd", "resume", "model", "callerSessionId"];
+	const inputFields = ["name", "text", "cwd", "resume", "repo", "model", "callerSessionId"];
 	const input = params as Record<string, unknown>;
 	if (input && typeof input === "object" && !Array.isArray(input))
 		for (const field of Object.keys(input)) if (!inputFields.includes(field)) invalid(field);
@@ -1838,12 +1839,18 @@ function parseInput(params: unknown): WorkInput {
 			invalid("callerSessionId");
 		callerSessionId = input.callerSessionId;
 	}
+	let repo: string | undefined;
+	if (input.repo !== undefined) {
+		if (typeof input.repo !== "string" || !input.repo) invalid("repo");
+		repo = input.repo;
+	}
 	return {
 		name,
 		text: input.text,
 		cwd: (input.cwd as string) ?? process.cwd(),
 		resume: input.resume === true,
 		model,
+		repo,
 		...(callerSessionId === undefined ? {} : { callerSessionId }),
 	};
 }
