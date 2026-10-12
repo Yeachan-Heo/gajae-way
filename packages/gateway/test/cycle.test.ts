@@ -46,6 +46,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
 		latestCutoverAt: null,
+		addressedSinceCutover: new Set(),
 		agentDisk: null,
 		gjcVersion: undefined,
 		monitorTerminalStreak: 0,
@@ -340,7 +341,19 @@ describe("runtime cycle projection", () => {
 		expect(history.phase).toBe("idle");
 		expect(history.sessions.map((s) => s.sessionId)).toEqual(["", ""]);
 
-		// A rebind started after the cutover stamps last_activity_at first: still gated.
+		// Work admitted for the origin since the cutover (its first bind may have
+		// failed without touching the row): gated even with a pre-cutover timestamp.
+		const addressed = projectRuntimeCycle(
+			sources({
+				sessionRows: [quarantinedLane, legacyOrigin],
+				latestCutoverAt: cutoverAt,
+				addressedSinceCutover: new Set([legacyOrigin.origin_key]),
+			}),
+			generatedAt,
+		);
+		expect(addressed.gates).toContain("stale_session_identity");
+
+		// An epoch bump (/new, work.run) after the cutover stamps last_activity_at: still gated.
 		const rebinding = { ...legacyOrigin, last_activity_at: "2026-08-10T00:00:00.001Z" };
 		const stuck = projectRuntimeCycle(sources({ sessionRows: [rebinding], latestCutoverAt: cutoverAt }), generatedAt);
 		expect(stuck.gates).toContain("stale_session_identity");

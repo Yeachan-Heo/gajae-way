@@ -1181,6 +1181,31 @@ export class GatewayDatabase {
 				.get()?.created_at ?? null
 		);
 	}
+
+	/**
+	 * Origins with inbound rows outside broker quarantine. A cutover quarantines
+	 * every inbound row it finds, so after one these are the origins addressed since.
+	 */
+	unquarantinedInboundOrigins(): string[] {
+		return this.#database
+			.query<{ origin_key: string }, []>(
+				"SELECT DISTINCT origin_key FROM inbound_messages i WHERE NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = i.message_id)",
+			)
+			.all()
+			.map((row) => row.origin_key);
+	}
+
+	/**
+	 * Monitor event types outside broker quarantine, with the monitor's declared
+	 * types (null once the monitor is deleted). Same post-cutover reading as above.
+	 */
+	unquarantinedMonitorEventTypes(): Array<{ monitor_id: string; event_type: string; event_types_json: string | null }> {
+		return this.#database
+			.query<{ monitor_id: string; event_type: string; event_types_json: string | null }, []>(
+				"SELECT DISTINCT e.monitor_id, e.event_type, m.event_types_json FROM monitor_events e LEFT JOIN monitors m ON m.monitor_id = e.monitor_id WHERE NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = e.event_id)",
+			)
+			.all();
+	}
 	/** Explicit seam for operations that must participate in a caller-owned commit. */
 	requireTransaction(): void {
 		if (!this.#inTransaction) throw new Error("operation requires a database transaction");
