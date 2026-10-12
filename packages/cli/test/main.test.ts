@@ -1216,6 +1216,8 @@ describe("work operator commands", () => {
 		expect(last.errors).toEqual(["jobs 3-3 of 3"]);
 		const whole = await run(["jobs"], { total: 1, offset: 0, jobs: [job] });
 		expect(whole.errors).toEqual([]);
+		const beyond = await run(["jobs", "--offset", "9"], { total: 3, offset: 9, jobs: [] });
+		expect(beyond.errors).toEqual(["jobs: none at offset 9 of 3"]);
 	});
 	test("work jobs rejects malformed paging flags before connecting", async () => {
 		for (const args of [
@@ -1224,6 +1226,8 @@ describe("work operator commands", () => {
 			["--offset", "x"],
 			["--limit", "1", "--limit", "2"],
 			["--all"],
+			["--limit", "0"],
+			["--limit", "501"],
 		]) {
 			const output = await run(["jobs", ...args], {});
 			expect(output.connections).toBe(0);

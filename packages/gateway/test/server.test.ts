@@ -1660,7 +1660,8 @@ test("work.jobs pages newest-first so a home with many jobs stays under the fram
 	const total = 1600;
 	database.transaction((tx) => {
 		for (let index = 0; index < total; index++) {
-			const at = new Date(Date.UTC(2026, 0, 1) + index * 1000);
+			// Pairs share updated_at, so only the job_id tiebreak keeps pages disjoint.
+			const at = new Date(Date.UTC(2026, 0, 1) + (index >> 1) * 1000);
 			const record = createLaneJobRecord({
 				jobId: `lanejob-${index.toString(16).padStart(4, "0")}`,
 				branch: "main",
@@ -1694,6 +1695,12 @@ test("work.jobs pages newest-first so a home with many jobs stays under the fram
 	const tail = await request("tail", { limit: WORK_JOBS_MAX_LIMIT, offset: total - 2 });
 	expect(tail.result.jobs.map((job: { lane_key: string }) => job.lane_key)).toEqual(["work-job1", "work-job0"]);
 	expect(tail.result.offset).toBe(total - 2);
+	const seen = new Set<string>();
+	for (let offset = 0; offset < total; offset += WORK_JOBS_MAX_LIMIT) {
+		const page = await request(`page-${offset}`, { limit: WORK_JOBS_MAX_LIMIT, offset });
+		for (const job of page.result.jobs) seen.add(job.job_id);
+	}
+	expect(seen.size).toBe(total);
 
 	for (const [id, params] of [
 		["zero", { limit: 0 }],

@@ -21,7 +21,7 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -454,7 +454,7 @@ function parseOpsDeliveriesArgs(args: readonly string[]): { params: OpsDeliverie
 	return { params, json };
 }
 
-/** `work jobs [--limit N] [--offset N]`; the gateway enforces the limit ceiling. */
+/** `work jobs [--limit N] [--offset N]`, bounded like the gateway so a bad value is a usage error. */
 function parseWorkJobsArgs(args: readonly string[], usage: string): WorkJobsParams {
 	const params: { limit?: number; offset?: number } = {};
 	for (let index = 0; index < args.length; index++) {
@@ -464,7 +464,10 @@ function parseWorkJobsArgs(args: readonly string[], usage: string): WorkJobsPara
 			throw new Error(usage);
 		const key = flag === "--limit" ? "limit" : "offset";
 		if (params[key] !== undefined) throw new Error(usage);
-		params[key] = Number(value);
+		const number = Number(value);
+		if (!Number.isSafeInteger(number) || (key === "limit" && (number < 1 || number > WORK_JOBS_MAX_LIMIT)))
+			throw new Error(usage);
+		params[key] = number;
 	}
 	return params;
 }
@@ -889,9 +892,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								);
 							}
 							const shownEnd = result.offset + result.jobs.length;
-							if (result.offset > 0 || shownEnd < result.total)
+							if (result.jobs.length === 0) console.error(`jobs: none at offset ${result.offset} of ${result.total}`);
+							else if (result.offset > 0 || shownEnd < result.total)
 								console.error(
-									`jobs ${result.jobs.length === 0 ? 0 : result.offset + 1}-${shownEnd} of ${result.total}${shownEnd < result.total ? ` (next: --offset ${shownEnd})` : ""}`,
+									`jobs ${result.offset + 1}-${shownEnd} of ${result.total}${shownEnd < result.total ? ` (next: --offset ${shownEnd})` : ""}`,
 								);
 						}
 					} finally {

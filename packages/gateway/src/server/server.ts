@@ -79,7 +79,7 @@ import {
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
-import { laneLastCommits, WorkLaneManager } from "../orchestrator/work-lane";
+import { laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
@@ -1195,7 +1195,8 @@ async function handleRequest(
 						...bound,
 						state: "corrupt" as const,
 						corrupt: true as const,
-						error: diagnostic(error),
+						// Bounded so one corrupt row cannot push a page past the frame cap.
+						error: utf8Prefix(diagnostic(error), 512),
 					};
 				}
 			});

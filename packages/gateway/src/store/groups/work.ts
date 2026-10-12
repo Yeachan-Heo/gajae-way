@@ -950,7 +950,7 @@ export class WorkGroup {
 	}> {
 		return this.#db
 			.prepare(
-				`SELECT job_id, lane_key, state, branch, worktree_path, updated_at FROM lane_jobs WHERE ${includeQuarantined ? "1=1" : "NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = lane_jobs.job_id)"} ORDER BY updated_at DESC`,
+				`SELECT job_id, lane_key, state, branch, worktree_path, updated_at FROM lane_jobs WHERE ${includeQuarantined ? "1=1" : "NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = lane_jobs.job_id)"} ORDER BY updated_at DESC, job_id DESC`,
 			)
 			.all() as Array<{
 			job_id: string;
