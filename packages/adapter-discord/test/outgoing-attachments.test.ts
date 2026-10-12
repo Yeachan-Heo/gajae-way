@@ -57,6 +57,8 @@ test("rejects files truncated, extended, or rewritten during preparation", async
 		const rewritten = await open(rewrittenPath, "r");
 		try {
 			const snapshot = await rewritten.stat({ bigint: true });
+			// Delay to ensure filesystem timestamp changes (mtime/ctime granularity).
+			await new Promise((resolve) => setTimeout(resolve, 10));
 			await writeFile(rewrittenPath, "after!");
 			await expect(readDiscordMediaFile(rewritten, snapshot)).rejects.toThrow("file changed");
 		} finally {
