@@ -1850,7 +1850,7 @@ function parseInput(params: unknown): WorkInput {
 		cwd: (input.cwd as string) ?? process.cwd(),
 		resume: input.resume === true,
 		model,
-		repo,
+		...(repo === undefined ? {} : { repo }),
 		...(callerSessionId === undefined ? {} : { callerSessionId }),
 	};
 }
