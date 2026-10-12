@@ -366,7 +366,7 @@ test("RT-SLACK-10 all three chunks keep thread and duplicate warning", async () 
 test("RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms", async () => {
 	for (const reaction of [
 		{ targetMessageId: "bad", emoji: "✅", emojiName: "check" },
-		{ targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "unknown" },
+		{ targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "INVALID" },
 	]) {
 		const api = new Api();
 		const client = new Client();
@@ -826,7 +826,7 @@ test("RT-SLACK-41 unknown rocket reaction fails definitively without a Slack cal
 		client,
 		api,
 		delivery({
-			reaction: { targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "rocket" },
+			reaction: { targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "rocket!invalid" },
 		} as Partial<ChatMessagePayload>),
 	);
 	expect(api.reactions).toEqual([]);

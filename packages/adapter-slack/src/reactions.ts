@@ -27,14 +27,21 @@ const reverseNames = new Map(
 	REACTION_ALLOWLIST.map(({ name, unicode }) => [SLACK_REACTION_NAMES[name], { emoji: unicode, emojiName: name }]),
 );
 
+// Slack emoji naming rules: lowercase/digits/_/-/'+, 2-80 chars
+const SLACK_CUSTOM_EMOJI_NAME = /^[a-z0-9_\-'+]{2,80}$/;
+
 export function slackReactionFor(reaction: Pick<ReactionRef, "emojiName">): string {
 	const name = Object.hasOwn(SLACK_REACTION_NAMES, reaction.emojiName)
 		? SLACK_REACTION_NAMES[reaction.emojiName]
 		: reaction.emojiName;
 	// Try the allowlist first, then try the custom emoji name directly.
-	// Slack will return invalid_name if the custom emoji doesn't exist in the workspace.
-	// The adapter is responsible for passing through only validated emoji names from the protocol.
+	// Custom emoji names must match Slack naming rules; if they don't, it's a protocol error.
+	// Slack will return invalid_name if the custom emoji doesn't exist in the workspace,
+	// but we reject names that don't match the rules without calling Slack.
 	if (!name) throw new SlackApiError(0, "invalid_name", `Slack has no reaction name for ${reaction.emojiName}`);
+	if (name !== SLACK_REACTION_NAMES[reaction.emojiName] && !SLACK_CUSTOM_EMOJI_NAME.test(name)) {
+		throw new SlackApiError(0, "invalid_name", `Custom emoji '${name}' does not match Slack naming rules`);
+	}
 	return name;
 }
 
