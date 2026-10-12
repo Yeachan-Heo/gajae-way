@@ -70,7 +70,8 @@ export function readBrokerAgentDrift(options: {
 	try {
 		const layout = homeLayout(options.home);
 		const manifest = readManifest(layout.brokerProvisionManifest);
-		const source = options.source ?? (typeof manifest?.source === "string" ? manifest.source : resolveBrokerAgentSource());
+		const source =
+			options.source ?? (typeof manifest?.source === "string" ? manifest.source : resolveBrokerAgentSource());
 		const dataSource =
 			options.source === undefined && typeof manifest?.dataSource === "string"
 				? manifest.dataSource
@@ -87,8 +88,7 @@ export function readBrokerAgentDrift(options: {
 				source: typeof manifest?.source === "string" ? manifest.source : null,
 				entries,
 			};
-		if (!manifest)
-			return { status: "unprovisioned", provisionedAt: null, genId: null, source: null, entries };
+		if (!manifest) return { status: "unprovisioned", provisionedAt: null, genId: null, source: null, entries };
 		return {
 			status: "provisioned",
 			provisionedAt: typeof manifest.provisionedAt === "string" ? manifest.provisionedAt : null,
@@ -132,7 +132,8 @@ function observeEntry(
 	const sourceRoot = sourceEntryRootSync(entry, source, dataSource);
 	const sourceExists = safeExists(entry, sourceRoot);
 	const copyExists = safeExists(entry, agentDir);
-	if (!sourceExists && !copyExists) return { name: entry.name, kind: entry.kind, state: entry.required ? "missing_copy" : "absent" };
+	if (!sourceExists && !copyExists)
+		return { name: entry.name, kind: entry.kind, state: entry.required ? "missing_copy" : "absent" };
 	if (!copyExists) return { name: entry.name, kind: entry.kind, state: "missing_copy" };
 	if (!sourceExists) return { name: entry.name, kind: entry.kind, state: "missing_source" };
 	const sourcePath = brokerAgentEntryPath(entry, sourceRoot);
@@ -147,7 +148,8 @@ function observeEntry(
 	if (sourceUnchanged && !copyUnchanged) return { name: entry.name, kind: entry.kind, state: "copy_changed" };
 	if (copyUnchanged && !sourceUnchanged) return { name: entry.name, kind: entry.kind, state: "source_changed" };
 	if (sourceUnchanged && copyUnchanged) return { name: entry.name, kind: entry.kind, state: "in_sync" };
-	if (record && sourceUnchanged !== copyUnchanged) return { name: entry.name, kind: entry.kind, state: sourceUnchanged ? "copy_changed" : "source_changed" };
+	if (record && sourceUnchanged !== copyUnchanged)
+		return { name: entry.name, kind: entry.kind, state: sourceUnchanged ? "copy_changed" : "source_changed" };
 	return { name: entry.name, kind: entry.kind, state: "diverged" };
 }
 

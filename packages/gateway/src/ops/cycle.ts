@@ -10,14 +10,14 @@ import {
 	type OpsSloResult,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
+import { type BrokerAgentDrift, readBrokerAgentDrift } from "../broker-agent/drift";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
 import { isBrokerIndexLockBlocked, readBrokerExitRecordSync } from "../orchestrator/broker-liveness";
 import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
-import type { MonitorsGroup } from "../store/groups/monitors";
 import type { Store } from "../store";
 import type { ConversationContextDiagnostics } from "../store/groups/inbox";
-import { readBrokerAgentDrift, type BrokerAgentDrift } from "../broker-agent/drift";
+import type { MonitorsGroup } from "../store/groups/monitors";
 import { DEFAULT_SLO_DAYS, evaluateSlo } from "./slo";
 
 /**
@@ -95,7 +95,10 @@ function agentDiskLow(disk: AgentDiskView): boolean {
 	return disk.freeBytes < AGENT_DISK_MIN_FREE_BYTES || disk.freeBytes < disk.totalBytes * AGENT_DISK_MIN_FREE_RATIO;
 }
 
-function observeMemoryGitIndexLock(memoryRoot: string | undefined, nowMs: number): {
+function observeMemoryGitIndexLock(
+	memoryRoot: string | undefined,
+	nowMs: number,
+): {
 	readonly path: string;
 	readonly ageMs: number;
 } | null {
@@ -255,8 +258,8 @@ export class RuntimeCycleProjector {
 			activeLanes: this.#database.bindings.workLaneRows().length,
 			maxLanes: this.#maxLanes,
 			settledWorkOrigins: new Set(
-				this.#database
-					.work.laneJobRows()
+				this.#database.work
+					.laneJobRows()
 					.filter((row) => SETTLED_JOB_STATES.has(row.state))
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
@@ -265,7 +268,10 @@ export class RuntimeCycleProjector {
 			monitorTerminalStreak: this.#database.monitors.consecutiveTerminalFailures(),
 			brokerRespawnChurn: this.#brokerRespawnChurn(),
 			brokerExitRecord: this.#agentDir === undefined ? undefined : readBrokerExitRecordSync(this.#agentDir),
-			brokerAgent: this.#home === undefined || this.#agentDir === undefined ? null : readBrokerAgentDrift({ home: this.#home, agentDir: this.#agentDir }),
+			brokerAgent:
+				this.#home === undefined || this.#agentDir === undefined
+					? null
+					: readBrokerAgentDrift({ home: this.#home, agentDir: this.#agentDir }),
 			slo: evaluateSlo(this.#database.core, DEFAULT_SLO_DAYS, new Date(nowMs)),
 		};
 	}

@@ -33,15 +33,17 @@ async function openDatabase(): Promise<Store> {
 }
 
 function storeJob(database: Store, record: LaneJobRecord, laneKey = "project-issue-10-lane-jobs"): void {
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: record.jobId,
-		laneKey,
-		state: record.state,
-		createdAt: record.createdAt,
-		updatedAt: record.updatedAt,
-		lane: record.lane,
-		json: JSON.stringify(record),
-	}));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: record.jobId,
+			laneKey,
+			state: record.state,
+			createdAt: record.createdAt,
+			updatedAt: record.updatedAt,
+			lane: record.lane,
+			json: JSON.stringify(record),
+		}),
+	);
 }
 
 describe("lane_jobs store (migration v10)", () => {
@@ -138,15 +140,17 @@ describe("lane_jobs store (migration v10)", () => {
 			});
 			storeJob(database, valid);
 			// Simulate on-disk corruption of the stored authority.
-			database.transaction((tx) => database.work.putLaneJob(tx, {
-				jobId: valid.jobId,
-				laneKey: "project-issue-10-lane-jobs",
-				state: valid.state,
-				createdAt: valid.createdAt,
-				updatedAt: valid.updatedAt,
-				lane: valid.lane,
-				json: '{"schemaVersion":1,"jobId":',
-			}));
+			database.transaction((tx) =>
+				database.work.putLaneJob(tx, {
+					jobId: valid.jobId,
+					laneKey: "project-issue-10-lane-jobs",
+					state: valid.state,
+					createdAt: valid.createdAt,
+					updatedAt: valid.updatedAt,
+					lane: valid.lane,
+					json: '{"schemaVersion":1,"jobId":',
+				}),
+			);
 			const corrupted = database.work.laneJobJson(valid.jobId);
 			expect(typeof corrupted).toBe("string");
 			expect(() => parseLaneJobRecord(corrupted as string)).toThrow(LaneJobError);

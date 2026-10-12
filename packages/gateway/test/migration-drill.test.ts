@@ -70,15 +70,17 @@ test("upgrades a deployed lane-jobs schema 10 database to combined schema 12 wit
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await Store.open(path);
-		latest.transaction((tx) => latest.work.putLaneJob(tx, {
-			jobId: "lanejob-test",
-			laneKey: "work/task/test",
-			state: "running",
-			createdAt: "2026-08-28T00:00:00.000Z",
-			updatedAt: "2026-08-28T00:00:00.000Z",
-			lane: { branch: "feat/test", worktreePath: "/tmp/test" },
-			json: '{"schemaVersion":1}',
-		}));
+		latest.transaction((tx) =>
+			latest.work.putLaneJob(tx, {
+				jobId: "lanejob-test",
+				laneKey: "work/task/test",
+				state: "running",
+				createdAt: "2026-08-28T00:00:00.000Z",
+				updatedAt: "2026-08-28T00:00:00.000Z",
+				lane: { branch: "feat/test", worktreePath: "/tmp/test" },
+				json: '{"schemaVersion":1}',
+			}),
+		);
 		latest.close();
 
 		// Recreate the exact pre-monitor-recovery shape: schema 10 already has
@@ -121,15 +123,17 @@ test("upgrades live schema 12 through bootstrap schema 14 without losing current
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await Store.open(path);
-		latest.transaction((tx) => latest.work.putLaneJob(tx, {
-			jobId: "lanejob-v12",
-			laneKey: "work/task/v12",
-			state: "running",
-			createdAt: "2026-08-28T00:00:00.000Z",
-			updatedAt: "2026-08-28T00:00:00.000Z",
-			lane: { branch: "fix/v12", worktreePath: "/tmp/v12" },
-			json: '{"schemaVersion":1}',
-		}));
+		latest.transaction((tx) =>
+			latest.work.putLaneJob(tx, {
+				jobId: "lanejob-v12",
+				laneKey: "work/task/v12",
+				state: "running",
+				createdAt: "2026-08-28T00:00:00.000Z",
+				updatedAt: "2026-08-28T00:00:00.000Z",
+				lane: { branch: "fix/v12", worktreePath: "/tmp/v12" },
+				json: '{"schemaVersion":1}',
+			}),
+		);
 		latest.core.metaSet("rebind_budget:discord/channel/c1", '{"used":2,"lifetime":7}');
 		latest.transaction((tx) => latest.bindings.bind(tx, "discord/channel/c1", "session-v12"));
 		latest.close();
@@ -386,13 +390,15 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		expect(upgraded.inbox.nonterminalTurnCount()).toBe(1);
 		// The uniqueness the actor relies on survives the rebuild.
 		expect(() =>
-			upgraded.transaction((tx) => upgraded.inbox.bindTurn(tx, {
-				messageId: "wedged-unbatched",
-				originKey: "o1",
-				epoch: 3,
-				opRef: "gw-p-dup",
-				sessionId: "s-live",
-			})),
+			upgraded.transaction((tx) =>
+				upgraded.inbox.bindTurn(tx, {
+					messageId: "wedged-unbatched",
+					originKey: "o1",
+					epoch: 3,
+					opRef: "gw-p-dup",
+					sessionId: "s-live",
+				}),
+			),
 		).toThrow("already has a nonterminal turn");
 		upgraded.close();
 	} finally {

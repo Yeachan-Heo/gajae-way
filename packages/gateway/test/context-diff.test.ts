@@ -3,6 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setContextFloor } from "../src/orchestrator/persona-session";
 import { Store } from "../src/store";
 import {
 	CONVERSATION_CONTEXT_RETENTION_MS,
@@ -10,7 +11,6 @@ import {
 	CONVERSATION_DIFF_MAX_ROWS,
 	RETENTION_BATCH_ROWS,
 } from "../src/store/groups/inbox";
-import { setContextFloor } from "../src/orchestrator/persona-session";
 
 const ORIGIN_KEY = "discord/channel/context-diff";
 const NOW = new Date();
@@ -31,14 +31,16 @@ async function open(): Promise<Store> {
 }
 
 function record(db: Store, messageId: string, body: string, receivedAt: string, authorName = "alice"): void {
-	db.transaction((tx) => db.inbox.contextRecord(tx, {
-		messageId,
-		originKey: ORIGIN_KEY,
-		authorId: `author-${authorName}`,
-		authorName,
-		body,
-		receivedAt,
-	}));
+	db.transaction((tx) =>
+		db.inbox.contextRecord(tx, {
+			messageId,
+			originKey: ORIGIN_KEY,
+			authorId: `author-${authorName}`,
+			authorName,
+			body,
+			receivedAt,
+		}),
+	);
 }
 
 test("287-row stale backlog selects only newest recent rows chronologically and never replays omissions", async () => {
@@ -62,9 +64,18 @@ test("287-row stale backlog selects only newest recent rows chronologically and 
 	expect(first.diagnostics.expired).toBe(226);
 	expect(first.diagnostics.truncated).toBe(0);
 
-	db.transaction((tx) => db.inbox.contextCommitWindow(tx, ORIGIN_KEY, [...first.selectedMessageIds, "trigger-current"], first.omissionRevision));
+	db.transaction((tx) =>
+		db.inbox.contextCommitWindow(
+			tx,
+			ORIGIN_KEY,
+			[...first.selectedMessageIds, "trigger-current"],
+			first.omissionRevision,
+		),
+	);
 	record(db, "trigger-next", "next owner turn", new Date(NOW.getTime() + 1_000).toISOString(), "owner");
-	const next = db.transaction((tx) => db.inbox.contextWindow(tx, ORIGIN_KEY, "trigger-next", new Date(NOW.getTime() + 1_000)));
+	const next = db.transaction((tx) =>
+		db.inbox.contextWindow(tx, ORIGIN_KEY, "trigger-next", new Date(NOW.getTime() + 1_000)),
+	);
 	expect(next.rows).toEqual([]);
 	expect(next.expiredCount).toBe(0);
 	expect(next.diagnostics.expired).toBe(226);
@@ -86,10 +97,14 @@ test("more than the count bound keeps newest N once and expires older recent row
 	expect(window.rows[0]?.body).toBe("body-7");
 	expect(window.rows.at(-1)?.body).toBe(`body-${CONVERSATION_DIFF_MAX_ROWS + 6}`);
 	expect(window.diagnostics.truncated).toBe(7);
-	db.transaction((tx) => db.inbox.contextCommitWindow(tx, ORIGIN_KEY, [...window.selectedMessageIds, "trigger"], window.omissionRevision));
+	db.transaction((tx) =>
+		db.inbox.contextCommitWindow(tx, ORIGIN_KEY, [...window.selectedMessageIds, "trigger"], window.omissionRevision),
+	);
 
 	record(db, "trigger-2", "again", new Date(NOW.getTime() + 1_000).toISOString());
-	expect(db.transaction((tx) => db.inbox.contextWindow(tx, ORIGIN_KEY, "trigger-2", new Date(NOW.getTime() + 1_000))).rows).toEqual([]);
+	expect(
+		db.transaction((tx) => db.inbox.contextWindow(tx, ORIGIN_KEY, "trigger-2", new Date(NOW.getTime() + 1_000))).rows,
+	).toEqual([]);
 	expect(db.inbox.contextDiagnostics(ORIGIN_KEY).truncated).toBe(7);
 });
 
@@ -117,7 +132,9 @@ test("reset floor survives restart and excludes every pre-reset row", async () =
 	database = restarted;
 	record(restarted, "after-reset", "new session context", new Date(NOW.getTime() + 1_000).toISOString());
 	record(restarted, "trigger", "current", new Date(NOW.getTime() + 2_000).toISOString());
-	const window = restarted.transaction((tx) => restarted.inbox.contextWindow(tx, ORIGIN_KEY, "trigger", new Date(NOW.getTime() + 2_000)));
+	const window = restarted.transaction((tx) =>
+		restarted.inbox.contextWindow(tx, ORIGIN_KEY, "trigger", new Date(NOW.getTime() + 2_000)),
+	);
 	expect(window.rows.map((row) => row.message_id)).toEqual(["after-reset"]);
 	expect(window.diagnostics.floorAt).toBe(floor);
 	expect(window.diagnostics.expired).toBe(1);
@@ -179,7 +196,9 @@ test("a later omission generation is not cleared by an older in-flight window co
 	record(db, "stale-while-running", "old two", stale);
 	db.transaction((tx) => db.inbox.contextCommitWindow(tx, ORIGIN_KEY, ["trigger"], first.omissionRevision));
 	record(db, "next-trigger", "next", new Date(NOW.getTime() + 1).toISOString());
-	const next = db.transaction((tx) => db.inbox.contextWindow(tx, ORIGIN_KEY, "next-trigger", new Date(NOW.getTime() + 1)));
+	const next = db.transaction((tx) =>
+		db.inbox.contextWindow(tx, ORIGIN_KEY, "next-trigger", new Date(NOW.getTime() + 1)),
+	);
 	expect(next.expiredCount).toBeGreaterThanOrEqual(1);
 });
 

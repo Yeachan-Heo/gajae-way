@@ -41,12 +41,16 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		const ownedDatabase = database;
 		const canonicalAgentDir = join(home, "fake-user-agent");
 		const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-		ownedDatabase.transaction((tx) => ownedDatabase.bindings.initializeAuthority(tx, authority, ownedDatabase.inspectBrokerAuthority().populated));
+		ownedDatabase.transaction((tx) =>
+			ownedDatabase.bindings.initializeAuthority(tx, authority, ownedDatabase.inspectBrokerAuthority().populated),
+		);
 		const port = new ScriptedSessionPort();
 		const bind = port.bind.bind(port);
 		port.bind = async (input) => {
 			const binding = await bind(input);
-			expect(ownedDatabase.transaction((tx) => ownedDatabase.bindings.recordOwnedBinding(tx, { ...binding, authority }))).toBe(true);
+			expect(
+				ownedDatabase.transaction((tx) => ownedDatabase.bindings.recordOwnedBinding(tx, { ...binding, authority })),
+			).toBe(true);
 			return binding;
 		};
 		const originKey = "loopback/loopback/observability";
@@ -59,25 +63,29 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 		});
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId: "m-1",
-				originKey,
-				originRefJson: JSON.stringify(origin),
-				body: "first",
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-1",
+					originKey,
+					originRefJson: JSON.stringify(origin),
+					body: "first",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound(originKey);
 		await eventually(() => port.sends.length === 1, "initial persistent operation was not sent");
 		const first = port.sends[0]!;
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId: "m-2",
-				originKey,
-				originRefJson: JSON.stringify(origin),
-				body: "steer this",
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-2",
+					originKey,
+					originRefJson: JSON.stringify(origin),
+					body: "steer this",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound(originKey);
 		await eventually(() => port.steers.length === 1, "steer was not delivered");

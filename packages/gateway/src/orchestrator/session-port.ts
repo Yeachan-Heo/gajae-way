@@ -466,13 +466,15 @@ export class BrokerSessionPort implements SessionPort {
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
 		if (
-			!this.#database.transaction((tx) => this.#database.bindings.recordOwnedBinding(tx, {
-				authority: this.#authority,
-				sessionId,
-				originKey: input.originKey,
-				epoch: input.epoch,
-				repo: input.repo,
-			}))
+			!this.#database.transaction((tx) =>
+				this.#database.bindings.recordOwnedBinding(tx, {
+					authority: this.#authority,
+					sessionId,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+				}),
+			)
 		) {
 			throw new Error(
 				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,

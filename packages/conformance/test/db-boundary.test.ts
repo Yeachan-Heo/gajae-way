@@ -6,9 +6,7 @@ const ROOT = join(import.meta.dir, "..", "..", "..");
 const BUN_SQLITE_IMPORT = /\b(?:from\s*|import\s*(?:\(\s*)?|require\s*\(\s*)["']bun:sqlite["']/;
 const GATEWAY_DB_LITERAL = /gateway\.db/;
 const BROKER_AGENT_DB = "packages/gateway/src/broker-agent/agent-db.ts";
-const ALLOWED_SQLITE_IMPORTS = [
-	"packages/gateway/src/broker-agent/agent-db.ts",
-];
+const ALLOWED_SQLITE_IMPORTS = ["packages/gateway/src/broker-agent/agent-db.ts"];
 const ALLOWED_DB_LITERALS = ["packages/gateway/src/config.ts", "packages/home/src/layout.ts"];
 
 function sourceFiles(): string[] {
@@ -33,11 +31,7 @@ function sourceFiles(): string[] {
 	return files;
 }
 
-function lineViolations(
-	pattern: RegExp,
-	files: readonly string[],
-	allowed: readonly string[] = [],
-): string[] {
+function lineViolations(pattern: RegExp, files: readonly string[], allowed: readonly string[] = []): string[] {
 	const hits: string[] = [];
 	for (const file of files) {
 		const rel = relative(ROOT, file);
@@ -91,12 +85,16 @@ describe("gateway database ownership boundary (AC3)", () => {
 
 	test("bun:sqlite imports stay in the gateway store and broker agent database", () => {
 		expect(BUN_SQLITE_IMPORT.test('import { Database } from "bun:sqlite";')).toBe(true);
-		const allowed = [...ALLOWED_SQLITE_IMPORTS, ...files.map((file) => relative(ROOT, file)).filter((path) => path.startsWith("packages/gateway/src/store/"))];
+		const allowed = [
+			...ALLOWED_SQLITE_IMPORTS,
+			...files.map((file) => relative(ROOT, file)).filter((path) => path.startsWith("packages/gateway/src/store/")),
+		];
 		expect(lineViolations(BUN_SQLITE_IMPORT, files, allowed)).toEqual([]);
 	});
 
 	test("broker agent database does not import store/config or mention the database filename", () => {
-		const forbidden = /(?:\b(?:from\s*|import\s*\(\s*|require\s*\(\s*)["'][^"']*(?:^|\/)(?:store|config)(?:\/|["'])|gateway\.db)/;
+		const forbidden =
+			/(?:\b(?:from\s*|import\s*\(\s*|require\s*\(\s*)["'][^"']*(?:^|\/)(?:store|config)(?:\/|["'])|gateway\.db)/;
 		expect(forbidden.test('import { Store } from "../store";')).toBe(true);
 		const source = readFileSync(join(ROOT, BROKER_AGENT_DB), "utf8");
 		expect(lineViolations(forbidden, [join(ROOT, BROKER_AGENT_DB)])).toEqual([]);

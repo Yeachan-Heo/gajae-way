@@ -37,7 +37,10 @@ async function fileSha256(path: string): Promise<string> {
 	return hash.digest("hex");
 }
 
-export async function writeBackup(database: StoreCore, path: string): Promise<{ path: string; sha256: string; bytes: number }> {
+export async function writeBackup(
+	database: StoreCore,
+	path: string,
+): Promise<{ path: string; sha256: string; bytes: number }> {
 	if (!isAbsolute(path)) throw new Error("backup target must be an absolute path");
 	const target = resolve(path);
 	const directory = dirname(target);
@@ -68,7 +71,11 @@ export async function writeBackup(database: StoreCore, path: string): Promise<{ 
 		const info = await stat(target);
 		return { path: target, sha256: await fileSha256(target), bytes: info.size };
 	} catch (error) {
-		await Promise.all([unlink(temporary).catch(() => undefined), unlink(`${temporary}-wal`).catch(() => undefined), unlink(`${temporary}-shm`).catch(() => undefined)]);
+		await Promise.all([
+			unlink(temporary).catch(() => undefined),
+			unlink(`${temporary}-wal`).catch(() => undefined),
+			unlink(`${temporary}-shm`).catch(() => undefined),
+		]);
 		throw error;
 	}
 }

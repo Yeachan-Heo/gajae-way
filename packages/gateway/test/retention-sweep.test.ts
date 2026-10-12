@@ -4,8 +4,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
-import { Store, HISTORY_RETENTION_MS } from "../src/store";
 import { MonitorRegistry } from "../src/monitors/registry";
+import { HISTORY_RETENTION_MS, Store } from "../src/store";
 
 const NOW = new Date("2026-10-03T00:00:00.000Z");
 const OLD = new Date(NOW.getTime() - HISTORY_RETENTION_MS - 86_400_000).toISOString();
@@ -33,13 +33,15 @@ test("retention deletes old terminal inbound rows and keeps pending, recent and 
 	await withDb((database, raw) => {
 		const key = originKey(LOOPBACK_ORIGIN);
 		for (const id of ["old-done", "old-pending", "recent-done", "old-quarantined"]) {
-			database.transaction((tx) => database.inbox.enqueue(tx, {
-				messageId: id,
-				originKey: key,
-				originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
-				body: id,
-				receivedAt: id.startsWith("recent") ? RECENT : OLD,
-			}));
+			database.transaction((tx) =>
+				database.inbox.enqueue(tx, {
+					messageId: id,
+					originKey: key,
+					originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+					body: id,
+					receivedAt: id.startsWith("recent") ? RECENT : OLD,
+				}),
+			);
 		}
 		raw.exec(
 			"UPDATE inbound_messages SET state = 'done' WHERE message_id IN ('old-done','recent-done','old-quarantined')",
@@ -178,7 +180,10 @@ test("targeted ledger reads agree with the unsettled/terminal split", async () =
 		expect(database.outbox.get("c")?.state).toBe("confirmed");
 		expect(database.outbox.get("missing")).toBeUndefined();
 		expect(
-			database.outbox.getMany(["c", "c", "p", "missing"]).map((row) => row.deliveryId).sort(),
+			database.outbox
+				.getMany(["c", "c", "p", "missing"])
+				.map((row) => row.deliveryId)
+				.sort(),
 		).toEqual(["c", "p"]);
 		const counts = database.outbox.counts();
 		expect(counts).toMatchObject({ pending: 2, expired: 2 });
@@ -199,7 +204,10 @@ test("reconcile reads select exactly the stranded and open monitor events", asyn
 		seedEvent(database, "ev-5", "admitted", null, "2026-10-01T00:00:00.500Z");
 
 		expect(
-			database.outbox.terminalForTurns(database.monitors.authoredBatchIds()).map((row) => row.delivery_id).sort(),
+			database.outbox
+				.terminalForTurns(database.monitors.authoredBatchIds())
+				.map((row) => row.delivery_id)
+				.sort(),
 		).toEqual(["d-confirmed", "d-expired"]);
 		// Oldest first; terminal events never appear.
 		expect(database.monitors.eventsOpen().map((r) => r.event_id)).toEqual(["ev-5", "ev-1", "ev-2", "ev-3"]);
@@ -241,8 +249,8 @@ test("memory intent probes cover deterministic ids, legacy payloads and the open
 		expect(database.memory.get("nope")).toBeUndefined();
 		database.transaction((tx) => database.memory.beginAttempt(tx, "other"));
 		expect(
-			database
-				.memory.openRows()
+			database.memory
+				.openRows()
 				.map((r) => r.id)
 				.sort(),
 		).toEqual(["legacy-1", "monitor-event-intent:ev-a", "other"]);

@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/store";
 import { ACK_TIMEOUT_MS, classifyDeliveryError, DeliveryService } from "../src/delivery/delivery";
+import { Store } from "../src/store";
 
 test("delivery ledger expires only after the fifth definitive failure", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));

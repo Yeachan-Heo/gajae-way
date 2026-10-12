@@ -1,10 +1,21 @@
 import { createHash } from "node:crypto";
-import { isSilentOutput, originKey, validateOriginRef, type ChatMessagePayload, type OriginRef } from "@gajae-gateway/protocol";
-import { assertValidOpRef, parseLaneJobRecord, type LaneJobRecord, type PromptStatusBody } from "@gajae-gateway/subsession";
+import {
+	type ChatMessagePayload,
+	isSilentOutput,
+	type OriginRef,
+	originKey,
+	validateOriginRef,
+} from "@gajae-gateway/protocol";
+import {
+	assertValidOpRef,
+	type LaneJobRecord,
+	type PromptStatusBody,
+	parseLaneJobRecord,
+} from "@gajae-gateway/subsession";
 import { buildDeliveryPayload } from "../../delivery/delivery";
+import type { GroupDb, StoreCore } from "../core";
 import { BrokerAuthorityError } from "../errors";
 import type { OpenWorkRows, OpenWorkScope } from "../open-work";
-import type { GroupDb, StoreCore } from "../core";
 import type { WriteTx } from "../tx";
 
 export type WorkAttemptMode = "start" | "run" | "historical";
@@ -316,9 +327,13 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 	);
 	for (const proof of [output.proof, output.knownSilence]) {
 		if (proof === null) continue;
-		workAssert(proof && proof.opRef === value.opRef && proof.sessionId === value.sessionId && proof.epoch === value.epoch);
+		workAssert(
+			proof && proof.opRef === value.opRef && proof.sessionId === value.sessionId && proof.epoch === value.epoch,
+		);
 		workAssert(Number.isFinite(proof.observedAtMs) && proof.observedAtMs >= Date.parse(value.startedAt));
-		workAssert(proof.source === "turn.result" && proof.attribution === "operation_ref" && proof.fullness === "original");
+		workAssert(
+			proof.source === "turn.result" && proof.attribution === "operation_ref" && proof.fullness === "original",
+		);
 		workAssert(proof.clientRef === value.opRef && proof.repo === value.cwd && proof.contentVersion === 1);
 		workAssert(Number.isFinite(proof.terminalAt) && proof.terminalAt >= Date.parse(value.startedAt));
 		workAssert(Number.isSafeInteger(proof.byteLength) && proof.byteLength >= 0);
@@ -326,11 +341,15 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 	}
 	workAssert(output.disposition !== "available" || (output.proof !== null && output.excerpt !== null));
 	workAssert(output.disposition !== "silent" || output.knownSilence !== null);
-	workAssert(["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.decision));
+	workAssert(
+		["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.decision),
+	);
 	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
 	if (value.decision !== "undecided") {
 		workAssert(value.terminal !== null && output.disposition !== "pending");
-		workAssert(!["reported", "fallback"].includes(value.decision) || (value.parent !== null && output.knownSilence === null));
+		workAssert(
+			!["reported", "fallback"].includes(value.decision) || (value.parent !== null && output.knownSilence === null),
+		);
 		workAssert(
 			value.decision !== "fallback" ||
 				value.parent?.kind === "persona" ||
@@ -410,7 +429,8 @@ function validateLaneReportRow(row: LaneReportRow): void {
 	workAssert(Number.isSafeInteger(row.claim_seq) && row.claim_seq >= 0);
 	workAssert(row.claim_ref === null || workString(row.claim_ref, 128));
 	workAssert(row.claim_target_op_ref === null || workString(row.claim_target_op_ref, 128));
-	for (const ref of [row.claim_ref, row.claim_target_op_ref, row.consumed_op_ref]) if (ref !== null) assertValidOpRef(ref);
+	for (const ref of [row.claim_ref, row.claim_target_op_ref, row.consumed_op_ref])
+		if (ref !== null) assertValidOpRef(ref);
 	workAssert((row.state !== "claimed" && row.state !== "held") || (row.claim_kind !== null && row.claim_ref !== null));
 	workAssert(row.claim_kind !== "steer" || row.claim_target_op_ref !== null);
 	workAssert(row.claim_kind !== "wake" || row.claim_target_op_ref === null);
@@ -524,8 +544,11 @@ export class WorkGroup {
 	}
 
 	workAttemptJobId(opRef: string): string | undefined {
-		return (this.#db.prepare("SELECT job_id FROM work_attempt_runtime WHERE op_ref = ?").get(opRef) as { job_id: string } | null)
-			?.job_id;
+		return (
+			this.#db.prepare("SELECT job_id FROM work_attempt_runtime WHERE op_ref = ?").get(opRef) as {
+				job_id: string;
+			} | null
+		)?.job_id;
 	}
 
 	workAttemptRows(): readonly { readonly op_ref: string; readonly job_id: string }[] {
@@ -581,7 +604,12 @@ export class WorkGroup {
 			);
 	}
 
-	workAttemptUpdate(tx: WriteTx, opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
+	workAttemptUpdate(
+		tx: WriteTx,
+		opRef: string,
+		expectedVersion: number,
+		patch: WorkAttemptPatch,
+	): WorkAttemptRuntime | undefined {
 		const current = this.workAttemptGet(opRef);
 		if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 		this.#assertNotQuarantined(current.jobId);
@@ -638,7 +666,8 @@ export class WorkGroup {
 							originKey(admission.fallbackPayload.origin) === draft.parent.originKey &&
 							admission.fallbackPayload.text === admission.row.body,
 					);
-					const refused = Boolean(admission.holdReason) || !checks.personaSessionExists || Boolean(checks.personaMessageExists);
+					const refused =
+						Boolean(admission.holdReason) || !checks.personaSessionExists || Boolean(checks.personaMessageExists);
 					decision = refused ? "fallback" : "reported";
 					if (refused) fallbackPayload = admission.fallbackPayload;
 				} else {
@@ -766,7 +795,8 @@ export class WorkGroup {
 
 	laneParentAvailable(name: string): boolean {
 		const jobId = laneJobDatabaseId(name);
-		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?").get(jobId)) return false;
+		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?").get(jobId))
+			return false;
 		const json = this.laneJobJsonByLaneKey(`work-${name}`);
 		if (json === undefined) return false;
 		try {
@@ -801,7 +831,11 @@ export class WorkGroup {
 		validateWorkRuntime(next, this.instanceId);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
-		workAssert(current.terminal === null || JSON.stringify(current.terminal) === JSON.stringify(next.terminal) || lateReceiptReconciled(current, next));
+		workAssert(
+			current.terminal === null ||
+				JSON.stringify(current.terminal) === JSON.stringify(next.terminal) ||
+				lateReceiptReconciled(current, next),
+		);
 		workAssert(
 			current.output.knownSilence === null ||
 				JSON.stringify(current.output.knownSilence) === JSON.stringify(next.output.knownSilence),
@@ -823,9 +857,15 @@ export class WorkGroup {
 
 	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
 		const record = parseLaneJobRecord(JSON.stringify(input));
-		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd, "history job identity matches runtime");
+		workAssert(
+			record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd,
+			"history job identity matches runtime",
+		);
 		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt, "history attempt identity matches runtime");
+		workAssert(
+			attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt,
+			"history attempt identity matches runtime",
+		);
 		workAssert(
 			runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt,
 			"attempt.endedAt matches runtime.settledAt",
@@ -836,7 +876,10 @@ export class WorkGroup {
 
 	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
 		const json = this.laneJobJson(runtime.jobId);
-		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json, "lane history rows share one serialized record");
+		workAssert(
+			json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json,
+			"lane history rows share one serialized record",
+		);
 		const record = parseLaneJobRecord(json);
 		this.#workValidateHistory(runtime, record);
 		return record;
@@ -866,17 +909,30 @@ export class WorkGroup {
 	}
 
 	laneJobJson(jobId: string): string | undefined {
-		return (this.#db.prepare("SELECT record_json FROM lane_jobs WHERE job_id = ?").get(jobId) as { record_json: string } | null)
-			?.record_json;
+		return (
+			this.#db.prepare("SELECT record_json FROM lane_jobs WHERE job_id = ?").get(jobId) as {
+				record_json: string;
+			} | null
+		)?.record_json;
 	}
 
 	laneJobJsonByLaneKey(laneKey: string): string | undefined {
-		return (this.#db.prepare("SELECT record_json FROM lane_jobs WHERE lane_key = ?").get(laneKey) as { record_json: string } | null)
-			?.record_json;
+		return (
+			this.#db.prepare("SELECT record_json FROM lane_jobs WHERE lane_key = ?").get(laneKey) as {
+				record_json: string;
+			} | null
+		)?.record_json;
 	}
 
-	laneJobHistoryRows(): readonly { readonly job_id: string; readonly lane_key: string; readonly state: string; readonly record_json: string }[] {
-		return this.#db.prepare("SELECT job_id, lane_key, state, record_json FROM lane_jobs ORDER BY job_id").all() as Array<{
+	laneJobHistoryRows(): readonly {
+		readonly job_id: string;
+		readonly lane_key: string;
+		readonly state: string;
+		readonly record_json: string;
+	}[] {
+		return this.#db
+			.prepare("SELECT job_id, lane_key, state, record_json FROM lane_jobs ORDER BY job_id")
+			.all() as Array<{
 			job_id: string;
 			lane_key: string;
 			state: string;
@@ -939,10 +995,12 @@ export class WorkGroup {
 
 	laneReportOpenCount(): number {
 		return (
-			(this.#db.prepare("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')").get() as { n: number } | null)
-				?.n ?? 0
+			(
+				this.#db.prepare("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')").get() as {
+					n: number;
+				} | null
+			)?.n ?? 0
 		);
-
 	}
 
 	sweep(tx: WriteTx, cutoffs: { historyCutoff: string; batch: number }): number {
@@ -954,7 +1012,9 @@ export class WorkGroup {
 	}
 
 	#laneReportGetInside(reportId: string): LaneReportRow | undefined {
-		const row = this.#db.prepare("SELECT * FROM lane_reports WHERE report_id = ?").get(reportId) as LaneReportRow | null;
+		const row = this.#db
+			.prepare("SELECT * FROM lane_reports WHERE report_id = ?")
+			.get(reportId) as LaneReportRow | null;
 
 		if (!row) return undefined;
 		try {
@@ -970,25 +1030,28 @@ export class WorkGroup {
 	}
 
 	laneReportsByParent(parentName: string): readonly LaneReportRow[] {
-		return (this.#db.prepare("SELECT * FROM lane_reports WHERE parent_name = ? ORDER BY created_at, rowid").all(parentName) as LaneReportRow[])
-
-			.map((row) => {
-				try {
-					validateLaneReportRow(row);
-					return row;
-				} catch {
-					throw new WorkAttemptStateError();
-				}
-			});
+		return (
+			this.#db
+				.prepare("SELECT * FROM lane_reports WHERE parent_name = ? ORDER BY created_at, rowid")
+				.all(parentName) as LaneReportRow[]
+		).map((row) => {
+			try {
+				validateLaneReportRow(row);
+				return row;
+			} catch {
+				throw new WorkAttemptStateError();
+			}
+		});
 	}
 
 	laneReportParentNames(): readonly string[] {
 		return (
 			this.#db
-				.prepare("SELECT DISTINCT parent_name FROM lane_reports WHERE state IN ('pending','claimed','held') ORDER BY parent_name")
+				.prepare(
+					"SELECT DISTINCT parent_name FROM lane_reports WHERE state IN ('pending','claimed','held') ORDER BY parent_name",
+				)
 				.all() as Array<{ parent_name: string }>
 		).map((row) => row.parent_name);
-
 	}
 
 	laneReportCounts(parentName: string): { pending: number; claimed: number; held: number; undeliverable: number } {
@@ -1010,7 +1073,13 @@ export class WorkGroup {
 		};
 	}
 
-	laneReportClaim(tx: WriteTx, reportId: string, kind: "steer" | "wake", ref: string, targetOpRef: string | null): LaneReportRow | undefined {
+	laneReportClaim(
+		tx: WriteTx,
+		reportId: string,
+		kind: "steer" | "wake",
+		ref: string,
+		targetOpRef: string | null,
+	): LaneReportRow | undefined {
 		assertValidOpRef(ref);
 		workAssert(kind === "steer" ? targetOpRef !== null : targetOpRef === null);
 		if (targetOpRef !== null) assertValidOpRef(targetOpRef);
@@ -1040,7 +1109,8 @@ export class WorkGroup {
 
 	laneReportRequeue(tx: WriteTx, reportId: string, ref: string): boolean {
 		const current = this.#laneReportGetInside(reportId);
-		if (!current || (current.state !== "claimed" && current.state !== "held") || current.claim_ref !== ref) return false;
+		if (!current || (current.state !== "claimed" && current.state !== "held") || current.claim_ref !== ref)
+			return false;
 		return (
 			this.#db
 				.prepare(
@@ -1070,7 +1140,11 @@ export class WorkGroup {
 		if (!current || current.state !== "pending") return false;
 		const root = laneReportRoot(current);
 		workAssert(root !== null);
-		const deliveryId = workAttemptDeliveryId(this.instanceId, laneJobDatabaseId(current.child_name), current.child_op_ref);
+		const deliveryId = workAttemptDeliveryId(
+			this.instanceId,
+			laneJobDatabaseId(current.child_name),
+			current.child_op_ref,
+		);
 		workAssert(
 			payload.deliveryId === deliveryId &&
 				payload.turnId === current.child_op_ref &&

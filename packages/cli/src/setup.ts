@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 /**
@@ -102,7 +101,9 @@ export function parseSetupArgs(args: readonly string[]): ParsedSetupArgs {
 	if (status && (fromEnv || brokerAgent || from !== undefined || adapters || owners.length > 0 || discordAppId))
 		throw new SetupError(`--status takes no other options\n${SETUP_USAGE}`);
 	if (brokerAgent && (fromEnv || adapters || owners.length > 0 || discordAppId))
-		throw new SetupError(`--broker-agent is standalone and cannot be combined with adapter setup options\n${SETUP_USAGE}`);
+		throw new SetupError(
+			`--broker-agent is standalone and cannot be combined with adapter setup options\n${SETUP_USAGE}`,
+		);
 	if (from !== undefined && !brokerAgent) throw new SetupError(`--from requires --broker-agent\n${SETUP_USAGE}`);
 	return {
 		mode: status ? "status" : brokerAgent ? "broker-agent" : "setup",

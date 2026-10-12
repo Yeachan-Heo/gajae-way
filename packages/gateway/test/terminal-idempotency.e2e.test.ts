@@ -122,13 +122,15 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 	});
 	try {
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId: "m-fence",
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body: "왜 두 번 말해?",
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-fence",
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body: "왜 두 번 말해?",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
@@ -145,9 +147,9 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 		await eventually(() => terminals.length >= 1, "reconcile never completed the batch");
 		await Bun.sleep(50);
 		expect(terminals).toEqual([{ trigger: "m-fence", text: "한 번만 말할게" }]);
-		expect(
-			database.inbox.turnRows(database.inbox.nonterminalTurns("discord/channel/chan-1")[0]?.opRef ?? ""),
-		).toEqual([]);
+		expect(database.inbox.turnRows(database.inbox.nonterminalTurns("discord/channel/chan-1")[0]?.opRef ?? "")).toEqual(
+			[],
+		);
 	} finally {
 		await manager.stop();
 	}
@@ -255,13 +257,15 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 	});
 	const enqueue = (messageId: string, body: string, receivedAt: string) =>
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId,
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body,
-				receivedAt,
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId,
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body,
+					receivedAt,
+				}),
+			),
 		).toBe(true);
 	try {
 		// Turn 1 is running when message 2 arrives (steer fails, row stays pending).
@@ -364,13 +368,15 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId,
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body,
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId,
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body,
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 	try {
 		enqueue("m-a1", "첫 질문");
@@ -432,13 +438,15 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 	let recovered: PersonaSessionManager | undefined;
 	try {
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId: "m-q1",
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body: "재시도",
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-q1",
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body: "재시도",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first attempt was not sent");
@@ -464,13 +472,15 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 		expect(port.sends).toHaveLength(1);
 		expect(terminals).toEqual([]);
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId: "m-q2",
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body: "new input after failure",
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-q2",
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body: "new input after failure",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await recovered.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "new input was not sent");
@@ -519,13 +529,15 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 	});
 	try {
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId: "m-l1",
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body: "업그레이드 전 질문",
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-l1",
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body: "업그레이드 전 질문",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
@@ -594,13 +606,15 @@ test("a foreign turn's answer cannot replace the current turn's result-only term
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, {
-				messageId,
-				originKey: "discord/channel/chan-1",
-				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
-				body,
-				receivedAt: new Date().toISOString(),
-			})),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId,
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body,
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 	try {
 		enqueue("m-o1", "야");

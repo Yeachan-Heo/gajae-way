@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
-import { PersonaSessionManager, retryInboundTurn, type PersonaSessionManagerOptions } from "../src/orchestrator/persona-session";
+import {
+	PersonaSessionManager,
+	type PersonaSessionManagerOptions,
+	retryInboundTurn,
+} from "../src/orchestrator/persona-session";
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import { type GatewayServer, messageEditId, renderMessageEdit, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -130,13 +134,15 @@ function enqueue(fixture: DirectFixture, messageId: string, body: string): void 
 	const receivedAt = fixture.clock.iso();
 	fixture.clock.advance();
 	expect(
-		fixture.database.transaction((tx) => fixture.database.inbox.enqueue(tx, {
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		})),
+		fixture.database.transaction((tx) =>
+			fixture.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
@@ -534,12 +540,10 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 
 		upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
-		expect(upgraded.inbox.turnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
-			[
-				["ride-trigger", "trigger", "bound"],
-				["ride-member", "steer", "bound"],
-			],
-		);
+		expect(upgraded.inbox.turnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual([
+			["ride-trigger", "trigger", "bound"],
+			["ride-member", "steer", "bound"],
+		]);
 		expect(upgraded!.transaction((tx) => retryInboundTurn(upgraded!, tx, "gw-p-ride"))).toBe(1);
 		expect(upgraded.inbox.nonterminalTurns("migration/ride")).toEqual([]);
 		expect(upgraded.inbox.pendingOldest("migration/ride")).toMatchObject({

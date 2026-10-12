@@ -18,7 +18,9 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-terminate-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const run: CliRunner = async (args) => {
 		if (args.includes("inspect")) {
 			const sessionId = args[args.indexOf("inspect") + 1]!;
@@ -49,13 +51,15 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 	// The port refuses any session it does not own (#assertOwned): register the
 	// ids these tests will name, exactly as bind() would have.
 	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5"]) {
-		const owned = database.transaction((tx) => database.bindings.recordOwnedBinding(tx, {
-			authority,
-			sessionId,
-			originKey: `loopback/loopback/${sessionId}`,
-			epoch: 0,
-			repo,
-		}));
+		const owned = database.transaction((tx) =>
+			database.bindings.recordOwnedBinding(tx, {
+				authority,
+				sessionId,
+				originKey: `loopback/loopback/${sessionId}`,
+				epoch: 0,
+				repo,
+			}),
+		);
 		if (!owned) throw new Error(`could not register ownership of ${sessionId}`);
 	}
 	return {

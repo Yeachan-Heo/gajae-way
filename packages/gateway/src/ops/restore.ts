@@ -1,9 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { copyFile, chmod, lstat, mkdir, open, readdir, realpath, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	copyFile,
+	lstat,
+	mkdir,
+	open,
+	readdir,
+	realpath,
+	rename,
+	rmdir,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
-import { LeaseHeldError, homeLayout } from "@gajae-gateway/home";
+import { homeLayout, LeaseHeldError } from "@gajae-gateway/home";
 import { gatewayHome } from "../config";
 import { withGatewayLease } from "../offline";
 import { StoreCore } from "../store/core";
@@ -41,7 +54,11 @@ function stagedName(home: string, id: string): string {
 function isStagedName(home: string, name: string): boolean {
 	const prefix = `${databaseName(home)}.restore-`;
 	const suffix = ".tmp";
-	return name.startsWith(prefix) && name.endsWith(suffix) && /^[0-9a-f-]{36}$/.test(name.slice(prefix.length, -suffix.length));
+	return (
+		name.startsWith(prefix) &&
+		name.endsWith(suffix) &&
+		/^[0-9a-f-]{36}$/.test(name.slice(prefix.length, -suffix.length))
+	);
 }
 
 class RestoreRefusedError extends Error {}
@@ -94,7 +111,8 @@ async function exists(path: string): Promise<boolean> {
 async function inspectRegular(path: string): Promise<FileIdentity | null> {
 	try {
 		const info = await lstat(path);
-		if (!info.isFile() || info.isSymbolicLink()) throw new RestoreUnrecoverableError(`unexpected_non_regular_file path=${path}`);
+		if (!info.isFile() || info.isSymbolicLink())
+			throw new RestoreUnrecoverableError(`unexpected_non_regular_file path=${path}`);
 		return { dev: info.dev, ino: info.ino, size: info.size };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -103,7 +121,13 @@ async function inspectRegular(path: string): Promise<FileIdentity | null> {
 }
 
 function sameIdentity(left: FileIdentity | null, right: FileIdentity | null, includeSize = true): boolean {
-	return left !== null && right !== null && left.dev === right.dev && left.ino === right.ino && (!includeSize || left.size === right.size);
+	return (
+		left !== null &&
+		right !== null &&
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		(!includeSize || left.size === right.size)
+	);
 }
 
 function isRecordedInOriginal(journal: RestoreJournal, identity: FileIdentity | null): boolean {
@@ -148,7 +172,11 @@ async function readRestoreJournal(path: string, home: string, backupsDir: string
 		const identity = original[name];
 		if (
 			identity !== null &&
-			(!identity || !Number.isSafeInteger(identity.dev) || !Number.isSafeInteger(identity.ino) || !Number.isSafeInteger(identity.size) || identity.size < 0)
+			(!identity ||
+				!Number.isSafeInteger(identity.dev) ||
+				!Number.isSafeInteger(identity.ino) ||
+				!Number.isSafeInteger(identity.size) ||
+				identity.size < 0)
 		)
 			throw new RestoreUnrecoverableError(`restore_journal_invalid original ${name}`);
 	}
@@ -169,13 +197,22 @@ async function writeRestoreJournal(path: string, home: string, journal: RestoreJ
 	}
 }
 
-async function updateJournal(path: string, home: string, journal: RestoreJournal, phase: RestorePhase): Promise<RestoreJournal> {
+async function updateJournal(
+	path: string,
+	home: string,
+	journal: RestoreJournal,
+	phase: RestorePhase,
+): Promise<RestoreJournal> {
 	const updated: RestoreJournal = { ...journal, phase };
 	await writeRestoreJournal(path, home, updated);
 	return updated;
 }
 
-async function checkBackup(path: string, liveDb: string, backupsDir: string): Promise<{ path: string; sha256: string }> {
+async function checkBackup(
+	path: string,
+	liveDb: string,
+	backupsDir: string,
+): Promise<{ path: string; sha256: string }> {
 	if (!isAbsolute(path)) throw new RestoreRefusedError("restore requires an absolute backup path");
 	const resolved = await realpath(path).catch(() => {
 		throw new RestoreRefusedError(`backup_missing path=${path}`);
@@ -199,7 +236,8 @@ async function checkBackup(path: string, liveDb: string, backupsDir: string): Pr
 	try {
 		const detail = db.integrityCheckDetail();
 		if (detail !== "ok") throw new RestoreRefusedError(`backup_integrity_check_failed detail=${detail}`);
-		if (db.schemaVersion > LATEST_SCHEMA_VERSION) throw new RestoreRefusedError(`backup_newer_schema version=${db.schemaVersion}`);
+		if (db.schemaVersion > LATEST_SCHEMA_VERSION)
+			throw new RestoreRefusedError(`backup_newer_schema version=${db.schemaVersion}`);
 	} finally {
 		db.close();
 	}
@@ -269,12 +307,17 @@ async function validatePreservedContents(home: string, journal: RestoreJournal):
 	const entries = await readdir(journal.preservedDir);
 	const names = liveNames(home);
 	if (entries.some((name) => !names.includes(name)))
-		throw new RestoreUnrecoverableError(`restore_anomaly unexpected_preserved_entry=${entries.find((name) => !names.includes(name))}`);
+		throw new RestoreUnrecoverableError(
+			`restore_anomaly unexpected_preserved_entry=${entries.find((name) => !names.includes(name))}`,
+		);
 }
 
-async function classifyOriginals(home: string, journal: RestoreJournal): Promise<Record<LiveName, "live" | "preserved" | "absent">> {
+async function classifyOriginals(
+	home: string,
+	journal: RestoreJournal,
+): Promise<Record<LiveName, "live" | "preserved" | "absent">> {
 	await validatePreservedContents(home, journal);
-	const completedInstall = journal.phase !== "preserving" && await installCompleted(home, journal);
+	const completedInstall = journal.phase !== "preserving" && (await installCompleted(home, journal));
 	const result = {} as Record<LiveName, "live" | "preserved" | "absent">;
 	const names = liveNames(home);
 	for (const name of names) {
@@ -283,7 +326,8 @@ async function classifyOriginals(home: string, journal: RestoreJournal): Promise
 		const preserved = await inspectRegular(join(journal.preservedDir, name));
 		if (name === databaseName(home) && completedInstall) live = null;
 		if (original === null) {
-			if (live !== null || preserved !== null) throw new RestoreUnrecoverableError(`restore_anomaly ${name}=unexpected`);
+			if (live !== null || preserved !== null)
+				throw new RestoreUnrecoverableError(`restore_anomaly ${name}=unexpected`);
 			result[name] = "absent";
 		} else if (sameIdentity(original, live) && preserved === null) {
 			result[name] = "live";
@@ -317,7 +361,7 @@ async function removeJournal(path: string, home: string): Promise<void> {
 
 async function rollback(journalPath: string, home: string, journal: RestoreJournal): Promise<void> {
 	const states = await classifyOriginals(home, journal);
-	if (journal.phase === "installed" || (journal.phase === "preserved" && await installCompleted(home, journal)))
+	if (journal.phase === "installed" || (journal.phase === "preserved" && (await installCompleted(home, journal))))
 		throw new RestoreUnrecoverableError("restore_abort_after_install_refused");
 	for (const name of liveNames(home)) {
 		if (states[name] !== "preserved") continue;
@@ -376,16 +420,19 @@ async function preserveOriginals(home: string, journalPath: string, initial: Res
 		fault(`after-preserve-${name === dbName ? "db" : name === walName ? "wal" : "shm"}`);
 		states = await classifyOriginals(home, journal);
 	}
-	if (!(await preservationComplete(home, journal))) throw new RestoreUnrecoverableError("restore_preservation_boundary_failed");
+	if (!(await preservationComplete(home, journal)))
+		throw new RestoreUnrecoverableError("restore_preservation_boundary_failed");
 	const preserved = await updateJournal(journalPath, home, journal, "preserved");
 	fault("after-journal-preserved");
 	return preserved;
 }
 
 async function installStaged(home: string, journalPath: string, journal: RestoreJournal): Promise<RestoreJournal> {
-	if (!(await preservationComplete(home, journal))) throw new RestoreUnrecoverableError("restore_install_without_preservation_boundary");
+	if (!(await preservationComplete(home, journal)))
+		throw new RestoreUnrecoverableError("restore_install_without_preservation_boundary");
 	for (const name of liveNames(home)) {
-		if (await exists(join(home, name))) throw new RestoreUnrecoverableError(`restore_install_live_name_occupied=${name}`);
+		if (await exists(join(home, name)))
+			throw new RestoreUnrecoverableError(`restore_install_live_name_occupied=${name}`);
 	}
 	const staged = await inspectRegular(journal.staged);
 	if (!staged || (await sha256File(journal.staged)) !== journal.backupSha256)
@@ -399,12 +446,20 @@ async function installStaged(home: string, journalPath: string, journal: Restore
 	return installed;
 }
 
-async function postCheck(home: string, journalPath: string, journal: RestoreJournal, allowReadOnlySidecars: boolean): Promise<void> {
+async function postCheck(
+	home: string,
+	journalPath: string,
+	journal: RestoreJournal,
+	allowReadOnlySidecars: boolean,
+): Promise<void> {
 	const liveDb = homeLayout(home).db;
 	const identity = await inspectRegular(liveDb);
 	if (!identity || (await sha256File(liveDb)) !== journal.backupSha256)
 		throw new RestoreUnrecoverableError("restore_post_check_backup_bytes_mismatch live_database");
-	if (!(await sidecarsAllowReadOnlyResume(home, journal)) || (!allowReadOnlySidecars && ((await exists(`${liveDb}-wal`)) || (await exists(`${liveDb}-shm`)))))
+	if (
+		!(await sidecarsAllowReadOnlyResume(home, journal)) ||
+		(!allowReadOnlySidecars && ((await exists(`${liveDb}-wal`)) || (await exists(`${liveDb}-shm`))))
+	)
 		throw new RestoreUnrecoverableError("restore_post_check_live_sidecar_present");
 	const database = await StoreCore.openReadonly(liveDb).catch((error: unknown) => {
 		throw new RestoreUnrecoverableError(`restore_post_check_open_failed ${diagnostic(error)}`);
@@ -429,7 +484,12 @@ async function pruneUnjournaledStages(home: string): Promise<void> {
 	}
 }
 
-async function startRestore(home: string, backupPath: string, journalPath: string, backupsDir: string): Promise<RestoreJournal> {
+async function startRestore(
+	home: string,
+	backupPath: string,
+	journalPath: string,
+	backupsDir: string,
+): Promise<RestoreJournal> {
 	const layout = homeLayout(home);
 	await assertDeviceBoundary(home, backupsDir);
 	const backup = await checkBackup(backupPath, layout.db, backupsDir);
@@ -486,7 +546,7 @@ async function continueRestore(home: string, journalPath: string, journal: Resto
 				const staged = await inspectRegular(current.staged);
 				const stagedValid = staged !== null && (await sha256File(current.staged)) === current.backupSha256;
 				if (!stagedValid) {
-					if (await inspectRegular(homeLayout(home).db) !== null)
+					if ((await inspectRegular(homeLayout(home).db)) !== null)
 						throw new RestoreUnrecoverableError("restore_anomaly staged_missing_live_database_present");
 					await rollback(journalPath, home, current);
 					console.error("restore_rolled_back staged_backup_unusable");
@@ -516,7 +576,8 @@ export async function runRestore(
 		return await withGatewayLease(home, async () => {
 			await mkdir(layout.backupsDir, { recursive: true, mode: 0o700 });
 			const backupInfo = await lstat(layout.backupsDir);
-			if (!backupInfo.isDirectory() || backupInfo.isSymbolicLink()) throw new RestoreRefusedError("backup_directory_invalid");
+			if (!backupInfo.isDirectory() || backupInfo.isSymbolicLink())
+				throw new RestoreRefusedError("backup_directory_invalid");
 			await chmod(layout.backupsDir, 0o700);
 			await assertDeviceBoundary(home, layout.backupsDir);
 			if (await exists(journalPath)) {
@@ -526,7 +587,10 @@ export async function runRestore(
 					if (supplied !== journal.backup) throw new RestoreRefusedError("restore_journal_backup_mismatch");
 				}
 				if (options.abort) {
-					if (journal.phase === "installed" || (journal.phase === "preserved" && await installCompleted(home, journal)))
+					if (
+						journal.phase === "installed" ||
+						(journal.phase === "preserved" && (await installCompleted(home, journal)))
+					)
 						throw new RestoreRefusedError("restore_abort_after_install_refused");
 					await rollback(journalPath, home, journal);
 					console.error("restore_rolled_back");

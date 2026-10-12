@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, realpath, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
@@ -22,16 +22,21 @@ async function fixture() {
 	const oldAgent = join(root, "old-agent");
 	const targetAgent = join(root, "target-agent");
 	await Promise.all([mkdir(home), mkdir(oldAgent), mkdir(targetAgent)]);
-	await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, gjc: { agentDir: await realpath(targetAgent) } }));
+	await writeFile(
+		join(home, "config.json"),
+		JSON.stringify({ schemaVersion: 1, gjc: { agentDir: await realpath(targetAgent) } }),
+	);
 	const config = await loadConfig({ home });
 	const layout = homeLayout(home);
 	const database = await Store.open(layout.db, { canonicalAgentDir: await realpath(oldAgent) });
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "open-before-cutover",
-		originKey: "discord:channel:cutover",
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "cutover" }),
-		body: "pending inbound",
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "open-before-cutover",
+			originKey: "discord:channel:cutover",
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "cutover" }),
+			body: "pending inbound",
+		}),
+	);
 	database.close();
 	return { root, home, oldAgent, targetAgent, config, layout };
 }
@@ -101,7 +106,7 @@ test("export failure leaves the live database bytes and authority unchanged", as
 	const f = await fixture();
 	const before = await readSnapshot(f.layout.db);
 	const collect = StoreCore.prototype.collectOpenWork;
-	StoreCore.prototype.collectOpenWork = function () {
+	StoreCore.prototype.collectOpenWork = () => {
 		throw new Error("injected export failure");
 	};
 	try {
@@ -121,9 +126,20 @@ test("export failure leaves the live database bytes and authority unchanged", as
 test("a corrupt record is exported as invalid before settlement refuses it", async () => {
 	const f = await fixture();
 	const raw = new Database(f.layout.db);
-	raw.query(
-		"INSERT INTO lane_jobs(job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-	).run("lanejob-cutover-invalid", "invalid-lane", "main", f.home, "running", "{broken", new Date().toISOString(), new Date().toISOString());
+	raw
+		.query(
+			"INSERT INTO lane_jobs(job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		)
+		.run(
+			"lanejob-cutover-invalid",
+			"invalid-lane",
+			"main",
+			f.home,
+			"running",
+			"{broken",
+			new Date().toISOString(),
+			new Date().toISOString(),
+		);
 	raw.close();
 	const beforeDatabase = await Store.openReadonly(f.layout.db);
 	const beforeAuthority = beforeDatabase.bindings.authority;

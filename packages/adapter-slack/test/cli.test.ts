@@ -17,7 +17,6 @@ test("Slack argv is resolved before connection work", () => {
 
 for (const flag of ["--help", "--version", "--boot-now"]) {
 	test(`Slack ${flag} exits without writing a lease`, async () => {
-
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-slack-cli-"));
 		try {
 			const child = Bun.spawn(["bun", join(import.meta.dir, "../src/main.ts"), flag], {

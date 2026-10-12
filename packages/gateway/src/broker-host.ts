@@ -1,13 +1,12 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import { access, lstat, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { acquireLease, LeaseHeldError, type Lease } from "@gajae-gateway/home";
-import { homeLayout } from "@gajae-gateway/home";
-import type { GatewayConfig } from "./config";
-import { BROKER_ENV_PROTECTED_KEYS, LIVE_BROKER_ENV_KEYS, resolveBrokerAgentSource } from "./broker-agent/allowlist";
+import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { assertAgentDb } from "./broker-agent/agent-db";
+import { BROKER_ENV_PROTECTED_KEYS, LIVE_BROKER_ENV_KEYS, resolveBrokerAgentSource } from "./broker-agent/allowlist";
 import { assertAgentDirectory, BrokerAgentError, recoverProvision } from "./broker-agent/provision";
+import type { GatewayConfig } from "./config";
 import { GJC_ATTACH_ONLY_ENV, readPinnedGjcVersion } from "./orchestrator/broker";
 
 const BROKER_ENV_FILE = "broker.env";
@@ -32,12 +31,14 @@ export async function runBrokerHost(config: GatewayConfig): Promise<number> {
 		const agentReal = await realpath(agentDir);
 		const operatorAgent = resolveBrokerAgentSource();
 		const operatorReal = await realpath(operatorAgent).catch(() => resolve(operatorAgent));
-		if (agentReal === operatorReal) throw new BrokerAgentError("broker_agent_live_link", "agentDir is the operator agent directory");
+		if (agentReal === operatorReal)
+			throw new BrokerAgentError("broker_agent_live_link", "agentDir is the operator agent directory");
 
 		await recoverProvision(config.home, agentDir, lease);
 		const manifest = await readProvisionManifest(layout.brokerProvisionManifest);
 		if (!manifest) throw new BrokerAgentError("broker_agent_unprovisioned", "manifest is absent or invalid");
-		if (manifest.agentDir !== agentReal) throw new BrokerAgentError("broker_agent_unrecoverable", "manifest agentDir does not match config");
+		if (manifest.agentDir !== agentReal)
+			throw new BrokerAgentError("broker_agent_unrecoverable", "manifest agentDir does not match config");
 		await validateTargetAgentDb(agentDir);
 
 		const brokerEnv = await readBrokerEnvironment(join(config.home, BROKER_ENV_FILE));
@@ -46,7 +47,8 @@ export async function runBrokerHost(config: GatewayConfig): Promise<number> {
 				throw new BrokerAgentError("broker_agent_live_link", `refused ${key}`);
 		}
 		for (const key of BROKER_ENV_PROTECTED_KEYS.slice(LIVE_BROKER_ENV_KEYS.length)) {
-			if (brokerEnv[key] !== undefined) throw new BrokerAgentError("broker_agent_live_link", `broker.env may not set ${key}`);
+			if (brokerEnv[key] !== undefined)
+				throw new BrokerAgentError("broker_agent_live_link", `broker.env may not set ${key}`);
 		}
 
 		const exe = await realpath(layout.gjcExecutable());
@@ -61,7 +63,8 @@ export async function runBrokerHost(config: GatewayConfig): Promise<number> {
 		};
 		const version = await versionOf(exe, env, config.home);
 		const pinned = readPinnedGjcVersion();
-		if (version !== pinned) throw new Error(`broker_host_version_mismatch running=${version ?? "unknown"} required=${pinned}`);
+		if (version !== pinned)
+			throw new Error(`broker_host_version_mismatch running=${version ?? "unknown"} required=${pinned}`);
 		return await runForegroundBroker(exe, agentDir, env, config.home);
 	} catch (error) {
 		console.error(`broker_host_refused ${error instanceof Error ? error.message : String(error)}`);
@@ -78,7 +81,12 @@ async function readProvisionManifest(path: string): Promise<Record<string, unkno
 		const value: unknown = JSON.parse(await readFile(path, "utf8"));
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const record = value as Record<string, unknown>;
-		if (record.version !== 2 || typeof record.genId !== "string" || !record.entries || typeof record.entries !== "object")
+		if (
+			record.version !== 2 ||
+			typeof record.genId !== "string" ||
+			!record.entries ||
+			typeof record.entries !== "object"
+		)
 			return undefined;
 		return record;
 	} catch (error) {
@@ -96,15 +104,21 @@ async function validateTargetAgentDb(agentDir: string): Promise<void> {
 }
 
 async function readBrokerEnvironment(path: string): Promise<Record<string, string>> {
-	let info;
+	let info: Stats;
 	try {
 		info = await lstat(path);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-		throw new BrokerAgentError("broker_agent_live_link", `broker.env unavailable: ${(error as NodeJS.ErrnoException).code ?? "unknown"}`);
+		throw new BrokerAgentError(
+			"broker_agent_live_link",
+			`broker.env unavailable: ${(error as NodeJS.ErrnoException).code ?? "unknown"}`,
+		);
 	}
 	if (info.isSymbolicLink() || !info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600)
-		throw new BrokerAgentError("broker_agent_live_link", "broker.env must be a regular file with mode 0600 and one link");
+		throw new BrokerAgentError(
+			"broker_agent_live_link",
+			"broker.env must be a regular file with mode 0600 and one link",
+		);
 	const result: Record<string, string> = {};
 	for (const [index, raw] of (await readFile(path, "utf8")).split(/\r?\n/).entries()) {
 		const line = raw.trim();
@@ -130,7 +144,12 @@ async function versionOf(exe: string, env: NodeJS.ProcessEnv, cwd: string): Prom
 	return (stdout || stderr).match(/\b(\d+\.\d+\.\d+)\b/)?.[1];
 }
 
-async function runForegroundBroker(exe: string, agentDir: string, env: NodeJS.ProcessEnv, cwd: string): Promise<number> {
+async function runForegroundBroker(
+	exe: string,
+	agentDir: string,
+	env: NodeJS.ProcessEnv,
+	cwd: string,
+): Promise<number> {
 	const args = [exe, "sdk", "broker", "run", "--agent-dir", agentDir];
 	const child = Bun.spawn(args, { cwd, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
 	const envKeys = Object.keys(env).sort().join(",");

@@ -1,7 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-
-import { createServer, type Server } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeFrame, PROFILE_VERSION } from "@gajae-gateway/protocol";

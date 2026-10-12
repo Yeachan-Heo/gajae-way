@@ -1,6 +1,5 @@
-import { acquireLease, exitOnLeaseHeld, LeaseHeldError, type Lease } from "@gajae-gateway/home";
-
 import { join } from "node:path";
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -1488,7 +1487,9 @@ export class ReconnectingGateway {
 			const options = {
 				clientName: "adapter-discord",
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
-					console.warn(`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`),
+					console.warn(
+						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
+					),
 			};
 			const client = initial
 				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
@@ -2275,17 +2276,16 @@ function threadActivityTimestamp(thread: RecoveryThreadLike): number {
 		return Number((BigInt(thread.lastMessageId) >> 22n) + 1_420_070_400_000n);
 	return 0;
 }
-export async function runDiscordAdapterWithLease<T>(
-	home: string,
-	start: (lease: Lease) => Promise<T>,
-): Promise<T> {
+export async function runDiscordAdapterWithLease<T>(home: string, start: (lease: Lease) => Promise<T>): Promise<T> {
 	let lease: Lease;
 	try {
 		lease = await acquireLease(home, "adapter-discord");
 		console.info(`lease_acquired name=adapter-discord pid=${process.pid}`);
 	} catch (error) {
 		if (!(error instanceof LeaseHeldError))
-			console.error(`lease_failed name=adapter-discord detail=${error instanceof Error ? error.message : String(error)}`);
+			console.error(
+				`lease_failed name=adapter-discord detail=${error instanceof Error ? error.message : String(error)}`,
+			);
 		throw error;
 	}
 	try {
@@ -2344,7 +2344,9 @@ if (import.meta.main) {
 						process.exit(0);
 					},
 					(error) => {
-						console.error(`Discord adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`);
+						console.error(
+							`Discord adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+						);
 						disposeLogging();
 						process.exit(1);
 					},

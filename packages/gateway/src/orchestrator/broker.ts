@@ -22,7 +22,6 @@ export {
 } from "./broker-liveness";
 export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 
-
 /**
  * Candidate locations for the pinned GJC version, in priority order.
  *
@@ -743,8 +742,7 @@ export class GlobalGjcClient {
 			if (Date.now() >= deadline) this.#unavailable("command queue timed out");
 		}
 		this.#assertAgentDirIdentity(true);
-		if (this.#stopped || (this.#started && !this.#available))
-			this.#unavailable("client stopped or broker unavailable");
+		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
 		this.#inflight++;
 		if (priority === "background") this.#backgroundInFlight++;
 		try {

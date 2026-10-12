@@ -3,8 +3,8 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import type { InboundTurn } from "../src/store/groups/inbox";
 import { Store } from "../src/store";
+import type { InboundTurn } from "../src/store/groups/inbox";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "coverage" } as const;
@@ -70,20 +70,17 @@ async function fixture(
 	};
 }
 
-function enqueue(
-	database: Store,
-	messageId: string,
-	body: string,
-	receivedAt = new Date().toISOString(),
-): void {
+function enqueue(database: Store, messageId: string, body: string, receivedAt = new Date().toISOString()): void {
 	expect(
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		})),
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 

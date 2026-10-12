@@ -1140,7 +1140,9 @@ test("RT-DISCORD-04 an inbound custom emoji is custom:name metadata that never b
 	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
 	expect(database.outbox.rows()).toHaveLength(0);
-	expect(database.inbox.contextUnread(ORIGIN_KEY, 10)[0]?.body).toBe("[reaction] reacted custom:lobster to message target-1");
+	expect(database.inbox.contextUnread(ORIGIN_KEY, 10)[0]?.body).toBe(
+		"[reaction] reacted custom:lobster to message target-1",
+	);
 	// The exact metadata spelling cannot round-trip into an outbound reaction: feed
 	// back what describeInboundReaction actually produced, not a hand-written string,
 	// or the assertion proves nothing about the spelling under test.

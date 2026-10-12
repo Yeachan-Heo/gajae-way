@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { BrokerSessionPort, MAX_POISONED_CREATE_ROTATIONS, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
+import {
+	BrokerSessionPort,
+	MAX_POISONED_CREATE_ROTATIONS,
+	SessionRequestTimeoutError,
+} from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import {
@@ -40,7 +44,10 @@ test("opt-in fake ownership records only successful binds and refuses unknown sa
 	await port.resume({ sessionId: "owned-0", repo, originKey: "origin", epoch: 0 });
 	expect(database.bindings.getSessionRecord("origin")).toMatchObject({ sessionId: "owned-1", epoch: 1 });
 	const authority = initializeTestBrokerAuthority(database, agentDir);
-	expect(database.bindings.assertOwnedSession("owned-0", repo, authority)).toMatchObject({ originKey: "origin", epoch: 0 });
+	expect(database.bindings.assertOwnedSession("owned-0", repo, authority)).toMatchObject({
+		originKey: "origin",
+		epoch: 0,
+	});
 	const failing = attachTestBrokerOwnership(
 		database,
 		new ScriptedSessionPort({
@@ -158,9 +165,9 @@ test("a successful owned binding clears the poisoned-create rotation budget", as
 
 	mode = "fail";
 	inspectGone = true;
-	await expect(
-		port.bind({ originKey, epoch: MAX_POISONED_CREATE_ROTATIONS, repo }),
-	).rejects.toMatchObject({ details: { code: "resource_gone" } });
+	await expect(port.bind({ originKey, epoch: MAX_POISONED_CREATE_ROTATIONS, repo })).rejects.toMatchObject({
+		details: { code: "resource_gone" },
+	});
 	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(MAX_POISONED_CREATE_ROTATIONS + 2);
 	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBe("1");
 });
@@ -251,7 +258,9 @@ test("session.create diagnostics are sanitized before failures reach callers", a
 		return createFailure("invalid_params", `Authorization: Bearer ${secret}; api_key=${secret}`);
 	};
 	const { port, repo } = await brokerPortFixture(run);
-	const failure = await port.bind({ originKey: "discord/dm/redacted-bind", epoch: 0, repo }).catch((error: unknown) => error);
+	const failure = await port
+		.bind({ originKey: "discord/dm/redacted-bind", epoch: 0, repo })
+		.catch((error: unknown) => error);
 
 	expect(failure).toBeInstanceOf(GjcCliError);
 	expect(String((failure as Error).message)).not.toContain(secret);
@@ -767,7 +776,10 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
 		expect(binding.sessionId).toBe("fresh-session");
 		expect(binding.epoch).toBe(2);
-		expect(database.bindings.getSessionRecord("monitor/eventtype/x")).toMatchObject({ epoch: 2, sessionId: "fresh-session" });
+		expect(database.bindings.getSessionRecord("monitor/eventtype/x")).toMatchObject({
+			epoch: 2,
+			sessionId: "fresh-session",
+		});
 	} finally {
 		database.close();
 		await rm(home, { recursive: true, force: true });
@@ -993,7 +1005,11 @@ test("legacy private bindings cannot initialize a global port or be resumed and 
 				tailRunner: new TailRunner({ stream: noRelay, repo: home }),
 			}),
 	).toThrow(BrokerAuthorityError);
-	expect(() => database!.transaction((tx) => database!.bindings.initializeAuthority(tx, authority, database!.inspectBrokerAuthority().populated))).toThrow(BrokerAuthorityError);
+	expect(() =>
+		database!.transaction((tx) =>
+			database!.bindings.initializeAuthority(tx, authority, database!.inspectBrokerAuthority().populated),
+		),
+	).toThrow(BrokerAuthorityError);
 	expect(database.bindings.getSessionRecord("legacy")).toMatchObject({ sessionId: "private-session", epoch: 0 });
 	expect(calls).toEqual([]);
 });
@@ -1075,7 +1091,13 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		canonicalAgentDir: join(home, "other-agent"),
 		identity: `gjc:${join(home, "other-agent")}`,
 	};
-	database!.transaction((tx) => database!.bindings.cutoverBrokerAuthority(tx, { expectedAuthority: authority, targetAuthority, evidence: "test fixture cutover" }));
+	database!.transaction((tx) =>
+		database!.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: authority,
+			targetAuthority,
+			evidence: "test fixture cutover",
+		}),
+	);
 	await expect(port.bind({ originKey: "origin", epoch: 2, repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
 	await expect(port.fetchLastAssistant({ sessionId: "retired-owned", repo })).rejects.toBeInstanceOf(
 		BrokerAuthorityError,
@@ -1171,12 +1193,14 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 	expect(() => database!.inspectBrokerAuthority()).toThrow();
 	expect(database.work.laneJobJson("lanejob-unrelated")).toBe("{");
 	expect(() =>
-		database!.transaction((tx) => database!.bindings.cutoverBrokerAuthority(tx, {
-			expectedAuthority: authority,
-			targetAuthority: { ...authority, identity: "different" },
-			evidence: "must validate history",
-			disposition: "quarantine",
-		})),
+		database!.transaction((tx) =>
+			database!.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: authority,
+				targetAuthority: { ...authority, identity: "different" },
+				evidence: "must validate history",
+				disposition: "quarantine",
+			}),
+		),
 	).toThrow();
 	await expect(port.fetchLastAssistant({ sessionId: "foreign", repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
 	await expect(port.setModel({ sessionId: "foreign", repo, selection: "model" })).rejects.toBeInstanceOf(

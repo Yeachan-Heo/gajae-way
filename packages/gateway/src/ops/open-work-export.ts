@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, fsyncSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	fsyncSync,
+	lstatSync,
+	openSync,
+	readSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { BrokerAuthority } from "../store/groups/bindings";
 import type { OpenWorkReport } from "../store/open-work";

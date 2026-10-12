@@ -117,13 +117,15 @@ function enqueue(
 	receivedAt = new Date().toISOString(),
 ): void {
 	expect(
-		fixture.database.transaction((tx) => fixture.database.inbox.enqueue(tx, {
-			messageId,
-			originKey: DIRECT_ORIGIN_KEY,
-			originRefJson: JSON.stringify(DIRECT_ORIGIN),
-			body,
-			receivedAt,
-		})),
+		fixture.database.transaction((tx) =>
+			fixture.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: DIRECT_ORIGIN_KEY,
+				originRefJson: JSON.stringify(DIRECT_ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
@@ -379,10 +381,7 @@ test("C2a: a 20-message burst has one send, nineteen ordered steers, and no unbo
 		expect(steerBodies(fixture.port)).toEqual(Array.from({ length: 19 }, (_, index) => `message ${index + 1}`));
 		expect(fixture.database.inbox.pendingOldest(DIRECT_ORIGIN_KEY)).toBeUndefined();
 		fixture.port.complete(required(fixture.port.sends[0], "burst trigger missing").opRef, "burst answer");
-		await eventually(
-			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
-			"burst turn did not complete",
-		);
+		await eventually(() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0, "burst turn did not complete");
 		expect(fixture.terminals).toEqual([{ trigger: "burst-0", text: "burst answer" }]);
 	} finally {
 		await fixture.close();

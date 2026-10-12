@@ -21,27 +21,30 @@ async function fixture() {
 	await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
 	const path = join(home, "gateway.db");
 	const database = await Store.open(path, { canonicalAgentDir: join(home, "agent") });
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "open-inbound",
-		originKey: "discord:channel:census",
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "census" }),
-		body: "pending",
-	}));
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: "lanejob-invalid-census",
-		laneKey: "census-lane",
-		state: "running",
-		createdAt: new Date().toISOString(),
-		updatedAt: new Date().toISOString(),
-		lane: { branch: "main", worktreePath: home },
-		json: "{broken",
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "open-inbound",
+			originKey: "discord:channel:census",
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "census" }),
+			body: "pending",
+		}),
+	);
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: "lanejob-invalid-census",
+			laneKey: "census-lane",
+			state: "running",
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			lane: { branch: "main", worktreePath: home },
+			json: "{broken",
+		}),
+	);
 	database.close();
 	const raw = new Database(path);
-	raw.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, ?)").run(
-		"lanejob-invalid-census",
-		"cutover-census",
-	);
+	raw
+		.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, ?)")
+		.run("lanejob-invalid-census", "cutover-census");
 	raw.close();
 	return { home, path, config: await loadConfig({ home }) };
 }
@@ -51,7 +54,10 @@ test("census is a read-only v32 view and reports quarantined invalid work by cut
 	const before = await readFile(f.path);
 	const report = await runCensus(f.config);
 	expect(report.schemaVersion).toBe(32);
-	expect(report.authority).toEqual({ canonicalAgentDir: join(f.home, "agent"), identity: `gjc:${join(f.home, "agent")}` });
+	expect(report.authority).toEqual({
+		canonicalAgentDir: join(f.home, "agent"),
+		identity: `gjc:${join(f.home, "agent")}`,
+	});
 	expect(report.authorityCounts.openInbound).toBe(1);
 	expect(report.tableCounts.inbound_messages).toBe(1);
 	expect(report.quickCheck).toBe("ok");

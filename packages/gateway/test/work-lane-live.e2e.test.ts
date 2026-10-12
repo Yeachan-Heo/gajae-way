@@ -5,7 +5,12 @@ import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
-import { GJC_ATTACH_ONLY_ENV, GjcCliUnavailableError, GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
+import {
+	GJC_ATTACH_ONLY_ENV,
+	GjcCliUnavailableError,
+	GlobalGjcClient,
+	readBrokerDiscovery,
+} from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
 import { BrokerSessionPort, isSteerAccepted } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
@@ -179,7 +184,9 @@ liveTest(
 		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000, log: () => {} });
 		const canonicalAgentDir = await realpath(agentDir);
 		const brokerAuthority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, brokerAuthority, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, brokerAuthority, database.inspectBrokerAuthority().populated),
+		);
 		const configSnapshot = async () => {
 			const snapshot = new Map<string, Buffer | null>();
 			for (const name of ["models.yml", "settings.json", "auth.json", "config.yml", "config.json"]) {

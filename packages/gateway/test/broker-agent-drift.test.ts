@@ -21,7 +21,9 @@ async function fixture() {
 	await mkdir(home, { recursive: true, mode: 0o700 });
 	await mkdir(source);
 	const database = new Database(join(source, "agent.db"));
-	database.exec("CREATE TABLE auth_credentials (provider TEXT, token TEXT); INSERT INTO auth_credentials VALUES ('p', 'token');");
+	database.exec(
+		"CREATE TABLE auth_credentials (provider TEXT, token TEXT); INSERT INTO auth_credentials VALUES ('p', 'token');",
+	);
 	database.close();
 	return { root, home, source, agentDir };
 }

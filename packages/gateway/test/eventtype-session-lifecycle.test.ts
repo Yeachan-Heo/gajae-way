@@ -47,10 +47,13 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 			originKey(monitorSessionOrigin(monitor.monitorId, "build")),
 		]);
 		expect(calls.map((call) => call.epoch)).toEqual([0, 0]);
-		database.transaction((tx) => database.bindings.rotateEpoch(tx,
-			originKey(monitorSessionOrigin(monitor.monitorId, "build")),
-			JSON.stringify(monitorSessionOrigin(monitor.monitorId, "build")),
-		));
+		database.transaction((tx) =>
+			database.bindings.rotateEpoch(
+				tx,
+				originKey(monitorSessionOrigin(monitor.monitorId, "build")),
+				JSON.stringify(monitorSessionOrigin(monitor.monitorId, "build")),
+			),
+		);
 		pipeline.submit(monitor.monitorId, "build", {});
 		await Bun.sleep(20);
 		expect(calls[2]!.epoch).toBe(1);

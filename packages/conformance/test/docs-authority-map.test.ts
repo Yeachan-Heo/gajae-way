@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import { LEASE_NAMES } from "../../home/src/layout";
 import { OWNER_FILE, TABLE_OWNER } from "../../gateway/src/store/ownership";
+import { LEASE_NAMES } from "../../home/src/layout";
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
 const MARKDOWN_DIRECTORIES = ["docs", "packages/gateway/src/persona/self-ops"] as const;

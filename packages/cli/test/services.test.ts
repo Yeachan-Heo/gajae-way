@@ -2,7 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BROKER_UNIT, GATEWAY_UNIT, installServices, restartStackCommands, serviceSpecs, systemdUnitName } from "../src/services";
+import {
+	BROKER_UNIT,
+	GATEWAY_UNIT,
+	installServices,
+	restartStackCommands,
+	serviceSpecs,
+	systemdUnitName,
+} from "../src/services";
 
 async function configuredHome(): Promise<{ home: string; cleanup: () => Promise<void> }> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-services-"));
@@ -73,7 +80,9 @@ test("a darwin install still writes launch agents, not units", async () => {
 		for (const path of paths) {
 			expect(path.startsWith(join(home, "agents"))).toBe(true);
 			expect(path.endsWith(".plist")).toBe(true);
-			const contents = [...written.values()].find((candidate) => candidate.includes(path.split("/").at(-1)?.replace(".plist", "") ?? ""));
+			const contents = [...written.values()].find((candidate) =>
+				candidate.includes(path.split("/").at(-1)?.replace(".plist", "") ?? ""),
+			);
 			expect(contents).toBeDefined();
 			expect(contents).toContain("<key>RunAtLoad</key><true/>");
 			expect(contents).toContain("<key>KeepAlive</key><true/>");

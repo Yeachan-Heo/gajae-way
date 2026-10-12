@@ -13,7 +13,9 @@ test("migrates the sessions foundation", async () => {
 		const database = await Store.open(join(directory, "gateway.db"));
 		expect(database.schemaVersion).toBe(32);
 
-		database.transaction((tx) => database.memory.createIntent(tx, { id: "memory-schema", kind: "daily_capture", payloadJson: "{}" }));
+		database.transaction((tx) =>
+			database.memory.createIntent(tx, { id: "memory-schema", kind: "daily_capture", payloadJson: "{}" }),
+		);
 		expect(database.memory.rows()[0]).toMatchObject({
 			state: "queued",
 			attempts: 0,
@@ -86,7 +88,9 @@ test("adds quarantine diagnostics to existing memory intents", async () => {
 	const path = join(directory, "gateway.db");
 	try {
 		const current = await Store.open(path);
-		current.transaction((tx) => current.memory.createIntent(tx, { id: "legacy-intent", kind: "daily_capture", payloadJson: "{}" }));
+		current.transaction((tx) =>
+			current.memory.createIntent(tx, { id: "legacy-intent", kind: "daily_capture", payloadJson: "{}" }),
+		);
 		current.close();
 
 		const legacy = new Database(path);
@@ -113,22 +117,28 @@ test("/new discards platform input but preserves internal lane reports", async (
 	try {
 		const database = await Store.open(join(directory, "gateway.db"));
 		const key = originKey(LOOPBACK_ORIGIN);
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "platform-before-new",
-			originKey: key,
-			originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
-			body: "platform message",
-			receivedAt: "2026-09-01T00:00:00.000Z",
-		}));
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "lane-report-internal",
-			originKey: key,
-			originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
-			body: "internal report",
-			receivedAt: "2026-09-01T00:00:01.000Z",
-			source: "lane_report",
-		}));
-		expect(database.transaction((tx) => database.inbox.discardBefore(tx, key, "2026-09-02T00:00:00.000Z"))).toEqual(["platform-before-new"]);
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "platform-before-new",
+				originKey: key,
+				originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+				body: "platform message",
+				receivedAt: "2026-09-01T00:00:00.000Z",
+			}),
+		);
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "lane-report-internal",
+				originKey: key,
+				originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+				body: "internal report",
+				receivedAt: "2026-09-01T00:00:01.000Z",
+				source: "lane_report",
+			}),
+		);
+		expect(database.transaction((tx) => database.inbox.discardBefore(tx, key, "2026-09-02T00:00:00.000Z"))).toEqual([
+			"platform-before-new",
+		]);
 		expect(database.inbox.pendingOldest(key)).toMatchObject({
 			message_id: "lane-report-internal",
 			source: "lane_report",
@@ -146,12 +156,14 @@ test("adds last_error to existing deliveries without touching their state (#171)
 	const path = join(directory, "gateway.db");
 	try {
 		const current = await Store.open(path);
-		current.transaction((tx) => current.outbox.create(tx, {
-			deliveryId: "legacy-delivery",
-			turnId: "turn",
-			originKey: "discord/channel/c",
-			payloadJson: "{}",
-		}));
+		current.transaction((tx) =>
+			current.outbox.create(tx, {
+				deliveryId: "legacy-delivery",
+				turnId: "turn",
+				originKey: "discord/channel/c",
+				payloadJson: "{}",
+			}),
+		);
 		const seeded = new Database(path);
 		seeded.query("UPDATE deliveries SET attempts = 2 WHERE delivery_id = ?").run("legacy-delivery");
 		seeded.close();

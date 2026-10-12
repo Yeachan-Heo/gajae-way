@@ -113,13 +113,15 @@ test("failed turn preserves selected context; later successful text consumes it 
 		},
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort, () => {
-		database.transaction((tx) => database.inbox.contextRecord(tx, {
-			messageId: "context-bot",
-			originKey: ORIGIN_KEY,
-			authorId: "bot-2",
-			authorName: "helper-bot",
-			body: "current bounded bot context",
-		}));
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, {
+				messageId: "context-bot",
+				originKey: ORIGIN_KEY,
+				authorId: "bot-2",
+				authorName: "helper-bot",
+				body: "current bounded bot context",
+			}),
+		);
 	});
 
 	send(client, "trigger-failed", "first owner request");
@@ -127,7 +129,8 @@ test("failed turn preserves selected context; later successful text consumes it 
 		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
 	);
 	expect(
-		database.inbox.contextUnread(ORIGIN_KEY)
+		database.inbox
+			.contextUnread(ORIGIN_KEY)
 			.map((row) => row.message_id)
 			.sort(),
 	).toEqual(["context-bot", "trigger-failed"]);
@@ -170,7 +173,9 @@ test("a delivered intermediate reply followed by runtime failure consumes the se
 		},
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort, () => {
-		database.transaction((tx) => database.inbox.contextRecord(tx, { messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" }));
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, { messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" }),
+		);
 	});
 	send(client, "intermediate-trigger", "owner request");
 	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
@@ -340,7 +345,9 @@ test("/new persists a floor that excludes pre-reset context after gateway restar
 		},
 	});
 	let { client } = await start(gatewayConfig, database, sessionPort, () => {
-		database.transaction((tx) => database.inbox.contextRecord(tx, { messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" }));
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, { messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" }),
+		);
 	});
 	send(client, "reset-command", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));

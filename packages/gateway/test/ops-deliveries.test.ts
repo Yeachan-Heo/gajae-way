@@ -83,12 +83,7 @@ async function startDeliveryServer() {
 test("ops.deliveries returns newest first and truncates text prefixes at 80 characters", async () => {
 	const { client } = await startDeliveryServer();
 	const result = await client.opsDeliveries();
-	expect(result.rows.map((row) => row.deliveryId)).toEqual([
-		"delivery-4",
-		"delivery-3",
-		"delivery-2",
-		"delivery-1",
-	]);
+	expect(result.rows.map((row) => row.deliveryId)).toEqual(["delivery-4", "delivery-3", "delivery-2", "delivery-1"]);
 	expect(result.rows[0]).toMatchObject({
 		deliveryId: "delivery-4",
 		turnId: "turn-delivery-4",

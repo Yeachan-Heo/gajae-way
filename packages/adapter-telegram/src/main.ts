@@ -1,4 +1,4 @@
-import { acquireLease, exitOnLeaseHeld, LeaseHeldError, type Lease } from "@gajae-gateway/home";
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
@@ -376,7 +376,9 @@ class ReconnectingGateway implements GatewayClientLike {
 			const options = {
 				clientName: "adapter-telegram",
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
-					console.warn(`gateway_socket_waiting client=adapter-telegram path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`),
+					console.warn(
+						`gateway_socket_waiting client=adapter-telegram path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
+					),
 			};
 			const client = initial
 				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
@@ -430,7 +432,6 @@ class ReconnectingGateway implements GatewayClientLike {
 	}
 }
 
-
 function defaultGatewaySocket(): string {
 	return `${adapterHome()}/gateway.sock`;
 }
@@ -443,17 +444,16 @@ function isTelegramResult(value: unknown): value is { readonly ok: true; readonl
 	return isObject(value) && value.ok === true && "result" in value;
 }
 
-export async function runTelegramAdapterWithLease<T>(
-	home: string,
-	start: (lease: Lease) => Promise<T>,
-): Promise<T> {
+export async function runTelegramAdapterWithLease<T>(home: string, start: (lease: Lease) => Promise<T>): Promise<T> {
 	let lease: Lease;
 	try {
 		lease = await acquireLease(home, "adapter-telegram");
 		console.info(`lease_acquired name=adapter-telegram pid=${process.pid}`);
 	} catch (error) {
 		if (!(error instanceof LeaseHeldError))
-			console.error(`lease_failed name=adapter-telegram detail=${error instanceof Error ? error.message : String(error)}`);
+			console.error(
+				`lease_failed name=adapter-telegram detail=${error instanceof Error ? error.message : String(error)}`,
+			);
 		throw error;
 	}
 	try {
@@ -469,7 +469,9 @@ if (import.meta.main) {
 			void lease.release().then(
 				() => process.exit(0),
 				(error) => {
-					console.error(`Telegram adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`);
+					console.error(
+						`Telegram adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
 					process.exit(1);
 				},
 			);

@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/store";
 import { DeliveryService } from "../src/delivery/delivery";
+import { Store } from "../src/store";
 
 let home = "";
 let child: ReturnType<typeof Bun.spawn> | undefined;

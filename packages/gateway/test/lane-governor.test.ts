@@ -45,7 +45,9 @@ function persistJob(name: string, state: "done" | "aborted" | "running", open = 
 		});
 	}
 	record = { ...record, state };
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 }
 
 test("activeLanes includes only bound work origins and derives idle time from activity", async () => {
@@ -181,15 +183,17 @@ test("a corrupt lane-job record fails closed: counted, never retired", async () 
 	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000);
 	const identity = laneJobIdentity("a");
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: identity.jobId,
-		laneKey: identity.laneKey,
-		state: "running",
-		createdAt: new Date(NOW).toISOString(),
-		updatedAt: new Date(NOW).toISOString(),
-		lane: { branch: "work/a", worktreePath: "/tmp/worker-repo" },
-		json: "{not json",
-	}));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: identity.jobId,
+			laneKey: identity.laneKey,
+			state: "running",
+			createdAt: new Date(NOW).toISOString(),
+			updatedAt: new Date(NOW).toISOString(),
+			lane: { branch: "work/a", worktreePath: "/tmp/worker-repo" },
+			json: "{not json",
+		}),
+	);
 	const port = new ScriptedSessionPort();
 	// Set session as live to prevent sweep second pass from releasing it
 	port.setSessionState("sess-a", { live: true });
@@ -224,7 +228,9 @@ test("an attempt the ledger ended without broker proof is retired only once the 
 		errorCode: "gateway_turn_reaped",
 		endedAt: new Date(NOW - 120_000).toISOString(),
 	});
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 	const port = new ScriptedSessionPort();
 	port.setSessionState(SESSION_ID, { live: true, repo: "/tmp/worker-repo" });
 	const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 60_000, now: () => NOW });
@@ -305,7 +311,9 @@ test("a ledger `failed` attempt is local evidence only: retirement waits for bro
 	// The gateway recorded `failed` because its status poll threw after an
 	// accepted send; the broker operation itself may still be running.
 	record = closeAttempt({ record, opRef, endState: "failed", endedAt: new Date(NOW - 120_000).toISOString() });
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 	class InFlightPort extends ScriptedSessionPort {
 		override async status(input: { sessionId: string; repo: string; opRef: string }) {
 			return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
@@ -325,15 +333,17 @@ test("an existing lane-job row with an empty body is corrupt, not absent", async
 	database = await Store.open(":memory:");
 	bind("a", NOW - 10 * 60_000);
 	const identity = laneJobIdentity("a");
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: identity.jobId,
-		laneKey: identity.laneKey,
-		state: "running",
-		createdAt: new Date(NOW).toISOString(),
-		updatedAt: new Date(NOW).toISOString(),
-		lane: { branch: "work/a", worktreePath: "/tmp/worker-repo" },
-		json: "",
-	}));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: identity.jobId,
+			laneKey: identity.laneKey,
+			state: "running",
+			createdAt: new Date(NOW).toISOString(),
+			updatedAt: new Date(NOW).toISOString(),
+			lane: { branch: "work/a", worktreePath: "/tmp/worker-repo" },
+			json: "",
+		}),
+	);
 	const port = new ScriptedSessionPort();
 	// Set session as live to prevent sweep second pass from releasing it
 	port.setSessionState("sess-a", { live: true });
@@ -376,12 +386,14 @@ test("quarantined historical names refuse admission and retirement before recove
 	bind("old", NOW, SESSION_ID);
 	persistJob("old", "running", true);
 	const history = database.work.laneJobJson(laneJobIdentity("old").jobId);
-	database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-		expectedAuthority: null,
-		targetAuthority: { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" },
-		evidence: "test operator quarantined old work",
-		disposition: "quarantine",
-	}));
+	database.transaction((tx) =>
+		database.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: null,
+			targetAuthority: { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" },
+			evidence: "test operator quarantined old work",
+			disposition: "quarantine",
+		}),
+	);
 	const port = new ScriptedSessionPort();
 	let recoveryCalls = 0;
 	let lockCalls = 0;
@@ -422,7 +434,9 @@ test("#340: broker mode - lane with no job record must use binding repo from wor
 	// Broker mode setup
 	const AUTHORITY = { canonicalAgentDir: "/broker/agent", identity: "test-broker" };
 	database = await Store.open(":memory:");
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, AUTHORITY, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, AUTHORITY, database.inspectBrokerAuthority().populated),
+	);
 
 	// Lane A: no job record in broker mode - CRITICAL #340 case
 	const LANE_A_REPO = "/binding/repo/a";
@@ -463,7 +477,9 @@ test("#340: broker mode - lane with no job record must use binding repo from wor
 		now: () => new Date(NOW),
 	});
 	recB = { ...recB, state: "done" };
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...recB, laneKey: idB.laneKey, json: JSON.stringify(recB) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...recB, laneKey: idB.laneKey, json: JSON.stringify(recB) }),
+	);
 
 	// Port that enforces broker authority: throws if close() repo doesn't match binding
 	class BrokerEnforcingPort extends ScriptedSessionPort {
@@ -622,7 +638,9 @@ test("#360: session_unavailable status error is treated like unknown: settled wh
 		errorCode: "gateway_turn_reaped",
 		endedAt: new Date(NOW - 120_000).toISOString(),
 	});
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 
 	class SessionUnavailablePort extends ScriptedSessionPort {
 		override async status(): Promise<any> {
@@ -666,7 +684,9 @@ test("#360: session_unavailable with live session does not settle", async () => 
 		errorCode: "gateway_turn_reaped",
 		endedAt: new Date(NOW - 120_000).toISOString(),
 	});
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 
 	class SessionUnavailablePort2 extends ScriptedSessionPort {
 		override async status(): Promise<any> {

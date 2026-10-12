@@ -75,12 +75,14 @@ test("persona state stays running until a terminal tail event is injected", asyn
 	});
 	try {
 		expect(
-			database.transaction((tx) => database.inbox.enqueue(tx, {
-				messageId: "m-1",
-				originKey: ORIGIN_KEY,
-				originRefJson: JSON.stringify(ORIGIN),
-				body: "wait for tail evidence",
-			})),
+			database.transaction((tx) =>
+				database.inbox.enqueue(tx, {
+					messageId: "m-1",
+					originKey: ORIGIN_KEY,
+					originRefJson: JSON.stringify(ORIGIN),
+					body: "wait for tail evidence",
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "persistent send did not start");

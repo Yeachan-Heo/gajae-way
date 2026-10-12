@@ -1,12 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer, type AddressInfo, type Server } from "node:net";
+import { type AddressInfo, createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeFrame, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { ADMIN_USAGE, USAGE_EXIT_CODE, usageFor } from "../src/cli";
-
-
 
 describe("admin usage guard", () => {
 	test("an empty argv is a usage error, not an implicit boot", () => {
@@ -83,7 +81,6 @@ test("serve waits for a gateway socket that appears after startup", async () => 
 				stderr += new TextDecoder().decode(value, { stream: true });
 			}
 		})();
-
 
 		const waitFor = async (predicate: () => boolean): Promise<void> => {
 			const deadline = Date.now() + 5_000;

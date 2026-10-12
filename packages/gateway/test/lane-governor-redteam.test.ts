@@ -315,7 +315,9 @@ function seedJob(
 		});
 	}
 	record = { ...record, state: state === "failed" ? "awaiting_operator" : state };
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 	return { record, opRef, identity };
 }
 
@@ -483,7 +485,9 @@ test("G7 corrupt bound job consumes socket capacity and identifies corrupt candi
 		},
 	);
 	const { record, identity } = seedJob(h.database, "a", "awaiting_operator");
-	h.database.transaction((tx) => h.database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: "{invalid json" }));
+	h.database.transaction((tx) =>
+		h.database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: "{invalid json" }),
+	);
 	const result = await h.run("b");
 	expect(result.error).toMatchObject({
 		code: "lane_capacity",
@@ -568,7 +572,9 @@ test("H3 sweep nomination cannot retire a done job replaced by a fresh open atte
 				{ ...record, state: "running" },
 				{ opRef: newOpRef("gen3-redteam"), sessionId, startedAt: new Date().toISOString() },
 			);
-			database.transaction((tx) => database.work.putLaneJob(tx, { ...running, laneKey: identity.laneKey, json: JSON.stringify(running) }));
+			database.transaction((tx) =>
+				database.work.putLaneJob(tx, { ...running, laneKey: identity.laneKey, json: JSON.stringify(running) }),
+			);
 		});
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 		expect(governor.activeLanes()[0]?.state).toBe("done");

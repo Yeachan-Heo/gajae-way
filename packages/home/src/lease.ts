@@ -77,9 +77,7 @@ export class LeaseHeldError extends Error {
 		readonly name: LeaseName,
 		readonly owner: LeaseOwner | undefined,
 	) {
-		super(
-			`lease_held name=${name}${owner ? ` owner_pid=${owner.pid} since=${owner.startedAt}` : ""}`,
-		);
+		super(`lease_held name=${name}${owner ? ` owner_pid=${owner.pid} since=${owner.startedAt}` : ""}`);
 	}
 }
 
@@ -135,11 +133,7 @@ function parseOwner(raw: string): LeaseOwner | undefined {
 	if (!raw.trim() || raw.length > MAX_OWNER_BYTES) return undefined;
 	try {
 		const value = JSON.parse(raw) as Partial<LeaseOwner>;
-		if (
-			Number.isSafeInteger(value.pid) &&
-			typeof value.token === "string" &&
-			typeof value.startedAt === "string"
-		)
+		if (Number.isSafeInteger(value.pid) && typeof value.token === "string" && typeof value.startedAt === "string")
 			return { pid: value.pid as number, token: value.token, startedAt: value.startedAt };
 	} catch {}
 	return undefined;
@@ -217,7 +211,10 @@ export async function acquireLease(home: string, name: LeaseName): Promise<Lease
 }
 
 /** For processes whose only correct response to contention is to exit and let the service manager retry. */
-export function exitOnLeaseHeld(error: LeaseHeldError, log: (line: string) => void = (line) => console.error(line)): never {
+export function exitOnLeaseHeld(
+	error: LeaseHeldError,
+	log: (line: string) => void = (line) => console.error(line),
+): never {
 	log(error.message);
 	process.exit(1);
 }

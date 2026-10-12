@@ -1,5 +1,10 @@
 export class DatabaseStartupError extends Error {
-	readonly code: "newer_schema" | "integrity_check_failed" | "migration_corrupt" | "schema_mismatch" | "quick_check_failed";
+	readonly code:
+		| "newer_schema"
+		| "integrity_check_failed"
+		| "migration_corrupt"
+		| "schema_mismatch"
+		| "quick_check_failed";
 
 	constructor(code: DatabaseStartupError["code"], message: string) {
 		super(message);

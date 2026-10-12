@@ -85,13 +85,15 @@ async function bindPersonaSession(
 ): Promise<string> {
 	const authority = f.database.inspectBrokerAuthority().authority;
 	if (!authority) throw new Error("test broker authority missing");
-	const recorded = f.database.transaction((tx) => f.database.bindings.recordOwnedBinding(tx, {
-		authority,
-		sessionId,
-		originKey: key,
-		epoch: 0,
-		repo: join(f.home, "workspace"),
-	}));
+	const recorded = f.database.transaction((tx) =>
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority,
+			sessionId,
+			originKey: key,
+			epoch: 0,
+			repo: join(f.home, "workspace"),
+		}),
+	);
 	if (!recorded) throw new Error("persona fixture binding lost its epoch");
 	return sessionId;
 }
@@ -213,7 +215,8 @@ for (const [label, origin] of [
 			() => f.database.inbox.turnRows(persona.opRef),
 			(rows) =>
 				rows.some(
-					(row) => row.source === "lane_report" && row.message_id === f.database.work.workAttemptGet(work.opRef)?.reportId,
+					(row) =>
+						row.source === "lane_report" && row.message_id === f.database.work.workAttemptGet(work.opRef)?.reportId,
 				),
 			"persona lane-report row",
 		);
@@ -420,13 +423,15 @@ test("AC-F conflicting inbound id selects fallback atomically", async () => {
 	const lane = await startLane(f, "conflict-worker");
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(
-		f.database.transaction((tx) => f.database.inbox.enqueue(tx, {
-			messageId: runtime.reportId,
-			originKey: rootKey,
-			originRefJson: JSON.stringify(rootOrigin),
-			body: "conflicting platform id",
-			source: "platform",
-		})),
+		f.database.transaction((tx) =>
+			f.database.inbox.enqueue(tx, {
+				messageId: runtime.reportId,
+				originKey: rootKey,
+				originRefJson: JSON.stringify(rootOrigin),
+				body: "conflicting platform id",
+				source: "platform",
+			}),
+		),
 	).toBe(true);
 	await settleLane(f, lane.result.opRef, "conflict fallback");
 	expect(f.database.work.workAttemptGet(lane.result.opRef)?.decision).toBe("fallback");
@@ -443,19 +448,23 @@ test("AC-F a quarantined nonterminal persona turn rejects report admission", asy
 		channels: { "quarantined-parent": { engagement: "open", audience: "all" } },
 	});
 	const personaSessionId = await bindPersonaSession(f, key);
-	f.database.transaction((tx) => f.database.inbox.enqueue(tx, {
-		messageId: "quarantine-human",
-		originKey: key,
-		originRefJson: JSON.stringify(origin),
-		body: "nonterminal parent turn",
-	}));
-	f.database.transaction((tx) => f.database.inbox.bindTurn(tx, {
-		messageId: "quarantine-human",
-		originKey: key,
-		epoch: 0,
-		opRef: "gw-quarantined-persona-turn",
-		sessionId: personaSessionId,
-	}));
+	f.database.transaction((tx) =>
+		f.database.inbox.enqueue(tx, {
+			messageId: "quarantine-human",
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: "nonterminal parent turn",
+		}),
+	);
+	f.database.transaction((tx) =>
+		f.database.inbox.bindTurn(tx, {
+			messageId: "quarantine-human",
+			originKey: key,
+			epoch: 0,
+			opRef: "gw-quarantined-persona-turn",
+			sessionId: personaSessionId,
+		}),
+	);
 	f.database.transaction((tx) => f.database.inbox.turnAccept(tx, "gw-quarantined-persona-turn"));
 	const raw = new Database(join(f.home, "gateway.db"));
 	try {
@@ -590,13 +599,15 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 	const sessionId = crypto.randomUUID();
 	const authority = f.database.inspectBrokerAuthority().authority;
 	if (!authority) throw new Error("test broker authority missing");
-	f.database.transaction((tx) => f.database.bindings.recordOwnedBinding(tx, {
-		authority,
-		sessionId,
-		originKey: rootKey,
-		epoch: 0,
-		repo: join(f.home, "workspace"),
-	}));
+	f.database.transaction((tx) =>
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority,
+			sessionId,
+			originKey: rootKey,
+			epoch: 0,
+			repo: join(f.home, "workspace"),
+		}),
+	);
 	const lane = await startLane(f, "spoofed-route", sessionId);
 	await settleLane(f, lane.result.opRef, "untrusted hint result");
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;

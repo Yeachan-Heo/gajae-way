@@ -2,9 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { freshTurnAttempt, retryInboundTurn } from "../src/orchestrator/persona-session";
 import { Store } from "../src/store";
 import { InboundTurnConflictError } from "../src/store/groups/inbox";
-import { freshTurnAttempt, retryInboundTurn } from "../src/orchestrator/persona-session";
 
 const ORIGIN_KEY = "discord:dm:1";
 
@@ -51,7 +51,9 @@ test("rows received in the same millisecond are served in insertion order, not p
 		const row = db.inbox.pendingOldest(ORIGIN_KEY);
 		if (!row) break;
 		served.push(row.message_id);
-		expect(db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: row.message_id, epoch: 0, opRef: "gw-p-x" }))).toBe(true);
+		expect(
+			db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: row.message_id, epoch: 0, opRef: "gw-p-x" })),
+		).toBe(true);
 	}
 	expect(served).toEqual(["z-first", "m-second", "a-third"]);
 	expect(db.inbox.turnRows("gw-p-x").map((row) => row.message_id)).toEqual(["z-first", "m-second", "a-third"]);
@@ -61,17 +63,21 @@ test("messages arriving while a turn is running become steers in arrival order",
 	const db = await open();
 	const now = Date.now();
 	const opRef = "gw-p-running";
-	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("m1", "런타임으로 다시 반영하고 체크해봐."), receivedAt: timestamp(now, 0) }));
+	db.transaction((tx) =>
+		db.inbox.enqueue(tx, { ...message("m1", "런타임으로 다시 반영하고 체크해봐."), receivedAt: timestamp(now, 0) }),
+	);
 
 	expect(
-		db.transaction((tx) => db.inbox.bindTurn(tx, {
-			messageId: "m1",
-			originKey: ORIGIN_KEY,
-			epoch: 0,
-			opRef,
-			sessionId: "session-1",
-			dispatchedAt: timestamp(now, 1),
-		})),
+		db.transaction((tx) =>
+			db.inbox.bindTurn(tx, {
+				messageId: "m1",
+				originKey: ORIGIN_KEY,
+				epoch: 0,
+				opRef,
+				sessionId: "session-1",
+				dispatchedAt: timestamp(now, 1),
+			}),
+		),
 	).toMatchObject({
 		message_id: "m1",
 		state: "pending",
@@ -113,7 +119,15 @@ test("#247: completion keeps a delivery claim, and a claim replaces a no-deliver
 		["m2", "gw-p-marked"],
 	] as const) {
 		db.transaction((tx) => db.inbox.enqueue(tx, message(id, id)));
-		db.transaction((tx) => db.inbox.bindTurn(tx, { messageId: id, originKey: ORIGIN_KEY, epoch: id === "m1" ? 0 : 1, opRef, sessionId: "s" }));
+		db.transaction((tx) =>
+			db.inbox.bindTurn(tx, {
+				messageId: id,
+				originKey: ORIGIN_KEY,
+				epoch: id === "m1" ? 0 : 1,
+				opRef,
+				sessionId: "s",
+			}),
+		);
 	}
 	expect(db.transaction((tx) => db.inbox.claimTerminal(tx, "gw-p-claimed", 0, "gw-t-a"))).toBe("gw-t-a");
 	expect(db.transaction((tx) => db.inbox.turnComplete(tx, "gw-p-claimed", "silent"))).toBe(1);
@@ -129,7 +143,9 @@ test("#247: completion keeps a delivery claim, and a claim replaces a no-deliver
 test("the terminal link audit counts done triggers with a NULL link", async () => {
 	const db = await open();
 	db.transaction((tx) => db.inbox.enqueue(tx, message("m1", "hello")));
-	db.transaction((tx) => db.inbox.bindTurn(tx, { messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef: "gw-p-a", sessionId: "s" }));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef: "gw-p-a", sessionId: "s" }),
+	);
 	expect(db.transaction((tx) => db.inbox.turnComplete(tx, "gw-p-a"))).toBe(1);
 	const since = new Date(Date.now() - 60_000).toISOString();
 	expect(db.inbox.terminalLinkAudit(since)).toEqual({ done: 1, unlinked: 0 });
@@ -142,7 +158,9 @@ test("the terminal link audit counts done triggers with a NULL link", async () =
 test("an old pending message remains eligible for a turn", async () => {
 	const db = await open();
 	const now = Date.now();
-	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("m1", "hello"), receivedAt: timestamp(now, -24 * 60 * 60 * 1_000) }));
+	db.transaction((tx) =>
+		db.inbox.enqueue(tx, { ...message("m1", "hello"), receivedAt: timestamp(now, -24 * 60 * 60 * 1_000) }),
+	);
 
 	expect(db.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({
 		message_id: "m1",
@@ -156,7 +174,9 @@ test("completed turns are never pending or nonterminal", async () => {
 	const db = await open();
 	const opRef = "gw-p-completed";
 	db.transaction((tx) => db.inbox.enqueue(tx, message("m1", "hello")));
-	db.transaction((tx) => db.inbox.bindTurn(tx, { messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" }));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" }),
+	);
 	expect(db.transaction((tx) => db.inbox.turnAccept(tx, opRef))).toBe(true);
 	expect(db.transaction((tx) => db.inbox.turnComplete(tx, opRef))).toBe(1);
 
@@ -179,20 +199,24 @@ test("turn bindings are scoped per origin", async () => {
 
 	expect(db.inbox.pendingOldest(ORIGIN_KEY)?.body).toBe("a");
 	expect(db.inbox.pendingOldest(secondOrigin)?.body).toBe("b");
-	db.transaction((tx) => db.inbox.bindTurn(tx, {
-		messageId: "m1",
-		originKey: ORIGIN_KEY,
-		epoch: 0,
-		opRef: "gw-p-origin-one",
-		sessionId: "session-1",
-	}));
-	db.transaction((tx) => db.inbox.bindTurn(tx, {
-		messageId: "m2",
-		originKey: secondOrigin,
-		epoch: 0,
-		opRef: "gw-p-origin-two",
-		sessionId: "session-2",
-	}));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "m1",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef: "gw-p-origin-one",
+			sessionId: "session-1",
+		}),
+	);
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "m2",
+			originKey: secondOrigin,
+			epoch: 0,
+			opRef: "gw-p-origin-two",
+			sessionId: "session-2",
+		}),
+	);
 
 	expect(db.inbox.nonterminalTurns(ORIGIN_KEY)).toEqual([
 		{
@@ -222,14 +246,16 @@ test("discarding at /new touches only unbound pending rows and terminal completi
 	const cutoff = timestamp(now, 3);
 	const opRef = "gw-p-discard";
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("trigger", "start"), receivedAt: timestamp(now, 0) }));
-	db.transaction((tx) => db.inbox.bindTurn(tx, {
-		messageId: "trigger",
-		originKey: ORIGIN_KEY,
-		epoch: 0,
-		opRef,
-		sessionId: "session-1",
-		dispatchedAt: timestamp(now, 0),
-	}));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "trigger",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef,
+			sessionId: "session-1",
+			dispatchedAt: timestamp(now, 0),
+		}),
+	);
 	expect(db.transaction((tx) => db.inbox.turnAccept(tx, opRef))).toBe(true);
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("steer", "follow"), receivedAt: timestamp(now, 1) }));
 	expect(db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: "steer", epoch: 0, opRef }))).toBe(true);
@@ -251,10 +277,19 @@ test("an abandoned held steer is closed as done input and its message leaves the
 	const now = Date.now();
 	const opRef = "gw-p-abandoned";
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("trigger", "start"), receivedAt: timestamp(now, 0) }));
-	db.transaction((tx) => db.inbox.bindTurn(tx, { messageId: "trigger", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" }));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "trigger", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" }),
+	);
 	expect(db.transaction((tx) => db.inbox.turnAccept(tx, opRef))).toBe(true);
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("held", "while you work"), receivedAt: timestamp(now, 1) }));
-	db.transaction((tx) => db.inbox.contextRecord(tx, { messageId: "held", originKey: ORIGIN_KEY, body: "while you work", receivedAt: timestamp(now, 1) }));
+	db.transaction((tx) =>
+		db.inbox.contextRecord(tx, {
+			messageId: "held",
+			originKey: ORIGIN_KEY,
+			body: "while you work",
+			receivedAt: timestamp(now, 1),
+		}),
+	);
 	expect(db.transaction((tx) => db.inbox.steerIssued(tx, { messageId: "held", epoch: 0, opRef }))).toBe(true);
 	expect(db.transaction((tx) => db.inbox.turnComplete(tx, opRef))).toBe(1);
 	expect(db.inbox.steersHeld(opRef).map((row) => row.message_id)).toEqual(["held"]);
@@ -279,36 +314,44 @@ test("one nonterminal trigger per epoch permits steers and retired epochs", asyn
 	const oldOpRef = "gw-p-old";
 	const currentOpRef = "gw-p-current";
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("a", "a"), receivedAt: timestamp(now, 0) }));
-	db.transaction((tx) => db.inbox.bindTurn(tx, {
-		messageId: "a",
-		originKey: ORIGIN_KEY,
-		epoch: 0,
-		opRef: oldOpRef,
-		sessionId: "session-old",
-	}));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "a",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef: oldOpRef,
+			sessionId: "session-old",
+		}),
+	);
 	expect(db.transaction((tx) => db.inbox.turnAccept(tx, oldOpRef))).toBe(true);
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("steer", "mid-turn"), receivedAt: timestamp(now, 1) }));
-	expect(db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: "steer", epoch: 0, opRef: oldOpRef }))).toBe(true);
+	expect(db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: "steer", epoch: 0, opRef: oldOpRef }))).toBe(
+		true,
+	);
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("c", "c"), receivedAt: timestamp(now, 2) }));
 	expect(
-		db.transaction((tx) => db.inbox.bindTurn(tx, {
-			messageId: "c",
-			originKey: ORIGIN_KEY,
-			epoch: 1,
-			opRef: currentOpRef,
-			sessionId: "session-current",
-		})),
+		db.transaction((tx) =>
+			db.inbox.bindTurn(tx, {
+				messageId: "c",
+				originKey: ORIGIN_KEY,
+				epoch: 1,
+				opRef: currentOpRef,
+				sessionId: "session-current",
+			}),
+		),
 	).toMatchObject({ message_id: "c", turn_role: "trigger", turn_epoch: 1, turn_state: "bound" });
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("d", "d"), receivedAt: timestamp(now, 3) }));
 
 	expect(() =>
-		db.transaction((tx) => db.inbox.bindTurn(tx, {
-			messageId: "d",
-			originKey: ORIGIN_KEY,
-			epoch: 1,
-			opRef: "gw-p-conflict",
-			sessionId: "session-conflict",
-		})),
+		db.transaction((tx) =>
+			db.inbox.bindTurn(tx, {
+				messageId: "d",
+				originKey: ORIGIN_KEY,
+				epoch: 1,
+				opRef: "gw-p-conflict",
+				sessionId: "session-conflict",
+			}),
+		),
 	).toThrow(InboundTurnConflictError);
 	expect(db.inbox.nonterminalTurns(ORIGIN_KEY)).toEqual([
 		{
@@ -334,7 +377,9 @@ test("terminal delivery claims are per-part and first claimant wins", async () =
 	const db = await open();
 	const opRef = "gw-p-terminal";
 	db.transaction((tx) => db.inbox.enqueue(tx, message("m1", "hello")));
-	db.transaction((tx) => db.inbox.bindTurn(tx, { messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" }));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" }),
+	);
 	expect(db.transaction((tx) => db.inbox.turnAccept(tx, opRef))).toBe(true);
 
 	expect(db.transaction((tx) => db.inbox.claimTerminal(tx, opRef, 0, "gw-t-a"))).toBe("gw-t-a");
@@ -352,14 +397,16 @@ test("an accepted turn with a delivered steer requeues its trigger for fresh att
 	const opRef = "gw-p-requeue";
 	const retryOpRef = "gw-p-requeue-retry";
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("trigger", "start"), receivedAt: timestamp(now, 0) }));
-	db.transaction((tx) => db.inbox.bindTurn(tx, {
-		messageId: "trigger",
-		originKey: ORIGIN_KEY,
-		epoch: 0,
-		opRef,
-		sessionId: "session-1",
-		dispatchedAt: timestamp(now, 0),
-	}));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "trigger",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef,
+			sessionId: "session-1",
+			dispatchedAt: timestamp(now, 0),
+		}),
+	);
 	expect(db.transaction((tx) => db.inbox.turnAccept(tx, opRef))).toBe(true);
 	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("steer-1", "mid-turn"), receivedAt: timestamp(now, 1) }));
 	expect(db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: "steer-1", epoch: 0, opRef }))).toBe(true);
@@ -385,14 +432,16 @@ test("an accepted turn with a delivered steer requeues its trigger for fresh att
 	]);
 	expect(db.inbox.nonterminalTurns(ORIGIN_KEY)).toEqual([]);
 
-	db.transaction((tx) => db.inbox.bindTurn(tx, {
-		messageId: "trigger",
-		originKey: ORIGIN_KEY,
-		epoch: 0,
-		opRef: retryOpRef,
-		sessionId: "session-2",
-		dispatchedAt: timestamp(now, 2),
-	}));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "trigger",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef: retryOpRef,
+			sessionId: "session-2",
+			dispatchedAt: timestamp(now, 2),
+		}),
+	);
 	expect(db.transaction((tx) => retryInboundTurn(db, tx, retryOpRef))).toBe(2);
 	expect(freshTurnAttempt(db, ORIGIN_KEY, 0, "trigger")).toBe(2);
 });

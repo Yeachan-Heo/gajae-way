@@ -1,12 +1,14 @@
 import { chmod, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
-import { acquireLease, homeLayout, LeaseHeldError, type Lease } from "@gajae-gateway/home";
+import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 
 import { type ConfigOverrides, loadConfig } from "./config";
-import { assertNoRestoreJournal } from "./offline";
+import { DeliveryService } from "./delivery/delivery";
 
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
+import { assertNoRestoreJournal } from "./offline";
+import { SloRecorder } from "./ops/slo";
 import {
 	GjcCliUnavailableError,
 	GlobalGjcClient,
@@ -17,10 +19,8 @@ import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
 import { PersonaLoader } from "./persona/persona";
-import { SloRecorder } from "./ops/slo";
 import { type GatewayServer, startStdioServer, startUnixServer } from "./server/server";
 import { Store } from "./store";
-import { DeliveryService } from "./delivery/delivery";
 
 export interface BootGatewayOptions {
 	readonly stdio?: boolean;
@@ -45,7 +45,6 @@ export interface BrokerWaitOptions {
 }
 
 export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
-
 
 /**
  * The persona workspace, created if missing and resolved through any symlink.
@@ -155,10 +154,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			try {
 				executable = await realpath(path);
 			} catch (error) {
-				throw new Error(
-					`Pinned gjc executable cannot be resolved at ${path}: ${diagnostic(error)}`,
-					{ cause: error },
-				);
+				throw new Error(`Pinned gjc executable cannot be resolved at ${path}: ${diagnostic(error)}`, { cause: error });
 			}
 		}
 		const pinnedVersion = readPinnedGjcVersion();

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm, realpath, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
@@ -29,18 +29,23 @@ test("offline authority cutover preserves failed delivery evidence in its backup
 	const config = await loadConfig({ home });
 	const layout = homeLayout(home);
 	const database = await Store.open(layout.db, { canonicalAgentDir: canonicalOldAgent });
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "old-authority-message",
-		originKey: "discord:channel:authority-cutover",
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "authority-cutover" }),
-		body: "accepted under the old authority",
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "old-authority-message",
+			originKey: "discord:channel:authority-cutover",
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "authority-cutover" }),
+			body: "accepted under the old authority",
+		}),
+	);
 	database.transaction((tx) => {
 		database.outbox.create(tx, {
 			deliveryId: "failed-delivery",
 			turnId: "old-turn",
 			originKey: "discord:channel:authority-cutover",
-			payloadJson: JSON.stringify({ origin: { platform: "discord", kind: "channel", conversationId: "authority-cutover" }, text: "held reply" }),
+			payloadJson: JSON.stringify({
+				origin: { platform: "discord", kind: "channel", conversationId: "authority-cutover" },
+				text: "held reply",
+			}),
 		});
 		database.outbox.fail(tx, "failed-delivery", true);
 	});
@@ -57,7 +62,9 @@ test("offline authority cutover preserves failed delivery evidence in its backup
 		console.error = error;
 	}
 
-	const backupName = (await readdir(layout.backupsDir)).find((name) => name.startsWith("pre-cutover-") && name.endsWith(".db"));
+	const backupName = (await readdir(layout.backupsDir)).find(
+		(name) => name.startsWith("pre-cutover-") && name.endsWith(".db"),
+	);
 	expect(backupName).toBeDefined();
 	const backup = new Database(join(layout.backupsDir, backupName as string), { readonly: true });
 	try {
@@ -75,9 +82,7 @@ test("offline authority cutover preserves failed delivery evidence in its backup
 			identity: `gjc:${canonicalTargetAgent}`,
 		});
 		expect(current.bindings.isQuarantined("inbound", "old-authority-message")).toBe(true);
-		expect(current.outbox.rows()).toMatchObject([
-			{ delivery_id: "failed-delivery", state: "failed_ambiguous" },
-		]);
+		expect(current.outbox.rows()).toMatchObject([{ delivery_id: "failed-delivery", state: "failed_ambiguous" }]);
 	} finally {
 		current.close();
 	}

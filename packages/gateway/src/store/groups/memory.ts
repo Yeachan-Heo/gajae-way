@@ -28,7 +28,9 @@ export class MemoryGroup {
 	createIntent(tx: WriteTx, row: { id: string; kind: string; payloadJson: string }): void {
 		const now = new Date().toISOString();
 		this.#db
-			.prepare("INSERT INTO memory_intents (id, kind, payload_json, state, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?)")
+			.prepare(
+				"INSERT INTO memory_intents (id, kind, payload_json, state, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?)",
+			)
 			.run(tx, row.id, row.kind, row.payloadJson, now, now);
 	}
 
@@ -62,7 +64,9 @@ export class MemoryGroup {
 
 	rows(): MemoryIntentDbRow[] {
 		return this.#db
-			.prepare("SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY created_at, id")
+			.prepare(
+				"SELECT id, kind, payload_json, state, attempts, quarantine_reason FROM memory_intents ORDER BY created_at, id",
+			)
 			.all() as MemoryIntentDbRow[];
 	}
 
@@ -88,7 +92,9 @@ export class MemoryGroup {
 		if (this.get(`monitor-event-intent:${eventId}`)) return true;
 		return (
 			this.#db
-				.prepare("SELECT 1 AS one FROM memory_intents WHERE kind = 'monitor-event' AND instr(payload_json, ?) > 0 LIMIT 1")
+				.prepare(
+					"SELECT 1 AS one FROM memory_intents WHERE kind = 'monitor-event' AND instr(payload_json, ?) > 0 LIMIT 1",
+				)
 				.get(eventId) !== null
 		);
 	}

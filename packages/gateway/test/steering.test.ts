@@ -31,13 +31,15 @@ class SteeringTranscriptPort extends ScriptedSessionPort {
 
 function enqueue(messageId: string, body: string): void {
 	expect(
-		database?.transaction((tx) => database?.inbox.enqueue(tx, {
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt: new Date().toISOString(),
-		})),
+		database?.transaction((tx) =>
+			database?.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt: new Date().toISOString(),
+			}),
+		),
 	).toBe(true);
 }
 

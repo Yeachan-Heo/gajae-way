@@ -5,17 +5,20 @@ import { homeLayout } from "@gajae-gateway/home";
 import type { GatewayConfig } from "../config";
 import { assertNoRestoreJournal, withGatewayLease } from "../offline";
 import { Store } from "../store";
+import type { StoreCore } from "../store/core";
 import type { BrokerAuthority } from "../store/groups/bindings";
 import { writeBackup } from "./backup";
 import { writeOpenWorkExport } from "./open-work-export";
-
-import type { StoreCore } from "../store/core";
 export interface CutoverReceipt {
 	readonly snapshotId: string;
 	readonly oldAuthority: BrokerAuthority | null;
 	readonly targetAuthority: BrokerAuthority;
 	readonly backup: { readonly path: string; readonly sha256: string };
-	readonly openWorkExport: { readonly path: string; readonly sha256: string; readonly counts: ReturnType<typeof writeOpenWorkExport>["counts"] };
+	readonly openWorkExport: {
+		readonly path: string;
+		readonly sha256: string;
+		readonly counts: ReturnType<typeof writeOpenWorkExport>["counts"];
+	};
 }
 
 function diagnostic(error: unknown): string {
@@ -31,7 +34,10 @@ async function prepareBackupsDir(home: string): Promise<string> {
 	return path;
 }
 
-export async function runCutover(input: { readonly config: GatewayConfig; readonly agentDir: string }): Promise<number> {
+export async function runCutover(input: {
+	readonly config: GatewayConfig;
+	readonly agentDir: string;
+}): Promise<number> {
 	const { config, agentDir } = input;
 	try {
 		return await withGatewayLease(config.home, async () => {
@@ -69,7 +75,9 @@ export async function runCutover(input: { readonly config: GatewayConfig; readon
 						schemaVersion: database.schemaVersion,
 						authority: recordedAuthority,
 					});
-					console.info(`open_work_exported reason=cutover path=${openWorkExport.path} sha256=${openWorkExport.sha256} counts=${JSON.stringify(openWorkExport.counts)}`);
+					console.info(
+						`open_work_exported reason=cutover path=${openWorkExport.path} sha256=${openWorkExport.sha256} counts=${JSON.stringify(openWorkExport.counts)}`,
+					);
 				} catch (error) {
 					console.error(`open_work_export_failed ${diagnostic(error)}`);
 					return 1;
@@ -92,7 +100,13 @@ export async function runCutover(input: { readonly config: GatewayConfig; readon
 					console.error(`cutover_census_invalid ${diagnostic(error)}`);
 				}
 				const report = openWork;
-				console.log(JSON.stringify({ schemaVersion: database.schemaVersion, authority: recordedAuthority, counts: census, openWork: report }, null, 2));
+				console.log(
+					JSON.stringify(
+						{ schemaVersion: database.schemaVersion, authority: recordedAuthority, counts: census, openWork: report },
+						null,
+						2,
+					),
+				);
 				const at = new Date().toISOString();
 				const evidence = {
 					host: hostname(),
@@ -102,12 +116,14 @@ export async function runCutover(input: { readonly config: GatewayConfig; readon
 					census,
 					openWorkExport,
 				};
-				const snapshotId = database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-					expectedAuthority: recordedAuthority,
-					targetAuthority,
-					evidence: JSON.stringify(evidence),
-					disposition: "quarantine",
-				}));
+				const snapshotId = database.transaction((tx) =>
+					database.bindings.cutoverBrokerAuthority(tx, {
+						expectedAuthority: recordedAuthority,
+						targetAuthority,
+						evidence: JSON.stringify(evidence),
+						disposition: "quarantine",
+					}),
+				);
 				const receipt: CutoverReceipt = {
 					snapshotId,
 					oldAuthority: recordedAuthority,

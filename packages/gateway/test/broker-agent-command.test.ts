@@ -4,9 +4,9 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
-import { loadConfig } from "../src/config";
-import { runBrokerAgentCommand } from "../src/broker-agent/command";
 import { credentialFingerprint } from "../src/broker-agent/agent-db";
+import { runBrokerAgentCommand } from "../src/broker-agent/command";
+import { loadConfig } from "../src/config";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -21,7 +21,9 @@ async function fixture() {
 	await mkdir(home, { recursive: true, mode: 0o700 });
 	await mkdir(source);
 	const database = new Database(join(source, "agent.db"));
-	database.exec("CREATE TABLE auth_credentials (provider TEXT, token TEXT); INSERT INTO auth_credentials VALUES ('p', 'token');");
+	database.exec(
+		"CREATE TABLE auth_credentials (provider TEXT, token TEXT); INSERT INTO auth_credentials VALUES ('p', 'token');",
+	);
 	database.close();
 	return { root, home, source, agentDir: homeLayout(home).brokerAgentDir, config: await loadConfig({ home }) };
 }
@@ -37,7 +39,9 @@ describe("broker-agent command", () => {
 		try {
 			expect(await runBrokerAgentCommand(args(f), f.config)).toBe(0);
 			expect(await runBrokerAgentCommand(args(f, "update"), f.config)).toBe(0);
-			const provisionLines = log.mock.calls.map((call) => String(call[0])).filter((line) => line.startsWith("broker_agent_provision status="));
+			const provisionLines = log.mock.calls
+				.map((call) => String(call[0]))
+				.filter((line) => line.startsWith("broker_agent_provision status="));
 			expect(provisionLines.some((line) => line.startsWith("broker_agent_provision status=ok"))).toBe(true);
 			expect(provisionLines).toContain("broker_agent_provision status=nothing_to_do");
 			log.mockClear();
@@ -58,7 +62,9 @@ describe("broker-agent command", () => {
 		const error = spyOn(console, "error").mockImplementation(() => {});
 		try {
 			expect(await runBrokerAgentCommand(["provision", "--mode", "invalid"], f.config)).toBe(2);
-			expect(await runBrokerAgentCommand(["provision", "--mode", "force", "--from", join(f.root, "missing")], f.config)).toBe(1);
+			expect(
+				await runBrokerAgentCommand(["provision", "--mode", "force", "--from", join(f.root, "missing")], f.config),
+			).toBe(1);
 			const lease = await acquireLease(f.home, "broker");
 			try {
 				expect(await runBrokerAgentCommand([...args(f), "--lease-wait-ms", "0"], f.config)).toBe(1);

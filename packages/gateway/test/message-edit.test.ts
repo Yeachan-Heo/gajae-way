@@ -316,10 +316,7 @@ test("a held steer accepted at the old turn's terminal consumes its context row:
 	// The runtime had recorded it: the replay at terminal returns acceptance.
 	port.torn = false;
 	port.complete(port.sends[0]!.opRef, "answer one");
-	await eventually(
-		() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done",
-		"turn did not complete",
-	);
+	await eventually(() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done", "turn did not complete");
 	expect(database!.inbox.steersHeld(port.sends[0]!.opRef)).toEqual([]);
 	dm(client, "s3", "m-3", "next");
 	await eventually(() => port.sends.length === 2, "next turn was not sent");
@@ -389,9 +386,13 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 		},
 	});
 	const record = (messageId: string, body: string) => {
-		database!.transaction((tx) => database!.inbox.contextRecord(tx, { messageId, originKey: ORIGIN_KEY, authorId: "owner", body }));
+		database!.transaction((tx) =>
+			database!.inbox.contextRecord(tx, { messageId, originKey: ORIGIN_KEY, authorId: "owner", body }),
+		);
 		expect(
-			database!.transaction((tx) => database!.inbox.enqueue(tx, { messageId, originKey: ORIGIN_KEY, originRefJson: JSON.stringify(ORIGIN), body })),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, { messageId, originKey: ORIGIN_KEY, originRefJson: JSON.stringify(ORIGIN), body }),
+			),
 		).toBe(true);
 	};
 	try {
@@ -409,7 +410,11 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 		// The unread window no longer contains m-2: consumed in the same
 		// transaction as the acceptance, before the crash.
 		// (m-1 is the running turn's own trigger; it is committed at that turn's terminal.)
-		expect(database!.transaction((tx) => database!.inbox.contextWindow(tx, ORIGIN_KEY, "probe")).rows.map((r) => r.message_id)).toEqual(["m-1"]);
+		expect(
+			database!
+				.transaction((tx) => database!.inbox.contextWindow(tx, ORIGIN_KEY, "probe"))
+				.rows.map((r) => r.message_id),
+		).toEqual(["m-1"]);
 	} finally {
 		await manager.stop();
 	}

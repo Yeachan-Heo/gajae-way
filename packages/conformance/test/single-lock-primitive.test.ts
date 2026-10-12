@@ -47,7 +47,11 @@ const RULES: readonly Rule[] = [
 		description: "create-exclusive ('wx') writes used as ownership",
 		pattern: /flag:\s*["']wx["']|\bopen\([^)\n]*["']wx["']/,
 		// Random-named temp files and first-write-wins content seeding, never ownership.
-		allowed: ["packages/gateway/src/persona/persona.ts", "packages/cli/src/setup.ts", "packages/adapter-slack/src/recovery.ts"],
+		allowed: [
+			"packages/gateway/src/persona/persona.ts",
+			"packages/cli/src/setup.ts",
+			"packages/adapter-slack/src/recovery.ts",
+		],
 		positive: `await writeFile(lockPath, pid, { flag: "wx" });`,
 	},
 	{

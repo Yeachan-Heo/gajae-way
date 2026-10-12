@@ -855,7 +855,9 @@ export class MonitorPropagator {
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
 				// rolls a session on its own — native gjc compaction owns keeping the
 				// context bounded while the session is answering.
-				const turns = this.#database.transaction((tx) => this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)));
+				const turns = this.#database.transaction((tx) =>
+					this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
+				);
 				this.#safetyState(sessionOriginKey).turns = turns;
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
@@ -1185,7 +1187,8 @@ export class MonitorPropagator {
 		const { sessionOriginKey, failureClass, error, sessionId, boundEpoch, replayed, monitor } = input;
 		const state = this.#safetyState(sessionOriginKey);
 		const currentEpoch =
-			boundEpoch !== undefined && boundEpoch === (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0);
+			boundEpoch !== undefined &&
+			boundEpoch === (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0);
 		const liveBinding = !replayed && currentEpoch;
 		if (isSessionBusy(error)) {
 			// A busy refusal is not evidence about context or contract: the prompt

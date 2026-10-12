@@ -47,7 +47,6 @@ async function trailerCommits(id: string): Promise<string[]> {
 	return output.trim() ? output.trim().split("\n") : [];
 }
 
-
 test("quarantined memory intents persist their reason in the database and log it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-quarantine-"));
 	const database = await Store.open(join(home, "gateway.db"));

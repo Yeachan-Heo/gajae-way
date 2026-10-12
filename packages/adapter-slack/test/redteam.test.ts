@@ -643,8 +643,6 @@ test("RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal i
 	expect(client.calls[0]).toMatchObject({ verb: "delivery.fail", params: { ambiguous: false } });
 });
 
-
-
 test("RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals", async () => {
 	const messages = [6, 5, 4, 3, 2, 1].map((n) => ({ ts: `${n}.0`, user: "U1", text: `message ${n}` }));
 	const seen: string[] = [];
@@ -1155,7 +1153,6 @@ test("RT-SLACK-57 persona allowlist is disjoint and thumbs up leaves presence al
 	expect(api.removed).toEqual([]);
 	await status.clear("C1");
 });
-
 
 for (const cosmetics of [1, 20])
 	test(`RT-SLACK-59 dispatch prioritizes late delivery over ${cosmetics} queued cosmetics`, async () => {

@@ -28,12 +28,7 @@ const CONSUMER_PACKAGES: Record<string, readonly string[]> = {
 // @gajae-gateway/log is public for the same reason as the protocol: it is an
 // unprivileged, dependency-free service sink (console + fs only) that a
 // third-party adapter needs in order to produce windowable logs at all.
-const PUBLIC_IMPORTS = [
-	"@gajae-gateway/sdk",
-	"@gajae-gateway/protocol",
-	"@gajae-gateway/log",
-	"@gajae-gateway/home",
-];
+const PUBLIC_IMPORTS = ["@gajae-gateway/sdk", "@gajae-gateway/protocol", "@gajae-gateway/log", "@gajae-gateway/home"];
 
 const FORBIDDEN_PREFIXES = [
 	"@gajae-gateway/gateway",

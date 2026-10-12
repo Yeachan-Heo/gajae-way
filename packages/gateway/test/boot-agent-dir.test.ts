@@ -68,7 +68,9 @@ test("boot reports a missing pinned gjc executable instead of searching PATH", a
 	const home = await tempDir();
 	const broker = { ...brokerFor(), executable: undefined as unknown as string };
 
-	await expect(bootGateway({ home, broker })).rejects.toThrow(`Pinned gjc executable cannot be resolved at ${homeLayout(home).gjcExecutable()}`);
+	await expect(bootGateway({ home, broker })).rejects.toThrow(
+		`Pinned gjc executable cannot be resolved at ${homeLayout(home).gjcExecutable()}`,
+	);
 	expect(await Bun.file(join(home, "gateway.db")).exists()).toBe(false);
 });
 

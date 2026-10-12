@@ -8,12 +8,12 @@ import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } 
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
 import { DatabaseStartupError, Store } from "../src/store";
 import {
+	resolveLaneReportOrigin,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
 	type WorkAttemptSettlement,
 	WorkAttemptStateError,
-	resolveLaneReportOrigin,
 	workAccepted,
 	workAttemptDeliveryId,
 	workAttemptReportId,
@@ -38,9 +38,19 @@ async function fixture() {
 	handles.push(database);
 	const canonicalAgentDir = join(directory, "agent");
 	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	expect(
-		database.transaction((tx) => database.bindings.recordOwnedBinding(tx, { authority, sessionId: SESSION, originKey: "work/task/a", epoch: 0, repo: "/work" })),
+		database.transaction((tx) =>
+			database.bindings.recordOwnedBinding(tx, {
+				authority,
+				sessionId: SESSION,
+				originKey: "work/task/a",
+				epoch: 0,
+				repo: "/work",
+			}),
+		),
 	).toBe(true);
 	const raw = new Database(path);
 	handles.push(raw);
@@ -120,7 +130,12 @@ function touchWorkSession(database: Store, tx: WriteTx, runtime: WorkAttemptRunt
 	);
 }
 
-function prepareAttempt(database: Store, tx: WriteTx, runtime: WorkAttemptRuntime, record: ReturnType<typeof appendAttempt>): void {
+function prepareAttempt(
+	database: Store,
+	tx: WriteTx,
+	runtime: WorkAttemptRuntime,
+	record: ReturnType<typeof appendAttempt>,
+): void {
 	const binding = database.bindings.getSessionRecord(runtime.sessionKey);
 	database.work.workAttemptPrepare(
 		tx,
@@ -141,7 +156,10 @@ function updateAttempt(
 	const current = database.work.workAttemptGet(opRef);
 	const updated = database.work.workAttemptUpdate(tx, opRef, expectedVersion, patch);
 	if (current && updated && !workAccepted(current) && workAccepted(updated) && updated.noticeHash !== null)
-		database.core.metaSet(`lane-notice:${updated.sessionKey}`, JSON.stringify({ epoch: updated.epoch, hash: updated.noticeHash }));
+		database.core.metaSet(
+			`lane-notice:${updated.sessionKey}`,
+			JSON.stringify({ epoch: updated.epoch, hash: updated.noticeHash }),
+		);
 	return updated;
 }
 
@@ -169,14 +187,17 @@ function settleAttempt(
 	if (!result) return undefined;
 	touchWorkSession(database, tx, result.runtime, result.runtime.settledAt!);
 	if (result.runtime.decision === "reported" && admission?.kind === "persona") {
-		if (!database.inbox.enqueue(tx, {
-			messageId: admission.row.messageId,
-			originKey: admission.row.originKey,
-			originRefJson: resolveLaneReportOrigin(result.runtime.parent, admission.row.originRefJson),
-			body: admission.row.body,
-			receivedAt: result.runtime.settledAt!,
-			source: "lane_report",
-		})) throw new Error("lane report inbound conflict");
+		if (
+			!database.inbox.enqueue(tx, {
+				messageId: admission.row.messageId,
+				originKey: admission.row.originKey,
+				originRefJson: resolveLaneReportOrigin(result.runtime.parent, admission.row.originRefJson),
+				body: admission.row.body,
+				receivedAt: result.runtime.settledAt!,
+				source: "lane_report",
+			})
+		)
+			throw new Error("lane report inbound conflict");
 	}
 	for (const payload of [result.fallbackPayload, result.childFallback]) {
 		if (!payload) continue;
@@ -222,7 +243,8 @@ describe("work attempt durable transactions", () => {
 			const settlement = { ...f.settlement, decision: mode === "start" ? ("report" as const) : ("no_target" as const) };
 			const admission = mode === "start" ? f.admission : undefined;
 			const expectedDecision = mode === "start" ? "fallback" : "no_target";
-			const identity = () => f.database.bindings.sessionIdentityRows().find((row) => row.origin_key === runtime.sessionKey);
+			const identity = () =>
+				f.database.bindings.sessionIdentityRows().find((row) => row.origin_key === runtime.sessionKey);
 			const workerOrigin = JSON.stringify({ platform: "work", kind: "task", conversationId: "a" });
 			// An AFTER fault proves both assignments roll back even after the UPDATE executes.
 			f.raw.exec("CREATE TRIGGER fault AFTER UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'fault'); END");
@@ -236,14 +258,19 @@ describe("work attempt durable transactions", () => {
 			// Simulate missing legacy metadata to prove settlement restores it too.
 			f.raw.query("UPDATE sessions SET origin_ref_json = NULL WHERE origin_key = ?").run(runtime.sessionKey);
 			f.raw.exec("CREATE TRIGGER fault AFTER UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'fault'); END");
-			expect(() => f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, settlement, admission))).toThrow();
+			expect(() =>
+				f.database.transaction((tx) =>
+					settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, settlement, admission),
+				),
+			).toThrow();
 			expect(identity()).toMatchObject({ origin_ref_json: null, last_activity_at: START });
 			expect(f.database.work.workAttemptGet(runtime.opRef)?.decision).toBe("undecided");
 			expect(f.database.outbox.rows()).toHaveLength(0);
 			f.raw.exec("DROP TRIGGER fault");
-			expect(f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, settlement, admission))?.runtime.decision).toBe(
-				expectedDecision,
-			);
+			expect(
+				f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, settlement, admission))
+					?.runtime.decision,
+			).toBe(expectedDecision);
 			expect(identity()).toMatchObject({ origin_ref_json: workerOrigin, last_activity_at: END });
 		});
 
@@ -261,13 +288,17 @@ describe("work attempt durable transactions", () => {
 			const requested = mode === "start" ? ("report" as const) : ("no_target" as const);
 			const expected = mode === "start" ? "fallback" : "no_target";
 			expect(
-				f.database.transaction((tx) => settleAttempt(f.database, tx, 
-					runtime.opRef,
-					0,
-					f.closed,
-					{ ...f.settlement, decision: requested },
-					mode === "start" ? f.admission : undefined,
-				))?.runtime.decision,
+				f.database.transaction((tx) =>
+					settleAttempt(
+						f.database,
+						tx,
+						runtime.opRef,
+						0,
+						f.closed,
+						{ ...f.settlement, decision: requested },
+						mode === "start" ? f.admission : undefined,
+					),
+				)?.runtime.decision,
 			).toBe(expected);
 			expect(f.database.bindings.sessionIdentityRows()).toEqual(before);
 		});
@@ -294,14 +325,20 @@ describe("work attempt durable transactions", () => {
 			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 			const action = table === "deliveries" ? "INSERT" : "UPDATE";
 			f.raw.exec(`CREATE TRIGGER fault BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'fault'); END`);
-			expect(() => f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission))).toThrow();
+			expect(() =>
+				f.database.transaction((tx) =>
+					settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+				),
+			).toThrow();
 			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(f.runtime);
 			expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 			expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(START);
 			expect(f.database.outbox.rows()).toHaveLength(0);
 			f.raw.exec("DROP TRIGGER fault");
 			expect(
-				f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission))?.runtime.decision,
+				f.database.transaction((tx) =>
+					settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+				)?.runtime.decision,
 			).toBe("fallback");
 			expect(f.database.outbox.rows()).toHaveLength(1);
 			expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(END);
@@ -311,22 +348,34 @@ describe("work attempt durable transactions", () => {
 	test("CAS refuses stale settlement and duplicate decisions; pruning does not regenerate", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
-		const accepted = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, {
-			sendPhase: "accepted",
-			sendEvidence: { source: "receipt", observedAt: START },
-		}));
-		expect(accepted?.version).toBe(1);
-		expect(f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission))).toBeUndefined();
-		expect(f.database.outbox.rows()).toHaveLength(0);
-		expect(f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 1, f.closed, f.settlement, f.admission))?.runtime.version).toBe(
-			2,
+		const accepted = f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			}),
 		);
+		expect(accepted?.version).toBe(1);
+		expect(
+			f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+			),
+		).toBeUndefined();
+		expect(f.database.outbox.rows()).toHaveLength(0);
+		expect(
+			f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, f.runtime.opRef, 1, f.closed, f.settlement, f.admission),
+			)?.runtime.version,
+		).toBe(2);
 		const ledger = new DeliveryService(f.database);
 		expect(ledger.confirm(f.runtime.deliveryId)).toBe("transitioned");
 		expect(ledger.prune(0, Date.now() + 1000)).toBe(1);
 		const reopened = await Store.open(f.path);
 		handles.push(reopened);
-		expect(reopened.transaction((tx) => settleAttempt(reopened, tx, f.runtime.opRef, 2, f.closed, f.settlement, f.admission))).toBeUndefined();
+		expect(
+			reopened.transaction((tx) =>
+				settleAttempt(reopened, tx, f.runtime.opRef, 2, f.closed, f.settlement, f.admission),
+			),
+		).toBeUndefined();
 		expect(reopened.transaction((tx) => updateAttempt(reopened, tx, f.runtime.opRef, 2, {}))).toBeUndefined();
 		expect(reopened.work.workAttemptGet(f.runtime.opRef)?.decision).toBe("fallback");
 		expect(reopened.outbox.rows()).toHaveLength(0);
@@ -367,7 +416,11 @@ describe("work attempt durable transactions", () => {
 			undefined,
 			f.runtime.deliveryId,
 		);
-		expect(() => f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+			),
+		).toThrow();
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.decision).toBe("undecided");
 		expect(f.database.outbox.rows()[0]?.turn_id).toBe("other-turn");
 	});
@@ -378,7 +431,9 @@ describe("work attempt durable transactions", () => {
 		expect(() => delivery.persistInTransaction(undefined as never, f.payload)).toThrow("inactive_tx");
 		expect(f.database.transaction((tx) => delivery.persistInTransaction(tx, f.payload))).toBe(true);
 		expect(f.database.transaction((tx) => delivery.persistInTransaction(tx, f.payload))).toBe(false);
-		expect(() => f.database.transaction((tx) => delivery.persistInTransaction(tx, { ...f.payload, text: "changed" }))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) => delivery.persistInTransaction(tx, { ...f.payload, text: "changed" })),
+		).toThrow();
 		expect(buildDeliveryPayload("turn", LOOPBACK_ORIGIN, "NO_REPLY", "silent")).toBeUndefined();
 	});
 
@@ -400,58 +455,81 @@ describe("work attempt durable transactions", () => {
 			byteLength: 8,
 		};
 		const output = { ...f.runtime.output, disposition: "silent" as const, knownSilence: proof, proof, excerpt: null };
-		expect(f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { output }))?.version).toBe(1);
-		expect(f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { output }))).toBeUndefined();
+		expect(f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { output }))?.version).toBe(
+			1,
+		);
+		expect(
+			f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { output })),
+		).toBeUndefined();
 		const reopened = await Store.open(f.path);
 		handles.push(reopened);
 		expect(reopened.work.workAttemptGet(f.runtime.opRef)?.output.knownSilence).toEqual(proof);
-		expect(() => reopened.transaction((tx) => updateAttempt(reopened, tx, f.runtime.opRef, 1, { output: f.runtime.output }))).toThrow();
+		expect(() =>
+			reopened.transaction((tx) => updateAttempt(reopened, tx, f.runtime.opRef, 1, { output: f.runtime.output })),
+		).toThrow();
 		const suppressed = { ...f.settlement, output, decision: "suppressed" as const };
-		expect(reopened.transaction((tx) => settleAttempt(reopened, tx, f.runtime.opRef, 1, f.closed, suppressed))?.runtime.decision).toBe("suppressed");
-		expect(reopened.transaction((tx) => settleAttempt(reopened, tx, f.runtime.opRef, 2, f.closed, suppressed))).toBeUndefined();
+		expect(
+			reopened.transaction((tx) => settleAttempt(reopened, tx, f.runtime.opRef, 1, f.closed, suppressed))?.runtime
+				.decision,
+		).toBe("suppressed");
+		expect(
+			reopened.transaction((tx) => settleAttempt(reopened, tx, f.runtime.opRef, 2, f.closed, suppressed)),
+		).toBeUndefined();
 		expect(reopened.outbox.rows()).toHaveLength(0);
 	});
 
 	test("output claims persist three-read budget; stale/wrong proof and oversized excerpt fail closed", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
-		let runtime = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: f.settlement.terminal }))!;
+		let runtime = f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: f.settlement.terminal }),
+		)!;
 		for (let reads = 1; reads <= 3; reads++)
-			runtime = f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
-				output: { ...runtime.output, reads, nextReadAt: END },
-			}))!;
+			runtime = f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
+					output: { ...runtime.output, reads, nextReadAt: END },
+				}),
+			)!;
 		expect(runtime.output.reads).toBe(3);
 		expect(() =>
-			f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, { output: { ...runtime.output, reads: 4 } })),
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, { output: { ...runtime.output, reads: 4 } }),
+			),
 		).toThrow();
 		expect(() =>
-			f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, { output: { ...runtime.output, reads: 0 } })),
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, { output: { ...runtime.output, reads: 0 } }),
+			),
 		).toThrow();
 		expect(() =>
-			f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
-				output: { ...runtime.output, excerpt: "界".repeat(1000) },
-			})),
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
+					output: { ...runtime.output, excerpt: "界".repeat(1000) },
+				}),
+			),
 		).toThrow();
 		expect(() =>
-			f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
-				output: {
-					...runtime.output,
-					knownSilence: {
-						opRef: "gw-other",
-						sessionId: SESSION,
-						epoch: 0,
-						observedAtMs: Date.parse(END),
-						source: "turn.result",
-						attribution: "operation_ref",
-						fullness: "original",
-						clientRef: runtime.opRef,
-						repo: "/work",
-						terminalAt: Date.parse(END),
-						contentVersion: 1,
-						byteLength: 8,
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
+					output: {
+						...runtime.output,
+						knownSilence: {
+							opRef: "gw-other",
+							sessionId: SESSION,
+							epoch: 0,
+							observedAtMs: Date.parse(END),
+							source: "turn.result",
+							attribution: "operation_ref",
+							fullness: "original",
+							clientRef: runtime.opRef,
+							repo: "/work",
+							terminalAt: Date.parse(END),
+							contentVersion: 1,
+							byteLength: 8,
+						},
 					},
-				},
-			})),
+				}),
+			),
 		).toThrow();
 	});
 
@@ -469,7 +547,9 @@ describe("work attempt durable transactions", () => {
 			reasonCode: "end_turn",
 			status: { ...missing.status, receiptState: "present" as const },
 		};
-		const runtime = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: missing }))!;
+		const runtime = f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: missing }),
+		)!;
 		const proof = {
 			opRef: f.runtime.opRef,
 			sessionId: SESSION,
@@ -486,21 +566,33 @@ describe("work attempt durable transactions", () => {
 		};
 		const available = { ...runtime.output, disposition: "available" as const, excerpt: "PR ready", proof };
 		// No proven body: the receipt cannot be upgraded.
-		expect(() => f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, { terminal: present }))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, { terminal: present }),
+			),
+		).toThrow();
 		// Any other terminal rewrite remains forbidden, even with a proven body.
 		expect(() =>
-			f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
-				terminal: { ...present, status: { ...present.status, outcome: { reason: "refusal" } } },
-				output: available,
-			})),
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
+					terminal: { ...present, status: { ...present.status, outcome: { reason: "refusal" } } },
+					output: available,
+				}),
+			),
 		).toThrow();
-		const upgraded = f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
-			terminal: present,
-			output: available,
-		}))!;
+		const upgraded = f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
+				terminal: present,
+				output: available,
+			}),
+		)!;
 		expect(upgraded.terminal).toEqual(present);
 		// present never regresses to missing.
-		expect(() => f.database.transaction((tx) => updateAttempt(f.database, tx, upgraded.opRef, upgraded.version, { terminal: missing }))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, upgraded.opRef, upgraded.version, { terminal: missing }),
+			),
+		).toThrow();
 	});
 
 	test("corrupt runtime projection or history throws rather than returning empty", async () => {
@@ -515,14 +607,27 @@ describe("work attempt durable transactions", () => {
 
 	test("run is response-only and final decisions cannot bypass settlement", async () => {
 		const f = await fixture();
-		expect(() => f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, mode: "run" }, f.record))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, mode: "run" }, f.record)),
+		).toThrow();
 		const runtime = { ...f.runtime, mode: "run" as const, parent: null };
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
-		expect(() => f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, 0, f.settlement))).toThrow();
-		expect(() => f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, f.settlement, f.admission))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, 0, f.settlement)),
+		).toThrow();
+		expect(() =>
+			f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, f.settlement, f.admission),
+			),
+		).toThrow();
 		const patch = { ...f.settlement, decision: "no_target" as const };
-		expect(() => f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, patch, f.admission))).toThrow();
-		expect(f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, patch))?.runtime.decision).toBe("no_target");
+		expect(() =>
+			f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, patch, f.admission)),
+		).toThrow();
+		expect(
+			f.database.transaction((tx) => settleAttempt(f.database, tx, runtime.opRef, 0, f.closed, patch))?.runtime
+				.decision,
+		).toBe("no_target");
 		expect(f.database.outbox.rows()).toHaveLength(0);
 	});
 
@@ -578,10 +683,12 @@ describe("work attempt durable transactions", () => {
 			const runtime = { ...f.runtime, parent: null, wakeReportId: linkedId };
 			f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
 			const terminal = { kind: "local" as const, observedAt: END, reasonCode };
-			const staged = f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, 0, {
-				terminal,
-				output: { ...runtime.output, disposition: "unavailable" },
-			}))!;
+			const staged = f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, 0, {
+					terminal,
+					output: { ...runtime.output, disposition: "unavailable" },
+				}),
+			)!;
 			const closed = closeAttempt({
 				record: f.record,
 				opRef: runtime.opRef,
@@ -589,12 +696,14 @@ describe("work attempt durable transactions", () => {
 				errorCode: reasonCode,
 				endedAt: END,
 			});
-			const result = f.database.transaction((tx) => settleAttempt(f.database, tx, staged.opRef, staged.version, closed, {
-				terminal,
-				output: staged.output,
-				decision: "wake_unaccepted",
-				settledAt: END,
-			}));
+			const result = f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, staged.opRef, staged.version, closed, {
+					terminal,
+					output: staged.output,
+					decision: "wake_unaccepted",
+					settledAt: END,
+				}),
+			);
 			expect(result?.runtime.decision).toBe("wake_unaccepted");
 			expect(f.database.work.workAttemptGet(runtime.opRef)?.decision).toBe("wake_unaccepted");
 			expect(f.database.inbox.turnRow(runtime.opRef)).toBeUndefined();
@@ -626,22 +735,28 @@ describe("work attempt durable transactions", () => {
 		const linkedId = seedLinkedWakeReport(f, root);
 		const personaSessionId = crypto.randomUUID();
 		expect(
-			f.database.transaction((tx) => f.database.bindings.recordOwnedBinding(tx, {
-				authority: f.authority,
-				sessionId: personaSessionId,
-				originKey: root.originKey,
-				epoch: 0,
-				repo: "/work",
-			})),
+			f.database.transaction((tx) =>
+				f.database.bindings.recordOwnedBinding(tx, {
+					authority: f.authority,
+					sessionId: personaSessionId,
+					originKey: root.originKey,
+					epoch: 0,
+					repo: "/work",
+				}),
+			),
 		).toBe(true);
 		const runtime = { ...f.runtime, wakeReportId: linkedId };
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
-		const accepted = f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, 0, {
-			sendPhase: "accepted",
-			sendEvidence: { source: "receipt", observedAt: START },
-		}))!;
+		const accepted = f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			}),
+		)!;
 		expect(f.database.work.laneReportGet(linkedId)?.state).toBe("consumed");
-		const result = f.database.transaction((tx) => settleAttempt(f.database, tx, accepted.opRef, accepted.version, f.closed, f.settlement, f.admission))!;
+		const result = f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, accepted.opRef, accepted.version, f.closed, f.settlement, f.admission),
+		)!;
 		expect(result.runtime.decision).toBe("reported");
 		expect(f.database.work.laneReportGet(linkedId)?.consumed_op_ref).toBe(runtime.opRef);
 		expect(f.database.inbox.pendingOldest(root.originKey)).toMatchObject({
@@ -656,13 +771,15 @@ describe("work attempt durable transactions", () => {
 		const root = { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN };
 		const linkedId = seedLinkedWakeReport(f, root);
 		const personaSessionId = crypto.randomUUID();
-		f.database.transaction((tx) => f.database.bindings.recordOwnedBinding(tx, {
-			authority: f.authority,
-			sessionId: personaSessionId,
-			originKey: root.originKey,
-			epoch: 0,
-			repo: "/work",
-		}));
+		f.database.transaction((tx) =>
+			f.database.bindings.recordOwnedBinding(tx, {
+				authority: f.authority,
+				sessionId: personaSessionId,
+				originKey: root.originKey,
+				epoch: 0,
+				repo: "/work",
+			}),
+		);
 		const runtime = { ...f.runtime, wakeReportId: linkedId };
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
 		const proof = {
@@ -685,7 +802,9 @@ describe("work attempt durable transactions", () => {
 			excerpt: "proven wake output",
 			proof,
 		};
-		const accepted = f.database.transaction((tx) => updateAttempt(f.database, tx, runtime.opRef, 0, { output: provenOutput }))!;
+		const accepted = f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, runtime.opRef, 0, { output: provenOutput }),
+		)!;
 		expect(accepted.sendPhase).toBe("prepared");
 		expect(f.database.work.laneReportGet(linkedId)?.state).toBe("consumed");
 		const patch = {
@@ -693,7 +812,9 @@ describe("work attempt durable transactions", () => {
 			output: { ...provenOutput, disposition: "unavailable" as const, excerpt: null },
 			decision: "report" as const,
 		};
-		const result = f.database.transaction((tx) => settleAttempt(f.database, tx, accepted.opRef, accepted.version, f.closed, patch, f.admission))!;
+		const result = f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, accepted.opRef, accepted.version, f.closed, patch, f.admission),
+		)!;
 		expect(result.runtime.decision).toBe("reported");
 		expect(result.runtime.output.proof).toEqual(proof);
 		expect(f.database.work.laneReportGet(linkedId)?.consumed_op_ref).toBe(runtime.opRef);
@@ -704,9 +825,17 @@ describe("work attempt durable transactions", () => {
 	});
 	test("wrong bound identity and history cannot be prepared", async () => {
 		const f = await fixture();
-		expect(() => f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, epoch: 1 }, f.record))).toThrow();
-		expect(() => f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, cwd: "/different" }, f.record))).toThrow();
-		expect(() => f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, deliveryId: "arbitrary" }, f.record))).toThrow();
+		expect(() =>
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, epoch: 1 }, f.record)),
+		).toThrow();
+		expect(() =>
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, { ...f.runtime, cwd: "/different" }, f.record)),
+		).toThrow();
+		expect(() =>
+			f.database.transaction((tx) =>
+				prepareAttempt(f.database, tx, { ...f.runtime, deliveryId: "arbitrary" }, f.record),
+			),
+		).toThrow();
 		expect(f.database.work.workAttemptOpen()).toHaveLength(0);
 		expect(f.database.work.laneJobJson(f.runtime.jobId)).toBeUndefined();
 	});
@@ -714,18 +843,22 @@ describe("work attempt durable transactions", () => {
 	test("v24 migration rewrites a quarantined v23 runtime and restores quarantine triggers", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
-		const settled = f.database.transaction((tx) => settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission))!;
+		const settled = f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
+		)!;
 		expect(settled.runtime.decision).toBe("fallback");
 		const targetAuthority = {
 			canonicalAgentDir: join(f.path, "..", "target-agent"),
 			identity: "target-broker",
 		};
-		f.database.transaction((tx) => f.database.bindings.cutoverBrokerAuthority(tx, {
-			expectedAuthority: f.authority,
-			targetAuthority,
-			evidence: "test v23 quarantine migration",
-			disposition: "quarantine",
-		}));
+		f.database.transaction((tx) =>
+			f.database.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: f.authority,
+				targetAuthority,
+				evidence: "test v23 quarantine migration",
+				disposition: "quarantine",
+			}),
+		);
 		const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 		const legacy: Record<string, unknown> = {
 			...current,
@@ -796,7 +929,9 @@ describe("work attempt durable transactions", () => {
 	});
 	test("v21 migration preserves historical open history and adopts without parent", async () => {
 		const f = await fixture();
-		f.database.transaction((tx) => f.database.work.putLaneJob(tx, { ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) }));
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, { ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) }),
+		);
 		// Preserve the fixture's explicit provenance while replaying v21 through v26.
 		// Restoring a snapshot is not initialization/adoption of a populated database.
 		f.raw.exec(`CREATE TEMP TABLE saved_authority AS SELECT * FROM broker_authority;
@@ -839,8 +974,9 @@ DELETE FROM schema_migrations WHERE version >= 21;
 		migrated.transaction((tx) => prepareAttempt(migrated, tx, historical, f.record));
 		expect(migrated.work.workAttemptGet(f.runtime.opRef)?.parent).toBeNull();
 		expect(
-			migrated.transaction((tx) => settleAttempt(migrated, tx, f.runtime.opRef, 0, f.closed, { ...f.settlement, decision: "no_target" }))?.runtime
-				.decision,
+			migrated.transaction((tx) =>
+				settleAttempt(migrated, tx, f.runtime.opRef, 0, f.closed, { ...f.settlement, decision: "no_target" }),
+			)?.runtime.decision,
 		).toBe("no_target");
 		expect(migrated.outbox.rows()).toHaveLength(0);
 	});

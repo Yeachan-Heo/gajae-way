@@ -4,11 +4,10 @@ import type {
 	ChatSendResult,
 	GatewayStatusResult,
 	OpsCycleResult,
-	OpsSloParams,
-	OpsSloResult,
 	OpsDeliveriesParams,
 	OpsDeliveriesResult,
-
+	OpsSloParams,
+	OpsSloResult,
 	WorkRunParams,
 	WorkRunResult,
 } from "@gajae-gateway/protocol";
@@ -121,7 +120,7 @@ export class GajaewayClient {
 
 		for (;;) {
 			try {
-				return await this.connectSocket(path, clientOptions);
+				return await GajaewayClient.connectSocket(path, clientOptions);
 			} catch (error) {
 				const remainingMs = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - (Date.now() - startedAt);
 				if (remainingMs <= 0) throw error;

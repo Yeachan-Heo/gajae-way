@@ -14,7 +14,9 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-epoch-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	let creates = 0;
 	const inputs: Array<Record<string, unknown>> = [];
 	const run: CliRunner = async (args) => {
@@ -76,7 +78,9 @@ test("generic and malformed create failures do not mint a new idempotency key or
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-generic-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const failures: Array<{ originKey: string; code?: string; result: CliResult }> = [
 		{
 			originKey: "create-operation-failed",
@@ -192,7 +196,9 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-thrown-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const failures = [
 		{
 			originKey: "create-thrown-timeout",
@@ -276,7 +282,9 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-public-uncertain-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const repo = join(home, "workspace");
 	const originKey = "discord/channel/stuck";
 	const poisonedKey = `gw-bind-${createHash("sha256").update(`public-uncertain|${originKey}|0|${repo}`).digest("hex").slice(0, 32)}`;
@@ -321,7 +329,9 @@ test("gjc 0.18 operation_failed naming a different key is not proof about the se
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-foreign-ref-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const repo = join(home, "workspace");
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {

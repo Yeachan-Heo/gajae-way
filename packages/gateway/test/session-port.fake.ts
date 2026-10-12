@@ -39,7 +39,9 @@ import type { BrokerAuthority } from "../src/store/groups/bindings";
 /** Initializes only a fresh test DB; never adopts legacy bindings or writes a GJC profile. */
 export function initializeTestBrokerAuthority(database: Store, canonicalAgentDir: string): BrokerAuthority {
 	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	return authority;
 }
 

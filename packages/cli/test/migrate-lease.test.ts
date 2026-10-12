@@ -1,11 +1,10 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, leaseHeld } from "@gajae-gateway/home";
-import { migrate } from "../src/migrate";
 import { main } from "../src/main";
-
+import { migrate } from "../src/migrate";
 
 async function sourceHome(): Promise<string> {
 	const source = await mkdtemp(join(tmpdir(), "gajaeway-migrate-source-"));

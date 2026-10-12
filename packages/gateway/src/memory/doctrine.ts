@@ -302,7 +302,6 @@ export function regenerateMap(root: string, registry?: AxisRegistry): Promise<vo
 	return regenerateMapFiles(root, registry);
 }
 
-
 async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promise<void> {
 	const axes = (registry ?? (await loadRegistry(root))).axes;
 	const files = await Promise.all(axes.map((axis) => axisEntries(root, axis)));

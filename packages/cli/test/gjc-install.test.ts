@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
-import { installPinnedGjc, type GjcInstallRunner } from "../src/gjc-install";
+import { type GjcInstallRunner, installPinnedGjc } from "../src/gjc-install";
 
 async function home(): Promise<string> {
 	return await mkdtemp(join(tmpdir(), "gajaeway-gjc-install-"));
@@ -67,8 +67,7 @@ test("installPinnedGjc prunes old versions while retaining current and its prede
 	const directory = await home();
 	const { runner } = installRunner();
 	try {
-		for (const version of ["0.18.8", "0.19.0", "0.20.0"])
-			await installPinnedGjc({ home: directory, version, runner });
+		for (const version of ["0.18.8", "0.19.0", "0.20.0"]) await installPinnedGjc({ home: directory, version, runner });
 		const layout = homeLayout(directory);
 		expect(await readlink(layout.gjcCurrent)).toBe("0.20.0");
 		expect((await readdir(layout.gjcPrefix)).sort()).toEqual(["0.19.0", "0.20.0", "current"]);

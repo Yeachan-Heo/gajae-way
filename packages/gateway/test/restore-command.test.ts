@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
-import { runRestore } from "../src/ops/restore";
 import { writeBackup } from "../src/ops/backup";
+import { runRestore } from "../src/ops/restore";
 import { Store } from "../src/store";
 
 const roots: string[] = [];
@@ -100,7 +100,10 @@ async function faultRestore(home: string, backup: string, point: string): Promis
 		stdout: "ignore",
 		stderr: "ignore",
 	});
-	const outcome = await Promise.race([child.exited.then(() => "exited" as const), Bun.sleep(10_000).then(() => "timeout" as const)]);
+	const outcome = await Promise.race([
+		child.exited.then(() => "exited" as const),
+		Bun.sleep(10_000).then(() => "timeout" as const),
+	]);
 	if (outcome === "timeout") child.kill("SIGKILL");
 	await child.exited;
 	expect(outcome).toBe("exited");
@@ -170,7 +173,9 @@ test("restore refuses a held lease, corrupt/newer backups, sidecar sources and n
 	expect(await quietly(() => runRestore(corrupt, { home: f.home }))).toBe(1);
 	const newer = join(f.root, "newer.db");
 	const newerDb = new Database(newer);
-	newerDb.exec("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (99, 'now')");
+	newerDb.exec(
+		"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (99, 'now')",
+	);
 	newerDb.close();
 	expect(await quietly(() => runRestore(newer, { home: f.home }))).toBe(1);
 	const nonSelfContained = join(f.root, "non-self-contained.db");
@@ -189,7 +194,9 @@ test("restore replaces corrupt and newer live databases without opening them fir
 		else {
 			const newerPath = join(f.root, "newer-live.db");
 			const newerDb = new Database(newerPath);
-			newerDb.exec("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (99, 'now')");
+			newerDb.exec(
+				"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (99, 'now')",
+			);
 			newerDb.close();
 			await copyFile(newerPath, f.livePath);
 		}

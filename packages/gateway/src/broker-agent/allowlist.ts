@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { lstat as lstatAsync, readFile as readFileAsync, readdir as readdirAsync, stat as statAsync } from "node:fs/promises";
+import { lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+	lstat as lstatAsync,
+	readdir as readdirAsync,
+	readFile as readFileAsync,
+	stat as statAsync,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { credentialFingerprint } from "./agent-db";
@@ -123,9 +128,14 @@ function entryBytesSync(entry: BrokerAgentAllowlistEntry, path: string): Array<{
 	return [{ name: entry.name, bytes: readFileSync(path) }];
 }
 
-async function entryBytes(entry: BrokerAgentAllowlistEntry, path: string): Promise<Array<{ name: string; bytes: Buffer }>> {
+async function entryBytes(
+	entry: BrokerAgentAllowlistEntry,
+	path: string,
+): Promise<Array<{ name: string; bytes: Buffer }>> {
 	if (entry.form === "group") {
-		const names = (await readdirAsync(path)).filter((name) => entry.files.includes(name as (typeof entry.files)[number]));
+		const names = (await readdirAsync(path)).filter((name) =>
+			entry.files.includes(name as (typeof entry.files)[number]),
+		);
 		return Promise.all(names.map(async (name) => ({ name, bytes: await readFileAsync(join(path, name)) })));
 	}
 	return [{ name: entry.name, bytes: await readFileAsync(path) }];
@@ -155,13 +165,14 @@ function fingerprintBytes(files: readonly { readonly name: string; readonly byte
 	return hash.digest("hex");
 }
 
-
 export function sourceEntryRootSync(entry: BrokerAgentAllowlistEntry, source: string, dataSource: string): string {
 	return entry.name === "agent.db" ? dataSource : source;
 }
 
-
-export function sourceEntryStat(entry: BrokerAgentAllowlistEntry, root: string): Promise<{
+export function sourceEntryStat(
+	entry: BrokerAgentAllowlistEntry,
+	root: string,
+): Promise<{
 	readonly size: number;
 	readonly mtimeNs: string;
 }> {
@@ -174,7 +185,10 @@ export function sourceEntryStat(entry: BrokerAgentAllowlistEntry, root: string):
 			);
 			return {
 				size: members.reduce((sum, member) => sum + member.bytes.byteLength, 0),
-				mtimeNs: mtimes.filter((info) => info !== undefined).map((info) => info.mtimeNs.toString()).join(","),
+				mtimeNs: mtimes
+					.filter((info) => info !== undefined)
+					.map((info) => info.mtimeNs.toString())
+					.join(","),
 			};
 		}
 		const info = await statAsync(path, { bigint: true });
@@ -208,7 +222,13 @@ export function hasLiveBrokerUrl(content: string): boolean {
 		const value = (match[3] ?? "").replace(/^['"]|['"]$/g, "").trim();
 		while (stack.length > 0 && (stack.at(-1)?.indent ?? -1) >= indent) stack.pop();
 		if (key === AUTH_BROKER_URL_KEY && value && value !== "null" && value !== "~") return true;
-		if (key === "url" && value && value !== "null" && value !== "~" && stack.map((item) => item.key).join(".") === "auth.broker")
+		if (
+			key === "url" &&
+			value &&
+			value !== "null" &&
+			value !== "~" &&
+			stack.map((item) => item.key).join(".") === "auth.broker"
+		)
 			return true;
 		if (!value) stack.push({ indent, key });
 	}

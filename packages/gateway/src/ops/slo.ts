@@ -1,12 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
 import { readFile } from "node:fs/promises";
-import type {
-	OpsSloResult,
-	OpsSloWindow,
-	SloDayResult,
-	SloDayStatus,
-} from "@gajae-gateway/protocol";
+import { join } from "node:path";
+import type { OpsSloResult, OpsSloWindow, SloDayResult, SloDayStatus } from "@gajae-gateway/protocol";
 import type { StoreCore } from "../store/core";
 
 export const SLO_TICK_MS = 5 * 60_000;
@@ -144,7 +139,6 @@ export class SloRecorder {
 		} catch (error) {
 			this.#log(`slo_final_tick_failed detail=${diagnostic(error)}`);
 		}
-
 	}
 	/** Refresh latest receipt state, then evaluate the requested fully elapsed UTC days. */
 	async evaluate(days: number = DEFAULT_SLO_DAYS, now: Date = new Date(this.#now())): Promise<OpsSloResult> {
@@ -188,7 +182,12 @@ export class SloRecorder {
 						continue;
 					}
 					mergeTickInterval(existing, interval.startMs, interval.endMs);
-					this.#core.metaSet(key, JSON.stringify(existing.map(({ startMs: intervalStart, endMs: intervalEnd }) => [intervalStart, intervalEnd])));
+					this.#core.metaSet(
+						key,
+						JSON.stringify(
+							existing.map(({ startMs: intervalStart, endMs: intervalEnd }) => [intervalStart, intervalEnd]),
+						),
+					);
 				}
 			});
 		} catch (error) {
@@ -225,7 +224,8 @@ export function eligibleSpans(windows: readonly SloWindowRecord[]): EligibleSpan
 
 /** Pure durable-evidence evaluation used by ops.slo and ops.cycle. */
 export function evaluateSlo(core: StoreCore, days: number = DEFAULT_SLO_DAYS, now: Date = new Date()): OpsSloResult {
-	if (!Number.isSafeInteger(days) || days < 1 || days > 3_650) throw new RangeError("SLO days must be an integer from 1 to 3650");
+	if (!Number.isSafeInteger(days) || days < 1 || days > 3_650)
+		throw new RangeError("SLO days must be an integer from 1 to 3650");
 	const nowMs = now.getTime();
 	if (!Number.isFinite(nowMs)) throw new RangeError("SLO evaluation time must be valid");
 	const todayStart = utcDayStart(nowMs);
@@ -240,10 +240,17 @@ export function evaluateSlo(core: StoreCore, days: number = DEFAULT_SLO_DAYS, no
 	const windows = windowRead.windows
 		.map(projectWindow)
 		.sort((left, right) => left.requestedAt.localeCompare(right.requestedAt) || left.id.localeCompare(right.id));
-	return { days: resultDays, windows, ok: resultDays.length === days && resultDays.every((day) => day.status === "ok") };
+	return {
+		days: resultDays,
+		windows,
+		ok: resultDays.length === days && resultDays.every((day) => day.status === "ok"),
+	};
 }
 
-export function classifySloEvents<T extends SloEvent>(events: readonly T[], windows: readonly SloWindowRecord[]): {
+export function classifySloEvents<T extends SloEvent>(
+	events: readonly T[],
+	windows: readonly SloWindowRecord[],
+): {
 	readonly counted: readonly T[];
 	readonly excluded: readonly T[];
 } {
@@ -271,13 +278,20 @@ function evaluateDay(
 	const date = utcDate(startMs);
 	const eventRead = readDayEvents(core, date);
 	const aliveRead = readDayIntervals(core, date);
-	const counted = classifySloEvents(eventRead.events, windows).counted.filter((event) => event.atMs >= startMs && event.atMs < endMs);
-	const excluded = eventRead.events.length - counted.length - eventRead.events.filter((event) => event.atMs < startMs || event.atMs >= endMs).length;
+	const counted = classifySloEvents(eventRead.events, windows).counted.filter(
+		(event) => event.atMs >= startMs && event.atMs < endMs,
+	);
+	const excluded =
+		eventRead.events.length -
+		counted.length -
+		eventRead.events.filter((event) => event.atMs < startMs || event.atMs >= endMs).length;
 	const intervals = clipAndUnion(aliveRead.intervals, startMs, endMs);
 	const gaps = uncoveredGaps(intervals, startMs, endMs);
 	const maxUncoveredGapMs = gaps.reduce((largest, gap) => Math.max(largest, gap.endMs - gap.startMs), 0);
 	const complete = gaps.every(
-		(gap) => gap.endMs - gap.startMs <= SLO_COVERAGE_GAP_MS || spans.some((span) => gap.startMs >= span.startMs && gap.endMs <= span.endMs),
+		(gap) =>
+			gap.endMs - gap.startMs <= SLO_COVERAGE_GAP_MS ||
+			spans.some((span) => gap.startMs >= span.startMs && gap.endMs <= span.endMs),
 	);
 	const aliveMs = intervals.reduce((total, interval) => total + interval.endMs - interval.startMs, 0);
 	const pendingWindows = windows.filter((window) => {
@@ -290,7 +304,8 @@ function evaluateDay(
 	const pending = pendingWindows.some((window) => nowMs < Date.parse(window.requestedAt) + SLO_UPDATE_WINDOW_MS);
 	const insufficientWindow = pendingWindows.length > 0 && !pending;
 	const overflow = core.metaGet(`slo:${date}:overflow`) === "1" || eventRead.events.length > SLO_MAX_EVENTS_PER_DAY;
-	const corruptEvidence = windowCorrupt || eventRead.corrupt || aliveRead.corrupt || core.metaGet(`slo:${date}:invalid`) === "1";
+	const corruptEvidence =
+		windowCorrupt || eventRead.corrupt || aliveRead.corrupt || core.metaGet(`slo:${date}:invalid`) === "1";
 	let status: SloDayStatus;
 	if (counted.length > 0 || overflow) status = "failed";
 	else if (pending) status = "pending";
@@ -334,7 +349,10 @@ function readDayEvents(core: StoreCore, date: string): { events: ParsedEvent[]; 
 	return { events, corrupt };
 }
 
-function readDayIntervals(core: StoreCore, date: string): { intervals: Array<{ startMs: number; endMs: number }>; corrupt: boolean } {
+function readDayIntervals(
+	core: StoreCore,
+	date: string,
+): { intervals: Array<{ startMs: number; endMs: number }>; corrupt: boolean } {
 	const raw = core.metaGet(`slo:${date}:alive`);
 	if (raw === undefined) return { intervals: [], corrupt: false };
 	const intervals = parseIntervals(raw);
@@ -372,9 +390,10 @@ function projectWindow(window: SloWindowRecord): OpsSloWindow {
 	const verified = eligibleSpans([window]).length === 1;
 	const eligibleStart = verified ? requestedAt : undefined;
 	const eligibleEnd = verified ? Math.min(finishedAt, requestedAt + SLO_UPDATE_WINDOW_MS) : undefined;
-	const overCapMs = Number.isFinite(finishedAt) && Number.isFinite(requestedAt)
-		? Math.max(0, finishedAt - (requestedAt + SLO_UPDATE_WINDOW_MS))
-		: 0;
+	const overCapMs =
+		Number.isFinite(finishedAt) && Number.isFinite(requestedAt)
+			? Math.max(0, finishedAt - (requestedAt + SLO_UPDATE_WINDOW_MS))
+			: 0;
 	return {
 		id: window.id,
 		trigger: window.trigger,
@@ -398,10 +417,14 @@ function parseRestartReceipt(raw: string): SloWindowRecord | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const receipt = value as Record<string, unknown>;
 	if (
-		typeof receipt.id !== "string" || receipt.id.length === 0 || receipt.id.length > 128 ||
+		typeof receipt.id !== "string" ||
+		receipt.id.length === 0 ||
+		receipt.id.length > 128 ||
 		(receipt.trigger !== "update" && receipt.trigger !== "manual") ||
-		typeof receipt.state !== "string" || !RESTART_STATES.has(receipt.state as RestartState) ||
-		typeof receipt.requestedAt !== "string" || !Number.isFinite(Date.parse(receipt.requestedAt)) ||
+		typeof receipt.state !== "string" ||
+		!RESTART_STATES.has(receipt.state as RestartState) ||
+		typeof receipt.requestedAt !== "string" ||
+		!Number.isFinite(Date.parse(receipt.requestedAt)) ||
 		!Array.isArray(receipt.steps)
 	)
 		return undefined;
@@ -432,10 +455,14 @@ function parseStoredWindow(value: unknown, id: string): SloWindowRecord | undefi
 	const window = value as Record<string, unknown>;
 	if (
 		(window.trigger !== "update" && window.trigger !== "manual") ||
-		typeof window.state !== "string" || !RESTART_STATES.has(window.state as RestartState) ||
-		typeof window.requestedAt !== "string" || !Number.isFinite(Date.parse(window.requestedAt)) ||
-		(window.finishedAt !== null && (typeof window.finishedAt !== "string" || !Number.isFinite(Date.parse(window.finishedAt)))) ||
-		!Array.isArray(window.stepResults) || !window.stepResults.every((result) => typeof result === "string" && STEP_RESULTS.has(result as RestartStepResult))
+		typeof window.state !== "string" ||
+		!RESTART_STATES.has(window.state as RestartState) ||
+		typeof window.requestedAt !== "string" ||
+		!Number.isFinite(Date.parse(window.requestedAt)) ||
+		(window.finishedAt !== null &&
+			(typeof window.finishedAt !== "string" || !Number.isFinite(Date.parse(window.finishedAt)))) ||
+		!Array.isArray(window.stepResults) ||
+		!window.stepResults.every((result) => typeof result === "string" && STEP_RESULTS.has(result as RestartStepResult))
 	)
 		return undefined;
 	return {
@@ -455,8 +482,13 @@ function parseEvents(raw: string): Array<[number, string, number]> | undefined {
 		const events: Array<[number, string, number]> = [];
 		for (const event of value) {
 			if (
-				!Array.isArray(event) || event.length !== 3 || !Number.isSafeInteger(event[0]) ||
-				typeof event[1] !== "string" || event[1].length === 0 || !Number.isSafeInteger(event[2]) || event[2] < 1
+				!Array.isArray(event) ||
+				event.length !== 3 ||
+				!Number.isSafeInteger(event[0]) ||
+				typeof event[1] !== "string" ||
+				event[1].length === 0 ||
+				!Number.isSafeInteger(event[2]) ||
+				event[2] < 1
 			)
 				return undefined;
 			events.push([event[0] as number, event[1] as string, event[2] as number]);
@@ -474,8 +506,11 @@ function parseIntervals(raw: string): Array<{ startMs: number; endMs: number }> 
 		const intervals: Array<{ startMs: number; endMs: number }> = [];
 		for (const interval of value) {
 			if (
-				!Array.isArray(interval) || interval.length !== 2 || !Number.isSafeInteger(interval[0]) ||
-				!Number.isSafeInteger(interval[1]) || interval[1] < interval[0]
+				!Array.isArray(interval) ||
+				interval.length !== 2 ||
+				!Number.isSafeInteger(interval[0]) ||
+				!Number.isSafeInteger(interval[1]) ||
+				interval[1] < interval[0]
 			)
 				return undefined;
 			intervals.push({ startMs: interval[0] as number, endMs: interval[1] as number });
@@ -499,11 +534,7 @@ function splitAtUtcMidnight(startMs: number, endMs: number): Array<{ date: strin
 	return result;
 }
 
-function mergeTickInterval(
-	intervals: Array<{ startMs: number; endMs: number }>,
-	startMs: number,
-	endMs: number,
-): void {
+function mergeTickInterval(intervals: Array<{ startMs: number; endMs: number }>, startMs: number, endMs: number): void {
 	const last = intervals.at(-1);
 	if (last && endMs <= last.endMs) return;
 	if (last && endMs - last.endMs <= SLO_TICK_EXTENSION_MS) {

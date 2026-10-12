@@ -3,16 +3,16 @@ import { exitOnLeaseHeld, LeaseError, LeaseHeldError } from "@gajae-gateway/home
 
 import { installStructuredLogging } from "@gajae-gateway/log";
 import { type BootedGateway, bootGateway } from "./boot";
+import { runBrokerAgentCommand } from "./broker-agent/command";
+import { runBrokerHost } from "./broker-host";
 import { gatewayHome, loadConfig } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { DEFAULT_EXIT_WRITER, installExitReporter } from "./exit-report";
-import { sanitizeDiagnostic } from "./orchestrator/rebind";
-import { runBrokerHost } from "./broker-host";
-import { runBrokerAgentCommand } from "./broker-agent/command";
+import { assertNoRestoreJournal } from "./offline";
 import { runCensus } from "./ops/census";
 import { runCutover } from "./ops/cutover";
 import { runRestore } from "./ops/restore";
-import { assertNoRestoreJournal } from "./offline";
+import { sanitizeDiagnostic } from "./orchestrator/rebind";
 
 /**
  * Hard ceiling on an ordered stop. Below the 30s `TimeoutStopSec` the service
@@ -36,7 +36,11 @@ if (command === "config" && args[0] === "check") {
 		try {
 			process.exitCode = await runBrokerHost(await loadConfig());
 		} catch (error) {
-			console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+			console.error(
+				error instanceof LeaseHeldError
+					? error.message
+					: sanitizeDiagnostic(error instanceof Error ? error.message : String(error)),
+			);
 			process.exitCode = 1;
 		}
 	}
@@ -46,7 +50,11 @@ if (command === "config" && args[0] === "check") {
 		await assertNoRestoreJournal(config.home);
 		process.exitCode = await runBrokerAgentCommand(args, config);
 	} catch (error) {
-		console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+		console.error(
+			error instanceof LeaseHeldError
+				? error.message
+				: sanitizeDiagnostic(error instanceof Error ? error.message : String(error)),
+		);
 		process.exitCode = 1;
 	}
 } else if (command === "cutover") {
@@ -57,7 +65,11 @@ if (command === "config" && args[0] === "check") {
 		try {
 			process.exitCode = await runCutover({ config: await loadConfig(), agentDir: args[1] as string });
 		} catch (error) {
-			console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+			console.error(
+				error instanceof LeaseHeldError
+					? error.message
+					: sanitizeDiagnostic(error instanceof Error ? error.message : String(error)),
+			);
 			process.exitCode = 1;
 		}
 	}
@@ -70,7 +82,11 @@ if (command === "config" && args[0] === "check") {
 			await runCensus(await loadConfig());
 			process.exitCode = 0;
 		} catch (error) {
-			console.error(error instanceof LeaseHeldError ? error.message : sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+			console.error(
+				error instanceof LeaseHeldError
+					? error.message
+					: sanitizeDiagnostic(error instanceof Error ? error.message : String(error)),
+			);
 			process.exitCode = 1;
 		}
 	}
@@ -161,6 +177,8 @@ if (command === "config" && args[0] === "check") {
 		process.exit(1);
 	}
 } else {
-	console.error("usage: gajaeway-gateway daemon [--stdio] | broker | broker-agent ... | cutover --agent-dir <dir> | census | restore <backup> [--abort] | config check [path]");
+	console.error(
+		"usage: gajaeway-gateway daemon [--stdio] | broker | broker-agent ... | cutover --agent-dir <dir> | census | restore <backup> [--abort] | config check [path]",
+	);
 	process.exitCode = 2;
 }

@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { acquireLease, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { detectHermes, readHermes } from "./migrate/hermes";
 import { detectOpenClaw, readOpenClaw } from "./migrate/openclaw";
 import {
@@ -11,7 +12,6 @@ import {
 	type SourceExtract,
 } from "./migrate/plan";
 import { expandHome, SourceTree } from "./migrate/source-fs";
-import { LeaseHeldError, acquireLease, type Lease } from "@gajae-gateway/home";
 
 export interface MigrateOptions {
 	source?: string;

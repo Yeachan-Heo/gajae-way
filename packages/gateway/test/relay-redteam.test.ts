@@ -160,7 +160,9 @@ async function actor(port = new ScriptedSessionPort()) {
 	});
 	cleanups.push(() => manager.stop());
 	const enqueue = (id: string) => {
-		db.transaction((tx) => db.inbox.enqueue(tx, { messageId: id, originKey: key, originRefJson: JSON.stringify(origin), body: id }));
+		db.transaction((tx) =>
+			db.inbox.enqueue(tx, { messageId: id, originKey: key, originRefJson: JSON.stringify(origin), body: id }),
+		);
 		return manager.notifyInbound(key);
 	};
 	return { db, port, manager, logs, terminal, speech, released, enqueue };

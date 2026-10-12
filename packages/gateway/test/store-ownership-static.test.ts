@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import { relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as ts from "typescript";
+import { OWNER_FILE, type OwnedTable, TABLE_OWNER } from "../src/store/ownership";
 import { classifySql } from "../src/store/sql-classify";
-import { OWNER_FILE, TABLE_OWNER, type OwnedTable } from "../src/store/ownership";
 
 const sourceRoot = fileURLToPath(new URL("../src/", import.meta.url));
 const rawMethods = new Set(["query", "exec", "prepare"]);
@@ -33,7 +33,8 @@ function writeOwnerViolation(file: string, sql: string): SqlWrite | undefined {
 	if (fileRelative === "store/migrations.ts") return undefined;
 	const classification = classifySql(sql);
 	if (classification?.kind !== "write") {
-		const writePrefix = /^\s*(?:INSERT\s|REPLACE\s|UPDATE\s|DELETE\s+FROM\b|WITH\s+(?:RECURSIVE\s+)?[A-Za-z_$][\w$]*\s+AS\b)/i;
+		const writePrefix =
+			/^\s*(?:INSERT\s|REPLACE\s|UPDATE\s|DELETE\s+FROM\b|WITH\s+(?:RECURSIVE\s+)?[A-Za-z_$][\w$]*\s+AS\b)/i;
 		if (writePrefix.test(sql)) return { file: fileRelative, table: "<unclassified SQL write>" };
 		return undefined;
 	}
@@ -67,7 +68,8 @@ function collectSourceFacts(file: string, text: string): { writes: SqlWrite[]; r
 		if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
 			const method = node.expression.name.text;
 			const receiver = node.expression.expression.getText(source);
-			if (rawCallViolation(relativePath, receiver, method)) rawCalls.push(`${relativePath}: ${receiver}.${method}(...)`);
+			if (rawCallViolation(relativePath, receiver, method))
+				rawCalls.push(`${relativePath}: ${receiver}.${method}(...)`);
 		}
 		ts.forEachChild(node, visit);
 	};
@@ -85,7 +87,7 @@ test("static SQL write literals stay in their table owner's file", async () => {
 	expect(violations).toEqual([]);
 });
 
-	test("raw SQLite calls stay in core or broker-agent DB code; non-database APIs are exempt", async () => {
+test("raw SQLite calls stay in core or broker-agent DB code; non-database APIs are exempt", async () => {
 	const files = await sourceFiles(sourceRoot);
 	const violations: string[] = [];
 	for (const file of files) {

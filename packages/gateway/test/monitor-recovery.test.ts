@@ -79,8 +79,8 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 	return JSON.parse(match[0]) as Array<{ eventId: string }>;
 }
 
-	type MonitorEventInput = Parameters<Store["monitors"]["eventCreate"]>[1];
-	type MonitorStage = Parameters<Store["monitors"]["eventUpdate"]>[2];
+type MonitorEventInput = Parameters<Store["monitors"]["eventCreate"]>[1];
+type MonitorStage = Parameters<Store["monitors"]["eventUpdate"]>[2];
 
 function createEvent(db: Store, row: MonitorEventInput): void {
 	db.transaction((tx) => db.monitors.eventCreate(tx, row));
@@ -130,7 +130,14 @@ function confirmAndSettleMonitorDelivery(
 	});
 }
 
-function acquireLease(db: Store, eventId: string, owner: string, leaseId: string, ttlMs: number, now?: number): boolean {
+function acquireLease(
+	db: Store,
+	eventId: string,
+	owner: string,
+	leaseId: string,
+	ttlMs: number,
+	now?: number,
+): boolean {
 	return db.transaction((tx) => db.monitors.eventAcquireLease(tx, eventId, owner, leaseId, ttlMs, now));
 }
 
@@ -188,12 +195,14 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		});
 		db.monitors.eventUpdate(tx, recovered, "delivered");
 	});
-	db.transaction((tx) => db.bindings.cutoverBrokerAuthority(tx, {
-		expectedAuthority: null,
-		targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
-		evidence: "Test operator authorized historical monitor quarantine",
-		disposition: "quarantine",
-	}));
+	db.transaction((tx) =>
+		db.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: null,
+			targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
+			evidence: "Test operator authorized historical monitor quarantine",
+			disposition: "quarantine",
+		}),
+	);
 	const history = db.monitors.eventRows(monitor.monitorId, "newest", true);
 	expect(history).toHaveLength(3);
 	expect(db.monitors.eventRows()).toEqual([]);
@@ -328,8 +337,8 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		const bounded = boundedResponse.recentEvents as Array<Record<string, unknown>>;
 		expect(bounded).toHaveLength(100);
 		expect(bounded.map((row) => row.eventId)).toEqual(
-			db
-				.monitors.eventRows(monitor.monitorId, "newest", true)
+			db.monitors
+				.eventRows(monitor.monitorId, "newest", true)
 				.slice(0, 100)
 				.map((row) => row.event_id),
 		);
@@ -340,8 +349,8 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		await propagator.reconcile();
 		expect(sends).toBe(0);
 		expect(
-			db
-				.monitors.eventRows(monitor.monitorId, "newest", true)
+			db.monitors
+				.eventRows(monitor.monitorId, "newest", true)
 				.filter((row) => [accepted, failed, recovered].includes(row.event_id)),
 		).toEqual(history);
 	} finally {
@@ -549,7 +558,8 @@ describe("monitor crash-boundary state machine", () => {
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db.monitors.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db.monitors.authoredOutput(eventId)).toBe("[SILENT]");
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
@@ -1201,7 +1211,8 @@ describe("durable cron slot catch-up (#157)", () => {
 		await incarnation(fixture, at(16, 35));
 		const expected = Array.from({ length: 16 }, (_, index) => at(index + 1).toISOString());
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(expected);
-		for (const slot of expected) expect(fixture.database.monitors.slotExists(fixture.monitor.monitorId, slot)).toBe(true);
+		for (const slot of expected)
+			expect(fixture.database.monitors.slotExists(fixture.monitor.monitorId, slot)).toBe(true);
 	});
 
 	test("duplicate startup and live sweeps admit each scheduled slot exactly once", async () => {
@@ -1464,8 +1475,8 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 			expect(intents[0]?.state).toBe("receipted");
 			// Duplicate/reconcile re-admission must not create a second intent.
 			const before = db.memory.rows().length;
-			const row = db
-				.monitors.eventRows()
+			const row = db.monitors
+				.eventRows()
 				.find((candidate) => candidate.event_id !== "" && candidate.stage === "authored");
 			expect(row).toBeDefined();
 			const eventRow = row as {
@@ -1482,7 +1493,11 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 						kind: "monitor-event",
 						payloadJson: JSON.stringify({
 							identity: `monitor-event:${eventRow.event_id}`,
-							originRefJson: JSON.stringify({ platform: "monitor", kind: "eventtype", conversationId: "memory.canonicalize" }),
+							originRefJson: JSON.stringify({
+								platform: "monitor",
+								kind: "eventtype",
+								conversationId: "memory.canonicalize",
+							}),
 						}),
 					});
 			});

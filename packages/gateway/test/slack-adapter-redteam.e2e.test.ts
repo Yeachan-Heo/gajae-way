@@ -111,8 +111,8 @@ test("RT-SLACK-22 check reaction token delivers on Slack and is refused on Teleg
 	await settle();
 	expect(f.turns).toHaveLength(2);
 	expect(
-		f.database
-			.outbox.rows()
+		f.database.outbox
+			.rows()
 			.filter((row) => row.origin_key.startsWith("telegram") && JSON.parse(row.payload_json).reaction),
 	).toEqual([]);
 	await expect(
@@ -147,7 +147,8 @@ test("RT-SLACK-24 thread and channel isolate sessions and route replies", async 
 	);
 	await settle();
 	expect(
-		f.database.bindings.sessionRows()
+		f.database.bindings
+			.sessionRows()
 			.map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId)
 			.sort(),
 	).toEqual(["C1", "C1:1.0"]);
@@ -194,8 +195,6 @@ test("RT-SLACK-34 plain channel reply threads under the triggering message; an e
 	await settle();
 	expect(explicit.posts).toEqual([["C1", "elsewhere", "9.0"]]);
 });
-
-
 
 for (const platform of ["slack", "discord", "telegram"] as const) {
 	test(`RT-SLACK-46 ${platform} channel triggering root preserves platform routing on redelivery`, async () => {
@@ -286,7 +285,6 @@ test("RT-SLACK-50 real socket activity bounds burst details thinking writing and
 	await Bun.sleep(50);
 	expect(progress.filter((p) => p.final)).toHaveLength(1);
 });
-
 
 for (const silent of [false, true])
 	test(`RT-SLACK-56 real gateway presence precedes progress and clears ${silent ? "silent final" : "thread delivery"}`, async () => {

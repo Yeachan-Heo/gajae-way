@@ -1,9 +1,8 @@
-import { LEASE_NAMES, homeLayout, readLeaseOwner } from "@gajae-gateway/home";
+import { homeLayout, LEASE_NAMES, readLeaseOwner } from "@gajae-gateway/home";
 import type { GatewayConfig } from "../config";
 import { assertNoRestoreJournal, withGatewayLease } from "../offline";
 import { Store } from "../store";
 import type { BrokerAuthority } from "../store/groups/bindings";
-
 
 export interface CensusAuthorityCounts {
 	readonly authority: BrokerAuthority | null;
@@ -21,23 +20,38 @@ export interface CensusReport {
 	readonly tableCounts: Readonly<Record<string, number>>;
 	readonly quickCheck: string;
 	readonly leaseOwners: Readonly<Record<string, Awaited<ReturnType<typeof readLeaseOwner>>>>;
-	readonly openQuarantined: Readonly<Record<string, {
-		readonly inbound: number;
-		readonly laneJobs: number;
-		readonly attempts: number;
-		readonly laneReports: number;
-		readonly invalid: number;
-		readonly monitors: number;
-	}>>;
+	readonly openQuarantined: Readonly<
+		Record<
+			string,
+			{
+				readonly inbound: number;
+				readonly laneJobs: number;
+				readonly attempts: number;
+				readonly laneReports: number;
+				readonly invalid: number;
+				readonly monitors: number;
+			}
+		>
+	>;
 }
 
 function addCutoverCount(
-	counts: Map<string, { inbound: number; laneJobs: number; attempts: number; laneReports: number; invalid: number; monitors: number }>,
+	counts: Map<
+		string,
+		{ inbound: number; laneJobs: number; attempts: number; laneReports: number; invalid: number; monitors: number }
+	>,
 	cutoverId: string | undefined,
 	key: "inbound" | "laneJobs" | "attempts" | "laneReports" | "invalid" | "monitors",
 ): void {
 	if (!cutoverId) return;
-	const count = counts.get(cutoverId) ?? { inbound: 0, laneJobs: 0, attempts: 0, laneReports: 0, invalid: 0, monitors: 0 };
+	const count = counts.get(cutoverId) ?? {
+		inbound: 0,
+		laneJobs: 0,
+		attempts: 0,
+		laneReports: 0,
+		invalid: 0,
+		monitors: 0,
+	};
 	count[key]++;
 	counts.set(cutoverId, count);
 }
@@ -54,7 +68,9 @@ function authoritySummary(database: Store): CensusAuthorityCounts {
 		const tables = database.core.tableRowCounts();
 		return {
 			authority: database.bindings.authority,
-			populated: Object.entries(tables).some(([name, count]) => !["schema_migrations", "broker_authority"].includes(name) && count > 0),
+			populated: Object.entries(tables).some(
+				([name, count]) => !["schema_migrations", "broker_authority"].includes(name) && count > 0,
+			),
 			openInbound: replayable.inbound.length,
 			openWork:
 				replayable.work.laneJobs.length +
@@ -73,14 +89,17 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 		try {
 			const authorityCounts = authoritySummary(database);
 			const work = database.core.collectOpenWork("quarantined");
-			const quarantineCounts = new Map<string, {
-				inbound: number;
-				laneJobs: number;
-				attempts: number;
-				laneReports: number;
-				invalid: number;
-				monitors: number;
-			}>();
+			const quarantineCounts = new Map<
+				string,
+				{
+					inbound: number;
+					laneJobs: number;
+					attempts: number;
+					laneReports: number;
+					invalid: number;
+					monitors: number;
+				}
+			>();
 			for (const row of work.inbound) addCutoverCount(quarantineCounts, row.cutoverId, "inbound");
 			for (const row of work.work.laneJobs) addCutoverCount(quarantineCounts, row.cutoverId, "laneJobs");
 			for (const row of work.work.attempts) addCutoverCount(quarantineCounts, row.cutoverId, "attempts");
@@ -97,7 +116,9 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 				tableCounts: database.core.tableRowCounts(),
 				quickCheck: database.core.quickCheckDetail(),
 				leaseOwners,
-				openQuarantined: Object.fromEntries([...quarantineCounts.entries()].sort(([left], [right]) => left.localeCompare(right))),
+				openQuarantined: Object.fromEntries(
+					[...quarantineCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
+				),
 			};
 			console.log(JSON.stringify(report, null, 2));
 			return report;

@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type BrokerDiscovery,
 	GJC_ATTACH_ONLY_ENV,
 	GjcCliUnavailableError,
 	GlobalGjcClient,
 	readPinnedGjcVersion,
-	type BrokerDiscovery,
 	type SpawnFn,
 } from "../src/orchestrator/broker";
 
@@ -37,7 +37,13 @@ const SESSIONS = JSON.stringify({ ok: true, result: { sessions: [] } });
 test("all spawned GJC commands and relays pin the configured agent directory and attach-only mode", async () => {
 	const home = await tempDir();
 	const agentDir = join(home, "configured-agent");
-	const envNames = ["GJC_EXECUTABLE", "GJC_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "GJC_AGENT_DIR", GJC_ATTACH_ONLY_ENV] as const;
+	const envNames = [
+		"GJC_EXECUTABLE",
+		"GJC_CODING_AGENT_DIR",
+		"PI_CODING_AGENT_DIR",
+		"GJC_AGENT_DIR",
+		GJC_ATTACH_ONLY_ENV,
+	] as const;
 	const previous = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 	process.env.GJC_EXECUTABLE = "/inherited/gjc";
 	process.env.GJC_CODING_AGENT_DIR = "/inherited/agent";

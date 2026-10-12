@@ -23,14 +23,16 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 
 function enqueue(messageId: string, authorName: string, body: string, receivedAt: string): void {
 	expect(
-		database?.transaction((tx) => database?.inbox.enqueue(tx, {
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			engagementJson: JSON.stringify({ authorName }),
-			receivedAt,
-		})),
+		database?.transaction((tx) =>
+			database?.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				engagementJson: JSON.stringify({ authorName }),
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 

@@ -61,13 +61,15 @@ function makeManager(port: ScriptedSessionPort, logs: string[], terminal: string
 
 function enqueue(messageId: string, body: string, receivedAt = new Date().toISOString()): void {
 	expect(
-		database?.transaction((tx) => database?.inbox.enqueue(tx, {
-			messageId,
-			originKey: KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		})),
+		database?.transaction((tx) =>
+			database?.inbox.enqueue(tx, {
+				messageId,
+				originKey: KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
@@ -162,13 +164,15 @@ test("a bound turn whose operation is unknown stays held and is never resent", a
 	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
 	const opRef = personaTurnOpRef("restart-test", KEY, 0, "m-unknown");
 	enqueue("m-unknown", "do not replay unknown");
-	database!.transaction((tx) => database!.inbox.bindTurn(tx, {
-		messageId: "m-unknown",
-		originKey: KEY,
-		epoch: 0,
-		opRef,
-		sessionId: binding.sessionId,
-	}));
+	database!.transaction((tx) =>
+		database!.inbox.bindTurn(tx, {
+			messageId: "m-unknown",
+			originKey: KEY,
+			epoch: 0,
+			opRef,
+			sessionId: binding.sessionId,
+		}),
+	);
 	manager = makeManager(port, logs);
 	await manager.recover();
 	expect(port.sendAttempts).toEqual([]);
@@ -356,13 +360,15 @@ test("a bound, unaccepted turn on a session the runtime cannot answer for is rel
 	});
 	const opRef = personaTurnOpRef("restart-test", KEY, 0, "m-1");
 	enqueue("m-1", "hello after cutover");
-	database!.transaction((tx) => database!.inbox.bindTurn(tx, {
-		messageId: "m-1",
-		originKey: KEY,
-		epoch: 0,
-		opRef,
-		sessionId: "pre-cutover-session",
-	}));
+	database!.transaction((tx) =>
+		database!.inbox.bindTurn(tx, {
+			messageId: "m-1",
+			originKey: KEY,
+			epoch: 0,
+			opRef,
+			sessionId: "pre-cutover-session",
+		}),
+	);
 	manager = makeManager(port, logs);
 
 	await manager.recover();
@@ -435,13 +441,15 @@ test("a bound turn whose id the Router disowns is released and re-fired even whe
 	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: staleId, epoch: 0 });
 	const opRef = personaTurnOpRef("restart-test", KEY, 0, "m-1");
 	enqueue("m-1", "hello");
-	database!.transaction((tx) => database!.inbox.bindTurn(tx, {
-		messageId: "m-1",
-		originKey: KEY,
-		epoch: 0,
-		opRef,
-		sessionId: staleId,
-	}));
+	database!.transaction((tx) =>
+		database!.inbox.bindTurn(tx, {
+			messageId: "m-1",
+			originKey: KEY,
+			epoch: 0,
+			opRef,
+			sessionId: staleId,
+		}),
+	);
 	manager = makeManager(port, logs);
 	await manager.recover();
 	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);

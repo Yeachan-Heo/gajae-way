@@ -104,13 +104,15 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 
 function enqueue(target: Fixture, messageId: string, body: string, receivedAt = new Date().toISOString()): void {
 	expect(
-		target.database.transaction((tx) => target.database.inbox.enqueue(tx, {
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		})),
+		target.database.transaction((tx) =>
+			target.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
@@ -427,13 +429,15 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 		expect(target.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
 		enqueue(target, "crash-window", "accepted before attribution", receivedAt);
 		const opRef = personaTurnOpRef("issue92-redteam", ORIGIN_KEY, 0, "crash-window");
-		target.database.transaction((tx) => target.database.inbox.bindTurn(tx, {
-			messageId: "crash-window",
-			originKey: ORIGIN_KEY,
-			epoch: 0,
-			opRef,
-			sessionId: binding.sessionId,
-		}));
+		target.database.transaction((tx) =>
+			target.database.inbox.bindTurn(tx, {
+				messageId: "crash-window",
+				originKey: ORIGIN_KEY,
+				epoch: 0,
+				opRef,
+				sessionId: binding.sessionId,
+			}),
+		);
 		port.seedAcceptedSend({ sessionId: binding.sessionId, repo, text: "accepted before attribution", opRef });
 
 		await target.manager.recover();

@@ -1,9 +1,9 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
-import { originKey, validateOriginRef, type OriginRef } from "@gajae-gateway/protocol";
+import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DatabaseStartupError } from "./errors";
 import type { WorkAttemptRuntime, WorkParent } from "./groups/work";
-import { workAssert, workAttemptReportId, validateWorkRuntime } from "./groups/work";
+import { validateWorkRuntime, workAssert, workAttemptReportId } from "./groups/work";
 
 export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | "get"> & {
 	all(...params: SQLQueryBindings[]): T[];
@@ -687,4 +687,3 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 		});
 	}
 }
-

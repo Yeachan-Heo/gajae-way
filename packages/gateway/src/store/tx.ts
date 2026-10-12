@@ -32,7 +32,11 @@ export class StoreOwnershipError extends Error {
 	readonly table?: string;
 
 	constructor(input: { reason: "unclassified" } | { reason: "not_owner"; group: OwnerGroup; table: string }) {
-		super(input.reason === "unclassified" ? "store ownership: unclassified SQL" : `store ownership: ${input.group} does not own ${input.table}`);
+		super(
+			input.reason === "unclassified"
+				? "store ownership: unclassified SQL"
+				: `store ownership: ${input.group} does not own ${input.table}`,
+		);
 		this.name = "StoreOwnershipError";
 		this.reason = input.reason;
 		if (input.reason === "not_owner") {

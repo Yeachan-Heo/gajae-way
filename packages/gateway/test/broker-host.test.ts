@@ -4,11 +4,11 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
-import { loadConfig } from "../src/config";
-import { runBrokerHost } from "../src/broker-host";
 import { credentialFingerprint } from "../src/broker-agent/agent-db";
-import { provisionBrokerAgent } from "../src/broker-agent/provision";
 import { resolveBrokerAgentSource } from "../src/broker-agent/allowlist";
+import { provisionBrokerAgent } from "../src/broker-agent/provision";
+import { runBrokerHost } from "../src/broker-host";
+import { loadConfig } from "../src/config";
 import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 
 interface Fixture {
@@ -41,11 +41,12 @@ async function fixture(): Promise<Fixture> {
 	await mkdir(home, { recursive: true, mode: 0o700 });
 	await mkdir(source, { recursive: true });
 	const database = new Database(join(source, "agent.db"));
-	database.exec("CREATE TABLE auth_credentials (provider TEXT NOT NULL, token TEXT NOT NULL); INSERT INTO auth_credentials VALUES ('p', 'secret-fixture');");
+	database.exec(
+		"CREATE TABLE auth_credentials (provider TEXT NOT NULL, token TEXT NOT NULL); INSERT INTO auth_credentials VALUES ('p', 'secret-fixture');",
+	);
 	database.close();
 	return { root, home, source, agentDir };
 }
-
 
 async function provision(f: Fixture): Promise<void> {
 	const lease = await acquireLease(f.home, "broker");

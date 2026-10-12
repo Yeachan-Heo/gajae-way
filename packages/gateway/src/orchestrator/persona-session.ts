@@ -14,12 +14,9 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
-import {
-	BrokerAuthorityError,
-	type Store,
-} from "../store";
+import { BrokerAuthorityError, type Store } from "../store";
+import { type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/groups/inbox";
 import type { WriteTx } from "../store/tx";
-import { terminalDeliveryIds, type InboundMessageRow, type InboundTurn } from "../store/groups/inbox";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
@@ -107,7 +104,12 @@ export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): numb
 	return attempt;
 }
 
-export function setContextFloor(store: Store, tx: WriteTx, originKey: string, floorAt = new Date().toISOString()): void {
+export function setContextFloor(
+	store: Store,
+	tx: WriteTx,
+	originKey: string,
+	floorAt = new Date().toISOString(),
+): void {
 	store.core.assertActive(tx);
 	const prefix = failedTurnKeyPrefix(originKey);
 	const end = `${prefix}\uffff`;
@@ -750,7 +752,8 @@ class OriginActor {
 		// The binding being rotated away from. Read before bumpEpoch clears it: if
 		// no turn is in flight nothing will ever reconcile this session, so its host
 		// would live on idle forever unless ended here.
-		const previousSessionId = previous?.sessionId ?? this.#manager.database.bindings.getSessionRecord(this.originKey)?.sessionId;
+		const previousSessionId =
+			previous?.sessionId ?? this.#manager.database.bindings.getSessionRecord(this.originKey)?.sessionId;
 		let nextEpoch = 0;
 		let discarded: string[] = [];
 		this.#manager.database.transaction((tx) => {
@@ -827,9 +830,7 @@ class OriginActor {
 					const retired = turn.epoch < this.#epoch();
 					const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
 						const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
-						const nextEpoch = retired
-							? this.#epoch()
-							: this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+						const nextEpoch = retired ? this.#epoch() : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
 						return { attempt, nextEpoch };
 					});
 					this.#manager.log(
@@ -899,9 +900,7 @@ class OriginActor {
 		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
 			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
 				const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
-				const nextEpoch = retired
-					? currentEpoch
-					: this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+				const nextEpoch = retired ? currentEpoch : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
 				return { attempt, nextEpoch };
 			});
 			// The binding itself is unusable: recreate through the existing rebind
@@ -1370,9 +1369,7 @@ class OriginActor {
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
 			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
 				const attempt = retryInboundTurn(this.#manager.database, tx, opRef);
-				const nextEpoch = sessionGone
-					? this.#manager.database.bindings.rotateEpoch(tx, this.originKey)
-					: undefined;
+				const nextEpoch = sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined;
 				return { attempt, nextEpoch };
 			});
 			this.#current = undefined;
@@ -1489,8 +1486,7 @@ class OriginActor {
 		const accepted = this.#manager.database.transaction((tx) =>
 			this.#manager.database.inbox.steerAccepted(tx, { messageId: row.message_id, epoch, opRef, contextMessageId }),
 		);
-		if (!accepted)
-			return false;
+		if (!accepted) return false;
 		if (bound) await bound.lifecycle.onSteerAccepted?.({ ...bound, row });
 		else await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef });
 		await this.#manager.emitSteer({ originKey: this.originKey, messageId: row.message_id, opRef });
@@ -1677,7 +1673,9 @@ class OriginActor {
 			// forever cannot recover it (live: one channel repeated it 335 times).
 			// Advance the epoch to derive a new key while leaving every inbound row
 			// pending and intact, then retry with the normal base delay.
-			const nextEpoch = this.#manager.database.transaction((tx) => this.#manager.database.bindings.rotateEpoch(tx, this.originKey));
+			const nextEpoch = this.#manager.database.transaction((tx) =>
+				this.#manager.database.bindings.rotateEpoch(tx, this.originKey),
+			);
 			this.#manager.log(
 				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${trigger.message_id} attempts=${attempts} reason=terminal_uncertain`,
 			);
@@ -2661,9 +2659,7 @@ class OriginActor {
 		await bound.tail?.close();
 		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
 			const attempt = retryInboundTurn(this.#manager.database, tx, bound.turn.opRef);
-			const nextEpoch = bound.retired
-				? this.#epoch()
-				: this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+			const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
 			return { attempt, nextEpoch };
 		});
 		if (bound.retired) {
@@ -2724,7 +2720,9 @@ class OriginActor {
 		// Only the CURRENT turn of the CURRENT epoch rotates: a retired turn or a
 		// turn a newer epoch already replaced never tears down the live binding.
 		const rotate =
-			!bound.retired && this.#current === bound && database.bindings.getSessionRecord(this.originKey)?.epoch === bound.epoch;
+			!bound.retired &&
+			this.#current === bound &&
+			database.bindings.getSessionRecord(this.originKey)?.epoch === bound.epoch;
 		const completed = database.transaction((tx) => {
 			const changed = database.inbox.turnComplete(tx, bound.turn.opRef, discarded ? "retired" : "turn_failed");
 			if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);

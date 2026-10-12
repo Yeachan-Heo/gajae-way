@@ -1,6 +1,5 @@
-import { acquireLease, exitOnLeaseHeld, LeaseHeldError, type Lease } from "@gajae-gateway/home";
-
 import { join } from "node:path";
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import type {
 	ChannelEngagementPolicy,
@@ -558,7 +557,9 @@ export class ReconnectingGateway implements GatewayClientLike {
 			const options = {
 				clientName: "adapter-slack",
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
-					console.warn(`gateway_socket_waiting client=adapter-slack path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${errorText(error)}`),
+					console.warn(
+						`gateway_socket_waiting client=adapter-slack path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${errorText(error)}`,
+					),
 			};
 			const client = initial
 				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
@@ -573,7 +574,6 @@ export class ReconnectingGateway implements GatewayClientLike {
 			if (generation === this.#connectionGeneration && !this.#stopped) this.scheduleReconnect();
 		}
 	}
-
 
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		const client = this.#client;
@@ -786,7 +786,6 @@ export async function startSlackAdapter(
 		recoveryCursorPath?: string;
 		now?: () => number;
 		connectGateway?: (gateway: ReconnectingGateway) => Promise<void>;
-
 	} = {},
 ): Promise<{
 	readonly socket: SlackSocketMode;
@@ -1276,10 +1275,7 @@ function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-export async function runSlackAdapterWithLease<T>(
-	home: string,
-	start: (lease: Lease) => Promise<T>,
-): Promise<T> {
+export async function runSlackAdapterWithLease<T>(home: string, start: (lease: Lease) => Promise<T>): Promise<T> {
 	let lease: Lease;
 	try {
 		lease = await acquireLease(home, "adapter-slack");

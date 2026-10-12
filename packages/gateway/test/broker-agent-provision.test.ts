@@ -1,16 +1,16 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
+import { assertAgentDb, credentialFingerprint } from "../src/broker-agent/agent-db";
 import {
 	BROKER_AGENT_ALLOWLIST,
 	resolveBrokerAgentDataSource,
 	resolveBrokerAgentSource,
 } from "../src/broker-agent/allowlist";
-import { assertAgentDb, credentialFingerprint } from "../src/broker-agent/agent-db";
 import { brokerAgentDrift } from "../src/broker-agent/drift";
 import { provisionBrokerAgent, recoverProvision } from "../src/broker-agent/provision";
 
@@ -84,7 +84,12 @@ async function treeDigest(root: string, excluded = new Set<string>()): Promise<s
 			const info = await lstat(path);
 			if (info.isDirectory()) await walk(path, relative);
 			else if (!excluded.has(relative))
-				files.push([relative, createHash("sha256").update(await readFile(path)).digest("hex")]);
+				files.push([
+					relative,
+					createHash("sha256")
+						.update(await readFile(path))
+						.digest("hex"),
+				]);
 		}
 	};
 	await walk(root);
@@ -93,7 +98,9 @@ async function treeDigest(root: string, excluded = new Set<string>()): Promise<s
 
 async function fileDigest(path: string): Promise<string | undefined> {
 	try {
-		return createHash("sha256").update(await readFile(path)).digest("hex");
+		return createHash("sha256")
+			.update(await readFile(path))
+			.digest("hex");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
@@ -222,7 +229,9 @@ describe("broker agent allowlist provisioning", () => {
 		}
 		expect((await lstat(join(f.agentDir, "model-presets"))).mode & 0o777).toBe(0o700);
 		await assertAgentDb(join(f.agentDir, "agent.db"));
-		expect(await credentialFingerprint(join(f.agentDir, "agent.db"))).toBe(await credentialFingerprint(join(f.source, "agent.db")));
+		expect(await credentialFingerprint(join(f.agentDir, "agent.db"))).toBe(
+			await credentialFingerprint(join(f.source, "agent.db")),
+		);
 	});
 
 	test("VACUUM INTO snapshots committed WAL credentials without changing the live source tree", async () => {
@@ -237,7 +246,11 @@ describe("broker agent allowlist provisioning", () => {
 			writeFileSync(${JSON.stringify(writerReady)}, "ready");
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 		`;
-		const writer = Bun.spawn([process.execPath, "--eval", writerScript], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+		const writer = Bun.spawn([process.execPath, "--eval", writerScript], {
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+		});
 		processes.push(writer);
 		await waitForFile(writerReady);
 		const sidecars = new Set(["agent.db", "agent.db-wal", "agent.db-shm"]);
@@ -256,7 +269,9 @@ describe("broker agent allowlist provisioning", () => {
 		expect(await fileSize(join(f.source, "agent.db-shm"))).toBe(shmBefore);
 		const copied = new Database(join(f.agentDir, "agent.db"), { readonly: true });
 		try {
-			expect(copied.query("SELECT token FROM auth_credentials WHERE provider = 'provider-b'").get()).toEqual({ token: "committed-wal-token" });
+			expect(copied.query("SELECT token FROM auth_credentials WHERE provider = 'provider-b'").get()).toEqual({
+				token: "committed-wal-token",
+			});
 			expect(copied.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
 		} finally {
 			copied.close();
@@ -274,7 +289,11 @@ describe("broker agent allowlist provisioning", () => {
 			writeFileSync(${JSON.stringify(writerReady)}, "ready");
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 		`;
-		const writer = Bun.spawn([process.execPath, "--eval", writerScript], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+		const writer = Bun.spawn([process.execPath, "--eval", writerScript], {
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+		});
 		processes.push(writer);
 		await waitForFile(writerReady);
 		writer.kill("SIGKILL");
@@ -293,7 +312,9 @@ describe("broker agent allowlist provisioning", () => {
 		expect(await fileSize(join(f.source, "agent.db-shm"))).toBeDefined();
 		const copied = new Database(join(f.agentDir, "agent.db"), { readonly: true });
 		try {
-			expect(copied.query("SELECT token FROM auth_credentials WHERE provider = 'provider-b'").get()).toEqual({ token: "committed-wal-token" });
+			expect(copied.query("SELECT token FROM auth_credentials WHERE provider = 'provider-b'").get()).toEqual({
+				token: "committed-wal-token",
+			});
 		} finally {
 			copied.close();
 		}
@@ -312,7 +333,11 @@ describe("broker agent allowlist provisioning", () => {
 			writeFileSync(${JSON.stringify(writerReady)}, "ready");
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 		`;
-		const writer = Bun.spawn([process.execPath, "--eval", writerScript], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+		const writer = Bun.spawn([process.execPath, "--eval", writerScript], {
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+		});
 		processes.push(writer);
 		await waitForFile(writerReady);
 		const databasePath = join(f.source, "agent.db");
@@ -342,7 +367,9 @@ describe("broker agent allowlist provisioning", () => {
 		const sourceFingerprint = await credentialFingerprint(join(f.source, "agent.db"));
 		await insertModelUsage(join(f.source, "agent.db"), "model-churn-only");
 		expect(await credentialFingerprint(join(f.source, "agent.db"))).toBe(sourceFingerprint);
-		expect((await brokerAgentDrift({ home: f.home, agentDir: f.agentDir, source: f.source })).entries[0]?.state).toBe("in_sync");
+		expect((await brokerAgentDrift({ home: f.home, agentDir: f.agentDir, source: f.source })).entries[0]?.state).toBe(
+			"in_sync",
+		);
 		await putCredential(join(f.agentDir, "agent.db"), "broker-refreshed-token");
 		await writeFile(join(f.source, "models.yml"), "model: changed-source\n");
 		const drift = await brokerAgentDrift({ home: f.home, agentDir: f.agentDir, source: f.source });
@@ -390,7 +417,9 @@ describe("broker agent allowlist provisioning", () => {
 		await mkdir(missing);
 		const lease = await acquireLease(f.home, "broker");
 		try {
-			await expect(provisionBrokerAgent({ home: f.home, agentDir: f.agentDir, source: missing, mode: "force", lease })).rejects.toMatchObject({
+			await expect(
+				provisionBrokerAgent({ home: f.home, agentDir: f.agentDir, source: missing, mode: "force", lease }),
+			).rejects.toMatchObject({
 				code: "agent_source_missing",
 			});
 			expect(await Bun.file(f.agentDir).exists()).toBe(false);
@@ -509,19 +538,27 @@ describe("broker agent allowlist provisioning", () => {
 		const source = resolveBrokerAgentSource(undefined, home);
 		await mkdir(join(xdg, "gjc"), { recursive: true });
 		expect(source).toBe(join(home, ".gjc", "agent"));
-		expect(resolveBrokerAgentDataSource(source, { homeDirectory: home, xdgDataHome: xdg, platform: "linux" })).toBe(join(xdg, "gjc"));
-		expect(resolveBrokerAgentDataSource(source, { homeDirectory: home, xdgDataHome: xdg, platform: "win32" })).toBe(source);
+		expect(resolveBrokerAgentDataSource(source, { homeDirectory: home, xdgDataHome: xdg, platform: "linux" })).toBe(
+			join(xdg, "gjc"),
+		);
+		expect(resolveBrokerAgentDataSource(source, { homeDirectory: home, xdgDataHome: xdg, platform: "win32" })).toBe(
+			source,
+		);
 		// Without XDG_DATA_HOME gjc keeps agent.db in ~/.gjc/agent, even when
 		// ~/.local/share/gjc exists for its installer releases.
 		await mkdir(join(home, ".local", "share", "gjc", "releases"), { recursive: true });
-		expect(resolveBrokerAgentDataSource(source, { homeDirectory: home, xdgDataHome: "", platform: "linux" })).toBe(source);
+		expect(resolveBrokerAgentDataSource(source, { homeDirectory: home, xdgDataHome: "", platform: "linux" })).toBe(
+			source,
+		);
 		expect(resolveBrokerAgentSource(join(root, "custom"), home)).toBe(join(root, "custom"));
 	});
 
 	test("a process crash after staging leaves the current generation intact and removes the orphan", async () => {
 		const f = await fixture();
 		await provision(f);
-		const oldManifest = JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")) as { genId: string };
+		const oldManifest = JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")) as {
+			genId: string;
+		};
 		const oldFingerprint = await credentialFingerprint(join(f.agentDir, "agent.db"));
 		await putCredential(join(f.source, "agent.db"), "uncommitted-source-token");
 		const marker = join(f.root, "staging-crash.marker");
@@ -539,7 +576,9 @@ describe("broker agent allowlist provisioning", () => {
 		}
 		expect((await readdir(provisionDir)).some((name) => name.startsWith("gen-"))).toBe(false);
 		expect(await credentialFingerprint(join(f.agentDir, "agent.db"))).toBe(oldFingerprint);
-		expect(JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")).genId).toBe(oldManifest.genId);
+		expect(JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")).genId).toBe(
+			oldManifest.genId,
+		);
 	});
 	test("process crashes at swap boundaries restore exactly one committed generation", async () => {
 		const points = [
@@ -600,7 +639,11 @@ describe("broker agent allowlist provisioning", () => {
 			writeFileSync(${JSON.stringify(marker)}, "ready");
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 		`;
-		const writer = Bun.spawn([process.execPath, "--eval", writerScript], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+		const writer = Bun.spawn([process.execPath, "--eval", writerScript], {
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+		});
 		processes.push(writer);
 		await waitForFile(marker);
 		writer.kill("SIGKILL");
@@ -646,7 +689,9 @@ describe("broker agent allowlist provisioning", () => {
 		await writeFile(join(f.agentDir, "models.yml"), "model: tampered\n");
 		const lease = await acquireLease(f.home, "broker");
 		try {
-			await expect(recoverProvision(f.home, f.agentDir, lease)).rejects.toMatchObject({ code: "broker_agent_unrecoverable" });
+			await expect(recoverProvision(f.home, f.agentDir, lease)).rejects.toMatchObject({
+				code: "broker_agent_unrecoverable",
+			});
 		} finally {
 			await lease.release();
 		}
@@ -668,7 +713,9 @@ describe("broker agent allowlist provisioning", () => {
 		] as const) {
 			const f = await fixture();
 			await provision(f);
-			const oldManifest = JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")) as { genId: string };
+			const oldManifest = JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")) as {
+				genId: string;
+			};
 			const oldFingerprint = await credentialFingerprint(join(f.agentDir, "agent.db"));
 			await putCredential(join(f.source, "agent.db"), `token-${point}`);
 			await writeFile(join(f.source, "models.yml"), `model: ${point}\n`);
@@ -689,12 +736,16 @@ describe("broker agent allowlist provisioning", () => {
 					const result = await run();
 					expect(result.status).toBe("ok");
 					expect(await credentialFingerprint(join(f.agentDir, "agent.db"))).not.toBe(oldFingerprint);
-					expect(JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")).genId).not.toBe(oldManifest.genId);
+					expect(JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")).genId).not.toBe(
+						oldManifest.genId,
+					);
 					expect(await readFile(join(f.agentDir, "models.yml"), "utf8")).toBe(`model: ${point}\n`);
 				} else {
 					await expect(run()).rejects.toMatchObject({ code: "broker_agent_failed_restored" });
 					expect(await credentialFingerprint(join(f.agentDir, "agent.db"))).toBe(oldFingerprint);
-					expect(JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")).genId).toBe(oldManifest.genId);
+					expect(JSON.parse(await readFile(homeLayout(f.home).brokerProvisionManifest, "utf8")).genId).toBe(
+						oldManifest.genId,
+					);
 					expect(await readFile(join(f.agentDir, "models.yml"), "utf8")).toBe("model: source-model\n");
 				}
 				expect(await Bun.file(join(f.home, "broker", "provision", "journal.json")).exists()).toBe(false);

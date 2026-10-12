@@ -1,9 +1,8 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, normalize } from "node:path";
-import type { StoreCore, GroupDb } from "../core";
-
-import { BrokerAuthorityError } from "../errors";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
+import type { GroupDb, StoreCore } from "../core";
+import { BrokerAuthorityError } from "../errors";
 import type { WriteTx } from "../tx";
 
 export interface BrokerAuthority {
@@ -119,16 +118,17 @@ export class BindingsGroup {
 	}
 
 	getSessionRecord(originKey: string): SessionRecord | undefined {
-		const row = this.#db.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?").get(originKey) as
-			| { gjc_session_id: string; epoch: number }
-			| null;
+		const row = this.#db.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?").get(originKey) as {
+			gjc_session_id: string;
+			epoch: number;
+		} | null;
 		return row ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
 	}
 
 	getOriginByKey(originKey: string): Record<string, unknown> | undefined {
-		const row = this.#db.prepare("SELECT origin_ref_json FROM sessions WHERE origin_key = ?").get(originKey) as
-			| { origin_ref_json: string | null }
-			| null;
+		const row = this.#db.prepare("SELECT origin_ref_json FROM sessions WHERE origin_key = ?").get(originKey) as {
+			origin_ref_json: string | null;
+		} | null;
 		if (!row?.origin_ref_json) return undefined;
 		try {
 			return JSON.parse(row.origin_ref_json) as Record<string, unknown>;
@@ -142,19 +142,17 @@ export class BindingsGroup {
 			.prepare(
 				"SELECT epoch, last_bootstrapped_epoch, agents_md_epoch, agents_md_digest, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
 			)
-			.get(originKey) as
-			| {
-					epoch: number;
-					last_bootstrapped_epoch: number;
-					agents_md_epoch: number;
-					agents_md_digest: string | null;
-					bootstrap_applied_at: string | null;
-					bootstrap_sections_json: string;
-					bootstrap_byte_count: number;
-					bootstrap_truncated: number;
-					bootstrap_diagnostics_json: string;
-			  }
-			| null;
+			.get(originKey) as {
+			epoch: number;
+			last_bootstrapped_epoch: number;
+			agents_md_epoch: number;
+			agents_md_digest: string | null;
+			bootstrap_applied_at: string | null;
+			bootstrap_sections_json: string;
+			bootstrap_byte_count: number;
+			bootstrap_truncated: number;
+			bootstrap_diagnostics_json: string;
+		} | null;
 		if (!row) return undefined;
 		return {
 			epoch: row.epoch,
@@ -246,15 +244,18 @@ export class BindingsGroup {
 				)
 				.run(tx, originKey, now, now);
 		}
-		const epoch = (this.#db.prepare("SELECT epoch FROM sessions WHERE origin_key = ?").get(originKey) as { epoch: number } | null)
-			?.epoch;
+		const epoch = (
+			this.#db.prepare("SELECT epoch FROM sessions WHERE origin_key = ?").get(originKey) as { epoch: number } | null
+		)?.epoch;
 		if (epoch === undefined) throw new Error(`session row for ${originKey} disappeared during rotation`);
 		return epoch;
 	}
 
 	retire(tx: WriteTx, sessionId: string, cutoverId: string): void {
 		this.#db
-			.prepare("INSERT INTO broker_retired_sessions(session_id, cutover_id) VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING")
+			.prepare(
+				"INSERT INTO broker_retired_sessions(session_id, cutover_id) VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING",
+			)
 			.run(tx, sessionId, cutoverId);
 	}
 
@@ -264,13 +265,7 @@ export class BindingsGroup {
 			.run(tx, at, originRefJson, originKey);
 	}
 
-	touchBoundSession(
-		tx: WriteTx,
-		originKey: string,
-		sessionId: string,
-		epoch: number,
-		at: string,
-	): boolean {
+	touchBoundSession(tx: WriteTx, originKey: string, sessionId: string, epoch: number, at: string): boolean {
 		return (
 			this.#db
 				.prepare(
@@ -280,9 +275,18 @@ export class BindingsGroup {
 		);
 	}
 
-	touchWorkSession(tx: WriteTx, originKey: string, sessionId: string, epoch: number, at: string, originRefJson: string): void {
+	touchWorkSession(
+		tx: WriteTx,
+		originKey: string,
+		sessionId: string,
+		epoch: number,
+		at: string,
+		originRefJson: string,
+	): void {
 		this.#db
-			.prepare("UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?")
+			.prepare(
+				"UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?",
+			)
 			.run(tx, at, originRefJson, originKey, sessionId, epoch);
 	}
 
@@ -294,8 +298,12 @@ export class BindingsGroup {
 			)
 			.run(tx, originKey, originRefJson ?? null, now, now);
 		return (
-			this.#db.prepare("SELECT turn_count FROM sessions WHERE origin_key = ?").get(originKey) as { turn_count: number } | null
-		)?.turn_count ?? 0;
+			(
+				this.#db.prepare("SELECT turn_count FROM sessions WHERE origin_key = ?").get(originKey) as {
+					turn_count: number;
+				} | null
+			)?.turn_count ?? 0
+		);
 	}
 
 	sessionRows(): Array<{
@@ -311,19 +319,21 @@ export class BindingsGroup {
 		bootstrap_diagnostics_json: string;
 	}> {
 		return this.#db
-			.prepare("SELECT origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at")
+			.prepare(
+				"SELECT origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
+			)
 			.all() as Array<{
-				origin_ref_json: string | null;
-				created_at: string;
-				last_activity_at: string | null;
-				epoch: number;
-				last_bootstrapped_epoch: number;
-					bootstrap_applied_at: string | null;
-				bootstrap_sections_json: string;
-				bootstrap_byte_count: number;
-				bootstrap_truncated: number;
-				bootstrap_diagnostics_json: string;
-			}>;
+			origin_ref_json: string | null;
+			created_at: string;
+			last_activity_at: string | null;
+			epoch: number;
+			last_bootstrapped_epoch: number;
+			bootstrap_applied_at: string | null;
+			bootstrap_sections_json: string;
+			bootstrap_byte_count: number;
+			bootstrap_truncated: number;
+			bootstrap_diagnostics_json: string;
+		}>;
 	}
 
 	sessionIdentityRows(): Array<{
@@ -341,50 +351,67 @@ export class BindingsGroup {
 		bootstrap_diagnostics_json: string;
 	}> {
 		return this.#db
-			.prepare("SELECT origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at")
+			.prepare(
+				"SELECT origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
+			)
 			.all() as Array<{
-				origin_key: string;
-				origin_ref_json: string | null;
-				gjc_session_id: string;
-				epoch: number;
-				created_at: string;
-				last_activity_at: string | null;
-				last_bootstrapped_epoch: number;
-				bootstrap_applied_at: string | null;
-				bootstrap_sections_json: string;
-				bootstrap_byte_count: number;
-				bootstrap_truncated: number;
-				bootstrap_diagnostics_json: string;
-			}>;
+			origin_key: string;
+			origin_ref_json: string | null;
+			gjc_session_id: string;
+			epoch: number;
+			created_at: string;
+			last_activity_at: string | null;
+			last_bootstrapped_epoch: number;
+			bootstrap_applied_at: string | null;
+			bootstrap_sections_json: string;
+			bootstrap_byte_count: number;
+			bootstrap_truncated: number;
+			bootstrap_diagnostics_json: string;
+		}>;
 	}
 
 	contextSessionCreatedAt(originKey: string): string | undefined {
-		return (this.#db.prepare("SELECT created_at FROM sessions WHERE origin_key = ?").get(originKey) as { created_at: string } | null)
-			?.created_at;
+		return (
+			this.#db.prepare("SELECT created_at FROM sessions WHERE origin_key = ?").get(originKey) as {
+				created_at: string;
+			} | null
+		)?.created_at;
 	}
 
 	sessionTurnCount(originKey: string): number {
-		return (this.#db.prepare("SELECT turn_count FROM sessions WHERE origin_key = ?").get(originKey) as { turn_count: number } | null)
-			?.turn_count ?? 0;
+		return (
+			(
+				this.#db.prepare("SELECT turn_count FROM sessions WHERE origin_key = ?").get(originKey) as {
+					turn_count: number;
+				} | null
+			)?.turn_count ?? 0
+		);
 	}
 
 	getSession(originKey: string): string | undefined {
-		return (this.#db.prepare("SELECT gjc_session_id FROM sessions WHERE origin_key = ?").get(originKey) as { gjc_session_id: string } | null)
-			?.gjc_session_id;
+		return (
+			this.#db.prepare("SELECT gjc_session_id FROM sessions WHERE origin_key = ?").get(originKey) as {
+				gjc_session_id: string;
+			} | null
+		)?.gjc_session_id;
 	}
 
 	workLaneRows(): Array<{ origin_key: string; gjc_session_id: string; last_activity_at: string | null }> {
 		return this.#db
-			.prepare("SELECT origin_key, gjc_session_id, last_activity_at FROM sessions WHERE origin_key LIKE 'work/task/%' AND gjc_session_id <> '' ORDER BY last_activity_at")
+			.prepare(
+				"SELECT origin_key, gjc_session_id, last_activity_at FROM sessions WHERE origin_key LIKE 'work/task/%' AND gjc_session_id <> '' ORDER BY last_activity_at",
+			)
 			.all() as Array<{ origin_key: string; gjc_session_id: string; last_activity_at: string | null }>;
 	}
 
 	workLaneRepoBySessionId(sessionId: string): string | undefined {
 		const authority = this.brokerAuthority();
 		if (!authority) return undefined;
-		return (this.#db
-			.prepare("SELECT repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?")
-			.get(brokerAuthorityKey(authority), sessionId) as { repo: string } | null)?.repo;
+		return (
+			this.#db
+				.prepare("SELECT repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?")
+				.get(brokerAuthorityKey(authority), sessionId) as { repo: string } | null
+		)?.repo;
 	}
 
 	hasCutovers(): boolean {
@@ -420,9 +447,9 @@ export class BindingsGroup {
 	}
 
 	brokerAuthority(): BrokerAuthority | null {
-		const row = this.#db.prepare("SELECT authority_key FROM broker_authority WHERE singleton = 1").get() as
-			| { authority_key: string }
-			| null;
+		const row = this.#db.prepare("SELECT authority_key FROM broker_authority WHERE singleton = 1").get() as {
+			authority_key: string;
+		} | null;
 		if (!row) return null;
 		let value: unknown;
 		try {
@@ -430,12 +457,7 @@ export class BindingsGroup {
 		} catch {
 			throw new BrokerAuthorityError("invalid_authority");
 		}
-		if (
-			!Array.isArray(value) ||
-			value.length !== 2 ||
-			typeof value[0] !== "string" ||
-			typeof value[1] !== "string"
-		)
+		if (!Array.isArray(value) || value.length !== 2 || typeof value[0] !== "string" || typeof value[1] !== "string")
 			throw new BrokerAuthorityError("invalid_authority");
 		const authority = { canonicalAgentDir: value[0], identity: value[1] };
 		if (brokerAuthorityKey(authority) !== row.authority_key) throw new BrokerAuthorityError("invalid_authority");
@@ -445,20 +467,24 @@ export class BindingsGroup {
 	assertAuthority(authority: BrokerAuthority): void {
 		const current = this.brokerAuthority();
 		if (current === null) throw new BrokerAuthorityError("cutover_required");
-		if (brokerAuthorityKey(current) !== brokerAuthorityKey(authority)) throw new BrokerAuthorityError("authority_mismatch");
+		if (brokerAuthorityKey(current) !== brokerAuthorityKey(authority))
+			throw new BrokerAuthorityError("authority_mismatch");
 	}
 
 	setAuthority(tx: WriteTx, authority: BrokerAuthority): void {
 		const key = brokerAuthorityKey(authority);
 		this.#db
-			.prepare("INSERT INTO broker_authority(singleton, authority_key) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET authority_key = excluded.authority_key")
+			.prepare(
+				"INSERT INTO broker_authority(singleton, authority_key) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET authority_key = excluded.authority_key",
+			)
 			.run(tx, key);
 	}
 
 	initializeAuthority(tx: WriteTx, authority: BrokerAuthority, populated: boolean | (() => boolean)): void {
 		const current = this.brokerAuthority();
 		if (current !== null) {
-			if (brokerAuthorityKey(current) !== brokerAuthorityKey(authority)) throw new BrokerAuthorityError("authority_mismatch");
+			if (brokerAuthorityKey(current) !== brokerAuthorityKey(authority))
+				throw new BrokerAuthorityError("authority_mismatch");
 			return;
 		}
 		if (typeof populated === "function" ? populated() : populated) throw new BrokerAuthorityError("cutover_required");
@@ -466,12 +492,17 @@ export class BindingsGroup {
 	}
 
 	assertInitialAuthority(tx: WriteTx, canonicalAgentDir: string, populated: () => boolean): void {
-		if (!isAbsolute(canonicalAgentDir) || normalize(canonicalAgentDir) !== canonicalAgentDir || canonicalAgentDir.includes("\0"))
+		if (
+			!isAbsolute(canonicalAgentDir) ||
+			normalize(canonicalAgentDir) !== canonicalAgentDir ||
+			canonicalAgentDir.includes("\0")
+		)
 			throw new BrokerAuthorityError("invalid_authority");
 		const expected: BrokerAuthority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
 		const current = this.brokerAuthority();
 		if (current !== null) {
-			if (brokerAuthorityKey(current) !== brokerAuthorityKey(expected)) throw new BrokerAuthorityError("authority_mismatch");
+			if (brokerAuthorityKey(current) !== brokerAuthorityKey(expected))
+				throw new BrokerAuthorityError("authority_mismatch");
 			return;
 		}
 		if (populated()) throw new BrokerAuthorityError("cutover_required");
@@ -481,14 +512,16 @@ export class BindingsGroup {
 	originForSessionId(sessionId: string): string | undefined {
 		if (!/^[A-Za-z0-9-]{1,128}$/.test(sessionId)) return undefined;
 		const origins = new Set<string>();
-		const session = this.#db.prepare("SELECT origin_key FROM sessions WHERE gjc_session_id = ?").get(sessionId) as
-			| { origin_key: string }
-			| null;
+		const session = this.#db.prepare("SELECT origin_key FROM sessions WHERE gjc_session_id = ?").get(sessionId) as {
+			origin_key: string;
+		} | null;
 		if (session) origins.add(session.origin_key);
 		const authority = this.brokerAuthority();
 		if (authority) {
 			for (const row of this.#db
-				.prepare("SELECT origin_key FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ? AND NOT EXISTS (SELECT 1 FROM broker_retired_sessions r WHERE r.session_id = broker_owned_bindings.session_id)")
+				.prepare(
+					"SELECT origin_key FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ? AND NOT EXISTS (SELECT 1 FROM broker_retired_sessions r WHERE r.session_id = broker_owned_bindings.session_id)",
+				)
 				.all(brokerAuthorityKey(authority), sessionId) as Array<{ origin_key: string }>)
 				origins.add(row.origin_key);
 		}
@@ -522,10 +555,14 @@ export class BindingsGroup {
 		)
 			throw new BrokerAuthorityError("unowned_session");
 		this.#db
-			.prepare("INSERT INTO broker_owned_bindings(authority_key, session_id, origin_key, epoch, repo, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO NOTHING")
+			.prepare(
+				"INSERT INTO broker_owned_bindings(authority_key, session_id, origin_key, epoch, repo, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO NOTHING",
+			)
 			.run(tx, key, binding.sessionId, binding.originKey, binding.epoch, binding.repo, new Date().toISOString());
 		this.#db
-			.prepare("INSERT INTO sessions(origin_key, gjc_session_id, epoch, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET gjc_session_id = excluded.gjc_session_id")
+			.prepare(
+				"INSERT INTO sessions(origin_key, gjc_session_id, epoch, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET gjc_session_id = excluded.gjc_session_id",
+			)
 			.run(tx, binding.originKey, binding.sessionId, binding.epoch, new Date().toISOString());
 		return true;
 	}
@@ -545,27 +582,37 @@ export class BindingsGroup {
 
 	quarantineInvalidWork(tx: WriteTx, jobId: string): void {
 		this.#db
-			.prepare("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING")
+			.prepare(
+				"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING",
+			)
 			.run(tx, "work", jobId, "recovery-auto-quarantine");
 	}
 
 	hasCutoverTarget(authority: BrokerAuthority): boolean {
-	return this.#db
-		.prepare("SELECT 1 FROM broker_cutovers WHERE old_authority = ? OR target_authority = ? LIMIT 1")
-		.get(brokerAuthorityKey(authority), brokerAuthorityKey(authority)) !== null;
+		return (
+			this.#db
+				.prepare("SELECT 1 FROM broker_cutovers WHERE old_authority = ? OR target_authority = ? LIMIT 1")
+				.get(brokerAuthorityKey(authority), brokerAuthorityKey(authority)) !== null
+		);
 	}
 
 	cutoverSnapshot(id: string): string | undefined {
-		return (this.#db.prepare("SELECT snapshot_json FROM broker_cutovers WHERE id = ?").get(id) as { snapshot_json: string } | null)
-			?.snapshot_json;
+		return (
+			this.#db.prepare("SELECT snapshot_json FROM broker_cutovers WHERE id = ?").get(id) as {
+				snapshot_json: string;
+			} | null
+		)?.snapshot_json;
 	}
 
-	cutoverBrokerAuthority(tx: WriteTx, input: {
-		readonly expectedAuthority: BrokerAuthority | null;
-		readonly targetAuthority: BrokerAuthority;
-		readonly evidence: string;
-		readonly disposition?: "quarantine";
-	}): string {
+	cutoverBrokerAuthority(
+		tx: WriteTx,
+		input: {
+			readonly expectedAuthority: BrokerAuthority | null;
+			readonly targetAuthority: BrokerAuthority;
+			readonly evidence: string;
+			readonly disposition?: "quarantine";
+		},
+	): string {
 		const target = brokerAuthorityKey(input.targetAuthority);
 		const expected = input.expectedAuthority === null ? null : brokerAuthorityKey(input.expectedAuthority);
 		const current = this.brokerAuthority();
@@ -573,49 +620,134 @@ export class BindingsGroup {
 			throw new BrokerAuthorityError("authority_mismatch");
 		if (this.hasCutoverTarget(input.targetAuthority)) throw new BrokerAuthorityError("authority_mismatch");
 		if (typeof input.evidence !== "string" || !input.evidence.trim()) throw new Error("cutover evidence is required");
-		if (input.disposition !== undefined && input.disposition !== "quarantine") throw new Error("invalid cutover disposition");
+		if (input.disposition !== undefined && input.disposition !== "quarantine")
+			throw new Error("invalid cutover disposition");
 
 		let openWork = 0;
-		for (const row of this.#db.prepare("SELECT job_id, record_json FROM lane_jobs").all() as Array<{ job_id: string; record_json: string }>) {
+		for (const row of this.#db.prepare("SELECT job_id, record_json FROM lane_jobs").all() as Array<{
+			job_id: string;
+			record_json: string;
+		}>) {
 			const job = parseLaneJobRecord(row.record_json);
 			if (job.jobId !== row.job_id) throw new Error("invalid lane job identity");
-			if (!this.isQuarantined("work", job.jobId) && (job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state)))
+			if (
+				!this.isQuarantined("work", job.jobId) &&
+				(job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state))
+			)
 				openWork++;
 		}
-		openWork += (this.#db.prepare("SELECT COUNT(*) AS n FROM work_attempt_runtime WHERE settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id)").get() as { n: number } | null)?.n ?? 0;
-		openWork += (this.#db.prepare("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')").get() as { n: number } | null)?.n ?? 0;
-		const openInbound = (this.#db.prepare("SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)").get() as { n: number } | null)?.n ?? 0;
-		const openMonitors = (this.#db.prepare("SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)").get() as { n: number } | null)?.n ?? 0;
+		openWork +=
+			(
+				this.#db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM work_attempt_runtime WHERE settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id)",
+					)
+					.get() as { n: number } | null
+			)?.n ?? 0;
+		openWork +=
+			(
+				this.#db.prepare("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')").get() as {
+					n: number;
+				} | null
+			)?.n ?? 0;
+		const openInbound =
+			(
+				this.#db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)",
+					)
+					.get() as { n: number } | null
+			)?.n ?? 0;
+		const openMonitors =
+			(
+				this.#db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+					)
+					.get() as { n: number } | null
+			)?.n ?? 0;
 		if ((openInbound || openWork || openMonitors) && input.disposition !== "quarantine")
 			throw new BrokerAuthorityError("old_work_open");
 
 		const snapshotTables = [
-			"sessions", "deliveries", "recall_snippets", "meta", "memory_intents", "monitors", "monitor_events",
-			"authored_outputs", "inbound_messages", "conversation_context", "lane_jobs", "monitor_failures",
-			"monitor_slots", "dispatch_leases", "conversation_context_state", "conversation_model",
-			"session_tail_cursors", "work_attempt_runtime", "lane_reports", "broker_owned_bindings",
-			"broker_tail_cursors", "broker_retired_sessions", "broker_quarantine",
+			"sessions",
+			"deliveries",
+			"recall_snippets",
+			"meta",
+			"memory_intents",
+			"monitors",
+			"monitor_events",
+			"authored_outputs",
+			"inbound_messages",
+			"conversation_context",
+			"lane_jobs",
+			"monitor_failures",
+			"monitor_slots",
+			"dispatch_leases",
+			"conversation_context_state",
+			"conversation_model",
+			"session_tail_cursors",
+			"work_attempt_runtime",
+			"lane_reports",
+			"broker_owned_bindings",
+			"broker_tail_cursors",
+			"broker_retired_sessions",
+			"broker_quarantine",
 		] as const;
-		const snapshot = Object.fromEntries(snapshotTables.map((table) => [table, this.#db.prepare(`SELECT * FROM ${table}`).all()]));
+		const snapshot = Object.fromEntries(
+			snapshotTables.map((table) => [table, this.#db.prepare(`SELECT * FROM ${table}`).all()]),
+		);
 		const id = crypto.randomUUID();
 		this.#db
-			.prepare("INSERT INTO broker_cutovers(id, old_authority, target_authority, evidence, disposition, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-			.run(tx, id, expected, target, input.evidence, input.disposition ?? "quiescent", JSON.stringify(snapshot), new Date().toISOString());
+			.prepare(
+				"INSERT INTO broker_cutovers(id, old_authority, target_authority, evidence, disposition, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				tx,
+				id,
+				expected,
+				target,
+				input.evidence,
+				input.disposition ?? "quiescent",
+				JSON.stringify(snapshot),
+				new Date().toISOString(),
+			);
 
 		const quarantines: ReadonlyArray<readonly [BrokerQuarantineKind, string[]]> = [
-			["inbound", (this.#db.prepare("SELECT message_id AS id FROM inbound_messages").all() as Array<{ id: string }>).map((row) => row.id)],
-			["work", (this.#db.prepare("SELECT job_id AS id FROM lane_jobs").all() as Array<{ id: string }>).map((row) => row.id)],
-			["monitor", (this.#db.prepare("SELECT event_id AS id FROM monitor_events").all() as Array<{ id: string }>).map((row) => row.id)],
+			[
+				"inbound",
+				(this.#db.prepare("SELECT message_id AS id FROM inbound_messages").all() as Array<{ id: string }>).map(
+					(row) => row.id,
+				),
+			],
+			[
+				"work",
+				(this.#db.prepare("SELECT job_id AS id FROM lane_jobs").all() as Array<{ id: string }>).map((row) => row.id),
+			],
+			[
+				"monitor",
+				(this.#db.prepare("SELECT event_id AS id FROM monitor_events").all() as Array<{ id: string }>).map(
+					(row) => row.id,
+				),
+			],
 		];
-		const quarantine = this.#db.prepare("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING");
+		const quarantine = this.#db.prepare(
+			"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING",
+		);
 		for (const [kind, ids] of quarantines) for (const subjectId of ids) quarantine.run(tx, kind, subjectId, id);
 
 		const retired = new Set<string>();
-		for (const row of this.#db.prepare("SELECT gjc_session_id AS id FROM sessions WHERE gjc_session_id <> '' UNION SELECT bound_session_id FROM inbound_messages WHERE bound_session_id IS NOT NULL UNION SELECT session_id FROM work_attempt_runtime UNION SELECT session_id FROM session_tail_cursors UNION SELECT session_id FROM broker_owned_bindings").all() as Array<{ id: string }>)
+		for (const row of this.#db
+			.prepare(
+				"SELECT gjc_session_id AS id FROM sessions WHERE gjc_session_id <> '' UNION SELECT bound_session_id FROM inbound_messages WHERE bound_session_id IS NOT NULL UNION SELECT session_id FROM work_attempt_runtime UNION SELECT session_id FROM session_tail_cursors UNION SELECT session_id FROM broker_owned_bindings",
+			)
+			.all() as Array<{ id: string }>)
 			retired.add(row.id);
 		for (const row of this.#db.prepare("SELECT record_json FROM lane_jobs").all() as Array<{ record_json: string }>)
 			for (const sessionId of parseLaneJobRecord(row.record_json).sessions) retired.add(sessionId);
-		const retire = this.#db.prepare("INSERT INTO broker_retired_sessions(session_id, cutover_id) VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING");
+		const retire = this.#db.prepare(
+			"INSERT INTO broker_retired_sessions(session_id, cutover_id) VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING",
+		);
 		for (const sessionId of retired) retire.run(tx, sessionId, id);
 		this.#db.prepare("UPDATE sessions SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0").run(tx);
 		this.setAuthority(tx, input.targetAuthority);
@@ -640,7 +772,9 @@ export class BindingsGroup {
 
 	modelSet(tx: WriteTx, originKey: string, selection: GjcModelSelection, setBy?: string): void {
 		this.#db
-			.prepare("INSERT OR REPLACE INTO conversation_model (origin_key, selection_json, set_by, updated_at) VALUES (?, ?, ?, ?)")
+			.prepare(
+				"INSERT OR REPLACE INTO conversation_model (origin_key, selection_json, set_by, updated_at) VALUES (?, ?, ?, ?)",
+			)
 			.run(tx, originKey, JSON.stringify(selection), setBy ?? null, new Date().toISOString());
 	}
 
@@ -649,13 +783,18 @@ export class BindingsGroup {
 	}
 
 	sessionTailCursor(sessionId: string): string | undefined {
-		return (this.#db.prepare("SELECT cursor FROM session_tail_cursors WHERE session_id = ?").get(sessionId) as { cursor: string } | null)
-			?.cursor;
+		return (
+			this.#db.prepare("SELECT cursor FROM session_tail_cursors WHERE session_id = ?").get(sessionId) as {
+				cursor: string;
+			} | null
+		)?.cursor;
 	}
 
 	setSessionTailCursor(tx: WriteTx, sessionId: string, cursor: string): void {
 		this.#db
-			.prepare("INSERT INTO session_tail_cursors(session_id, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at")
+			.prepare(
+				"INSERT INTO session_tail_cursors(session_id, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+			)
 			.run(tx, sessionId, cursor, new Date().toISOString());
 	}
 
@@ -669,7 +808,9 @@ export class BindingsGroup {
 	setBrokerTailCursor(tx: WriteTx, authority: BrokerAuthority, sessionId: string, cursor: string): void {
 		this.assertAuthority(authority);
 		this.#db
-			.prepare("INSERT INTO broker_tail_cursors(authority_key, session_id, cursor, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at")
+			.prepare(
+				"INSERT INTO broker_tail_cursors(authority_key, session_id, cursor, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+			)
 			.run(tx, brokerAuthorityKey(authority), sessionId, cursor, new Date().toISOString());
 	}
 }

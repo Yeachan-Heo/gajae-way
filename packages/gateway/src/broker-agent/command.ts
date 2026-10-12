@@ -1,8 +1,8 @@
-import { acquireLease, LeaseHeldError, type Lease } from "@gajae-gateway/home";
+import { acquireLease, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import type { GatewayConfig } from "../config";
-import { BrokerAgentError, provisionBrokerAgent, type BrokerProvisionFault } from "./provision";
-import { readBrokerAgentDrift } from "./drift";
 import { resolveBrokerAgentSource } from "./allowlist";
+import { readBrokerAgentDrift } from "./drift";
+import { BrokerAgentError, type BrokerProvisionFault, provisionBrokerAgent } from "./provision";
 
 export interface BrokerAgentCommandDependencies {
 	readonly fault?: (point: BrokerProvisionFault) => void | Promise<void>;
@@ -16,7 +16,9 @@ export async function runBrokerAgentCommand(
 	const [verb, ...options] = args;
 	if (verb === "status") return runStatus(options, config);
 	if (verb !== "provision") {
-		console.error("usage: broker-agent provision --mode force|update [--from DIR] [--lease-wait-ms N] | broker-agent status [--json]");
+		console.error(
+			"usage: broker-agent provision --mode force|update [--from DIR] [--lease-wait-ms N] | broker-agent status [--json]",
+		);
 		return 2;
 	}
 	const parsed = parseProvisionArgs(options);
@@ -47,7 +49,8 @@ export async function runBrokerAgentCommand(
 			fault: dependencies.fault,
 		});
 		console.log(`broker_agent_provision status=${result.status}${result.genId ? ` genId=${result.genId}` : ""}`);
-		for (const entry of result.entries) console.log(`broker_agent_entry name=${entry.name} kind=${entry.kind} state=${entry.state}`);
+		for (const entry of result.entries)
+			console.log(`broker_agent_entry name=${entry.name} kind=${entry.kind} state=${entry.state}`);
 		return 0;
 	} catch (error) {
 		if (error instanceof BrokerAgentError) {
@@ -79,13 +82,14 @@ async function runStatus(args: readonly string[], config: GatewayConfig): Promis
 	console.log(
 		`broker_agent_status status=${drift.status} genId=${drift.genId ?? "none"} provisionedAt=${drift.provisionedAt ?? "none"} source=${drift.source ?? "none"}`,
 	);
-	for (const entry of drift.entries) console.log(`broker_agent_entry name=${entry.name} kind=${entry.kind} state=${entry.state}`);
+	for (const entry of drift.entries)
+		console.log(`broker_agent_entry name=${entry.name} kind=${entry.kind} state=${entry.state}`);
 	return 0;
 }
 
-function parseProvisionArgs(args: readonly string[]):
-	| { readonly mode: "force" | "update"; readonly from?: string; readonly leaseWaitMs: number }
-	| undefined {
+function parseProvisionArgs(
+	args: readonly string[],
+): { readonly mode: "force" | "update"; readonly from?: string; readonly leaseWaitMs: number } | undefined {
 	let mode: "force" | "update" | undefined;
 	let from: string | undefined;
 	let leaseWaitMs = 0;

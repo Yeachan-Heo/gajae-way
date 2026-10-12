@@ -201,7 +201,6 @@ test("map trimming never emits a partial markdown link line", async () => {
 	for (const line of map.split("\n")) if (line.includes("](")) expect(line).toMatch(/^- \[[^\]]+\]\([^)]+\)$/);
 });
 
-
 test("a failed git operation reports argv, exit status and stdout, never a bare `failed:` (#192)", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-reason-"));
 	await initializeMemory(home);

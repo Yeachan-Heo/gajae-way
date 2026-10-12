@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	type BrokerDiscovery,
 	brokerHealthArgs,
+	GJC_ATTACH_ONLY_ENV,
 	GlobalGjcClient,
 	HEALTH_PROBE_SESSION_ID,
 	isHealthySessionList,
@@ -14,7 +15,6 @@ import {
 	probeBrokerEndpoint,
 	readBrokerDiscovery,
 	type SpawnFn,
-	GJC_ATTACH_ONLY_ENV,
 } from "../src/orchestrator/broker";
 
 const directories: string[] = [];
@@ -261,11 +261,14 @@ async function eventually(predicate: () => boolean): Promise<void> {
 	expect(predicate()).toBe(true);
 }
 
-
 test("broker-unavailable CLI and relay refusals share the SLO recorder callback", async () => {
 	const timestamps: number[] = [];
 	const value = client({
-		command: async () => ({ exitCode: 1, stdout: "", stderr: '{"ok":false,"error":{"code":"broker_unavailable","message":"offline"}}' }),
+		command: async () => ({
+			exitCode: 1,
+			stdout: "",
+			stderr: '{"ok":false,"error":{"code":"broker_unavailable","message":"offline"}}',
+		}),
 		onUnavailable: (at) => timestamps.push(at),
 	});
 	await value.start();
@@ -790,7 +793,6 @@ test("rejects relative executable and untrusted project dotenv path selection", 
 	);
 	expect(() => client({ cwd })).toThrow("project-declared");
 });
-
 
 test("preflight fails closed when the stream relay rejects its argv (usage exit 2)", async () => {
 	const run = async (args: readonly string[]) =>

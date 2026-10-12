@@ -4,10 +4,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
-import type { BrokerAuthority } from "../src/store/groups/bindings";
-import { Store } from "../src/store";
-import { type WorkAttemptRuntime, workAttemptDeliveryId, workAttemptReportId } from "../src/store/groups/work";
 import { retryInboundTurn } from "../src/orchestrator/persona-session";
+import { Store } from "../src/store";
+import type { BrokerAuthority } from "../src/store/groups/bindings";
+import { type WorkAttemptRuntime, workAttemptDeliveryId, workAttemptReportId } from "../src/store/groups/work";
 
 const GLOBAL: BrokerAuthority = { canonicalAgentDir: "/home/operator/.gjc/agent", identity: "global-user" };
 const PRIVATE: BrokerAuthority = { canonicalAgentDir: "/srv/gateway/agent", identity: "retired-private" };
@@ -39,18 +39,38 @@ function binding(authority = GLOBAL, sessionId = SESSION, epoch = 0) {
 
 function seedAccepted(database: Store) {
 	database.transaction((tx) => database.bindings.bind(tx, ORIGIN, SESSION));
-	database.transaction((tx) => database.inbox.enqueue(tx, { messageId: "accepted", originKey: ORIGIN, originRefJson: "{}", body: "do not replay" }));
-	database.transaction((tx) => database.inbox.bindTurn(tx, {
-		messageId: "accepted",
-		originKey: ORIGIN,
-		epoch: 0,
-		opRef: "gw-old-accepted",
-		sessionId: SESSION,
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "accepted",
+			originKey: ORIGIN,
+			originRefJson: "{}",
+			body: "do not replay",
+		}),
+	);
+	database.transaction((tx) =>
+		database.inbox.bindTurn(tx, {
+			messageId: "accepted",
+			originKey: ORIGIN,
+			epoch: 0,
+			opRef: "gw-old-accepted",
+			sessionId: SESSION,
+		}),
+	);
 	database.transaction((tx) => database.inbox.turnAccept(tx, "gw-old-accepted"));
-	database.transaction((tx) => database.inbox.enqueue(tx, { messageId: "pending", originKey: ORIGIN, originRefJson: "{}", body: "old pending" }));
-	database.transaction((tx) => database.inbox.enqueue(tx, { messageId: "held", originKey: ORIGIN, originRefJson: "{}", body: "old ambiguous steer" }));
-	database.transaction((tx) => database.inbox.steerIssued(tx, { messageId: "held", epoch: 0, opRef: "gw-old-accepted" }));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, { messageId: "pending", originKey: ORIGIN, originRefJson: "{}", body: "old pending" }),
+	);
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "held",
+			originKey: ORIGIN,
+			originRefJson: "{}",
+			body: "old ambiguous steer",
+		}),
+	);
+	database.transaction((tx) =>
+		database.inbox.steerIssued(tx, { messageId: "held", epoch: 0, opRef: "gw-old-accepted" }),
+	);
 }
 
 function seedLane(database: Store) {
@@ -64,28 +84,38 @@ function seedLane(database: Store) {
 		}),
 		{ opRef: "gw-authority-work", sessionId: SESSION, startedAt: START },
 	);
-	database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: "work-authority", json: JSON.stringify(record) }));
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: "work-authority", json: JSON.stringify(record) }),
+	);
 	return record;
 }
 
 function cutover(database: Store) {
-	return database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-		expectedAuthority: null,
-		targetAuthority: GLOBAL,
-		evidence: "Operator authorized archive and quarantine; no runtime operations.",
-		disposition: "quarantine",
-	}));
+	return database.transaction((tx) =>
+		database.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: null,
+			targetAuthority: GLOBAL,
+			evidence: "Operator authorized archive and quarantine; no runtime operations.",
+			disposition: "quarantine",
+		}),
+	);
 }
 
 describe("durable single broker authority", () => {
 	test("boot requires explicit initialization and never replaces the active identity", async () => {
 		const { database, path } = await fixture();
 		expect(() => database.bindings.assertAuthority(GLOBAL)).toThrow("cutover_required");
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+		);
 		const reopened = await Store.open(path);
 		handles.push(reopened);
 		reopened.bindings.assertAuthority(GLOBAL);
-		expect(() => reopened.transaction((tx) => reopened.bindings.initializeAuthority(tx, PRIVATE, reopened.inspectBrokerAuthority().populated))).toThrow("authority_mismatch");
+		expect(() =>
+			reopened.transaction((tx) =>
+				reopened.bindings.initializeAuthority(tx, PRIVATE, reopened.inspectBrokerAuthority().populated),
+			),
+		).toThrow("authority_mismatch");
 		expect(() =>
 			reopened.bindings.assertAuthority({ ...GLOBAL, canonicalAgentDir: "/home/operator/../operator/.gjc/agent" }),
 		).toThrow("invalid_authority");
@@ -97,54 +127,82 @@ describe("durable single broker authority", () => {
 		raw
 			.query("INSERT INTO session_tail_cursors(session_id, cursor, updated_at) VALUES (?, ?, ?)")
 			.run(SESSION, "private-cursor", START);
-		expect(() => database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated))).toThrow("cutover_required");
+		expect(() =>
+			database.transaction((tx) =>
+				database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+			),
+		).toThrow("cutover_required");
 		expect(database.bindings.getSession(ORIGIN)).toBe(SESSION);
 		expect(() => database.bindings.assertOwnedSession(SESSION, "/work", GLOBAL)).toThrow("cutover_required");
 		cutover(database);
 		expect(() => database.bindings.assertOwnedSession(SESSION, "/work", GLOBAL)).toThrow("unowned_session");
-		expect(() => database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, SESSION, 1)))).toThrow("unowned_session");
+		expect(() =>
+			database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, SESSION, 1))),
+		).toThrow("unowned_session");
 		database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, NEXT_SESSION, 1)));
 		expect(raw.query("SELECT cursor FROM session_tail_cursors").get()).toEqual({ cursor: "private-cursor" });
 	});
 
 	test("context-only legacy databases also require cutover", async () => {
 		const { database } = await fixture();
-		database.transaction((tx) => database.inbox.contextRecord(tx, { messageId: "context-only", originKey: ORIGIN, body: "preserve context" }));
-		expect(() => database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated))).toThrow("cutover_required");
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, { messageId: "context-only", originKey: ORIGIN, body: "preserve context" }),
+		);
+		expect(() =>
+			database.transaction((tx) =>
+				database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+			),
+		).toThrow("cutover_required");
 	});
 
 	test("ownership requires immutable create provenance, not same cwd or arbitrary binding", async () => {
 		const { database, raw } = await fixture();
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+		);
 		expect(database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding()))).toBe(true);
 		expect(database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding()))).toBe(true);
 		expect(database.bindings.assertOwnedSession(SESSION, "/work", GLOBAL)).toEqual(binding());
 		expect(() => database.bindings.assertOwnedSession(NEXT_SESSION, "/work", GLOBAL)).toThrow("unowned_session");
 		expect(() => database.bindings.assertOwnedSession(SESSION, "/other", GLOBAL)).toThrow("unowned_session");
 		expect(() => database.bindings.assertOwnedSession(SESSION, "/work", PRIVATE)).toThrow("authority_mismatch");
-		expect(() => database.transaction((tx) => database.bindings.recordOwnedBinding(tx, { ...binding(), originKey: "discord/channel/unrelated" }))).toThrow(
+		expect(() =>
+			database.transaction((tx) =>
+				database.bindings.recordOwnedBinding(tx, { ...binding(), originKey: "discord/channel/unrelated" }),
+			),
+		).toThrow("unowned_session");
+		expect(() => database.transaction((tx) => database.bindings.bind(tx, ORIGIN, NEXT_SESSION))).toThrow(
 			"unowned_session",
 		);
-		expect(() => database.transaction((tx) => database.bindings.bind(tx, ORIGIN, NEXT_SESSION))).toThrow("unowned_session");
-		expect(() => database.transaction((tx) => database.bindings.bindAtEpoch(tx, ORIGIN, NEXT_SESSION, 0))).toThrow("unowned_session");
+		expect(() => database.transaction((tx) => database.bindings.bindAtEpoch(tx, ORIGIN, NEXT_SESSION, 0))).toThrow(
+			"unowned_session",
+		);
 		expect(() => raw.exec("UPDATE broker_owned_bindings SET repo = '/other'")).toThrow("immutable broker provenance");
 		expect(() => raw.exec("DELETE FROM broker_owned_bindings")).toThrow("immutable broker provenance");
 	});
 
 	test("epoch races reject stale creates while retired owned sessions remain readable", async () => {
 		const { database } = await fixture();
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+		);
 		database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding()));
 		database.transaction((tx) => database.bindings.rotateEpoch(tx, ORIGIN));
-		expect(database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, NEXT_SESSION, 0)))).toBe(false);
+		expect(
+			database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, NEXT_SESSION, 0))),
+		).toBe(false);
 		expect(() => database.bindings.assertOwnedSession(NEXT_SESSION, "/work", GLOBAL)).toThrow("unowned_session");
-		expect(database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, NEXT_SESSION, 1)))).toBe(true);
+		expect(
+			database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(GLOBAL, NEXT_SESSION, 1))),
+		).toBe(true);
 		expect(database.bindings.assertOwnedSession(SESSION, "/work", GLOBAL).epoch).toBe(0);
 	});
 
 	test("binding transactions roll back without phantom ownership", async () => {
 		const { database, raw } = await fixture();
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+		);
 		raw.exec("CREATE TRIGGER fault AFTER INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'fault'); END");
 		expect(() => database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding()))).toThrow("fault");
 		expect(database.bindings.getSession(ORIGIN)).toBeUndefined();
@@ -159,16 +217,24 @@ describe("durable single broker authority", () => {
 		expect(database.work.workAttemptOpen()).toEqual([]);
 		expect(database.inspectBrokerAuthority().openWork).toBeGreaterThan(0);
 		expect(() =>
-			database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, { expectedAuthority: null, targetAuthority: GLOBAL, evidence: "inspect" })),
+			database.transaction((tx) =>
+				database.bindings.cutoverBrokerAuthority(tx, {
+					expectedAuthority: null,
+					targetAuthority: GLOBAL,
+					evidence: "inspect",
+				}),
+			),
 		).toThrow("old_work_open");
 		cutover(database);
 		expect(database.work.laneJobJson(record.jobId)).toBe(JSON.stringify(record));
 		expect(database.bindings.isQuarantined("work", record.jobId)).toBe(true);
 		expect(database.work.laneJobRows()).toEqual([]);
 		expect(database.work.laneJobRows(true)).toHaveLength(1);
-		expect(() => database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: "work-authority", json: JSON.stringify(record) }))).toThrow(
-			"quarantined",
-		);
+		expect(() =>
+			database.transaction((tx) =>
+				database.work.putLaneJob(tx, { ...record, laneKey: "work-authority", json: JSON.stringify(record) }),
+			),
+		).toThrow("quarantined");
 	});
 
 	test("failed awaiting-operator history is an explicit hold even with no open attempt", async () => {
@@ -183,15 +249,19 @@ describe("durable single broker authority", () => {
 			}),
 			state: "awaiting_operator" as const,
 		};
-		database.transaction((tx) => database.work.putLaneJob(tx, { ...record, laneKey: "work-authority", json: JSON.stringify(record) }));
+		database.transaction((tx) =>
+			database.work.putLaneJob(tx, { ...record, laneKey: "work-authority", json: JSON.stringify(record) }),
+		);
 		expect(record.attempts.every((attempt) => attempt.endedAt !== undefined)).toBe(true);
 		expect(database.inspectBrokerAuthority().openWork).toBe(1);
 		expect(() =>
-			database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-				expectedAuthority: null,
-				targetAuthority: GLOBAL,
-				evidence: "no active runtime is insufficient",
-			})),
+			database.transaction((tx) =>
+				database.bindings.cutoverBrokerAuthority(tx, {
+					expectedAuthority: null,
+					targetAuthority: GLOBAL,
+					evidence: "no active runtime is insufficient",
+				}),
+			),
 		).toThrow("old_work_open");
 		cutover(database);
 		expect(database.work.laneJobRows()).toEqual([]);
@@ -213,14 +283,18 @@ describe("durable single broker authority", () => {
 	test("accepted, pending and ambiguous old inputs remain archived holds, never replayed", async () => {
 		const { database, raw, path } = await fixture();
 		seedAccepted(database);
-		database.transaction((tx) => database.inbox.contextRecord(tx, { messageId: "context", originKey: ORIGIN, body: "keep unread" }));
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, { messageId: "context", originKey: ORIGIN, body: "keep unread" }),
+		);
 		database.core.metaSet("delivery_dedup", "keep");
-		database.transaction((tx) => database.outbox.create(tx, {
-			deliveryId: "delivery-old",
-			turnId: "gw-old-accepted",
-			originKey: ORIGIN,
-			payloadJson: "{}",
-		}));
+		database.transaction((tx) =>
+			database.outbox.create(tx, {
+				deliveryId: "delivery-old",
+				turnId: "gw-old-accepted",
+				originKey: ORIGIN,
+				payloadJson: "{}",
+			}),
+		);
 		database.transaction((tx) => {
 			database.monitors.eventCreate(tx, {
 				eventId: "monitor-old",
@@ -236,7 +310,13 @@ describe("durable single broker authority", () => {
 		const deliveriesBefore = raw.query("SELECT * FROM deliveries").all();
 		const contextBefore = raw.query("SELECT * FROM conversation_context").all();
 		expect(() =>
-			database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, { expectedAuthority: null, targetAuthority: GLOBAL, evidence: "no disposition" })),
+			database.transaction((tx) =>
+				database.bindings.cutoverBrokerAuthority(tx, {
+					expectedAuthority: null,
+					targetAuthority: GLOBAL,
+					evidence: "no disposition",
+				}),
+			),
 		).toThrow("old_work_open");
 		const id = cutover(database);
 		const snapshot = JSON.parse(database.bindings.cutoverSnapshot(id)!);
@@ -253,23 +333,29 @@ describe("durable single broker authority", () => {
 		expect(database.monitors.eventRows(undefined, "oldest")).toEqual([]);
 		expect(database.monitors.eventRows("monitor", "oldest")).toEqual([]);
 		expect(database.monitors.eventRows(undefined, "newest", true)).toHaveLength(1);
-		expect(() => database.transaction((tx) => database.monitors.eventAcquireLease(tx, "monitor-old", "owner", "lease", 1000))).toThrow("quarantined");
-		expect(() => database.transaction((tx) => database.monitors.eventUpdate(tx, "monitor-old", "admitted"))).toThrow("quarantined");
+		expect(() =>
+			database.transaction((tx) => database.monitors.eventAcquireLease(tx, "monitor-old", "owner", "lease", 1000)),
+		).toThrow("quarantined");
+		expect(() => database.transaction((tx) => database.monitors.eventUpdate(tx, "monitor-old", "admitted"))).toThrow(
+			"quarantined",
+		);
 		expect(() =>
 			database.transaction((tx) => database.monitors.authorFenced(tx, "monitor-old", "", "new text")),
 		).toThrow("quarantined");
 		expect(database.transaction((tx) => database.monitors.eventSettle(tx, "monitor-old", "delivered"))).toBe(false);
-		expect(database.transaction((tx) => {
-			const delivery = database.outbox.get("delivery-old");
-			if (!delivery) return "unknown";
-			if (delivery.state === "confirmed" || delivery.state === "expired") {
-				if (delivery.state === "confirmed") database.monitors.settleForTurn(tx, delivery.turnId, "delivered");
-				return "already_terminal";
-			}
-			database.outbox.confirm(tx, delivery.deliveryId);
-			database.monitors.settleForTurn(tx, delivery.turnId, "delivered");
-			return "transitioned";
-		})).toBe("transitioned");
+		expect(
+			database.transaction((tx) => {
+				const delivery = database.outbox.get("delivery-old");
+				if (!delivery) return "unknown";
+				if (delivery.state === "confirmed" || delivery.state === "expired") {
+					if (delivery.state === "confirmed") database.monitors.settleForTurn(tx, delivery.turnId, "delivered");
+					return "already_terminal";
+				}
+				database.outbox.confirm(tx, delivery.deliveryId);
+				database.monitors.settleForTurn(tx, delivery.turnId, "delivered");
+				return "transitioned";
+			}),
+		).toBe("transitioned");
 		expect(database.outbox.rows()[0]?.state).toBe("confirmed");
 		for (const messageId of ["accepted", "pending", "held"])
 			expect(database.bindings.isQuarantined("inbound", messageId)).toBe(true);
@@ -283,26 +369,47 @@ describe("durable single broker authority", () => {
 		expect(database.inbox.pendingByOrigin()).toEqual([]);
 		expect(database.inbox.steersHeld("gw-old-accepted")).toEqual([]);
 		expect(database.inbox.steersHeldAfterTerminal(ORIGIN)).toEqual([]);
-		expect(database.transaction((tx) => database.inbox.discardBefore(tx, ORIGIN, "2099-01-01T00:00:00.000Z"))).toEqual([]);
+		expect(database.transaction((tx) => database.inbox.discardBefore(tx, ORIGIN, "2099-01-01T00:00:00.000Z"))).toEqual(
+			[],
+		);
 		expect(database.inbox.turnRow("gw-old-accepted")?.turn_state).toBe("accepted");
 		expect(database.inbox.turnRows("gw-old-accepted")).toHaveLength(2);
-		expect(() => database.transaction((tx) => database.inbox.turnComplete(tx, "gw-old-accepted"))).toThrow("quarantined");
-		expect(() => database.transaction((tx) => database.inbox.steerRefused(tx, "held", "gw-old-accepted"))).toThrow("quarantined");
+		expect(() => database.transaction((tx) => database.inbox.turnComplete(tx, "gw-old-accepted"))).toThrow(
+			"quarantined",
+		);
+		expect(() => database.transaction((tx) => database.inbox.steerRefused(tx, "held", "gw-old-accepted"))).toThrow(
+			"quarantined",
+		);
 		expect(() =>
-			database.transaction((tx) => database.inbox.bindTurn(tx, {
-				messageId: "pending",
-				originKey: ORIGIN,
-				epoch: 1,
-				opRef: "gw-new",
-				sessionId: NEXT_SESSION,
-			})),
+			database.transaction((tx) =>
+				database.inbox.bindTurn(tx, {
+					messageId: "pending",
+					originKey: ORIGIN,
+					epoch: 1,
+					opRef: "gw-new",
+					sessionId: NEXT_SESSION,
+				}),
+			),
 		).toThrow("quarantined");
-		expect(() => database.transaction((tx) => retryInboundTurn(database, tx, "gw-old-accepted"))).toThrow("quarantined");
-		expect(() => database.transaction((tx) => database.inbox.steerIssued(tx, { messageId: "held", epoch: 1, opRef: "new" }))).toThrow("quarantined");
+		expect(() => database.transaction((tx) => retryInboundTurn(database, tx, "gw-old-accepted"))).toThrow(
+			"quarantined",
+		);
+		expect(() =>
+			database.transaction((tx) => database.inbox.steerIssued(tx, { messageId: "held", epoch: 1, opRef: "new" })),
+		).toThrow("quarantined");
 		expect(
-			database.transaction((tx) => database.inbox.enqueue(tx, { messageId: "accepted", originKey: ORIGIN, originRefJson: "{}", body: "duplicate" })),
+			database.transaction((tx) =>
+				database.inbox.enqueue(tx, {
+					messageId: "accepted",
+					originKey: ORIGIN,
+					originRefJson: "{}",
+					body: "duplicate",
+				}),
+			),
 		).toBe(false);
-		database.transaction((tx) => database.inbox.enqueue(tx, { messageId: "new", originKey: ORIGIN, originRefJson: "{}", body: "new input" }));
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, { messageId: "new", originKey: ORIGIN, originRefJson: "{}", body: "new input" }),
+		);
 		expect(database.inbox.pendingOldest(ORIGIN)?.message_id).toBe("new");
 		const reopened = await Store.open(path);
 		handles.push(reopened);
@@ -343,8 +450,12 @@ describe("durable single broker authority", () => {
 		expect(database.work.workAttemptGet(runtime.opRef)).toEqual(runtime);
 		expect(database.work.workAttemptOpen()).toEqual([]);
 		expect(database.work.workAttemptOpenByLane("work-authority")).toBeUndefined();
-		expect(() => database.transaction((tx) => database.work.workAttemptUpdate(tx, runtime.opRef, 0, {}))).toThrow("quarantined");
-		expect(() => database.transaction((tx) => database.work.workAttemptPrepare(tx, runtime, record))).toThrow("quarantined");
+		expect(() => database.transaction((tx) => database.work.workAttemptUpdate(tx, runtime.opRef, 0, {}))).toThrow(
+			"quarantined",
+		);
+		expect(() => database.transaction((tx) => database.work.workAttemptPrepare(tx, runtime, record))).toThrow(
+			"quarantined",
+		);
 		expect(database.work.laneJobJson(record.jobId)).toBe(JSON.stringify(record));
 	});
 
@@ -364,24 +475,30 @@ describe("durable single broker authority", () => {
 
 	test("wrong expected authority and authority resurrection are rejected", async () => {
 		const { database } = await fixture();
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, PRIVATE, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, PRIVATE, database.inspectBrokerAuthority().populated),
+		);
 		database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding(PRIVATE)));
 		expect(() => cutover(database)).toThrow("authority_mismatch");
-		database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-			expectedAuthority: PRIVATE,
-			targetAuthority: GLOBAL,
-			evidence: "authorized",
-			disposition: "quarantine",
-		}));
+		database.transaction((tx) =>
+			database.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: PRIVATE,
+				targetAuthority: GLOBAL,
+				evidence: "authorized",
+				disposition: "quarantine",
+			}),
+		);
 		expect(() => database.bindings.assertOwnedSession(SESSION, "/work", PRIVATE)).toThrow("authority_mismatch");
 		expect(() => database.bindings.assertOwnedSession(SESSION, "/work", GLOBAL)).toThrow("unowned_session");
 		expect(() =>
-			database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-				expectedAuthority: GLOBAL,
-				targetAuthority: PRIVATE,
-				evidence: "unsafe resurrection",
-				disposition: "quarantine",
-			})),
+			database.transaction((tx) =>
+				database.bindings.cutoverBrokerAuthority(tx, {
+					expectedAuthority: GLOBAL,
+					targetAuthority: PRIVATE,
+					evidence: "unsafe resurrection",
+					disposition: "quarantine",
+				}),
+			),
 		).toThrow("authority_mismatch");
 	});
 
@@ -390,7 +507,11 @@ describe("durable single broker authority", () => {
 		seedLane(database);
 		raw.exec("UPDATE lane_jobs SET record_json = '{' ");
 		expect(() => database.inspectBrokerAuthority()).toThrow();
-		expect(() => database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated))).toThrow();
+		expect(() =>
+			database.transaction((tx) =>
+				database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+			),
+		).toThrow();
 		expect(() => cutover(database)).toThrow();
 		expect(raw.query("SELECT * FROM broker_authority").all()).toEqual([]);
 		expect(raw.query("SELECT * FROM broker_cutovers").all()).toEqual([]);
@@ -398,23 +519,31 @@ describe("durable single broker authority", () => {
 
 	test("established authority checks isolate unrelated corrupt history while inspection remains fail-closed", async () => {
 		const { database, raw } = await fixture();
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+		);
 		database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding()));
 		seedLane(database);
 		raw.exec("UPDATE lane_jobs SET record_json = '{'");
 		expect(() => database.bindings.assertAuthority(GLOBAL)).not.toThrow();
-		expect(() => database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, () => database.inspectBrokerAuthority().populated))).not.toThrow();
+		expect(() =>
+			database.transaction((tx) =>
+				database.bindings.initializeAuthority(tx, GLOBAL, () => database.inspectBrokerAuthority().populated),
+			),
+		).not.toThrow();
 		expect(database.bindings.assertOwnedSession(SESSION, "/work", GLOBAL)).toEqual(binding());
 		expect(() => database.bindings.assertAuthority(PRIVATE)).toThrow("authority_mismatch");
 		expect(() => database.bindings.assertOwnedSession(NEXT_SESSION, "/work", GLOBAL)).toThrow("unowned_session");
 		expect(() => database.inspectBrokerAuthority()).toThrow();
 		expect(() =>
-			database.transaction((tx) => database.bindings.cutoverBrokerAuthority(tx, {
-				expectedAuthority: GLOBAL,
-				targetAuthority: PRIVATE,
-				evidence: "validate history",
-				disposition: "quarantine",
-			})),
+			database.transaction((tx) =>
+				database.bindings.cutoverBrokerAuthority(tx, {
+					expectedAuthority: GLOBAL,
+					targetAuthority: PRIVATE,
+					evidence: "validate history",
+					disposition: "quarantine",
+				}),
+			),
 		).toThrow();
 		expect(database.work.laneJobJson("lanejob-authority")).toBe("{");
 		expect(raw.query("SELECT * FROM broker_cutovers").all()).toEqual([]);
@@ -422,9 +551,15 @@ describe("durable single broker authority", () => {
 
 	test("corrupt authority is rejected rather than initialized over", async () => {
 		const { database, raw } = await fixture();
-		database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated));
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+		);
 		raw.query("UPDATE broker_authority SET authority_key = ?").run("{");
 		expect(() => database.inspectBrokerAuthority()).toThrow();
-		expect(() => database.transaction((tx) => database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated))).toThrow();
+		expect(() =>
+			database.transaction((tx) =>
+				database.bindings.initializeAuthority(tx, GLOBAL, database.inspectBrokerAuthority().populated),
+			),
+		).toThrow();
 	});
 });

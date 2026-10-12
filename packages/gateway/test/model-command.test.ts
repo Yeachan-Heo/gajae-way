@@ -5,9 +5,9 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { applyModelCommand, listModelChoices, parseModelArgument } from "../src/server/model-command";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { Store } from "../src/store";
 import type { GjcModelSelection } from "../src/store/groups/bindings";
 import type { WriteTx } from "../src/store/tx";
-import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 function store(initial?: GjcModelSelection) {

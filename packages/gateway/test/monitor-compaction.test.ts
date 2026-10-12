@@ -520,7 +520,8 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		await pipeline.reconcile();
 		// No loss: every event, including the two that failed, ends with its note.
-		for (const eventId of [...healthy, ...failed]) expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		for (const eventId of [...healthy, ...failed])
+			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
 		// No duplicate: a successful event is requested exactly once, and a failed
 		// one exactly twice (its failure plus its single recovery). Only the event
 		// PAYLOAD counts as a request; a rolled session's digest legitimately

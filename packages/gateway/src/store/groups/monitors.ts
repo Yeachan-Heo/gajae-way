@@ -1,7 +1,7 @@
 import {
-	PROTOCOL_FAILURE_REASONS,
 	type MonitorEventRecovery,
 	type MonitorProtocolFailureRecord,
+	PROTOCOL_FAILURE_REASONS,
 	type ProtocolFailureReason,
 } from "@gajae-gateway/protocol";
 import type { GroupDb, StoreCore } from "../core";
@@ -132,9 +132,11 @@ export class MonitorsGroup {
 
 	openCount(): number {
 		return (
-			(this.#db
-				.prepare(`SELECT COUNT(*) AS n FROM monitor_events WHERE ${OPEN_MONITOR_EVENT} AND ${REPLAYABLE_MONITOR}`)
-				.get() as { n: number } | null)?.n ?? 0
+			(
+				this.#db
+					.prepare(`SELECT COUNT(*) AS n FROM monitor_events WHERE ${OPEN_MONITOR_EVENT} AND ${REPLAYABLE_MONITOR}`)
+					.get() as { n: number } | null
+			)?.n ?? 0
 		);
 	}
 
@@ -326,7 +328,14 @@ export class MonitorsGroup {
 		return inserted?.skipped_by ?? undefined;
 	}
 
-	eventAcquireLease(tx: WriteTx, eventId: string, owner: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
+	eventAcquireLease(
+		tx: WriteTx,
+		eventId: string,
+		owner: string,
+		leaseId: string,
+		ttlMs: number,
+		now = Date.now(),
+	): boolean {
 		this.#core.assertNotQuarantined("monitor", eventId);
 		const nowIso = new Date(now).toISOString();
 		const expiresIso = new Date(now + ttlMs).toISOString();
@@ -347,9 +356,11 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 
 	leaseLiveCount(now = Date.now()): number {
 		return (
-			(this.#db.prepare("SELECT COUNT(*) AS n FROM dispatch_leases WHERE expires_at > ?").get(new Date(now).toISOString()) as
-				| { n: number }
-				| null)?.n ?? 0
+			(
+				this.#db
+					.prepare("SELECT COUNT(*) AS n FROM dispatch_leases WHERE expires_at > ?")
+					.get(new Date(now).toISOString()) as { n: number } | null
+			)?.n ?? 0
 		);
 	}
 
@@ -410,8 +421,13 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		const leaseParams = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
 		const changes = this.#db
 			.prepare(`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND ${leasePredicate}`)
-			.run(tx, noDelivery ? "authored_no_delivery" : "authored", new Date(now).toISOString(), eventId, ...leaseParams)
-			.changes;
+			.run(
+				tx,
+				noDelivery ? "authored_no_delivery" : "authored",
+				new Date(now).toISOString(),
+				eventId,
+				...leaseParams,
+			).changes;
 		if (changes === 0) return false;
 		this.authoredOutputCreate(tx, eventId, note);
 		return true;
@@ -472,20 +488,30 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		if (!MONITOR_EVENT_STAGES.includes(stage)) throw new Error(`unknown monitor event stage: ${stage}`);
 		this.#core.assertNotQuarantined("monitor", eventId);
 		this.#db
-			.prepare("UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?")
+			.prepare(
+				"UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?",
+			)
 			.run(tx, stage, batchId, new Date().toISOString(), eventId);
 	}
 
 	settleForTurn(tx: WriteTx, turnId: string, stage: "delivered" | "authored"): void {
-		const events = this.#db.prepare("SELECT event_id FROM monitor_events WHERE batch_id = ?").all(turnId) as Array<{ event_id: string }>;
+		const events = this.#db.prepare("SELECT event_id FROM monitor_events WHERE batch_id = ?").all(turnId) as Array<{
+			event_id: string;
+		}>;
 		for (const event of events) this.eventSettle(tx, event.event_id, stage);
 	}
 
 	eventSettle(tx: WriteTx, eventId: string, stage: "delivered" | "authored"): boolean {
-		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = ?").get(eventId)) return false;
-		const row = this.#db.prepare("SELECT stage FROM monitor_events WHERE event_id = ?").get(eventId) as { stage: string } | null;
+		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = ?").get(eventId))
+			return false;
+		const row = this.#db.prepare("SELECT stage FROM monitor_events WHERE event_id = ?").get(eventId) as {
+			stage: string;
+		} | null;
 		if (!row) return false;
-		if (stage === "delivered" && (row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))) {
+		if (
+			stage === "delivered" &&
+			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
+		) {
 			this.eventUpdate(tx, eventId, "delivered");
 			return true;
 		}
@@ -510,11 +536,18 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		reason: string,
 	): string[] {
 		const events = this.#db
-			.prepare(`SELECT event_id FROM monitor_events WHERE batch_id = ? AND stage = 'authored' AND ${REPLAYABLE_MONITOR}`)
+			.prepare(
+				`SELECT event_id FROM monitor_events WHERE batch_id = ? AND stage = 'authored' AND ${REPLAYABLE_MONITOR}`,
+			)
 			.all(turnId) as Array<{ event_id: string }>;
 		for (const { event_id } of events) {
 			this.eventUpdate(tx, event_id, "failed_no_retry");
-			this.failureRecord(tx, event_id, "delivery_expired", `delivery ${deliveryId} expired after ${attempts} attempts: ${reason}`);
+			this.failureRecord(
+				tx,
+				event_id,
+				"delivery_expired",
+				`delivery ${deliveryId} expired after ${attempts} attempts: ${reason}`,
+			);
 		}
 		return events.map((row) => row.event_id);
 	}
@@ -528,9 +561,11 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 
 	eventDispatchAttempts(eventId: string): number {
 		return (
-			(this.#db.prepare("SELECT dispatch_attempts FROM monitor_events WHERE event_id = ?").get(eventId) as
-				| { dispatch_attempts: number }
-				| null)?.dispatch_attempts ?? 0
+			(
+				this.#db.prepare("SELECT dispatch_attempts FROM monitor_events WHERE event_id = ?").get(eventId) as {
+					dispatch_attempts: number;
+				} | null
+			)?.dispatch_attempts ?? 0
 		);
 	}
 
@@ -541,7 +576,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		limit?: number,
 	): MonitorEventDbRow[] {
 		const direction = order === "oldest" ? "ASC" : "DESC";
-		const terms = [monitorId === undefined ? undefined : "monitor_id = ?", includeQuarantined ? undefined : REPLAYABLE_MONITOR];
+		const terms = [
+			monitorId === undefined ? undefined : "monitor_id = ?",
+			includeQuarantined ? undefined : REPLAYABLE_MONITOR,
+		];
 		const where = terms.filter((term) => term !== undefined).join(" AND ") || "1=1";
 		const params: Array<string | number> = monitorId === undefined ? [] : [monitorId];
 		if (limit !== undefined) params.push(limit);
@@ -555,7 +593,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	eventGet(eventId: string, includeQuarantined = false): MonitorEventDbRow | undefined {
 		return (
 			(this.#db
-				.prepare(`SELECT * FROM monitor_events WHERE event_id = ?${includeQuarantined ? "" : ` AND ${REPLAYABLE_MONITOR}`}`)
+				.prepare(
+					`SELECT * FROM monitor_events WHERE event_id = ?${includeQuarantined ? "" : ` AND ${REPLAYABLE_MONITOR}`}`,
+				)
 				.get(eventId) as MonitorEventDbRow | null) ?? undefined
 		);
 	}
@@ -563,25 +603,33 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	eventsByIds(eventIds: readonly string[]): MonitorEventDbRow[] {
 		if (eventIds.length === 0) return [];
 		return this.#db
-			.prepare(`SELECT * FROM monitor_events WHERE event_id IN (SELECT value FROM json_each(?)) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`)
+			.prepare(
+				`SELECT * FROM monitor_events WHERE event_id IN (SELECT value FROM json_each(?)) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+			)
 			.all(JSON.stringify(eventIds)) as MonitorEventDbRow[];
 	}
 
 	eventsByBatch(batchId: string): MonitorEventDbRow[] {
 		return this.#db
-			.prepare(`SELECT * FROM monitor_events WHERE batch_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`)
+			.prepare(
+				`SELECT * FROM monitor_events WHERE batch_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
+			)
 			.all(batchId) as MonitorEventDbRow[];
 	}
 
 	eventsOpen(): MonitorEventDbRow[] {
 		return this.#db
-			.prepare(`SELECT * FROM monitor_events WHERE ${OPEN_MONITOR_EVENT} AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid`)
+			.prepare(
+				`SELECT * FROM monitor_events WHERE ${OPEN_MONITOR_EVENT} AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid`,
+			)
 			.all() as MonitorEventDbRow[];
 	}
 
 	authoredBatchIds(): string[] {
 		return this.#db
-			.prepare(`SELECT DISTINCT batch_id FROM monitor_events WHERE stage = 'authored' AND batch_id IS NOT NULL AND ${REPLAYABLE_MONITOR}`)
+			.prepare(
+				`SELECT DISTINCT batch_id FROM monitor_events WHERE stage = 'authored' AND batch_id IS NOT NULL AND ${REPLAYABLE_MONITOR}`,
+			)
 			.all()
 			.map((row) => (row as { batch_id: string }).batch_id);
 	}
@@ -603,7 +651,13 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.run(tx, eventId, outputText, new Date().toISOString());
 	}
 
-	eventFencedSetProcedure(tx: WriteTx, eventId: string, leaseId: string, procedureJson: string, now = Date.now()): boolean {
+	eventFencedSetProcedure(
+		tx: WriteTx,
+		eventId: string,
+		leaseId: string,
+		procedureJson: string,
+		now = Date.now(),
+	): boolean {
 		this.#core.assertNotQuarantined("monitor", eventId);
 		return (
 			this.#db
@@ -619,14 +673,18 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 
 	authoredOutput(eventId: string): string | undefined {
 		return (
-			this.#db.prepare("SELECT output_text FROM authored_outputs WHERE event_id = ?").get(eventId) as { output_text: string } | null
+			this.#db.prepare("SELECT output_text FROM authored_outputs WHERE event_id = ?").get(eventId) as {
+				output_text: string;
+			} | null
 		)?.output_text;
 	}
 
 	failure(eventId: string): MonitorFailureRow | undefined {
 		return (
 			(this.#db
-				.prepare("SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1")
+				.prepare(
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+				)
 				.get(eventId) as MonitorFailureRow | null) ?? undefined
 		);
 	}
@@ -662,7 +720,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				protocolFailure?.responseEntryCount ?? null,
 			);
 		this.#db
-			.prepare("DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)")
+			.prepare(
+				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
+			)
 			.run(tx, eventId, eventId);
 	}
 
@@ -672,7 +732,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.get(eventId) as { stage: string; updated_at: string; dispatch_attempts: number } | null;
 		if (!event) return undefined;
 		const rows = this.#db
-			.prepare("SELECT protocol_reason, failed_at, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? AND protocol_reason IS NOT NULL ORDER BY rowid ASC")
+			.prepare(
+				"SELECT protocol_reason, failed_at, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? AND protocol_reason IS NOT NULL ORDER BY rowid ASC",
+			)
 			.all(eventId) as Array<{
 			protocol_reason: string | null;
 			failed_at: string;
@@ -737,7 +799,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		},
 	): { admitted: false } | { admitted: true; skippedBy: string | undefined } {
 		const claim = this.#db
-			.prepare("INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING")
+			.prepare(
+				"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
+			)
 			.run(tx, row.monitorId, row.slotAt, row.eventId, new Date().toISOString()).changes;
 		if (claim === 0) return { admitted: false };
 		const skippedBy = this.eventCreate(tx, {
@@ -756,23 +820,27 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	}
 
 	slotExists(monitorId: string, slotAt: string): boolean {
-		const row = this.#db.prepare("SELECT COUNT(*) AS n FROM monitor_slots WHERE monitor_id = ? AND slot_at = ?").get(monitorId, slotAt) as
-			| { n: number }
-			| null;
+		const row = this.#db
+			.prepare("SELECT COUNT(*) AS n FROM monitor_slots WHERE monitor_id = ? AND slot_at = ?")
+			.get(monitorId, slotAt) as { n: number } | null;
 		return (row?.n ?? 0) > 0;
 	}
 
 	slotCursor(monitorId: string): string | undefined {
 		return (
-			(this.#db.prepare("SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?").get(monitorId) as
-				| { slot_at: string | null }
-				| null)?.slot_at ?? undefined
+			(
+				this.#db.prepare("SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?").get(monitorId) as {
+					slot_at: string | null;
+				} | null
+			)?.slot_at ?? undefined
 		);
 	}
 
 	sweep(tx: WriteTx, cutoffs: { historyCutoff: string; batch: number }): { events: number; slots: number } {
 		const events = this.#db
-			.prepare(`SELECT event_id FROM monitor_events WHERE ${TERMINAL_MONITOR_EVENT} AND updated_at < ? AND ${REPLAYABLE_MONITOR} ORDER BY updated_at LIMIT ?`)
+			.prepare(
+				`SELECT event_id FROM monitor_events WHERE ${TERMINAL_MONITOR_EVENT} AND updated_at < ? AND ${REPLAYABLE_MONITOR} ORDER BY updated_at LIMIT ?`,
+			)
 			.all(cutoffs.historyCutoff, cutoffs.batch) as Array<{ event_id: string }>;
 		for (const { event_id } of events) {
 			this.#db.prepare("DELETE FROM authored_outputs WHERE event_id = ?").run(tx, event_id);
@@ -781,7 +849,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			this.#db.prepare("DELETE FROM monitor_events WHERE event_id = ?").run(tx, event_id);
 		}
 		const slots = this.#db
-			.prepare("DELETE FROM monitor_slots WHERE rowid IN (SELECT t.rowid FROM monitor_slots t WHERE t.slot_at < ? AND t.slot_at < (SELECT MAX(m.slot_at) FROM monitor_slots m WHERE m.monitor_id = t.monitor_id) LIMIT ?)")
+			.prepare(
+				"DELETE FROM monitor_slots WHERE rowid IN (SELECT t.rowid FROM monitor_slots t WHERE t.slot_at < ? AND t.slot_at < (SELECT MAX(m.slot_at) FROM monitor_slots m WHERE m.monitor_id = t.monitor_id) LIMIT ?)",
+			)
 			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
 		return { events: events.length, slots };
 	}

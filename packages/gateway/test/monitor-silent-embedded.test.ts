@@ -78,7 +78,8 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT] This is a status update");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
@@ -101,7 +102,8 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db!.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
 		// [SILENT] anywhere silences (per containsSilenceToken grammar)
@@ -119,7 +121,8 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");

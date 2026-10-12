@@ -34,7 +34,6 @@ test("every gjc spelling of a dropped session is one session-gone code", () => {
 		expect(isSessionGoneCode(code)).toBe(false);
 });
 
-
 /** The envelope gjc 0.18.1 prints for `sdk session inspect` of an id the broker no longer serves (gaebal-gajae, 2026-09-30). */
 const INSPECT_ENDPOINT_STALE = JSON.stringify({
 	schema: "gjc.command-error",
@@ -56,7 +55,9 @@ test("gjc 0.18 endpoint_stale on inspect retires the saved session instead of re
 	const home = await tempDir("gajaeway-stale-inspect-");
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const repo = join(home, "workspace");
 	let dropped = false;
 	let creates = 0;

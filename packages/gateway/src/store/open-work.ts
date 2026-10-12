@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { OriginRef } from "@gajae-gateway/protocol";
-import { parseLaneJobRecord, type LaneJobRecord } from "@gajae-gateway/subsession";
+import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 
 export type OpenWorkScope = "replayable" | "quarantined" | "all";
 

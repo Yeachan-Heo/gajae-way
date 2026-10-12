@@ -32,7 +32,10 @@ await runRestartStack({
 		}
 		const spec = serviceSpecs().find((candidate) => candidate.label === label);
 		if (spec?.id === "admin") adminPid++;
-		const leaseName = spec?.id === "broker" || spec?.id === "gateway" || spec?.id.startsWith("adapter-") ? spec.id as LeaseName : undefined;
+		const leaseName =
+			spec?.id === "broker" || spec?.id === "gateway" || spec?.id.startsWith("adapter-")
+				? (spec.id as LeaseName)
+				: undefined;
 		if (leaseName !== undefined) {
 			await leases.get(leaseName)?.release();
 			leases.set(leaseName, await acquireLease(home, leaseName));

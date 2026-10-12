@@ -21,7 +21,10 @@ afterEach(async () => {
 });
 
 function holder(...flags: string[]) {
-	const child = Bun.spawn([process.execPath, FIXTURE, home, "gateway", ...flags], { stdout: "pipe", stderr: "inherit" });
+	const child = Bun.spawn([process.execPath, FIXTURE, home, "gateway", ...flags], {
+		stdout: "pipe",
+		stderr: "inherit",
+	});
 	spawned.push(child.pid);
 	return child;
 }

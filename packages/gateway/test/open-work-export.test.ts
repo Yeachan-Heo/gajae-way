@@ -1,10 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/store";
 import { writeOpenWorkExport } from "../src/ops/open-work-export";
+import { Store } from "../src/store";
 
 const roots: string[] = [];
 
@@ -17,37 +17,41 @@ async function fixture() {
 	roots.push(root);
 	const path = join(root, "gateway.db");
 	const database = await Store.open(path);
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "open-inbound",
-		originKey: "discord:channel:fixture",
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "fixture" }),
-		body: "replayable work",
-	}));
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "replayable-inbound",
-		originKey: "discord:channel:fixture",
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "fixture" }),
-		body: "not quarantined",
-	}));
-	database.transaction((tx) => database.work.putLaneJob(tx, {
-		jobId: "lanejob-invalid-record",
-		laneKey: "fixture-lane",
-		state: "running",
-		createdAt: new Date().toISOString(),
-		updatedAt: new Date().toISOString(),
-		lane: { branch: "main", worktreePath: root },
-		json: "{invalid",
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "open-inbound",
+			originKey: "discord:channel:fixture",
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "fixture" }),
+			body: "replayable work",
+		}),
+	);
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "replayable-inbound",
+			originKey: "discord:channel:fixture",
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "fixture" }),
+			body: "not quarantined",
+		}),
+	);
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: "lanejob-invalid-record",
+			laneKey: "fixture-lane",
+			state: "running",
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			lane: { branch: "main", worktreePath: root },
+			json: "{invalid",
+		}),
+	);
 	database.close();
 	const raw = new Database(path);
-	raw.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, ?)").run(
-		"lanejob-invalid-record",
-		"cutover-invalid",
-	);
-	raw.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('inbound', ?, ?)").run(
-		"open-inbound",
-		"cutover-inbound",
-	);
+	raw
+		.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, ?)")
+		.run("lanejob-invalid-record", "cutover-invalid");
+	raw
+		.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('inbound', ?, ?)")
+		.run("open-inbound", "cutover-inbound");
 	raw.close();
 	return { root, path, database: await Store.open(path) };
 }

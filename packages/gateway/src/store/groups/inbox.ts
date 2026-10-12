@@ -1,5 +1,5 @@
-import { BrokerAuthorityError } from "../errors";
 import type { GroupDb, StoreCore } from "../core";
+import { BrokerAuthorityError } from "../errors";
 import type { WriteTx } from "../tx";
 
 export const INBOUND_TURN_STATES = ["bound", "accepted", "done"] as const;
@@ -105,15 +105,19 @@ export class InboxGroup {
 	}
 
 	originTriggeredTurn(originKey: string): boolean {
-		return this.#db
-			.prepare("SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' LIMIT 1")
-			.get(originKey) !== null;
+		return (
+			this.#db
+				.prepare("SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' LIMIT 1")
+				.get(originKey) !== null
+		);
 	}
 
 	messageJoinedTurn(originKey: string, messageId: string): boolean {
 		return (
 			this.#db
-				.prepare("SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role IN ('trigger', 'steer') LIMIT 1")
+				.prepare(
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+				)
 				.get(originKey, messageId) !== null
 		);
 	}
@@ -126,11 +130,13 @@ export class InboxGroup {
 	}
 	openCount(): number {
 		return (
-			(this.#db
-				.prepare(
-					`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
-				)
-				.get() as { n: number } | null)?.n ?? 0
+			(
+				this.#db
+					.prepare(
+						`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
+					)
+					.get() as { n: number } | null
+			)?.n ?? 0
 		);
 	}
 
@@ -172,8 +178,16 @@ export class InboxGroup {
 				.prepare(
 					"INSERT INTO inbound_messages (message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
 				)
-				.run(tx, row.messageId, source, row.originKey, row.originRefJson, row.body, row.engagementJson ?? null, receivedAt)
-				.changes > 0
+				.run(
+					tx,
+					row.messageId,
+					source,
+					row.originKey,
+					row.originRefJson,
+					row.body,
+					row.engagementJson ?? null,
+					receivedAt,
+				).changes > 0
 		);
 	}
 
@@ -197,7 +211,8 @@ export class InboxGroup {
 			readonly dispatchedAt?: string;
 		},
 	): InboundMessageRow {
-		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0) throw new Error("turn epoch must be a non-negative integer");
+		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0)
+			throw new Error("turn epoch must be a non-negative integer");
 		if (!input.sessionId) throw new Error("turn session id must not be empty");
 		this.#assertNotQuarantined(input.messageId);
 		this.#assertReplayableTurn(input.opRef);
@@ -242,14 +257,17 @@ export class InboxGroup {
 
 	turnDispatchedAt(opRef: string): string | undefined {
 		return (
-			this.#db
-				.prepare("SELECT dispatched_at FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'")
-				.get(opRef) as { dispatched_at: string | null } | null
-		)?.dispatched_at ?? undefined;
+			(
+				this.#db
+					.prepare("SELECT dispatched_at FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'")
+					.get(opRef) as { dispatched_at: string | null } | null
+			)?.dispatched_at ?? undefined
+		);
 	}
 
 	claimTerminal(tx: WriteTx, opRef: string, part: number, deliveryId: string): string {
-		if (!Number.isSafeInteger(part) || part < 0) throw new Error("terminal delivery part must be a non-negative integer");
+		if (!Number.isSafeInteger(part) || part < 0)
+			throw new Error("terminal delivery part must be a non-negative integer");
 		this.#assertNotQuarantinedByOpRef(opRef);
 		const row = this.#db
 			.prepare("SELECT terminal_delivery_id FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'")
@@ -259,7 +277,8 @@ export class InboxGroup {
 		if (row.terminal_delivery_id) {
 			try {
 				const parsed: unknown = JSON.parse(row.terminal_delivery_id);
-				if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) claims = parsed as Record<string, string>;
+				if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed))
+					claims = parsed as Record<string, string>;
 			} catch {
 				claims = {};
 			}
@@ -308,7 +327,10 @@ export class InboxGroup {
 			.run(tx, opRef).changes;
 	}
 
-	steerIssued(tx: WriteTx, input: { readonly messageId: string; readonly epoch: number; readonly opRef: string }): boolean {
+	steerIssued(
+		tx: WriteTx,
+		input: { readonly messageId: string; readonly epoch: number; readonly opRef: string },
+	): boolean {
 		this.#assertNotQuarantined(input.messageId);
 		this.#assertReplayableTurn(input.opRef);
 		return (
@@ -322,7 +344,12 @@ export class InboxGroup {
 
 	steerAccepted(
 		tx: WriteTx,
-		input: { readonly messageId: string; readonly epoch: number; readonly opRef: string; readonly contextMessageId?: string },
+		input: {
+			readonly messageId: string;
+			readonly epoch: number;
+			readonly opRef: string;
+			readonly contextMessageId?: string;
+		},
 	): boolean {
 		const accepted =
 			this.#db
@@ -462,11 +489,13 @@ export class InboxGroup {
 
 	nonterminalTurnCount(): number {
 		return (
-			(this.#db
-				.prepare(
-					`SELECT COUNT(*) AS n FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND}`,
-				)
-				.get() as { n: number } | null)?.n ?? 0
+			(
+				this.#db
+					.prepare(
+						`SELECT COUNT(*) AS n FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND}`,
+					)
+					.get() as { n: number } | null
+			)?.n ?? 0
 		);
 	}
 
@@ -524,11 +553,18 @@ export class InboxGroup {
 			.prepare(
 				"SELECT origin_key, COUNT(*) AS count, MIN(received_at) AS oldest, MAX(received_at) AS newest FROM conversation_context WHERE consumed_at IS NULL AND received_at < ? GROUP BY origin_key",
 			)
-			.all(relevanceCutoff) as Array<{ origin_key: string; count: number; oldest: string | null; newest: string | null }>;
+			.all(relevanceCutoff) as Array<{
+			origin_key: string;
+			count: number;
+			oldest: string | null;
+			newest: string | null;
+		}>;
 		let expired = 0;
 		for (const group of groups) {
 			this.#db
-				.prepare("UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?")
+				.prepare(
+					"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?",
+				)
 				.run(tx, at, group.origin_key, relevanceCutoff);
 			this.#recordContextOmissions(
 				tx,
@@ -563,10 +599,12 @@ export class InboxGroup {
 
 	contextFloorAt(originKey: string): string | undefined {
 		return (
-			this.#db
-				.prepare("SELECT floor_at FROM conversation_context_state WHERE origin_key = ?")
-				.get(originKey) as { floor_at: string | null } | null
-		)?.floor_at ?? undefined;
+			(
+				this.#db.prepare("SELECT floor_at FROM conversation_context_state WHERE origin_key = ?").get(originKey) as {
+					floor_at: string | null;
+				} | null
+			)?.floor_at ?? undefined
+		);
 	}
 
 	recentInbound(
@@ -600,7 +638,6 @@ export class InboxGroup {
 			})
 			.reverse();
 	}
-
 
 	contextWindow(
 		tx: WriteTx,
@@ -637,7 +674,9 @@ export class InboxGroup {
 			.prepare(
 				"SELECT rowid AS row_id, message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND rowid > ? ORDER BY received_at DESC, message_id DESC, rowid DESC LIMIT ?",
 			)
-			.all(originKey, triggerMessageId, effectiveFloor, floorRowId, limit) as Array<ConversationContextRow & { row_id: number }>;
+			.all(originKey, triggerMessageId, effectiveFloor, floorRowId, limit) as Array<
+			ConversationContextRow & { row_id: number }
+		>;
 		const boundary = newest[newest.length - 1];
 		const truncated = boundary
 			? this.#contextAggregate(
@@ -695,27 +734,35 @@ export class InboxGroup {
 
 	contextSetFloor(tx: WriteTx, originKey: string, floorAt: string, failedOps: ReadonlySet<string>): void {
 		const maxRowId =
-			(this.#db
-				.prepare("SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?")
-				.get(originKey) as { row_id: number } | null)?.row_id ?? 0;
+			(
+				this.#db
+					.prepare("SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?")
+					.get(originKey) as { row_id: number } | null
+			)?.row_id ?? 0;
 		const carriedIds = this.#unansweredTailRowIds(originKey, floorAt, failedOps);
 		const keep = carriedIds.length > 0 ? ` AND rowid NOT IN (${carriedIds.map(() => "?").join(",")})` : "";
 		const expireWhere = `origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)${keep}`;
 		const expireParams = [originKey, floorAt, maxRowId, ...carriedIds];
 		const expired = this.#contextAggregate(tx, expireWhere, expireParams);
 		if (expired.count > 0)
-			this.#db.prepare(`UPDATE conversation_context SET consumed_at = ? WHERE ${expireWhere}`).run(tx, floorAt, ...expireParams);
+			this.#db
+				.prepare(`UPDATE conversation_context SET consumed_at = ? WHERE ${expireWhere}`)
+				.run(tx, floorAt, ...expireParams);
 		const oldestCarried = carriedIds[0];
 		let stateFloorAt = floorAt;
 		let stateFloorRowId = maxRowId;
 		if (oldestCarried !== undefined) {
 			this.#db
-				.prepare(`UPDATE conversation_context SET consumed_at = NULL WHERE rowid IN (${carriedIds.map(() => "?").join(",")})`)
+				.prepare(
+					`UPDATE conversation_context SET consumed_at = NULL WHERE rowid IN (${carriedIds.map(() => "?").join(",")})`,
+				)
 				.run(tx, ...carriedIds);
 			stateFloorAt =
-				(this.#db.prepare("SELECT received_at FROM conversation_context WHERE rowid = ?").get(oldestCarried) as
-					| { received_at: string }
-					| null)?.received_at ?? floorAt;
+				(
+					this.#db.prepare("SELECT received_at FROM conversation_context WHERE rowid = ?").get(oldestCarried) as {
+						received_at: string;
+					} | null
+				)?.received_at ?? floorAt;
 			stateFloorRowId = oldestCarried - 1;
 		}
 		this.#db
@@ -739,26 +786,39 @@ export class InboxGroup {
 
 	contextDiagnostics(originKey?: string): ConversationContextDiagnostics {
 		const unread = originKey
-			? ((this.#db
-					.prepare("SELECT COUNT(*) AS n FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL")
-					.get(originKey) as { n: number } | null)?.n ?? 0)
-			: ((this.#db.prepare("SELECT COUNT(*) AS n FROM conversation_context WHERE consumed_at IS NULL").get() as { n: number } | null)
-					?.n ?? 0);
+			? ((
+					this.#db
+						.prepare("SELECT COUNT(*) AS n FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL")
+						.get(originKey) as { n: number } | null
+				)?.n ?? 0)
+			: ((
+					this.#db.prepare("SELECT COUNT(*) AS n FROM conversation_context WHERE consumed_at IS NULL").get() as {
+						n: number;
+					} | null
+				)?.n ?? 0);
 		const state = originKey
 			? (this.#db
-						.prepare(
-							"SELECT expired_count AS expired, truncated_count AS truncated, omitted_oldest_at AS oldest, omitted_newest_at AS newest, floor_at AS floor FROM conversation_context_state WHERE origin_key = ?",
-						)
-						.get(originKey) as
-						| { expired: number; truncated: number; oldest: string | null; newest: string | null; floor: string | null }
-						| null)
+					.prepare(
+						"SELECT expired_count AS expired, truncated_count AS truncated, omitted_oldest_at AS oldest, omitted_newest_at AS newest, floor_at AS floor FROM conversation_context_state WHERE origin_key = ?",
+					)
+					.get(originKey) as {
+					expired: number;
+					truncated: number;
+					oldest: string | null;
+					newest: string | null;
+					floor: string | null;
+				} | null)
 			: (this.#db
-						.prepare(
-							"SELECT COALESCE(SUM(expired_count), 0) AS expired, COALESCE(SUM(truncated_count), 0) AS truncated, MIN(omitted_oldest_at) AS oldest, MAX(omitted_newest_at) AS newest, NULL AS floor FROM conversation_context_state",
-						)
-						.get() as
-						| { expired: number; truncated: number; oldest: string | null; newest: string | null; floor: null }
-						| null);
+					.prepare(
+						"SELECT COALESCE(SUM(expired_count), 0) AS expired, COALESCE(SUM(truncated_count), 0) AS truncated, MIN(omitted_oldest_at) AS oldest, MAX(omitted_newest_at) AS newest, NULL AS floor FROM conversation_context_state",
+					)
+					.get() as {
+					expired: number;
+					truncated: number;
+					oldest: string | null;
+					newest: string | null;
+					floor: null;
+				} | null);
 		return {
 			unread,
 			expired: state?.expired ?? 0,
@@ -785,11 +845,13 @@ export class InboxGroup {
 
 	knownMessage(originKey: string, messageId: string): boolean {
 		return (
-			((this.#db
-				.prepare(
-					"SELECT (SELECT COUNT(*) FROM inbound_messages WHERE origin_key = ? AND message_id = ?) + (SELECT COUNT(*) FROM conversation_context WHERE origin_key = ? AND message_id = ?) AS n",
-				)
-				.get(originKey, messageId, originKey, messageId) as { n: number } | null)?.n ?? 0) > 0
+			((
+				this.#db
+					.prepare(
+						"SELECT (SELECT COUNT(*) FROM inbound_messages WHERE origin_key = ? AND message_id = ?) + (SELECT COUNT(*) FROM conversation_context WHERE origin_key = ? AND message_id = ?) AS n",
+					)
+					.get(originKey, messageId, originKey, messageId) as { n: number } | null
+			)?.n ?? 0) > 0
 		);
 	}
 
@@ -803,9 +865,13 @@ export class InboxGroup {
 
 	pendingCount(originKey: string): number {
 		return (
-			(this.#db
-				.prepare(`SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND ${REPLAYABLE_INBOUND}`)
-				.get(originKey) as { n: number } | null)?.n ?? 0
+			(
+				this.#db
+					.prepare(
+						`SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND ${REPLAYABLE_INBOUND}`,
+					)
+					.get(originKey) as { n: number } | null
+			)?.n ?? 0
 		);
 	}
 
@@ -889,7 +955,9 @@ export class InboxGroup {
 		params: (string | number)[],
 	): { count: number; oldest: string | null; newest: string | null } {
 		const row = this.#db
-			.prepare(`SELECT COUNT(*) AS count, MIN(received_at) AS oldest, MAX(received_at) AS newest FROM conversation_context WHERE ${where}`)
+			.prepare(
+				`SELECT COUNT(*) AS count, MIN(received_at) AS oldest, MAX(received_at) AS newest FROM conversation_context WHERE ${where}`,
+			)
 			.getWithWrite(tx, ...params) as { count: number; oldest: string | null; newest: string | null } | null;
 		return row ?? { count: 0, oldest: null, newest: null };
 	}
@@ -902,9 +970,13 @@ export class InboxGroup {
 		at: string,
 	): void {
 		if (expired.count === 0 && truncated.count === 0) return;
-		const oldest = [expired.oldest, truncated.oldest].filter((value): value is string => value !== null).sort()[0] ?? null;
+		const oldest =
+			[expired.oldest, truncated.oldest].filter((value): value is string => value !== null).sort()[0] ?? null;
 		const newest =
-			[expired.newest, truncated.newest].filter((value): value is string => value !== null).sort().at(-1) ?? null;
+			[expired.newest, truncated.newest]
+				.filter((value): value is string => value !== null)
+				.sort()
+				.at(-1) ?? null;
 		this.#db.prepare("INSERT OR IGNORE INTO conversation_context_state (origin_key) VALUES (?)").run(tx, originKey);
 		this.#db
 			.prepare(
@@ -941,9 +1013,13 @@ export class InboxGroup {
 				.prepare(
 					"SELECT pending_expired_count AS expired, pending_truncated_count AS truncated, pending_omitted_oldest_at AS oldest, pending_omitted_newest_at AS newest, omission_revision AS revision FROM conversation_context_state WHERE origin_key = ?",
 				)
-				.get(originKey) as
-					| { expired: number; truncated: number; oldest: string | null; newest: string | null; revision: number }
-				| null) ?? { expired: 0, truncated: 0, oldest: null, newest: null, revision: 0 }
+				.get(originKey) as {
+				expired: number;
+				truncated: number;
+				oldest: string | null;
+				newest: string | null;
+				revision: number;
+			} | null) ?? { expired: 0, truncated: 0, oldest: null, newest: null, revision: 0 }
 		);
 	}
 }

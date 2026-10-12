@@ -2,24 +2,16 @@ import { Database } from "bun:sqlite";
 import { lstatSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { BrokerAuthorityError, DatabaseStartupError } from "./errors";
+import { BindingsGroup } from "./groups/bindings";
+import { WorkAttemptStateError, WorkGroup } from "./groups/work";
+import { LATEST_SCHEMA_VERSION, type MigrationStatement, runMigrations } from "./migrations";
+import { collectOpenWork as collectOpenWorkReport, type OpenWorkRows, type OpenWorkScope } from "./open-work";
 import type { OwnedTable, OwnerGroup } from "./ownership";
 import { TABLE_OWNER } from "./ownership";
-import { collectOpenWork as collectOpenWorkReport, type OpenWorkRows, type OpenWorkScope } from "./open-work";
-import { BindingsGroup } from "./groups/bindings";
-import { DatabaseStartupError, BrokerAuthorityError } from "./errors";
-import { LATEST_SCHEMA_VERSION, runMigrations, type MigrationStatement } from "./migrations";
 import { classifySql } from "./sql-classify";
-import {
-	mintWriteTx,
-	StoreOwnershipError,
-	StoreTransactionError,
-	writeTxStore,
-	type WriteTx,
-} from "./tx";
-
-import { WorkAttemptStateError, WorkGroup } from "./groups/work";
-
-import { parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { mintWriteTx, StoreOwnershipError, StoreTransactionError, type WriteTx, writeTxStore } from "./tx";
 
 type RawStatement = ReturnType<Database["query"]>;
 
@@ -75,13 +67,11 @@ export class StoreCore {
 	#serial = 0;
 	#active: WriteTx | undefined;
 
-
 	private constructor(database: Database, backupsDir?: string) {
 		this.#database = database;
 		this.#backupsDir = backupsDir;
 		this.#work = new WorkGroup(this);
 	}
-
 
 	static async open(path: string, options: StoreOpenOptions = {}): Promise<StoreCore> {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -144,11 +134,12 @@ export class StoreCore {
 	}
 
 	get instanceId(): string {
-		const row = this.#database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get("instance_id");
+		const row = this.#database
+			.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
+			.get("instance_id");
 		if (!row) throw new DatabaseStartupError("integrity_check_failed", "meta.instance_id missing after migration");
 		return row.value;
 	}
-
 
 	transaction<T>(operation: (tx: WriteTx) => T): T {
 		if (this.#active !== undefined) throw new StoreTransactionError("nested");
@@ -257,12 +248,16 @@ export class StoreCore {
 	}
 
 	integrityCheckDetail(): string {
-		return this.#database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check ?? "unknown";
+		return (
+			this.#database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check ??
+			"unknown"
+		);
 	}
 
 	integrityCheck(): void {
 		const detail = this.integrityCheckDetail();
-		if (detail !== "ok") throw new DatabaseStartupError("integrity_check_failed", `SQLite integrity_check failed: ${detail}`);
+		if (detail !== "ok")
+			throw new DatabaseStartupError("integrity_check_failed", `SQLite integrity_check failed: ${detail}`);
 	}
 
 	quickCheckDetail(): string {
@@ -281,12 +276,15 @@ export class StoreCore {
 
 	tableRowCounts(): Readonly<Record<string, number>> {
 		const tables = this.#database
-			.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+			.query<{ name: string }, []>(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+			)
 			.all();
 		const counts: Record<string, number> = {};
 		for (const { name } of tables) {
 			const identifier = `"${name.replaceAll('"', '""')}"`;
-			counts[name] = this.#database.query<{ count: number }, []>(`SELECT COUNT(*) AS count FROM ${identifier}`).get()?.count ?? 0;
+			counts[name] =
+				this.#database.query<{ count: number }, []>(`SELECT COUNT(*) AS count FROM ${identifier}`).get()?.count ?? 0;
 		}
 		return counts;
 	}
@@ -294,8 +292,6 @@ export class StoreCore {
 	maintain(): void {
 		this.#database.exec("PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;");
 	}
-
-
 
 	collectOpenWork(scope: OpenWorkScope) {
 		return collectOpenWorkReport(
@@ -333,7 +329,6 @@ export class StoreCore {
 		};
 	}
 
-
 	assertNotQuarantined(kind: string, id: string): void {
 		if (this.#database.query("SELECT 1 FROM broker_quarantine WHERE kind = ? AND subject_id = ?").get(kind, id))
 			throw new BrokerAuthorityError("quarantined");
@@ -347,8 +342,7 @@ export class StoreCore {
 		const core = this;
 		runMigrations({
 			database: {
-				statement: <T = unknown>(sql: string) =>
-					this.#database.query(sql) as unknown as MigrationStatement<T>,
+				statement: <T = unknown>(sql: string) => this.#database.query(sql) as unknown as MigrationStatement<T>,
 				execute: (sql) => this.#database.exec(sql),
 			},
 			get schemaVersion() {
@@ -389,7 +383,9 @@ export class StoreCore {
 			for (const row of this.#work.workAttemptRows()) {
 				const runtime = this.#work.workAttemptGet(row.op_ref)!;
 				if (runtime.settledAt === null)
-					this.#database.query("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?").get(runtime.jobId);
+					this.#database
+						.query("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?")
+						.get(runtime.jobId);
 			}
 			this.#work.laneReportOpenCount();
 		} catch (error) {
@@ -418,13 +414,16 @@ export class StoreCore {
 
 	private assertInitialAuthority(canonicalAgentDir: string): void {
 		const bindings = new BindingsGroup(this);
-		this.transaction((tx) => bindings.assertInitialAuthority(tx, canonicalAgentDir, () => this.authorityCensusPopulated()));
+		this.transaction((tx) =>
+			bindings.assertInitialAuthority(tx, canonicalAgentDir, () => this.authorityCensusPopulated()),
+		);
 	}
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
 	return (
-		(value !== null && (typeof value === "object" || typeof value === "function")) &&
+		value !== null &&
+		(typeof value === "object" || typeof value === "function") &&
 		typeof (value as { then?: unknown }).then === "function"
 	);
 }

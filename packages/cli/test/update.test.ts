@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { homeLayout, acquireLease, leaseHeld } from "@gajae-gateway/home";
+import { acquireLease, homeLayout, leaseHeld } from "@gajae-gateway/home";
 
 import pkg from "../package.json";
 import { main } from "../src/main";
@@ -14,6 +14,7 @@ import {
 	parseUpdateArgs,
 	type ReleaseFetcher,
 	type ReleaseInfo,
+	type RunUpdateOptions,
 	releaseAssetName,
 	releaseRepo,
 	releaseVersion,
@@ -22,7 +23,6 @@ import {
 	runUpdate,
 	selectReleaseAsset,
 	UPDATE_USAGE,
-	type RunUpdateOptions,
 	type UpdateDeps,
 } from "../src/update";
 
@@ -222,70 +222,69 @@ describe("runUpdate", () => {
 			expect(result.checkedOnly).toBe(true);
 			expect(renderUpdate(result)).toEqual(["update available: 0.1.1 → 0.2.0 (release v0.2.0)"]);
 			// A check never stages, backs up, or marks anything.
-
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
 
-test("an install replaces installed binaries, backs them up, marks the release, and queues the restart", async () => {
-	const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
-	const home = await homeWithConfig();
-	const calls = recorder();
-	const extractor = extractorFor(KNOWN_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
-	try {
-		const result = await runUpdate({
-			args: { check: false, force: false, noRestart: false, binDir: dir },
-			home,
-			deps: {
-				fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
-				downloadAsset: async (asset) => {
-					calls.downloads.push(asset.name);
-					return new Uint8Array(0);
+	test("an install replaces installed binaries, backs them up, marks the release, and queues the restart", async () => {
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
+		const home = await homeWithConfig();
+		const calls = recorder();
+		const extractor = extractorFor(KNOWN_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
+		try {
+			const result = await runUpdate({
+				args: { check: false, force: false, noRestart: false, binDir: dir },
+				home,
+				deps: {
+					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
+					downloadAsset: async (asset) => {
+						calls.downloads.push(asset.name);
+						return new Uint8Array(0);
+					},
+					extractTarball: extractor,
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home),
+					queueRestart: async (restartHome, _binDir, trigger) => {
+						calls.restarts.push(restartHome);
+						expect(trigger).toBe("update");
+						expect(await leaseHeld(restartHome, "update")).toBe(false);
+						return { receiptId: "r-1", supervisorPid: 42 };
+					},
+					platform: "darwin",
+					arch: "arm64",
 				},
-				extractTarball: extractor,
-				gjcInstallRunner,
-				serviceOptions: serviceOptions(home),
-				queueRestart: async (restartHome, _binDir, trigger) => {
-					calls.restarts.push(restartHome);
-					expect(trigger).toBe("update");
-					expect(await leaseHeld(restartHome, "update")).toBe(false);
-					return { receiptId: "r-1", supervisorPid: 42 };
-				},
-				platform: "darwin",
-				arch: "arm64",
-			},
-		});
-		// Adapters the host never installed stay uninstalled; the core pair is refreshed.
-		expect(result.installed).toEqual(["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
-		expect(result.restartQueued).toBe("r-1");
-		expect(result.upToDate).toBe(false);
-		expect(calls.downloads).toEqual([DARWIN_ASSET]);
-		expect(calls.restarts).toEqual([home]);
-		expect(await leaseHeld(home, "update")).toBe(false);
-		for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]) {
-			const body = await readFile(join(dir, name), "utf8");
-			expect(body.startsWith(`staged-${name}\n`)).toBe(true);
-			expect((await stat(join(dir, name))).mode & 0o777).toBe(0o755);
+			});
+			// Adapters the host never installed stay uninstalled; the core pair is refreshed.
+			expect(result.installed).toEqual(["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
+			expect(result.restartQueued).toBe("r-1");
+			expect(result.upToDate).toBe(false);
+			expect(calls.downloads).toEqual([DARWIN_ASSET]);
+			expect(calls.restarts).toEqual([home]);
+			expect(await leaseHeld(home, "update")).toBe(false);
+			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]) {
+				const body = await readFile(join(dir, name), "utf8");
+				expect(body.startsWith(`staged-${name}\n`)).toBe(true);
+				expect((await stat(join(dir, name))).mode & 0o777).toBe(0o755);
+			}
+			expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
+			expect(await readlink(homeLayout(home).gjcCurrent)).toBe(PINNED_GJC);
+			const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
+			expect(backups).toHaveLength(1);
+			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
+				expect(await readFile(join(dir, backups[0], name), "utf8")).toBe(`old-${name}`);
+			for (const entry of await readdir(dir)) expect(entry.startsWith(".update-")).toBe(false);
+			expect(await readdir(dir)).not.toContain("gajaeway-admin");
+			const lines = renderUpdate(result);
+			expect(lines[0]).toBe("updated 0.1.1 → 0.2.0 from Yeachan-Heo/gajae-way (v0.2.0)");
+			expect(lines[1]).toBe("installed: gajaeway, gajaeway-gateway, gajaeway-slack");
+			expect(lines[2]).toBe(`backup: ${join(dir, backups[0])}`);
+			expect(lines[3]).toBe("restart: queued r-1 — check with: gajaeway ops restart-stack --status");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
 		}
-		expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
-		expect(await readlink(homeLayout(home).gjcCurrent)).toBe(PINNED_GJC);
-		const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
-		expect(backups).toHaveLength(1);
-		for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
-			expect(await readFile(join(dir, backups[0], name), "utf8")).toBe(`old-${name}`);
-		for (const entry of await readdir(dir)) expect(entry.startsWith(".update-")).toBe(false);
-		expect(await readdir(dir)).not.toContain("gajaeway-admin");
-		const lines = renderUpdate(result);
-		expect(lines[0]).toBe("updated 0.1.1 → 0.2.0 from Yeachan-Heo/gajae-way (v0.2.0)");
-		expect(lines[1]).toBe("installed: gajaeway, gajaeway-gateway, gajaeway-slack");
-		expect(lines[2]).toBe(`backup: ${join(dir, backups[0])}`);
-		expect(lines[3]).toBe("restart: queued r-1 — check with: gajaeway ops restart-stack --status");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-		await rm(home, { recursive: true, force: true });
-	}
-});
+	});
 
 	test("--no-restart replaces binaries without touching the service manager", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
@@ -333,7 +332,10 @@ test("an install replaces installed binaries, backs them up, marks the release, 
 				deps: {
 					fetchLatestRelease: async () => release("v0.2.0", [releaseAssetName("linux", "arm64")]),
 					downloadAsset: noBytes,
-					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })), "0.19.2"),
+					extractTarball: extractorFor(
+						CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })),
+						"0.19.2",
+					),
 					gjcInstallRunner,
 					serviceOptions: serviceOptions(home, async (path: string, contents: string) => {
 						unitFiles.set(path, contents);
@@ -389,7 +391,9 @@ test("an install replaces installed binaries, backs them up, marks the release, 
 			};
 			const notProvisioned = await runUpdate(options);
 			expect(notProvisioned.brokerNotEnabled).toBe(true);
-			expect(renderUpdate(notProvisioned)).toContain("broker unit installed, not enabled: run gajaeway setup --broker-agent");
+			expect(renderUpdate(notProvisioned)).toContain(
+				"broker unit installed, not enabled: run gajaeway setup --broker-agent",
+			);
 			expect(serviceCommands[0]).toEqual(["systemctl", "--user", "daemon-reload"]);
 			expect(serviceCommands[1]).toEqual([
 				"systemctl",

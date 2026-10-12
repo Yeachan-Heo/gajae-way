@@ -90,13 +90,15 @@ async function startBotTurn(claimTerminal: boolean) {
 	const guard = new BotAudienceTurnGuard(database.core);
 	const messageId = "bot-trigger";
 	expect(
-		database!.transaction((tx) => database!.inbox.enqueue(tx, {
-			messageId,
-			originKey: ORIGIN,
-			originRefJson: JSON.stringify(ORIGIN_REF),
-			body: "scheduled bot request",
-			engagementJson: JSON.stringify({ mentioned: true, group: true, authorId: "bot", authorIsBot: true }),
-		})),
+		database!.transaction((tx) =>
+			database!.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN,
+				originRefJson: JSON.stringify(ORIGIN_REF),
+				body: "scheduled bot request",
+				engagementJson: JSON.stringify({ mentioned: true, group: true, authorId: "bot", authorIsBot: true }),
+			}),
+		),
 	).toBe(true);
 	guard.recordBotAdmission(ORIGIN, messageId);
 	manager = new PersonaSessionManager({
@@ -107,7 +109,8 @@ async function startBotTurn(claimTerminal: boolean) {
 		onTurnStart: ({ turn }) => ({
 			text: "bot turn",
 			onTerminal: () => {
-				if (claimTerminal) database?.transaction((tx) => database?.inbox.claimTerminal(tx, turn.opRef, 0, "answer-delivery"));
+				if (claimTerminal)
+					database?.transaction((tx) => database?.inbox.claimTerminal(tx, turn.opRef, 0, "answer-delivery"));
 			},
 			onFailure: () => {},
 			onSettled: ({ terminalDeliveryId }) => {

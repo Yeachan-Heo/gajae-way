@@ -302,13 +302,15 @@ test("admissionHold is broker_wedged after BIND_WEDGE_PROBE_STRIKES and clears a
 		},
 		log: () => {},
 	});
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "m-broker-wedge",
-		originKey: ORIGIN,
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
-		body: "hello",
-		receivedAt: new Date(NOW).toISOString(),
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "m-broker-wedge",
+			originKey: ORIGIN,
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
+			body: "hello",
+			receivedAt: new Date(NOW).toISOString(),
+		}),
+	);
 	try {
 		await manager.notifyInbound(ORIGIN);
 		await eventually(() => port.bindAttempts === 1, "first bind did not run");
@@ -356,13 +358,15 @@ test("admissionHold reflects an emitted non-wedged bind hold reason", async () =
 		},
 		log: () => {},
 	});
-	database.transaction((tx) => database.inbox.enqueue(tx, {
-		messageId: "m-sdk-hold",
-		originKey: ORIGIN,
-		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
-		body: "hello",
-		receivedAt: new Date(NOW).toISOString(),
-	}));
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "m-sdk-hold",
+			originKey: ORIGIN,
+			originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "broker-wedge" }),
+			body: "hello",
+			receivedAt: new Date(NOW).toISOString(),
+		}),
+	);
 	try {
 		await manager.notifyInbound(ORIGIN);
 		await eventually(() => port.bindAttempts === 1, "first bind did not run");

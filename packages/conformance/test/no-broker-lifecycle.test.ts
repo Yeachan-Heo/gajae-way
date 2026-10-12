@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
@@ -55,7 +55,9 @@ describe("single broker lifecycle authority (AC6)", () => {
 	});
 
 	test("foreground broker commands are owned by broker-host only", () => {
-		const locations = hits(files, /broker-internal|\bbroker run\b|"broker",\s*"run"/).map((hit) => hit.split(":", 1)[0]);
+		const locations = hits(files, /broker-internal|\bbroker run\b|"broker",\s*"run"/).map(
+			(hit) => hit.split(":", 1)[0],
+		);
 		expect(locations.length).toBeGreaterThan(0);
 		expect(locations.every((path) => path === BROKER_HOST)).toBe(true);
 	});

@@ -6,8 +6,9 @@ import {
 	type ReactionRef,
 } from "@gajae-gateway/protocol";
 import type { ExpiredDeliveryRow, LedgerOutcome } from "../store/groups/outbox";
-import type { WriteTx } from "../store/tx";
 import type { Store } from "../store/store";
+import type { WriteTx } from "../store/tx";
+
 export { ACK_TIMEOUT_MS, classifyDeliveryError } from "../store/groups/outbox";
 
 const DELIVERY_FRESHNESS_MS = 24 * 60 * 60 * 1_000;
@@ -64,12 +65,17 @@ export class DeliveryService {
 	): ChatMessagePayload | undefined {
 		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId, final);
 		if (!payload) return undefined;
-		if (!this.#store.transaction((tx) => this.#store.outbox.create(tx, {
-			deliveryId,
-			turnId,
-			originKey: originKey(origin),
-			payloadJson: JSON.stringify(payload),
-		}))) return undefined;
+		if (
+			!this.#store.transaction((tx) =>
+				this.#store.outbox.create(tx, {
+					deliveryId,
+					turnId,
+					originKey: originKey(origin),
+					payloadJson: JSON.stringify(payload),
+				}),
+			)
+		)
+			return undefined;
 		return payload;
 	}
 
@@ -99,12 +105,15 @@ export class DeliveryService {
 	createPending(row: { deliveryId: string; turnId: string; originKey: string; payloadJson: string }): boolean {
 		return this.#store.transaction((tx) => this.#store.outbox.create(tx, row));
 	}
-	createPendingInTransaction(tx: WriteTx, row: {
-		deliveryId: string;
-		turnId: string;
-		originKey: string;
-		payloadJson: string;
-	}): boolean {
+	createPendingInTransaction(
+		tx: WriteTx,
+		row: {
+			deliveryId: string;
+			turnId: string;
+			originKey: string;
+			payloadJson: string;
+		},
+	): boolean {
 		return this.#store.outbox.enqueue(tx, row);
 	}
 
@@ -165,7 +174,9 @@ export class DeliveryService {
 			requeued,
 			payloads: requeued.flatMap((id) => {
 				const row = rows.get(id);
-				return row ? [{ ...(JSON.parse(row.payloadJson) as ChatMessagePayload), redelivered: true, duplicateWarning: true }] : [];
+				return row
+					? [{ ...(JSON.parse(row.payloadJson) as ChatMessagePayload), redelivered: true, duplicateWarning: true }]
+					: [];
 			}),
 		};
 	}

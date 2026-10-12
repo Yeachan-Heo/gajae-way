@@ -87,7 +87,10 @@ describe("runtime cycle projection", () => {
 		);
 	});
 	test("broker-agent drift is reported without gating, while missing authority blocks the cycle", () => {
-		const agent = (status: "provisioned" | "unprovisioned" | "interrupted", state: "source_changed" | "missing_copy") => ({
+		const agent = (
+			status: "provisioned" | "unprovisioned" | "interrupted",
+			state: "source_changed" | "missing_copy",
+		) => ({
 			status,
 			provisionedAt: status === "provisioned" ? "2026-09-01T00:00:00.000Z" : null,
 			genId: status === "provisioned" ? "generation-1" : null,
@@ -102,9 +105,9 @@ describe("runtime cycle projection", () => {
 				"broker_agent_unprovisioned",
 			);
 		}
-		expect(projectRuntimeCycle(sources({ brokerAgent: agent("provisioned", "missing_copy") }), generatedAt).gates).toContain(
-			"broker_agent_unprovisioned",
-		);
+		expect(
+			projectRuntimeCycle(sources({ brokerAgent: agent("provisioned", "missing_copy") }), generatedAt).gates,
+		).toContain("broker_agent_unprovisioned");
 	});
 
 	// Issue #15: the GJC agent directory grew to 70+ GB with no reaper; the

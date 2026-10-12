@@ -59,7 +59,8 @@ class PersistentPort extends ScriptedSessionPort {
 		readonly authority: BrokerAuthority,
 	) {
 		super({
-			sessionIdForBind: (input) => database.bindings.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID(),
+			sessionIdForBind: (input) =>
+				database.bindings.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID(),
 		});
 	}
 	private record(method: string, input: object) {
@@ -85,7 +86,11 @@ class PersistentPort extends ScriptedSessionPort {
 	override async bind(input: SessionBindInput) {
 		this.record("bind", input);
 		const binding = await super.bind(input);
-		if (!this.database.transaction((tx) => this.database.bindings.recordOwnedBinding(tx, { ...binding, authority: this.authority })))
+		if (
+			!this.database.transaction((tx) =>
+				this.database.bindings.recordOwnedBinding(tx, { ...binding, authority: this.authority }),
+			)
+		)
 			throw new Error("fixture session bind lost its epoch");
 		writeFileSync(join(this.home, `${binding.sessionId}.session.json`), JSON.stringify(binding));
 		return binding;
@@ -190,7 +195,9 @@ async function serve(home: string, barrier?: Barrier) {
 	const database = await Store.open(join(home, "gateway.db"));
 	const agentDir = resolve(join(home, "agent"));
 	const authority = { canonicalAgentDir: agentDir, identity: `gjc:${agentDir}` };
-	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated));
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	let acceptanceBarrierPending = false;
 	let settlementCommitPending = false;
 	let settling = false;
@@ -421,7 +428,8 @@ export class WorkFixture {
 				repo: join(this.home, "workspace"),
 				authority,
 			};
-			if (!database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding))) throw new Error("persona fixture binding lost its epoch");
+			if (!database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding)))
+				throw new Error("persona fixture binding lost its epoch");
 			writeFileSync(join(this.home, `${sessionId}.session.json`), JSON.stringify(binding));
 		} finally {
 			database.close();

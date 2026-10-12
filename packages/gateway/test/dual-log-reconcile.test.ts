@@ -124,8 +124,8 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 		await pipeline.reconcile();
 		// Insertion order (rowid) preserves the oldest-first replay; the
 		// (created_at, id) index scrambles same-millisecond UUID ties.
-		const intents = database
-			.memory.rowsByRowid()
+		const intents = database.memory
+			.rowsByRowid()
 			.filter((row) => row.kind === "monitor-event")
 			.map((row) => (JSON.parse(row.payload_json) as { replyText: string }).replyText);
 		expect(intents).toEqual(["authored-0", "authored-1"]);

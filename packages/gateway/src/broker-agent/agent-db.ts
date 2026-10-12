@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 
 export class AgentDatabaseError extends Error {
 	readonly code = "agent_database_invalid";
@@ -26,14 +26,17 @@ export function assertAgentDb(path: string): void {
 	const database = new Database(path, { readonly: true });
 	try {
 		const integrity = database.query("PRAGMA integrity_check").get() as Record<string, unknown> | null;
-		if (!integrity || Object.values(integrity)[0] !== "ok") throw new AgentDatabaseError("agent.db failed integrity_check");
+		if (!integrity || Object.values(integrity)[0] !== "ok")
+			throw new AgentDatabaseError("agent.db failed integrity_check");
 		const credentials = database
 			.query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'")
 			.get() as Record<string, unknown> | null;
 		if (!credentials) throw new AgentDatabaseError("agent.db is missing auth_credentials");
 	} catch (error) {
 		if (error instanceof AgentDatabaseError) throw error;
-		throw new AgentDatabaseError(`agent.db could not be validated: ${error instanceof Error ? error.message : String(error)}`);
+		throw new AgentDatabaseError(
+			`agent.db could not be validated: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	} finally {
 		database.close();
 	}
@@ -56,7 +59,9 @@ export function credentialFingerprint(path: string): string {
 		return createHash("sha256").update(canonical).digest("hex");
 	} catch (error) {
 		if (error instanceof AgentDatabaseError) throw error;
-		throw new AgentDatabaseError(`auth_credentials could not be fingerprinted: ${error instanceof Error ? error.message : String(error)}`);
+		throw new AgentDatabaseError(
+			`auth_credentials could not be fingerprinted: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	} finally {
 		database.close();
 	}

@@ -1,4 +1,10 @@
-import { assertOpenWorkExported, type GroupDb, type OpenWorkExported, type WriteTx, runGroupWrite } from "../../src/store";
+import {
+	assertOpenWorkExported,
+	type GroupDb,
+	type OpenWorkExported,
+	runGroupWrite,
+	type WriteTx,
+} from "../../src/store";
 
 function settle(tx: WriteTx, exported: OpenWorkExported): void {
 	assertOpenWorkExported(tx, exported);

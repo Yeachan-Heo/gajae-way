@@ -61,8 +61,8 @@ if (!stress) {
 				await Bun.sleep(100);
 			await memory.drain();
 			const monitorEvents = database.monitors.eventRows().length;
-			const receipted = database
-				.memory.rows()
+			const receipted = database.memory
+				.rows()
 				.filter((intent) => intent.kind === "monitor-event" && intent.state === "receipted").length;
 			const elapsedMs = Math.round(performance.now() - started);
 			console.log(JSON.stringify({ stress: "burst", monitorEvents, receipted, turns, elapsedMs }));

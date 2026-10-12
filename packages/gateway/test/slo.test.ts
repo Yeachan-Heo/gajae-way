@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/store";
 import {
 	classifySloEvents,
 	eligibleSpans,
@@ -11,6 +10,7 @@ import {
 	SloRecorder,
 	type SloWindowRecord,
 } from "../src/ops/slo";
+import { Store } from "../src/store";
 
 const stores: Store[] = [];
 const directories: string[] = [];
@@ -83,9 +83,15 @@ describe("durable SLO evidence", () => {
 	test("coverage accepts an 89-minute gap, rejects a 91-minute gap, and measures the final tail", async () => {
 		const { store } = await fixture();
 		const gapStart = OCT_9 + 10 * 60 * 60_000;
-		for (const [gapMinutes, complete] of [[89, true], [91, false]] as const) {
+		for (const [gapMinutes, complete] of [
+			[89, true],
+			[91, false],
+		] as const) {
 			const gap = gapMinutes * 60_000;
-			setAlive(store, "2026-10-09", [[OCT_9, gapStart], [gapStart + gap, OCT_9 + DAY_MS]]);
+			setAlive(store, "2026-10-09", [
+				[OCT_9, gapStart],
+				[gapStart + gap, OCT_9 + DAY_MS],
+			]);
 			const day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 			expect(day.complete).toBe(complete);
 			expect(day.maxUncoveredGapMs).toBe(gap);
@@ -153,8 +159,14 @@ describe("durable SLO evidence", () => {
 		const { home, store } = await fixture();
 		const logs: string[] = [];
 		const at = Date.parse("2026-10-09T12:00:00.000Z");
-		new SloRecorder(store.core, { home, bootId: "gateway-a", log: (line) => logs.push(line) }).note("broker_unavailable", at);
-		new SloRecorder(store.core, { home, bootId: "gateway-b", log: (line) => logs.push(line) }).note("broker_unavailable", at);
+		new SloRecorder(store.core, { home, bootId: "gateway-a", log: (line) => logs.push(line) }).note(
+			"broker_unavailable",
+			at,
+		);
+		new SloRecorder(store.core, { home, bootId: "gateway-b", log: (line) => logs.push(line) }).note(
+			"broker_unavailable",
+			at,
+		);
 		expect(JSON.parse(store.core.metaGet("slo:2026-10-09:broker_unavailable:ts")!)).toEqual([
 			[at, "gateway-a", 1],
 			[at, "gateway-b", 1],
@@ -188,11 +200,14 @@ describe("durable SLO evidence", () => {
 			stepResults: ["ok"],
 		});
 
-		await writeReceipt(home, receipt({
-			id: "receipt-a",
-			requestedAt: "2026-10-09T10:00:00.000Z",
-			finishedAt: "2026-10-09T10:31:00.000Z",
-		}));
+		await writeReceipt(
+			home,
+			receipt({
+				id: "receipt-a",
+				requestedAt: "2026-10-09T10:00:00.000Z",
+				finishedAt: "2026-10-09T10:31:00.000Z",
+			}),
+		);
 		expect(await recorder.refreshWindow()).toBe(true);
 		expect(JSON.parse(store.core.metaGet("slo:window:receipt-a")!).state).toBe("ok");
 		await writeFile(join(home, "restart-stack.json"), "not json");
@@ -206,11 +221,14 @@ describe("durable SLO evidence", () => {
 			const recorder = new SloRecorder(store.core, { home, bootId: `boot-${durationMinutes}`, log: () => {} });
 			const requestedAt = Date.parse("2026-10-09T10:00:00.000Z");
 			const finishedAt = requestedAt + durationMinutes * 60_000;
-			await writeReceipt(home, receipt({
-				id: `update-${durationMinutes}`,
-				requestedAt: new Date(requestedAt).toISOString(),
-				finishedAt: new Date(finishedAt).toISOString(),
-			}));
+			await writeReceipt(
+				home,
+				receipt({
+					id: `update-${durationMinutes}`,
+					requestedAt: new Date(requestedAt).toISOString(),
+					finishedAt: new Date(finishedAt).toISOString(),
+				}),
+			);
 			await recorder.refreshWindow();
 			for (const offset of [28 * 60_000 + 59_000, 29 * 60_000, 30 * 60_000, 30 * 60_000 + 1_000])
 				recorder.note("broker_unavailable", requestedAt + offset);
@@ -232,15 +250,21 @@ describe("durable SLO evidence", () => {
 		const recorder = new SloRecorder(store.core, { home, bootId: "long-update", log: () => {} });
 		const requestedAt = Date.parse("2026-10-09T10:00:00.000Z");
 		const finishedAt = requestedAt + 2 * 60 * 60_000;
-		await writeReceipt(home, receipt({
-			id: "update-two-hours",
-			requestedAt: new Date(requestedAt).toISOString(),
-			finishedAt: new Date(finishedAt).toISOString(),
-		}));
+		await writeReceipt(
+			home,
+			receipt({
+				id: "update-two-hours",
+				requestedAt: new Date(requestedAt).toISOString(),
+				finishedAt: new Date(finishedAt).toISOString(),
+			}),
+		);
 		await recorder.refreshWindow();
 		for (const offset of [0, 30 * 60_000, 30 * 60_000 + 1_000, 2 * 60 * 60_000])
 			recorder.note("persona_bind_failed", requestedAt + offset);
-		setAlive(store, "2026-10-09", [[OCT_9, requestedAt], [finishedAt, OCT_9 + DAY_MS]]);
+		setAlive(store, "2026-10-09", [
+			[OCT_9, requestedAt],
+			[finishedAt, OCT_9 + DAY_MS],
+		]);
 
 		const day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 		expect(day.persona_bind_failed).toBe(2);
@@ -262,11 +286,14 @@ describe("durable SLO evidence", () => {
 		for (let index = 0; index < fixtures.length; index++) {
 			const item = fixtures[index]!;
 			const requestedAt = Date.parse(`2026-10-09T${String(2 + index * 5).padStart(2, "0")}:00:00.000Z`);
-			await writeReceipt(home, receipt({
-				...item,
-				requestedAt: new Date(requestedAt).toISOString(),
-				finishedAt: new Date(requestedAt + 20 * 60_000).toISOString(),
-			}));
+			await writeReceipt(
+				home,
+				receipt({
+					...item,
+					requestedAt: new Date(requestedAt).toISOString(),
+					finishedAt: new Date(requestedAt + 20 * 60_000).toISOString(),
+				}),
+			);
 			await recorder.refreshWindow();
 			recorder.note("broker_unavailable", requestedAt + 5 * 60_000);
 		}
@@ -283,11 +310,14 @@ describe("durable SLO evidence", () => {
 		expect(evaluateSlo(store.core, 1, OCT_10_NOON).windows).toEqual([]);
 
 		const requestedAt = Date.parse("2026-10-09T23:50:00.000Z");
-		await writeReceipt(home, receipt({
-			id: "still-running",
-			requestedAt: new Date(requestedAt).toISOString(),
-			state: "running",
-		}));
+		await writeReceipt(
+			home,
+			receipt({
+				id: "still-running",
+				requestedAt: new Date(requestedAt).toISOString(),
+				state: "running",
+			}),
+		);
 		await recorder.refreshWindow();
 		recorder.note("broker_unavailable", requestedAt + 5 * 60_000);
 		const pending = evaluateSlo(store.core, 7, new Date("2026-10-10T00:05:00.000Z"));
@@ -306,18 +336,24 @@ describe("durable SLO evidence", () => {
 	test("overwritten unfinished receipts remain running and cannot certify a day", async () => {
 		const { home, store } = await fixture();
 		const recorder = new SloRecorder(store.core, { home, log: () => {} });
-		await writeReceipt(home, receipt({
-			id: "old-running",
-			requestedAt: "2026-10-09T23:50:00.000Z",
-			state: "running",
-		}));
+		await writeReceipt(
+			home,
+			receipt({
+				id: "old-running",
+				requestedAt: "2026-10-09T23:50:00.000Z",
+				state: "running",
+			}),
+		);
 		await recorder.refreshWindow();
-		await writeReceipt(home, receipt({
-			id: "later-manual",
-			requestedAt: "2026-10-10T00:01:00.000Z",
-			finishedAt: "2026-10-10T00:02:00.000Z",
-			trigger: "manual",
-		}));
+		await writeReceipt(
+			home,
+			receipt({
+				id: "later-manual",
+				requestedAt: "2026-10-10T00:01:00.000Z",
+				finishedAt: "2026-10-10T00:02:00.000Z",
+				trigger: "manual",
+			}),
+		);
 		await recorder.refreshWindow();
 		const result = evaluateSlo(store.core, 1, new Date("2026-10-10T00:05:00.000Z"));
 		expect(result.windows.find((window) => window.id === "old-running")?.state).toBe("running");
@@ -370,18 +406,23 @@ describe("durable SLO evidence", () => {
 				store.core.metaSet("slo:2026-10-09:alive", JSON.stringify(intervals));
 				store.core.metaSet(
 					"slo:2026-10-09:broker_unavailable:ts",
-					JSON.stringify(events.filter((_, index) => index % 2 === 0).map((event) => [event.atMs, event.bootId, event.seq])),
+					JSON.stringify(
+						events.filter((_, index) => index % 2 === 0).map((event) => [event.atMs, event.bootId, event.seq]),
+					),
 				);
 				store.core.metaSet(
 					"slo:2026-10-09:persona_bind_failed:ts",
-					JSON.stringify(events.filter((_, index) => index % 2 === 1).map((event) => [event.atMs, event.bootId, event.seq])),
+					JSON.stringify(
+						events.filter((_, index) => index % 2 === 1).map((event) => [event.atMs, event.bootId, event.seq]),
+					),
 				);
 			});
 			const evaluated = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 			const inDate = events.filter((event) => event.atMs >= OCT_9 && event.atMs < OCT_9 + DAY_MS);
 			const expectedCounted = classifySloEvents(inDate, windows).counted.length;
 			expect(evaluated.broker_unavailable + evaluated.persona_bind_failed).toBe(expectedCounted);
-			const expectedComplete = gapEnd - gapStart <= 90 * 60_000 || spans.some((span) => gapStart >= span.startMs && gapEnd <= span.endMs);
+			const expectedComplete =
+				gapEnd - gapStart <= 90 * 60_000 || spans.some((span) => gapStart >= span.startMs && gapEnd <= span.endMs);
 			expect(evaluated.complete).toBe(expectedComplete);
 		}
 	});
@@ -392,6 +433,9 @@ describe("durable SLO evidence", () => {
 		new SloRecorder(store.core, { home, bootId: "process-one", log: () => {} }).note("broker_unavailable", at);
 		new SloRecorder(store.core, { home, bootId: "process-two", log: () => {} }).note("broker_unavailable", at);
 		const events = JSON.parse(store.core.metaGet("slo:2026-10-09:broker_unavailable:ts")!) as unknown[][];
-		expect(events.map((event) => event.slice(1))).toEqual([["process-one", 1], ["process-two", 1]]);
+		expect(events.map((event) => event.slice(1))).toEqual([
+			["process-one", 1],
+			["process-two", 1],
+		]);
 	});
 });

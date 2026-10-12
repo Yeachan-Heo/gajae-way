@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StoreCore, runGroupWrite } from "../src/store/core";
-import { StoreTransactionError, assertOpenWorkExported, mintOpenWorkExported, type WriteTx } from "../src/store/tx";
+import { runGroupWrite, StoreCore } from "../src/store/core";
+import { assertOpenWorkExported, mintOpenWorkExported, StoreTransactionError, type WriteTx } from "../src/store/tx";
 
 async function withCore(operation: (core: StoreCore) => void | Promise<void>): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-store-transaction-"));
@@ -42,9 +42,11 @@ test("rejects nested transactions and async callbacks before starting a transact
 			);
 		});
 		expect(
-			(core.groupDb("bindings").query("SELECT origin_key FROM sessions WHERE origin_key = 'async-check'").get() as
-				| { origin_key: string }
-				| null)?.origin_key,
+			(
+				core.groupDb("bindings").query("SELECT origin_key FROM sessions WHERE origin_key = 'async-check'").get() as {
+					origin_key: string;
+				} | null
+			)?.origin_key,
 		).toBe("async-check");
 	});
 });
@@ -64,9 +66,9 @@ test("rolls back a sync callback that returns a thenable", async () => {
 			"async_callback",
 		);
 		expect(
-			(core.groupDb("bindings").query("SELECT origin_key FROM sessions WHERE origin_key = 'thenable'").get() as
-				| { origin_key: string }
-				| null) ?? null,
+			(core.groupDb("bindings").query("SELECT origin_key FROM sessions WHERE origin_key = 'thenable'").get() as {
+				origin_key: string;
+			} | null) ?? null,
 		).toBeNull();
 	});
 });
@@ -84,8 +86,6 @@ test("rejects escaped and foreign transaction capabilities", async () => {
 		}),
 	);
 });
-
-
 
 test("OpenWorkExported is tied to the transaction that minted it", async () => {
 	await withCore((core) => {

@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { Store } from "../src/store";
 import { DeliveryService } from "../src/delivery/delivery";
+import { Store } from "../src/store";
 import { type Barrier, eventually, noticeOrigin, WorkFixture } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];

@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
+import { DeliveryService } from "../src/delivery/delivery";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { DeliveryService } from "../src/delivery/delivery";
 import { sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
@@ -64,25 +64,31 @@ test("projector reads durable rows through the database and stays fail-closed", 
 		expect(missing.gates).toContain("agent_disk_headroom");
 
 		// A durable pending inbound message projects dispatching and attaches to its origin.
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "m1",
-			originKey: key,
-			originRefJson: JSON.stringify(discordDm),
-			body: "hello",
-		}));
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "m1",
+				originKey: key,
+				originRefJson: JSON.stringify(discordDm),
+				body: "hello",
+			}),
+		);
 		const dispatching = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(dispatching.phase).toBe("dispatching");
 		expect(dispatching.sessions[0].pendingInbound).toBe(1);
 
 		// Binding it as a turn keeps it dispatching; terminal completion returns to idle.
-		database.transaction((tx) => database.inbox.bindTurn(tx, { messageId: "m1", originKey: key, epoch: 0, opRef: "gw-p-m1", sessionId: "s1" }));
+		database.transaction((tx) =>
+			database.inbox.bindTurn(tx, { messageId: "m1", originKey: key, epoch: 0, opRef: "gw-p-m1", sessionId: "s1" }),
+		);
 		const boundCycle = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(boundCycle.phase).toBe("dispatching");
 		expect(database.transaction((tx) => database.inbox.turnComplete(tx, "gw-p-m1"))).toBe(1);
 		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project().phase).toBe("idle");
 
 		// A quarantined memory intent is a gate, not silence.
-		database.transaction((tx) => database.memory.createIntent(tx, { id: "mi1", kind: "daily_capture", payloadJson: "{}" }));
+		database.transaction((tx) =>
+			database.memory.createIntent(tx, { id: "mi1", kind: "daily_capture", payloadJson: "{}" }),
+		);
 		database.transaction((tx) => database.memory.quarantine(tx, "mi1", "Error: test quarantine"));
 		const gated = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(gated.gates).toContain("memory_closure_blocked");
@@ -118,23 +124,29 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 		database.transaction((tx) => database.bindings.bind(tx, key, "sess-bound-000000000"));
 		const old = new Date(Date.now() - 20 * 60_000).toISOString();
 		// An accepted trigger that has been running for 20 minutes is a long turn, not starvation.
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "long",
-			originKey: key,
-			originRefJson: JSON.stringify(discordDm),
-			body: "x",
-			receivedAt: old,
-		}));
-		database.transaction((tx) => database.inbox.bindTurn(tx, { messageId: "long", originKey: key, epoch: 0, opRef: "gw-p-long", sessionId: "s1" }));
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "long",
+				originKey: key,
+				originRefJson: JSON.stringify(discordDm),
+				body: "x",
+				receivedAt: old,
+			}),
+		);
+		database.transaction((tx) =>
+			database.inbox.bindTurn(tx, { messageId: "long", originKey: key, epoch: 0, opRef: "gw-p-long", sessionId: "s1" }),
+		);
 		database.transaction((tx) => database.inbox.turnAccept(tx, "gw-p-long"));
 		// A message queued behind it for 20 minutes is waiting on that turn, not stuck.
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "queued",
-			originKey: key,
-			originRefJson: JSON.stringify(discordDm),
-			body: "y",
-			receivedAt: old,
-		}));
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "queued",
+				originKey: key,
+				originRefJson: JSON.stringify(discordDm),
+				body: "y",
+				receivedAt: old,
+			}),
+		);
 		const busy = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(busy.gates).toEqual([]);
 		expect(busy.phase).toBe("dispatching");
@@ -143,13 +155,15 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 		const other = { ...discordDm, conversationId: "c2", peerId: "p2" };
 		const otherKey = "discord/dm/c2/peer=p2";
 		database.transaction((tx) => database.bindings.bind(tx, otherKey, "sess-other-000000000"));
-		database.transaction((tx) => database.inbox.enqueue(tx, {
-			messageId: "stuck",
-			originKey: otherKey,
-			originRefJson: JSON.stringify(other),
-			body: "z",
-			receivedAt: old,
-		}));
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "stuck",
+				originKey: otherKey,
+				originRefJson: JSON.stringify(other),
+				body: "z",
+				receivedAt: old,
+			}),
+		);
 		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(starved.gates).toEqual(["inbound_starved"]);
 	} finally {
@@ -228,7 +242,11 @@ test("issue #189: consecutive failed_no_retry monitor events degrade the project
 		database.transaction((tx) => database.monitors.eventUpdate(tx, "ok-0", "delivered"));
 		for (const id of ["lost-1", "lost-2"]) {
 			fire(id);
-			expect(database.transaction((tx) => database.monitors.eventTerminalFail(tx, id, "internal_error", "authoring turn failed"))).toBe(true);
+			expect(
+				database.transaction((tx) =>
+					database.monitors.eventTerminalFail(tx, id, "internal_error", "authoring turn failed"),
+				),
+			).toBe(true);
 		}
 		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
 		expect(database.monitors.consecutiveTerminalFailures()).toBe(2);
@@ -236,7 +254,9 @@ test("issue #189: consecutive failed_no_retry monitor events degrade the project
 		// the #189 dispatch streak stays below its threshold.
 		expect(projector.project().gates).toEqual(["monitor_authoring_lost"]);
 		fire("lost-3");
-		database.transaction((tx) => database.monitors.eventTerminalFail(tx, "lost-3", "internal_error", "authoring turn failed"));
+		database.transaction((tx) =>
+			database.monitors.eventTerminalFail(tx, "lost-3", "internal_error", "authoring turn failed"),
+		);
 		const outage = projector.project();
 		expect(outage.gates).toEqual(["monitor_authoring_lost", "monitor_dispatch_failing"]);
 		expect(outage.phase).toBe("degraded");

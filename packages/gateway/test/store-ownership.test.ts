@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store, StoreOwnershipError, TABLE_OWNER, type OwnerGroup } from "../src/store";
+import { type OwnerGroup, Store, StoreOwnershipError, TABLE_OWNER } from "../src/store";
 
 const groups: readonly OwnerGroup[] = ["core", "bindings", "outbox", "inbox", "work", "monitors", "memory"];
 
@@ -42,7 +42,7 @@ test("TABLE_OWNER covers every fully migrated table exactly once", async () => {
 test("every owner accepts its writes and every non-owner rejects all classified write forms", async () => {
 	await withStore((store) => {
 		for (const [table, owner] of Object.entries(TABLE_OWNER) as Array<[keyof typeof TABLE_OWNER, OwnerGroup]>) {
-			const quoted = `\"${table}\"`;
+			const quoted = `"${table}"`;
 			const writes = [
 				`INSERT INTO ${table} DEFAULT VALUES`,
 				`INSERT OR IGNORE INTO main.${quoted} DEFAULT VALUES`,
@@ -89,7 +89,11 @@ test("every group fails closed for unclassified SQL", async () => {
 test("one transaction rolls back outbox enqueue and binding touch together", async () => {
 	await withStore((store) => {
 		const originKey = "loopback/loopback/store-ownership-atomicity";
-		const originRefJson = JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "store-ownership-atomicity" });
+		const originRefJson = JSON.stringify({
+			platform: "loopback",
+			kind: "loopback",
+			conversationId: "store-ownership-atomicity",
+		});
 		store.transaction((tx) => {
 			store.bindings.bind(tx, originKey, "session-atomicity");
 			store.bindings.touch(tx, originKey, originRefJson, "2026-10-01T00:00:00.000Z");
@@ -108,7 +112,11 @@ test("one transaction rolls back outbox enqueue and binding touch together", asy
 					originKey,
 					payloadJson: "{}",
 				});
-				store.bindings.touch(tx, originKey, JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "changed" }));
+				store.bindings.touch(
+					tx,
+					originKey,
+					JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "changed" }),
+				);
 				throw new Error("injected transaction failure");
 			}),
 		).toThrow("injected transaction failure");

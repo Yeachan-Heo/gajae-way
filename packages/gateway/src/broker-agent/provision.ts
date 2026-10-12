@@ -1,10 +1,25 @@
 import { randomUUID } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import {
+	chmod,
+	copyFile,
+	lstat,
+	mkdir,
+	mkdtemp,
+	open,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Lease } from "@gajae-gateway/home";
 import { homeLayout } from "@gajae-gateway/home";
 import { defaultPidAlive } from "../orchestrator/broker";
 import { judgeBrokerLiveness } from "../orchestrator/broker-liveness";
+import { assertAgentDb, snapshotAgentDb } from "./agent-db";
 import {
 	BROKER_AGENT_ALLOWLIST,
 	type BrokerAgentAllowlistEntry,
@@ -17,8 +32,7 @@ import {
 	sourceEntryRootSync,
 	sourceEntryStat,
 } from "./allowlist";
-import { assertAgentDb, snapshotAgentDb } from "./agent-db";
-import { brokerAgentDrift, type BrokerAgentEntryState } from "./drift";
+import { type BrokerAgentEntryState, brokerAgentDrift } from "./drift";
 
 export type BrokerAgentErrorCode =
 	| "broker_agent_unprovisioned"
@@ -31,7 +45,7 @@ export type BrokerAgentErrorCode =
 	| "broker_agent_symlink"
 	| "broker_agent_invalid_entry"
 	| "broker_agent_failed_restored"
-	| "broker_lease_required"
+	| "broker_lease_required";
 
 export class BrokerAgentError extends Error {
 	constructor(
@@ -65,7 +79,11 @@ export interface ProvisionBrokerAgentOptions {
 export interface BrokerAgentProvisionResult {
 	readonly status: "ok" | "nothing_to_do";
 	readonly genId?: string;
-	readonly entries: readonly { readonly name: BrokerAgentAllowlistEntry["name"]; readonly kind: string; readonly state: BrokerAgentEntryState }[];
+	readonly entries: readonly {
+		readonly name: BrokerAgentAllowlistEntry["name"];
+		readonly kind: string;
+		readonly state: BrokerAgentEntryState;
+	}[];
 }
 
 interface FileIdentity {
@@ -111,7 +129,8 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 	assertBrokerLease(options.lease);
 	const home = resolve(options.home);
 	const agentDir = resolve(options.agentDir);
-	if (!isAbsolute(options.agentDir)) throw new BrokerAgentError("broker_agent_invalid_target", "agentDir must be absolute");
+	if (!isAbsolute(options.agentDir))
+		throw new BrokerAgentError("broker_agent_invalid_target", "agentDir must be absolute");
 	const source = resolveBrokerAgentSource(options.source);
 	const sourceReal = await realpath(source).catch(() => {
 		throw new BrokerAgentError("agent_source_missing", `source=${source}`);
@@ -150,7 +169,8 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 	const layout = homeLayout(home);
 	await assertNoSymlinkAncestors(agentDir);
 	await assertNoSymlinkAncestors(layout.brokerProvisionDir);
-	if (targetReal !== agentDir) throw new BrokerAgentError("broker_agent_invalid_target", "agentDir resolves through a symlink");
+	if (targetReal !== agentDir)
+		throw new BrokerAgentError("broker_agent_invalid_target", "agentDir resolves through a symlink");
 	if (await pathExists(agentDir)) await assertAgentDirectory(agentDir);
 	else await ensureAgentDirectory(agentDir);
 	await assertAgentDirectory(agentDir);
@@ -172,7 +192,9 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 	const resultEntries: BrokerAgentProvisionResult["entries"] = BROKER_AGENT_ALLOWLIST.map((entry) => ({
 		name: entry.name,
 		kind: entry.kind,
-		state: selectedNames.has(entry.name) ? "in_sync" : drift.entries.find((item) => item.name === entry.name)?.state ?? "absent",
+		state: selectedNames.has(entry.name)
+			? "in_sync"
+			: (drift.entries.find((item) => item.name === entry.name)?.state ?? "absent"),
 	}));
 	if (selected.length === 0) {
 		console.info(`broker_agent_sync copied=0 kept=${resultEntries.length} exit=0`);
@@ -182,7 +204,10 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 	const stagedDir = await mkdtemp(join(layout.brokerProvisionDir, "gen-"));
 	const genId = basename(stagedDir).slice("gen-".length);
 	const prevDir = join(layout.brokerProvisionDir, `prev-${genId}`);
-	const stagedMetadata = new Map<string, { sourceFingerprint: string; copyFingerprint: string; sourceStat: ManifestEntry["sourceStat"] }>();
+	const stagedMetadata = new Map<
+		string,
+		{ sourceFingerprint: string; copyFingerprint: string; sourceStat: ManifestEntry["sourceStat"] }
+	>();
 	let journalPersisted = false;
 	try {
 		for (const entry of selected) {
@@ -204,7 +229,8 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 			const original: Record<string, FileIdentity | null> = {};
 			for (const name of targetComponents(entry)) original[name] = await identityOrNull(join(agentDir, name));
 			const stagedIdentity = await identityOrNull(brokerAgentEntryPath(entry, stagedDir));
-			if (!stagedIdentity) throw new BrokerAgentError("broker_agent_unrecoverable", `staged entry disappeared: ${entry.name}`);
+			if (!stagedIdentity)
+				throw new BrokerAgentError("broker_agent_unrecoverable", `staged entry disappeared: ${entry.name}`);
 			journalEntries[entry.name] = { original, stagedIdentity };
 		}
 		await mkdir(prevDir, { mode: DIRECTORY_MODE });
@@ -258,7 +284,12 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 		await writeJsonAtomic(layout.brokerProvisionDir, layout.brokerProvisionManifest, manifest);
 		await options.fault?.("after_manifest");
 		await finishCommit(layout.brokerProvisionDir, journal);
-		logProvisioned(genId, manifest.by, selected.map((entry) => entry.name), BROKER_AGENT_ALLOWLIST.length - selected.length);
+		logProvisioned(
+			genId,
+			manifest.by,
+			selected.map((entry) => entry.name),
+			BROKER_AGENT_ALLOWLIST.length - selected.length,
+		);
 		return { status: "ok", genId, entries: resultEntries };
 	} catch (error) {
 		if (!journalPersisted) {
@@ -270,18 +301,31 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 			const outcome = await recoverProvision(home, agentDir, options.lease);
 			const manifest = await readManifest(layout.brokerProvisionManifest);
 			if (manifest?.genId === genId || outcome === "finished") {
-				logProvisioned(genId, manifest?.by ?? process.env.USER ?? "gajaeway", selected.map((entry) => entry.name), BROKER_AGENT_ALLOWLIST.length - selected.length);
+				logProvisioned(
+					genId,
+					manifest?.by ?? process.env.USER ?? "gajaeway",
+					selected.map((entry) => entry.name),
+					BROKER_AGENT_ALLOWLIST.length - selected.length,
+				);
 				return { status: "ok", genId, entries: resultEntries };
 			}
 			throw new BrokerAgentError("broker_agent_failed_restored", errorMessage(error));
 		} catch (recoveryError) {
-			if (recoveryError instanceof BrokerAgentError && recoveryError.code === "broker_agent_failed_restored") throw recoveryError;
-			throw new BrokerAgentError("broker_agent_unrecoverable", `cause=${errorMessage(error)} recovery=${errorMessage(recoveryError)}`);
+			if (recoveryError instanceof BrokerAgentError && recoveryError.code === "broker_agent_failed_restored")
+				throw recoveryError;
+			throw new BrokerAgentError(
+				"broker_agent_unrecoverable",
+				`cause=${errorMessage(error)} recovery=${errorMessage(recoveryError)}`,
+			);
 		}
 	}
 }
 
-export async function recoverProvision(home: string, agentDir: string, lease: Lease): Promise<"none" | "rolled_back" | "finished"> {
+export async function recoverProvision(
+	home: string,
+	agentDir: string,
+	lease: Lease,
+): Promise<"none" | "rolled_back" | "finished"> {
 	assertBrokerLease(lease);
 	const layout = homeLayout(resolve(home));
 	const journalPath = join(layout.brokerProvisionDir, "journal.json");
@@ -290,7 +334,7 @@ export async function recoverProvision(home: string, agentDir: string, lease: Le
 	} catch (error) {
 		throw new BrokerAgentError("broker_agent_unrecoverable", `provision path invalid: ${errorMessage(error)}`);
 	}
-	let journalInfo;
+	let journalInfo: Stats;
 	try {
 		journalInfo = await lstat(journalPath);
 	} catch (error) {
@@ -301,7 +345,12 @@ export async function recoverProvision(home: string, agentDir: string, lease: Le
 		}
 		throw new BrokerAgentError("broker_agent_unrecoverable", `journal stat failed: ${errorMessage(error)}`);
 	}
-	if (journalInfo.isSymbolicLink() || !journalInfo.isFile() || journalInfo.nlink !== 1 || (journalInfo.mode & 0o777) !== FILE_MODE)
+	if (
+		journalInfo.isSymbolicLink() ||
+		!journalInfo.isFile() ||
+		journalInfo.nlink !== 1 ||
+		(journalInfo.mode & 0o777) !== FILE_MODE
+	)
 		throw new BrokerAgentError("broker_agent_unrecoverable", "journal must be a regular 0600 file with one link");
 	let raw: string;
 	try {
@@ -346,16 +395,20 @@ function logProvisioned(genId: string, by: string, copied: readonly string[], ke
 }
 
 export async function assertAgentDirectory(agentDir: string): Promise<void> {
-	let info;
+	let info: Stats;
 	try {
 		info = await lstat(agentDir);
 	} catch (error) {
-		throw new BrokerAgentError("broker_agent_invalid_target", `agentDir unavailable: ${(error as NodeJS.ErrnoException).code ?? "unknown"}`);
+		throw new BrokerAgentError(
+			"broker_agent_invalid_target",
+			`agentDir unavailable: ${(error as NodeJS.ErrnoException).code ?? "unknown"}`,
+		);
 	}
 	if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o777) !== DIRECTORY_MODE)
 		throw new BrokerAgentError("broker_agent_invalid_target", "agentDir must be a real directory with mode 0700");
 	const canonical = await realpath(agentDir);
-	if (canonical !== resolve(agentDir)) throw new BrokerAgentError("broker_agent_invalid_target", "agentDir resolves through a symlink");
+	if (canonical !== resolve(agentDir))
+		throw new BrokerAgentError("broker_agent_invalid_target", "agentDir resolves through a symlink");
 }
 
 export function assertBrokerLease(lease: Lease): void {
@@ -451,10 +504,10 @@ function brokerAgentEntryRefusal(error: unknown): BrokerAgentError {
 	if (error instanceof BrokerAgentError) return error;
 	const message = error instanceof Error ? error.message : String(error);
 	if (message.startsWith("broker_agent_symlink")) return new BrokerAgentError("broker_agent_symlink", message);
-	if (message.startsWith("broker_agent_invalid_entry")) return new BrokerAgentError("broker_agent_invalid_entry", message);
+	if (message.startsWith("broker_agent_invalid_entry"))
+		return new BrokerAgentError("broker_agent_invalid_entry", message);
 	throw error;
 }
-
 
 async function ensureProvisionDirectory(home: string): Promise<void> {
 	const layout = homeLayout(home);
@@ -483,7 +536,8 @@ async function stageEntry(entry: BrokerAgentAllowlistEntry, sourcePath: string, 
 			const sourceFile = join(sourcePath, name);
 			try {
 				const info = await lstat(sourceFile);
-				if (info.isSymbolicLink() || !info.isFile()) throw new BrokerAgentError("broker_agent_symlink", `entry=${entry.name}/${name}`);
+				if (info.isSymbolicLink() || !info.isFile())
+					throw new BrokerAgentError("broker_agent_symlink", `entry=${entry.name}/${name}`);
 				await copyFile(sourceFile, join(stagePath, name));
 				await chmod(join(stagePath, name), FILE_MODE);
 				await syncFile(join(stagePath, name));
@@ -497,7 +551,8 @@ async function stageEntry(entry: BrokerAgentAllowlistEntry, sourcePath: string, 
 		return;
 	}
 	const info = await lstat(sourcePath);
-	if (info.isSymbolicLink() || !info.isFile()) throw new BrokerAgentError("broker_agent_symlink", `entry=${entry.name}`);
+	if (info.isSymbolicLink() || !info.isFile())
+		throw new BrokerAgentError("broker_agent_symlink", `entry=${entry.name}`);
 	await copyFile(sourcePath, stagePath);
 	await chmod(stagePath, FILE_MODE);
 	await syncFile(stagePath);
@@ -512,7 +567,8 @@ async function identityOrNull(path: string): Promise<FileIdentity | null> {
 		const info = await lstat(path);
 		if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
 			throw new BrokerAgentError("broker_agent_invalid_entry", `path=${path}`);
-		if (info.isFile() && info.nlink !== 1) throw new BrokerAgentError("broker_agent_invalid_entry", `hard_link=${path}`);
+		if (info.isFile() && info.nlink !== 1)
+			throw new BrokerAgentError("broker_agent_invalid_entry", `hard_link=${path}`);
 		return { dev: info.dev, ino: info.ino, size: info.size };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -532,7 +588,8 @@ async function rollbackJournal(agentDir: string, provisionDir: string, journal: 
 			const targetIdentity = await identityOrNull(targetPath);
 			const oldIdentity = record.original[component] ?? null;
 			const stageIdentity = component === entry.name ? record.stagedIdentity : undefined;
-			if (targetIdentity && sameIdentity(targetIdentity, stageIdentity)) await rm(targetPath, { recursive: true, force: true });
+			if (targetIdentity && sameIdentity(targetIdentity, stageIdentity))
+				await rm(targetPath, { recursive: true, force: true });
 			if (oldIdentity && (await identityOrNull(previousPath))) await rename(previousPath, targetPath);
 		}
 		const stagePath = brokerAgentEntryPath(entry, journal.stagedDir);
@@ -613,7 +670,7 @@ async function writeJsonAtomic(directory: string, destination: string, value: un
 }
 
 async function readManifest(path: string): Promise<BrokerAgentManifest | undefined> {
-	let info;
+	let info: Stats;
 	try {
 		info = await lstat(path);
 	} catch (error) {
@@ -658,7 +715,8 @@ function parseJournal(value: unknown, provisionDir: string): ProvisionJournal {
 		throw new Error("invalid journal fields");
 	const expectedStage = join(provisionDir, `gen-${journal.genId}`);
 	const expectedPrevious = join(provisionDir, `prev-${journal.genId}`);
-	if (journal.stagedDir !== expectedStage || journal.prevDir !== expectedPrevious) throw new Error("journal paths do not match generation");
+	if (journal.stagedDir !== expectedStage || journal.prevDir !== expectedPrevious)
+		throw new Error("journal paths do not match generation");
 	for (const name of journal.selected) {
 		if (typeof name !== "string" || !entryByName(name) || !journal.entries[name])
 			throw new Error(`unknown journal entry=${String(name)}`);
@@ -671,7 +729,15 @@ function entryByName(name: string): BrokerAgentAllowlistEntry | undefined {
 }
 
 function sameIdentity(left: FileIdentity | null | undefined, right: FileIdentity | null | undefined): boolean {
-	return left !== null && left !== undefined && right !== null && right !== undefined && left.dev === right.dev && left.ino === right.ino && left.size === right.size;
+	return (
+		left !== null &&
+		left !== undefined &&
+		right !== null &&
+		right !== undefined &&
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size
+	);
 }
 
 async function syncFile(path: string): Promise<void> {
@@ -698,7 +764,6 @@ async function syncDirectoryIfExists(path: string): Promise<void> {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 }
-
 
 function asBrokerAgentError(error: unknown): BrokerAgentError {
 	if (error instanceof BrokerAgentError) return error;

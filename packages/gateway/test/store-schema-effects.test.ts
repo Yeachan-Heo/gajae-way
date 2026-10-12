@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store, LATEST_SCHEMA_VERSION, TABLE_OWNER } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store, TABLE_OWNER } from "../src/store";
 import { classifySql } from "../src/store/sql-classify";
 
 type SchemaState = { readonly name: string; readonly open: (path: string) => Promise<Store> };

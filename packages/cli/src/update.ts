@@ -11,20 +11,19 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
-import { homeLayout, LeaseHeldError, acquireLease, type Lease } from "@gajae-gateway/home";
-import { installPinnedGjc, type GjcInstallRunner } from "./gjc-install";
-import {
-	installServices,
-	serviceSpecs,
-	systemdUnitName,
-	type InstallServicesOptions,
-	type ServicePlatform,
-} from "./services";
-
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import pkg from "../package.json";
+import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
 import { launchRestartStack } from "./restart-stack";
+import {
+	type InstallServicesOptions,
+	installServices,
+	type ServicePlatform,
+	serviceSpecs,
+	systemdUnitName,
+} from "./services";
 
 /**
  * `gajaeway update`: self-update a binary install from the project's GitHub
@@ -137,7 +136,6 @@ const MAX_ASSET_BYTES = 512 * 1024 * 1024;
 
 const RELEASE_MARKER = ".gajaeway-release";
 
-
 export function releaseMarkerPath(binDir: string): string {
 	return join(binDir, RELEASE_MARKER);
 }
@@ -247,7 +245,9 @@ async function readPinnedGjcVersion(path: string): Promise<string> {
 	try {
 		parsed = JSON.parse(await readFile(path, "utf8"));
 	} catch (error) {
-		throw new Error(`could not read pinned gjc version from ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(
+			`could not read pinned gjc version from ${path}: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
 		throw new Error(`invalid release package metadata at ${path}`);
@@ -356,7 +356,8 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			const installedNames = await knownBinariesIn(binDir);
 			const toInstall = binariesToInstall(staged.names, installedNames);
 			const missingCore = CORE_BINARIES.filter((name) => !toInstall.includes(name));
-			if (missingCore.length > 0) throw new Error(`release tarball is missing core binaries: ${missingCore.join(", ")}`);
+			if (missingCore.length > 0)
+				throw new Error(`release tarball is missing core binaries: ${missingCore.join(", ")}`);
 			await assertStagedBinariesUsable(staged, toInstall);
 
 			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, "package.json"));

@@ -2,14 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	acquireLease,
-	homeLayout,
-	LeaseError,
-	LeaseHeldError,
-	leaseHeld,
-	readLeaseOwner,
-} from "../src/index";
+import { acquireLease, homeLayout, LeaseError, LeaseHeldError, leaseHeld, readLeaseOwner } from "../src/index";
 
 let home: string;
 beforeEach(async () => {

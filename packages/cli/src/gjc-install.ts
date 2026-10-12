@@ -1,5 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { access, chmod, lstat, mkdir, mkdtemp, readlink, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+	access,
+	chmod,
+	lstat,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readlink,
+	rename,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 
@@ -42,7 +54,8 @@ async function verifyGjc(path: string, cwd: string, version: string, runner: Gjc
 	const result = await runner(command, cwd);
 	assertSuccessful(command, result);
 	const reported = versionFromOutput(`${result.stdout}\n${result.stderr}`);
-	if (reported !== version) throw new Error(`gjc version verification failed: expected ${version}, got ${reported ?? "unknown"}`);
+	if (reported !== version)
+		throw new Error(`gjc version verification failed: expected ${version}, got ${reported ?? "unknown"}`);
 }
 
 async function currentVersion(prefix: string, current: string): Promise<string | undefined> {

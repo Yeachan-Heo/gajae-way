@@ -1,5 +1,5 @@
 import type { DeliveryErrorCode } from "@gajae-gateway/protocol";
-import { StoreCore, type GroupDb } from "../core";
+import type { GroupDb, StoreCore } from "../core";
 import type { WriteTx } from "../tx";
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
@@ -66,7 +66,8 @@ export interface UnsettledDeliveryRow {
 	readonly createdAt: string;
 }
 
-const DELIVERY_COLUMNS = "delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error";
+const DELIVERY_COLUMNS =
+	"delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error";
 
 /** Persistence and retry policy for the durable delivery outbox. */
 export class OutboxGroup {
@@ -79,7 +80,12 @@ export class OutboxGroup {
 	/** Strict deduplicating enqueue used by composites: a reused id must name the same obligation. */
 	enqueue(
 		tx: WriteTx,
-		row: { readonly deliveryId: string; readonly turnId: string; readonly originKey: string; readonly payloadJson: string },
+		row: {
+			readonly deliveryId: string;
+			readonly turnId: string;
+			readonly originKey: string;
+			readonly payloadJson: string;
+		},
 		now = Date.now(),
 	): boolean {
 		const existing = this.#db
@@ -96,7 +102,9 @@ export class OutboxGroup {
 		}
 		const at = new Date(now).toISOString();
 		this.#db
-			.prepare("INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)")
+			.prepare(
+				"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+			)
 			.run(tx, row.deliveryId, row.turnId, row.originKey, row.payloadJson, at, at);
 		return true;
 	}
@@ -104,13 +112,20 @@ export class OutboxGroup {
 	/** Ordinary delivery creation is idempotent; a duplicate id is left unchanged. */
 	create(
 		tx: WriteTx,
-		row: { readonly deliveryId: string; readonly turnId: string; readonly originKey: string; readonly payloadJson: string },
+		row: {
+			readonly deliveryId: string;
+			readonly turnId: string;
+			readonly originKey: string;
+			readonly payloadJson: string;
+		},
 		now = Date.now(),
 	): boolean {
 		const at = new Date(now).toISOString();
 		return (
 			this.#db
-				.prepare("INSERT OR IGNORE INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)")
+				.prepare(
+					"INSERT OR IGNORE INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+				)
 				.run(tx, row.deliveryId, row.turnId, row.originKey, row.payloadJson, at, at).changes === 1
 		);
 	}
@@ -180,11 +195,15 @@ export class OutboxGroup {
 		const before = new Date(now - freshnessMs).toISOString();
 		const expiredAt = new Date(now).toISOString();
 		const rows = this.#db
-			.prepare("SELECT delivery_id, origin_key, attempts, last_error FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?")
+			.prepare(
+				"SELECT delivery_id, origin_key, attempts, last_error FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			)
 			.all(before) as Array<{ delivery_id: string; origin_key: string; attempts: number; last_error: string | null }>;
 		if (rows.length === 0) return [];
 		this.#db
-			.prepare("UPDATE deliveries SET state = 'expired', updated_at = ? WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?")
+			.prepare(
+				"UPDATE deliveries SET state = 'expired', updated_at = ? WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			)
 			.run(tx, expiredAt, before);
 		return rows.map((row) => ({
 			deliveryId: row.delivery_id,
@@ -197,18 +216,24 @@ export class OutboxGroup {
 
 	requeue(tx: WriteTx, deliveryId: string): string[] {
 		const changed = this.#db
-			.prepare("UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE delivery_id = ? AND state IN ('expired', 'failed_ambiguous', 'pending')")
+			.prepare(
+				"UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE delivery_id = ? AND state IN ('expired', 'failed_ambiguous', 'pending')",
+			)
 			.run(tx, new Date().toISOString(), deliveryId).changes;
 		return changed === 1 ? [deliveryId] : [];
 	}
 
 	requeueSince(tx: WriteTx, since: string): string[] {
 		const rows = this.#db
-			.prepare("SELECT delivery_id FROM deliveries WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ? ORDER BY updated_at, delivery_id")
+			.prepare(
+				"SELECT delivery_id FROM deliveries WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ? ORDER BY updated_at, delivery_id",
+			)
 			.all(since) as Array<{ delivery_id: string }>;
 		if (rows.length === 0) return [];
 		this.#db
-			.prepare("UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ?")
+			.prepare(
+				"UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ?",
+			)
 			.run(tx, new Date().toISOString(), since);
 		return rows.map((row) => row.delivery_id);
 	}
@@ -234,14 +259,28 @@ export class OutboxGroup {
 		recentPending: readonly UnsettledDeliveryRow[];
 	} {
 		const open = this.#db
-			.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous')")
+			.prepare(
+				"SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous')",
+			)
 			.get() as { n: number; oldest: string | null };
-		const expiredCount = (this.#db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'expired'").get() as { n: number }).n;
+		const expiredCount = (
+			this.#db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'expired'").get() as { n: number }
+		).n;
 		const expiredRows = this.#db
-			.prepare("SELECT delivery_id, origin_key, attempts, updated_at, last_error FROM deliveries WHERE state = 'expired' ORDER BY updated_at DESC, delivery_id LIMIT 5")
-			.all() as Array<{ delivery_id: string; origin_key: string; attempts: number; updated_at: string; last_error: string | null }>;
+			.prepare(
+				"SELECT delivery_id, origin_key, attempts, updated_at, last_error FROM deliveries WHERE state = 'expired' ORDER BY updated_at DESC, delivery_id LIMIT 5",
+			)
+			.all() as Array<{
+			delivery_id: string;
+			origin_key: string;
+			attempts: number;
+			updated_at: string;
+			last_error: string | null;
+		}>;
 		const pendingRows = this.#db
-			.prepare(`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') ORDER BY created_at LIMIT 5`)
+			.prepare(
+				`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') ORDER BY created_at LIMIT 5`,
+			)
 			.all() as DeliveryDbRow[];
 		return {
 			pending: open.n,
@@ -270,9 +309,9 @@ export class OutboxGroup {
 	}
 
 	get(deliveryId: string): DeliveryRow | undefined {
-		const row = this.#db.prepare(`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE delivery_id = ?`).get(deliveryId) as
-			| DeliveryDbRow
-			| null;
+		const row = this.#db
+			.prepare(`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE delivery_id = ?`)
+			.get(deliveryId) as DeliveryDbRow | null;
 		return row ? this.#toRow(row) : undefined;
 	}
 
@@ -282,18 +321,29 @@ export class OutboxGroup {
 	}
 
 	stateCounts(): Array<{ state: string; n: number }> {
-		return this.#db.prepare("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{ state: string; n: number }>;
+		return this.#db.prepare("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{
+			state: string;
+			n: number;
+		}>;
 	}
 
 	unsettledByOrigin(nowMs: number): Array<{ origin_key: string; n: number; oldest_ms: number }> {
 		return this.#db
-			.prepare("SELECT origin_key, COUNT(*) AS n, MAX((? - CAST(strftime('%s', created_at) AS INTEGER)) * 1000) AS oldest_ms FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') GROUP BY origin_key")
+			.prepare(
+				"SELECT origin_key, COUNT(*) AS n, MAX((? - CAST(strftime('%s', created_at) AS INTEGER)) * 1000) AS oldest_ms FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') GROUP BY origin_key",
+			)
 			.all(Math.floor(nowMs / 1000)) as Array<{ origin_key: string; n: number; oldest_ms: number }>;
 	}
 
-	confirmedConversation(conversationId: string, floorAt: string, limit: number): Array<{ created_at: string; payload_json: string }> {
+	confirmedConversation(
+		conversationId: string,
+		floorAt: string,
+		limit: number,
+	): Array<{ created_at: string; payload_json: string }> {
 		return this.#db
-			.prepare("SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT ?")
+			.prepare(
+				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+			)
 			.all(conversationId, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
 	}
 
@@ -302,26 +352,42 @@ export class OutboxGroup {
 		if (ids.length === 0) return [];
 		const placeholders = ids.map(() => "?").join(", ");
 		return this.#db
-			.prepare(`SELECT delivery_id, turn_id, state FROM deliveries WHERE turn_id IN (${placeholders}) AND state IN ('confirmed','expired')`)
+			.prepare(
+				`SELECT delivery_id, turn_id, state FROM deliveries WHERE turn_id IN (${placeholders}) AND state IN ('confirmed','expired')`,
+			)
 			.all(...ids) as Array<{ delivery_id: string; turn_id: string; state: string }>;
 	}
 
 	sweep(tx: WriteTx, cutoffs: { deliveryCutoff: string; historyCutoff: string; batch: number }): number {
 		return this.#db
-			.prepare("DELETE FROM deliveries WHERE rowid IN (SELECT rowid FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) LIMIT ?)")
+			.prepare(
+				"DELETE FROM deliveries WHERE rowid IN (SELECT rowid FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) LIMIT ?)",
+			)
 			.run(tx, cutoffs.deliveryCutoff, cutoffs.historyCutoff, cutoffs.batch).changes;
 	}
 
-	#update(tx: WriteTx, deliveryId: string, state: DeliveryState, attempts?: number, lastError?: DeliveryErrorCode): void {
+	#update(
+		tx: WriteTx,
+		deliveryId: string,
+		state: DeliveryState,
+		attempts?: number,
+		lastError?: DeliveryErrorCode,
+	): void {
 		this.#db
-			.prepare("UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = COALESCE(?, last_error), updated_at = ? WHERE delivery_id = ?")
+			.prepare(
+				"UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = COALESCE(?, last_error), updated_at = ? WHERE delivery_id = ?",
+			)
 			.run(tx, state, attempts ?? null, lastError ?? null, new Date().toISOString(), deliveryId);
 	}
 
 	unsettledRows(): DeliveryRow[] {
-		return (this.#db
-			.prepare(`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') ORDER BY created_at`)
-			.all() as DeliveryDbRow[]).map((row) => this.#toRow(row));
+		return (
+			this.#db
+				.prepare(
+					`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') ORDER BY created_at`,
+				)
+				.all() as DeliveryDbRow[]
+		).map((row) => this.#toRow(row));
 	}
 
 	#toRow(row: DeliveryDbRow): DeliveryRow {
