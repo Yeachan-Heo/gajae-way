@@ -90,9 +90,9 @@ test("settleSlackReaction with action 'add' calls api.addReaction", async () => 
 	};
 	const gatewayRequests: { verb: string; params: unknown }[] = [];
 	const gateway: Pick<GatewayClientLike, "request"> = {
-		request: async (verb: string, params?: unknown) => {
+		request: async <T = unknown>(verb: string, params?: unknown): Promise<T> => {
 			gatewayRequests.push({ verb, params });
-			return {} as unknown;
+			return {} as T;
 		},
 	};
 	const message: ChatMessagePayload = {
@@ -128,9 +128,9 @@ test("settleSlackReaction with action 'remove' calls api.removeReaction and not 
 	};
 	const gatewayRequests: { verb: string; params: unknown }[] = [];
 	const gateway: Pick<GatewayClientLike, "request"> = {
-		request: async (verb: string, params?: unknown) => {
+		request: async <T = unknown>(verb: string, params?: unknown): Promise<T> => {
 			gatewayRequests.push({ verb, params });
-			return {} as unknown;
+			return {} as T;
 		},
 	};
 	const message: ChatMessagePayload = {

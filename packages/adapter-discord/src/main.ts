@@ -181,6 +181,7 @@ export interface TypingPort {
 }
 
 export interface DiscordClientLike {
+	user?: { id: string | number } | null;
 	channels: { fetch(id: string): Promise<unknown> };
 }
 
