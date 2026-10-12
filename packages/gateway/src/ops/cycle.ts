@@ -133,6 +133,12 @@ export interface RuntimeCycleSources {
 	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
 	 */
 	readonly settledWorkOrigins: ReadonlySet<string>;
+	/**
+	 * When the newest broker authority cutover committed; null when none ran.
+	 * A cutover unbinds every origin (`gjc_session_id = ''`) and quarantines
+	 * its jobs, while any later rebind stamps `last_activity_at` before binding.
+	 */
+	readonly latestCutoverAt: string | null;
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
@@ -229,6 +235,7 @@ export class RuntimeCycleProjector {
 					.filter((row) => SETTLED_JOB_STATES.has(row.state))
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
+			latestCutoverAt: this.#database.latestBrokerCutoverAt(),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
 			gjcVersion: this.#gjcVersion(),
 			monitorTerminalStreak: this.#database.monitorConsecutiveTerminalFailures(),
@@ -241,6 +248,7 @@ export class RuntimeCycleProjector {
 /** Pure projection over already-snapshotted sources — independently unit-testable. */
 export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: string): OpsCycleResult {
 	const gates = new Set<CycleGateReason>();
+	const cutoverMs = sources.latestCutoverAt === null ? Number.NaN : Date.parse(sources.latestCutoverAt);
 
 	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
 		const origin = parseOriginRef(row.origin_ref_json);
@@ -253,7 +261,13 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			row.origin_key.startsWith(WORK_LANE_PREFIX) &&
 			row.gjc_session_id === "" &&
 			sources.settledWorkOrigins.has(row.origin_key);
-		if ((row.gjc_session_id === "" && !retiredLane) || row.epoch < 0) gates.add("stale_session_identity");
+		// A cutover unbinds every origin at once. An origin untouched since then
+		// is quarantined history, not a rebind in progress: any rebind attempt
+		// stamps last_activity_at past the cutover and is gated again.
+		const lastActivityMs = Date.parse(row.last_activity_at ?? row.created_at);
+		const cutoverRetired = row.gjc_session_id === "" && lastActivityMs <= cutoverMs;
+		if ((row.gjc_session_id === "" && !retiredLane && !cutoverRetired) || row.epoch < 0)
+			gates.add("stale_session_identity");
 		return {
 			originKey: row.origin_key,
 			origin,

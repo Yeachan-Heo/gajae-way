@@ -45,6 +45,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		activeLanes: 0,
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
+		latestCutoverAt: null,
 		agentDisk: null,
 		gjcVersion: undefined,
 		monitorTerminalStreak: 0,
@@ -312,6 +313,48 @@ describe("runtime cycle projection", () => {
 		const failedBind = projectRuntimeCycle(sources({ sessionRows: [unbound] }), generatedAt);
 		expect(failedBind.gates).toContain("stale_session_identity");
 		expect(failedBind.phase).toBe("degraded");
+	});
+
+	test("an origin unbound by a broker cutover and untouched since is history, not a stuck rebind", () => {
+		const cutoverAt = "2026-08-10T00:00:00.000Z";
+		// Quarantined worker lane: its job is excluded from settled evidence, yet the cutover unbound it.
+		const quarantinedLane = {
+			...boundSession,
+			origin_key: "work/task/old-fix",
+			origin_ref_json: JSON.stringify({ platform: "work", kind: "task", conversationId: "old-fix" }),
+			gjc_session_id: "",
+			last_activity_at: "2026-08-09T00:00:00.000Z",
+		};
+		// Legacy persona origin no longer addressed after the cutover.
+		const legacyOrigin = {
+			...boundSession,
+			origin_key: "monitor/eventtype/memory.audit",
+			gjc_session_id: "",
+			last_activity_at: cutoverAt,
+		};
+		const history = projectRuntimeCycle(
+			sources({ sessionRows: [quarantinedLane, legacyOrigin], latestCutoverAt: cutoverAt }),
+			generatedAt,
+		);
+		expect(history.gates).toEqual([]);
+		expect(history.phase).toBe("idle");
+		expect(history.sessions.map((s) => s.sessionId)).toEqual(["", ""]);
+
+		// A rebind started after the cutover stamps last_activity_at first: still gated.
+		const rebinding = { ...legacyOrigin, last_activity_at: "2026-08-10T00:00:00.001Z" };
+		const stuck = projectRuntimeCycle(sources({ sessionRows: [rebinding], latestCutoverAt: cutoverAt }), generatedAt);
+		expect(stuck.gates).toContain("stale_session_identity");
+
+		// Without any cutover the same unbound rows stay gated.
+		const noCutover = projectRuntimeCycle(sources({ sessionRows: [quarantinedLane, legacyOrigin] }), generatedAt);
+		expect(noCutover.gates).toContain("stale_session_identity");
+
+		// A negative epoch is never excused by age.
+		const negative = projectRuntimeCycle(
+			sources({ sessionRows: [{ ...legacyOrigin, epoch: -1 }], latestCutoverAt: cutoverAt }),
+			generatedAt,
+		);
+		expect(negative.gates).toContain("stale_session_identity");
 	});
 
 	test("healthy bound session with no work projects idle and carries identity/provenance", () => {

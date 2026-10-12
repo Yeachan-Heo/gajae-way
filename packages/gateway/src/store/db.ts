@@ -1172,6 +1172,15 @@ export class GatewayDatabase {
 			.query<{ snapshot_json: string }, [string]>("SELECT snapshot_json FROM broker_cutovers WHERE id = ?")
 			.get(id)?.snapshot_json;
 	}
+
+	/** When the newest broker authority cutover committed; null when none ever ran. */
+	latestBrokerCutoverAt(): string | null {
+		return (
+			this.#database
+				.query<{ created_at: string | null }, []>("SELECT MAX(created_at) AS created_at FROM broker_cutovers")
+				.get()?.created_at ?? null
+		);
+	}
 	/** Explicit seam for operations that must participate in a caller-owned commit. */
 	requireTransaction(): void {
 		if (!this.#inTransaction) throw new Error("operation requires a database transaction");
