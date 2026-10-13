@@ -42,7 +42,7 @@ describe("GJC version pinning", () => {
 			preflightGjcRuntime(mockRun, "0.16.0", undefined, {
 				pinnedVersion,
 			}),
-		).rejects.toThrow("version mismatch");
+		).rejects.toThrow(/version mismatch.*Run 'gajaeway update --force'/);
 	});
 
 	it("falls back to minimum version check when pinnedVersion is not set", async () => {

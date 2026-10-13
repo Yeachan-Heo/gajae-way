@@ -387,12 +387,7 @@ async function runRestartStackWithLease(options: RunRestartOptions): Promise<Res
 					issuedAt = now();
 					let command = step.command;
 					let status = await runner(command);
-					if (
-						status !== 0 &&
-						receipt.trigger === "update" &&
-						platform === "darwin" &&
-						(await probe(step.label)) === undefined
-					) {
+					if (status !== 0 && platform === "darwin" && (await probe(step.label)) === undefined) {
 						command = serviceBootstrapCommand(options, platform, step.label);
 						step.command = command;
 						issuedAt = now();

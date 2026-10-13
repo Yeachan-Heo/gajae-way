@@ -251,7 +251,7 @@ export async function preflightGjcRuntime(
 	if (options?.pinnedVersion) {
 		if (detectedVersion !== options.pinnedVersion) {
 			throw new Error(
-				`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
+				`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires ${options.pinnedVersion}). Run 'gajaeway update --force' to update the gateway's gjc.`,
 			);
 		}
 	} else {

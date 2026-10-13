@@ -432,6 +432,82 @@ test("manual broker restarts do not run provisioning", async () => {
 		await cleanup();
 	}
 });
+
+test("manual restart bootstraps a provisioned LaunchAgent that was never loaded", async () => {
+	const { home, cleanup } = await tempHome();
+	let brokerLease: Lease | undefined;
+	let running = false;
+	const commands: string[][] = [];
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "manual-unloaded-broker",
+			trigger: "manual",
+			platform: "darwin",
+			uid: 501,
+			env: { HOME: "/Users/operator" },
+			launchAgentsDir: "/Users/operator/Library/LaunchAgents",
+			runner: async (command) => {
+				commands.push([...command]);
+				if (command[1] === "kickstart") return 113;
+				if (command[1] === "bootstrap") {
+					brokerLease = await acquireLease(home, "broker");
+					running = true;
+				}
+				return 0;
+			},
+			probe: async (label) => (label === "dev.gajaeway.broker" && running ? { pid: process.pid } : undefined),
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker",
+			binaryModifiedAt: async () => Date.now() - 1000,
+			verifyTimeoutMs: 100,
+			sleep: async () => {},
+		});
+
+		expect(receipt.state).toBe("ok");
+		expect(receipt.steps[0]?.command).toEqual([
+			"launchctl",
+			"bootstrap",
+			"gui/501",
+			"/Users/operator/Library/LaunchAgents/dev.gajaeway.broker.plist",
+		]);
+		expect(commands).toEqual([
+			["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.broker"],
+			["launchctl", "bootstrap", "gui/501", "/Users/operator/Library/LaunchAgents/dev.gajaeway.broker.plist"],
+		]);
+		expect(commands.some((command) => command.includes("provision"))).toBe(false);
+	} finally {
+		await brokerLease?.release();
+		await cleanup();
+	}
+});
+
+test("manual restart does not bootstrap the broker before it is provisioned", async () => {
+	const { home, cleanup } = await tempHome();
+	const commands: string[][] = [];
+	try {
+		await rm(join(home, "broker", "provision", "manifest.json"));
+		const receipt = await runRestartStack({
+			home,
+			id: "manual-unprovisioned-broker",
+			trigger: "manual",
+			platform: "darwin",
+			uid: 501,
+			runner: async (command) => {
+				commands.push([...command]);
+				return 113;
+			},
+			probe: async () => undefined,
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker",
+		});
+
+		expect(receipt.state).toBe("ok");
+		expect(receipt.steps[0]?.result).toBe("skipped");
+		expect(receipt.steps[0]?.detail).toBe("broker agent is not provisioned");
+		expect(commands).toEqual([]);
+	} finally {
+		await cleanup();
+	}
+});
 test("an unfinished receipt is interrupted when its update lease is gone", async () => {
 	const { home, cleanup } = await tempHome();
 	const receipt = {
