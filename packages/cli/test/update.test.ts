@@ -231,6 +231,7 @@ describe("runUpdate", () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
 		const home = await homeWithConfig();
 		const calls = recorder();
+		const serviceFiles = new Map<string, string>();
 		const extractor = extractorFor(KNOWN_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
 		try {
 			const result = await runUpdate({
@@ -244,7 +245,9 @@ describe("runUpdate", () => {
 					},
 					extractTarball: extractor,
 					gjcInstallRunner,
-					serviceOptions: serviceOptions(home),
+					serviceOptions: serviceOptions(home, async (path, contents) => {
+						serviceFiles.set(path, contents);
+					}),
 					queueRestart: async (restartHome, _binDir, trigger) => {
 						calls.restarts.push(restartHome);
 						expect(trigger).toBe("update");
@@ -262,6 +265,7 @@ describe("runUpdate", () => {
 			expect(calls.downloads).toEqual([DARWIN_ASSET]);
 			expect(calls.restarts).toEqual([home]);
 			expect(await leaseHeld(home, "update")).toBe(false);
+			expect(serviceFiles.has(join(home, "agents", "dev.gajaeway.admin.plist"))).toBe(false);
 			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]) {
 				const body = await readFile(join(dir, name), "utf8");
 				expect(body.startsWith(`staged-${name}\n`)).toBe(true);
@@ -320,7 +324,7 @@ describe("runUpdate", () => {
 	});
 
 	test("systemd update writes only configured adapter units and no-start refresh is daemon-reload only", async () => {
-		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-discord"]);
 		const home = await homeWithConfig();
 		const unitFiles = new Map<string, string>();
 		const serviceCommands: string[][] = [];
@@ -333,7 +337,10 @@ describe("runUpdate", () => {
 					fetchLatestRelease: async () => release("v0.2.0", [releaseAssetName("linux", "arm64")]),
 					downloadAsset: noBytes,
 					extractTarball: extractorFor(
-						CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })),
+						[
+							...CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })),
+							{ name: "gajaeway-discord", marker: "staged-gajaeway-discord" },
+						],
 						"0.19.2",
 					),
 					gjcInstallRunner,
@@ -363,7 +370,7 @@ describe("runUpdate", () => {
 	});
 
 	test("systemd update enables broker only with its provisioning manifest", async () => {
-		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway", "gajaeway-slack"]);
 		const home = await homeWithConfig();
 		const serviceCommands: string[][] = [];
 		try {
@@ -374,7 +381,10 @@ describe("runUpdate", () => {
 				deps: {
 					fetchLatestRelease: async () => release("v0.2.0", [releaseAssetName("linux", "arm64")]),
 					downloadAsset: noBytes,
-					extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
+					extractTarball: extractorFor([
+						...CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })),
+						{ name: "gajaeway-slack", marker: "staged-gajaeway-slack" },
+					]),
 					gjcInstallRunner,
 					serviceOptions: serviceOptions(home),
 					serviceRunner: async (command: readonly string[]) => {
@@ -401,7 +411,6 @@ describe("runUpdate", () => {
 				"enable",
 				"gajaeway-gateway.service",
 				"gajaeway-adapter-slack.service",
-				"gajaeway-admin.service",
 			]);
 			await mkdir(join(home, "broker", "provision"), { recursive: true });
 			await writeFile(join(home, "broker", "provision", "manifest.json"), "{}", "utf8");
@@ -414,7 +423,6 @@ describe("runUpdate", () => {
 				"gajaeway-broker.service",
 				"gajaeway-gateway.service",
 				"gajaeway-adapter-slack.service",
-				"gajaeway-admin.service",
 			]);
 		} finally {
 			await rm(dir, { recursive: true, force: true });

@@ -375,6 +375,7 @@ export async function installServices(options: InstallServicesOptions): Promise<
 	await mkdir(targetDir, { recursive: true, mode: 0o700 });
 	const specs: ServiceSpec[] = [];
 	for (const spec of SERVICE_SPECS) {
+		if (!(await Bun.file(join(binDir, spec.binary)).exists())) continue;
 		if (options.configuredAdaptersOnly && spec.id.startsWith("adapter-")) {
 			const adapter = spec.id.slice("adapter-".length);
 			if (!(await Bun.file(join(home, `adapter-${adapter}.json`)).exists())) continue;

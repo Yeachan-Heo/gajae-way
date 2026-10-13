@@ -298,6 +298,7 @@ async function installUpdatedServices(options: {
 		if (!noRestart) {
 			const enableUnits: string[] = [];
 			for (const spec of serviceSpecs()) {
+				if (!(await exists(join(binDir, spec.binary)))) continue;
 				if (spec.id === "broker" && !brokerProvisioned) continue;
 				if (
 					spec.id.startsWith("adapter-") &&

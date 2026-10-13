@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -501,7 +501,10 @@ describe("service installation", () => {
 					runtime: { path: ["~/custom", "/usr/bin"] },
 				}),
 			);
-			const env = { HOME: "/Users/operator", GAJAEWAY_HOME: home };
+			const env = { HOME: home, GAJAEWAY_HOME: home };
+			const binDir = join(home, "gaja&<bin>");
+			await mkdir(binDir);
+			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
 			const writes: Array<{ path: string; contents: string }> = [];
 			const writer = async (path: string, contents: string): Promise<void> => {
 				writes.push({ path, contents });

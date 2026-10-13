@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,9 +19,12 @@ async function configuredHome(): Promise<{ home: string; cleanup: () => Promise<
 
 async function generate(platform: "darwin" | "linux") {
 	const { home, cleanup } = await configuredHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+	for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
 	const written = new Map<string, string>();
 	const paths = await installServices({
-		binDir: join(home, "bin"),
+		binDir,
 		platform,
 		unitDir: join(home, "units"),
 		launchAgentsDir: join(home, "agents"),
@@ -93,16 +96,44 @@ test("a darwin install still writes launch agents, not units", async () => {
 	}
 });
 
+test("a darwin update skips a launch agent when its binary is missing", async () => {
+	const { home, cleanup } = await configuredHome();
+	const binDir = join(home, "bin");
+	const written = new Map<string, string>();
+	try {
+		await mkdir(binDir);
+		await writeFile(join(binDir, "gajaeway-gateway"), "gateway stub");
+		const paths = await installServices({
+			binDir,
+			platform: "darwin",
+			launchAgentsDir: join(home, "agents"),
+			env: { HOME: home, GAJAEWAY_HOME: home },
+			configuredAdaptersOnly: true,
+			loginPathRunner: () => "/usr/bin:/bin",
+			writeFile: (path, contents) => {
+				written.set(path, contents);
+			},
+		});
+
+		expect(paths).toContain(join(home, "agents", "dev.gajaeway.gateway.plist"));
+		expect(paths).not.toContain(join(home, "agents", "dev.gajaeway.admin.plist"));
+		expect(written.has(join(home, "agents", "dev.gajaeway.admin.plist"))).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("compareAndWrite leaves unchanged service definitions untouched", async () => {
 	const { home, cleanup } = await configuredHome();
 	const unitDir = join(home, "units");
+	const binDir = join(home, "bin");
 	let writes = 0;
 	const write = async (path: string, contents: string) => {
 		writes++;
 		await writeFile(path, contents, "utf8");
 	};
 	const options = {
-		binDir: join(home, "bin"),
+		binDir,
 		unitDir,
 		platform: "linux" as const,
 		env: { HOME: home, GAJAEWAY_HOME: home },
@@ -110,6 +141,8 @@ test("compareAndWrite leaves unchanged service definitions untouched", async () 
 		writeFile: write,
 	};
 	try {
+		await mkdir(binDir);
+		for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
 		await installServices(options);
 		expect(writes).toBe(serviceSpecs().length);
 		writes = 0;
