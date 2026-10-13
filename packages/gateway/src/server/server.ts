@@ -1539,25 +1539,29 @@ async function handleRequest(
 			if (!resolved)
 				throw new ProtocolError(
 					"invalid_params",
-					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist: ${reactionAllowlistDescription(origin.platform)}`,
+					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist or custom emoji rules: ${reactionAllowlistDescription(origin.platform)}`,
 				);
-			// Personas cannot request custom emoji: the protocol only knows the allowlisted emoji.
-			if (resolved.isCustom === true)
-				throw new ProtocolError(
-					"invalid_params",
-					`custom emoji ${resolved.name} are not supported in the persona protocol; use: ${reactionAllowlistDescription(origin.platform)}`,
-				);
-			// Allowlisted is not the same as deliverable: Telegram accepts only its own
-			// reaction set, so asking for one it cannot express would be a guaranteed dead
-			// delivery. Refuse it here instead of letting the persona believe it acknowledged.
-			if (!platformSupportsReaction(origin.platform, resolved.name))
-				throw new ProtocolError(
-					"invalid_params",
-					`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
-				);
+			// Custom emoji are allowed on Discord and Slack; Telegram rejects them as unsupported.
+			const isCustom = resolved.isCustom === true;
+			if (isCustom) {
+				if (origin.platform === "telegram")
+					throw new ProtocolError(
+						"invalid_params",
+						`${origin.platform} does not support custom emoji; it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+					);
+			} else {
+				// Allowlisted is not the same as deliverable: Telegram accepts only its own
+				// reaction set, so asking for one it cannot express would be a guaranteed dead
+				// delivery. Refuse it here instead of letting the persona believe it acknowledged.
+				if (!platformSupportsReaction(origin.platform, resolved.name))
+					throw new ProtocolError(
+						"invalid_params",
+						`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+					);
+			}
 			const reaction: ReactionRef = {
 				targetMessageId: params.targetMessageId.trim(),
-				emoji: resolved.unicode,
+				emoji: isCustom ? "" : (resolved as any).unicode,
 				emojiName: resolved.name,
 				action,
 			};

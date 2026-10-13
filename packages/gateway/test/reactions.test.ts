@@ -824,3 +824,15 @@ test("a reaction added in an earlier part of the turn can be removed in a later 
 	expect(reactions[2].payload.reaction.emoji).toBe("✅");
 	expect(reactions[2].payload.reaction.action).toBeUndefined(); // add is default
 });
+
+test("custom emoji names are allowed on Discord and reach the adapter with empty emoji field", async () => {
+	const { client } = await gateway("[REACT:custom_emoji_name]");
+	sendMessage(client, "c1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	expect(reactions).toHaveLength(1);
+	const reaction = reactions[0].payload.reaction;
+	expect(reaction.targetMessageId).toBe("m1");
+	expect(reaction.emoji).toBe("");
+	expect(reaction.emojiName).toBe("custom_emoji_name");
+});
