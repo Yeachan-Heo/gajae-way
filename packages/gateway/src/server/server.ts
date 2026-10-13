@@ -1556,12 +1556,13 @@ async function handleRequest(
 				if (!platformSupportsReaction(origin.platform, resolved.name))
 					throw new ProtocolError(
 						"invalid_params",
-						`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+						`${origin.platform} cannot react with ${(resolved as any).unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
 					);
 			}
+			const unicode = !isCustom ? (resolved as any).unicode : "";
 			const reaction: ReactionRef = {
 				targetMessageId: params.targetMessageId.trim(),
-				emoji: isCustom ? "" : (resolved as any).unicode,
+				emoji: unicode,
 				emojiName: resolved.name,
 				action,
 			};
@@ -1575,7 +1576,7 @@ async function handleRequest(
 				if (!owned)
 					throw new ProtocolError(
 						"invalid_params",
-						`cannot remove ${resolved.unicode}: the persona did not add this reaction`,
+						`cannot remove ${unicode}: the persona did not add this reaction`,
 					);
 			} else {
 				const rejection = runtime.reactions.claim({
