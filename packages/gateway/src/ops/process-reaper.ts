@@ -164,7 +164,7 @@ function isWorkerArgv(argv: string[], gjcPath: string): boolean {
  * Returns empty array if the system doesn't provide process information.
  */
 async function readProcessTable(procRoot?: string): Promise<ProcessTableEntry[]> {
-	if (process.platform === "linux") {
+	if (procRoot !== undefined || process.platform === "linux") {
 		return await readProcessTableLinux(procRoot);
 	} else {
 		return await readProcessTableUnix();
@@ -190,8 +190,9 @@ async function readProcessTableLinux(procRoot: string = "/proc"): Promise<Proces
 				const stat = await readFile(join(procRoot, entry, "stat"), "utf-8").catch(() => "");
 				if (!stat) continue;
 
-				const statParts = stat.split(" ");
-				const ppid = Number(statParts[3]);
+				// comm (field 2) is parenthesized and may contain spaces or ')', so parse after the last ')'.
+				const afterComm = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+				const ppid = Number(afterComm[1]);
 				if (!Number.isSafeInteger(ppid)) continue;
 
 				// Read /proc/[pid]/cmdline (NUL-separated argv)

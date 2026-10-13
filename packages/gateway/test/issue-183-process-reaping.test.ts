@@ -419,3 +419,58 @@ test("integration: reapLeftoverWorkers with injected process table", async () =>
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("proc reader: reads ppid, argv and agent dir from a /proc fixture, including a comm with spaces and parens", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-procroot-"));
+	const brokerAgentDir = join(home, "broker", "agent");
+	const gjcPath = join(home, "gjc", "current", "bin", "gjc");
+	const procRoot = join(home, "proc");
+	const writeProc = async (pid: number, stat: string, argv: string[], env: string[]): Promise<void> => {
+		await mkdir(join(procRoot, String(pid)), { recursive: true });
+		await writeFile(join(procRoot, String(pid), "stat"), stat);
+		await writeFile(join(procRoot, String(pid), "cmdline"), `${argv.join("\0")}\0`);
+		await writeFile(join(procRoot, String(pid), "environ"), `${env.join("\0")}\0`);
+	};
+	try {
+		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
+		await writeFile(gjcPath, "");
+		await mkdir(brokerAgentDir, { recursive: true });
+		const workerArgv = (id: string): string[] => [gjcPath, "sdk", "serve", "--stdio", "--session", id];
+		// Orphan reparented to a subreaper; comm contains ") " which breaks a naive split(" ").
+		await writeProc(
+			4001,
+			"4001 (gjc) x (y) S 1234 4001 4001 0 -1 4194560",
+			workerArgv("00000000-0000-4000-8000-000000000011"),
+			["HOME=/x", `GJC_CODING_AGENT_DIR=${brokerAgentDir}`],
+		);
+		// Child of the booting gateway: must be kept.
+		await writeProc(
+			4002,
+			`4002 (gjc) S ${process.pid} 4002 4002 0 -1 4194560`,
+			workerArgv("00000000-0000-4000-8000-000000000012"),
+			[`GJC_CODING_AGENT_DIR=${brokerAgentDir}`],
+		);
+		// Prefix-colliding agent dir: must be kept.
+		await writeProc(4003, "4003 (gjc) S 1 4003 4003 0 -1 4194560", workerArgv("00000000-0000-4000-8000-000000000013"), [
+			`GJC_CODING_AGENT_DIR=${brokerAgentDir}2`,
+		]);
+
+		const killCalled: Array<{ pid: number; signal: string }> = [];
+		const result = await reapLeftoverWorkers(home, {
+			log: () => {
+				/* suppress */
+			},
+			procRoot,
+			kill: (pid, signal) => {
+				killCalled.push({ pid, signal });
+				return Promise.resolve();
+			},
+		});
+
+		expect(result.found).toBe(1);
+		expect(killCalled[0]).toEqual({ pid: 4001, signal: "SIGTERM" });
+		expect(killCalled.every((call) => call.pid === 4001)).toBe(true);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
