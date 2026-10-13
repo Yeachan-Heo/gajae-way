@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ProcessTableEntry, reapLeftoverWorkers, selectOrphanedWorkers } from "../src/ops/process-reaper";
@@ -14,7 +14,7 @@ import { type ProcessTableEntry, reapLeftoverWorkers, selectOrphanedWorkers } fr
  */
 
 test("process reaper: returns consistent result structure in clean environment", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-clean-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-clean-")));
 	try {
 		// Create minimal home layout structure for reapLeftoverWorkers to discover
 		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
@@ -36,7 +36,7 @@ test("process reaper: returns consistent result structure in clean environment",
 });
 
 test("process reaper: handles missing gjc executable gracefully", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-missing-gjc-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-missing-gjc-")));
 	try {
 		// Create home layout but NOT the gjc executable
 		await mkdir(join(home, "broker", "agent"), { recursive: true });
@@ -59,8 +59,8 @@ test("process reaper: handles missing gjc executable gracefully", async () => {
 });
 
 test("process reaper: respects home directory parameter", async () => {
-	const home1 = await mkdtemp(join(tmpdir(), "gajaeway-reaper-home1-"));
-	const home2 = await mkdtemp(join(tmpdir(), "gajaeway-reaper-home2-"));
+	const home1 = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-reaper-home1-")));
+	const home2 = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-reaper-home2-")));
 	try {
 		// Set up both home directories
 		for (const h of [home1, home2]) {
@@ -92,7 +92,7 @@ test("process reaper: respects home directory parameter", async () => {
 });
 
 test("process reaper: does not throw on unreadable /proc entries", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-unreadable-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-process-reaper-unreadable-")));
 	try {
 		await mkdir(join(home, "gjc", "current", "bin"), { recursive: true });
 		await writeFile(join(home, "gjc", "current", "bin", "gjc"), "");
@@ -373,7 +373,7 @@ test("fixture: POSITIVE reap worker spawned as bun gjcPath (argv[0] = bun)", asy
 });
 
 test("integration: reapLeftoverWorkers with injected process table", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-integration-kill-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-integration-kill-")));
 	const brokerAgentDir = join(home, "broker", "agent");
 	const gjcPath = join(home, "gjc", "current", "bin", "gjc");
 	try {
@@ -381,7 +381,6 @@ test("integration: reapLeftoverWorkers with injected process table", async () =>
 		await writeFile(gjcPath, "");
 		await mkdir(brokerAgentDir, { recursive: true });
 
-		const selfPid = 1000;
 		const processTable: ProcessTableEntry[] = [
 			{
 				pid: 2008,
@@ -421,7 +420,7 @@ test("integration: reapLeftoverWorkers with injected process table", async () =>
 });
 
 test("proc reader: reads ppid, argv and agent dir from a /proc fixture, including a comm with spaces and parens", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-procroot-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-procroot-")));
 	const brokerAgentDir = join(home, "broker", "agent");
 	const gjcPath = join(home, "gjc", "current", "bin", "gjc");
 	const procRoot = join(home, "proc");
