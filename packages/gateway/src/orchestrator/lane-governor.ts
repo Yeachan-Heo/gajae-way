@@ -1,4 +1,5 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, realpathSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
@@ -592,10 +593,34 @@ export class LaneGovernor {
 				const listError = listResult.stderr?.toString().trim() || "unknown error";
 				throw new Error(`git worktree list failed: ${listError}`);
 			}
+			const normalizedStoredPath = (() => {
+				try {
+					return realpathSync(worktreePath);
+				} catch {
+					// Path doesn't exist (removed externally), but try to normalize parent directories
+					const parentPath = dirname(worktreePath);
+					try {
+						const normalizedParent = realpathSync(parentPath);
+						const baseName = worktreePath.split(/[\\\\\\/]/).pop() ?? "";
+						return `${normalizedParent}/${baseName}`;
+					} catch {
+						return worktreePath;
+					}
+				}
+			})();
 			const stillRegistered = listResult.stdout
 				?.toString()
 				.split(/\r?\n/)
-				.some((line) => line === `worktree ${worktreePath}`);
+				.some((line) => {
+					const gitPath = line.replace(/^worktree /, "");
+					if (!gitPath) return false;
+					try {
+						const normalizedGitPath = realpathSync(gitPath);
+						return normalizedGitPath === normalizedStoredPath;
+					} catch {
+						return gitPath === worktreePath; // Fallback to string comparison if paths don't exist
+					}
+				});
 			if (stillRegistered) throw new Error(`worktree remains registered after pruning: ${stderr}`);
 		}
 
