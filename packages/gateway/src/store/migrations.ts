@@ -1,6 +1,5 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
-import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DatabaseStartupError } from "./errors";
 import type { WorkAttemptRuntime, WorkParent } from "./groups/work";
 import { validateWorkRuntime, workAssert, workAttemptReportId } from "./groups/work";

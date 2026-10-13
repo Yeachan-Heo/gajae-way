@@ -28,7 +28,6 @@ import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
 	type FailedTurnEvidenceInput,
-	readFailedTransportCause,
 	readFailedTurnEvidence,
 } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
@@ -910,8 +909,8 @@ export class BrokerSessionPort implements SessionPort {
 		let onAbort!: () => void;
 		const cancelled = new Promise<WorkerOutputResult>((resolve) => {
 			onAbort = () => resolve({ status: "unavailable", code: "cancelled" });
-			input.signal!.addEventListener("abort", onAbort, { once: true });
-			if (input.signal!.aborted) onAbort();
+			input.signal?.addEventListener("abort", onAbort, { once: true });
+			if (input.signal?.aborted) onAbort();
 		});
 		try {
 			return await Promise.race([read(), cancelled]);

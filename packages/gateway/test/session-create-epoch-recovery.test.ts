@@ -212,7 +212,7 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 	const epoch = 7;
 	const instanceId = "create-thrown";
 	const repo = join(home, "workspace");
-	let activeError: Error = failures[0]!.error;
+	let activeError: Error = failures[0]?.error;
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);

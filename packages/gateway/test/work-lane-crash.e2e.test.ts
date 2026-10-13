@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { DeliveryService } from "../src/delivery/delivery";
 import { Store } from "../src/store";
-import { type Barrier, eventually, noticeOrigin, WorkFixture } from "./fixtures/work-lane-server";
+import { type Barrier, eventually, WorkFixture } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];
 afterEach(async () => {
@@ -197,7 +197,7 @@ for (const point of [
 for (const point of ["settle-before", "settle-report", "settle-commit"] as const) {
 	test(`persona parent crash at ${point}: one durable inbound report and one persona send`, async () => {
 		const f = await fixture();
-		const rootKey = "discord/channel/fixture";
+		const _rootKey = "discord/channel/fixture";
 		const rootSessionId = await f.seedPersonaSession();
 		const priorPersonaSends = f.calls("send").filter((call) => call.input.sessionId === rootSessionId).length;
 		const { client, receipt } = await start(f, "persona-child", rootSessionId);
@@ -389,7 +389,7 @@ test("three claimed post-terminal reads stay consumed across three process crash
 for (const [scenario, text] of [
 	["bare NO_REPLY", "NO_REPLY"],
 	["preamble and SILENT marker", "Nothing to add.\n\n[SILENT]"],
-	["SILENT marker beyond the persisted excerpt", "Nothing to add.\n\n" + "界".repeat(800) + "\n\n[SILENT]"],
+	["SILENT marker beyond the persisted excerpt", `Nothing to add.\n\n${"界".repeat(800)}\n\n[SILENT]`],
 ] as const) {
 	test(`original final silence (${scenario}) survives proof commit crash and unavailable full output on restart`, async () => {
 		const f = await fixture("silence-after");

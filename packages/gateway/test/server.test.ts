@@ -273,7 +273,7 @@ test("inflight rows are not re-broadcast by the timed sweep within ack timeout",
 	const ledger = new DeliveryService(database);
 	ledger.markInflight(deliveryId);
 	const row = ledger.get(deliveryId);
-	const updatedAt = Date.parse(row!.updatedAt);
+	const updatedAt = Date.parse(row?.updatedAt);
 
 	// Count chat.message frames with this deliveryId before the sweep
 	const messagesBeforeSweep = client.frames.filter(
@@ -1184,11 +1184,11 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	expect(turns[0]).toContain("[alice | discord channel c1 (author:u1, msg:m1)]");
 	try {
 		// Each steer names its speaker and message, like a trigger would.
-		expect(sessionPort.steers[0]!.text).toContain("bob");
-		expect(sessionPort.steers[0]!.text).toContain("msg:m2");
-		expect(sessionPort.steers[0]!.text).toContain("second message");
-		expect(sessionPort.steers[1]!.text).toContain("carol");
-		expect(sessionPort.steers[1]!.text).toContain("msg:m3");
+		expect(sessionPort.steers[0]?.text).toContain("bob");
+		expect(sessionPort.steers[0]?.text).toContain("msg:m2");
+		expect(sessionPort.steers[0]?.text).toContain("second message");
+		expect(sessionPort.steers[1]?.text).toContain("carol");
+		expect(sessionPort.steers[1]?.text).toContain("msg:m3");
 	} finally {
 		release();
 	}
@@ -2049,7 +2049,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	await waitFor(client.frames, 2);
 	const first = client.frames.find((frame) => frame.id === "first");
 	expect(first).toMatchObject({ type: "response", result: { held: false, sessionKey: "work/task/a" } });
-	const sessionId = database.bindings.getSessionRecord("work/task/a")!.sessionId;
+	const sessionId = database.bindings.getSessionRecord("work/task/a")?.sessionId;
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -2456,7 +2456,7 @@ test("Unix stop detaches a long run before request drain and leaves the attempt 
 	for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 	expect(f.port.sends).toHaveLength(1);
 	let stopped = false;
-	const stop = server!.stop().then(() => {
+	const stop = server?.stop().then(() => {
 		stopped = true;
 	});
 	for (let i = 0; i < 600 && !stopped; i++) await Bun.sleep(5);
@@ -2555,7 +2555,7 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		try {
 			expect(reopened.work.workAttemptOpen()).toHaveLength(1);
 			expect(
-				parseLaneJobRecord(reopened.work.laneJobJson(reopened.work.workAttemptOpen()[0]!.jobId)!).attempts[0]?.endedAt,
+				parseLaneJobRecord(reopened.work.laneJobJson(reopened.work.workAttemptOpen()[0]?.jobId)!).attempts[0]?.endedAt,
 			).toBeUndefined();
 		} finally {
 			reopened.close();
@@ -2574,7 +2574,7 @@ for (const verb of ["work.start", "work.run"] as const) {
 		f.client.send({ v: "0.1", type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
 		for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 		expect(f.port.sends).toHaveLength(1);
-		const opRef = f.port.sends[0]!.opRef;
+		const opRef = f.port.sends[0]?.opRef;
 		const expectedOrigin = { platform: "work", kind: "task", conversationId: name };
 		for (const phase of ["open", "settled"] as const) {
 			if (phase === "settled") {

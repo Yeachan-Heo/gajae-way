@@ -258,7 +258,7 @@ test("memory intent probes cover deterministic ids, legacy payloads and the open
 });
 
 test("authored-note digest returns newest notes that actually have output", async () => {
-	await withDb((database, raw) => {
+	await withDb((database, _raw) => {
 		for (const [id, at] of [
 			["n1", "2026-10-01T00:00:01.000Z"],
 			["n2", "2026-10-01T00:00:02.000Z"],

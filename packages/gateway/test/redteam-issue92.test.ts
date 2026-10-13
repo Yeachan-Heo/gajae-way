@@ -302,8 +302,8 @@ test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh ep
 			true,
 		);
 		// The stale session's binding was rotated: the send rode a NEW session.
-		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
-		port.complete(port.sends[0]!.opRef, "answer on the fresh session");
+		expect(port.sends[0]?.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
+		port.complete(port.sends[0]?.opRef, "answer on the fresh session");
 		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not settle");
 		expect(target.terminal).toEqual(["answer on the fresh session"]);
 		expect(target.logs.some((line) => line.includes("host hello did not arrive"))).toBe(false);

@@ -280,7 +280,7 @@ test("a torn steer transport is replayed on the same clientRef, never rebinds th
 	expect(logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 	expect(port.sends).toHaveLength(1);
 	expect(
-		database.inbox.turnRows(database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!.opRef).map((r) => r.message_id),
+		database.inbox.turnRows(database.inbox.nonterminalTurns(ORIGIN_KEY)[0]?.opRef).map((r) => r.message_id),
 	).toEqual(["trigger", "torn"]);
 	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 });
@@ -324,7 +324,7 @@ test("a steer transport that stays torn HOLDS the row - the message may already 
 	expect(port.sends).toHaveLength(1);
 	// Held = durably attributed to the running turn, not an ordinary pending row.
 	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
-	const opRef = port.sends[0]!.opRef;
+	const opRef = port.sends[0]?.opRef;
 	expect(database.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
 	// The next admission retries the same clientRef; once the transport answers
 	// (here: the recorded acceptance), the row is attributed without a duplicate.
@@ -371,7 +371,7 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 	enqueue("trigger", "first");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send missing");
-	const opRef = port.sends[0]!.opRef;
+	const opRef = port.sends[0]?.opRef;
 	enqueue("maybe-landed", "second");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => logs.some((line) => line.startsWith("steer_hold")), "torn steer was not held");
@@ -399,8 +399,8 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 	enqueue("later", "third");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length >= 2, "held steer was not released");
-	expect(port.sends[1]!.text).toBe("second");
-	expect(port.sends[1]!.sessionId).toBe(port.sends[0]!.sessionId);
+	expect(port.sends[1]?.text).toBe("second");
+	expect(port.sends[1]?.sessionId).toBe(port.sends[0]?.sessionId);
 	expect(port.binds).toHaveLength(1);
 });
 
@@ -440,7 +440,7 @@ test("a held steer on a finished turn whose session is gone is closed with that 
 	enqueue("trigger", "first");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send missing");
-	const opRef = port.sends[0]!.opRef;
+	const opRef = port.sends[0]?.opRef;
 	enqueue("maybe-landed", "second");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => logs.some((line) => line.startsWith("steer_hold")), "torn steer was not held");
@@ -591,7 +591,7 @@ test("a torn steer whose replay returns a definitive refusal waits for terminal 
 		"refused message was not returned to pending",
 	);
 	expect(port.attempts).toBe(2);
-	expect(port.steers[0]!.clientRef).toBe(port.steers[1]!.clientRef);
+	expect(port.steers[0]?.clientRef).toBe(port.steers[1]?.clientRef);
 	expect(port.steers.every((steer) => steer.sessionId === running.sessionId)).toBe(true);
 	expect(port.binds).toHaveLength(1);
 	expect(port.sends).toHaveLength(1);
@@ -599,9 +599,9 @@ test("a torn steer whose replay returns a definitive refusal waits for terminal 
 	expect(logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(0);
 	port.complete(running.opRef, "first answer");
 	await eventually(() => port.sends.length === 2, "refused message did not start after current terminal");
-	expect(port.sends[1]!.text).toBe("second");
-	expect(port.sends[1]!.sessionId).toBe(running.sessionId);
-	expect(port.sends[1]!.opRef).not.toBe(running.opRef);
+	expect(port.sends[1]?.text).toBe("second");
+	expect(port.sends[1]?.sessionId).toBe(running.sessionId);
+	expect(port.sends[1]?.opRef).not.toBe(running.opRef);
 	expect(port.binds).toHaveLength(1);
 	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 });

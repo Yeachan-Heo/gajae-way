@@ -94,8 +94,8 @@ export class Store {
 					openWork++;
 			}
 			for (const row of this.work.workAttemptRows()) {
-				const runtime = this.work.workAttemptGet(row.op_ref)!;
-				if (runtime.settledAt === null && !this.bindings.isQuarantined("work", runtime.jobId)) openWork++;
+				const runtime = this.work.workAttemptGet(row.op_ref);
+				if (runtime && runtime.settledAt === null && !this.bindings.isQuarantined("work", runtime.jobId)) openWork++;
 			}
 			openWork += this.work.laneReportOpenCount();
 		} catch (error) {

@@ -234,7 +234,7 @@ test("transcript.list pages over the relay with the host's continuationCursor as
 		complete: true,
 	});
 	expect(f.relay.requests.map((request) => request.cursor)).toEqual([undefined, "c-1"]);
-	const written = f.relay.streams[0]!.written.filter((frame) => frame.type === "query_request");
+	const written = f.relay.streams[0]?.written.filter((frame) => frame.type === "query_request");
 	expect(written[1]).toMatchObject({ query: "transcript.list", input: {}, cursor: "c-1" });
 	await f.handle.close();
 });

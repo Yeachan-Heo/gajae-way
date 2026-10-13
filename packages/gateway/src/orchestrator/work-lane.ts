@@ -197,7 +197,7 @@ function getServiceDirectory(): string {
 			encoding: "utf-8",
 		}).trim();
 		return gitRoot;
-	} catch (error) {
+	} catch (_error) {
 		// If not in a git repo, return the binary directory
 		return dirname(process.execPath);
 	}
@@ -696,7 +696,7 @@ export class WorkLaneManager {
 			let cwdRealpath: string;
 			try {
 				cwdRealpath = realpathSync(input.cwd);
-			} catch (realpathError) {
+			} catch (_realpathError) {
 				// If realpath fails (e.g., path doesn't exist), resolve to absolute path
 				// and then try to resolve parent directories up to an existing ancestor
 				let current = resolve(input.cwd);
@@ -1723,7 +1723,7 @@ export class WorkLaneManager {
 		}
 		if (this.#attemptByOpRef(opRef)) return;
 		const fresh = this.#db.work.laneReportGet(row.report_id);
-		if (!fresh || fresh.state !== "claimed") return;
+		if (fresh?.state !== "claimed") return;
 		if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, opRef))) return;
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
@@ -2219,7 +2219,7 @@ function terminalEvidence(status: PromptStatusBody, observedAt: string): WorkAtt
 					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
 						? "end_turn"
 						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
-							? status.outcome!.reason!
+							? status.outcome?.reason!
 							: "stopped_incomplete";
 	return { kind: "broker", observedAt, reasonCode, status };
 }
@@ -2329,7 +2329,7 @@ export function reportText(
 	}
 
 	if (factsLines.length > 0 && body) {
-		body = body + " " + factsLines.join(" ");
+		body = `${body} ${factsLines.join(" ")}`;
 	} else if (factsLines.length > 0) {
 		body = factsLines.join(" ");
 	}

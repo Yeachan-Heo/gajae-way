@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import type { MemoryClosureQueue } from "./closure";
-import { type CorpusWriter, corpusEntries, regenerateMap } from "./doctrine";
+import { corpusEntries, regenerateMap } from "./doctrine";
 import { loadRegistry } from "./registry";
 
 /**
@@ -99,7 +99,7 @@ function normalizeAlias(alias: string): string {
 }
 
 export async function buildAliasIndex(
-	root: string,
+	_root: string,
 	files: readonly string[],
 	texts: ReadonlyMap<string, string>,
 ): Promise<AliasEntry[]> {

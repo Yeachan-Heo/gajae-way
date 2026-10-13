@@ -78,12 +78,12 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+		for (let attempt = 0; attempt < 100 && db?.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT] This is a status update");
+		expect(db?.monitors.authoredOutput(eventId)).toBe("[SILENT] This is a status update");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.outbox.rows()).toHaveLength(0);
+		expect(db?.outbox.rows()).toHaveLength(0);
 	});
 
 	test("note with [SILENT] mid-text is also NOT delivered (grammar: anywhere silences)", async () => {
@@ -102,13 +102,13 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+		for (let attempt = 0; attempt < 100 && db?.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
+		expect(db?.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
 		// [SILENT] anywhere silences (per containsSilenceToken grammar)
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.outbox.rows()).toHaveLength(0);
+		expect(db?.outbox.rows()).toHaveLength(0);
 	});
 
 	test("only [SILENT] token (exact match) is also silent", async () => {
@@ -121,11 +121,11 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
+		for (let attempt = 0; attempt < 100 && db?.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(db?.monitors.authoredOutput(eventId)).toBe("[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.outbox.rows()).toHaveLength(0);
+		expect(db?.outbox.rows()).toHaveLength(0);
 	});
 });

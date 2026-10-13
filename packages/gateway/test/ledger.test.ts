@@ -105,7 +105,7 @@ test("ambiguous failures never expire by count", async () => {
 		});
 		for (let attempt = 0; attempt < 9; attempt++) ledger.fail("ambiguous", true);
 		expect(ledger.get("ambiguous")).toMatchObject({ state: "failed_ambiguous", attempts: 9 });
-		const updatedAt = Date.parse(ledger.get("ambiguous")!.updatedAt);
+		const updatedAt = Date.parse(ledger.get("ambiguous")?.updatedAt);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 5 * 60_000 - 1)).toHaveLength(0);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 5 * 60_000)).toHaveLength(1);
 		database.close();
@@ -121,18 +121,18 @@ test("retry backoff doubles from two seconds and caps at five minutes", async ()
 		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "backoff", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.fail("backoff");
-		let updatedAt = Date.parse(ledger.get("backoff")!.updatedAt);
+		let updatedAt = Date.parse(ledger.get("backoff")?.updatedAt);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 1_999)).toHaveLength(0);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 2_000)).toHaveLength(1);
 		ledger.fail("backoff");
-		updatedAt = Date.parse(ledger.get("backoff")!.updatedAt);
+		updatedAt = Date.parse(ledger.get("backoff")?.updatedAt);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 3_999)).toHaveLength(0);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 4_000)).toHaveLength(1);
 		// A newly negotiated adapter is a new transport: backoff does not gate its replay.
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt, true)).toHaveLength(1);
 		for (let attempt = 0; attempt < 8; attempt++) ledger.fail("backoff", true);
 		expect(ledger.get("backoff")?.attempts).toBe(10);
-		updatedAt = Date.parse(ledger.get("backoff")!.updatedAt);
+		updatedAt = Date.parse(ledger.get("backoff")?.updatedAt);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 5 * 60_000 - 1)).toHaveLength(0);
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt + 5 * 60_000)).toHaveLength(1);
 		database.close();
@@ -215,10 +215,10 @@ test("requeue-by-id and requeue-since reset eligible rows without touching confi
 		ledger.fail("ambiguous", true);
 		ledger.fail("confirmed");
 		ledger.confirm("confirmed");
-		const priorUpdatedAt = ledger.get("expired")!.updatedAt;
+		const priorUpdatedAt = ledger.get("expired")?.updatedAt;
 		expect(ledger.requeueById("expired")).toEqual(["expired"]);
 		expect(ledger.get("expired")).toMatchObject({ state: "pending", attempts: 0 });
-		expect(Date.parse(ledger.get("expired")!.updatedAt)).toBeGreaterThanOrEqual(Date.parse(priorUpdatedAt));
+		expect(Date.parse(ledger.get("expired")?.updatedAt)).toBeGreaterThanOrEqual(Date.parse(priorUpdatedAt));
 		expect(ledger.requeueById("confirmed")).toEqual([]);
 		expect(ledger.requeueById("unknown")).toEqual([]);
 		const since = new Date(Date.now() - 10_000).toISOString();
@@ -255,8 +255,8 @@ test("timed sweep does not re-broadcast fresh inflight rows until ack timeout ex
 		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "inflight", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("inflight");
-		const createdAt = Date.parse(ledger.get("inflight")!.createdAt);
-		const updatedAt = Date.parse(ledger.get("inflight")!.updatedAt);
+		const _createdAt = Date.parse(ledger.get("inflight")?.createdAt);
+		const updatedAt = Date.parse(ledger.get("inflight")?.updatedAt);
 
 		// Fresh inflight row should not be returned by the timed sweep (ignoreBackoff=false)
 		expect(ledger.listUndelivered(24 * 60 * 60_000, updatedAt, false)).toHaveLength(0);
@@ -280,7 +280,7 @@ test("onConnect sweep replays inflight rows immediately without waiting for ack 
 		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "inflight", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("inflight");
-		const updatedAt = Date.parse(ledger.get("inflight")!.updatedAt);
+		const updatedAt = Date.parse(ledger.get("inflight")?.updatedAt);
 
 		// Immediately after marking inflight, with ignoreBackoff=true (onConnect case)
 		const undelivered = ledger.listUndelivered(24 * 60 * 60_000, updatedAt, true);
@@ -300,7 +300,7 @@ test("timed sweep re-broadcasts inflight rows after ack timeout for crash/lost-a
 		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "lost-ack", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("lost-ack");
-		const updatedAt = Date.parse(ledger.get("lost-ack")!.updatedAt);
+		const updatedAt = Date.parse(ledger.get("lost-ack")?.updatedAt);
 
 		// Within ack timeout, not returned by timed sweep (ignoreBackoff=false)
 		let undelivered = ledger.listUndelivered(24 * 60 * 60_000, updatedAt + ACK_TIMEOUT_MS - 1, false);

@@ -110,7 +110,7 @@ test("coverage audit attributes a message arriving exactly at the settle fire bo
 		now = base + 100;
 		await fixtureState.manager.tick(ORIGIN_KEY);
 		await eventually(() => fixtureState.port.sends.length === 1, "boundary batch did not dispatch");
-		fixtureState.port.complete(fixtureState.port.sends[0]!.opRef, "done");
+		fixtureState.port.complete(fixtureState.port.sends[0]?.opRef, "done");
 		await eventually(
 			() => fixtureState.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"boundary message remained pending past settle plus grace",

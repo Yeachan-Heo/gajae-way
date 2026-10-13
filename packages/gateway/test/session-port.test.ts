@@ -38,7 +38,7 @@ test("opt-in fake ownership records only successful binds and refuses unknown sa
 	);
 	expect(fake.resumes).toHaveLength(0);
 	await port.bind({ originKey: "origin", epoch: 0, repo });
-	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, "origin"));
+	database?.transaction((tx) => database?.bindings.rotateEpoch(tx, "origin"));
 	await port.bind({ originKey: "origin", epoch: 1, repo });
 	fake.setSessionState("owned-0", { live: false });
 	await port.resume({ sessionId: "owned-0", repo, originKey: "origin", epoch: 0 });
@@ -448,7 +448,7 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 	expect(calls.some((args) => args.includes("session.last_assistant"))).toBe(false);
 	// The relay is closed once the request settles.
 	expect(relay.streams).toHaveLength(1);
-	expect(relay.streams[0]!.closed).toBe(true);
+	expect(relay.streams[0]?.closed).toBe(true);
 });
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
@@ -988,7 +988,7 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 test("legacy private bindings cannot initialize a global port or be resumed and rebound", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-legacy-"));
 	database = await Store.open(join(home, "gateway.db"));
-	database!.transaction((tx) => database!.bindings.bindAtEpoch(tx, "legacy", "private-session", 0));
+	database?.transaction((tx) => database?.bindings.bindAtEpoch(tx, "legacy", "private-session", 0));
 	const authority = { canonicalAgentDir: join(home, "global"), identity: `gjc:${join(home, "global")}` };
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
@@ -1006,8 +1006,8 @@ test("legacy private bindings cannot initialize a global port or be resumed and 
 			}),
 	).toThrow(BrokerAuthorityError);
 	expect(() =>
-		database!.transaction((tx) =>
-			database!.bindings.initializeAuthority(tx, authority, database!.inspectBrokerAuthority().populated),
+		database?.transaction((tx) =>
+			database?.bindings.initializeAuthority(tx, authority, database?.inspectBrokerAuthority().populated),
 		),
 	).toThrow(BrokerAuthorityError);
 	expect(database.bindings.getSessionRecord("legacy")).toMatchObject({ sessionId: "private-session", epoch: 0 });
@@ -1022,8 +1022,8 @@ test("bind rejects an unowned persisted ID before inspect and without epoch rota
 	await createOwnedSessionFixture(database, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
 	const record = database.bindings.getSessionRecord("origin")!;
 	// Corrupt the read boundary deliberately: no production adoption API is used.
-	const getSessionRecord = database!.bindings.getSessionRecord.bind(database!.bindings);
-	database!.bindings.getSessionRecord = () => ({ ...record, sessionId: "private-session" });
+	const getSessionRecord = database?.bindings.getSessionRecord.bind(database?.bindings);
+	database?.bindings.getSessionRecord = () => ({ ...record, sessionId: "private-session" });
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
@@ -1040,7 +1040,7 @@ test("bind rejects an unowned persisted ID before inspect and without epoch rota
 		await expect(port.bind({ originKey: "origin", epoch: 0, repo })).rejects.toBeInstanceOf(BrokerAuthorityError);
 		expect(calls).toEqual([]);
 	} finally {
-		database!.bindings.getSessionRecord = getSessionRecord;
+		database?.bindings.getSessionRecord = getSessionRecord;
 	}
 	expect(database.bindings.getSessionRecord("origin")).toEqual(record);
 });
@@ -1059,7 +1059,7 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 	database.close();
 	database = await Store.open(join(home, "gateway.db"));
 	database.bindings.assertAuthority(authority);
-	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, "origin"));
+	database?.transaction((tx) => database?.bindings.rotateEpoch(tx, "origin"));
 	await createOwnedSessionFixture(database, authority, {
 		sessionId: "current-owned",
 		originKey: "origin",
@@ -1091,8 +1091,8 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		canonicalAgentDir: join(home, "other-agent"),
 		identity: `gjc:${join(home, "other-agent")}`,
 	};
-	database!.transaction((tx) =>
-		database!.bindings.cutoverBrokerAuthority(tx, {
+	database?.transaction((tx) =>
+		database?.bindings.cutoverBrokerAuthority(tx, {
 			expectedAuthority: authority,
 			targetAuthority,
 			evidence: "test fixture cutover",
@@ -1190,11 +1190,11 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 	expect((await port.fetchLastAssistant({ sessionId: "owned", repo })).text).toBe("owned answer");
 	expect(await port.setModel({ sessionId: "owned", repo, selection: "model" })).toEqual({ changed: true });
 	expect(calls).toHaveLength(2);
-	expect(() => database!.inspectBrokerAuthority()).toThrow();
+	expect(() => database?.inspectBrokerAuthority()).toThrow();
 	expect(database.work.laneJobJson("lanejob-unrelated")).toBe("{");
 	expect(() =>
-		database!.transaction((tx) =>
-			database!.bindings.cutoverBrokerAuthority(tx, {
+		database?.transaction((tx) =>
+			database?.bindings.cutoverBrokerAuthority(tx, {
 				expectedAuthority: authority,
 				targetAuthority: { ...authority, identity: "different" },
 				evidence: "must validate history",
@@ -1300,7 +1300,7 @@ test("a relay that dies before the steer reply is ambiguity, never a definitive 
 	});
 	const attempt = port.steer({ sessionId: "sdk-1", repo: "/tmp/repo", text: "input", clientRef: "expected-ref" });
 	await Bun.sleep(5);
-	relay.streams[0]!.close();
+	relay.streams[0]?.close();
 	const failure = await attempt.catch((error: unknown) => error);
 	expect(failure).toBeInstanceOf(Error);
 	expect((failure as { details?: { refused?: boolean } }).details?.refused).toBeUndefined();
@@ -1428,7 +1428,7 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 			return { ok: true, result: { commandId: "c", turnId: "t", accepted: true, clientRef: request.input.clientRef } };
 		relayQueries += 1;
 		// The relay tears on the first status read: the answer never comes.
-		relay.streams[0]!.close();
+		relay.streams[0]?.close();
 		return new Promise(() => {});
 	});
 	const port = new BrokerSessionPort({
@@ -1492,7 +1492,7 @@ for (const progressing of [true, false]) {
 			sleep: async (ms) => {
 				clock += ms;
 				if (progressing)
-					relay.streams[0]!.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
+					relay.streams[0]?.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
 				// Let the pushed frame reach the handle before the next deadline check.
 				await Bun.sleep(1);
 			},

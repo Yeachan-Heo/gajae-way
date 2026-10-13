@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireLease, LeaseHeldError, leaseHeld } from "@gajae-gateway/home";
+import { acquireLease, leaseHeld } from "@gajae-gateway/home";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { bootGateway } from "../src/boot";
 import { readPinnedGjcVersion } from "../src/orchestrator/broker";

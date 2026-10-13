@@ -68,7 +68,7 @@ test("connectSocketWithBackoff retries until a late Unix socket appears", async 
 		expect(retries.map(({ attempt }) => attempt)).toEqual(retries.map((_, index) => index + 1));
 	} finally {
 		await client.close();
-		if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+		if (server) await new Promise<void>((resolve) => server?.close(() => resolve()));
 		const index = servers.indexOf(server!);
 		if (index >= 0) servers.splice(index, 1);
 	}

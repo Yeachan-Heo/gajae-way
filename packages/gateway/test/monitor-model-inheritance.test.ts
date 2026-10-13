@@ -10,7 +10,7 @@ import { sessionPortFromScript } from "./session-port.fake";
 
 const responseFor = (prompt: string) =>
 	JSON.stringify([
-		{ eventId: (JSON.parse(prompt.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>)[0]!.eventId, note: "ok" },
+		{ eventId: (JSON.parse(prompt.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>)[0]?.eventId, note: "ok" },
 	]);
 
 test("monitors inherit gateway model/tier by default and may override both per monitor", async () => {

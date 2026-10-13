@@ -463,7 +463,9 @@ test("G6 idle retirement interval starts at turn end, including the exact bounda
 	});
 	expect((await h.run("a")).result.text).toBe("done");
 	const governor = new LaneGovernor({ database: h.database, sessionPort: h.port, idleRetireMs });
-	const activityAt = Date.parse(governor.activeLanes()[0]!.lastActivityAt!);
+	const lane = governor.activeLanes()[0];
+	const lastActivityAt = lane?.lastActivityAt ?? "0";
+	const activityAt = Date.parse(lastActivityAt);
 	expect(completedAt - startedAt).toBeGreaterThanOrEqual(idleRetireMs);
 	expect(activityAt).toBeGreaterThanOrEqual(completedAt);
 	expect(await governor.sweep(activityAt + idleRetireMs - 1)).toBe(0);

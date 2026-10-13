@@ -11,7 +11,7 @@ export async function startScript(
 ): Promise<() => void> {
 	if (!command.length) throw new Error("script command is required");
 	const root = await realpath(scriptRoot);
-	const executable = await realpath(command[0]!);
+	const executable = await realpath(command[0]);
 	if (!(executable === root || executable.startsWith(`${root}${sep}`)))
 		throw new Error("script executable is outside allowlist");
 	const guard = new ActionGuard();

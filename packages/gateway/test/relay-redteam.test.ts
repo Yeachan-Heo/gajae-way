@@ -248,7 +248,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 		const f = await actor(port);
 		await f.enqueue("trigger");
 		expect(sequence).toEqual(["send", "status"]);
-		const op = port.sendAttempts[0]!.opRef;
+		const op = port.sendAttempts[0]?.opRef;
 		expect(f.db.inbox.turnRow(op)?.turn_state).toBe(state === "unknown" ? "bound" : "accepted");
 		if (state === "unknown") expect(f.logs.some((line) => line.includes("operation_state_unknown"))).toBe(true);
 		expect(f.released).toEqual([]);
@@ -335,7 +335,7 @@ test("RT06 status query timeout keeps actor accepted and held", async () => {
 	await f.manager.reconcile(key);
 	expect(sawRelay).toBe(true);
 	expect(f.logs.some((line) => line.includes("reason=status_unavailable"))).toBe(true);
-	expect(f.db.inbox.turnRow(f.port.sends[0]!.opRef)?.turn_state).toBe("accepted");
+	expect(f.db.inbox.turnRow(f.port.sends[0]?.opRef)?.turn_state).toBe("accepted");
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.released).toEqual([]);
 });
@@ -418,7 +418,7 @@ test("RT09 steer uses owned connection and held steer replay retains clientRef w
 	expect(port.steers.length).toBeGreaterThan(1);
 	expect(port.steers[0]?.relay).toBe(port.sends[0]?.relay);
 	accept = true;
-	port.complete(port.sends[0]!.opRef, "done");
+	port.complete(port.sends[0]?.opRef, "done");
 	await until(() => f.terminal.length === 1);
 	await f.manager.reconcile(key);
 	expect(new Set(port.steers.map((input) => input.clientRef)).size).toBe(1);

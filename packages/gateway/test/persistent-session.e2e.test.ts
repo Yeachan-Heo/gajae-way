@@ -335,7 +335,7 @@ liveTest(
 			}
 		}
 		if (failures.length || preservation.length)
-			throw new Error("persistent live failure " + JSON.stringify({ stage, failures, preservation }));
+			throw new Error(`persistent live failure ${JSON.stringify({ stage, failures, preservation })}`);
 	},
 	300_000,
 );

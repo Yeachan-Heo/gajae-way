@@ -464,8 +464,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async fetchLastAssistant(input: { sessionId: string; repo: string }) {
 		const operation = [...this.#operations.values()].reverse().find((entry) => entry.sessionId === input.sessionId);
-		if (!operation || operation.state !== "terminal_ok")
-			throw new Error("scripted session has no terminal assistant output");
+		if (operation?.state !== "terminal_ok") throw new Error("scripted session has no terminal assistant output");
 		return { text: operation.text, pages: 1, complete: true };
 	}
 

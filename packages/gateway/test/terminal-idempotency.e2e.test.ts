@@ -122,8 +122,8 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 	});
 	try {
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId: "m-fence",
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
@@ -168,12 +168,12 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	port.emitTool(send.sessionId);
 	port.emitAssistant(send.sessionId, "재시작해도 한 번만", "evt-final-1", send.opRef);
 	await eventually(() => messages(client).length === 1, "tail answer was not delivered");
-	const before = database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const before = database?.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(before).toHaveLength(1);
-	expect(before[0]!.delivery_id.startsWith("gw-i-")).toBe(true);
+	expect(before[0]?.delivery_id.startsWith("gw-i-")).toBe(true);
 	// The gateway dies before the batch completes; the daemon finishes the op.
 	const dbPath = join(directory, "gateway.db");
-	await server!.stop();
+	await server?.stop();
 	server = undefined;
 	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "재시작해도 한 번만");
 	// A fresh gateway on the same database recovers the accepted batch with no
@@ -194,11 +194,11 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	};
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	await eventually(
-		() => database!.inbox.nonterminalTurns("discord/channel/chan-1").length === 0,
+		() => database?.inbox.nonterminalTurns("discord/channel/chan-1").length === 0,
 		"recovered batch never completed",
 		2_000,
 	);
-	const after = database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const after = database?.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(after.map((row) => row.delivery_id)).toEqual(before.map((row) => row.delivery_id));
 }, 20_000);
 
@@ -210,7 +210,7 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 	const send = port.sends[0]!;
 	port.complete(send.opRef, "하나\n[BREAK]\n둘\n[BREAK]\n셋");
 	await eventually(() => messages(client).length === 3, "three parts were not delivered");
-	const rows = () => database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const rows = () => database?.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(rows().map((row) => JSON.parse(row.payload_json).text)).toEqual(["하나", "둘", "셋"]);
 	// Each part landed exactly once. The finalized text reached the gateway on
 	// the tail first, so the rows are the interim ones; the terminal path then
@@ -223,7 +223,7 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 	// part. Exercise the real claim with the real op-ref.
 	for (let part = 0; part < 3; part++) {
 		const regenerated = deterministicTerminalDeliveryId("discord/channel/chan-1", "m-b1", part);
-		const owner = database!.transaction((tx) => database!.inbox.claimTerminal(tx, send.opRef, part, regenerated));
+		const owner = database?.transaction((tx) => database?.inbox.claimTerminal(tx, send.opRef, part, regenerated));
 		expect(owner).not.toBe(regenerated);
 		expect(rows().some((row) => row.delivery_id === owner)).toBe(true);
 	}
@@ -257,8 +257,8 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 	});
 	const enqueue = (messageId: string, body: string, receivedAt: string) =>
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId,
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
@@ -275,7 +275,7 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 		enqueue("m-c2", "밀린 질문", new Date(Date.now() - 4_000).toISOString());
 		// Turn 1 completes AFTER message 2's inclusion cutoff (received_at + 0ms).
 		await Bun.sleep(50);
-		port.complete(port.sends[0]!.opRef, "첫 답");
+		port.complete(port.sends[0]?.opRef, "첫 답");
 		await eventually(() => terminals.length === 1, "first reply missing");
 		// The backlog batch dispatches now with an old cutoff; its op then ends
 		// with NO assistant row of its own.
@@ -328,12 +328,12 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 	port.emitAssistant(send.sessionId, "첫 번째 발견: 500이 3분마다 찍힘", null, send.opRef);
 	port.emitAssistant(send.sessionId, "두 번째 발견: 토큰 갱신이 실패함", null, send.opRef);
 	await eventually(() => messages(client).length === 2, "two interim findings were not delivered");
-	const rows = database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	const rows = database?.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(new Set(rows.map((row) => row.delivery_id)).size).toBe(2);
 	// Replaying the first interim text (e.g. after a stream reopen backfill) is a ledger no-op.
 	port.emitAssistant(send.sessionId, "첫 번째 발견: 500이 3분마다 찍힘", null, send.opRef);
 	await Bun.sleep(100);
-	expect(database!.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1")).toHaveLength(2);
+	expect(database?.outbox.rows().filter((row) => row.origin_key === "discord/channel/chan-1")).toHaveLength(2);
 	port.complete(send.opRef, "끝");
 });
 
@@ -368,8 +368,8 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId,
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
@@ -382,7 +382,7 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 		enqueue("m-a1", "첫 질문");
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first turn was not sent");
-		port.complete(port.sends[0]!.opRef, "첫 답");
+		port.complete(port.sends[0]?.opRef, "첫 답");
 		await eventually(() => terminals.length === 1, "first reply missing");
 
 		enqueue("m-a2", "둘째 질문");
@@ -438,8 +438,8 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 	let recovered: PersonaSessionManager | undefined;
 	try {
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId: "m-q1",
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
@@ -466,14 +466,14 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 		await Bun.sleep(400);
 		await recovered.reconcile("discord/channel/chan-1");
 		await eventually(
-			() => database!.inbox.nonterminalTurns("discord/channel/chan-1").length === 0,
+			() => database?.inbox.nonterminalTurns("discord/channel/chan-1").length === 0,
 			"failed turn did not settle",
 		);
 		expect(port.sends).toHaveLength(1);
 		expect(terminals).toEqual([]);
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId: "m-q2",
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
@@ -529,8 +529,8 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 	});
 	try {
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId: "m-l1",
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
@@ -606,8 +606,8 @@ test("a foreign turn's answer cannot replace the current turn's result-only term
 	});
 	const enqueue = (messageId: string, body: string) =>
 		expect(
-			database!.transaction((tx) =>
-				database!.inbox.enqueue(tx, {
+			database?.transaction((tx) =>
+				database?.inbox.enqueue(tx, {
 					messageId,
 					originKey: "discord/channel/chan-1",
 					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),

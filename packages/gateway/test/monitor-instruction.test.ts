@@ -21,7 +21,7 @@ async function harness(directory: string) {
 			scripted.complete(
 				input.opRef,
 				JSON.stringify(
-					(JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+					(JSON.parse(input.text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "recorded",
 					})),
@@ -87,7 +87,7 @@ test("a monitor without an instruction keeps the exact pre-existing prompt shape
 		expect(prompts).toHaveLength(1);
 		// No instruction and no maintenance guidance for this event type: no
 		// guidance segment at all.
-		expect(prompts[0]!.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		expect(prompts[0]?.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -203,8 +203,8 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 			sessionPort: new ScriptedSessionPort({
 				onSend: (input, scripted) => {
 					prompts.push(input.text);
-					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "No new friction." }]));
+					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>;
+					scripted.complete(input.opRef, JSON.stringify([{ eventId: event?.eventId, note: "No new friction." }]));
 				},
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
@@ -214,11 +214,11 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 		});
 		pipeline.submit(monitorId, "gajaeway.runtime-feedback.daily", { at: "2026-09-07T11:00:00.000Z" });
 		await Bun.sleep(250);
-		expect(prompts[0]!.startsWith(`Author monitor events. ${instruction} Respond ONLY`)).toBe(true);
+		expect(prompts[0]?.startsWith(`Author monitor events. ${instruction} Respond ONLY`)).toBe(true);
 		expect(delivered).toHaveLength(1);
-		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
+		expect(delivered[0]?.origin).toEqual(channelTarget.origin);
 		// The mention comes from the typed field, not from the author remembering it.
-		expect(delivered[0]!.text).toBe("<@1468532331001413743> No new friction.");
+		expect(delivered[0]?.text).toBe("<@1468532331001413743> No new friction.");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

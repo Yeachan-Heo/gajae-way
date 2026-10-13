@@ -621,7 +621,7 @@ test("CLI, version preflight and stdio relay use exactly one executable, cwd and
 	for (const invocation of invocations) {
 		expect(invocation.cmd[0]).toBe("/opt/user-selected/gjc");
 		expect(invocation.cwd).toBe(cwd);
-		expect(invocation.env).toEqual(invocations[0]!.env);
+		expect(invocation.env).toEqual(invocations[0]?.env);
 		expect(invocation.env.GJC_CODING_AGENT_DIR).toBe(agentDir);
 		expect(invocation.env[GJC_ATTACH_ONLY_ENV]).toBe("0");
 		expect(invocation.env.PI_CODING_AGENT_DIR).toBeUndefined();

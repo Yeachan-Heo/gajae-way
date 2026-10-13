@@ -966,7 +966,7 @@ function trustedEnvironment(cwd: string): Record<string, string> {
 				throw error;
 			}
 			for (const match of text.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/gm)) {
-				const key = process.platform === "win32" ? match[1]!.toUpperCase() : match[1]!;
+				const key = process.platform === "win32" ? match[1]?.toUpperCase() : match[1]!;
 				if (sensitive.has(key) && env[key])
 					throw new Error(`Cannot trust project-declared ${key}; launch from a clean service directory`);
 			}

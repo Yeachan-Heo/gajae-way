@@ -202,7 +202,7 @@ class UnavailableReplacementBindPort extends ScriptedSessionPort {
 		return await super.bind(input);
 	}
 
-	async steer(input: SessionSteerInput): Promise<void> {
+	async steer(_input: SessionSteerInput): Promise<void> {
 		this.steerAttempts++;
 		throw steerRefused("scripted steer refusal");
 	}
@@ -537,8 +537,8 @@ test("C3b: consecutive refusals each wait for the current terminal without rotat
 		expect(port.sends).toHaveLength(2);
 		expect(port.steerAttempts).toBe(2);
 		expect(fixture.database.inbox.nonterminalTurns(DIRECT_ORIGIN_KEY)).toHaveLength(1);
-		expect(fixture.database.inbox.turnRow(port.sends[1]!.opRef)?.turn_state).toBe("accepted");
-		port.complete(port.sends[1]!.opRef, "answer 1");
+		expect(fixture.database.inbox.turnRow(port.sends[1]?.opRef)?.turn_state).toBe("accepted");
+		port.complete(port.sends[1]?.opRef, "answer 1");
 		await eventually(
 			() => port.sends.length === 3 && port.steers.length === 1,
 			"pending rows did not dispatch after terminal",
@@ -548,7 +548,7 @@ test("C3b: consecutive refusals each wait for the current terminal without rotat
 		expect(port.sends.map((send) => send.text)).toEqual(["old", "first refusal", "second refusal"]);
 		expect(steerBodies(port)).toEqual(["new row behind refusal"]);
 		expect(new Set(port.sends.map((send) => send.opRef)).size).toBe(3);
-		port.complete(port.sends[2]!.opRef, "answer 2");
+		port.complete(port.sends[2]?.opRef, "answer 2");
 		await eventually(
 			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"consecutive-refusal turns did not drain",
@@ -582,7 +582,7 @@ test("C3c: steer refusal never attempts unavailable replacement binds; explicit 
 		await eventually(() => port.sends.length === 2, "pending row did not reuse the available session");
 		expect(port.sends[1]?.sessionId).toBe(old.sessionId);
 		expect(port.bindAttempts).toBe(1);
-		port.complete(port.sends[1]!.opRef, "pending answer");
+		port.complete(port.sends[1]?.opRef, "pending answer");
 		await eventually(
 			() => fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"refusal sequence did not drain",
@@ -994,7 +994,7 @@ test("C6b: an accepted operation on a broker-disowned dead session is closed at 
 		enqueue(fixture, "after-close", "a new question");
 		await recovered.notifyInbound(DIRECT_ORIGIN_KEY);
 		await eventually(() => port.sends.length === 2, "new message was not sent after the close");
-		expect(port.sends[1]!.sessionId).not.toBe(first.sessionId);
+		expect(port.sends[1]?.sessionId).not.toBe(first.sessionId);
 	} finally {
 		await recovered?.stop();
 		await fixture.close();

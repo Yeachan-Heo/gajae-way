@@ -159,13 +159,13 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
 	const requestId = "req-1";
 	socket.write(
-		JSON.stringify({
+		`${JSON.stringify({
 			v: "0.1",
 			type: "request",
 			id: requestId,
@@ -176,7 +176,7 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 				messageId: "m-1",
 				engagement: { mentioned: true, group: true, authorId: "user-1" },
 			},
-		}) + "\n",
+		})}\n`,
 	);
 
 	// Wait for the turn to be sent to the session port
@@ -260,13 +260,13 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
 	const requestId = "req-2";
 	socket.write(
-		JSON.stringify({
+		`${JSON.stringify({
 			v: "0.1",
 			type: "request",
 			id: requestId,
@@ -277,7 +277,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 				messageId: "m-2",
 				engagement: { mentioned: true, group: true, authorId: "user-1" },
 			},
-		}) + "\n",
+		})}\n`,
 	);
 
 	// Wait for the turn to be sent to the session port
@@ -310,7 +310,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 
 	// With maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
 	expect(messages.length).toBe(1);
-	expect(messages[0]!.payload.text).toBe("final-answer-maxperturn-0");
+	expect(messages[0]?.payload.text).toBe("final-answer-maxperturn-0");
 });
 
 test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.ts, scripted turn runs, 0 interim deliveries", async () => {
@@ -365,13 +365,13 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
 	const requestId = "req-3";
 	socket.write(
-		JSON.stringify({
+		`${JSON.stringify({
 			v: "0.1",
 			type: "request",
 			id: requestId,
@@ -382,7 +382,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 				messageId: "m-3",
 				engagement: { mentioned: true, group: true, authorId: "user-1" },
 			},
-		}) + "\n",
+		})}\n`,
 	);
 
 	// Wait for the turn to be sent to the session port
@@ -415,5 +415,5 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 
 	// With config-based maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
 	expect(messages.length).toBe(1);
-	expect(messages[0]!.payload.text).toBe("final-boot-answer");
+	expect(messages[0]?.payload.text).toBe("final-boot-answer");
 });

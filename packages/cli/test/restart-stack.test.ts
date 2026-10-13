@@ -16,7 +16,7 @@ import {
 	supervisorArgv,
 } from "../src/restart-stack";
 
-import { GATEWAY_UNIT, serviceSpecs, systemdUnitName, systemdUnitPath } from "../src/services";
+import { serviceSpecs, systemdUnitName, systemdUnitPath } from "../src/services";
 
 const DEPLOYED_AT = Date.parse("2026-08-29T06:40:00.000Z");
 const BIN_DIR = "/opt/gajaeway/bin";

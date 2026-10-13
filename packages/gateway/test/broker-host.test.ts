@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
 import { credentialFingerprint } from "../src/broker-agent/agent-db";
@@ -72,7 +72,7 @@ async function installFakeGjc(
 	const wait = options.waitForTerm ? "while :; do sleep 0.05; done" : "exit 0";
 	const script = [
 		"#!/bin/sh",
-		'if [ "$1" = "--version" ]; then printf \'gjc %s\\n\' ' + shellQuote(version) + "; exit 0; fi",
+		`if [ "$1" = "--version" ]; then printf 'gjc %s\\n' ${shellQuote(version)}; exit 0; fi`,
 		`printf '%s\\n' "$@" > ${shellQuote(argsPath)}`,
 		`printf '%s\\n%s\\n%s\\n' "$GJC_CODING_AGENT_DIR" "$GJC_SDK_BROKER_AUTOSTART" "$MODEL_PROVIDER_KEY" > ${shellQuote(envPath)}`,
 		`trap 'printf forwarded > ${shellQuote(termPath)}; exit 23' TERM`,

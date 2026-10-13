@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, join } from "node:path";
+import { isAbsolute } from "node:path";
 
 import type {
 	MonitorEventRecord,

@@ -68,7 +68,7 @@ async function fixture() {
 			original[name] = null;
 		}
 	}
-	if (!original["gateway.db-wal"] || original["gateway.db-wal"]!.size === 0)
+	if (!original["gateway.db-wal"] || original["gateway.db-wal"]?.size === 0)
 		throw new Error("fixture failed to leave a non-empty WAL");
 
 	const sourcePath = join(root, "backup-source.db");

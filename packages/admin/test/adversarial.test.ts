@@ -95,23 +95,19 @@ describe("nothing dispatches without the full contract", () => {
 		}
 	});
 
-	test.each([
-		"HEAD",
-		"PUT",
-		"PATCH",
-		"DELETE",
-		"OPTIONS",
-		"GET",
-	])("%s on the mutation path is refused", async (method) => {
-		const app = harness();
-		try {
-			const response = await app.fetch("/api/mutations", { method });
-			expect(response.status).toBe(405);
-			assertNothingDispatched(app);
-		} finally {
-			app.stop();
-		}
-	});
+	test.each(["HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "GET"])(
+		"%s on the mutation path is refused",
+		async (method) => {
+			const app = harness();
+			try {
+				const response = await app.fetch("/api/mutations", { method });
+				expect(response.status).toBe(405);
+				assertNothingDispatched(app);
+			} finally {
+				app.stop();
+			}
+		},
+	);
 
 	test("params cannot pollute the prototype", async () => {
 		const app = harness();
@@ -257,18 +253,19 @@ describe("hostile gateway data cannot become markup", () => {
 		return renderIndex(snapshot, DEFAULT_ALLOWLIST);
 	}
 
-	test.each(
-		HOSTILE.map((value, index) => [index, value] as const),
-	)("payload %i introduces no script element and closes none", async (_index, value) => {
-		const html = await documentWith(value);
-		expect(html).not.toContain("<script>alert");
-		// Exactly the three script elements this document authors: two data
-		// islands and the body. Any injection would change the count.
-		expect(html.match(/<script/g)?.length).toBe(3);
-		expect(html.match(/<\/script>/g)?.length).toBe(3);
-		const bootstrap = html.slice(html.indexOf('id="bootstrap"'));
-		expect(bootstrap).not.toContain("</script><script>alert");
-	});
+	test.each(HOSTILE.map((value, index) => [index, value] as const))(
+		"payload %i introduces no script element and closes none",
+		async (_index, value) => {
+			const html = await documentWith(value);
+			expect(html).not.toContain("<script>alert");
+			// Exactly the three script elements this document authors: two data
+			// islands and the body. Any injection would change the count.
+			expect(html.match(/<script/g)?.length).toBe(3);
+			expect(html.match(/<\/script>/g)?.length).toBe(3);
+			const bootstrap = html.slice(html.indexOf('id="bootstrap"'));
+			expect(bootstrap).not.toContain("</script><script>alert");
+		},
+	);
 });
 
 describe("a hostile or broken gateway never breaks the page", () => {

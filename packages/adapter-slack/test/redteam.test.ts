@@ -46,7 +46,7 @@ process.env.GAJAEWAY_HOME = join(tmpdir(), `slack-test-home-${crypto.randomUUID(
 const origin = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const engagement = { mentioned: false, group: true, authorId: "U1" };
 const names = { userName: () => undefined, userHandle: () => undefined, channelName: () => undefined };
-const cleanups: Array<() => Promise<unknown> | void> = [];
+const cleanups: Array<() => Promise<unknown> | undefined> = [];
 afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
@@ -277,7 +277,7 @@ test("RT-SLACK-04 literal mentions in code count; entities decode once and broad
 });
 
 test("RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks", () => {
-	const chunks = chunkSlackMessage("```ts\n" + "x".repeat(50_000) + "\n```");
+	const chunks = chunkSlackMessage(`\`\`\`ts\n${"x".repeat(50_000)}\n\`\`\``);
 	expect(chunks.length).toBeGreaterThan(12);
 	for (const chunk of chunks) {
 		expect(chunk.length).toBeLessThanOrEqual(4000);
@@ -294,7 +294,7 @@ test("RT-SLACK-06 file-only body survives and empty body drops", async () => {
 	await f.event({ ts: "2.0", text: "", files: [] });
 	const sends = f.client.calls.filter((c) => c.verb === "chat.send");
 	expect(sends).toHaveLength(1);
-	expect(sends[0]!.params.text).toContain("report.pdf");
+	expect(sends[0]?.params.text).toContain("report.pdf");
 });
 
 test("RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send", async () => {
@@ -320,8 +320,8 @@ test("RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf", async () 
 	await f.event({ ts: "2.0", thread_ts: "1.0", parent_user_id: "UBOT" });
 	await f.event({ ts: "3.0", thread_ts: "1.0" });
 	const sends = f.client.calls.filter((c) => c.verb === "chat.send");
-	expect(sends[0]!.params.engagement.mentioned).toBe(true);
-	expect(sends[1]!.params.engagement.replyTo).not.toHaveProperty("fromSelf");
+	expect(sends[0]?.params.engagement.mentioned).toBe(true);
+	expect(sends[1]?.params.engagement.replyTo).not.toHaveProperty("fromSelf");
 });
 
 test("RT-SLACK-09 transport failure ambiguous, Slack API failure definitive", async () => {
@@ -359,8 +359,8 @@ test("RT-SLACK-10 all three chunks keep thread and duplicate warning", async () 
 	);
 	expect(api.posts).toHaveLength(3);
 	for (const post of api.posts) expect(post[2]).toBe("1.0");
-	expect(api.posts[0]![1]).toStartWith("[recovered - may be a duplicate]");
-	expect(client.calls[0]!.verb).toBe("delivery.confirm");
+	expect(api.posts[0]?.[1]).toStartWith("[recovered - may be a duplicate]");
+	expect(client.calls[0]?.verb).toBe("delivery.confirm");
 });
 
 test("RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms", async () => {
@@ -384,7 +384,7 @@ test("RT-SLACK-11 malformed and unknown reactions fail without API; already_reac
 		api,
 		delivery({ reaction: { targetMessageId: "C1:1.0", emoji: "✅", emojiName: "check" } }),
 	);
-	expect(client.calls[0]!.verb).toBe("delivery.confirm");
+	expect(client.calls[0]?.verb).toBe("delivery.confirm");
 });
 
 test("RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered", async () => {
@@ -394,7 +394,7 @@ test("RT-SLACK-12 disconnected edit overflow retains newest 256 and replays orde
 	for (let i = 0; i < 300; i++) adapter.sendEdit(`C1:${i}.0`, origin, `edit-${i}`, engagement);
 	await flush();
 	expect(adapter.pendingEdits).toHaveLength(256);
-	expect(adapter.pendingEdits[0]!.text).toBe("edit-44");
+	expect(adapter.pendingEdits[0]?.text).toBe("edit-44");
 	expect(log.mock.calls.filter((c) => String(c[0]).includes("dropped the oldest"))).toHaveLength(44);
 	const client = new Client();
 	adapter.adoptClient(client);
@@ -416,7 +416,7 @@ test("RT-SLACK-13 failed edit remains queued and reconnects for replay", async (
 	const healthy = new Client();
 	adapter.adoptClient(healthy);
 	await flush();
-	expect(healthy.calls[0]!.verb).toBe("chat.edit");
+	expect(healthy.calls[0]?.verb).toBe("chat.edit");
 	expect(adapter.pendingEdits).toEqual([]);
 });
 
@@ -967,15 +967,15 @@ test("RT-SLACK-51 unengaged truncated reply walks persist and drain pending root
 	f.client.engaged = true;
 	await f.event({ ts: "3.0", thread_ts: "1.0" });
 	await f.recoverMissedMessages();
-	const before = (await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]!.lastSeenAt;
+	const before = (await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]?.lastSeenAt;
 	spyOn(f.api, "conversationsReplies").mockImplementationOnce(async () => {
 		now = 20000;
 		await f.event({ ts: "4.0", thread_ts: "1.0" });
 		return { messages: [{ ts: "5.0", user: "U1", text: "walked", thread_ts: "1.0" }], has_more: false };
 	});
 	await f.recoverMissedMessages();
-	expect((await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]!.lastSeenAt >= before).toBe(true);
-	expect((await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]!.lastSeenAt).toBe(
+	expect((await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]?.lastSeenAt >= before).toBe(true);
+	expect((await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]?.lastSeenAt).toBe(
 		new Date(20000).toISOString(),
 	);
 });
@@ -1403,7 +1403,7 @@ test("RT-SLACK-69 retirement frees idle lane and preserves waiter arriving durin
 	await limiter.acquire("C1");
 	expect(timers).toHaveLength(1);
 	now = 100;
-	timers.shift()!.resolve();
+	timers.shift()?.resolve();
 	await flush();
 	expect(limiter.pendingMs("C1")).toBe(0);
 	// Rewind the injected clock: a retained old lane would wait for its old nextAt.

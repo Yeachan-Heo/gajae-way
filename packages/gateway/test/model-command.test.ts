@@ -323,7 +323,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		});
 		await waitFor(() => port.sends.length === 3, "cleared-model persistent turn did not start");
 		expect(port.sends[2]?.sessionId).toBe(first.sessionId);
-		port.complete(port.sends[2]!.opRef, "third transcript");
+		port.complete(port.sends[2]?.opRef, "third transcript");
 	} finally {
 		client?.close();
 		try {

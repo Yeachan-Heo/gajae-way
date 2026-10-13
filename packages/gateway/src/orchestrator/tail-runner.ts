@@ -685,7 +685,7 @@ class ManagedTailHandle implements TailHandle {
 			if (textual && !this.#connectionId && !this.#refusal) {
 				this.#refusal = new RelayRefusedError(
 					this.sessionId,
-					sanitizeDiagnostic(textual[1]!.toLowerCase()) || "relay_refused",
+					sanitizeDiagnostic(textual[1]?.toLowerCase()) || "relay_refused",
 					sanitizeDiagnostic(textual[2] ?? "").slice(0, 200) || undefined,
 				);
 				this.#helloResolve?.();

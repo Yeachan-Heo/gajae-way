@@ -26,7 +26,7 @@ async function harness(home: string) {
 			scripted.complete(
 				input.opRef,
 				JSON.stringify(
-					(JSON.parse(input.text.match(/\[[^[]*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+					(JSON.parse(input.text.match(/\[[^[]*\]$/s)?.[0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "recorded",
 					})),
@@ -83,10 +83,12 @@ test("a procedure edit reaches the very next firing of a long-lived event-type s
 		// Each authored event records the procedure version that produced it.
 		const [second, first] = database.monitors.eventRows(monitor.monitorId);
 		expect(first?.stage).toBe("authored_no_delivery");
-		expect(JSON.parse(first!.procedure_json!)).toEqual([
+		const firstJson = first?.procedure_json;
+		expect(JSON.parse(firstJson!)).toEqual([
 			expect.objectContaining({ path: "memory/ops/gajaeway-feedback.md", status: "ok", sha256: sha256(before) }),
 		]);
-		expect(JSON.parse(second!.procedure_json!)).toEqual([
+		const secondJson = second?.procedure_json;
+		expect(JSON.parse(secondJson!)).toEqual([
 			expect.objectContaining({ status: "ok", sha256: sha256(after) }),
 		]);
 		database.close();
@@ -114,7 +116,8 @@ test("procedure files are confined to the workspace and report their state inste
 		expect(prompts[0]).not.toContain("secret doctrine");
 		const [row] = database.monitors.eventRows(monitor.monitorId);
 		expect(row?.stage).toBe("authored_no_delivery");
-		expect(JSON.parse(row!.procedure_json!).map((entry: { status: string }) => entry.status)).toEqual([
+		const rowJson = row?.procedure_json;
+		expect(JSON.parse(rowJson!).map((entry: { status: string }) => entry.status)).toEqual([
 			"outside_root",
 			"missing",
 			"too_large",
@@ -151,7 +154,7 @@ test("a monitor without procedure files keeps the pre-existing prompt and record
 			burstPolicy: "serialize",
 		});
 		await pipeline.submitAwaitable(monitor.monitorId, "p", {});
-		expect(prompts[0]!.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		expect(prompts[0]?.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
 		expect(database.monitors.eventRows(monitor.monitorId)[0]?.procedure_json).toBeNull();
 		database.close();
 	} finally {

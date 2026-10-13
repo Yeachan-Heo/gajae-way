@@ -353,7 +353,9 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		for (const eventId of healthyIds) expect(rolled.prompt).toContain(`note for ${eventId}`);
 		// The response contract is still the last thing in the prompt.
 		expect(rolled.prompt).toContain('Respond ONLY with a JSON array containing exactly one {"eventId","note"}');
-		const rolledEventId = rolled.prompt.match(/"eventId":"([^"]+)"/)![1]!;
+		const match = rolled.prompt.match(/"eventId":"([^"]+)"/);
+		const matchGroup = match?.[1];
+		const rolledEventId = matchGroup!;
 		expect(database.monitors.authoredOutput(rolledEventId)).toBe(`note for ${rolledEventId}`);
 		// Armed state consumed exactly once: the next healthy turn does not roll again.
 		const after = pipeline.sessionSafetyState(sessionKey);
@@ -361,8 +363,8 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		expect(after.lastRoll).toBe("context_failures_native_compaction_unavailable");
 		expect(after.contextFailures).toBe(0);
 		await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick: 201 });
-		expect(turns.at(-1)!.sessionId).toBe("event-session-e1");
-		expect(turns.at(-1)!.prompt).not.toContain("Context compaction");
+		expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
+		expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -556,7 +558,7 @@ test("a monitor with no instruction is unchanged, and rolls with a digest that o
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 0 });
 		// Unchanged prompt shape for an instruction-less monitor: no guidance, no
 		// digest, no leading blank.
-		expect(turns[0]!.prompt.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		expect(turns[0]?.prompt.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
 		empty = true;
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 1 });
 		empty = false;

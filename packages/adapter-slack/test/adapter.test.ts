@@ -962,7 +962,8 @@ test("Slack recovery replays a configured channel's gap through chat.send and ad
 			"first",
 			"second",
 		]);
-		expect((sends[0]?.params as { messageId: string }).messageId).toBe("C1:1700000040.000001");
+		const sendParams = sends[0]?.params as { messageId: string } | undefined;
+		expect(sendParams?.messageId).toBe("C1:1700000040.000001");
 		const cursors = await loadRecoveryCursors(f.recoveryCursorPath);
 		expect(cursors.recoveredThrough.C1).toBe("1700000050.000002");
 		// A second pass is a no-op: everything is behind the watermark.
@@ -1095,8 +1096,10 @@ test("Slack recovery revisits a thread the persona joined after its parent fell 
 		expect(await f.recoverMissedMessages()).toBe(true);
 		const sent = f.client.requests.filter((request) => request.verb === "chat.send");
 		expect(sent).toHaveLength(1);
-		expect((sent[0]?.params as { origin: OriginRef; text: string }).text).toBe("late reply");
-		expect((sent[0]?.params as { origin: OriginRef }).origin).toEqual({
+		const params = sent[0]?.params as { origin: OriginRef; text: string } | undefined;
+		expect(params?.text).toBe("late reply");
+		const origin = sent[0]?.params as { origin: OriginRef } | undefined;
+		expect(origin?.origin).toEqual({
 			platform: "slack",
 			kind: "thread",
 			conversationId: "C1:1700000001.000000",

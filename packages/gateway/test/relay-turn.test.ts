@@ -129,13 +129,13 @@ test("control responses resolve by id; a refused control carries its error code"
 	// Out-of-order answers land on the right waiter.
 	relay.host({
 		type: "control_response",
-		id: requestB!.id,
+		id: requestB?.id,
 		ok: false,
 		error: { code: "busy", message: "turn running" },
 	});
 	relay.host({
 		type: "control_response",
-		id: requestA!.id,
+		id: requestA?.id,
 		ok: true,
 		result: { commandId: "c", turnId: "t", accepted: true },
 	});
@@ -377,7 +377,7 @@ test("a relay that ends mid-turn reports the loss, fails pending requests, and r
 	handle.beginTurn("op-1", CORRELATION);
 	handle.setTurnRunning(true);
 	const pending = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
-	relays[0]!.end();
+	relays[0]?.end();
 	await expect(pending).rejects.toBeInstanceOf(RelayClosedError);
 	await Bun.sleep(10);
 	expect(lost).toEqual([{ sessionId: "s1", brokerGeneration: 3 }]);
@@ -386,9 +386,11 @@ test("a relay that ends mid-turn reports the loss, fails pending requests, and r
 	// The reopened relay is usable for commands again.
 	const after = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
 	await Bun.sleep(0);
-	const request = relays[1]!.lastRequest("query_request")!;
+	const relay = relays[1];
+	const lastRequest = relay?.lastRequest("query_request");
+	const request = lastRequest!;
 	expect(request.connectionId).toBe("connection:2");
-	relays[1]!.host({ type: "query_response", id: request.id, ok: true, result: { status: "terminal_ok" } });
+	relays[1]?.host({ type: "query_response", id: request.id, ok: true, result: { status: "terminal_ok" } });
 	expect(await after).toMatchObject({ ok: true });
 	await handle.close();
 });
@@ -496,7 +498,7 @@ test("a relay that dies six times in a row is declared dead: the handle closes a
 	handle.beginTurn("op-1", CORRELATION);
 	handle.setTurnRunning(true);
 	for (let i = 0; i < 8; i++) {
-		relays.at(-1)!.end();
+		relays.at(-1)?.end();
 		await Bun.sleep(5);
 	}
 	expect(dead).toEqual([{ sessionId: "s1", brokerGeneration: 2 }]);
@@ -526,7 +528,7 @@ test("request replies do not count as turn progress: a silent turn still stalls 
 		await Bun.sleep(0);
 		relay.host({
 			type: "query_response",
-			id: relay.lastRequest("query_request")!.id,
+			id: relay.lastRequest("query_request")?.id,
 			ok: true,
 			result: { status: "in_flight" },
 		});

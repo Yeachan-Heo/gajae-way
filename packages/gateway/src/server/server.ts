@@ -2766,7 +2766,7 @@ async function createInboundTurnLifecycle(
 	let lastKnown = { toolCalls: 0, outputTokens: 0 };
 	let activity: ChatProgressActivity | undefined;
 	/** Heartbeats present the most recent tail observation; they never invent progress. */
-	let tailActivitySeen = false;
+	let _tailActivitySeen = false;
 	let ended = false;
 	const emitProgress = (
 		progress: { toolCalls: number; outputTokens: number },
@@ -2828,7 +2828,7 @@ async function createInboundTurnLifecycle(
 	// biome-ignore lint/correctness/noUnusedFunctionParameters: sessionId provided by caller
 	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
 		if (ended) return false;
-		tailActivitySeen = true;
+		_tailActivitySeen = true;
 		// Every assistant message the owned relay delivers before the final answer
 		// is mid-work speech. The persona's own instructions decide what it says
 		// mid-turn; the gateway delivers it. The stream delivers each message

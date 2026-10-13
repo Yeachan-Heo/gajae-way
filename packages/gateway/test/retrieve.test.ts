@@ -64,8 +64,8 @@ test("a strong hit pulls its crosslinked neighbour in as a discounted secondary 
 	expect(hits[0]?.path).toBe("decisions/cutover.md");
 	const neighbour = hits.find((hit) => hit.path === "people/collab.md");
 	expect(neighbour).toBeDefined();
-	expect(neighbour!.score).toBeLessThan(hits[0]!.score);
-	expect(neighbour!.excerpt).toContain("linked from decisions/cutover.md");
+	expect(neighbour?.score).toBeLessThan(hits[0]?.score);
+	expect(neighbour?.excerpt).toContain("linked from decisions/cutover.md");
 	// Secondary hits never displace direct hits under a tight limit.
 	const tight = await searchMemory(root, "cutover 결정", 1);
 	expect(tight).toHaveLength(1);
@@ -95,5 +95,5 @@ test("tags boost ranking and pull tag-group neighbours in as secondary hits", as
 	expect(hits[0]?.path).toBe("ops/rules/deploy.md");
 	const grouped = hits.find((hit) => hit.path === "ops/rules/rollback.md");
 	expect(grouped).toBeDefined();
-	expect(grouped!.excerpt).toContain("shared tag #deployment");
+	expect(grouped?.excerpt).toContain("shared tag #deployment");
 });
