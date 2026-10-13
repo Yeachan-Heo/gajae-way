@@ -6,13 +6,12 @@ import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import type { SessionPort, SessionRequestInput, SessionRequestResult } from "../src/orchestrator/session-port";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 
 test("issue #187: dispatch retry reuses authoring turn if request fails after prompt delivery", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retry-idempotency-"));
 	try {
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "retry-test",
@@ -80,7 +79,7 @@ test("issue #187: dispatch retry reuses authoring turn if request fails after pr
 			registry,
 			sessionPort: sessionPort as SessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 			repo: join(home, "workspace"),
 			model: undefined,
@@ -91,7 +90,7 @@ test("issue #187: dispatch retry reuses authoring turn if request fails after pr
 
 		// Wait for first dispatch attempt to fail
 		for (let i = 0; i < 100; i++) {
-			const row = database.monitorEventRows().find((r) => r.event_id === eventId);
+			const row = database.monitors.monitorEventRows().find((r) => r.event_id === eventId);
 			if (row?.stage === "failed") break;
 			await Bun.sleep(10);
 		}
@@ -127,7 +126,7 @@ test("issue #187: dispatch retry reuses authoring turn if request fails after pr
 			expect(requestCount).toBe(2);
 
 			// After retry succeeds, check event is delivered
-			const finalRow = database.monitorEventRows().find((r) => r.event_id === eventId);
+			const finalRow = database.monitors.monitorEventRows().find((r) => r.event_id === eventId);
 			expect(finalRow?.stage).toMatch(/authored|delivered|authored_no_delivery/);
 		}
 
