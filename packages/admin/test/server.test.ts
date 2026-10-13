@@ -417,11 +417,11 @@ describe("event stream", () => {
 		const instance = app();
 		const response = await instance.fetch("/api/stream");
 		const reader = response.body?.getReader();
-		expect(reader).toBeDefined();
-		await readUntil(reader!, "event: snapshot");
+		if (!reader) throw new Error("stream response had no reader");
+		await readUntil(reader, "event: snapshot");
 
 		instance.emit("gateway.connection", { connected: false });
-		const disconnected = await readUntil(reader!, "event: gateway.connection");
+		const disconnected = await readUntil(reader, "event: gateway.connection");
 		expect(eventData(disconnected, "gateway.connection")).toEqual({ connected: false });
 
 		const loaded = await instance.fetch("/");
@@ -429,14 +429,15 @@ describe("event stream", () => {
 
 		const lateResponse = await instance.fetch("/api/stream");
 		const lateReader = lateResponse.body?.getReader();
-		const lateSnapshot = await readUntil(lateReader!, "event: snapshot");
+		if (!lateReader) throw new Error("late stream response had no reader");
+		const lateSnapshot = await readUntil(lateReader, "event: snapshot");
 		expect(lateSnapshot).toContain("retry: 15000");
 		expect((eventData(lateSnapshot, "snapshot") as { gateway: { reachable: boolean } }).gateway.reachable).toBe(false);
 
 		instance.emit("gateway.connection", { connected: true });
-		const reconnected = await readUntil(reader!, "event: gateway.connection");
+		const reconnected = await readUntil(reader, "event: gateway.connection");
 		expect(eventData(reconnected, "gateway.connection")).toEqual({ connected: true });
-		const refreshed = await readUntil(reader!, "event: snapshot");
+		const refreshed = await readUntil(reader, "event: snapshot");
 		expect((eventData(refreshed, "snapshot") as { gateway: { reachable: boolean } }).gateway.reachable).toBe(true);
 		expect(
 			instance.calls.every(({ method }) =>
@@ -519,12 +520,14 @@ describe("event stream", () => {
 		let reader: ResponseReader | undefined;
 		try {
 			const response = await instance.handler(new Request("http://admin.test/api/stream"));
-			reader = response.body?.getReader();
+			const streamReader = response.body?.getReader();
+			if (!streamReader) throw new Error("stream response had no reader");
+			reader = streamReader;
 			await statusStarted;
 			listener("gateway.connection", { connected: false });
-			await readUntil(reader!, "event: gateway.connection");
+			await readUntil(streamReader, "event: gateway.connection");
 			releaseStatus();
-			const snapshotFrame = await readUntil(reader!, "event: snapshot");
+			const snapshotFrame = await readUntil(streamReader, "event: snapshot");
 			expect((eventData(snapshotFrame, "snapshot") as { gateway: { reachable: boolean } }).gateway.reachable).toBe(
 				false,
 			);

@@ -120,7 +120,7 @@ test("stdio serialization errors reject only the invalid request", async () => {
 			await expect(client.request("invalid", params)).rejects.toThrow();
 			expect(disconnects).toBe(0);
 		}
-		expect(await client.request("valid")).toBe("ok");
+		expect(await client.request<string>("valid")).toBe("ok");
 	} finally {
 		controller.close();
 		await client.close();

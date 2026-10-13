@@ -15,7 +15,12 @@ export type AdminGatewayRetryOptions = {
 export class AdminGateway {
 	static async connect(socketPath: string, retryOptions: AdminGatewayRetryOptions = {}): Promise<AdminGateway> {
 		const gateway = new AdminGateway(socketPath, retryOptions);
-		const client = await GajaewayClient.connectSocket(socketPath);
+		const client = await GajaewayClient.connectSocketWithBackoff(socketPath, {
+			onRetry: (attempt, delayMs, error) =>
+				console.error(
+					`Gateway socket ${socketPath} unavailable; retry ${attempt} in ${delayMs}ms: ${error instanceof Error ? error.message : String(error)}`,
+				),
+		});
 		gateway.#attach(client);
 		return gateway;
 	}
@@ -49,9 +54,12 @@ export class AdminGateway {
 	}
 
 	onConnectionChange(handler: (connected: boolean) => void): () => void {
-		handler(this.connected);
-		if (this.#closed) return () => {};
+		if (this.#closed) {
+			this.#notifyConnectionHandler(handler, this.connected);
+			return () => {};
+		}
 		this.#connectionHandlers.add(handler);
+		this.#notifyConnectionHandler(handler, this.connected);
 		return () => this.#connectionHandlers.delete(handler);
 	}
 
@@ -118,7 +126,16 @@ export class AdminGateway {
 	}
 
 	#notifyConnection(): void {
-		for (const handler of this.#connectionHandlers) handler(this.connected);
+		const connected = this.connected;
+		for (const handler of this.#connectionHandlers) this.#notifyConnectionHandler(handler, connected);
+	}
+
+	#notifyConnectionHandler(handler: (connected: boolean) => void, connected: boolean): void {
+		try {
+			handler(connected);
+		} catch (error) {
+			console.error("Admin gateway connection observer failed", error);
+		}
 	}
 
 	#subscribe(client: GajaewayClient, event: string, handler: GatewayEventHandler): void {

@@ -371,6 +371,34 @@ test("shutdown clears the stability timer for an attached gateway", async () => 
 	}
 });
 
+test("throwing connection observers cannot block shutdown or later notifications", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-admin-connection-observer-"));
+	const path = join(directory, "gateway.sock");
+	let server: ReturnType<typeof listenGateway> | undefined;
+	let gateway: AdminGateway | undefined;
+	const failure = new Error("connection observer failed");
+	const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		server = listenGateway(path);
+		gateway = await AdminGateway.connect(path);
+		const states: boolean[] = [];
+		gateway.onConnectionChange((connected) => {
+			if (!connected) throw failure;
+		});
+		gateway.onConnectionChange((connected) => states.push(connected));
+
+		await gateway.close();
+		await until(() => server?.active === 0);
+		expect(states).toEqual([true, false]);
+		expect(diagnostic).toHaveBeenCalledWith("Admin gateway connection observer failed", failure);
+	} finally {
+		diagnostic.mockRestore();
+		await gateway?.close();
+		server?.stop();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("shutdown aborts an in-flight reconnect negotiation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-admin-negotiation-close-"));
 	const path = join(directory, "gateway.sock");
@@ -397,24 +425,6 @@ test("shutdown aborts an in-flight reconnect negotiation", async () => {
 		await gateway?.close();
 		initial?.stop();
 		negotiating?.stop();
-		await rm(directory, { recursive: true, force: true });
-	}
-});
-
-test("an initial connection failure remains an immediate admin startup failure", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-admin-initial-failure-"));
-	try {
-		const path = join(directory, "missing.sock");
-		const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/main.ts"), "serve"], {
-			stdout: "pipe",
-			stderr: "pipe",
-			env: { ...process.env, GAJAEWAY_SOCKET: path, GAJAEWAY_HOME: directory },
-		});
-		const [stderr, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
-		expect(code).toBe(1);
-		expect(stderr).toContain(`Unable to connect to gateway socket ${path}`);
-		expect(stderr).toContain("Start the daemon out-of-band first.");
-	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });

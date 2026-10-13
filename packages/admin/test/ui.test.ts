@@ -123,7 +123,8 @@ function runInlineHealthScript(markup: string, snapshot: ConsoleSnapshot) {
 		getElementById: (id: string) => nodes.get(id) ?? null,
 		querySelector: (selector: string) => {
 			const match = selector.match(/^\[data-panel="([^"]+)"\]$/);
-			return match ? (sections.get(match[1]!) ?? null) : null;
+			const panel = match?.[1];
+			return panel === undefined ? null : (sections.get(panel) ?? null);
 		},
 		querySelectorAll: (selector: string) => (selector === '.panel[data-live="1"]' ? [livePanel] : []),
 	};
@@ -131,9 +132,9 @@ function runInlineHealthScript(markup: string, snapshot: ConsoleSnapshot) {
 	const source = {
 		addEventListener: (name: string, listener: UiListener) => eventListeners.set(name, listener),
 	};
-	const EventSource = function (_url: string) {
+	function EventSource(_url: string) {
 		return source;
-	};
+	}
 	const fetch = () => new Promise<{ json: () => Promise<unknown> }>(() => {});
 	const setInterval = (_callback: () => void, _delay: number): number => 0;
 	new Function("document", "EventSource", "fetch", "setInterval", markup.slice(bodyStart, bodyEnd))(
