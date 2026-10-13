@@ -1,4 +1,5 @@
 import type { LogLevel } from "@gajae-gateway/log";
+import { existsSync, rmSync } from "node:fs";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
@@ -294,11 +295,18 @@ export class LaneGovernor {
 				);
 			}
 			// Only a non-forced operator retirement (no sweep nomination) deletes the
-			// runtime-created worktree and branch. A sweep is unattended: the lane must stay
-			// resumable and its unpushed commits must survive.
-			if (!expected && record?.lane.worktreePath && record.lane.repository) {
+			// runtime-created worktree and branch. Unattended sweep/force retirement keeps
+			// the durable lane path and its unpushed commits resumable.
+			const repositoryPath = record?.lane.repositoryPath ?? record?.lane.repository;
+			if (!expected && record?.lane.worktreePath && repositoryPath) {
 				try {
-					this.#cleanupWorktree(name, lane.sessionId, record.lane.worktreePath, record.lane.repository);
+					this.#cleanupWorktree(
+						name,
+						lane.sessionId,
+						record.lane.worktreePath,
+						repositoryPath,
+						record.lane.repositoryPath !== undefined,
+					);
 				} catch (error) {
 					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
 					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
@@ -420,16 +428,8 @@ export class LaneGovernor {
 					return { retired: false, sessionKey, reason: detail };
 				}
 			}
-			// Clean up the worktree for force retire as well (issue #480)
-			if (record?.lane.worktreePath && record.lane.repository) {
-				try {
-					this.#cleanupWorktree(name, lane.sessionId, record.lane.worktreePath, record.lane.repository);
-				} catch (error) {
-					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
-					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
-					return { retired: false, sessionKey, reason: `worktree cleanup failed: ${detail}` };
-				}
-			}
+			// Forced retirement is unattended; preserve the durable worktree and
+			// branch so its commits and the stored worktree path remain resumable.
 			// Close the session and rebind the epoch.
 			let closed = false;
 			try {
@@ -547,7 +547,20 @@ export class LaneGovernor {
 	}
 
 	/** Cleans up a runtime-created worktree and its branch. Throws on error (issue #480). */
-	#cleanupWorktree(name: string, sessionId: string, worktreePath: string, repository: string): void {
+	#cleanupWorktree(
+		name: string,
+		sessionId: string,
+		worktreePath: string,
+		repository: string,
+		removeRepository: boolean,
+	): void {
+		// A previous cleanup can have removed the managed bare repository before
+		// the binding epoch was rotated. Treat that state as already cleaned up.
+		if (removeRepository && !existsSync(repository)) {
+			if (existsSync(worktreePath)) throw new Error("managed repository is missing while the worktree still exists");
+			return;
+		}
+
 		// Remove the worktree using git worktree remove --force
 		const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
 			cwd: repository,
@@ -557,7 +570,33 @@ export class LaneGovernor {
 
 		if (removeResult.exitCode !== 0) {
 			const stderr = removeResult.stderr?.toString().trim() || "unknown error";
-			throw new Error(`git worktree remove failed: ${stderr}`);
+			if (existsSync(worktreePath)) throw new Error(`git worktree remove failed: ${stderr}`);
+
+			// External deletion leaves a stale administrative worktree record. Prune
+			// only after confirming the path is absent, then verify it is unregistered.
+			const pruneResult = Bun.spawnSync(["git", "worktree", "prune"], {
+				cwd: repository,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (pruneResult.exitCode !== 0) {
+				const pruneError = pruneResult.stderr?.toString().trim() || "unknown error";
+				throw new Error(`git worktree prune failed: ${pruneError}`);
+			}
+			const listResult = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+				cwd: repository,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (listResult.exitCode !== 0) {
+				const listError = listResult.stderr?.toString().trim() || "unknown error";
+				throw new Error(`git worktree list failed: ${listError}`);
+			}
+			const stillRegistered = listResult.stdout
+				?.toString()
+				.split(/\r?\n/)
+				.some((line) => line === `worktree ${worktreePath}`);
+			if (stillRegistered) throw new Error(`worktree remains registered after pruning: ${stderr}`);
 		}
 
 		// Delete the branch using git branch -D
@@ -576,6 +615,7 @@ export class LaneGovernor {
 				"warn",
 			);
 		}
+		if (removeRepository) rmSync(repository, { recursive: true, force: true });
 	}
 
 	/** `undefined` when no job row exists; `"corrupt"` when one exists but cannot be trusted. */

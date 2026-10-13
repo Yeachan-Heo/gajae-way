@@ -117,7 +117,7 @@ describe("op projection: error.code surfaces and deadline kills are attempt_ende
 });
 
 describe("durable record schema: versioned, frozen, fail-closed", () => {
-	test("createLaneJobRecord produces a v1 record with identity that outlives ops", () => {
+	test("createLaneJobRecord produces a v3 record with identity that outlives ops", () => {
 		const created = record();
 		expect(created.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
 		expect(created.jobId).toBe("lanejob-project-issue-10-lane-jobs");
@@ -139,16 +139,60 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		expect(parsed.checkpoints[0].sha).toBe("a".repeat(40));
 	});
 
+	test("round-trips repository identity and its managed repository path", () => {
+		const created = createLaneJobRecord({
+			jobId: "lanejob-project-issue-10-lane-jobs",
+			branch: "work/lane-jobs",
+			worktreePath: "/wt/lane-jobs",
+			repository: "https://example.test/project.git",
+			repositoryPath: "/home/user/.gajaeway/repositories/lane-jobs",
+			now: () => NOW,
+		});
+		const parsed = parseLaneJobRecord(JSON.stringify(created));
+		expect(parsed.schemaVersion).toBe(3);
+		expect(parsed.lane.repository).toBe("https://example.test/project.git");
+		expect(parsed.lane.repositoryPath).toBe("/home/user/.gajaeway/repositories/lane-jobs");
+	});
+
 	test("refuses an unknown schemaVersion (migration boundary, fail closed)", () => {
 		const raw = JSON.stringify({ ...JSON.parse(JSON.stringify(record())), schemaVersion: 999 });
 		expect(() => parseLaneJobRecord(raw)).toThrow(/schemaVersion/);
 	});
 
-	test("reads a version-1 record as version 2 (v2 only added optional lane.repository)", () => {
+	test("reads a version-1 record as version 3 without repository metadata", () => {
 		const raw = JSON.stringify({ ...JSON.parse(JSON.stringify(record())), schemaVersion: 1 });
 		const parsed = parseLaneJobRecord(raw);
 		expect(parsed.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
 		expect(parsed.lane.repository).toBeUndefined();
+	});
+
+	test("reads a version-2 record with repository identity but without a managed path", () => {
+		const created = record();
+		const raw = JSON.stringify({
+			...created,
+			schemaVersion: 2,
+			lane: { ...created.lane, repository: "https://example.test/project.git" },
+		});
+		const parsed = parseLaneJobRecord(raw);
+		expect(parsed.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
+		expect(parsed.lane.repository).toBe("https://example.test/project.git");
+		expect(parsed.lane.repositoryPath).toBeUndefined();
+	});
+
+	test("rejects relative managed repository paths at creation and parse", () => {
+		expect(() =>
+			createLaneJobRecord({
+				jobId: "lanejob-project-issue-10-lane-jobs",
+				branch: "work/lane-jobs",
+				worktreePath: "/wt/lane-jobs",
+				repositoryPath: "relative/repository",
+			}),
+		).toThrow(/absolute path/);
+		const raw = JSON.stringify({
+			...record(),
+			lane: { branch: "work/lane-jobs", worktreePath: "/wt/lane-jobs", repositoryPath: "relative/repository" },
+		});
+		expect(() => parseLaneJobRecord(raw)).toThrow(/absolute path/);
 	});
 
 	test("refuses corrupt JSON and structural garbage instead of coercing", () => {

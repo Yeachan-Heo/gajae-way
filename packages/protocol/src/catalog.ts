@@ -631,7 +631,7 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
-	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
+	/** Absolute local Git repository path or Git URL used for the worktree and its push remote (issue #480). */
 	readonly repo?: string;
 	/** Base branch or ref for worktree creation when repo is specified (issue #480). */
 	readonly base?: string;
@@ -704,6 +704,7 @@ export interface WorkStatusResult {
 	readonly op: PromptStatusBody | null;
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
+		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */
 		readonly url: string;
 		readonly branch: string;
 		readonly base?: string;

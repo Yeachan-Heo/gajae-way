@@ -23,6 +23,7 @@
  *   - resume is progress-gated so restart cannot mint duplicate attempts.
  */
 
+import { isAbsolute } from "node:path";
 import { assertValidOpRef } from "./send";
 import type { PromptStatusBody, SupervisorOpState } from "./status";
 import { projectOpState } from "./status";
@@ -53,11 +54,11 @@ export class LaneJobError extends Error {
 
 /**
  * Wire/storage version of the persisted LaneJobRecord. Version 2 added the
- * optional `lane.repository`; a version-1 record is a valid version-2 record
- * without it, so both parse and every record is written back as version 2.
+ * optional repository identity; version 3 adds the managed repository path.
+ * Version-1 and version-2 records remain readable without newer fields.
  */
-export const LANE_JOB_SCHEMA_VERSION = 2 as const;
-const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, LANE_JOB_SCHEMA_VERSION];
+export const LANE_JOB_SCHEMA_VERSION = 3 as const;
+const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, 2, LANE_JOB_SCHEMA_VERSION];
 
 /** Issue #9's exact evidence vocabulary. No synonyms. */
 export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress_uncommitted" | "no_work_produced";
@@ -114,8 +115,10 @@ export type LaneJobRecord = {
 	readonly lane: {
 		readonly branch: string;
 		readonly worktreePath: string;
-		/** Repository bound to this lane (URL or alias); used for worktree creation and push target (issue #480). */
+		/** Repository identity (absolute local path or Git URL) used for worktree creation and push target (issue #480). */
 		readonly repository?: string;
+		/** Gateway-owned bare clone used as the common Git directory for this lane. */
+		readonly repositoryPath?: string;
 	};
 	/** Every runtime session this job has ever been driven through. */
 	readonly sessions: readonly string[];
@@ -143,8 +146,10 @@ export type CreateLaneJobInput = {
 	readonly sessionId?: string;
 	/** The worktree HEAD at creation; the baseline progress is measured against. */
 	readonly baselineSha?: string;
-	/** Repository binding (URL or alias); used for worktree creation and push target (issue #480). */
+	/** Repository identity (absolute local path or Git URL) used for worktree creation and push target (issue #480). */
 	readonly repository?: string;
+	/** Gateway-owned bare clone path associated with this lane's repository identity. */
+	readonly repositoryPath?: string;
 	readonly now?: () => Date;
 };
 
@@ -157,7 +162,7 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 	if (!SLASH_SAFE_BRANCH.test(input.branch) || input.branch.length === 0) {
 		throw new LaneJobError(`invalid lane branch "${input.branch}"`);
 	}
-	if (input.worktreePath.length === 0 || !input.worktreePath.startsWith("/")) {
+	if (input.worktreePath.length === 0 || !isAbsolute(input.worktreePath)) {
 		throw new LaneJobError(`invalid worktree path "${input.worktreePath}"`);
 	}
 	const at = (input.now ?? (() => new Date()))().toISOString();
@@ -166,6 +171,12 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 	}
 	if (input.repository !== undefined && typeof input.repository !== "string") {
 		throw new LaneJobError(`repository must be a string`);
+	}
+	if (
+		input.repositoryPath !== undefined &&
+		(typeof input.repositoryPath !== "string" || !isAbsolute(input.repositoryPath))
+	) {
+		throw new LaneJobError(`repositoryPath must be an absolute path`);
 	}
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
@@ -177,6 +188,7 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 			branch: input.branch,
 			worktreePath: input.worktreePath,
 			...(input.repository !== undefined ? { repository: input.repository } : {}),
+			...(input.repositoryPath !== undefined ? { repositoryPath: input.repositoryPath } : {}),
 		}),
 		sessions: input.sessionId ? Object.freeze([assertSessionIdShape(input.sessionId)]) : Object.freeze([]),
 		attempts: Object.freeze([]),
@@ -245,11 +257,17 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 	if (typeof laneObj.branch !== "string" || !SLASH_SAFE_BRANCH.test(laneObj.branch) || laneObj.branch.length === 0) {
 		throw new LaneJobError(`invalid lane branch ${JSON.stringify(laneObj.branch)}`);
 	}
-	if (typeof laneObj.worktreePath !== "string" || !laneObj.worktreePath.startsWith("/")) {
+	if (typeof laneObj.worktreePath !== "string" || !isAbsolute(laneObj.worktreePath)) {
 		throw new LaneJobError("lane worktreePath must be an absolute path");
 	}
 	if (laneObj.repository !== undefined && typeof laneObj.repository !== "string") {
 		throw new LaneJobError("lane repository must be a string when present");
+	}
+	if (
+		laneObj.repositoryPath !== undefined &&
+		(typeof laneObj.repositoryPath !== "string" || !isAbsolute(laneObj.repositoryPath))
+	) {
+		throw new LaneJobError("lane repositoryPath must be an absolute path when present");
 	}
 	const sessions = parseSessions(record.sessions);
 	const attempts = parseAttempts(record.attempts);
@@ -267,6 +285,7 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 			branch: laneObj.branch as string,
 			worktreePath: laneObj.worktreePath as string,
 			...(laneObj.repository === undefined ? {} : { repository: laneObj.repository as string }),
+			...(laneObj.repositoryPath === undefined ? {} : { repositoryPath: laneObj.repositoryPath as string }),
 		}),
 		sessions,
 		attempts,

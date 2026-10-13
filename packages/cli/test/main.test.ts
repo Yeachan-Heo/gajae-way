@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -1026,6 +1026,26 @@ describe("work operator commands", () => {
 			sessionId: "s",
 		});
 		expect(output.requests).toEqual([{ verb: "work.start", params: { name: "fix", text: "task" } }]);
+	});
+
+	test("work start resolves relative repo paths in the CLI process", async () => {
+		const output = await run(["start", "fix", "--repo", ".", "task"], {
+			started: true,
+			jobId: "j",
+			opRef: "o",
+			sessionKey: "k",
+			sessionId: "s",
+		});
+		expect(output.requests).toEqual([
+			{ verb: "work.start", params: { name: "fix", repo: resolve("."), text: "task" } },
+		]);
+	});
+
+	test("work start rejects --base without --repo before connecting", async () => {
+		const output = await run(["start", "fix", "--cwd", "/repo", "--base", "dev", "task"], {});
+		expect(output.requests).toEqual([]);
+		expect(output.connections).toBe(0);
+		expect(output.errors.join(" ")).toContain("--repo");
 	});
 
 	for (const command of ["run", "start"]) {
