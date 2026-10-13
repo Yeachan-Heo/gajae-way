@@ -206,7 +206,13 @@ const REACT_TOKEN = /^\s*\[(REACT|UNREACT):([^\]\n]*)\]/;
  */
 export function parseReactionReply(text: string): ReactionReply | undefined {
 	let rest = text;
-	const reactions: { emoji: string; emojiName: string; targetMessageId?: string; action?: ReactionAction; isCustom?: boolean }[] = [];
+	const reactions: {
+		emoji: string;
+		emojiName: string;
+		targetMessageId?: string;
+		action?: ReactionAction;
+		isCustom?: boolean;
+	}[] = [];
 	for (let match = rest.match(REACT_TOKEN); match; match = rest.match(REACT_TOKEN)) {
 		const [token, action = "REACT", argument = ""] = match;
 		const at = argument.lastIndexOf("@");
