@@ -4,10 +4,10 @@ import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gat
 
 import { type ConfigOverrides, loadConfig } from "./config";
 import { DeliveryService } from "./delivery/delivery";
-
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import { assertNoRestoreJournal } from "./offline";
+import { reapLeftoverWorkers } from "./ops/process-reaper";
 import { SloRecorder } from "./ops/slo";
 import {
 	GjcCliUnavailableError,
@@ -146,6 +146,12 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 	};
 	try {
 		await assertNoRestoreJournal(config.home);
+		// Reap orphaned worker processes from previous boot epochs before accepting new work.
+		// This prevents stale relay processes from accumulating and blocking resources.
+		const reapResult = await reapLeftoverWorkers(config.home);
+		if (reapResult.found > 0) {
+			console.info(`process_reaper found=${reapResult.found} killed=${reapResult.killed} failed=${reapResult.failed}`);
+		}
 		const personaWorkspace = await resolvePersonaWorkspace(config.home);
 		const layout = homeLayout(config.home);
 		let executable = options.broker?.executable;
