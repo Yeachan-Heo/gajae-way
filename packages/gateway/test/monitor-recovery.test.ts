@@ -20,13 +20,13 @@ import {
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
 import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_RETRY_BACKOFF_MS } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
+import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_RETRY_BACKOFF_MS } from "../src/store/groups/monitors";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let propagators: MonitorPropagator[] = [];
 afterEach(async () => {
 	for (const propagator of propagators) await propagator.drain();
@@ -49,7 +49,7 @@ async function harness(
 	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const monitor = registry.add({
 		name: "canonicalize",
@@ -64,7 +64,7 @@ async function harness(
 		registry,
 		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-		delivery: new DeliveryService(new DeliveryLedger(database)),
+		delivery: new DeliveryService(database),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
 		...(options.now ? { now: options.now } : {}),
@@ -79,23 +79,95 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 	return JSON.parse(match[0]) as Array<{ eventId: string }>;
 }
 
-const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
+type MonitorEventInput = Parameters<Store["monitors"]["eventCreate"]>[1];
+type MonitorStage = Parameters<Store["monitors"]["eventUpdate"]>[2];
 
-function seedEvent(db: GatewayDatabase, monitorId: string, stage: string, batchId: string | null = null): string {
-	const eventId = crypto.randomUUID();
-	db.monitorEventCreate({
-		eventId,
-		monitorId,
-		eventType: "memory.canonicalize",
-		payloadJson: JSON.stringify({ at: new Date().toISOString() }),
-		firedAt: new Date().toISOString(),
+function createEvent(db: Store, row: MonitorEventInput): void {
+	db.transaction((tx) => db.monitors.eventCreate(tx, row));
+}
+
+function updateEvent(db: Store, eventId: string, stage: MonitorStage, batchId?: string | null): void {
+	db.transaction((tx) => db.monitors.eventUpdate(tx, eventId, stage, batchId));
+}
+
+function createMonitor(db: Store, row: Parameters<Store["monitors"]["create"]>[1]): void {
+	db.transaction((tx) => db.monitors.create(tx, row));
+}
+
+function recordFailure(
+	db: Store,
+	eventId: string,
+	code: string,
+	detail: string,
+	options?: Parameters<Store["monitors"]["failureRecord"]>[4],
+): void {
+	db.transaction((tx) => db.monitors.failureRecord(tx, eventId, code, detail, options));
+}
+
+function createOutput(db: Store, eventId: string, output: string): void {
+	db.transaction((tx) => db.monitors.authoredOutputCreate(tx, eventId, output));
+}
+
+function createIntent(db: Store, row: { id: string; kind: string; payloadJson: string }): void {
+	db.transaction((tx) => db.memory.createIntent(tx, row));
+}
+
+function confirmAndSettleMonitorDelivery(
+	db: Store,
+	deliveryId: string,
+	stageName: "delivered" | "authored",
+): "unknown" | "transitioned" | "already_terminal" {
+	return db.transaction((tx) => {
+		const delivery = db.outbox.get(deliveryId);
+		if (!delivery) return "unknown";
+		if (delivery.state === "confirmed" || delivery.state === "expired") {
+			if (delivery.state === "confirmed") db.monitors.settleForTurn(tx, delivery.turnId, stageName);
+			return "already_terminal";
+		}
+		db.outbox.confirm(tx, deliveryId);
+		db.monitors.settleForTurn(tx, delivery.turnId, stageName);
+		return "transitioned";
 	});
-	db.monitorEventUpdate(eventId, stage as never, batchId);
+}
+
+function acquireLease(
+	db: Store,
+	eventId: string,
+	owner: string,
+	leaseId: string,
+	ttlMs: number,
+	now?: number,
+): boolean {
+	return db.transaction((tx) => db.monitors.eventAcquireLease(tx, eventId, owner, leaseId, ttlMs, now));
+}
+
+function renewLease(db: Store, eventId: string, leaseId: string, ttlMs: number, now?: number): boolean {
+	return db.transaction((tx) => db.monitors.eventRenewLease(tx, eventId, leaseId, ttlMs, now));
+}
+
+function releaseLease(db: Store, eventId: string, leaseId: string): void {
+	db.transaction((tx) => db.monitors.eventReleaseLease(tx, eventId, leaseId));
+}
+
+const stage = (db: Store, id: string) => db.monitors.eventRows().find((row) => row.event_id === id)?.stage;
+
+function seedEvent(db: Store, monitorId: string, stage: string, batchId: string | null = null): string {
+	const eventId = crypto.randomUUID();
+	db.transaction((tx) => {
+		db.monitors.eventCreate(tx, {
+			eventId,
+			monitorId,
+			eventType: "memory.canonicalize",
+			payloadJson: JSON.stringify({ at: new Date().toISOString() }),
+			firedAt: new Date().toISOString(),
+		});
+		db.monitors.eventUpdate(tx, eventId, stage as never, batchId);
+	});
 	return eventId;
 }
 
-function backdateMonitor(db: GatewayDatabase, monitorId: string, createdAt: Date): void {
-	db.monitorSetCreatedAt(monitorId, createdAt.toISOString());
+function backdateMonitor(db: Store, monitorId: string, createdAt: Date): void {
+	db.transaction((tx) => db.monitors.setCreatedAt(tx, monitorId, createdAt.toISOString()));
 }
 
 test("monitor.inspect exposes quarantined accepted and failed history without recovery sends", async () => {
@@ -113,25 +185,29 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 	const accepted = seedEvent(db, monitor.monitorId, "dispatched", "old-accepted-batch");
 	const failed = seedEvent(db, monitor.monitorId, "failed", "old-failed-batch");
 	const recovered = seedEvent(db, monitor.monitorId, "failed", "recovered-batch");
-	db.monitorFailureRecord(recovered, "authoring_response_invalid", "safe protocol failure", {
-		protocolFailure: {
-			reason: "protocol_unparseable_json",
-			responseByteLength: 12,
-			responseEntryCount: null,
-		},
+	db.transaction((tx) => {
+		db.monitors.failureRecord(tx, recovered, "authoring_response_invalid", "safe protocol failure", {
+			protocolFailure: {
+				reason: "protocol_unparseable_json",
+				responseByteLength: 12,
+				responseEntryCount: null,
+			},
+		});
+		db.monitors.eventUpdate(tx, recovered, "delivered");
 	});
-	db.monitorEventUpdate(recovered, "delivered");
-	db.cutoverBrokerAuthority({
-		expectedAuthority: null,
-		targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
-		evidence: "Test operator authorized historical monitor quarantine",
-		disposition: "quarantine",
-	});
-	const history = db.monitorEventRows(monitor.monitorId, "newest", true);
+	db.transaction((tx) =>
+		db.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: null,
+			targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
+			evidence: "Test operator authorized historical monitor quarantine",
+			disposition: "quarantine",
+		}),
+	);
+	const history = db.monitors.eventRows(monitor.monitorId, "newest", true);
 	expect(history).toHaveLength(3);
-	expect(db.monitorEventRows()).toEqual([]);
-	expect(db.monitorEventRows(undefined, "oldest")).toEqual([]);
-	expect(db.monitorEventRows(monitor.monitorId, "oldest")).toEqual([]);
+	expect(db.monitors.eventRows()).toEqual([]);
+	expect(db.monitors.eventRows(undefined, "oldest")).toEqual([]);
+	expect(db.monitors.eventRows(monitor.monitorId, "oldest")).toEqual([]);
 	await propagator.reconcile();
 	expect(sends).toBe(0);
 	const socketPath = join(home, "inspect.sock");
@@ -139,6 +215,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		config: {
 			schemaVersion: 1,
 			home,
+			gjc: { agentDir: join(home, "agent") },
 			configPath: join(home, "config.json"),
 			socketPath,
 			dbPath: join(home, "gateway.db"),
@@ -208,7 +285,7 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 			},
 		});
 		expect(inspected.catchUp).toBeUndefined();
-		db.monitorCronRecordSkip(
+		new MonitorRegistry(db).recordCronSkip(
 			monitor.monitorId,
 			{
 				count: 2,
@@ -260,8 +337,8 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		const bounded = boundedResponse.recentEvents as Array<Record<string, unknown>>;
 		expect(bounded).toHaveLength(100);
 		expect(bounded.map((row) => row.eventId)).toEqual(
-			db
-				.monitorEventRows(monitor.monitorId, "newest", true)
+			db.monitors
+				.eventRows(monitor.monitorId, "newest", true)
 				.slice(0, 100)
 				.map((row) => row.event_id),
 		);
@@ -272,8 +349,8 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 		await propagator.reconcile();
 		expect(sends).toBe(0);
 		expect(
-			db
-				.monitorEventRows(monitor.monitorId, "newest", true)
+			db.monitors
+				.eventRows(monitor.monitorId, "newest", true)
 				.filter((row) => [accepted, failed, recovered].includes(row.event_id)),
 		).toEqual(history);
 	} finally {
@@ -294,7 +371,7 @@ describe("monitor crash-boundary state machine", () => {
 		for (let attempt = 0; attempt < 100 && stage(db, eventId) !== "authored_no_delivery"; attempt++)
 			await Bun.sleep(10);
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
-		expect(db.authoredOutput(eventId)).toBe("authored note");
+		expect(db.monitors.authoredOutput(eventId)).toBe("authored note");
 	});
 
 	test("restart crossing the batched stage: reconcile reclaims a stranded batched row exactly once", async () => {
@@ -332,7 +409,7 @@ describe("monitor crash-boundary state machine", () => {
 
 	test("legacy origin-invalid event types terminalize without invoking the session port", async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-event-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
 		const registry = new MonitorRegistry(db);
 		const monitor = registry.add({
@@ -350,12 +427,12 @@ describe("monitor crash-boundary state machine", () => {
 				return "[]";
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(db)),
+			delivery: new DeliveryService(db),
 			emit: () => {},
 		});
 		propagators.push(propagator);
 		const eventId = crypto.randomUUID();
-		db.monitorEventCreate({
+		createEvent(db, {
 			eventId,
 			monitorId: monitor.monitorId,
 			eventType: "broken/type",
@@ -366,7 +443,7 @@ describe("monitor crash-boundary state machine", () => {
 		await propagator.reconcile();
 
 		expect(stage(db, eventId)).toBe("failed_no_retry");
-		expect(db.monitorFailure(eventId)).toMatchObject({
+		expect(db.monitors.failure(eventId)).toMatchObject({
 			code: "event_type_invalid",
 			detail: "dispatch setup failed (event_type_invalid)",
 		});
@@ -377,7 +454,7 @@ describe("monitor crash-boundary state machine", () => {
 
 	test("malformed persisted monitors are isolated and their events terminalize once", async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-record-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
 		const validRegistry = new MonitorRegistry(db);
 		const valid = validRegistry.add({
@@ -386,7 +463,7 @@ describe("monitor crash-boundary state machine", () => {
 			eventTypes: ["healthy.event"],
 		});
 		const invalidId = crypto.randomUUID();
-		db.monitorCreate({
+		createMonitor(db, {
 			id: invalidId,
 			name: "legacy-invalid",
 			triggerJson: "{not-json",
@@ -401,7 +478,7 @@ describe("monitor crash-boundary state machine", () => {
 		const registry = new MonitorRegistry(db);
 		expect(registry.list().map((record) => record.monitorId)).toEqual([valid.monitorId]);
 		const eventId = crypto.randomUUID();
-		db.monitorEventCreate({
+		createEvent(db, {
 			eventId,
 			monitorId: invalidId,
 			eventType: "broken/type",
@@ -417,7 +494,7 @@ describe("monitor crash-boundary state machine", () => {
 				return "[]";
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(db)),
+			delivery: new DeliveryService(db),
 			emit: () => {},
 		});
 		propagators.push(propagator);
@@ -425,13 +502,13 @@ describe("monitor crash-boundary state machine", () => {
 		await propagator.reconcile();
 
 		expect(stage(db, eventId)).toBe("failed_no_retry");
-		expect(db.monitorFailure(eventId)).toMatchObject({
+		expect(db.monitors.failure(eventId)).toMatchObject({
 			code: "monitor_invalid",
 			detail: "dispatch setup failed (monitor_invalid)",
 		});
 		expect(turns).toBe(0);
 		await propagator.reconcile();
-		expect(db.monitorEventRows().filter((row) => row.event_id === eventId)).toHaveLength(1);
+		expect(db.monitors.eventRows().filter((row) => row.event_id === eventId)).toHaveLength(1);
 		expect(turns).toBe(0);
 	});
 
@@ -441,7 +518,7 @@ describe("monitor crash-boundary state machine", () => {
 		);
 		const batchId = crypto.randomUUID();
 		const eventId = seedEvent(db, monitor.monitorId, "authored", batchId);
-		const delivery = new DeliveryService(new DeliveryLedger(db));
+		const delivery = new DeliveryService(db);
 		const payload = delivery.prepare(
 			batchId,
 			{ platform: "loopback", kind: "loopback", conversationId: "loopback" },
@@ -455,7 +532,7 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("authored");
 		// Adapter confirms → delivered.
 		expect(delivery.confirm(deliveryId)).toBe("transitioned");
-		db.withTransaction(() => db.monitorEventUpdate(eventId, "delivered"));
+		updateEvent(db, eventId, "delivered");
 		expect(stage(db, eventId)).toBe("delivered");
 		// Ambiguous failure is distinguishable in the ledger, never delivered.
 		const payload2 = delivery.prepare(
@@ -466,7 +543,7 @@ describe("monitor crash-boundary state machine", () => {
 		const deliveryId2 = payload2.deliveryId as string;
 		delivery.markInflight(deliveryId2);
 		delivery.fail(deliveryId2, true);
-		const row = db.deliveryRows().find((entry) => entry.delivery_id === deliveryId2);
+		const row = db.outbox.rows().find((entry) => entry.delivery_id === deliveryId2);
 		expect(row?.state).toBe("failed_ambiguous");
 		expect(stage(db, eventId)).toBe("delivered");
 	});
@@ -481,11 +558,12 @@ describe("monitor crash-boundary state machine", () => {
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db.authoredOutput(eventId) === undefined; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 100 && db.monitors.authoredOutput(eventId) === undefined; attempt++)
+			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(db.monitors.authoredOutput(eventId)).toBe("[SILENT]");
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
-		expect(db.deliveryRows()).toHaveLength(0);
+		expect(db.outbox.rows()).toHaveLength(0);
 	});
 
 	test("reconcile settles events already stranded at authored (#94)", async () => {
@@ -497,21 +575,21 @@ describe("monitor crash-boundary state machine", () => {
 			throw new Error("stranded authored events must not be re-authored");
 		});
 		const silent = seedEvent(db, monitor.monitorId, "authored", crypto.randomUUID());
-		db.authoredOutputCreate(silent, "[SILENT]");
+		createOutput(db, silent, "[SILENT]");
 		const expiredBatch = crypto.randomUUID();
 		const expired = seedEvent(db, monitor.monitorId, "authored", expiredBatch);
-		db.authoredOutputCreate(expired, "report");
-		const ledger = new DeliveryLedger(db);
+		createOutput(db, expired, "report");
+		const ledger = new DeliveryService(db);
 		ledger.createPending({ deliveryId: "old", turnId: expiredBatch, originKey: "loopback", payloadJson: "{}" });
 		for (let attempt = 0; attempt < 3; attempt++) ledger.fail("old");
 		ledger.expireStale(0, Date.now() + 1);
 		// Memory intents exist, as they do for any event that was authored live.
 		for (const eventId of [silent, expired])
-			db.memoryIntentCreate({ id: `monitor-event-intent:${eventId}`, kind: "monitor-event", payloadJson: eventId });
+			createIntent(db, { id: `monitor-event-intent:${eventId}`, kind: "monitor-event", payloadJson: eventId });
 		await propagator.reconcile();
 		expect(stage(db, silent)).toBe("authored_no_delivery");
 		expect(stage(db, expired)).toBe("failed_no_retry");
-		expect(db.monitorFailure(expired)).toMatchObject({
+		expect(db.monitors.failure(expired)).toMatchObject({
 			code: "delivery_expired",
 			detail: "delivery old expired after 3 attempts: expired_before_settlement",
 		});
@@ -530,9 +608,9 @@ describe("monitor crash-boundary state machine", () => {
 			await Bun.sleep(10);
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 		// Terminal: reconcile never redispatches it.
-		const turnsBefore = db.monitorEventRows().length;
+		const turnsBefore = db.monitors.eventRows().length;
 		await propagator.reconcile();
-		expect(db.monitorEventRows().length).toBe(turnsBefore);
+		expect(db.monitors.eventRows().length).toBe(turnsBefore);
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 	});
 
@@ -619,7 +697,7 @@ describe("monitor crash-boundary state machine", () => {
 			};
 			const eventId = seedEvent(db, monitor.monitorId, "failed");
 			await propagator.reconcile();
-			const detail = db.monitorFailure(eventId)?.detail ?? "";
+			const detail = db.monitors.failure(eventId)?.detail ?? "";
 			expect(detail).toContain(expected);
 			expect(detail).toContain('"phase":"request"');
 			expect(detail).toContain('"sessionId":"s1"');
@@ -636,20 +714,15 @@ describe("monitor crash-boundary state machine", () => {
 	test("protocol failure evidence persists only its allowlisted reason and response shape", async () => {
 		const { monitor, database: db } = await harness(async () => "unused");
 		const eventId = seedEvent(db, monitor.monitorId, "failed");
-		db.monitorFailureRecord(
-			eventId,
-			"authoring_response_invalid",
-			"dispatch phase failed (authoring_response_invalid)",
-			{
-				protocolFailure: {
-					reason: "protocol_unknown_event",
-					responseByteLength: 57,
-					responseEntryCount: 1,
-				},
+		recordFailure(db, eventId, "authoring_response_invalid", "dispatch phase failed (authoring_response_invalid)", {
+			protocolFailure: {
+				reason: "protocol_unknown_event",
+				responseByteLength: 57,
+				responseEntryCount: 1,
 			},
-		);
+		});
 
-		expect(db.monitorFailure(eventId)).toMatchObject({
+		expect(db.monitors.failure(eventId)).toMatchObject({
 			protocol_reason: "protocol_unknown_event",
 			response_byte_length: 57,
 			response_entry_count: 1,
@@ -660,20 +733,20 @@ describe("monitor crash-boundary state machine", () => {
 		const storedReasons: string[] = [];
 		for (const reason of PROTOCOL_FAILURE_REASONS) {
 			const eventId = seedEvent(db, monitor.monitorId, "failed");
-			db.monitorFailureRecord(eventId, "authoring_response_invalid", "safe detail", {
+			recordFailure(db, eventId, "authoring_response_invalid", "safe detail", {
 				protocolFailure: {
 					reason,
 					responseByteLength: 0,
 					responseEntryCount: null,
 				},
 			});
-			storedReasons.push(db.monitorFailure(eventId)?.protocol_reason ?? "missing");
+			storedReasons.push(db.monitors.failure(eventId)?.protocol_reason ?? "missing");
 		}
 
 		expect(storedReasons).toEqual([...PROTOCOL_FAILURE_REASONS]);
 		expect(storedReasons).toContain("protocol_off_contract");
 		expect(() =>
-			db.monitorFailureRecord("invalid-reason", "authoring_response_invalid", "safe detail", {
+			recordFailure(db, "invalid-reason", "authoring_response_invalid", "safe detail", {
 				protocolFailure: {
 					reason: "ghp_attacker_controlled_reason",
 					responseByteLength: 0,
@@ -702,14 +775,14 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("failed");
 		await propagator.reconcile();
 		expect(stage(db, eventId)).toBe("authored");
-		const event = db.monitorEventRows().find((row) => row.event_id === eventId);
-		const delivery = db.deliveryRows().find((row) => row.turn_id === event?.batch_id);
+		const event = db.monitors.eventRows().find((row) => row.event_id === eventId);
+		const delivery = db.outbox.rows().find((row) => row.turn_id === event?.batch_id);
 		expect(delivery).toBeDefined();
 		if (!delivery) throw new Error("monitor delivery was not prepared");
-		db.deliveryConfirmWithSettle(delivery.delivery_id, "delivered");
+		confirmAndSettleMonitorDelivery(db, delivery.delivery_id, "delivered");
 		expect(stage(db, eventId)).toBe("delivered");
 
-		const recovery = db.monitorEventRecovery(eventId);
+		const recovery = db.monitors.eventRecovery(eventId);
 		expect(recovery).toMatchObject({
 			protocolFailures: [
 				{
@@ -731,8 +804,8 @@ describe("monitor crash-boundary state machine", () => {
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
 		for (let attempt = 0; attempt < 100 && stage(db, eventId) !== "failed"; attempt++) await Bun.sleep(10);
 
-		const failure = db.monitorFailure(eventId);
-		const durable = `${failure?.detail ?? ""} ${JSON.stringify(db.monitorEventRecovery(eventId))}`;
+		const failure = db.monitors.failure(eventId);
+		const durable = `${failure?.detail ?? ""} ${JSON.stringify(db.monitors.eventRecovery(eventId))}`;
 		expect(failure?.protocol_reason).toBe("protocol_unknown_event");
 		expect(durable).not.toContain("ghp_");
 		expect(durable).not.toContain("secret.example");
@@ -764,7 +837,7 @@ describe("monitor crash-boundary state machine", () => {
 		const attemptsAfter = turns;
 		await propagator.reconcile();
 		expect(turns).toBe(attemptsAfter);
-		const failure = db.monitorFailure(eventId);
+		const failure = db.monitors.failure(eventId);
 		expect(failure).toBeDefined();
 		// Public-safe: no raw error body persisted.
 		expect(failure?.detail).toBeDefined();
@@ -804,7 +877,7 @@ describe("monitor crash-boundary state machine", () => {
 			clock += 60_000;
 		}
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
-		expect(db.authoredOutput(eventId)).toBe("note");
+		expect(db.monitors.authoredOutput(eventId)).toBe("note");
 	});
 
 	test("#187 a retry attaches to the still-running authoring turn instead of re-prompting the session", async () => {
@@ -842,7 +915,7 @@ describe("monitor crash-boundary state machine", () => {
 		// One prompt for one event: the retry observed the original turn.
 		expect(sessionPort.sends).toHaveLength(1);
 		expect(sessionPort.sendAttempts.map((input) => input.opRef)).toEqual([firstOpRef, firstOpRef]);
-		expect(db.authoredOutput(eventId)).toBe("slot done");
+		expect(db.monitors.authoredOutput(eventId)).toBe("slot done");
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 	});
 
@@ -961,20 +1034,20 @@ describe("monitor crash-boundary state machine", () => {
 		await propagator.drain(100);
 		expect(Date.now() - started).toBeLessThan(2_000);
 		expect(stage(db, eventId)).toBe("failed");
-		const failure = db.monitorFailure(eventId);
+		const failure = db.monitors.failure(eventId);
 		expect(failure?.code).toBe("gateway_shutdown");
 		expect(failure?.detail).toContain("gateway stopped at");
 		expect(failure?.detail).toContain('"sessionId":"s1"');
 		expect(failure?.detail).toContain('"phase":"request"');
 		// The lease is released immediately: the next boot need not wait for the
 		// 10-minute TTL before reclaiming the event.
-		expect(db.monitorEventLiveLeaseOwner(eventId)).toBeUndefined();
+		expect(db.monitors.eventLiveLeaseOwner(eventId)).toBeUndefined();
 		// The orphaned turn finishing after the stop is fenced out: no authored
 		// output and no stage change from the dead attempt.
 		release?.();
 		await reconcile;
 		expect(stage(db, eventId)).toBe("failed");
-		expect(db.authoredOutput(eventId)).toBeUndefined();
+		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
 		// Next boot: a fresh propagator reclaims the event as recoverable state
 		// once its retry backoff has elapsed (#179: the second retry waits 10 minutes).
 		const next = new MonitorPropagator({
@@ -984,14 +1057,14 @@ describe("monitor crash-boundary state machine", () => {
 				JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "recovered" }))),
 			),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(db)),
+			delivery: new DeliveryService(db),
 			emit: () => {},
 			now: () => Date.now() + 10 * 60_000 + 1,
 		});
 		propagators.push(next);
 		await next.reconcile();
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
-		expect(db.authoredOutput(eventId)).toBe("recovered");
+		expect(db.monitors.authoredOutput(eventId)).toBe("recovered");
 	});
 
 	test("a closing propagator starts no new dispatch from reconcile", async () => {
@@ -1026,21 +1099,21 @@ describe("monitor crash-boundary state machine", () => {
 		});
 		const hostileId = seedEvent(db, monitor.monitorId, "admitted");
 		await propagator.reconcile();
-		const hostileFailure = db.monitorFailure(hostileId);
+		const hostileFailure = db.monitors.failure(hostileId);
 		const hostileDetail = hostileFailure?.detail ?? "";
 		expect(hostileDetail).toContain('"class":"Error"');
 		expect(hostileDetail).toContain('"frame":"#dispatchBatch"');
 		expect(hostileDetail).not.toContain("ghp_");
 		expect(hostileDetail).not.toContain("/Users/");
 		expect(JSON.stringify(hostileFailure)).not.toContain("ghp_");
-		expect(db.monitorEventRecovery(hostileId)).toBeUndefined();
+		expect(db.monitors.eventRecovery(hostileId)).toBeUndefined();
 
 		const closed = new Error("Database has closed: ghp_attacker-secret");
 		closed.stack = "Error: Database has closed\n    at withTransaction (/Users/private/gateway.db:3:4)";
 		thrown = closed;
 		const closedId = seedEvent(db, monitor.monitorId, "admitted");
 		await propagator.reconcile();
-		const detail = db.monitorFailure(closedId)?.detail ?? "";
+		const detail = db.monitors.failure(closedId)?.detail ?? "";
 		expect(detail).toContain('"class":"Error"');
 		expect(detail).toContain('"cause":"database_closed"');
 		expect(detail).toContain('"frame":"#dispatchBatch"');
@@ -1051,7 +1124,7 @@ describe("monitor crash-boundary state machine", () => {
 	test("unknown stage writes are rejected fail-closed", async () => {
 		const { monitor, database: db } = await harness(async () => "[]");
 		const eventId = seedEvent(db, monitor.monitorId, "admitted");
-		expect(() => db.monitorEventUpdate(eventId, "corrupt" as never)).toThrow(/unknown monitor event stage/);
+		expect(() => updateEvent(db, eventId, "corrupt" as never)).toThrow(/unknown monitor event stage/);
 		expect(stage(db, eventId)).toBe("admitted");
 	});
 });
@@ -1079,7 +1152,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		now: Date,
 		catchUp?: { maxSlots: number; maxAgeMs: number },
 	) {
-		const runtime = new MonitorRuntime({} as never, fixture.registry, fixture.propagator, fixture.database, {
+		const runtime = new MonitorRuntime({} as never, fixture.registry, fixture.propagator, {
 			now: () => now,
 			...(catchUp ? { catchUp } : {}),
 		});
@@ -1087,8 +1160,8 @@ describe("durable cron slot catch-up (#157)", () => {
 		await runtime.stop();
 	}
 
-	const admitted = (db: GatewayDatabase, monitorId: string) =>
-		db.monitorEventRows(monitorId, "oldest").map((row) => row.fired_at);
+	const admitted = (db: Store, monitorId: string) =>
+		db.monitors.eventRows(monitorId, "oldest").map((row) => row.fired_at);
 
 	test("planner retains the newest slots and counts age/count overflow once", () => {
 		const hourly = compileCron("0 * * * *");
@@ -1127,7 +1200,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
 			[at(0), at(4), at(8), at(12)].map((slot) => slot.toISOString()),
 		);
-		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toBeUndefined();
+		expect(fixture.registry.cronState(fixture.monitor.monitorId)).toBeUndefined();
 	});
 
 	test("restarts after 30 minutes, 2 hours, and 13 hours recover every due slot", async () => {
@@ -1138,7 +1211,8 @@ describe("durable cron slot catch-up (#157)", () => {
 		await incarnation(fixture, at(16, 35));
 		const expected = Array.from({ length: 16 }, (_, index) => at(index + 1).toISOString());
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(expected);
-		for (const slot of expected) expect(fixture.database.monitorSlotExists(fixture.monitor.monitorId, slot)).toBe(true);
+		for (const slot of expected)
+			expect(fixture.database.monitors.slotExists(fixture.monitor.monitorId, slot)).toBe(true);
 	});
 
 	test("duplicate startup and live sweeps admit each scheduled slot exactly once", async () => {
@@ -1150,7 +1224,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		const stop = startCron(
 			"*/30 * * * *",
 			{
-				cursor: () => new Date(fixture.database.monitorCronCursor(fixture.monitor.monitorId) ?? at(5, 45)),
+				cursor: () => new Date(fixture.registry.cronCursor(fixture.monitor.monitorId) ?? at(5, 45)),
 				fire: (slot) => {
 					const id = fixture.propagator.submitSlot(
 						fixture.monitor.monitorId,
@@ -1205,7 +1279,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
 			[at(11), at(12), at(13)].map((slot) => slot.toISOString()),
 		);
-		expect(fixture.database.monitorSlotExists(fixture.monitor.monitorId, at(10).toISOString())).toBe(false);
+		expect(fixture.database.monitors.slotExists(fixture.monitor.monitorId, at(10).toISOString())).toBe(false);
 	});
 
 	test("age/count skips advance a durable cursor and are exposed without recounting", async () => {
@@ -1215,7 +1289,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toEqual(
 			[at(10), at(11), at(12)].map((slot) => slot.toISOString()),
 		);
-		const state = fixture.database.monitorCronState(fixture.monitor.monitorId);
+		const state = fixture.registry.cronState(fixture.monitor.monitorId);
 		expect(state).toEqual({
 			cursor: at(9).toISOString(),
 			skippedTotal: 10,
@@ -1227,19 +1301,19 @@ describe("durable cron slot catch-up (#157)", () => {
 			},
 		});
 		await incarnation(fixture, at(12, 5), policy);
-		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toEqual(state);
+		expect(fixture.registry.cronState(fixture.monitor.monitorId)).toEqual(state);
 		expect(admitted(fixture.database, fixture.monitor.monitorId)).toHaveLength(3);
 		await incarnation(fixture, at(20, 5), { maxSlots: 3, maxAgeMs: 60_000 });
-		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)?.skippedTotal).toBe(18);
-		expect(fixture.database.monitorCronCursor(fixture.monitor.monitorId)).toBe(at(20).toISOString());
+		expect(fixture.registry.cronState(fixture.monitor.monitorId)?.skippedTotal).toBe(18);
+		expect(fixture.registry.cronCursor(fixture.monitor.monitorId)).toBe(at(20).toISOString());
 		expect(fixture.registry.remove(fixture.monitor.monitorId)).toBe(true);
-		expect(fixture.database.monitorCronState(fixture.monitor.monitorId)).toBeUndefined();
+		expect(fixture.registry.cronState(fixture.monitor.monitorId)).toBeUndefined();
 	});
 
 	test("runtime startup respects monitor.createdAt", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-runtime-catchup-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "startup",
@@ -1259,16 +1333,16 @@ describe("durable cron slot catch-up (#157)", () => {
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note" }))),
 				}),
 				memory: closure,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {},
 				emit: () => {},
 			});
-			db.monitorSetCreatedAt(monitor.monitorId, at(6, 29).toISOString());
-			const runtimeOld = new MonitorRuntime({} as never, registry, propagator, db, { now: () => at(6, 31) });
+			backdateMonitor(db, monitor.monitorId, at(6, 29));
+			const runtimeOld = new MonitorRuntime({} as never, registry, propagator, { now: () => at(6, 31) });
 			await runtimeOld.start();
 			await runtimeOld.stop();
 			await closure.drain();
-			expect(db.monitorSlotExists(monitor.monitorId, at(6, 30).toISOString())).toBe(true);
+			expect(db.monitors.slotExists(monitor.monitorId, at(6, 30).toISOString())).toBe(true);
 			const monitorNew = registry.add({
 				name: "fresh",
 				trigger: { kind: "cron", schedule: "30 6 * * *" },
@@ -1276,11 +1350,11 @@ describe("durable cron slot catch-up (#157)", () => {
 				burstPolicy: "serialize",
 				enabled: true,
 			});
-			const runtimeNew = new MonitorRuntime({} as never, registry, propagator, db, { now: () => at(6, 31) });
+			const runtimeNew = new MonitorRuntime({} as never, registry, propagator, { now: () => at(6, 31) });
 			await runtimeNew.start();
 			await runtimeNew.stop();
 			await closure.drain();
-			expect(db.monitorSlotExists(monitorNew.monitorId, at(6, 30).toISOString())).toBe(false);
+			expect(db.monitors.slotExists(monitorNew.monitorId, at(6, 30).toISOString())).toBe(false);
 			await propagator.drain();
 			await closure.drain();
 			db.close();
@@ -1295,7 +1369,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		const slotAt = at(6, 30);
 		const first = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slotAt.toISOString() }, slotAt);
 		expect(first).not.toBeNull();
-		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
+		expect(db.monitors.eventRows(monitor.monitorId)).toHaveLength(1);
 		const second = propagator.submitSlot(
 			monitor.monitorId,
 			"memory.canonicalize",
@@ -1303,7 +1377,7 @@ describe("durable cron slot catch-up (#157)", () => {
 			slotAt,
 		);
 		expect(second).toBeNull();
-		expect(db.monitorEventRows(monitor.monitorId)).toHaveLength(1);
+		expect(db.monitors.eventRows(monitor.monitorId)).toHaveLength(1);
 	});
 
 	test("slot payload carries the exact scheduled timestamp", async () => {
@@ -1312,7 +1386,7 @@ describe("durable cron slot catch-up (#157)", () => {
 		const slotAt = at(6, 30);
 		const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slotAt.toISOString() }, slotAt);
 		expect(id).not.toBeNull();
-		const rows = db.monitorEventRows(monitor.monitorId);
+		const rows = db.monitors.eventRows(monitor.monitorId);
 		expect(JSON.parse(rows[0]?.payload_json ?? "null").at).toBe(slotAt.toISOString());
 		expect(rows[0]?.fired_at).toBe(slotAt.toISOString());
 	});
@@ -1322,15 +1396,15 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 		const { monitor, database: db } = await harness(async () => "[]");
 		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
 		const now = Date.now();
-		expect(db.monitorEventAcquireLease(eventId, "proc-A", "lease-A1", 60_000, now)).toBe(true);
+		expect(acquireLease(db, eventId, "proc-A", "lease-A1", 60_000, now)).toBe(true);
 		// Process B (restart) cannot steal a LIVE lease...
-		expect(db.monitorEventAcquireLease(eventId, "proc-B", "lease-B1", 60_000, now + 1000)).toBe(false);
+		expect(acquireLease(db, eventId, "proc-B", "lease-B1", 60_000, now + 1000)).toBe(false);
 		// ...only after it expires.
-		expect(db.monitorEventAcquireLease(eventId, "proc-B", "lease-B1", 60_000, now + 61_000)).toBe(true);
+		expect(acquireLease(db, eventId, "proc-B", "lease-B1", 60_000, now + 61_000)).toBe(true);
 		// The stale attempt A1 can no longer release or hold the lease.
-		db.monitorEventReleaseLease(eventId, "lease-A1");
-		expect(db.monitorEventLeaseHeld(eventId, "lease-A1", now + 61_000)).toBe(false);
-		expect(db.monitorEventLeaseHeld(eventId, "lease-B1", now + 61_000)).toBe(true);
+		releaseLease(db, eventId, "lease-A1");
+		expect(db.monitors.eventLeaseHeld(eventId, "lease-A1", now + 61_000)).toBe(false);
+		expect(db.monitors.eventLeaseHeld(eventId, "lease-B1", now + 61_000)).toBe(true);
 	});
 
 	test("an event with a live lease is not reclaimed by a new process's reconcile", async () => {
@@ -1346,20 +1420,20 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
 		// Another process still holds a live lease on this event (its gjc turn may
 		// still be running there).
-		expect(db.monitorEventAcquireLease(eventId, "proc-old", "lease-old", 60_000)).toBe(true);
+		expect(acquireLease(db, eventId, "proc-old", "lease-old", 60_000)).toBe(true);
 		await propagator.reconcile();
 		expect(turns).toBe(0);
 		expect(stage(db, eventId)).toBe("batched");
 		// Once the lease expires, reclaim succeeds.
 		await Bun.sleep(5);
 		// Expire by acquiring with a now past the TTL.
-		expect(db.monitorEventAcquireLease(eventId, "proc-new", "lease-new", 60_000, Date.now() + 61_000)).toBe(true);
+		expect(acquireLease(db, eventId, "proc-new", "lease-new", 60_000, Date.now() + 61_000)).toBe(true);
 	});
 
 	test("authored monitor intent is processed to receipted in the same live process, exactly once", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-same-run-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "same-run",
@@ -1381,7 +1455,7 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note" }))),
 				}),
 				memory: closure,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {
 					deliveries++;
 				},
@@ -1392,17 +1466,17 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 			// intent (bounded poll, no fixed-sleep assumption), then drain the
 			// closure queue: the intent must reach receipted in this live process.
 			for (let attempt = 0; attempt < 400; attempt++) {
-				if (db.memoryIntentRows().some((row) => row.kind === "monitor-event")) break;
+				if (db.memory.rows().some((row) => row.kind === "monitor-event")) break;
 				await Bun.sleep(5);
 			}
 			await closure.drain();
-			const intents = db.memoryIntentRows().filter((row) => row.kind === "monitor-event");
+			const intents = db.memory.rows().filter((row) => row.kind === "monitor-event");
 			expect(intents).toHaveLength(1);
 			expect(intents[0]?.state).toBe("receipted");
 			// Duplicate/reconcile re-admission must not create a second intent.
-			const before = db.memoryIntentRows().length;
-			const row = db
-				.monitorEventRows()
+			const before = db.memory.rows().length;
+			const row = db.monitors
+				.eventRows()
 				.find((candidate) => candidate.event_id !== "" && candidate.stage === "authored");
 			expect(row).toBeDefined();
 			const eventRow = row as {
@@ -1410,16 +1484,24 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 				event_type: string;
 				fired_at: string;
 			};
-			db.monitorEventFencedAuthorWithIntent(
-				eventRow.event_id,
-				"",
-				"note",
-				false,
-				eventRow.event_type,
-				`monitor-event-intent:${eventRow.event_id}`,
-				JSON.stringify({ platform: "monitor", kind: "eventtype", conversationId: "memory.canonicalize" }),
-			);
-			expect(db.memoryIntentRows().length).toBe(before);
+			db.transaction((tx) => {
+				const intentId = `monitor-event-intent:${eventRow.event_id}`;
+				const authored = db.monitors.authorFenced(tx, eventRow.event_id, "", "note");
+				if (authored && !db.memory.get(intentId))
+					db.memory.createIntent(tx, {
+						id: intentId,
+						kind: "monitor-event",
+						payloadJson: JSON.stringify({
+							identity: `monitor-event:${eventRow.event_id}`,
+							originRefJson: JSON.stringify({
+								platform: "monitor",
+								kind: "eventtype",
+								conversationId: "memory.canonicalize",
+							}),
+						}),
+					});
+			});
+			expect(db.memory.rows().length).toBe(before);
 			expect(deliveries).toBe(1);
 			db.close();
 		} finally {
@@ -1433,13 +1515,13 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 		const now = Date.now();
 		// TTL 60s claimed at `now`; renewed at now+50s with the same TTL extends to
 		// now+110s (renewal takes effect from the renewal instant).
-		expect(db.monitorEventAcquireLease(eventId, "proc-A", "lease-A", 60_000, now)).toBe(true);
-		expect(db.monitorEventLiveLeaseOwner(eventId, now + 50_000)).toBe("lease-A");
-		expect(db.monitorEventRenewLease(eventId, "lease-A", 60_000, now + 50_000)).toBe(true);
-		expect(db.monitorEventLiveLeaseOwner(eventId, now + 100_000)).toBe("lease-A");
-		expect(db.monitorEventLiveLeaseOwner(eventId, now + 110_001)).toBeUndefined();
+		expect(acquireLease(db, eventId, "proc-A", "lease-A", 60_000, now)).toBe(true);
+		expect(db.monitors.eventLiveLeaseOwner(eventId, now + 50_000)).toBe("lease-A");
+		expect(renewLease(db, eventId, "lease-A", 60_000, now + 50_000)).toBe(true);
+		expect(db.monitors.eventLiveLeaseOwner(eventId, now + 100_000)).toBe("lease-A");
+		expect(db.monitors.eventLiveLeaseOwner(eventId, now + 110_001)).toBeUndefined();
 		// A stale attempt (expired lease) cannot renew:
-		expect(db.monitorEventRenewLease(eventId, "lease-A", 60_000, now + 200_000)).toBe(false);
+		expect(renewLease(db, eventId, "lease-A", 60_000, now + 200_000)).toBe(false);
 	});
 
 	test("stale attempt completion cannot overwrite a newer claim's outcome", async () => {
@@ -1447,18 +1529,18 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
 		const now = Date.now();
 		// Attempt A claims and starts a long authoring turn...
-		expect(db.monitorEventAcquireLease(eventId, "proc-A", "lease-A", 60_000, now)).toBe(true);
+		expect(acquireLease(db, eventId, "proc-A", "lease-A", 60_000, now)).toBe(true);
 		// ...A's process dies; the lease expires; process B steals the claim.
-		expect(db.monitorEventAcquireLease(eventId, "proc-B", "lease-B", 60_000, now + 61_000)).toBe(true);
+		expect(acquireLease(db, eventId, "proc-B", "lease-B", 60_000, now + 61_000)).toBe(true);
 		// A's authoring turn finally completes and tries to write its result. The
 		// stale attempt does NOT hold the lease anymore:
-		expect(db.monitorEventLeaseHeld(eventId, "lease-A", now + 61_000)).toBe(false);
+		expect(db.monitors.eventLeaseHeld(eventId, "lease-A", now + 61_000)).toBe(false);
 		// A lease-guarded release is a no-op on B's claim:
-		db.monitorEventReleaseLease(eventId, "lease-A");
-		expect(db.monitorEventLiveLeaseOwner(eventId, now + 61_000)).toBe("lease-B");
+		releaseLease(db, eventId, "lease-A");
+		expect(db.monitors.eventLiveLeaseOwner(eventId, now + 61_000)).toBe("lease-B");
 		// B completes and releases cleanly:
-		db.monitorEventReleaseLease(eventId, "lease-B");
-		expect(db.monitorEventLiveLeaseOwner(eventId, now + 61_000)).toBeUndefined();
+		releaseLease(db, eventId, "lease-B");
+		expect(db.monitors.eventLiveLeaseOwner(eventId, now + 61_000)).toBeUndefined();
 	});
 });
 
@@ -1466,7 +1548,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	test("all fences rejected: leases released, no heartbeat leak, no dispatch", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-fences-rej-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "fences",
@@ -1487,7 +1569,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 					},
 				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {},
 				emit: () => {},
 				// Force the initial fenced batching to fail for every row while the
@@ -1498,7 +1580,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			await Bun.sleep(80);
 			expect(responseRan).toBe(false);
 			// Every acquire was rolled back: no live leases remain (no leak).
-			expect(db.monitorLeaseLiveCount()).toBe(0);
+			expect(db.monitors.leaseLiveCount()).toBe(0);
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
@@ -1508,7 +1590,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	test("claim race: the production loser performs no writes of any kind", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-claim-race-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "race-claim",
@@ -1533,7 +1615,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 					},
 				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {},
 				emit: () => {},
 			});
@@ -1551,7 +1633,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 					},
 				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {
 					deliveriesB++;
 				},
@@ -1569,7 +1651,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			// shape). Both dispatchers reconcile; B's atomic claim deterministically
 			// loses via the injected seam.
 			const seeded = crypto.randomUUID();
-			db.monitorEventCreate({
+			createEvent(db, {
 				eventId: seeded,
 				monitorId: monitor.monitorId,
 				eventType: "memory.canonicalize",
@@ -1583,16 +1665,16 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			expect(bFencedBatchCalls).toBe(0);
 			expect(turnsB).toBe(0);
 			expect(deliveriesB).toBe(0);
-			const seededRow = db.monitorEventRows().find((candidate) => candidate.event_id === seeded);
+			const seededRow = db.monitors.eventRows().find((candidate) => candidate.event_id === seeded);
 			expect(seededRow?.stage).toBe("admitted");
-			expect(db.authoredOutput(seeded)).toBeUndefined();
-			expect(db.monitorFailure(seeded)).toBeUndefined();
-			expect(db.memoryIntentRows().filter((row) => row.payload_json.includes(seeded))).toHaveLength(0);
-			expect(db.deliveryRows()).toHaveLength(0);
+			expect(db.monitors.authoredOutput(seeded)).toBeUndefined();
+			expect(db.monitors.failure(seeded)).toBeUndefined();
+			expect(db.memory.rows().filter((row) => row.payload_json.includes(seeded))).toHaveLength(0);
+			expect(db.outbox.rows()).toHaveLength(0);
 			// A then claims and completes the seeded event through its own chain.
 			await propagatorA.reconcile();
 			expect(turnsA).toBe(1);
-			expect(db.monitorEventRows().find((candidate) => candidate.event_id === seeded)?.stage).toBe(
+			expect(db.monitors.eventRows().find((candidate) => candidate.event_id === seeded)?.stage).toBe(
 				"authored_no_delivery",
 			);
 			db.close();
@@ -1604,7 +1686,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	test("partial authoring response: omitted dispatched events never become delivered", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-partial-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "partial",
@@ -1626,7 +1708,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 						JSON.stringify([]),
 				}),
 				memory: closure,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {
 					deliveries++;
 				},
@@ -1639,9 +1721,9 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			// The partial response is a structured failure: rows failed (recoverable),
 			// never authored, and no delivery admitted.
 			expect(deliveries).toBe(0);
-			expect(db.deliveryRows()).toHaveLength(0);
-			expect(db.monitorFailure(first)).toBeDefined();
-			expect(db.monitorFailure(second)).toBeDefined();
+			expect(db.outbox.rows()).toHaveLength(0);
+			expect(db.monitors.failure(first)).toBeDefined();
+			expect(db.monitors.failure(second)).toBeDefined();
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
@@ -1651,7 +1733,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	test("atomic confirm+settle repairs legacy split state; crash window closed", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-atomic-confirm-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "atomic-confirm",
@@ -1661,15 +1743,15 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			});
 			const batchId = crypto.randomUUID();
 			const eventId = crypto.randomUUID();
-			db.monitorEventCreate({
+			createEvent(db, {
 				eventId,
 				monitorId: monitor.monitorId,
 				eventType: "memory.canonicalize",
 				payloadJson: "{}",
 				firedAt: new Date().toISOString(),
 			});
-			db.monitorEventUpdate(eventId, "authored", batchId);
-			const delivery = new DeliveryService(new DeliveryLedger(db));
+			updateEvent(db, eventId, "authored", batchId);
+			const delivery = new DeliveryService(db);
 			const payload = delivery.prepare(
 				batchId,
 				{ platform: "loopback", kind: "loopback", conversationId: "loopback" },
@@ -1679,15 +1761,15 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const deliveryId = payload.deliveryId as string;
 			delivery.markInflight(deliveryId);
 			// Atomic path: one call transitions ledger AND settles events.
-			const outcome = db.deliveryConfirmWithSettle(deliveryId, "delivered");
+			const outcome = confirmAndSettleMonitorDelivery(db, deliveryId, "delivered");
 			expect(outcome).toBe("transitioned");
-			expect(db.deliveryRows().find((row) => row.delivery_id === deliveryId)?.state).toBe("confirmed");
+			expect(db.outbox.rows().find((row) => row.delivery_id === deliveryId)?.state).toBe("confirmed");
 			expect(stage(db, eventId)).toBe("delivered");
 			// Legacy split-state repair: simulate confirmed ledger + authored event.
-			db.monitorEventUpdate(eventId, "authored");
+			updateEvent(db, eventId, "authored");
 			expect(stage(db, eventId)).toBe("authored");
 			// Idempotent re-confirm repairs the legacy split:
-			expect(db.deliveryConfirmWithSettle(deliveryId, "delivered")).toBe("already_terminal");
+			expect(confirmAndSettleMonitorDelivery(db, deliveryId, "delivered")).toBe("already_terminal");
 			expect(stage(db, eventId)).toBe("delivered");
 			// Expired + late confirm leaves events authored (unchanged behavior).
 			db.close();
@@ -1699,7 +1781,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	test("submitAwaitable rejects non-serialize policies (honest seam contract)", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-await-seam-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "coalesced",
@@ -1717,7 +1799,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "n" }))),
 				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {},
 				emit: () => {},
 			});
@@ -1737,7 +1819,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	test("stale attempt A cannot overwrite B's outcome, enqueue, or re-deliver after losing its lease", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-lease-race-"));
 		try {
-			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const db = await Store.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
 				name: "race",
@@ -1783,7 +1865,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 					},
 				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {
 					deliveriesA++;
 				},
@@ -1798,8 +1880,8 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				});
 			await aParked;
 			await Bun.sleep(10);
-			eventId = db.monitorEventRows()[0]?.event_id ?? eventId;
-			const leaseA = db.monitorEventLiveLeaseOwner(eventId);
+			eventId = db.monitors.eventRows()[0]?.event_id ?? eventId;
+			const leaseA = db.monitors.eventLiveLeaseOwner(eventId);
 			expect(leaseA).toBeString();
 
 			// A's lease "expires": attempt B (clock shifted past A's TTL) finds no
@@ -1816,7 +1898,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "B note" }))),
 				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-				delivery: new DeliveryService(new DeliveryLedger(db)),
+				delivery: new DeliveryService(db),
 				deliver: () => {
 					deliveriesB++;
 				},
@@ -1826,9 +1908,9 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			// B's production recovery path: reconcile claims the expired event and
 			// dispatches it (real chain; asserted below by deliveries/intents).
 			await propagatorB.reconcile();
-			const row = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
+			const row = db.monitors.eventRows().find((candidate) => candidate.event_id === eventId);
 			expect(row?.stage).toBe("authored");
-			expect(db.authoredOutput(eventId)).toBe("B note");
+			expect(db.monitors.authoredOutput(eventId)).toBe("B note");
 			expect(deliveriesB).toBe(1);
 
 			// Unblock A: its stale attempt completes with an A note. Await A's exact
@@ -1836,22 +1918,22 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			aUnblocked = true;
 			await aReturned;
 			await aDispatch;
-			const freshRow = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
+			const freshRow = db.monitors.eventRows().find((candidate) => candidate.event_id === eventId);
 			expect(freshRow?.stage).toBe("authored");
-			expect(db.authoredOutput(eventId)).toBe("B note");
+			expect(db.monitors.authoredOutput(eventId)).toBe("B note");
 			// Exactly one deterministic memory intent (B's; A fenced out):
-			const intents = db.memoryIntentRows().filter((intent) => intent.payload_json.includes(eventId));
+			const intents = db.memory.rows().filter((intent) => intent.payload_json.includes(eventId));
 			expect(intents).toHaveLength(1);
 			expect(intents[0]?.id).toBe(`monitor-event-intent:${eventId}`);
 			expect(intents[0]?.payload_json).toContain("B note");
 			// Exactly one ledger delivery row (B's); A emitted none:
-			expect(db.deliveryRows()).toHaveLength(1);
+			expect(db.outbox.rows()).toHaveLength(1);
 			expect(deliveriesA).toBe(0);
 			expect(deliveriesB).toBe(1);
 			// No A failure evidence:
-			expect(db.monitorFailure(eventId)).toBeUndefined();
+			expect(db.monitors.failure(eventId)).toBeUndefined();
 			// Lease state explicit: B released on completion → owner undefined.
-			expect(db.monitorEventLiveLeaseOwner(eventId, Date.now() + bClockShift)).toBeUndefined();
+			expect(db.monitors.eventLiveLeaseOwner(eventId, Date.now() + bClockShift)).toBeUndefined();
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
@@ -1862,7 +1944,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 describe("monitor overlap policy (issue #83)", () => {
 	async function overlapHarness(overlap: "queue" | "skip" | undefined) {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-overlap-"));
-		const db = await GatewayDatabase.open(join(home, "gateway.db"));
+		const db = await Store.open(join(home, "gateway.db"));
 		database = db;
 		const registry = new MonitorRegistry(db);
 		const monitor = registry.add({
@@ -1887,7 +1969,7 @@ describe("monitor overlap policy (issue #83)", () => {
 				return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "no-op" })));
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(db)),
+			delivery: new DeliveryService(db),
 			emit: () => {},
 		});
 		propagators.push(propagator);
@@ -1898,7 +1980,7 @@ describe("monitor overlap policy (issue #83)", () => {
 		return { db, monitor, propagator, prompts, openGate, registry };
 	}
 	const slot = (minute: number) => new Date(2026, 7, 27, 10, minute);
-	async function settle(db: GatewayDatabase, eventId: string) {
+	async function settle(db: Store, eventId: string) {
 		for (let attempt = 0; attempt < 400 && stage(db, eventId) !== "authored_no_delivery"; attempt++) await Bun.sleep(5);
 		return stage(db, eventId);
 	}
@@ -1912,12 +1994,12 @@ describe("monitor overlap policy (issue #83)", () => {
 		// The 10:30 slot fires while the 10:00 authoring turn is still running.
 		const second = propagator.submitSlot(monitor.monitorId, "backlog.watch", {}, slot(30)) as string;
 		expect(second).not.toBeNull();
-		const row = db.monitorEventRows(monitor.monitorId).find((candidate) => candidate.event_id === second);
+		const row = db.monitors.eventRows(monitor.monitorId).find((candidate) => candidate.event_id === second);
 		expect(row?.stage).toBe("skipped");
 		expect(row?.skipped_by).toBe(first);
 		// A scheduling outcome, not an error: no failure evidence, and recovery
 		// never revives it into a late (stale) authoring turn.
-		expect(db.monitorFailure(second)).toBeUndefined();
+		expect(db.monitors.failure(second)).toBeUndefined();
 		await propagator.reconcile();
 		expect(stage(db, second)).toBe("skipped");
 		// Webhook/script admission honors the same policy.
@@ -1949,7 +2031,7 @@ describe("monitor overlap policy (issue #83)", () => {
 
 	test("an invalid overlap policy is rejected at registration", async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-overlap-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		expect(() =>
 			registry.add({

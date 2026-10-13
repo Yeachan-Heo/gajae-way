@@ -9,7 +9,7 @@ import { cronMatches, cronSlotsBetween, nextCronFire, startCron } from "../src/m
 import { startScript } from "../src/monitors/triggers/script";
 import { startWatcher } from "../src/monitors/triggers/watcher";
 import { startWebhook } from "../src/monitors/triggers/webhook";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 test("cron supports steps, lists, ranges, dow and injected clock", () => {
 	const monday = new Date(2026, 0, 5, 10, 15);
@@ -140,7 +140,7 @@ test("next cron fire reports the configured wall-clock time as a UTC instant", (
 
 test("cron timezone validation rejects invalid zones and defaults to the gateway local zone", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-cron-timezone-"));
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	try {
 		const registry = new MonitorRegistry(database);
 		expect(() =>
@@ -254,7 +254,7 @@ test("default memory monitors seed once and respect operator removals", async ()
 	const { mkdtemp: mkTemp } = await import("node:fs/promises");
 	const { tmpdir: tmp } = await import("node:os");
 	const { join: joinPath } = await import("node:path");
-	const { GatewayDatabase: Db } = await import("../src/store/db");
+	const { Store: Db } = await import("../src/store");
 	const { MonitorRegistry: Registry } = await import("../src/monitors/registry");
 	const { seedDefaultMonitors } = await import("../src/monitors/defaults");
 	const dir = await mkTemp(joinPath(tmp(), "gajaeway-seed-"));

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -29,7 +30,6 @@ import {
 	type StatusReactionsMode,
 } from "./config";
 import { GatewayDownAlarm, lastLogLine } from "./down-alert";
-import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
 	type DiscordInboundReaction,
@@ -182,6 +182,7 @@ export interface TypingPort {
 }
 
 export interface DiscordClientLike {
+	user?: { id: string | number } | null;
 	channels: { fetch(id: string): Promise<unknown> };
 }
 
@@ -1233,7 +1234,8 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		void gateway.recoverMissedMessages();
 	});
 	console.log("Discord adapter starting.");
-	await gateway.connect();
+	await gateway.connectInitial();
+
 	await discord.login(config.token);
 }
 
@@ -1464,8 +1466,25 @@ export class ReconnectingGateway {
 	}
 
 	async connect(): Promise<void> {
+		await this.#connect(false);
+	}
+
+	async connectInitial(): Promise<void> {
+		await this.#connect(true);
+	}
+
+	async #connect(initial: boolean): Promise<void> {
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath, { clientName: "adapter-discord" });
+			const options = {
+				clientName: "adapter-discord",
+				onRetry: (attempt: number, delayMs: number, error: unknown) =>
+					console.warn(
+						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
+					),
+			};
+			const client = initial
+				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
+				: await GajaewayClient.connectSocket(this.socketPath, options);
 			this.#client = client;
 			this.#attempt = 0;
 			void this.downAlarm?.up();
@@ -2250,6 +2269,25 @@ function threadActivityTimestamp(thread: RecoveryThreadLike): number {
 		return Number((BigInt(thread.lastMessageId) >> 22n) + 1_420_070_400_000n);
 	return 0;
 }
+export async function runDiscordAdapterWithLease<T>(home: string, start: (lease: Lease) => Promise<T>): Promise<T> {
+	let lease: Lease;
+	try {
+		lease = await acquireLease(home, "adapter-discord");
+		console.info(`lease_acquired name=adapter-discord pid=${process.pid}`);
+	} catch (error) {
+		if (!(error instanceof LeaseHeldError))
+			console.error(
+				`lease_failed name=adapter-discord detail=${error instanceof Error ? error.message : String(error)}`,
+			);
+		throw error;
+	}
+	try {
+		return await start(lease);
+	} finally {
+		await lease.release();
+	}
+}
+
 export const DISCORD_USAGE = [
 	"usage: gajaeway-discord [--help] [--version]",
 	"",
@@ -2291,25 +2329,31 @@ if (import.meta.main) {
 		const disposeLogging = installStructuredLogging({
 			path: join(adapterHome(), "adapter-discord.log"),
 		});
-		// The lock is taken before the config is even read: refusing early keeps a
-		// stray start from touching the resident instance's gateway session.
-		AdapterLock.acquire(adapterHome())
-			.then(async (lock) => {
-				// Registering a signal handler suppresses the default terminate, so
-				// the lock is dropped and the exit is then performed by hand.
-				const release = (): void =>
-					void lock.release().finally(() => {
+		void runDiscordAdapterWithLease(adapterHome(), async (lease) => {
+			const shutdown = (): void => {
+				void lease.release().then(
+					() => {
 						disposeLogging();
 						process.exit(0);
-					});
-				process.once("SIGINT", release);
-				process.once("SIGTERM", release);
-				await startDiscordAdapter(await loadDiscordAdapterConfig());
-			})
-			.catch((error) => {
-				console.error(error instanceof Error ? error.message : String(error));
-				disposeLogging();
-				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
-			});
+					},
+					(error) => {
+						console.error(
+							`Discord adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+						);
+						disposeLogging();
+						process.exit(1);
+					},
+				);
+			};
+			process.once("SIGINT", shutdown);
+			process.once("SIGTERM", shutdown);
+			await startDiscordAdapter(await loadDiscordAdapterConfig());
+			await new Promise<void>(() => {});
+		}).catch((error) => {
+			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
+			console.error(error instanceof Error ? error.message : String(error));
+			disposeLogging();
+			process.exitCode = 1;
+		});
 	}
 }

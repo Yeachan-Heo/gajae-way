@@ -17,8 +17,7 @@ import {
 	TailRunner,
 } from "../src/orchestrator/tail-runner";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	createOwnedSessionFixture,
@@ -107,7 +106,7 @@ async function attached(host: Host, onFrame?: (frame: TailFrame) => void | Promi
 }
 async function database() {
 	const home = await mkdtemp(join(tmpdir(), "relay-redteam-"));
-	const db = await GatewayDatabase.open(join(home, "gateway.db"));
+	const db = await Store.open(join(home, "gateway.db"));
 	cleanups.push(async () => {
 		db.close();
 		await rm(home, { recursive: true, force: true });
@@ -161,7 +160,9 @@ async function actor(port = new ScriptedSessionPort()) {
 	});
 	cleanups.push(() => manager.stop());
 	const enqueue = (id: string) => {
-		db.inboundEnqueue({ messageId: id, originKey: key, originRefJson: JSON.stringify(origin), body: id });
+		db.transaction((tx) =>
+			db.inbox.enqueue(tx, { messageId: id, originKey: key, originRefJson: JSON.stringify(origin), body: id }),
+		);
 		return manager.notifyInbound(key);
 	};
 	return { db, port, manager, logs, terminal, speech, released, enqueue };
@@ -169,7 +170,7 @@ async function actor(port = new ScriptedSessionPort()) {
 
 test("RT01 duplicate message_end reaches callback twice but deterministic ledger permits one delivery", async () => {
 	const { db } = await database();
-	const service = new DeliveryService(new DeliveryLedger(db));
+	const service = new DeliveryService(db);
 	const host = new Host();
 	const delivered: string[] = [];
 	let callbacks = 0;
@@ -187,7 +188,7 @@ test("RT01 duplicate message_end reaches callback twice but deterministic ledger
 	host.host(message("same"));
 	await until(() => callbacks === 2);
 	expect(delivered).toEqual(["same"]);
-	expect(db.deliveryRows()).toHaveLength(1);
+	expect(db.outbox.rows()).toHaveLength(1);
 });
 
 test("RT02 every contradictory correlation is dropped; only uncorrelated idle survives", async () => {
@@ -248,7 +249,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 		await f.enqueue("trigger");
 		expect(sequence).toEqual(["send", "status"]);
 		const op = port.sendAttempts[0]!.opRef;
-		expect(f.db.inboundTurnRow(op)?.turn_state).toBe(state === "unknown" ? "bound" : "accepted");
+		expect(f.db.inbox.turnRow(op)?.turn_state).toBe(state === "unknown" ? "bound" : "accepted");
 		if (state === "unknown") expect(f.logs.some((line) => line.includes("operation_state_unknown"))).toBe(true);
 		expect(f.released).toEqual([]);
 	});
@@ -317,7 +318,7 @@ test("RT04 unknown bound operation releases only after a second status sweep pro
 	expect(statuses).toBeGreaterThanOrEqual(2);
 	expect(f.released).toEqual([firstOp]);
 	expect(port.sendAttempts).toHaveLength(1);
-	expect(f.db.inboundPendingCount(key)).toBe(1);
+	expect(f.db.inbox.pendingCount(key)).toBe(1);
 });
 
 test("RT06 status query timeout keeps actor accepted and held", async () => {
@@ -334,7 +335,7 @@ test("RT06 status query timeout keeps actor accepted and held", async () => {
 	await f.manager.reconcile(key);
 	expect(sawRelay).toBe(true);
 	expect(f.logs.some((line) => line.includes("reason=status_unavailable"))).toBe(true);
-	expect(f.db.inboundTurnRow(f.port.sends[0]!.opRef)?.turn_state).toBe("accepted");
+	expect(f.db.inbox.turnRow(f.port.sends[0]!.opRef)?.turn_state).toBe("accepted");
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.released).toEqual([]);
 });
@@ -504,6 +505,7 @@ test("RT13 fifty synchronous frames preserve order through a slow asynchronous c
 
 test("RT14 work start survives observer spawn failure, sends once without relay and settles by status", async () => {
 	const { db, home } = await database();
+	const gajaewayHome = join(home, "gajaeway");
 	const port = new ScriptedSessionPort({ sessionIdForBind: () => crypto.randomUUID() });
 	attachTestBrokerOwnership(db, port, join(home, "agent"));
 	port.attachTail = async () => {
@@ -513,6 +515,7 @@ test("RT14 work start survives observer spawn failure, sends once without relay 
 		database: db,
 		port,
 		lanes: new LaneGovernor({ database: db, sessionPort: port, maxLanes: 1 }),
+		gajaewayHome,
 		pollMs: 5,
 		waitTimeoutMs: 1000,
 	});
@@ -523,7 +526,7 @@ test("RT14 work start survives observer spawn failure, sends once without relay 
 	expect(port.sends).toHaveLength(1);
 	expect(port.sends[0]?.relay).toBeUndefined();
 	port.seedOperation(result.opRef, result.sessionId, "terminal_ok", "work result");
-	await until(() => db.workAttemptGet(result.opRef)?.settledAt != null);
+	await until(() => db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.workerOutputReads).toHaveLength(1);
 });

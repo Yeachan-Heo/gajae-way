@@ -1,4 +1,4 @@
-import type { GatewayDatabase } from "../store/db";
+import type { Store } from "../store";
 import type { MonitorRegistry } from "./registry";
 
 /**
@@ -28,8 +28,8 @@ export const DEFAULT_MEMORY_MONITORS = [
 
 const SEED_FLAG = "default_monitors_seeded";
 
-export function seedDefaultMonitors(registry: MonitorRegistry, database: GatewayDatabase): number {
-	if (database.metaGet(SEED_FLAG)) return 0;
+export function seedDefaultMonitors(registry: MonitorRegistry, database: Store): number {
+	if (database.core.metaGet(SEED_FLAG)) return 0;
 	const existingNames = new Set(registry.list().map((monitor) => monitor.name));
 	let seeded = 0;
 	for (const spec of DEFAULT_MEMORY_MONITORS) {
@@ -37,6 +37,6 @@ export function seedDefaultMonitors(registry: MonitorRegistry, database: Gateway
 		registry.add(spec);
 		seeded++;
 	}
-	database.metaSet(SEED_FLAG, new Date().toISOString());
+	database.core.metaSet(SEED_FLAG, new Date().toISOString());
 	return seeded;
 }

@@ -5,23 +5,27 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { applyModelCommand, listModelChoices, parseModelArgument } from "../src/server/model-command";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import type { GjcModelSelection } from "../src/store/db";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
+import type { GjcModelSelection } from "../src/store/groups/bindings";
+import type { WriteTx } from "../src/store/tx";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 function store(initial?: GjcModelSelection) {
 	let current = initial;
 	const writes: GjcModelSelection[] = [];
 	return {
-		conversationModelGet: () => (current === undefined ? undefined : { selection: current }),
-		conversationModelSet: (_key: string, selection: GjcModelSelection) => {
-			current = selection;
-			writes.push(selection);
-		},
-		conversationModelClear: () => {
-			const had = current !== undefined;
-			current = undefined;
-			return had;
+		transaction: <T>(operation: (tx: WriteTx) => T) => operation(undefined as unknown as WriteTx),
+		bindings: {
+			modelGet: () => (current === undefined ? undefined : { selection: current }),
+			modelSet: (_tx: WriteTx, _key: string, selection: GjcModelSelection) => {
+				current = selection;
+				writes.push(selection);
+			},
+			modelClear: (_tx: WriteTx) => {
+				const had = current !== undefined;
+				current = undefined;
+				return had;
+			},
 		},
 		writes,
 		get current() {
@@ -206,6 +210,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
@@ -213,7 +218,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		model: { preset: "base" },
 		serviceTier: "priority",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	let server: GatewayServer | undefined;
@@ -271,7 +276,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 				),
 			"live model.set was not issued",
 		);
-		expect(database.getSessionRecord("loopback/loopback/model")).toMatchObject({
+		expect(database.bindings.getSessionRecord("loopback/loopback/model")).toMatchObject({
 			epoch: 0,
 			sessionId: first.sessionId,
 		});

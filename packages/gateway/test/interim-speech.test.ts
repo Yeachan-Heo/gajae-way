@@ -6,7 +6,7 @@ import type { GatewayConfig } from "../src/config";
 import { InterimSpeechGate, isNearDuplicate, isProceduralNarration } from "../src/server/interim-speech";
 import type { GatewayServer } from "../src/server/server";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 let directory = "";
@@ -125,13 +125,14 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-test": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
@@ -225,13 +226,14 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-test": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
@@ -331,7 +333,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 		}),
 	);
 
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	const sessionPort = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 

@@ -1,13 +1,18 @@
 #!/usr/bin/env bun
-import { Database } from "bun:sqlite";
-import { copyFile, lstat, readFile, stat } from "node:fs/promises";
+
 import { isAbsolute, join } from "node:path";
+
 import type {
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
 	MonitorSpec,
 	OpsCycleResult,
+	OpsDeliveriesParams,
+	OpsDeliveriesResult,
+	OpsSloParams,
+	OpsSloResult,
+	WorkJobsParams,
 	WorkJobsResult,
 	WorkRetireResult,
 	WorkRunResult,
@@ -16,8 +21,11 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import pkg from "../package.json";
+
 import {
 	columnNames,
 	type ListOptions,
@@ -41,7 +49,13 @@ import {
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
-import { performUpgrade } from "./upgrade";
+
+async function connectGatewaySocket(
+	path: string,
+	options: { readonly requestTimeoutMs?: number } = {},
+): Promise<GajaewayClient> {
+	return GajaewayClient.connectSocketWithBackoff(path, { ...options, deadlineMs: 30_000 });
+}
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -70,7 +84,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -97,7 +111,7 @@ function gatewayHome(): string {
 export interface MainOptions {
 	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
 	/** Test seams for `setup`: the platform fetch and the prompter. */
-	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env">;
+	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env" | "binDir" | "runBrokerAgent">;
 	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
 	readonly restartStack?: {
 		readonly launch?: Omit<LaunchRestartOptions, "home">;
@@ -307,6 +321,10 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(
 		`memory: queued=${cycle.memoryIntents.queued} written=${cycle.memoryIntents.written} committed=${cycle.memoryIntents.committed} receipted=${cycle.memoryIntents.receipted} quarantined=${cycle.memoryIntents.quarantined}${cycle.memoryClosing ? " (closing)" : ""}`,
 	);
+	if (cycle.memoryGitIndexLock) {
+		const { path, ageMs } = cycle.memoryGitIndexLock;
+		lines.push(`memory_git_index_lock: ${path} age=${Math.round(ageMs)}ms`);
+	}
 	if (cycle.agentDisk) {
 		const { path, freeBytes, totalBytes } = cycle.agentDisk;
 		const gib = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
@@ -316,6 +334,19 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 				: `agent_disk: ${path} free=${gib(freeBytes)}GiB total=${gib(totalBytes)}GiB`,
 		);
 	}
+	if (cycle.brokerAgent !== null) {
+		lines.push(`broker_agent: ${cycle.brokerAgent.status}`);
+		for (const entry of cycle.brokerAgent.entries)
+			if (entry.state !== "in_sync") lines.push(`broker_agent ${entry.name}: kind=${entry.kind} state=${entry.state}`);
+	}
+	const sloState = cycle.slo.ok
+		? "ok"
+		: cycle.slo.days.some((day) => day.status === "failed")
+			? "failed"
+			: cycle.slo.days.some((day) => day.status === "insufficient")
+				? "insufficient"
+				: "pending";
+	lines.push(`slo: seven-day=${sloState}`);
 	// Always rendered: an empty subsystem must be distinguishable from an absent one.
 	lines.push(
 		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,
@@ -346,106 +377,110 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
-
-/**
- * The same acceptance the gateway applies at boot (`PRAGMA integrity_check`
- * must answer `ok`), run read-only against the backup before it replaces
- * anything. A 16-byte header match is not a database: a truncated or
- * bit-flipped file passes it, gets copied into place, and the next boot
- * fails while the restore already reported success.
- *
- * An empty file is also refused: SQLite treats a zero-length file as a valid
- * empty database and `integrity_check` answers `ok` for it, but restoring it
- * would boot a gateway with every table freshly created and nothing in them.
- *
- * Opening a WAL-mode backup read-only may leave empty `-wal`/`-shm` sidecars
- * next to the backup; `ops backup` writes delete-mode files, which gain none.
- */
-export function verifyBackupIntegrity(backupPath: string): void {
-	let database: Database;
-	try {
-		database = new Database(backupPath, { readonly: true });
-	} catch (error) {
-		throw new Error(
-			`Backup is not readable: ${backupPath} (${error instanceof Error ? error.message : String(error)})`,
+export function renderSlo(result: OpsSloResult): string[] {
+	const message = result.ok
+		? `SLO ok: ${result.days.length} consecutive UTC days`
+		: result.days.some((day) => day.status === "failed")
+			? "SLO failed: counted failure events or journal overflow"
+			: result.days.some((day) => day.status === "insufficient")
+				? "SLO insufficient: coverage or durable evidence is incomplete"
+				: "SLO pending: an update window is still running; rerun later";
+	const lines = [message];
+	for (const day of result.days)
+		lines.push(
+			`${day.date} status=${day.status} coverage=${day.complete ? "complete" : "incomplete"} alive_ms=${day.aliveMs} max_gap_ms=${day.maxUncoveredGapMs} broker_unavailable=${day.broker_unavailable} persona_bind_failed=${day.persona_bind_failed} excluded=${day.excluded}`,
 		);
-	}
-	let detail: string;
-	let pageCount: number;
-	try {
-		pageCount = database.query<{ page_count: number }, []>("PRAGMA page_count").get()?.page_count ?? 0;
-		detail =
-			database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check ?? "unknown";
-	} catch (error) {
-		throw new Error(
-			`Backup is not a readable SQLite database: ${backupPath} (${error instanceof Error ? error.message : String(error)})`,
+	for (const window of result.windows)
+		lines.push(
+			`window id=${window.id} trigger=${window.trigger} state=${window.state} requested=${window.requestedAt} finished=${window.finishedAt ?? "-"} verified=${window.verified} eligible=${window.eligibleStart ?? "-"}..${window.eligibleEnd ?? "-"} over_cap_ms=${window.overCapMs}`,
 		);
-	} finally {
-		database.close();
-	}
-	if (pageCount === 0) throw new Error(`Backup is an empty SQLite database: ${backupPath}`);
-	if (detail !== "ok") throw new Error(`Backup failed SQLite integrity_check: ${backupPath} (${detail})`);
+	return lines;
 }
 
-/**
- * The database the gateway actually opens: `config.json` `dbPath` when set,
- * otherwise `<home>/gateway.db` — the same file-based resolution as the
- * gateway's `loadConfig`. An absent `config.json` means defaults, exactly as
- * at boot. A present-but-unreadable one (EACCES, EISDIR, or a dangling symlink,
- * which reports ENOENT while the entry exists) refuses the restore instead of
- * guessing, as boot refuses to start: copying a backup over the wrong file
- * reports success while the live database stays broken.
- *
- * `schemaVersion` is deliberately not checked: `dbPath` is a version-independent
- * string, and disaster recovery must not be blocked by an unrelated schema bump.
- */
-export async function restoreTargetPath(home = gatewayHome()): Promise<string> {
-	const configPath = join(home, "config.json");
-	let raw: string | undefined;
-	try {
-		raw = await readFile(configPath, "utf8");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		const entryExists = await lstat(configPath).then(
-			() => true,
-			() => false,
-		);
-		if (code !== "ENOENT" || entryExists) throw new Error(`Cannot read ${configPath}; refusing restore.`);
-	}
-	if (raw === undefined) return join(home, "gateway.db");
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch {
-		throw new Error(`Cannot parse ${configPath}; refusing restore.`);
-	}
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-		throw new Error(`Invalid configuration ${configPath}: config must be an object; refusing restore.`);
-	const dbPath = (parsed as { dbPath?: unknown }).dbPath;
-	if (dbPath === undefined) return join(home, "gateway.db");
-	if (typeof dbPath !== "string" || dbPath.length === 0)
-		throw new Error(`Invalid configuration ${configPath}: dbPath must be a non-empty string; refusing restore.`);
-	return dbPath;
+export function sloExitCode(result: OpsSloResult): number {
+	return result.ok ? 0 : 1;
 }
 
-export async function restoreDatabase(socket: string, backupPath: string): Promise<void> {
-	if (!isAbsolute(backupPath)) throw new Error("ops restore requires an absolute backup path");
-	try {
-		await stat(socket);
-		throw new Error(`Refusing restore: gateway socket ${socket} exists. Stop the daemon before restoring.`);
-	} catch (error) {
-		if (error instanceof Error && error.message.startsWith("Refusing restore:")) throw error;
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-			throw new Error(`Cannot verify gateway socket ${socket}; refusing restore.`);
+const OPS_USAGE =
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--json]|integrity|restart-stack [--status]";
+function parseOpsSloArgs(args: readonly string[]): { params: OpsSloParams; json: boolean } {
+	let days = 7;
+	let json = false;
+	const seen = new Set<string>();
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		if (flag === "--json") {
+			if (json) throw new Error(OPS_USAGE);
+			json = true;
+			continue;
+		}
+		if (flag !== "--days" || seen.has(flag)) throw new Error(OPS_USAGE);
+		seen.add(flag);
+		const value = args[++index];
+		if (!value || !/^\d+$/.test(value)) throw new Error(OPS_USAGE);
+		days = Number(value);
+		if (!Number.isSafeInteger(days) || days < 1 || days > 3_650) throw new Error(OPS_USAGE);
 	}
-	verifyBackupIntegrity(backupPath);
-	const databasePath = await restoreTargetPath();
-	const preservedPath = `${databasePath}.pre-restore-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-	await copyFile(databasePath, preservedPath);
-	await copyFile(backupPath, databasePath);
-	console.log(`Validated SQLite backup: ${backupPath}`);
-	console.log(`Copied current database to: ${preservedPath}`);
-	console.log(`Restored backup to: ${databasePath}`);
+	return { params: { days }, json };
+}
+
+function parseOpsDeliveriesArgs(args: readonly string[]): { params: OpsDeliveriesParams; json: boolean } {
+	const params: { since?: string; state?: string; limit?: number } = {};
+	const seen = new Set<string>();
+	let json = false;
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		if (flag === "--json") {
+			if (json) throw new Error(OPS_USAGE);
+			json = true;
+			continue;
+		}
+		if (flag !== "--since" && flag !== "--state" && flag !== "--limit") throw new Error(OPS_USAGE);
+		if (seen.has(flag)) throw new Error(OPS_USAGE);
+		seen.add(flag);
+		const value = args[++index];
+		if (!value || value.startsWith("--")) throw new Error(OPS_USAGE);
+		if (flag === "--since") {
+			if (!Number.isFinite(Date.parse(value))) throw new Error(OPS_USAGE);
+			params.since = value;
+		} else if (flag === "--state") params.state = value;
+		else {
+			if (!/^\d+$/.test(value)) throw new Error(OPS_USAGE);
+			const limit = Number(value);
+			if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error(OPS_USAGE);
+			params.limit = limit;
+		}
+	}
+	return { params, json };
+}
+
+/** `work jobs [--limit N] [--offset N]`, bounded like the gateway so a bad value is a usage error. */
+function parseWorkJobsArgs(args: readonly string[], usage: string): WorkJobsParams {
+	const params: { limit?: number; offset?: number } = {};
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		const value = args[++index];
+		if ((flag !== "--limit" && flag !== "--offset") || value === undefined || !/^\d+$/.test(value))
+			throw new Error(usage);
+		const key = flag === "--limit" ? "limit" : "offset";
+		if (params[key] !== undefined) throw new Error(usage);
+		const number = Number(value);
+		if (!Number.isSafeInteger(number) || (key === "limit" && (number < 1 || number > WORK_JOBS_MAX_LIMIT)))
+			throw new Error(usage);
+		params[key] = number;
+	}
+	return params;
+}
+
+export function renderDeliveries(result: OpsDeliveriesResult): string[] {
+	if (result.rows.length === 0) return ["deliveries: none"];
+	return [
+		`deliveries: ${result.rows.length}`,
+		...result.rows.map(
+			(row) =>
+				`${row.createdAt} ${row.state} delivery=${row.deliveryId} turn=${row.turnId} origin=${row.originKey} conversation=${row.conversationId} text=${JSON.stringify(row.textPrefix)}`,
+		),
+	];
 }
 
 const CHAT_TURN_TIMEOUT_MS = 30 * 60_000;
@@ -453,7 +488,7 @@ const CHAT_TURN_TIMEOUT_MS = 30 * 60_000;
 async function chat(socket: string): Promise<void> {
 	let client: GajaewayClient;
 	try {
-		client = await GajaewayClient.connectSocket(socket);
+		client = await connectGatewaySocket(socket);
 	} catch {
 		console.error(`Unable to connect to gateway socket ${socket}. Start the daemon out-of-band first.`);
 		process.exitCode = 1;
@@ -510,6 +545,10 @@ async function chat(socket: string): Promise<void> {
 
 export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
 	const parsed = parseArgs(args);
+	if (parsed.command === "--version" && parsed.rest.length === 0) {
+		console.log(pkg.version);
+		return;
+	}
 	const usage = usageFor(parsed.command);
 	if (usage !== undefined) {
 		console.error(usage);
@@ -518,7 +557,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 	try {
 		switch (parsed.command) {
 			case "status": {
-				const client = await GajaewayClient.connectSocket(parsed.socket);
+				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					console.log(JSON.stringify(await client.status()));
 				} finally {
@@ -527,7 +566,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "shutdown": {
-				const client = await GajaewayClient.connectSocket(parsed.socket);
+				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					await client.shutdown();
 				} finally {
@@ -548,7 +587,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "sessions": {
 				const listOptions =
 					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), SESSION_COLUMNS) : undefined;
-				const client = await GajaewayClient.connectSocket(parsed.socket);
+				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					const result = await client.request<{
 						sessions: Array<{
@@ -602,32 +641,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				break;
 			}
 			case "ops": {
-				const [command, path, ...extraArgs] = parsed.rest;
-				if (command === "upgrade") {
-					// gajaeway ops upgrade [--gjc X.Y.Z]
-					const home = gatewayHome();
-					let gjcVersion: string | undefined;
-					if (path === "--gjc" && extraArgs[0]) {
-						gjcVersion = extraArgs[0];
-					} else if (path && path !== "--gjc") {
-						throw new Error("usage: gajaeway ops upgrade [--gjc X.Y.Z]");
-					}
-					const result = await performUpgrade({ home, gjcVersion });
-					console.log(result.detail);
-					if (result.status !== "ok") {
-						process.exitCode = 1;
-						break;
-					}
-					// After upgrade, trigger restart-stack
-					const { receipt, supervisorPid } = await launchRestartStack({ home });
-					console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
-					console.log("read the outcome with: gajaeway ops restart-stack --status");
-					break;
-				}
-				if (command === "restore" && path) {
-					await restoreDatabase(parsed.socket, path);
-					break;
-				}
+				const [command, path] = parsed.rest;
+				if (
+					command === undefined ||
+					!["backup", "deliveries", "redeliver", "integrity", "slo", "cycle", "restart-stack"].includes(command)
+				)
+					throw new Error(`unknown ops command: ${command ?? "(missing)"}\n${OPS_USAGE}`);
+				const deliveries = command === "deliveries" ? parseOpsDeliveriesArgs(parsed.rest.slice(1)) : undefined;
+				const slo = command === "slo" ? parseOpsSloArgs(parsed.rest.slice(1)) : undefined;
 				if (command === "restart-stack") {
 					// Deliberately socket-free: the reason to run this is a gateway that
 					// has to come back, so it must not need the gateway to answer first.
@@ -647,9 +668,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					} else if (flag === "--status" && parsed.rest.length === 2) {
 						const receipt = await readRestartReceipt(home);
 						if (receipt === undefined) throw new Error("no restart-stack receipt");
-						for (const line of renderRestartReceipt(receipt)) console.log(line);
+						const state = await effectiveRestartState(receipt, home);
+						for (const line of renderRestartReceipt(receipt, state)) console.log(line);
 						// Only a completed, verified sequence exits 0; queued or running is not yet success.
-						if (effectiveRestartState(receipt) !== "ok") process.exitCode = 1;
+						if (state !== "ok") process.exitCode = 1;
 					} else if (parsed.rest.length === 1) {
 						const { receipt, supervisorPid } = await launchRestartStack({ ...options.restartStack?.launch, home });
 						console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
@@ -669,10 +691,15 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						redeliverParams = { since: parsed.rest[2] };
 					else throw new Error("usage: gajaeway ops redeliver <deliveryId>|--since <iso>");
 				}
-				const client = await GajaewayClient.connectSocket(parsed.socket);
+				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					if (command === "backup" && path) console.log(JSON.stringify(await client.request("ops.backup", { path })));
-					else if (redeliverParams) console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
+					else if (deliveries) {
+						const result = await client.opsDeliveries(deliveries.params);
+						if (deliveries.json) console.log(JSON.stringify(result));
+						else for (const line of renderDeliveries(result)) console.log(line);
+					} else if (redeliverParams)
+						console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
 					else if (command === "cycle") {
 						const cycle = await client.opsCycle();
@@ -682,10 +709,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						// Fail-closed: a gated/degraded cycle exits non-zero even though the
 						// request itself succeeded, so scripts can never read it as healthy.
 						process.exitCode = cycleExitCode(cycle);
-					} else
-						throw new Error(
-							"usage: gajaeway ops backup <path>|redeliver <deliveryId>|redeliver --since <iso>|cycle [--json]|integrity|restore <backupPath>|upgrade [--gjc X.Y.Z]|restart-stack [--status]",
-						);
+					} else if (slo) {
+						const result = await client.opsSlo(slo.params);
+						if (slo.json) console.log(JSON.stringify(result));
+						else for (const line of renderSlo(result)) console.log(line);
+						process.exitCode = sloExitCode(result);
+					} else throw new Error(OPS_USAGE);
 				} finally {
 					await client.close();
 				}
@@ -698,7 +727,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				// plain audit would read as a repair attempt that reproduced the failure.
 				if ((parsed.rest[0] === "audit" || parsed.rest[0] === "autolink") && parsed.rest.length > 1)
 					throw new Error(`${usage} (unknown argument: ${parsed.rest[1]})`);
-				const client = await GajaewayClient.connectSocket(parsed.socket);
+				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {
 						const result = await client.request<{ ok: boolean; issues: unknown[] }>("memory.audit");
@@ -721,7 +750,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const listOptions = command === "list" ? parseListOptions(args, MONITOR_COLUMNS) : undefined;
 				const update = command === "update" ? parseMonitorUpdateArgs(args) : undefined;
 				const monitorTest = command === "test" ? parseMonitorTestArgs(args) : undefined;
-				const client = await GajaewayClient.connectSocket(parsed.socket);
+				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					if (command === "add" && args[0] === "--json" && args[1])
 						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
@@ -780,7 +809,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						(command === "status" ? args.length !== 1 : !text || args.slice(1).some((arg) => arg.startsWith("--")))
 					)
 						throw new Error(usage);
-					const client = await GajaewayClient.connectSocket(parsed.socket);
+					const client = await connectGatewaySocket(parsed.socket);
 					try {
 						if (command === "status") {
 							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
@@ -798,6 +827,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					let force = false;
 					let allDead = false;
 					let name: string | undefined;
+					let jobsPage: WorkJobsParams | undefined;
 					if (command === "retire") {
 						for (let i = 0; i < args.length; i++) {
 							const arg = args[i];
@@ -815,9 +845,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						if (!allDead && !name) throw new Error(usage);
 						if (allDead && name) throw new Error(usage);
 					} else if (args.length !== 0) {
-						throw new Error(usage);
+						jobsPage = parseWorkJobsArgs(args, usage);
 					}
-					const client = await GajaewayClient.connectSocket(parsed.socket);
+					const client = await connectGatewaySocket(parsed.socket);
 					try {
 						if (command === "retire") {
 							const result = await client.request<WorkRetireResult>("work.retire", {
@@ -836,7 +866,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								);
 							}
 						} else {
-							const result = await client.request<WorkJobsResult>("work.jobs");
+							const result = await client.request<WorkJobsResult>("work.jobs", jobsPage);
 							for (const job of result.jobs) {
 								// lane_key is the stored `work-<name>`; print the name work.retire accepts.
 								const name = job.lane_key.startsWith("work-") ? job.lane_key.slice("work-".length) : job.lane_key;
@@ -861,6 +891,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 									}`,
 								);
 							}
+							const shownEnd = result.offset + result.jobs.length;
+							if (result.jobs.length === 0) console.error(`jobs: none at offset ${result.offset} of ${result.total}`);
+							else if (result.offset > 0 || shownEnd < result.total)
+								console.error(
+									`jobs ${result.offset + 1}-${shownEnd} of ${result.total}${shownEnd < result.total ? ` (next: --offset ${shownEnd})` : ""}`,
+								);
 						}
 					} finally {
 						await client.close();
@@ -893,7 +929,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
 				// This is a caller response-wait budget, never an attempt deadline.
 				// Timeout/disconnect leaves the attempt observable via work.status.
-				const client = await GajaewayClient.connectSocket(parsed.socket, {
+				const client = await connectGatewaySocket(parsed.socket, {
 					requestTimeoutMs: command === "run" ? 3_600_000 : 120_000,
 				});
 				try {

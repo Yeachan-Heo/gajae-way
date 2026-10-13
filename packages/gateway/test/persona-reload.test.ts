@@ -8,7 +8,7 @@ import { originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { PersonaLoader, SELF_OPS_PREAMBLE_POINTER } from "../src/persona/persona";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 const LOOPBACK_ORIGIN = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
@@ -27,17 +27,18 @@ type TestSessionPort = ReturnType<typeof sessionPortFromResponder>;
 async function startAgentsGateway(
 	home: string,
 	seen: string[],
-	options: { readonly database?: GatewayDatabase; readonly sessionPort?: TestSessionPort } = {},
+	options: { readonly database?: Store; readonly sessionPort?: TestSessionPort } = {},
 ) {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 	};
-	const database = options.database ?? (await GatewayDatabase.open(config.dbPath));
+	const database = options.database ?? (await Store.open(config.dbPath));
 	const sessionPort =
 		options.sessionPort ??
 		sessionPortFromResponder({
@@ -114,13 +115,14 @@ test("persona USER.md edits are included on the next turn", async () => {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 	};
 	const seen: string[] = [];
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => `${key}#${epoch}`,
 		respond: async (_id, _text, preamble) => {
@@ -313,7 +315,7 @@ test("fresh session leaves AGENTS.md to gjc project-context discovery", async ()
 		expect(seen).toHaveLength(2);
 		expect(agentsSectionCount(preambleAt(seen, 0))).toBe(0);
 		expect(agentsSectionCount(preambleAt(seen, 1))).toBe(0);
-		expect(gateway.database.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
+		expect(gateway.database.bindings.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
 			epoch: 0,
 			lastBootstrappedEpoch: 0,
 			agentsMdEpoch: 0,
@@ -345,7 +347,7 @@ test("AGENTS.md edits and deletion supersede the session-start copy once per tur
 		expect(agentsSectionCount(preambleAt(seen, 1))).toBe(1);
 		expect(seen[1]).toContain(`${UPDATED_AGENTS_MD_HEADING}\nupdated instructions`);
 		expect(seen[1]).not.toContain("session-start instructions");
-		expect(gateway.database.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
+		expect(gateway.database.bindings.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
 			agentsMdEpoch: 0,
 			agentsMdDigest: createHash("sha256").update("updated instructions").digest("hex"),
 		});
@@ -387,7 +389,7 @@ test("a new session epoch establishes the current AGENTS.md as its baseline", as
 
 		expect(agentsSectionCount(preambleAt(seen, 0))).toBe(0);
 		expect(agentsSectionCount(preambleAt(seen, 1))).toBe(0);
-		expect(gateway.database.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
+		expect(gateway.database.bindings.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
 			epoch: 1,
 			lastBootstrappedEpoch: 1,
 			agentsMdEpoch: 1,
@@ -445,7 +447,7 @@ test("AGENTS.md baseline survives a gateway and database reload", async () => {
 	const seen: string[] = [];
 	let gateway: Awaited<ReturnType<typeof startAgentsGateway>> | undefined;
 	let client: Awaited<ReturnType<typeof connectLoopbackClient>> | undefined;
-	let reopenedDatabase: GatewayDatabase | undefined;
+	let reopenedDatabase: Store | undefined;
 	try {
 		await mkdir(join(home, "workspace"), { recursive: true });
 		await writeFile(agentsPath, "persisted baseline");
@@ -461,8 +463,8 @@ test("AGENTS.md baseline survives a gateway and database reload", async () => {
 		client = undefined;
 		await gateway.server.stop();
 		gateway = undefined;
-		reopenedDatabase = await GatewayDatabase.open(dbPath);
-		expect(reopenedDatabase.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
+		reopenedDatabase = await Store.open(dbPath);
+		expect(reopenedDatabase.bindings.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))).toMatchObject({
 			agentsMdEpoch: 0,
 			agentsMdDigest: expectedDigest,
 		});

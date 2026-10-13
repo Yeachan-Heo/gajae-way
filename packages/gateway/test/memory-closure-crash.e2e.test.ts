@@ -1,11 +1,11 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { originKey } from "@gajae-gateway/protocol";
 import { MemoryClosureQueue } from "../src/memory/closure";
 import { memoryRoot } from "../src/memory/doctrine";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 let home = "";
 afterEach(async () => {
@@ -29,8 +29,8 @@ async function run(killPoint?: string, recover = false): Promise<number> {
 }
 
 async function intent() {
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const row = database.memoryIntentRows()[0];
+	const database = await Store.open(join(home, "gateway.db"));
+	const row = database.memory.rows()[0];
 	database.close();
 	if (!row) throw new Error("missing memory intent");
 	return row;
@@ -47,44 +47,32 @@ async function trailerCommits(id: string): Promise<string[]> {
 	return output.trim() ? output.trim().split("\n") : [];
 }
 
-async function receiptContains(id: string): Promise<boolean> {
-	try {
-		return (await readFile(join(home, "memory-receipts.jsonl"), "utf8"))
-			.split("\n")
-			.some((line) => line && JSON.parse(line).id === id);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-		throw error;
-	}
-}
-
-test("quarantined memory intents persist a reason, log it, and emit a negative receipt", async () => {
+test("quarantined memory intents persist their reason in the database and log it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-quarantine-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const id = "invalid-memory-intent";
 	const origin = { platform: "discord", kind: "channel", conversationId: "C1" } as const;
 	const reason = "Error: unsupported memory intent unsupported";
-	database.memoryIntentCreate({
-		id,
-		kind: "unsupported",
-		payloadJson: JSON.stringify({
-			originRefJson: JSON.stringify(origin),
-			userText: "captured",
-			replyText: "reply",
+	database.transaction((tx) =>
+		database.memory.createIntent(tx, {
+			id,
+			kind: "unsupported",
+			payloadJson: JSON.stringify({
+				originRefJson: JSON.stringify(origin),
+				userText: "captured",
+				replyText: "reply",
+			}),
 		}),
-	});
+	);
 	const warning = spyOn(console, "warn").mockImplementation(() => {});
 	try {
 		await new MemoryClosureQueue(database, home).initialize();
-		const row = database.memoryIntentRows()[0];
+		const row = database.memory.rows()[0];
 		expect(row).toMatchObject({ state: "quarantined", attempts: 1, quarantine_reason: reason });
 		expect(warning).toHaveBeenCalledTimes(1);
 		expect(warning.mock.calls[0]?.[0]).toContain(
 			`id=${id} kind=unsupported origin=${originKey(origin)} reason=${reason}`,
 		);
-		const receipt = JSON.parse((await readFile(join(home, "memory-receipts.jsonl"), "utf8")).trim());
-		expect(receipt).toMatchObject({ id, state: "quarantined", reason });
-		expect(Number.isFinite(Date.parse(receipt.at))).toBe(true);
 	} finally {
 		warning.mockRestore();
 		database.close();
@@ -113,12 +101,10 @@ for (const [name, killPoint] of [
 		if (name === "M3") {
 			expect(before.state).toBe("committed");
 			expect(await trailerCommits(before.id)).toHaveLength(1);
-			expect(await receiptContains(before.id)).toBe(false);
 		}
 		expect(await run(undefined, true)).toBe(0);
 		const after = await intent();
 		expect(after.state).toBe("receipted");
 		expect(await trailerCommits(after.id)).toHaveLength(1);
-		expect(await receiptContains(after.id)).toBe(true);
 	});
 }

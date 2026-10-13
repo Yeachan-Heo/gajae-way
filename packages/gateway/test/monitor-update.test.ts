@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 test("monitor update changes a cron schedule without replacing identity or event history", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-update-"));
-	let database: GatewayDatabase | undefined;
+	let database: Store | undefined;
 	try {
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const created = registry.add({
 			name: "schedule-change",
@@ -22,13 +22,15 @@ test("monitor update changes a cron schedule without replacing identity or event
 		const before = registry.get(created.monitorId);
 		if (!before) throw new Error("new monitor was not persisted");
 		const eventId = crypto.randomUUID();
-		database.monitorEventCreate({
-			eventId,
-			monitorId: created.monitorId,
-			eventType: "schedule.changed",
-			payloadJson: "{}",
-			firedAt: "2026-09-25T10:00:00.000Z",
-		});
+		database!.transaction((tx) =>
+			database!.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: created.monitorId,
+				eventType: "schedule.changed",
+				payloadJson: "{}",
+				firedAt: "2026-09-25T10:00:00.000Z",
+			}),
+		);
 
 		const updated = registry.update({ monitorId: created.monitorId, schedule: "0 */2 * * *" });
 
@@ -40,7 +42,7 @@ test("monitor update changes a cron schedule without replacing identity or event
 		});
 		if (!updated) throw new Error("monitor update removed the monitor");
 		expect(registry.list()).toEqual([updated]);
-		expect(database.monitorEventRows(created.monitorId, "newest", true).map((event) => event.event_id)).toEqual([
+		expect(database.monitors.eventRows(created.monitorId, "newest", true).map((event) => event.event_id)).toEqual([
 			eventId,
 		]);
 	} finally {
@@ -51,11 +53,11 @@ test("monitor update changes a cron schedule without replacing identity or event
 
 test("monitor.update RPC returns the stable ID and monitor.inspect reads the changed schedule", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-update-rpc-"));
-	let database: GatewayDatabase | undefined;
+	let database: Store | undefined;
 	let server: Awaited<ReturnType<typeof startUnixServer>> | undefined;
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
 	try {
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const monitor = new MonitorRegistry(database).add({
 			name: "rpc-schedule-change",
 			trigger: { kind: "cron", schedule: "*/30 * * * *" },
@@ -67,6 +69,7 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 			config: {
 				schemaVersion: 1,
 				home,
+				gjc: { agentDir: join(home, "agent") },
 				configPath: join(home, "config.json"),
 				socketPath,
 				dbPath: join(home, "gateway.db"),
@@ -126,9 +129,9 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 
 test("updating a webhook never replaces its generated route with a caller-chosen route", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-update-webhook-"));
-	let database: GatewayDatabase | undefined;
+	let database: Store | undefined;
 	try {
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const original = registry.add({
 			name: "webhook-update",

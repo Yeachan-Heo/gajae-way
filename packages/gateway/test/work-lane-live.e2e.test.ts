@@ -5,12 +5,17 @@ import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
-import { GjcCliUnavailableError, GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
+import {
+	GJC_ATTACH_ONLY_ENV,
+	GjcCliUnavailableError,
+	GlobalGjcClient,
+	readBrokerDiscovery,
+} from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
 import { BrokerSessionPort, isSteerAccepted } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 const liveTest = process.env.GAJAEWAY_E2E_WORK === "1" ? test : test.skip;
 const diagnosticCode = /^[a-z][a-z_]{1,63}$/;
@@ -175,11 +180,13 @@ liveTest(
 			const initialized = Bun.spawn(["git", "init", "--quiet", repo], { stdout: "ignore", stderr: "pipe" });
 			expect(await initialized.exited).toBe(0);
 		}
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000, log: () => {} });
 		const canonicalAgentDir = await realpath(agentDir);
 		const brokerAuthority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-		database.assertBrokerAuthority(brokerAuthority, { initializeEmpty: true });
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, brokerAuthority, database.inspectBrokerAuthority().populated),
+		);
 		const configSnapshot = async () => {
 			const snapshot = new Map<string, Buffer | null>();
 			for (const name of ["models.yml", "settings.json", "auth.json", "config.yml", "config.json"]) {
@@ -198,10 +205,8 @@ liveTest(
 				cwd: repo,
 				env: {
 					...process.env,
-					GJC_EXECUTABLE: executable,
+					[GJC_ATTACH_ONLY_ENV]: "0",
 					GJC_CODING_AGENT_DIR: agentDir,
-					PI_CODING_AGENT_DIR: agentDir,
-					GJC_AGENT_DIR: agentDir,
 				},
 				stdin: "ignore",
 				stdout: "pipe",
@@ -317,6 +322,7 @@ liveTest(
 				database,
 				port,
 				lanes: new LaneGovernor({ database, sessionPort: port, maxLanes: 1 }),
+				gajaewayHome: home,
 				brokerGeneration: () => broker.generation,
 				pollMs: 500,
 				waitTimeoutMs: 120_000,
@@ -329,7 +335,7 @@ liveTest(
 				text: "Verification only: use the bash tool to run sleep 15 exactly once, without reading or modifying any files or running other commands. After that wait, reply briefly with WORK_LANE_LIVE_OK and honor any steering message received during the wait.",
 			});
 			if (!started.started) throw new Error("fresh work lane unexpectedly held");
-			expect(database.workAttemptGet(started.opRef)?.sendPhase).toBe("accepted");
+			expect(database.work.workAttemptGet(started.opRef)?.sendPhase).toBe("accepted");
 			stage = "independent-active-turn-steer";
 			const activeSessionId = started.sessionId;
 			expect(unrelated.includes(activeSessionId)).toBe(false);
@@ -380,7 +386,7 @@ liveTest(
 				}
 				await Bun.sleep(Math.min(500, Math.max(0, deadline - Date.now())));
 			}
-			const runtime = database.workAttemptGet(started.opRef)!;
+			const runtime = database.work.workAttemptGet(started.opRef)!;
 			expect(runtime.settledAt).not.toBeNull();
 			expect(runtime.terminal?.reasonCode).toBe("end_turn");
 			stage = "invocation-owned-output";
@@ -439,10 +445,10 @@ liveTest(
 			failures.push({
 				stage,
 				evidence: [...evidence],
-				work: database.laneJobRows(true).map((row) => {
-					const parsed = JSON.parse(database.laneJobJson(row.job_id) ?? "{}");
+				work: database.work.laneJobRows(true).map((row) => {
+					const parsed = JSON.parse(database.work.laneJobJson(row.job_id) ?? "{}");
 					const attempt = parsed.attempts?.at(-1);
-					const runtime = attempt ? database.workAttemptGet(attempt.opRef) : undefined;
+					const runtime = attempt ? database.work.workAttemptGet(attempt.opRef) : undefined;
 					return {
 						state: row.state,
 						endState: attempt?.endState,
@@ -463,7 +469,7 @@ liveTest(
 			try {
 				await broker.start();
 				// This fresh database contains only sessions created by this test's port.
-				for (const row of database.workLaneRows()) {
+				for (const row of database.bindings.workLaneRows()) {
 					expect(unrelated.includes(row.gjc_session_id)).toBe(false);
 					await port?.close({ sessionId: row.gjc_session_id, repo });
 				}

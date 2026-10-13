@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 let directory = "";
@@ -25,6 +25,7 @@ async function makeConfig(): Promise<GatewayConfig> {
 	return {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -82,7 +83,7 @@ test("a trigger re-dispatched after its first attach failed still answers the lo
 		}
 	}
 	const config = await makeConfig();
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new StaleFirstPort({
 		onBind: (input) => `${input.originKey}#${input.epoch}`,
 		onSend: (input, scripted) => scripted.complete(input.opRef, "answer on the fresh session"),
@@ -106,14 +107,14 @@ test("a trigger re-dispatched after its first attach failed still answers the lo
 	const answer = requester.frames.find((frame) => frame.event === "chat.message");
 	expect(answer.payload).toMatchObject({ turnId, text: "answer on the fresh session", final: true });
 	expect(adapter.frames.filter((frame) => frame.event === "chat.message")).toEqual([]);
-	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
+	expect(database.inbox.pendingCount("loopback/loopback/loopback")).toBe(0);
 	adapter.close();
 	requester.close();
 });
 
 test("a failed loopback turn ends the requester's wait with a final failure notice", async () => {
 	const config = await makeConfig();
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
 		onBind: (input) => `${input.originKey}#${input.epoch}`,
 		onSend: (input, scripted) => scripted.fail(input.opRef, "provider exploded"),
@@ -132,13 +133,13 @@ test("a failed loopback turn ends the requester's wait with a final failure noti
 	const notice = requester.frames.find((frame) => frame.event === "chat.message");
 	expect(notice.payload.turnId).toBe(turnId);
 	expect(notice.payload.text).toStartWith("[turn failed]");
-	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
+	expect(database.inbox.pendingCount("loopback/loopback/loopback")).toBe(0);
 	requester.close();
 });
 
 test("a duplicate message id is acknowledged but never dispatched twice", async () => {
 	const config = await makeConfig();
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = new ScriptedSessionPort({
 		onBind: (input) => `${input.originKey}#${input.epoch}`,
@@ -163,13 +164,13 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	expect(dup.result).toMatchObject({ turnId: null, engaged: true });
 	expect(turns).toEqual(["hello"]);
 	expect(client.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(1);
-	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
+	expect(database.inbox.pendingCount("loopback/loopback/loopback")).toBe(0);
 	client.close();
 });
 
 test("a message arriving while a persistent turn is in flight is steered into that turn", async () => {
 	const config = await makeConfig();
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -192,6 +193,6 @@ test("a message arriving while a persistent turn is in flight is steered into th
 
 	const replies = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
 	expect(replies).toEqual(["reply to first"]);
-	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
+	expect(database.inbox.pendingCount("loopback/loopback/loopback")).toBe(0);
 	client.close();
 });

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase, workAttemptDeliveryId } from "../src/store/db";
+import { Store } from "../src/store";
+import { workAttemptDeliveryId } from "../src/store/groups/work";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const rootOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "parent-channel" };
@@ -14,7 +15,7 @@ const rootKey = originKey(rootOrigin);
 const fixtures: Array<{
 	home: string;
 	server: GatewayServer;
-	database: GatewayDatabase;
+	database: Store;
 	port: ScriptedSessionPort;
 	client: Awaited<ReturnType<typeof connect>>;
 }> = [];
@@ -84,13 +85,15 @@ async function bindPersonaSession(
 ): Promise<string> {
 	const authority = f.database.inspectBrokerAuthority().authority;
 	if (!authority) throw new Error("test broker authority missing");
-	const recorded = f.database.recordOwnedBinding({
-		authority,
-		sessionId,
-		originKey: key,
-		epoch: 0,
-		repo: join(f.home, "workspace"),
-	});
+	const recorded = f.database.transaction((tx) =>
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority,
+			sessionId,
+			originKey: key,
+			epoch: 0,
+			repo: join(f.home, "workspace"),
+		}),
+	);
 	if (!recorded) throw new Error("persona fixture binding lost its epoch");
 	return sessionId;
 }
@@ -105,6 +108,7 @@ async function fixture(
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
@@ -114,12 +118,12 @@ async function fixture(
 		...(options.channels ? { channels: options.channels } : {}),
 		...(options.allowNested === undefined ? {} : { work: { allowNested: options.allowNested } }),
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessions = new Map<string, string>();
 	const port = new ScriptedSessionPort({
 		onBind: (input) => {
 			const bindingKey = `${input.originKey}#${input.epoch}`;
-			const known = database.getSessionRecord(input.originKey);
+			const known = database.bindings.getSessionRecord(input.originKey);
 			const knownSessionId = known?.epoch === input.epoch && known.sessionId ? known.sessionId : undefined;
 			const sessionId = sessions.get(bindingKey) ?? knownSessionId ?? crypto.randomUUID();
 			sessions.set(bindingKey, sessionId);
@@ -169,7 +173,7 @@ async function startLane(f: Awaited<ReturnType<typeof fixture>>, name: string, c
 async function settleLane(f: Awaited<ReturnType<typeof fixture>>, opRef: string, answer = "lane answer") {
 	f.port.complete(opRef, answer);
 	return await eventually(
-		() => f.database.workAttemptGet(opRef),
+		() => f.database.work.workAttemptGet(opRef),
 		(runtime) => runtime?.settledAt !== undefined && runtime.settledAt !== null,
 		`lane ${opRef} settlement`,
 	);
@@ -178,7 +182,7 @@ async function settleLane(f: Awaited<ReturnType<typeof fixture>>, opRef: string,
 async function silencePersona(f: Awaited<ReturnType<typeof fixture>>, opRef: string): Promise<void> {
 	f.port.complete(opRef, "[SILENT]");
 	await eventually(
-		() => f.database.inboundTurnRow(opRef),
+		() => f.database.inbox.turnRow(opRef),
 		(row) => row?.turn_state === "done",
 		`silent persona turn ${opRef}`,
 	);
@@ -208,14 +212,15 @@ for (const [label, origin] of [
 		const work = lane.result;
 		await settleLane(f, work.opRef, "bounded result");
 		const reportRow = await eventually(
-			() => f.database.inboundTurnRows(persona.opRef),
+			() => f.database.inbox.turnRows(persona.opRef),
 			(rows) =>
 				rows.some(
-					(row) => row.source === "lane_report" && row.message_id === f.database.workAttemptGet(work.opRef)?.reportId,
+					(row) =>
+						row.source === "lane_report" && row.message_id === f.database.work.workAttemptGet(work.opRef)?.reportId,
 				),
 			"persona lane-report row",
 		);
-		const reportId = f.database.workAttemptGet(work.opRef)!.reportId;
+		const reportId = f.database.work.workAttemptGet(work.opRef)!.reportId;
 		expect(reportRow.filter((row) => row.message_id === reportId)).toMatchObject([
 			expect.objectContaining({
 				source: "lane_report",
@@ -255,13 +260,13 @@ test("AC-A [SILENT] persona answer posts nothing", async () => {
 	const lane = await startLane(f, "silent-worker", persona.sessionId);
 	await settleLane(f, lane.result.opRef, "work done");
 	await eventually(
-		() => f.database.inboundTurnRows(persona.opRef),
+		() => f.database.inbox.turnRows(persona.opRef),
 		(rows) => rows.some((row) => row.source === "lane_report"),
 		"internal lane report row",
 	);
 	f.port.complete(persona.opRef, "[SILENT]");
 	await eventually(
-		() => f.database.inboundTurnRow(persona.opRef),
+		() => f.database.inbox.turnRow(persona.opRef),
 		(row) => row?.turn_state === "done",
 		"silent persona turn",
 	);
@@ -274,7 +279,7 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 	await bindPersonaSession(f, rootKey, personaSessionId);
 	const lane = await startLane(f, "idle-worker", personaSessionId);
 	await settleLane(f, lane.result.opRef, "idle report");
-	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
 		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
@@ -283,7 +288,7 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
 	expect(reportSend.text).toContain("[lane idle-worker] completed: idle report");
 	expect(reportSend.sessionId).toBe(personaSessionId);
-	expect(f.database.inboundTurnRows(reportSend.opRef)).toMatchObject([
+	expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
 		expect.objectContaining({ message_id: reportId, source: "lane_report", origin_key: rootKey }),
 	]);
 	expect(chatMessages(f)).toHaveLength(0);
@@ -296,6 +301,39 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 	expect(chatMessages(f)[0]?.payload.text).toBe("ack");
 });
 
+test("a lane-report turn can [POST:] its result line to another configured channel", async () => {
+	const f = await fixture({
+		channels: {
+			"parent-channel": { engagement: "open", audience: "all" },
+			"report-room": { engagement: "open", audience: "all" },
+		},
+	});
+	const personaSessionId = crypto.randomUUID();
+	await bindPersonaSession(f, rootKey, personaSessionId);
+	const lane = await startLane(f, "post-worker", personaSessionId);
+	await settleLane(f, lane.result.opRef, "deployed");
+	const sends = await eventually(
+		() => f.port.sends,
+		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
+		"persona wake send",
+	);
+	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
+	f.port.complete(
+		reportSend.opRef,
+		"배포 끝났어\n[BREAK]\n[POST:discord/channel/report-room] 완료: 배포 <#parent-channel>",
+	);
+	await eventually(
+		() => chatMessages(f),
+		(messages) => messages.length === 2,
+		"lane-report reply and post",
+	);
+	expect(chatMessages(f).map((frame) => [frame.payload.origin.conversationId, frame.payload.text])).toEqual([
+		["parent-channel", "배포 끝났어"],
+		["report-room", "완료: 배포 <#parent-channel>"],
+	]);
+	expect(f.database.outbox.rows().filter((row) => row.origin_key === "discord/channel/report-room")).toHaveLength(1);
+});
+
 for (const [label, callerSessionId] of [
 	["no caller id", undefined],
 	["unknown caller id", "unknown-session-id"],
@@ -306,7 +344,7 @@ for (const [label, callerSessionId] of [
 		await bindPersonaSession(f, rootKey, personaSessionId);
 		const lane = await startLane(f, `owner-${label.replaceAll(" ", "-")}`, callerSessionId);
 		await settleLane(f, lane.result.opRef, "owner report");
-		const runtime = f.database.workAttemptGet(lane.result.opRef)!;
+		const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 		expect(runtime.parent).toMatchObject({ kind: "persona", originKey: rootKey });
 		const report = await eventually(
 			() => f.port.sends,
@@ -324,11 +362,11 @@ test("AC-D no ownerTarget settles durably as no_target without inbound row or po
 	const f = await fixture({ ownerTarget: false });
 	const lane = await startLane(f, "status-only");
 	await settleLane(f, lane.result.opRef, "no destination");
-	const runtime = f.database.workAttemptGet(lane.result.opRef)!;
+	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime).toMatchObject({ parent: null, decision: "no_target" });
-	expect(f.database.laneReportsByParent("status-only")).toEqual([]);
-	expect(f.database.deliveryRows()).toEqual([]);
-	expect(f.database.inboundTurnRows(lane.result.opRef)).toEqual([]);
+	expect(f.database.work.laneReportsByParent("status-only")).toEqual([]);
+	expect(f.database.outbox.rows()).toEqual([]);
+	expect(f.database.inbox.turnRows(lane.result.opRef)).toEqual([]);
 	expect(chatMessages(f)).toHaveLength(0);
 });
 
@@ -344,7 +382,7 @@ test("AC-E work.start from a lane is refused by default before bind, send, or jo
 	});
 	expect(f.port.binds).toHaveLength(binds);
 	expect(f.port.sendAttempts).toHaveLength(sends);
-	expect(f.database.laneJobJson("lanejob-" + Buffer.from("refused-child").toString("hex"))).toBeUndefined();
+	expect(f.database.work.laneJobJson("lanejob-" + Buffer.from("refused-child").toString("hex"))).toBeUndefined();
 });
 
 test("AC-E work.run from a lane is refused before bind or waiter creation", async () => {
@@ -364,7 +402,7 @@ test("AC-E work.run from a lane is refused before bind or waiter creation", asyn
 	});
 	expect(f.port.binds).toHaveLength(binds);
 	expect(f.port.sendAttempts).toHaveLength(sends);
-	expect(f.database.laneJobJson(`lanejob-${Buffer.from("run-child").toString("hex")}`)).toBeUndefined();
+	expect(f.database.work.laneJobJson(`lanejob-${Buffer.from("run-child").toString("hex")}`)).toBeUndefined();
 });
 
 test("AC-E allowed nested work.run remains response-only", async () => {
@@ -386,9 +424,9 @@ test("AC-E allowed nested work.run remains response-only", async () => {
 	const response = await responsePromise;
 	expect(response.error).toBeUndefined();
 	expect(response.result.text).toBe("response result");
-	expect(f.database.workAttemptGet(run.opRef)).toMatchObject({ mode: "run", parent: null, decision: "no_target" });
-	expect(f.database.laneReportsByParent("run-parent")).toEqual([]);
-	expect(f.database.deliveryRows()).toEqual([]);
+	expect(f.database.work.workAttemptGet(run.opRef)).toMatchObject({ mode: "run", parent: null, decision: "no_target" });
+	expect(f.database.work.laneReportsByParent("run-parent")).toEqual([]);
+	expect(f.database.outbox.rows()).toEqual([]);
 	expect(chatMessages(f)).toHaveLength(0);
 });
 
@@ -396,11 +434,11 @@ test("AC-F no sessions row falls back with one ledger row and one chat.message",
 	const f = await fixture();
 	const lane = await startLane(f, "fallback-worker");
 	await settleLane(f, lane.result.opRef, "fallback body");
-	const runtime = f.database.workAttemptGet(lane.result.opRef)!;
+	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime.decision).toBe("fallback");
-	expect(f.database.deliveryRows()).toHaveLength(1);
-	expect(f.database.deliveryRows()[0]?.delivery_id).toBe(runtime.deliveryId);
-	expect(f.database.deliveryRows()[0]?.origin_key).toBe(rootKey);
+	expect(f.database.outbox.rows()).toHaveLength(1);
+	expect(f.database.outbox.rows()[0]?.delivery_id).toBe(runtime.deliveryId);
+	expect(f.database.outbox.rows()[0]?.origin_key).toBe(rootKey);
 	await eventually(
 		() => chatMessages(f),
 		(messages) => messages.length === 1,
@@ -408,7 +446,7 @@ test("AC-F no sessions row falls back with one ledger row and one chat.message",
 	);
 	expect(chatMessages(f)[0]?.payload.text).toBe("[lane fallback-worker] completed: fallback body");
 	await f.client.request("work.status", { name: "fallback-worker" });
-	expect(f.database.deliveryRows()).toHaveLength(1);
+	expect(f.database.outbox.rows()).toHaveLength(1);
 	expect(chatMessages(f)).toHaveLength(1);
 });
 
@@ -416,21 +454,23 @@ test("AC-F conflicting inbound id selects fallback atomically", async () => {
 	const f = await fixture();
 	await bindPersonaSession(f, rootKey);
 	const lane = await startLane(f, "conflict-worker");
-	const runtime = f.database.workAttemptGet(lane.result.opRef)!;
+	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(
-		f.database.inboundEnqueue({
-			messageId: runtime.reportId,
-			originKey: rootKey,
-			originRefJson: JSON.stringify(rootOrigin),
-			body: "conflicting platform id",
-			source: "platform",
-		}),
+		f.database.transaction((tx) =>
+			f.database.inbox.enqueue(tx, {
+				messageId: runtime.reportId,
+				originKey: rootKey,
+				originRefJson: JSON.stringify(rootOrigin),
+				body: "conflicting platform id",
+				source: "platform",
+			}),
+		),
 	).toBe(true);
 	await settleLane(f, lane.result.opRef, "conflict fallback");
-	expect(f.database.workAttemptGet(lane.result.opRef)?.decision).toBe("fallback");
-	expect(f.database.deliveryRows()).toHaveLength(1);
-	expect(f.database.deliveryRows()[0]?.delivery_id).toBe(runtime.deliveryId);
-	expect(f.database.inboundPendingOldest(rootKey)).toMatchObject({ message_id: runtime.reportId, source: "platform" });
+	expect(f.database.work.workAttemptGet(lane.result.opRef)?.decision).toBe("fallback");
+	expect(f.database.outbox.rows()).toHaveLength(1);
+	expect(f.database.outbox.rows()[0]?.delivery_id).toBe(runtime.deliveryId);
+	expect(f.database.inbox.pendingOldest(rootKey)).toMatchObject({ message_id: runtime.reportId, source: "platform" });
 });
 
 test("AC-F a quarantined nonterminal persona turn rejects report admission", async () => {
@@ -441,20 +481,24 @@ test("AC-F a quarantined nonterminal persona turn rejects report admission", asy
 		channels: { "quarantined-parent": { engagement: "open", audience: "all" } },
 	});
 	const personaSessionId = await bindPersonaSession(f, key);
-	f.database.inboundEnqueue({
-		messageId: "quarantine-human",
-		originKey: key,
-		originRefJson: JSON.stringify(origin),
-		body: "nonterminal parent turn",
-	});
-	f.database.inboundBindTurn({
-		messageId: "quarantine-human",
-		originKey: key,
-		epoch: 0,
-		opRef: "gw-quarantined-persona-turn",
-		sessionId: personaSessionId,
-	});
-	f.database.inboundTurnAccept("gw-quarantined-persona-turn");
+	f.database.transaction((tx) =>
+		f.database.inbox.enqueue(tx, {
+			messageId: "quarantine-human",
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: "nonterminal parent turn",
+		}),
+	);
+	f.database.transaction((tx) =>
+		f.database.inbox.bindTurn(tx, {
+			messageId: "quarantine-human",
+			originKey: key,
+			epoch: 0,
+			opRef: "gw-quarantined-persona-turn",
+			sessionId: personaSessionId,
+		}),
+	);
+	f.database.transaction((tx) => f.database.inbox.turnAccept(tx, "gw-quarantined-persona-turn"));
 	const raw = new Database(join(f.home, "gateway.db"));
 	try {
 		raw
@@ -465,9 +509,9 @@ test("AC-F a quarantined nonterminal persona turn rejects report admission", asy
 	}
 	const lane = await startLane(f, "quarantine-worker", personaSessionId);
 	await settleLane(f, lane.result.opRef, "held report");
-	expect(f.database.workAttemptGet(lane.result.opRef)?.decision).toBe("fallback");
-	expect(f.database.deliveryRows()).toHaveLength(1);
-	expect(f.database.inboundTurnRow("gw-quarantined-persona-turn")).toMatchObject({
+	expect(f.database.work.workAttemptGet(lane.result.opRef)?.decision).toBe("fallback");
+	expect(f.database.outbox.rows()).toHaveLength(1);
+	expect(f.database.inbox.turnRow("gw-quarantined-persona-turn")).toMatchObject({
 		message_id: "quarantine-human",
 		turn_state: "accepted",
 	});
@@ -479,7 +523,7 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 		const persona = await startPersonaTurn(f, rootOrigin, `epoch-human-${reset}`);
 		f.port.complete(persona.opRef, "initial response");
 		await eventually(
-			() => f.database.inboundTurnRow(persona.opRef),
+			() => f.database.inbox.turnRow(persona.opRef),
 			(row) => row?.turn_state === "done",
 			"initial persona turn did not settle",
 		);
@@ -493,12 +537,12 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 			});
 			expect(command.error).toBeUndefined();
 		} else {
-			f.database.rebindEpoch(rootKey);
+			f.database.transaction((tx) => f.database.bindings.rotateEpoch(tx, rootKey));
 		}
-		const afterReset = f.database.getSessionRecord(rootKey)!;
+		const afterReset = f.database.bindings.getSessionRecord(rootKey)!;
 		expect(afterReset.sessionId).toBe("");
 		await settleLane(f, lane.result.opRef, "follows origin");
-		const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+		const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 		const internalSend = await eventually(
 			() => f.port.sends,
 			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal lane report:"))),
@@ -506,11 +550,11 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 		);
 		const reportSend = internalSend.find((send) => send.text.includes("[Internal lane report:"))!;
 		expect(reportSend.sessionId).not.toBe(persona.sessionId);
-		expect(f.database.getSessionRecord(rootKey)?.epoch).toBe(afterReset.epoch);
-		expect(f.database.inboundTurnRows(reportSend.opRef)).toMatchObject([
+		expect(f.database.bindings.getSessionRecord(rootKey)?.epoch).toBe(afterReset.epoch);
+		expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
 			expect.objectContaining({ message_id: reportId, source: "lane_report", origin_key: rootKey }),
 		]);
-		expect(f.database.workAttemptGet(lane.result.opRef)?.decision).toBe("reported");
+		expect(f.database.work.workAttemptGet(lane.result.opRef)?.decision).toBe("reported");
 		await silencePersona(f, reportSend.opRef);
 	});
 }
@@ -525,17 +569,17 @@ test("AC-J closed channel admits an internal report without engagement", async (
 	await bindPersonaSession(f, key);
 	const lane = await startLane(f, "closed-worker");
 	await settleLane(f, lane.result.opRef, "closed report");
-	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
 		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
 		"closed channel did not admit internal report",
 	);
 	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
-	expect(f.database.inboundTurnRows(reportSend.opRef)).toMatchObject([
+	expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
 		expect.objectContaining({ message_id: reportId, source: "lane_report", origin_key: key }),
 	]);
-	expect(f.database.workAttemptGet(lane.result.opRef)?.decision).toBe("reported");
+	expect(f.database.work.workAttemptGet(lane.result.opRef)?.decision).toBe("reported");
 	await silencePersona(f, reportSend.opRef);
 });
 
@@ -548,8 +592,8 @@ test("AC-J mention-open internal report does not alter botAudience state", async
 	});
 	await bindPersonaSession(f, key);
 	const stateKey = `bot-audience-state:${key}`;
-	f.database.metaSet(stateKey, JSON.stringify({ admissions: ["existing-human-admission"], count: 1 }));
-	const before = f.database.metaGet(stateKey);
+	f.database.core.metaSet(stateKey, JSON.stringify({ admissions: ["existing-human-admission"], count: 1 }));
+	const before = f.database.core.metaGet(stateKey);
 	const lane = await startLane(f, "mention-open-worker");
 	await settleLane(f, lane.result.opRef, "mention-open report");
 	const sends = await eventually(
@@ -557,7 +601,7 @@ test("AC-J mention-open internal report does not alter botAudience state", async
 		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
 		"mention-open channel did not admit internal report",
 	);
-	expect(f.database.metaGet(stateKey)).toBe(before);
+	expect(f.database.core.metaGet(stateKey)).toBe(before);
 	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
 	await silencePersona(f, reportSend.opRef);
 });
@@ -578,8 +622,8 @@ test("AC-J chat.send and chat.edit reject internal lane-report ids", async () =>
 		engagement: { mentioned: true, group: true, authorId: "human-1" },
 	});
 	expect(edit.error).toMatchObject({ code: "invalid_params" });
-	expect(f.database.inboundPendingCount(rootKey)).toBe(0);
-	const humanCount = f.database.metaGet(`bot-audience-state:${rootKey}`);
+	expect(f.database.inbox.pendingCount(rootKey)).toBe(0);
+	const humanCount = f.database.core.metaGet(`bot-audience-state:${rootKey}`);
 	expect(humanCount).toBeUndefined();
 });
 
@@ -588,16 +632,18 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 	const sessionId = crypto.randomUUID();
 	const authority = f.database.inspectBrokerAuthority().authority;
 	if (!authority) throw new Error("test broker authority missing");
-	f.database.recordOwnedBinding({
-		authority,
-		sessionId,
-		originKey: rootKey,
-		epoch: 0,
-		repo: join(f.home, "workspace"),
-	});
+	f.database.transaction((tx) =>
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority,
+			sessionId,
+			originKey: rootKey,
+			epoch: 0,
+			repo: join(f.home, "workspace"),
+		}),
+	);
 	const lane = await startLane(f, "spoofed-route", sessionId);
 	await settleLane(f, lane.result.opRef, "untrusted hint result");
-	const runtime = f.database.workAttemptGet(lane.result.opRef)!;
+	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime.parent).toMatchObject({ kind: "persona", originKey: rootKey });
 	expect(runtime.decision).toBe("reported");
 	const sends = await eventually(
@@ -623,9 +669,9 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	const lane = await startLane(f, "ac435-slack-worker", persona.sessionId);
 	expect(lane.error).toBeUndefined();
 	await settleLane(f, lane.result.opRef, "slack thread result");
-	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 	const reportRows = await eventually(
-		() => f.database.inboundTurnRows(persona.opRef),
+		() => f.database.inbox.turnRows(persona.opRef),
 		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
 		"lane report row for AC-435 slack",
 	);
@@ -649,9 +695,9 @@ test("AC-435 Discord channel root trigger routes lane report to thread", async (
 	const lane = await startLane(f, "ac435-discord-worker", persona.sessionId);
 	expect(lane.error).toBeUndefined();
 	await settleLane(f, lane.result.opRef, "discord thread result");
-	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 	const reportRows = await eventually(
-		() => f.database.inboundTurnRows(persona.opRef),
+		() => f.database.inbox.turnRows(persona.opRef),
 		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
 		"lane report row for AC-435 discord",
 	);

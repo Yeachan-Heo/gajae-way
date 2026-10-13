@@ -7,14 +7,16 @@ import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { noRelay } from "./session-port.fake";
 
 test("a poisoned session-create key advances one epoch and retries with a fresh key", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-epoch-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	let creates = 0;
 	const inputs: Array<Record<string, unknown>> = [];
 	const run: CliRunner = async (args) => {
@@ -61,7 +63,7 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 		});
 		expect(creates).toBe(6);
 		expect(binding).toMatchObject({ sessionId: "fresh-session", epoch: 1, startupModelApplied: true });
-		expect(database.getSessionRecord("monitor/eventtype/memory.canonicalize")).toMatchObject({
+		expect(database.bindings.getSessionRecord("monitor/eventtype/memory.canonicalize")).toMatchObject({
 			epoch: 1,
 			sessionId: "fresh-session",
 		});
@@ -74,9 +76,11 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 
 test("generic and malformed create failures do not mint a new idempotency key or rotate the epoch", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-generic-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const failures: Array<{ originKey: string; code?: string; result: CliResult }> = [
 		{
 			originKey: "create-operation-failed",
@@ -178,8 +182,8 @@ test("generic and malformed create failures do not mint a new idempotency key or
 			expect(createCalls).toBe(2);
 			expect(idempotencyKeys).toHaveLength(2);
 			expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
-			expect(database.getSessionRecord(failure.originKey)).toBeUndefined();
-			expect(database.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
+			expect(database.bindings.getSessionRecord(failure.originKey)).toBeUndefined();
+			expect(database.core.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
 			if (failure.code) expect(lastError).toMatchObject({ name: "GjcCliError", details: { code: failure.code } });
 		}
 	} finally {
@@ -190,9 +194,11 @@ test("generic and malformed create failures do not mint a new idempotency key or
 
 test("direct thrown create transport failures preserve the error, epoch, and idempotency key", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-thrown-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const failures = [
 		{
 			originKey: "create-thrown-timeout",
@@ -234,8 +240,8 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 				expect(error).toMatchObject({ name: "Error", message: failure.error.message });
 			}
 			expect(idempotencyKeys).toEqual([expectedKey, expectedKey]);
-			expect(database.getSessionRecord(failure.originKey)).toBeUndefined();
-			expect(database.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
+			expect(database.bindings.getSessionRecord(failure.originKey)).toBeUndefined();
+			expect(database.core.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
 		}
 	} finally {
 		database.close();
@@ -274,9 +280,11 @@ function publicUndecidableCreate(referencedKey: string): CliResult {
 
 test("gjc 0.18 operation_failed naming the sent create key as undecidable rotates one epoch to a fresh key", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-public-uncertain-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const repo = join(home, "workspace");
 	const originKey = "discord/channel/stuck";
 	const poisonedKey = `gw-bind-${createHash("sha256").update(`public-uncertain|${originKey}|0|${repo}`).digest("hex").slice(0, 32)}`;
@@ -310,7 +318,7 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 		expect(idempotencyKeys[0]).toBe(poisonedKey);
 		expect(idempotencyKeys[1]).not.toBe(poisonedKey);
 		expect(binding).toMatchObject({ sessionId: "fresh-session", epoch: 1 });
-		expect(database.getSessionRecord(originKey)).toMatchObject({ epoch: 1, sessionId: "fresh-session" });
+		expect(database.bindings.getSessionRecord(originKey)).toMatchObject({ epoch: 1, sessionId: "fresh-session" });
 	} finally {
 		database.close();
 		await rm(home, { recursive: true, force: true });
@@ -319,9 +327,11 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 
 test("gjc 0.18 operation_failed naming a different key is not proof about the sent key and retries it", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-foreign-ref-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const repo = join(home, "workspace");
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
@@ -343,8 +353,8 @@ test("gjc 0.18 operation_failed naming a different key is not proof about the se
 		}
 		expect(idempotencyKeys).toHaveLength(2);
 		expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
-		expect(database.getSessionRecord("foreign")).toBeUndefined();
-		expect(database.metaGet("create_rotation:foreign")).toBeUndefined();
+		expect(database.bindings.getSessionRecord("foreign")).toBeUndefined();
+		expect(database.core.metaGet("create_rotation:foreign")).toBeUndefined();
 	} finally {
 		database.close();
 		await rm(home, { recursive: true, force: true });

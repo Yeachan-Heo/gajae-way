@@ -1,6 +1,9 @@
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
-import { type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+import { adapterHome, type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
@@ -109,14 +112,15 @@ export class TelegramBotApi {
 		});
 	}
 
-	setMessageReaction(chatId: string, messageId: string, emoji: string): Promise<unknown> {
+	setMessageReaction(chatId: string, messageId: string, emoji?: string): Promise<unknown> {
 		// setMessageReaction sets the bot's chosen reactions on one message and returns
 		// True; a single-element array is exactly one reaction, and bots may not use
-		// paid reactions. https://core.telegram.org/bots/api (fetched 2026-08-27)
+		// paid reactions. An empty array removes all reactions.
+		// https://core.telegram.org/bots/api (fetched 2026-08-27)
 		return this.call("setMessageReaction", {
 			chat_id: chatId,
 			message_id: Number(messageId),
-			reaction: [{ type: "emoji", emoji }],
+			reaction: emoji ? [{ type: "emoji", emoji }] : [],
 		});
 	}
 }
@@ -177,15 +181,21 @@ export async function settleTelegramReaction(
 	if (message.origin.platform !== "telegram" || !message.deliveryId || !message.reaction) return;
 	const deliveryId = message.deliveryId;
 	const reaction = message.reaction;
+	const action = reaction.action ?? "add";
 	try {
-		const mapped = telegramReactionFor(reaction);
-		// TelegramApiError keeps `deliveryFailureIsAmbiguous` honest: an emoji Telegram
-		// refuses is definitively not delivered, exactly like a rejected API call.
-		if ("unsupported" in mapped) throw new TelegramApiError(400, mapped.unsupported);
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
-		await bot.setMessageReaction(route.chatId, reaction.targetMessageId, mapped.emoji);
+		if (action === "remove") {
+			// Remove the reaction by passing no emoji
+			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, undefined);
+		} else {
+			const mapped = telegramReactionFor(reaction);
+			// TelegramApiError keeps `deliveryFailureIsAmbiguous` honest: an emoji Telegram
+			// refuses is definitively not delivered, exactly like a rejected API call.
+			if ("unsupported" in mapped) throw new TelegramApiError(400, mapped.unsupported);
+			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, mapped.emoji);
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
@@ -335,7 +345,8 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 	if (!identity.username) throw new Error("Telegram bot account has no username");
 	const adapter = new TelegramAdapter(state, identity.username, String(identity.id), config);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
-	await gateway.connect();
+	await gateway.connectInitial();
+
 	for (;;) {
 		try {
 			for (const update of await bot.getUpdates(state.updateId === undefined ? undefined : state.updateId + 1))
@@ -360,8 +371,25 @@ class ReconnectingGateway implements GatewayClientLike {
 	) {}
 
 	async connect(): Promise<void> {
+		await this.#connect(false);
+	}
+
+	async connectInitial(): Promise<void> {
+		await this.#connect(true);
+	}
+
+	async #connect(initial: boolean): Promise<void> {
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath);
+			const options = {
+				clientName: "adapter-telegram",
+				onRetry: (attempt: number, delayMs: number, error: unknown) =>
+					console.warn(
+						`gateway_socket_waiting client=adapter-telegram path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
+					),
+			};
+			const client = initial
+				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
+				: await GajaewayClient.connectSocket(this.socketPath, options);
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
@@ -411,10 +439,6 @@ class ReconnectingGateway implements GatewayClientLike {
 	}
 }
 
-function adapterHome(): string {
-	return process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`;
-}
-
 function defaultGatewaySocket(): string {
 	return `${adapterHome()}/gateway.sock`;
 }
@@ -427,11 +451,45 @@ function isTelegramResult(value: unknown): value is { readonly ok: true; readonl
 	return isObject(value) && value.ok === true && "result" in value;
 }
 
+export async function runTelegramAdapterWithLease<T>(home: string, start: (lease: Lease) => Promise<T>): Promise<T> {
+	let lease: Lease;
+	try {
+		lease = await acquireLease(home, "adapter-telegram");
+		console.info(`lease_acquired name=adapter-telegram pid=${process.pid}`);
+	} catch (error) {
+		if (!(error instanceof LeaseHeldError))
+			console.error(
+				`lease_failed name=adapter-telegram detail=${error instanceof Error ? error.message : String(error)}`,
+			);
+		throw error;
+	}
+	try {
+		return await start(lease);
+	} finally {
+		await lease.release();
+	}
+}
+
 if (import.meta.main) {
-	loadTelegramAdapterConfig()
-		.then(startTelegramAdapter)
-		.catch((error) => {
-			console.error(error instanceof Error ? error.message : String(error));
-			process.exitCode = 1;
-		});
+	void runTelegramAdapterWithLease(adapterHome(), async (lease) => {
+		const shutdown = (): void => {
+			void lease.release().then(
+				() => process.exit(0),
+				(error) => {
+					console.error(
+						`Telegram adapter lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					process.exit(1);
+				},
+			);
+		};
+		process.once("SIGINT", shutdown);
+		process.once("SIGTERM", shutdown);
+		await startTelegramAdapter(await loadTelegramAdapterConfig());
+		await new Promise<void>(() => {});
+	}).catch((error) => {
+		if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	});
 }

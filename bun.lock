@@ -14,6 +14,7 @@
       "name": "@gajae-gateway/adapter-discord",
       "version": "0.1.0",
       "dependencies": {
+        "@gajae-gateway/home": "workspace:*",
         "@gajae-gateway/log": "workspace:*",
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/sdk": "workspace:*",
@@ -24,6 +25,7 @@
       "name": "@gajae-gateway/adapter-slack",
       "version": "0.1.0",
       "dependencies": {
+        "@gajae-gateway/home": "workspace:*",
         "@gajae-gateway/log": "workspace:*",
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/sdk": "workspace:*",
@@ -33,6 +35,7 @@
       "name": "@gajae-gateway/adapter-telegram",
       "version": "0.1.0",
       "dependencies": {
+        "@gajae-gateway/home": "workspace:*",
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/sdk": "workspace:*",
       },
@@ -47,13 +50,16 @@
     },
     "packages/cli": {
       "name": "@gajae-gateway/cli",
-      "version": "0.1.8",
+      "version": "0.2.0",
       "bin": {
         "gajaeway": "./dist/main.js",
       },
       "dependencies": {
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "@gajae-gateway/home": "workspace:*",
       },
     },
     "packages/conformance": {
@@ -70,11 +76,16 @@
         "gajaeway-gateway": "./src/main.ts",
       },
       "dependencies": {
+        "@gajae-gateway/home": "workspace:*",
         "@gajae-gateway/log": "workspace:*",
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/subsession": "workspace:*",
         "cron-parser": "5.10.1",
       },
+    },
+    "packages/home": {
+      "name": "@gajae-gateway/home",
+      "version": "0.1.0",
     },
     "packages/log": {
       "name": "@gajae-gateway/log",
@@ -82,11 +93,11 @@
     },
     "packages/protocol": {
       "name": "@gajae-gateway/protocol",
-      "version": "0.1.8",
+      "version": "0.2.0",
     },
     "packages/sdk": {
       "name": "@gajae-gateway/sdk",
-      "version": "0.1.8",
+      "version": "0.2.0",
       "dependencies": {
         "@gajae-gateway/protocol": "workspace:*",
       },
@@ -140,6 +151,8 @@
     "@gajae-gateway/conformance": ["@gajae-gateway/conformance@workspace:packages/conformance"],
 
     "@gajae-gateway/gateway": ["@gajae-gateway/gateway@workspace:packages/gateway"],
+
+    "@gajae-gateway/home": ["@gajae-gateway/home@workspace:packages/home"],
 
     "@gajae-gateway/log": ["@gajae-gateway/log@workspace:packages/log"],
 

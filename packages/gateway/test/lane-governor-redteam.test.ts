@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { appendAttempt, closeAttempt, createLaneJobRecord, newOpRef } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	createOwnedSessionFixture,
@@ -54,7 +54,7 @@ async function harness(
 	} = {},
 ) {
 	directory = await mkdtemp(join(tmpdir(), "lane-redteam-"));
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	const sessionIdForBind = sessionIdsByEpoch();
 	const port = new ScriptedSessionPort({
 		onBind:
@@ -71,6 +71,7 @@ async function harness(
 		config: {
 			schemaVersion: 1,
 			home: directory,
+			gjc: { agentDir: join(directory, "agent") },
 			configPath: join(directory, "config.json"),
 			socketPath,
 			dbPath: join(directory, "gateway.db"),
@@ -141,7 +142,7 @@ test("R1 concurrent new names cannot overbook the final slot", async () => {
 	await Bun.sleep(30);
 	release.resolve();
 	const results = await Promise.all([first, second]);
-	expect(h.database.workLaneRows().length).toBeLessThanOrEqual(2);
+	expect(h.database.bindings.workLaneRows().length).toBeLessThanOrEqual(2);
 	expect(results.filter((frame) => frame.error?.code === "lane_capacity")).toHaveLength(1);
 });
 
@@ -174,19 +175,19 @@ test("R2 retire refuses an open live turn without waiting for it to finish", asy
 test("R3 retirement advances epoch and rerun never references the old session", async () => {
 	const h = await harness();
 	await h.run("recycled");
-	const before = h.database.getSessionRecord("work/task/recycled")!;
-	expect(h.database.referencedSessionIds()).toContain(before.sessionId);
+	const before = h.database.bindings.getSessionRecord("work/task/recycled")!;
+	expect(h.database.bindings.referencedSessionIds()).toContain(before.sessionId);
 	expect((await h.request("work.retire", { name: "recycled" })).result).toMatchObject({
 		retired: true,
 		sessionId: before.sessionId,
 		closed: true,
 	});
-	expect(h.database.referencedSessionIds()).not.toContain(before.sessionId);
+	expect(h.database.bindings.referencedSessionIds()).not.toContain(before.sessionId);
 	await h.run("recycled");
-	const after = h.database.getSessionRecord("work/task/recycled")!;
+	const after = h.database.bindings.getSessionRecord("work/task/recycled")!;
 	expect(after.epoch).toBe(before.epoch + 1);
 	expect(after.sessionId).not.toBe(before.sessionId);
-	expect(h.database.referencedSessionIds()).not.toContain(before.sessionId);
+	expect(h.database.bindings.referencedSessionIds()).not.toContain(before.sessionId);
 });
 
 test("R4 invalid models and name boundaries fail closed; valid model reaches bind and request", async () => {
@@ -245,7 +246,7 @@ test("R6 sweep is idempotent and protects an idle lane with an open attempt", as
 		});
 		expect(await governor.sweep()).toBe(1);
 		expect(await governor.sweep()).toBe(0);
-		expect(h.database.workLaneRows().map((row) => row.origin_key)).toEqual(["work/task/busy"]);
+		expect(h.database.bindings.workLaneRows().map((row) => row.origin_key)).toEqual(["work/task/busy"]);
 	} finally {
 		release.resolve();
 		await running;
@@ -271,14 +272,14 @@ test("R7b a failed first bind leaves an unbound worker row with no job and stays
 		onBind: async (input) => {
 			// Mirror BrokerSessionPort's create failure: the epoch is rotated for a
 			// retry key before the failure propagates, so a row exists unbound.
-			h.database.rebindEpoch(input.originKey);
+			h.database.transaction((tx) => h.database.bindings.rotateEpoch(tx, input.originKey));
 			throw new Error("session.create exploded");
 		},
 	});
 	const failed = await h.run("broken");
 	expect(failed.type).toBe("error");
-	expect(h.database.getSessionRecord("work/task/broken")).toMatchObject({ sessionId: "" });
-	expect(h.database.laneJobRows()).toEqual([]);
+	expect(h.database.bindings.getSessionRecord("work/task/broken")).toMatchObject({ sessionId: "" });
+	expect(h.database.work.laneJobRows()).toEqual([]);
 	const cycle = (await h.request("ops.cycle")).result;
 	expect(cycle.gates).toContain("stale_session_identity");
 	expect(cycle.phase).toBe("degraded");
@@ -295,7 +296,7 @@ test("R8 retirement source never calls session.delete or deleteSession", async (
 });
 
 function seedJob(
-	database: GatewayDatabase,
+	database: Store,
 	name: string,
 	state: "awaiting_operator" | "done" | "attempt_ended" | "failed",
 	sessionId: string = crypto.randomUUID(),
@@ -314,7 +315,9 @@ function seedJob(
 		});
 	}
 	record = { ...record, state: state === "failed" ? "awaiting_operator" : state };
-	database.putLaneJob({ ...record, laneKey: identity.laneKey, json: JSON.stringify(record) });
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
 	return { record, opRef, identity };
 }
 
@@ -322,7 +325,7 @@ function seedJob(
 // Exercise the durable timeout boundary directly rather than waiting for a production timeout.
 for (const unavailable of [false, true]) {
 	test(`${unavailable ? "G2" : "G1"} ended gateway wait does not prove broker terminality (${unavailable ? "status unavailable" : "in_flight"})`, async () => {
-		const database = await GatewayDatabase.open(":memory:");
+		const database = await Store.open(":memory:");
 		try {
 			class UnsettledPort extends ScriptedSessionPort {
 				override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
@@ -339,7 +342,7 @@ for (const unavailable of [false, true]) {
 			const { opRef } = seedJob(database, "a", "attempt_ended", sessionId);
 			port.seedOperation(opRef, sessionId);
 			port.setSessionState(sessionId, { live: true });
-			const before = database.getSessionRecord("work/task/a");
+			const before = database.bindings.getSessionRecord("work/task/a");
 			const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 			expect(await governor.retire("a", "operator")).toMatchObject({
 				retired: false,
@@ -347,7 +350,7 @@ for (const unavailable of [false, true]) {
 			});
 			expect(await governor.sweep()).toBe(0);
 			expect(port.closes).toEqual([]);
-			expect(database.getSessionRecord("work/task/a")).toEqual(before);
+			expect(database.bindings.getSessionRecord("work/task/a")).toEqual(before);
 		} finally {
 			database.close();
 		}
@@ -355,7 +358,7 @@ for (const unavailable of [false, true]) {
 }
 
 test("G3 ambiguous close retains identity until broker explicitly disowns session", async () => {
-	const database = await GatewayDatabase.open(":memory:");
+	const database = await Store.open(":memory:");
 	try {
 		class AmbiguousPort extends ScriptedSessionPort {
 			disowned = false;
@@ -371,16 +374,16 @@ test("G3 ambiguous close retains identity until broker explicitly disowns sessio
 		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const governor = new LaneGovernor({ database, sessionPort: port });
-		const before = database.getSessionRecord("work/task/a")!;
+		const before = database.bindings.getSessionRecord("work/task/a")!;
 		expect(await governor.retire("a", "operator")).toMatchObject({
 			retired: false,
 			reason: expect.stringContaining("not proven gone"),
 		});
-		expect(database.getSessionRecord("work/task/a")).toEqual(before);
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual(before);
 		expect(governor.activeLanes()).toHaveLength(1);
 		port.disowned = true;
 		expect(await governor.retire("a", "operator")).toMatchObject({ retired: true, closed: false });
-		expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
 		expect(port.closes).toHaveLength(2);
 	} finally {
 		database.close();
@@ -388,17 +391,17 @@ test("G3 ambiguous close retains identity until broker explicitly disowns sessio
 });
 
 test("G4 sweep snapshot cannot retire a replacement bound before lock acquisition", async () => {
-	const database = await GatewayDatabase.open(":memory:");
+	const database = await Store.open(":memory:");
 	const release = deferred();
 	const port = new ScriptedSessionPort({ onBind: (input) => `0000aaaa-0000-4000-8000-00000000a00${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 	let rebinding: Promise<void> | undefined;
 	try {
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
-		const before = database.getSessionRecord("work/task/a")!;
+		const before = database.bindings.getSessionRecord("work/task/a")!;
 		rebinding = port.runExclusive("work/task/a", async () => {
 			await release.promise;
-			database.rebindEpoch("work/task/a");
+			database.transaction((tx) => database.bindings.rotateEpoch(tx, "work/task/a"));
 			await port.bind({ originKey: "work/task/a", epoch: before.epoch + 1, repo: process.cwd() });
 		});
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
@@ -406,7 +409,7 @@ test("G4 sweep snapshot cannot retire a replacement bound before lock acquisitio
 		release.resolve();
 		await rebinding;
 		expect(await sweeping).toBe(0);
-		expect(database.getSessionRecord("work/task/a")).toEqual({
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual({
 			sessionId: "0000aaaa-0000-4000-8000-00000000a002",
 			epoch: before.epoch + 1,
 		});
@@ -438,7 +441,7 @@ test("G5 admission lock is released while first distinct lane turn is still runn
 		const second = await Promise.race([h.run("b", { text: "fast" }), Bun.sleep(500).then(() => ({ timedOut: true }))]);
 		expect(second).toMatchObject({ result: { text: "fast" } });
 		expect(order).toEqual(["fast"]);
-		expect(h.database.workLaneRows()).toHaveLength(2);
+		expect(h.database.bindings.workLaneRows()).toHaveLength(2);
 	} finally {
 		release.resolve();
 		await first;
@@ -482,7 +485,9 @@ test("G7 corrupt bound job consumes socket capacity and identifies corrupt candi
 		},
 	);
 	const { record, identity } = seedJob(h.database, "a", "awaiting_operator");
-	h.database.putLaneJob({ ...record, laneKey: identity.laneKey, json: "{invalid json" });
+	h.database.transaction((tx) =>
+		h.database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: "{invalid json" }),
+	);
 	const result = await h.run("b");
 	expect(result.error).toMatchObject({
 		code: "lane_capacity",
@@ -494,7 +499,7 @@ test("G7 corrupt bound job consumes socket capacity and identifies corrupt candi
 
 test("G8 socket cycle gates unbound unsettled work but not done work", async () => {
 	const h = await harness();
-	h.database.rebindEpoch("work/task/x");
+	h.database.transaction((tx) => h.database.bindings.rotateEpoch(tx, "work/task/x"));
 	seedJob(h.database, "x", "awaiting_operator");
 	const unsettled = (await h.request("ops.cycle")).result;
 	expect(unsettled.gates).toContain("stale_session_identity");
@@ -503,11 +508,11 @@ test("G8 socket cycle gates unbound unsettled work but not done work", async () 
 	const done = (await h.request("ops.cycle")).result;
 	expect(done.gates).not.toContain("stale_session_identity");
 	expect(done.lanes.active).toBe(0);
-	expect(h.database.getSessionRecord("work/task/x")?.sessionId).toBe("");
+	expect(h.database.bindings.getSessionRecord("work/task/x")?.sessionId).toBe("");
 });
 
 test("H1 failed ledger retires when broker proves terminal_ok", async () => {
-	const database = await GatewayDatabase.open(":memory:");
+	const database = await Store.open(":memory:");
 	try {
 		const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
 		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
@@ -515,11 +520,11 @@ test("H1 failed ledger retires when broker proves terminal_ok", async () => {
 		const { opRef } = seedJob(database, "a", "failed", sessionId);
 		port.seedOperation(opRef, sessionId, "terminal_ok", "finished");
 		port.setSessionState(sessionId, { live: true });
-		const before = database.getSessionRecord("work/task/a")!;
+		const before = database.bindings.getSessionRecord("work/task/a")!;
 		const governor = new LaneGovernor({ database, sessionPort: port });
 		expect(await governor.retire("a", "operator")).toMatchObject({ retired: true, sessionId, closed: true });
 		expect(port.closes).toHaveLength(1);
-		expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
 	} finally {
 		database.close();
 	}
@@ -527,14 +532,14 @@ test("H1 failed ledger retires when broker proves terminal_ok", async () => {
 
 test("H2 failed ledger with unknown broker operation needs a dead session", async () => {
 	for (const live of [true, false]) {
-		const database = await GatewayDatabase.open(":memory:");
+		const database = await Store.open(":memory:");
 		try {
 			const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
 			attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 			const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 			seedJob(database, "a", "failed", sessionId);
 			port.setSessionState(sessionId, { live });
-			const before = database.getSessionRecord("work/task/a")!;
+			const before = database.bindings.getSessionRecord("work/task/a")!;
 			const governor = new LaneGovernor({ database, sessionPort: port });
 			expect(await governor.retire("a", "operator")).toMatchObject(
 				live
@@ -542,7 +547,7 @@ test("H2 failed ledger with unknown broker operation needs a dead session", asyn
 					: { retired: true, sessionId, closed: true },
 			);
 			expect(port.closes).toHaveLength(live ? 0 : 1);
-			expect(database.getSessionRecord("work/task/a")).toEqual(
+			expect(database.bindings.getSessionRecord("work/task/a")).toEqual(
 				live ? before : { sessionId: "", epoch: before.epoch + 1 },
 			);
 		} finally {
@@ -552,7 +557,7 @@ test("H2 failed ledger with unknown broker operation needs a dead session", asyn
 });
 
 test("H3 sweep nomination cannot retire a done job replaced by a fresh open attempt", async () => {
-	const database = await GatewayDatabase.open(":memory:");
+	const database = await Store.open(":memory:");
 	const release = deferred();
 	const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
 	attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
@@ -560,14 +565,16 @@ test("H3 sweep nomination cannot retire a done job replaced by a fresh open atte
 	try {
 		const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const { record, identity } = seedJob(database, "a", "done", sessionId);
-		const before = database.getSessionRecord("work/task/a");
+		const before = database.bindings.getSessionRecord("work/task/a");
 		updating = port.runExclusive("work/task/a", async () => {
 			await release.promise;
 			const running = appendAttempt(
 				{ ...record, state: "running" },
 				{ opRef: newOpRef("gen3-redteam"), sessionId, startedAt: new Date().toISOString() },
 			);
-			database.putLaneJob({ ...running, laneKey: identity.laneKey, json: JSON.stringify(running) });
+			database.transaction((tx) =>
+				database.work.putLaneJob(tx, { ...running, laneKey: identity.laneKey, json: JSON.stringify(running) }),
+			);
 		});
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 		expect(governor.activeLanes()[0]?.state).toBe("done");
@@ -577,7 +584,7 @@ test("H3 sweep nomination cannot retire a done job replaced by a fresh open atte
 		expect(governor.activeLanes()[0]).toMatchObject({ state: "running", attemptOpen: true });
 		expect(await sweeping).toBe(0);
 		expect(port.closes).toEqual([]);
-		expect(database.getSessionRecord("work/task/a")).toEqual(before);
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual(before);
 	} finally {
 		release.resolve();
 		await updating;
@@ -586,7 +593,7 @@ test("H3 sweep nomination cannot retire a done job replaced by a fresh open atte
 });
 
 test("H4 sweep refuses rebound even when the replacement job is also done", async () => {
-	const database = await GatewayDatabase.open(":memory:");
+	const database = await Store.open(":memory:");
 	const release = deferred();
 	const port = new ScriptedSessionPort({ onBind: (input) => `0000aaaa-0000-4000-8000-00000000a00${input.epoch + 1}` });
 	attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
@@ -594,10 +601,10 @@ test("H4 sweep refuses rebound even when the replacement job is also done", asyn
 	try {
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		seedJob(database, "a", "done", "0000aaaa-0000-4000-8000-00000000a001");
-		const before = database.getSessionRecord("work/task/a")!;
+		const before = database.bindings.getSessionRecord("work/task/a")!;
 		updating = port.runExclusive("work/task/a", async () => {
 			await release.promise;
-			database.rebindEpoch("work/task/a");
+			database.transaction((tx) => database.bindings.rotateEpoch(tx, "work/task/a"));
 			await port.bind({ originKey: "work/task/a", epoch: before.epoch + 1, repo: process.cwd() });
 			seedJob(database, "a", "done", "0000aaaa-0000-4000-8000-00000000a002");
 		});
@@ -618,7 +625,7 @@ test("H4 sweep refuses rebound even when the replacement job is also done", asyn
 			{ retired: false, sessionKey: "work/task/a", reason: expect.stringContaining("rebound") },
 		]);
 		expect(governor.activeLanes()[0]?.state).toBe("done");
-		expect(database.getSessionRecord("work/task/a")).toEqual({
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual({
 			sessionId: "0000aaaa-0000-4000-8000-00000000a002",
 			epoch: before.epoch + 1,
 		});
@@ -643,9 +650,9 @@ test("H5 empty job JSON consumes capacity and socket retirement refuses corrupt 
 		},
 	);
 	const { record, identity } = seedJob(h.database, "a", "done");
-	h.database.putLaneJob({ ...record, laneKey: identity.laneKey, json: "" });
-	const before = h.database.getSessionRecord("work/task/a");
-	expect(h.database.laneJobJson(identity.jobId)).toBe("");
+	h.database.transaction((tx) => h.database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: "" }));
+	const before = h.database.bindings.getSessionRecord("work/task/a");
+	expect(h.database.work.laneJobJson(identity.jobId)).toBe("");
 	expect((await h.run("b")).error).toMatchObject({
 		code: "lane_capacity",
 		detail: { active: 1, maxLanes: 1, candidates: [{ name: "a", state: "corrupt" }] },
@@ -654,7 +661,7 @@ test("H5 empty job JSON consumes capacity and socket retirement refuses corrupt 
 		retired: false,
 		reason: expect.stringContaining("corrupt"),
 	});
-	expect(h.database.getSessionRecord("work/task/a")).toEqual(before);
+	expect(h.database.bindings.getSessionRecord("work/task/a")).toEqual(before);
 	expect(h.port.binds).toEqual([]);
 	expect(h.port.closes).toEqual([]);
 });
@@ -672,7 +679,7 @@ test("H6 operator socket retirement of an idle done job needs no sweep nominatio
 		},
 	);
 	seedJob(h.database, "a", "done", "0000aaaa-0000-4000-8000-00000000a003");
-	const before = h.database.getSessionRecord("work/task/a")!;
+	const before = h.database.bindings.getSessionRecord("work/task/a")!;
 	const governor = new LaneGovernor({ database: h.database, sessionPort: h.port });
 	expect(governor.activeLanes()[0]).toMatchObject({ state: "done", idleMs: Number.POSITIVE_INFINITY });
 	expect((await h.request("work.retire", { name: "a" })).result).toMatchObject({
@@ -681,20 +688,20 @@ test("H6 operator socket retirement of an idle done job needs no sweep nominatio
 		closed: true,
 	});
 	expect(h.port.closes).toHaveLength(1);
-	expect(h.database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
+	expect(h.database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
 });
 
 test("H7 concurrent sweeps close once and bump the epoch exactly once", async () => {
-	const database = await GatewayDatabase.open(":memory:");
+	const database = await Store.open(":memory:");
 	try {
 		const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
 		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
-		const before = database.getSessionRecord("work/task/a")!;
+		const before = database.bindings.getSessionRecord("work/task/a")!;
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 		expect((await Promise.all([governor.sweep(), governor.sweep()])).sort()).toEqual([0, 1]);
 		expect(port.closes).toEqual([{ sessionId: before.sessionId, repo: process.cwd() }]);
-		expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
+		expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before.epoch + 1 });
 		expect(governor.activeLanes()).toEqual([]);
 	} finally {
 		database.close();

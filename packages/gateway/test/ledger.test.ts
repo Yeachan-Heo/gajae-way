@@ -2,14 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GatewayDatabase } from "../src/store/db";
-import { ACK_TIMEOUT_MS, classifyDeliveryError, DeliveryLedger } from "../src/store/ledger";
+import { ACK_TIMEOUT_MS, classifyDeliveryError, DeliveryService } from "../src/delivery/delivery";
+import { Store } from "../src/store";
 
 test("delivery ledger expires only after the fifth definitive failure", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "one", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		expect(ledger.counts().pending).toBe(1);
 		ledger.markInflight("one");
@@ -33,8 +33,8 @@ test("delivery ledger expires only after the fifth definitive failure", async ()
 test("a failed attempt records an allowlisted last_error and the scheduled next_retry_at", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "retry", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("retry");
 		const inflight = ledger.get("retry")!;
@@ -64,7 +64,7 @@ test("a failed attempt records an allowlisted last_error and the scheduled next_
 			nextRetryAt: null,
 		});
 		expect(ledger.counts().recentExpired[0]).toMatchObject({ deliveryId: "retry", lastError: "not_found" });
-		expect(ledger.requeue("retry")).toEqual(["retry"]);
+		expect(ledger.requeueById("retry")).toEqual(["retry"]);
 		const redriven = ledger.get("retry")!;
 		expect(redriven).toMatchObject({ state: "pending", lastError: "not_found", nextRetryAt: redriven.updatedAt });
 		ledger.confirm("retry");
@@ -95,8 +95,8 @@ test("failure reasons map onto the allowlisted classification codes", () => {
 test("ambiguous failures never expire by count", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({
 			deliveryId: "ambiguous",
 			turnId: "turn",
@@ -117,8 +117,8 @@ test("ambiguous failures never expire by count", async () => {
 test("retry backoff doubles from two seconds and caps at five minutes", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "backoff", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.fail("backoff");
 		let updatedAt = Date.parse(ledger.get("backoff")!.updatedAt);
@@ -144,8 +144,8 @@ test("retry backoff doubles from two seconds and caps at five minutes", async ()
 test("an age sweep expires stale unsettled rows and returns expiry evidence", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "stale", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.createPending({
 			deliveryId: "confirmed",
@@ -177,8 +177,8 @@ test("an age sweep expires stale unsettled rows and returns expiry evidence", as
 test("counts include expired totals and the five newest metadata-only entries", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		for (let index = 0; index < 7; index++) {
 			const deliveryId = `expired-${index}`;
 			ledger.createPending({
@@ -207,8 +207,8 @@ test("counts include expired totals and the five newest metadata-only entries", 
 test("requeue-by-id and requeue-since reset eligible rows without touching confirmed rows", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		for (const deliveryId of ["expired", "ambiguous", "pending", "confirmed"])
 			ledger.createPending({ deliveryId, turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		for (let attempt = 0; attempt < 5; attempt++) ledger.fail("expired");
@@ -216,11 +216,11 @@ test("requeue-by-id and requeue-since reset eligible rows without touching confi
 		ledger.fail("confirmed");
 		ledger.confirm("confirmed");
 		const priorUpdatedAt = ledger.get("expired")!.updatedAt;
-		expect(ledger.requeue("expired")).toEqual(["expired"]);
+		expect(ledger.requeueById("expired")).toEqual(["expired"]);
 		expect(ledger.get("expired")).toMatchObject({ state: "pending", attempts: 0 });
 		expect(Date.parse(ledger.get("expired")!.updatedAt)).toBeGreaterThanOrEqual(Date.parse(priorUpdatedAt));
-		expect(ledger.requeue("confirmed")).toEqual([]);
-		expect(ledger.requeue("unknown")).toEqual([]);
+		expect(ledger.requeueById("confirmed")).toEqual([]);
+		expect(ledger.requeueById("unknown")).toEqual([]);
 		const since = new Date(Date.now() - 10_000).toISOString();
 		expect(new Set(ledger.requeueSince(since))).toEqual(new Set(["expired", "ambiguous", "pending"]));
 		for (const deliveryId of ["expired", "ambiguous", "pending"])
@@ -236,8 +236,8 @@ test("requeue-by-id and requeue-since reset eligible rows without touching confi
 test("a deterministic tail delivery id is admitted once across replay", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		const row = { deliveryId: "gw-d-tail-event", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" };
 		expect(ledger.createPending(row)).toBe(true);
 		expect(ledger.createPending(row)).toBe(false);
@@ -251,8 +251,8 @@ test("a deterministic tail delivery id is admitted once across replay", async ()
 test("timed sweep does not re-broadcast fresh inflight rows until ack timeout expires", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "inflight", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("inflight");
 		const createdAt = Date.parse(ledger.get("inflight")!.createdAt);
@@ -276,8 +276,8 @@ test("timed sweep does not re-broadcast fresh inflight rows until ack timeout ex
 test("onConnect sweep replays inflight rows immediately without waiting for ack timeout", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "inflight", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("inflight");
 		const updatedAt = Date.parse(ledger.get("inflight")!.updatedAt);
@@ -296,8 +296,8 @@ test("onConnect sweep replays inflight rows immediately without waiting for ack 
 test("timed sweep re-broadcasts inflight rows after ack timeout for crash/lost-ack recovery", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		const ledger = new DeliveryLedger(database);
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "lost-ack", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("lost-ack");
 		const updatedAt = Date.parse(ledger.get("lost-ack")!.updatedAt);

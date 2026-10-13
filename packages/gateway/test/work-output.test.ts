@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type CliResult, type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { BrokerSessionPort, parseWorkerOutputResponse, type WorkerOutputInput } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
@@ -61,7 +61,7 @@ async function broker(
 	relay?: (request: ScriptedRelayRequest) => ScriptedRelayReply | Promise<ScriptedRelayReply>,
 ): Promise<BrokerSessionPort> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-work-output-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	cleanup.push(async () => {
 		database.close();
 		await rm(home, { recursive: true, force: true });
@@ -370,10 +370,16 @@ test("completed fake status reflects original operation evidence without inventi
 			outcome: { reason: "end_turn" },
 		});
 		expect(report.status.startedAt).toBeGreaterThanOrEqual(before);
-		expect(report.status.terminalAt).toBeGreaterThanOrEqual(report.status.startedAt!);
+		const startedAt = report.status.startedAt;
+		expect(startedAt).toBeDefined();
+		expect(report.status.terminalAt).toBeGreaterThanOrEqual(startedAt ?? 0);
 		// The host names the turn on accept and reports the same identity at terminal.
-		expect(report.status.commandId).toBe(receipt.commandId!);
-		expect(report.status.turnId).toBe(receipt.turnId!);
+		const commandId = receipt.commandId;
+		expect(commandId).toBeDefined();
+		expect(report.status.commandId).toBe(commandId);
+		const turnId = receipt.turnId;
+		expect(turnId).toBeDefined();
+		expect(report.status.turnId).toBe(turnId);
 		expect(await port.fetchWorkerOutput({ ...input, notBeforeMs: before, terminalIdentity: undefined })).toMatchObject({
 			status: "proven",
 			text: "original answer",

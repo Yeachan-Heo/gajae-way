@@ -159,6 +159,7 @@ async function fixture(
 		},
 		{
 			api,
+			connectGateway: async () => {},
 			recoveryCursorPath,
 			now: () => 1_700_000_100_000,
 			log: { log() {}, error() {} },
@@ -910,6 +911,7 @@ test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder
 		},
 		{
 			api,
+			connectGateway: async () => {},
 			// Never the ambient $GAJAEWAY_HOME store: this process may be a real host.
 			recoveryCursorPath: join(tmpdir(), `slack-recovery-${crypto.randomUUID()}.json`),
 			log: { log() {}, error() {} },
@@ -1335,6 +1337,7 @@ test("Slack recovery gate times socket and gateway outages independently", async
 		},
 		{
 			api,
+			connectGateway: async () => {},
 			recoveryCursorPath: join(
 				tmpdir(),
 				`slack-recovery-${crypto.randomUUID()}`,

@@ -9,7 +9,8 @@ import { parseConfigFile } from "../src/config";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import { RelayRefusedError } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase, type InboundTurn } from "../src/store/db";
+import { Store } from "../src/store";
+import type { InboundTurn } from "../src/store/groups/inbox";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "issue92-redteam" } as const;
@@ -18,7 +19,7 @@ const SOURCE_ROOT = join(import.meta.dir, "../src");
 
 type Fixture = {
 	readonly home: string;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly manager: PersonaSessionManager;
 	readonly port: ScriptedSessionPort;
 	readonly turns: Map<string, InboundTurn>;
@@ -51,7 +52,7 @@ function required<T>(value: T | undefined, message: string): T {
 
 async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-issue92-redteam-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const port =
 		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
@@ -103,18 +104,20 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 
 function enqueue(target: Fixture, messageId: string, body: string, receivedAt = new Date().toISOString()): void {
 	expect(
-		target.database.inboundEnqueue({
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		}),
+		target.database.transaction((tx) =>
+			target.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
 function assertCoverage(target: Fixture, messageIds: readonly string[]): void {
-	const rows = [...target.turns.values()].flatMap((turn) => target.database.inboundTurnRows(turn.opRef));
+	const rows = [...target.turns.values()].flatMap((turn) => target.database.inbox.turnRows(turn.opRef));
 	expect(rows.map((row) => row.message_id).sort()).toEqual([...messageIds].sort());
 	expect(new Set(rows.map((row) => row.message_id)).size).toBe(messageIds.length);
 	for (const row of rows)
@@ -123,7 +126,7 @@ function assertCoverage(target: Fixture, messageIds: readonly string[]): void {
 			turn_state: "done",
 			turn_op_ref: expect.any(String),
 		});
-	expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 }
 
 class FailFirstSteerPort extends ScriptedSessionPort {
@@ -224,14 +227,14 @@ test("red-team: relay loss holds the accepted turn until status and turn.result 
 		);
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
 		expect(port.sends).toHaveLength(1);
-		expect(target.database.inboundTurnRows(batch.opRef)).toEqual(
+		expect(target.database.inbox.turnRows(batch.opRef)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ state: "pending", turn_state: "accepted" })]),
 		);
 
 		port.completeWithoutAnswerFrame(send.opRef, "terminal result evidence");
 		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"lost relay turn did not settle from status",
 		);
 		expect(target.terminal).toEqual(["terminal result evidence"]);
@@ -253,7 +256,7 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 		const first = required(port.sends[0], "first send missing");
 		const firstRelay = port.tailsOf(first.sessionId)[0];
 		port.complete(first.opRef, "first answer");
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "first turn did not settle");
+		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not settle");
 
 		enqueue(target, "second-trigger", "second");
 		await target.manager.notifyInbound(ORIGIN_KEY);
@@ -268,7 +271,7 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 		// The live turn still streams and completes over its own relay.
 		port.emitAssistant(second.sessionId, "second interim");
 		port.complete(second.opRef, "second answer");
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "second turn did not settle");
+		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "second turn did not settle");
 		expect(target.terminal).toEqual(["first answer", "second answer"]);
 		expect(target.logs.filter((line) => line.includes("terminal_status_reconciled"))).toEqual([]);
 		expect(port.sends).toHaveLength(2);
@@ -301,7 +304,7 @@ test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh ep
 		// The stale session's binding was rotated: the send rode a NEW session.
 		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
 		port.complete(port.sends[0]!.opRef, "answer on the fresh session");
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "turn did not settle");
+		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not settle");
 		expect(target.terminal).toEqual(["answer on the fresh session"]);
 		expect(target.logs.some((line) => line.includes("host hello did not arrive"))).toBe(false);
 	} finally {
@@ -328,7 +331,7 @@ test("red-team: a relay declared dead settles the turn from CLI status without a
 		// and no explicit tick is issued: the actor's own recheck must find it.
 		port.completeWithoutAnswerFrame(send.opRef, "terminal after relay death");
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"dead-relay turn did not settle from status on its own recheck",
 		);
 		expect(target.terminal).toEqual(["terminal after relay death"]);
@@ -358,8 +361,8 @@ test("canonical: a refused steer stays pending until the running turn terminates
 		expect(target.logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(0);
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds.map((bind) => bind.epoch)).toEqual([firstEpoch]);
-		expect(target.database.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
-		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-after-death" });
+		expect(target.database.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(target.database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-after-death" });
 		await target.manager.onBrokerGeneration(2);
 		expect(port.sends).toHaveLength(1);
 		port.complete(first.opRef, "first terminal");
@@ -373,7 +376,7 @@ test("canonical: a refused steer stays pending until the running turn terminates
 		expect(port.sendAttempts.map((input) => input.opRef)).toHaveLength(2);
 		port.complete(second.opRef, "second terminal");
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"steer-failure sequence left pending rows",
 		);
 		expect(target.terminal).toEqual(["first terminal", "second terminal"]);
@@ -407,7 +410,7 @@ test("canonical: a stream of 500ms fragments never waits - the first is the turn
 			"fragment-4",
 		]);
 		port.complete(required(port.sends[0], "first send missing").opRef, "one response");
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "fragments did not complete");
+		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "fragments did not complete");
 		expect(port.sends).toHaveLength(1);
 		expect(target.terminal).toEqual(["one response"]);
 		assertCoverage(target, ["fragment-0", "fragment-1", "fragment-2", "fragment-3", "fragment-4"]);
@@ -423,21 +426,23 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 		const receivedAt = new Date().toISOString();
 		const repo = join(target.home, "workspace");
 		const binding = await port.bind({ originKey: ORIGIN_KEY, epoch: 0, repo });
-		expect(target.database.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
+		expect(target.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
 		enqueue(target, "crash-window", "accepted before attribution", receivedAt);
 		const opRef = personaTurnOpRef("issue92-redteam", ORIGIN_KEY, 0, "crash-window");
-		target.database.inboundBindTurn({
-			messageId: "crash-window",
-			originKey: ORIGIN_KEY,
-			epoch: 0,
-			opRef,
-			sessionId: binding.sessionId,
-		});
+		target.database.transaction((tx) =>
+			target.database.inbox.bindTurn(tx, {
+				messageId: "crash-window",
+				originKey: ORIGIN_KEY,
+				epoch: 0,
+				opRef,
+				sessionId: binding.sessionId,
+			}),
+		);
 		port.seedAcceptedSend({ sessionId: binding.sessionId, repo, text: "accepted before attribution", opRef });
 
 		await target.manager.recover();
 		expect(port.sendAttempts).toHaveLength(1);
-		expect(target.database.inboundTurnRows(opRef)).toEqual(
+		expect(target.database.inbox.turnRows(opRef)).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ state: "pending", turn_state: "accepted", turn_op_ref: opRef }),
 			]),
@@ -445,7 +450,7 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 		port.complete(opRef, "reconciled terminal");
 		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"accepted crash-window batch did not reconcile",
 		);
 		assertCoverage(target, ["crash-window"]);
@@ -470,7 +475,7 @@ test("red-team: /new preserves an accepted batch, discards only unbatched pre-fl
 		now = base + 2;
 		await target.manager.reset(ORIGIN_KEY, JSON.stringify(ORIGIN), new Date(now).toISOString());
 		expect(target.discarded).toEqual(["discard-before-new"]);
-		expect(target.database.inboundTurnRows(oldBatch.opRef)).toEqual(
+		expect(target.database.inbox.turnRows(oldBatch.opRef)).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ message_id: "old-trigger", state: "pending", turn_state: "accepted" }),
 			]),
@@ -485,11 +490,11 @@ test("red-team: /new preserves an accepted batch, discards only unbatched pre-fl
 		port.complete(fresh.opRef, "fresh output");
 		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"/new sequence did not reconcile both batches",
 		);
 		expect(target.terminal).toEqual(["fresh output"]);
-		expect(target.database.inboundTurnRows(oldBatch.opRef)).toEqual(
+		expect(target.database.inbox.turnRows(oldBatch.opRef)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ state: "done", turn_state: "done" })]),
 		);
 		assertCoverage(target, ["old-trigger", "new-trigger"]);
@@ -523,7 +528,7 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 		port.complete(old.opRef, "stale generation output");
 		await target.manager.tick(ORIGIN_KEY);
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"retired hold did not reconcile terminal",
 		);
 		expect(target.terminal).toEqual(["fresh generation output"]);
@@ -543,8 +548,8 @@ test("red-team: an unknown unaccepted send is held once, then a live-idle sessio
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		const first = target.database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
-		expect(target.database.inboundTurnRows(first.opRef)).toEqual(
+		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
+		expect(target.database.inbox.turnRows(first.opRef)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ message_id: "conflict-trigger", turn_state: "bound" })]),
 		);
 		expect(target.logs.some((line) => line.includes("reason=operation_state_unknown sweeps=1"))).toBe(true);
@@ -562,7 +567,7 @@ test("red-team: an unknown unaccepted send is held once, then a live-idle sessio
 		port.complete(replacement.opRef, "recovered without an operator");
 		await eventually(() => target.terminal.length === 1, "replacement did not complete");
 		expect(target.terminal).toEqual(["recovered without an operator"]);
-		expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+		expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 	} finally {
 		await target.close();
 	}
@@ -595,7 +600,7 @@ test("red-team: an unknown op on a live-idle session whose transcript already ho
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		const first = target.database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
+		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 		// The persona answered after dispatch; only the gateway could not see it.
 		port.answer = { text: "written while you were not looking", atMs: Date.now() + 1 };
 		await target.manager.tick(ORIGIN_KEY);
@@ -606,8 +611,8 @@ test("red-team: an unknown op on a live-idle session whose transcript already ho
 		expect(port.sends).toEqual([]);
 		expect(target.logs.some((line) => line.includes("unobserved_answer_delivered"))).toBe(true);
 		expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session"))).toBe(false);
-		expect(target.database.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
-		expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+		expect(target.database.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+		expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 	} finally {
 		await target.close();
 	}
@@ -664,7 +669,7 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
 		expect(target.terminal).toEqual([]);
 		expect(target.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
-		expect(target.database.inboundTurnRows(batch.opRef)[0]).toMatchObject({
+		expect(target.database.inbox.turnRows(batch.opRef)[0]).toMatchObject({
 			state: "pending",
 			turn_state: "accepted",
 		});
@@ -673,7 +678,7 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 		await eventually(() => target.terminal.length === 1, "terminal tail did not settle the held batch");
 		expect(target.terminal).toEqual(["tail terminal arrived during grace"]);
 		expect(target.logs.some((line) => line.startsWith("terminal_status_reconciled"))).toBe(false);
-		expect(target.database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
+		expect(target.database.inbox.turnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 
 		grace.work();
 		await Bun.sleep(20);
@@ -727,7 +732,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		);
 		expect(target.terminal).toEqual([]);
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(target.database.inboundTurnRows(firstBatch.opRef)[0]).toMatchObject({
+		expect(target.database.inbox.turnRows(firstBatch.opRef)[0]).toMatchObject({
 			state: "pending",
 			turn_state: "accepted",
 		});
@@ -746,7 +751,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		expect(target.logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 		expect(target.terminal).toEqual(["status-only terminal"]);
 		expect(target.logs.filter((line) => line.startsWith("terminal_status_reconciled"))).toHaveLength(1);
-		expect(target.database.inboundTurnRows(firstBatch.opRef)[0]).toMatchObject({
+		expect(target.database.inbox.turnRows(firstBatch.opRef)[0]).toMatchObject({
 			state: "done",
 			turn_state: "done",
 		});
@@ -767,7 +772,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		port.turnEnded = false;
 		port.complete(second.opRef, "next turn terminal");
 		await eventually(
-			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"slow-tail sequence left a row orphaned",
 		);
 		assertCoverage(target, ["slow-tail-trigger", "arrived-during-grace"]);
@@ -838,18 +843,18 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 			// Drain sequentially: refusal leaves the current turn intact and later
 			// rows pending until its terminal. Every row must retain attribution.
 			let completedSends = 0;
-			for (let round = 0; target.database.inboundPendingCount(ORIGIN_KEY) > 0; round++) {
+			for (let round = 0; target.database.inbox.pendingCount(ORIGIN_KEY) > 0; round++) {
 				if (round > 32) throw new Error(`seed ${seed} did not drain`);
 				await eventually(() => port.sends.length > completedSends, `seed ${seed} left pending rows without a turn`);
 				expect(port.sends).toHaveLength(completedSends + 1);
-				expect(target.database.inboundNonterminalTurns(ORIGIN_KEY)).toHaveLength(1);
+				expect(target.database.inbox.nonterminalTurns(ORIGIN_KEY)).toHaveLength(1);
 				expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
 				const send = required(port.sends[completedSends], `seed ${seed} send ${completedSends} missing`);
 				port.complete(send.opRef, `terminal-${seed}-${completedSends}`);
 				await target.manager.tick(ORIGIN_KEY);
 				completedSends++;
 				await eventually(
-					() => target.database.inboundTurnRow(send.opRef)?.turn_state === "done",
+					() => target.database.inbox.turnRow(send.opRef)?.turn_state === "done",
 					`seed ${seed} did not reconcile terminal send ${completedSends}`,
 				);
 				now += 100;
@@ -874,7 +879,7 @@ test("red-team non-goal probes: no running-turn abort or coexistence control rem
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-issue92-persistence-"));
 	const path = join(home, "gateway.db");
 	try {
-		const database = await GatewayDatabase.open(path);
+		const database = await Store.open(path);
 		database.close();
 		const raw = new Database(path, { readonly: true });
 		const columns = raw
@@ -930,7 +935,7 @@ test("red-team: an idle binding whose session died is resumed exactly once befor
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "first turn did not send");
 		const sessionId = required(port.sends[0], "first send missing").sessionId;
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
+		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
 		// Broker restarted while idle: saved authority exists but the host is dead.
 		port.setSessionState(sessionId, { live: false });
 		enqueue(target, "idle-2", "second turn");
@@ -955,7 +960,7 @@ test("red-team: an inspect outage on an idle binding never blocks the send and n
 		enqueue(target, "outage-1", "first turn");
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "first turn did not send");
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
+		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
 		enqueue(target, "outage-2", "second turn");
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 2, "second turn was blocked by the inspect outage");

@@ -20,13 +20,9 @@ import {
 	type GjcServiceTier,
 	type SessionHostConfig,
 } from "../config";
-import {
-	BrokerAuthorityError,
-	type GatewayDatabase,
-	type InboundMessageRow,
-	type InboundTurn,
-	terminalDeliveryIds,
-} from "../store/db";
+import { BrokerAuthorityError, type Store } from "../store";
+import { type InboundMessageRow, type InboundTurn, terminalDeliveryIds } from "../store/groups/inbox";
+import type { WriteTx } from "../store/tx";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
@@ -79,6 +75,105 @@ const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 /** Identical bind failures before the broker's own discovery file is judged. */
+
+function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
+	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
+}
+
+function failedTurnKeyPrefix(originKey: string): string {
+	return `turn-failed:${originKey}:`;
+}
+
+function failedTurnResetCapKey(originKey: string): string {
+	return `failed-turn-reset-cap:${createHash("sha256")
+		.update(JSON.stringify([originKey]))
+		.digest("hex")}`;
+}
+
+export function freshTurnAttempt(store: Store, originKey: string, epoch: number, triggerMessageId: string): number {
+	const value = Number.parseInt(store.core.metaGet(freshTurnMetaKey(originKey, epoch, triggerMessageId)) ?? "0", 10);
+	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): number {
+	store.core.assertActive(tx);
+	const trigger = store.inbox.turnRow(opRef);
+	if (!trigger || trigger.turn_epoch === null) throw new Error(`turn ${opRef} has no retryable trigger`);
+	if (store.bindings.isQuarantined("inbound", trigger.message_id)) throw new BrokerAuthorityError("quarantined");
+	if (!trigger.state || trigger.state !== "pending" || !["bound", "accepted"].includes(trigger.turn_state ?? ""))
+		throw new Error(`turn ${opRef} cannot be requeued from its current lifecycle state`);
+	const key = freshTurnMetaKey(trigger.origin_key, trigger.turn_epoch, trigger.message_id);
+	const prior = Number.parseInt(store.core.metaGet(key) ?? "0", 10);
+	const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
+	store.core.metaSet(key, String(attempt));
+	store.inbox.turnRequeue(tx, opRef);
+	return attempt;
+}
+
+export function setContextFloor(
+	store: Store,
+	tx: WriteTx,
+	originKey: string,
+	floorAt = new Date().toISOString(),
+): void {
+	store.core.assertActive(tx);
+	const prefix = failedTurnKeyPrefix(originKey);
+	const end = `${prefix}\uffff`;
+	const failedOps = new Set(store.core.metaKeysInRange(prefix, end).map((key) => key.slice(prefix.length)));
+	store.inbox.contextSetFloor(tx, originKey, floorAt, failedOps);
+	store.core.metaDeleteRange(tx, prefix, end);
+}
+
+function clearFailedTurnResetCap(store: Store, tx: WriteTx, originKey: string): void {
+	store.core.assertActive(tx);
+	store.core.metaSet(failedTurnResetCapKey(originKey), "0");
+}
+
+function failedTurnResetCapped(store: Store, originKey: string): boolean {
+	const cap = store.core.metaGet(failedTurnResetCapKey(originKey));
+	return cap !== undefined && cap !== "0";
+}
+
+export function resetFailedTurn(
+	store: Store,
+	tx: WriteTx,
+	input: {
+		readonly originKey: string;
+		readonly epoch: number;
+		readonly sessionId: string;
+		readonly opRef: string;
+		readonly triggerMessageId: string;
+	},
+): number | undefined {
+	store.core.assertActive(tx);
+	const trigger = store.inbox.turnRow(input.opRef);
+	const session = store.bindings.getSessionRecord(input.originKey);
+	const dedupeKey = `failed-turn-reset:${createHash("sha256")
+		.update(JSON.stringify([input.originKey, input.triggerMessageId]))
+		.digest("hex")}`;
+	const capKey = failedTurnResetCapKey(input.originKey);
+	const cap = store.core.metaGet(capKey);
+	if (
+		!trigger ||
+		trigger.origin_key !== input.originKey ||
+		trigger.message_id !== input.triggerMessageId ||
+		trigger.turn_epoch !== input.epoch ||
+		trigger.bound_session_id !== input.sessionId ||
+		trigger.state !== "pending" ||
+		trigger.turn_state !== "accepted" ||
+		session?.epoch !== input.epoch ||
+		session.sessionId !== input.sessionId ||
+		store.core.metaGet(dedupeKey) !== undefined ||
+		(cap !== undefined && cap !== "0")
+	)
+		return undefined;
+	if (store.inbox.turnComplete(tx, input.opRef, "turn_failed") !== 1)
+		throw new Error("failed turn completion lost its fence");
+	store.core.metaSet(dedupeKey, "1");
+	store.core.metaSet(capKey, "1");
+	store.inbox.contextConsume(tx, [input.triggerMessageId]);
+	return store.bindings.rotateEpoch(tx, input.originKey);
+}
 export const BIND_WEDGE_PROBE_STRIKES = 5;
 /** A turn held for host capacity re-checks at this cadence even if no host frees in between. */
 const HOST_CAPACITY_RETRY_MS = 5_000;
@@ -187,7 +282,7 @@ export interface PersonaBindHoldInput {
 }
 
 export interface PersonaSessionManagerOptions {
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly port: SessionPort;
 	readonly instanceId: string;
 	readonly repo: string;
@@ -237,6 +332,8 @@ export interface PersonaSessionManagerOptions {
 	readonly brokerLiveness?: BrokerLivenessProbe;
 	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
+	/** Records a failed persona bind in the durable SLO journal. */
+	readonly onSloEvent?: (code: "persona_bind_failed", at: number) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
@@ -264,7 +361,7 @@ export interface PersonaSessionManagerOptions {
  * by origin, epoch, session, and generation.
  */
 export class PersonaSessionManager {
-	readonly #database: GatewayDatabase;
+	readonly #database: Store;
 	readonly #port: SessionPort;
 	readonly #instanceId: string;
 	readonly #repo: string;
@@ -285,6 +382,7 @@ export class PersonaSessionManager {
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
+	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#maxLiveHosts: number;
@@ -321,6 +419,7 @@ export class PersonaSessionManager {
 			"hostIdleRetireMs",
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
+		this.#onSloEvent = options.onSloEvent;
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -453,9 +552,9 @@ export class PersonaSessionManager {
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
-			...this.#database.inboundNonterminalOrigins(),
-			...this.#database.inboundPendingOrigins(),
-			...this.#database.inboundHeldSteerOrigins(),
+			...this.#database.inbox.nonterminalOrigins(),
+			...this.#database.inbox.pendingOrigins(),
+			...this.#database.inbox.heldSteerOrigins(),
 		]);
 		return Promise.all(
 			[...origins].map((originKey) =>
@@ -515,6 +614,10 @@ export class PersonaSessionManager {
 		}
 	}
 
+	recordBindFailure(): void {
+		this.#onSloEvent?.("persona_bind_failed", this.#now());
+	}
+
 	#actor(originKey: string): OriginActor {
 		let actor = this.#actors.get(originKey);
 		if (!actor) {
@@ -524,7 +627,7 @@ export class PersonaSessionManager {
 		return actor;
 	}
 
-	get database(): GatewayDatabase {
+	get database(): Store {
 		return this.#database;
 	}
 
@@ -729,7 +832,7 @@ class OriginActor {
 		if (!this.hostIdle || this.#manager.stopped) return false;
 		const sessionId = this.#hostSessionId;
 		if (sessionId === undefined) return false;
-		if (this.#manager.database.inboundPendingOldest(this.originKey)) return false;
+		if (this.#manager.database.inbox.pendingOldest(this.originKey)) return false;
 		const port = this.#manager.port;
 		if (!port.terminateHost) return false;
 		if (port.runningJobs) {
@@ -803,7 +906,7 @@ class OriginActor {
 	admissionHold(): string | undefined {
 		if (this.#bindWedged) return "broker_wedged";
 		if (this.#lastBindHoldReason) return this.#lastBindHoldReason;
-		if (this.#manager.database.inboundHasQuarantinedNonterminalTurn(this.originKey)) return "quarantined_turn";
+		if (this.#manager.database.inbox.hasQuarantinedNonterminalTurn(this.originKey)) return "quarantined_turn";
 		return undefined;
 	}
 
@@ -853,14 +956,15 @@ class OriginActor {
 		// The binding being rotated away from. Read before bumpEpoch clears it: if
 		// no turn is in flight nothing will ever reconcile this session, so its host
 		// would live on idle forever unless ended here.
-		const previousSessionId = previous?.sessionId ?? this.#manager.database.getSessionRecord(this.originKey)?.sessionId;
+		const previousSessionId =
+			previous?.sessionId ?? this.#manager.database.bindings.getSessionRecord(this.originKey)?.sessionId;
 		let nextEpoch = 0;
 		let discarded: string[] = [];
-		this.#manager.database.withTransaction(() => {
-			nextEpoch = this.#manager.database.bumpEpoch(this.originKey, originRefJson);
-			this.#manager.database.contextSetFloor(this.originKey, floorAt);
-			discarded = this.#manager.database.inboundDiscardBefore(this.originKey, floorAt);
-			this.#manager.database.clearFailedTurnResetCap(this.originKey);
+		this.#manager.database.transaction((tx) => {
+			nextEpoch = this.#manager.database.bindings.rotateEpoch(tx, this.originKey, originRefJson);
+			setContextFloor(this.#manager.database, tx, this.originKey, floorAt);
+			discarded = this.#manager.database.inbox.discardBefore(tx, this.originKey, floorAt);
+			clearFailedTurnResetCap(this.#manager.database, tx, this.originKey);
 		});
 		await this.#manager.discardInbound(discarded);
 		if (previous) {
@@ -877,7 +981,7 @@ class OriginActor {
 			);
 			this.#scheduleRetiredReattach(previous);
 		}
-		for (const turn of this.#manager.database.inboundNonterminalTurns(this.originKey)) {
+		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
 			if (turn.epoch < nextEpoch && !this.#retired.has(`${turn.epoch}:${turn.opRef}`)) {
 				this.#manager.log(
 					`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=/new`,
@@ -916,7 +1020,7 @@ class OriginActor {
 
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
-		for (const turn of this.#manager.database.inboundNonterminalTurns(this.originKey)) {
+		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
 			try {
@@ -928,9 +1032,12 @@ class OriginActor {
 				// main cutover from a schema-16 home hit this (three boxes, 2026-09-05)
 				// and each needed the row hand-edited before the origin worked again.
 				if (turn.state === "bound" && sdkStatusErrorCode(error) === "session_unavailable") {
-					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 					const retired = turn.epoch < this.#epoch();
-					const nextEpoch = retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
+					const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+						const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
+						const nextEpoch = retired ? this.#epoch() : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+						return { attempt, nextEpoch };
+					});
 					this.#manager.log(
 						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${turn.sessionId} attempt=${attempt} reason=tail_attach_disowned`,
 					);
@@ -947,8 +1054,8 @@ class OriginActor {
 	}
 
 	#quarantinedTurn(opRef: string): boolean {
-		const row = this.#manager.database.inboundTurnRow(opRef);
-		if (!row || !this.#manager.database.isBrokerQuarantined("inbound", row.message_id)) return false;
+		const row = this.#manager.database.inbox.turnRow(opRef);
+		if (!row || !this.#manager.database.bindings.isQuarantined("inbound", row.message_id)) return false;
 		this.#manager.log(
 			`recovery_hold origin=${this.originKey} opRef=${opRef} reason=broker_authority_quarantined`,
 			"warn",
@@ -996,13 +1103,16 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
-			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+				const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
+				const nextEpoch = retired ? currentEpoch : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+				return { attempt, nextEpoch };
+			});
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next dispatch binds a fresh live session.
 			// A retired turn's epoch was already rotated away from; it simply
 			// re-enters the queue under the current one (its send never ran, so
 			// the message is owed a turn, not a permanent hold).
-			const nextEpoch = retired ? currentEpoch : this.#manager.database.rebindEpoch(this.originKey);
 			this.#manager.log(
 				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt}${retired ? " reason=retired_router_disowned" : ""}`,
 			);
@@ -1067,14 +1177,16 @@ class OriginActor {
 			(status.status.status === "terminal_ok" || status.status.status === "failed");
 		switch (decision.action) {
 			case "observe": {
-				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
+				if (turn.state === "bound")
+					this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, turn.opRef));
 				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, knownTerminal);
 				await this.#reconcileBound(bound);
 				if (!bound.retired && this.#current === bound) await this.#steerPending();
 				return;
 			}
 			case "fresh_turn": {
-				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
+				if (turn.state === "bound")
+					this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, turn.opRef));
 				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, knownTerminal);
 				// Recovered failures use the same exact evidence and reset-next cap.
 				// The original trigger is completed, never dispatched again.
@@ -1123,8 +1235,11 @@ class OriginActor {
 				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && turn.state === "bound";
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
 					this.#holdSweeps.delete(turn.opRef);
-					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
-					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+					const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+						const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
+						const nextEpoch = this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+						return { attempt, nextEpoch };
+					});
 					this.#manager.log(
 						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
 					);
@@ -1146,7 +1261,7 @@ class OriginActor {
 		retired: boolean,
 		knownTerminal: boolean,
 	): Promise<BoundTurn> {
-		const trigger = this.#manager.database.inboundTurnRow(turn.opRef);
+		const trigger = this.#manager.database.inbox.turnRow(turn.opRef);
 		if (!trigger) throw new Error(`turn ${turn.opRef} disappeared during recovery`);
 		if (this.#quarantinedTurn(turn.opRef)) throw new Error("broker_authority_quarantined");
 		const lifecycle = await this.#manager.startTurn({
@@ -1322,10 +1437,10 @@ class OriginActor {
 	async #dispatchNext(): Promise<void> {
 		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
 		await this.#resolveStaleHolds();
-		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
+		const trigger = this.#manager.database.inbox.pendingOldest(this.originKey);
 		if (!trigger) return;
 		const epoch = this.#epoch();
-		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
+		const retryAttempt = freshTurnAttempt(this.#manager.database, this.originKey, epoch, trigger.message_id);
 		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
 		if (!this.hostLive) {
 			const admission = await this.#manager.admitHost(this);
@@ -1344,13 +1459,15 @@ class OriginActor {
 			await this.#noteBindFailure(trigger, epoch, error);
 			return;
 		}
-		const bound = this.#manager.database.inboundBindTurn({
-			messageId: trigger.message_id,
-			originKey: this.originKey,
-			epoch,
-			opRef,
-			sessionId: binding.sessionId,
-		});
+		const bound = this.#manager.database.transaction((tx) =>
+			this.#manager.database.inbox.bindTurn(tx, {
+				messageId: trigger.message_id,
+				originKey: this.originKey,
+				epoch,
+				opRef,
+				sessionId: binding.sessionId,
+			}),
+		);
 		const turn: InboundTurn = {
 			originKey: this.originKey,
 			epoch,
@@ -1382,8 +1499,10 @@ class OriginActor {
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
 			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
-			this.#manager.database.inboundTurnRequeue(opRef);
-			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			const nextEpoch = this.#manager.database.transaction((tx) => {
+				retryInboundTurn(this.#manager.database, tx, opRef);
+				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+			});
 			this.#bindFailures += 1;
 			const attempts = this.#bindFailures;
 			this.#manager.log(
@@ -1461,14 +1580,17 @@ class OriginActor {
 				);
 		} catch (error) {
 			await tail.close();
-			const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
+			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+				const attempt = retryInboundTurn(this.#manager.database, tx, opRef);
+				const nextEpoch = sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined;
+				return { attempt, nextEpoch };
+			});
 			this.#current = undefined;
 			this.#state = "idle";
 			await this.#notifyReleased(current);
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
-			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
-			const nextEpoch = sessionGone ? this.#manager.database.rebindEpoch(this.originKey) : undefined;
 			this.#manager.log(
 				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 				"error",
@@ -1492,7 +1614,7 @@ class OriginActor {
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 			});
 			tail.correlate(opRef, receipt);
-			this.#manager.database.inboundTurnAccept(opRef);
+			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
@@ -1502,8 +1624,10 @@ class OriginActor {
 			// the broker may have accepted the operation before the CLI failed.
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
 				await tail.close();
-				this.#manager.database.inboundTurnRequeue(opRef);
-				const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+				const nextEpoch = this.#manager.database.transaction((tx) => {
+					retryInboundTurn(this.#manager.database, tx, opRef);
+					return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+				});
 				this.#current = undefined;
 				this.#state = "idle";
 				await this.#notifyReleased(current);
@@ -1573,8 +1697,10 @@ class OriginActor {
 		const contextMessageId = bound
 			? bound.lifecycle.steerContextMessageId?.(row)
 			: this.#manager.heldSteerContextMessageId(row);
-		if (!this.#manager.database.inboundSteerAccepted({ messageId: row.message_id, epoch, opRef, contextMessageId }))
-			return false;
+		const accepted = this.#manager.database.transaction((tx) =>
+			this.#manager.database.inbox.steerAccepted(tx, { messageId: row.message_id, epoch, opRef, contextMessageId }),
+		);
+		if (!accepted) return false;
 		if (bound) await bound.lifecycle.onSteerAccepted?.({ ...bound, row });
 		else await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef });
 		await this.#manager.emitSteer({ originKey: this.originKey, messageId: row.message_id, opRef });
@@ -1592,7 +1718,10 @@ class OriginActor {
 		const contextMessageId = bound
 			? bound.lifecycle.steerContextMessageId?.(row)
 			: this.#manager.heldSteerContextMessageId(row);
-		if (!this.#manager.database.inboundSteerAbandoned(row.message_id, opRef, contextMessageId)) return;
+		const closed = this.#manager.database.transaction((tx) =>
+			this.#manager.database.inbox.steerAbandoned(tx, row.message_id, opRef, contextMessageId),
+		);
+		if (!closed) return;
 		await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef, abandoned: true });
 		this.#manager.log(
 			`steer_abandoned origin=${this.originKey} message=${row.message_id} opRef=${opRef} reason=session_gone`,
@@ -1607,15 +1736,15 @@ class OriginActor {
 	 * newer rows are NOT blocked behind it.
 	 */
 	async #resolveStaleHolds(): Promise<void> {
-		for (const held of this.#manager.database.inboundSteersHeldAfterTerminal(this.originKey)) {
+		for (const held of this.#manager.database.inbox.steersHeldAfterTerminal(this.originKey)) {
 			const opRef = held.turn_op_ref;
 			if (
-				this.#manager.database.isBrokerQuarantined("inbound", held.message_id) ||
+				this.#manager.database.bindings.isQuarantined("inbound", held.message_id) ||
 				(opRef && this.#quarantinedTurn(opRef))
 			)
 				continue;
 			const epoch = held.turn_epoch;
-			const sessionId = held.bound_session_id ?? this.#manager.database.inboundTurnRow(opRef ?? "")?.bound_session_id;
+			const sessionId = held.bound_session_id ?? this.#manager.database.inbox.turnRow(opRef ?? "")?.bound_session_id;
 			if (!opRef || epoch === null || !sessionId) continue;
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, epoch, held.message_id);
 			try {
@@ -1627,7 +1756,10 @@ class OriginActor {
 				});
 				await this.#finalizeSteerAcceptance(held, epoch, opRef, undefined);
 			} catch (error) {
-				if (isDefinitiveSteerRejection(error)) this.#manager.database.inboundSteerRefused(held.message_id, opRef);
+				if (isDefinitiveSteerRejection(error))
+					this.#manager.database.transaction((tx) =>
+						this.#manager.database.inbox.steerRefused(tx, held.message_id, opRef),
+					);
 				else if (await this.#sessionProvablyGone(sessionId, error)) {
 					// The turn is over and its session is gone: nothing will ever answer
 					// the clientRef replay. Whether the model saw the message is
@@ -1705,6 +1837,7 @@ class OriginActor {
 			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${attempts} detail=${detail}`,
 			"error",
 		);
+		this.#manager.recordBindFailure();
 		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 			this.#manager.log(
 				`persona_send_unrecoverable origin=${this.originKey} message=${trigger.message_id} attempts=${attempts} reason=bind_failed`,
@@ -1754,7 +1887,9 @@ class OriginActor {
 			// forever cannot recover it (live: one channel repeated it 335 times).
 			// Advance the epoch to derive a new key while leaving every inbound row
 			// pending and intact, then retry with the normal base delay.
-			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			const nextEpoch = this.#manager.database.transaction((tx) =>
+				this.#manager.database.bindings.rotateEpoch(tx, this.originKey),
+			);
 			this.#manager.log(
 				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${trigger.message_id} attempts=${attempts} reason=terminal_uncertain`,
 			);
@@ -1797,12 +1932,17 @@ class OriginActor {
 		const current = this.#current;
 		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
 		if (this.#deferredSteerOpRef === current.turn.opRef) return;
+		// A turn in recovery_hold (operation_state_unknown or past stall threshold)
+		// must not absorb new inbound as steers; new inbound must remain pending so it
+		// can start a fresh trigger turn. This ensures mentions and other new messages
+		// always get a reply, not silently absorbed into a dead op (fix for #405).
+		if (this.#holdSweeps.has(current.turn.opRef)) return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
-		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
+		for (const held of this.#manager.database.inbox.steersHeld(current.turn.opRef))
 			if (!(await this.#steerRow(current, held))) return;
 		for (;;) {
-			const row = this.#manager.database.inboundPendingOldest(this.originKey);
+			const row = this.#manager.database.inbox.pendingOldest(this.originKey);
 			if (!row) return;
 			if (!(await this.#steerRow(current, row))) return;
 		}
@@ -1815,7 +1955,7 @@ class OriginActor {
 	 */
 	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
 		if (
-			this.#manager.database.isBrokerQuarantined("inbound", row.message_id) ||
+			this.#manager.database.bindings.isQuarantined("inbound", row.message_id) ||
 			this.#quarantinedTurn(current.turn.opRef)
 		)
 			return false;
@@ -1828,12 +1968,14 @@ class OriginActor {
 		// still be steered even when the original is in the context window.
 		if (current.lifecycle.contextMessageIds?.has(row.message_id)) {
 			const contextMessageId = current.lifecycle.steerContextMessageId?.(row);
-			const closed = this.#manager.database.inboundSteerAccepted({
-				messageId: row.message_id,
-				epoch: current.epoch,
-				opRef: current.turn.opRef,
-				contextMessageId,
-			});
+			const closed = this.#manager.database.transaction((tx) =>
+				this.#manager.database.inbox.steerAccepted(tx, {
+					messageId: row.message_id,
+					epoch: current.epoch,
+					opRef: current.turn.opRef,
+					contextMessageId,
+				}),
+			);
 			if (!closed) return false;
 			await current.lifecycle.onSteerAccepted?.({ ...current, row });
 			this.#manager.log(
@@ -1848,11 +1990,13 @@ class OriginActor {
 			// turn. A torn transport leaves it `steer/bound` - never dispatched as
 			// a trigger, retried on this clientRef by the next admission, tick or
 			// restart - until the runtime records acceptance or refuses.
-			this.#manager.database.inboundSteerIssued({
-				messageId: row.message_id,
-				epoch: current.epoch,
-				opRef: current.turn.opRef,
-			});
+			this.#manager.database.transaction((tx) =>
+				this.#manager.database.inbox.steerIssued(tx, {
+					messageId: row.message_id,
+					epoch: current.epoch,
+					opRef: current.turn.opRef,
+				}),
+			);
 			const steer = {
 				sessionId: current.sessionId,
 				repo: this.#manager.repo,
@@ -1900,7 +2044,9 @@ class OriginActor {
 				// Keep the row pending for the next turn in this session. Do not
 				// repeatedly offer a refused row on each running-turn tick.
 				this.#deferredSteerOpRef = current.turn.opRef;
-				this.#manager.database.inboundSteerRefused(row.message_id, current.turn.opRef);
+				this.#manager.database.transaction((tx) =>
+					this.#manager.database.inbox.steerRefused(tx, row.message_id, current.turn.opRef),
+				);
 				this.#manager.log(
 					`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(failure)}`,
 					"error",
@@ -1914,7 +2060,7 @@ class OriginActor {
 	}
 
 	async #ensureSession(epoch: number): Promise<SessionBinding> {
-		const existing = this.#manager.database.getSessionRecord(this.originKey);
+		const existing = this.#manager.database.bindings.getSessionRecord(this.originKey);
 		if (existing?.epoch === epoch && existing.sessionId) {
 			const binding = { sessionId: existing.sessionId, originKey: this.originKey, epoch, repo: this.#manager.repo };
 			// An idle binding may point at a session the broker no longer hosts
@@ -2068,11 +2214,12 @@ class OriginActor {
 		} as unknown as StatusReport;
 		await bound.lifecycle.onTerminal?.({ ...bound, text, status });
 		this.#holdSweeps.delete(bound.turn.opRef);
-		// Accept then complete, as the ordinary terminal path does; each is its own
-		// statement (onTerminal may already hold a transaction for the delivery).
-		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
-			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
-		this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+		// Acceptance and terminal closure share one durable turn boundary.
+		this.#manager.database.transaction((tx) => {
+			if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
+				this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef);
+			this.#manager.database.inbox.turnComplete(tx, bound.turn.opRef);
+		});
 		await this.#notifySettled(bound);
 		await this.#settleAfterTerminal(bound);
 		return true;
@@ -2239,6 +2386,12 @@ class OriginActor {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
+		// If turn is in recovery_hold and not already retired, retire it so pending inbound
+		// can start a fresh trigger turn in the next epoch.
+		const inRecoveryHold = !bound.retired && !retired && this.#holdSweeps.has(bound.turn.opRef);
+		if (inRecoveryHold) {
+			bound.retired = true;
+		}
 		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
 		if (retired || bound.retired) {
 			this.#flushStaleOutput(bound, "stall");
@@ -2258,6 +2411,16 @@ class OriginActor {
 				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 				"warn",
 			);
+			this.#holdSweeps.delete(bound.turn.opRef);
+			// If we just retired a turn in recovery_hold, dispatch pending inbound as a new trigger turn.
+			if (inRecoveryHold) {
+				// Clear the current turn if this is the bound turn, and set state to idle for dispatch.
+				if (this.#current === bound) {
+					this.#current = undefined;
+					this.#state = "idle";
+				}
+				await this.#dispatchNext();
+			}
 			await this.#reconcileBound(bound);
 		}
 	}
@@ -2290,7 +2453,7 @@ class OriginActor {
 			return;
 		}
 		// Extract the trigger author ID from the bound turn
-		const trigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
+		const trigger = this.#manager.database.inbox.turnRow(bound.turn.opRef);
 		const triggerAuthorId = trigger?.engagement_json
 			? (JSON.parse(trigger.engagement_json) as { authorId?: string }).authorId
 			: undefined;
@@ -2352,7 +2515,7 @@ class OriginActor {
 				// run and acted: it is NEVER re-sent. On positive evidence the session
 				// is dead (live=false or disowned) it is closed; an unanswerable
 				// liveness probe holds it.
-				const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
+				const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
 				const dead = raw?.live === false || raw?.disowned === true;
 				const wanted = !bound.retired || bound.answerWanted;
 				if (state === "bound" && wanted && raw?.live !== true) {
@@ -2377,7 +2540,7 @@ class OriginActor {
 		if (report.status.status === "unknown") {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
-			const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
+			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
 			// This is the live counterpart of startup's operator_hold recovery.
 			// A BOUND turn has no broker acknowledgement. When the live session
 			// reports no such operation and its prompt queue remains empty across
@@ -2418,8 +2581,8 @@ class OriginActor {
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);
-		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
-			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
+		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
+			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
 			if (bound.detached && !bound.tailEvidenceUnavailable) {
 				// A turn the user still wants answered is re-attached like the
@@ -2564,8 +2727,9 @@ class OriginActor {
 		const resetApplied = this.#resetFailedTurn(bound, report, failedTurnEvidence);
 		const completed = resetApplied
 			? 1
-			: this.#manager.database.withTransaction(() => {
-					const changed = this.#manager.database.inboundTurnComplete(
+			: this.#manager.database.transaction((tx) => {
+					const changed = this.#manager.database.inbox.turnComplete(
+						tx,
 						bound.turn.opRef,
 						bound.retired && !bound.answerWanted ? "retired" : "no_delivery",
 					);
@@ -2587,9 +2751,9 @@ class OriginActor {
 						Number.isFinite(report.status.terminalAt) &&
 						report.status.terminalAt >= report.status.startedAt &&
 						report.status.terminalAt <= this.#manager.now() &&
-						this.#manager.database.getSessionRecord(this.originKey)?.sessionId === bound.sessionId
+						this.#manager.database.bindings.getSessionRecord(this.originKey)?.sessionId === bound.sessionId
 					) {
-						this.#manager.database.clearFailedTurnResetCap(this.originKey);
+						clearFailedTurnResetCap(this.#manager.database, tx, this.originKey);
 						this.#submissionFailures.delete(bound.sessionId);
 					}
 					return changed;
@@ -2603,7 +2767,7 @@ class OriginActor {
 		// more time now that the turn is over (the runtime still holds the
 		// recorded outcome). What stays unresolved is held on this op-ref for
 		// the operator - never dispatched as a new turn, never silently dropped.
-		for (const held of this.#manager.database.inboundSteersHeld(bound.turn.opRef)) {
+		for (const held of this.#manager.database.inbox.steersHeld(bound.turn.opRef)) {
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, bound.epoch, held.message_id);
 			try {
 				await this.#manager.port.steer({
@@ -2616,7 +2780,9 @@ class OriginActor {
 			} catch (error) {
 				if (isDefinitiveSteerRejection(error)) {
 					// Never reached the turn: an ordinary pending message for the next one.
-					this.#manager.database.inboundSteerRefused(held.message_id, bound.turn.opRef);
+					this.#manager.database.transaction((tx) =>
+						this.#manager.database.inbox.steerRefused(tx, held.message_id, bound.turn.opRef),
+					);
 				} else {
 					this.#manager.log(
 						`steer_hold origin=${this.originKey} message=${held.message_id} opRef=${bound.turn.opRef} reason=unresolved_at_terminal detail=${safeDiagnostic(error)}`,
@@ -2635,7 +2801,7 @@ class OriginActor {
 	 * unobserved-answer path, so both settle a turn the same way.
 	 */
 	async #notifySettled(bound: BoundTurn): Promise<void> {
-		const settledTrigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
+		const settledTrigger = this.#manager.database.inbox.turnRow(bound.turn.opRef);
 		if (settledTrigger?.turn_state !== "done") return;
 		try {
 			await bound.lifecycle.onSettled?.({
@@ -2694,7 +2860,7 @@ class OriginActor {
 			!bound.replyVisible &&
 			bound.lastAssistantText === undefined &&
 			!bound.openTool &&
-			this.#manager.database.freshTurnAttempt(this.originKey, bound.epoch, bound.turn.triggerMessageId) === 0
+			freshTurnAttempt(this.#manager.database, this.originKey, bound.epoch, bound.turn.triggerMessageId) === 0
 		);
 	}
 
@@ -2704,7 +2870,9 @@ class OriginActor {
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
-		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+		const attempt = this.#manager.database.transaction((tx) =>
+			retryInboundTurn(this.#manager.database, tx, bound.turn.opRef),
+		);
 		this.#current = undefined;
 		this.#state = "idle";
 		this.#manager.log(
@@ -2727,8 +2895,11 @@ class OriginActor {
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
-		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
-		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
+		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+			const attempt = retryInboundTurn(this.#manager.database, tx, bound.turn.opRef);
+			const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+			return { attempt, nextEpoch };
+		});
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
@@ -2761,7 +2932,7 @@ class OriginActor {
 		const database = this.#manager.database;
 		// Only a still-open trigger is closed: a repeat call after completion (or
 		// after a restart that already closed it) sends no second notice.
-		const open = database.inboundTurnRow(bound.turn.opRef);
+		const open = database.inbox.turnRow(bound.turn.opRef);
 		if (!open || open.state !== "pending" || (open.turn_state !== "accepted" && open.turn_state !== "bound")) {
 			await this.#forgetClosed(bound);
 			return;
@@ -2787,13 +2958,15 @@ class OriginActor {
 		// Only the CURRENT turn of the CURRENT epoch rotates: a retired turn or a
 		// turn a newer epoch already replaced never tears down the live binding.
 		const rotate =
-			!bound.retired && this.#current === bound && database.getSessionRecord(this.originKey)?.epoch === bound.epoch;
-		const completed = database.withTransaction(() => {
-			const changed = database.inboundTurnComplete(bound.turn.opRef, discarded ? "retired" : "turn_failed");
-			if (changed === 1 && rotate) database.rebindEpoch(this.originKey);
+			!bound.retired &&
+			this.#current === bound &&
+			database.bindings.getSessionRecord(this.originKey)?.epoch === bound.epoch;
+		const completed = database.transaction((tx) => {
+			const changed = database.inbox.turnComplete(tx, bound.turn.opRef, discarded ? "retired" : "turn_failed");
+			if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);
 			return changed;
 		});
-		for (const held of database.inboundSteersHeld(bound.turn.opRef))
+		for (const held of database.inbox.steersHeld(bound.turn.opRef))
 			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
 		this.#manager.log(
 			`${discarded ? "retired_turn_closed" : "accepted_turn_closed"} origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=${reason}`,
@@ -2936,7 +3109,7 @@ class OriginActor {
 		if (!port.terminateHost) return;
 		if (except?.retiredHostTerminationAttempted) return;
 		if (this.#current?.sessionId === sessionId) return;
-		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
+		if (this.#manager.database.bindings.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
 		for (const other of this.#retired.values()) if (other !== except && other.sessionId === sessionId) return;
 		if (except) except.retiredHostTerminationAttempted = true;
 		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
@@ -2973,7 +3146,7 @@ class OriginActor {
 	}
 
 	#dispatchFloorMs(opRef: string): number | undefined {
-		const dispatchedAt = this.#manager.database.inboundTurnDispatchedAt(opRef);
+		const dispatchedAt = this.#manager.database.inbox.turnDispatchedAt(opRef);
 		const at = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
 		return Number.isFinite(at) ? at : undefined;
 	}
@@ -2992,7 +3165,7 @@ class OriginActor {
 	}
 
 	#epoch(): number {
-		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
+		return this.#manager.database.bindings.getSessionRecord(this.originKey)?.epoch ?? 0;
 	}
 
 	/** Reads only bounded saved-transcript evidence for a current failed turn. */
@@ -3038,6 +3211,16 @@ class OriginActor {
 			this.#manager.log(
 				`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
 			);
+		const { startedAt, terminalAt } = report.status;
+		const isSubmissionPhaseFailure = report.status.outcome?.phase === "submission";
+		// The SDK reports no startedAt for a prompt that never started (#477), so a
+		// submission-phase failure is fenced by its terminalAt instead.
+		const turnFloor =
+			typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0
+				? startedAt
+				: isSubmissionPhaseFailure
+					? terminalAt
+					: undefined;
 		if (
 			report.status.status !== "failed" ||
 			report.operationRef !== bound.turn.opRef ||
@@ -3047,24 +3230,21 @@ class OriginActor {
 			bound.brokerGeneration !== this.#manager.brokerGeneration ||
 			this.#stopped ||
 			this.#manager.stopped ||
-			typeof report.status.startedAt !== "number" ||
-			!Number.isFinite(report.status.startedAt) ||
-			report.status.startedAt <= 0 ||
-			typeof report.status.terminalAt !== "number" ||
-			!Number.isFinite(report.status.terminalAt) ||
-			report.status.terminalAt < report.status.startedAt ||
-			report.status.terminalAt > this.#manager.now() ||
+			typeof terminalAt !== "number" ||
+			!Number.isFinite(terminalAt) ||
+			typeof turnFloor !== "number" ||
+			terminalAt < turnFloor ||
+			terminalAt > this.#manager.now() ||
 			bound.dispatchedAtMs === undefined ||
-			report.status.startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
+			turnFloor + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
 		)
 			return false;
 		if (evidence?.reason === "provider_quota_exhausted" || evidence?.reason === "provider_rate_limited") {
 			this.#submissionFailures.delete(bound.sessionId);
 			return false;
 		}
-		const submissionFailure = report.status.outcome?.phase === "submission";
 		let repeatedSubmissionFailure = false;
-		if (submissionFailure) {
+		if (isSubmissionPhaseFailure) {
 			const count = Math.min(2, (this.#submissionFailures.get(bound.sessionId) ?? 0) + 1);
 			this.#submissionFailures.set(bound.sessionId, count);
 			repeatedSubmissionFailure = count >= 2;
@@ -3076,16 +3256,18 @@ class OriginActor {
 					? "repeated_submission_failure"
 					: undefined;
 		if (!resetReason) return false;
-		const nextEpoch = this.#manager.database.inboundFailedTurnReset({
-			originKey: this.originKey,
-			epoch: bound.epoch,
-			sessionId: bound.sessionId,
-			opRef: bound.turn.opRef,
-			triggerMessageId: bound.turn.triggerMessageId,
-		});
+		const nextEpoch = this.#manager.database.transaction((tx) =>
+			resetFailedTurn(this.#manager.database, tx, {
+				originKey: this.originKey,
+				epoch: bound.epoch,
+				sessionId: bound.sessionId,
+				opRef: bound.turn.opRef,
+				triggerMessageId: bound.turn.triggerMessageId,
+			}),
+		);
 		if (nextEpoch === undefined) {
 			if (
-				this.#manager.database.failedTurnResetCapped(this.originKey) &&
+				failedTurnResetCapped(this.#manager.database, this.originKey) &&
 				!this.#loggedCappedFailedTurnSessions.has(bound.sessionId)
 			) {
 				this.#loggedCappedFailedTurnSessions.add(bound.sessionId);

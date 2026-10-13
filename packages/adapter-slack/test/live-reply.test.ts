@@ -24,6 +24,7 @@ class LiveApi {
 		if (this.updateFailure) throw this.updateFailure;
 	}
 	async addReaction(_channel: string, _ts: string, _name: string) {}
+	async removeReaction(_channel: string, _ts: string, _name: string) {}
 }
 
 const part = (extra: Partial<LiveDeliveryInput> = {}): LiveDeliveryInput => ({

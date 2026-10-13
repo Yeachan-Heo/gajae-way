@@ -29,16 +29,6 @@ function gitEnv(): Record<string, string> {
 	};
 }
 
-/**
- * One git operation per corpus at a time. The closure queue (intent commits),
- * the autolink sweep and any other in-process writer each run `add` then
- * `commit` as separate commands on the SAME repository; interleaved, one of
- * them finds the other's `.git/index.lock` and fails (live: 100 `memory git add
- * failed: index.lock exists`, gaebal, 2026-09-05). Git's lock is per-process,
- * not per-caller, so the serialization has to be ours.
- */
-const gitChains = new Map<string, Promise<void>>();
-
 export class CorpusWriter {
 	readonly #root: string;
 	constructor(root: string) {
@@ -68,40 +58,26 @@ export class CorpusWriter {
 	}
 }
 
-/** Runs `work` after every earlier call on the same `root` in `chains` has settled. */
-async function serializedOnRoot<T>(
-	chains: Map<string, Promise<void>>,
-	root: string,
-	work: () => Promise<T>,
-): Promise<T> {
-	const previous = chains.get(root) ?? Promise.resolve();
-	let release!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const chain = previous.then(() => gate);
-	chains.set(root, chain);
-	await previous;
-	try {
-		return await work();
-	} finally {
-		release();
-		if (chains.get(root) === chain) chains.delete(root);
+export function memoryGit(root: string, args: readonly string[]): Promise<string> {
+	return memoryGitUnserialized(root, args);
+}
+
+export class MemoryGitLockedError extends Error {
+	readonly path: string;
+	readonly ageMs: number | undefined;
+
+	constructor(path: string, ageMs?: number) {
+		super(`memory git blocked by index lock ${path}${ageMs === undefined ? "" : ` (age ${ageMs}ms)`}`);
+		this.name = "MemoryGitLockedError";
+		this.path = path;
+		this.ageMs = ageMs;
 	}
 }
-
-export function memoryGit(root: string, args: readonly string[]): Promise<string> {
-	return serializedOnRoot(gitChains, root, () => memoryGitUnserialized(root, args));
-}
-
-/** git's lock file; an orphan (no live git on this repo) blocks every later write until removed by hand. */
-const INDEX_LOCK_RE = /Unable to create '(.+?\/\.git\/index\.lock)': File exists/;
 
 async function memoryGitUnserialized(root: string, args: readonly string[]): Promise<string> {
 	// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
 	// though git exists (observed under parallel test load); one bounded retry
 	// keeps a durable closure from failing on a scheduler hiccup.
-	let lockCleared = false;
 	for (let attempt = 0; ; attempt++) {
 		let child: ReturnType<typeof Bun.spawn>;
 		try {
@@ -119,25 +95,15 @@ async function memoryGitUnserialized(root: string, args: readonly string[]): Pro
 			child.exited,
 		]);
 		if (code === 0) return stdout.trim();
-		// Serialized above, so a lock we run into was left by a git that died
-		// (killed mid-commit on a restart, or a persona tool call). Wait long
-		// enough for a legitimately running git to finish, then treat a lock
-		// that is still there and older than that wait as orphaned. Once.
-		const lockPath = INDEX_LOCK_RE.exec(stderr)?.[1];
-		if (lockPath && !lockCleared) {
-			lockCleared = true;
-			await Bun.sleep(ORPHANED_LOCK_GRACE_MS);
+		const lockPath = join(root, ".git", "index.lock");
+		if (stderr.includes("Unable to create") && stderr.includes(".git/index.lock") && stderr.includes("File exists")) {
+			let ageMs: number | undefined;
 			try {
-				const age = Date.now() - (await stat(lockPath)).mtimeMs;
-				if (age >= ORPHANED_LOCK_GRACE_MS) {
-					await unlink(lockPath);
-					console.info(`memory git: removed orphaned ${lockPath} (age ${Math.round(age / 1000)}s)`);
-					continue;
-				}
+				ageMs = Math.max(0, Date.now() - (await stat(lockPath)).mtimeMs);
 			} catch {
-				// Gone meanwhile: the retry below decides.
-				continue;
+				// The path is still part of git's diagnostic even if it raced away.
 			}
+			throw new MemoryGitLockedError(lockPath, ageMs);
 		}
 		throw new Error(gitFailureMessage(args, code, stdout, stderr));
 	}
@@ -157,9 +123,6 @@ function gitFailureMessage(args: readonly string[], code: number, stdout: string
 	const reason = [stderr.trim(), stdout.trim()].filter(Boolean).join(" | ") || "(no output)";
 	return `memory git ${args[0]} failed (exit ${code}, argv: ${argv}): ${reason}`;
 }
-
-/** Longer than any git op on a memory corpus should take; shorter than a monitor tick. */
-const ORPHANED_LOCK_GRACE_MS = 5_000;
 
 /**
  * Bring a corpus up to the current axis set, creating only what is missing.
@@ -336,15 +299,10 @@ export function mapListsAxis(map: string, axis: AxisDescriptor): boolean {
  * is special-cased by id.
  */
 export function regenerateMap(root: string, registry?: AxisRegistry): Promise<void> {
-	// One regeneration per corpus at a time: the closure queue, `initializeMemory`
-	// and the autolink sweep all regenerate the same map, and two overlapping
-	// renders of a corpus that changes between them must not interleave (#227).
-	return serializedOnRoot(mapChains, root, () => regenerateMapUnserialized(root, registry));
+	return regenerateMapFiles(root, registry);
 }
 
-const mapChains = new Map<string, Promise<void>>();
-
-async function regenerateMapUnserialized(root: string, registry?: AxisRegistry): Promise<void> {
+async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promise<void> {
 	const axes = (registry ?? (await loadRegistry(root))).axes;
 	const files = await Promise.all(axes.map((axis) => axisEntries(root, axis)));
 	const indexed = axes.map((axis, index) => {

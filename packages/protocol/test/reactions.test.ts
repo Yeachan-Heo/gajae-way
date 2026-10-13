@@ -131,6 +131,53 @@ describe("reaction reply token", () => {
 			expect(isSilenceToken(token)).toBe(true);
 			expect(parseReactionReply(token)).toBeUndefined();
 		}
-		expect(isSilenceToken("[REACT:👍]")).toBe(false);
+		expect(isSilenceToken("[REACT:\ud83d\udc4d]")).toBe(false);
+	});
+
+	test("a reply that opens with [UNREACT:...@target] removes a reaction", () => {
+		expect(parseReactionReply("[UNREACT:\ud83d\udc4d@m1]")).toEqual({
+			reactions: [{ emoji: "\ud83d\udc4d", emojiName: "thumbsup", targetMessageId: "m1", action: "remove" }],
+			body: "",
+		});
+	});
+
+	test("UNREACT requires an explicit target message id", () => {
+		// UNREACT always needs @target, unlike REACT which defaults to the trigger message
+		expect(parseReactionReply("[UNREACT:\ud83d\udc4d]")).toBeUndefined();
+		expect(parseReactionReply("[UNREACT:thumbsup@1418812345678]")).toEqual({
+			reactions: [{ emoji: "\ud83d\udc4d", emojiName: "thumbsup", targetMessageId: "1418812345678", action: "remove" }],
+			body: "",
+		});
+	});
+
+	test("UNREACT and REACT tokens may be mixed in one reply", () => {
+		const parsed = parseReactionReply("[REACT:\ud83d\udc4d][UNREACT:\ud83d\udd25@42] changing reaction");
+		expect(parsed?.reactions).toEqual([
+			{ emoji: "\ud83d\udc4d", emojiName: "thumbsup" },
+			{ emoji: "\ud83d\udd25", emojiName: "fire", targetMessageId: "42", action: "remove" },
+		]);
+		expect(parsed?.body).toBe("changing reaction");
+	});
+
+	test("UNREACT is case-insensitive like REACT (but still needs a target)", () => {
+		// Both the keyword and the emoji work case-insensitively, but target is still required
+		expect(parseReactionReply("[unreact:\ud83d\udc4d]")).toBeUndefined();
+		expect(parseReactionReply("[UNREACT:THUMBSUP@m1]")).toEqual({
+			reactions: [{ emoji: "\ud83d\udc4d", emojiName: "thumbsup", targetMessageId: "m1", action: "remove" }],
+			body: "",
+		});
+	});
+
+	test("a malformed UNREACT token invalidates the entire reply", () => {
+		for (const text of [
+			"[UNREACT:\ud83d\ude80] launch", // not allowlisted
+			"[UNREACT:]",
+			"[UNREACT: ]",
+			"[UNREACT:\ud83d\udc4d]", // UNREACT requires explicit @target, no implicit default
+			"[UNREACT:\ud83d\udc4d@]", // explicit @ with no id
+			"[UNREACT:\ud83d\udc4d", // unclosed
+			"unreact [UNREACT:\ud83d\udc4d]", // not at start
+		])
+			expect(parseReactionReply(text)).toBeUndefined();
 	});
 });

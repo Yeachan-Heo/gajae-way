@@ -10,8 +10,12 @@
  * the old names silently stopped recovering (gaebal-gajae, 2026-09-30).
  */
 
-/** Oldest gjc whose SDK surface the gateway supports at all. */
-export const MIN_GJC_VERSION = "0.16.0";
+/**
+ * Oldest gjc the gateway supports: 0.18.9 is the first release that honors the
+ * attach-only contract (`GJC_SDK_BROKER_AUTOSTART=0`) and ships the public foreground
+ * broker command the broker host supervises.
+ */
+export const MIN_GJC_VERSION = "0.18.9";
 
 /**
  * Newest gjc minor whose envelopes this build's classification was verified

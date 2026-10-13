@@ -5,7 +5,6 @@ import {
 	cronMonitor,
 	deliveryOrigin,
 	emitChannels,
-	emitImportedAxis,
 	emitMonitors,
 	emptyChannelPlan,
 	emptyExtract,
@@ -107,7 +106,6 @@ export async function readHermes(tree: SourceTree, home: string): Promise<Source
 			content: entriesToMarkdown("Long-term memory (imported from Hermes)", memoryText),
 			mtime: info?.mtime,
 		});
-		emitImportedAxis(extract);
 	}
 
 	const envPath = join(root, ".env");

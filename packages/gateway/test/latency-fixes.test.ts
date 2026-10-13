@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 
 let directory = "";
@@ -38,16 +38,16 @@ test("SessionPort.runExclusive serializes same-origin work and releases after re
 
 test("turn_count survives increments and resets on epoch bump", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-turncount-"));
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(directory, "agent"));
 	try {
 		const key = "discord/channel/rot-1";
 		const origin = JSON.stringify({ platform: "discord", kind: "channel", conversationId: "rot-1" });
 		await port.bind({ originKey: key, epoch: 0, repo: join(directory, "workspace") });
-		expect(database.incrementTurnCount(key)).toBe(1);
-		expect(database.incrementTurnCount(key)).toBe(2);
-		database.bumpEpoch(key, origin);
-		expect(database.incrementTurnCount(key)).toBe(1);
+		expect(database.transaction((tx) => database.bindings.incrementTurnCount(tx, key))).toBe(1);
+		expect(database.transaction((tx) => database.bindings.incrementTurnCount(tx, key))).toBe(2);
+		database.transaction((tx) => database.bindings.rotateEpoch(tx, key, origin));
+		expect(database.transaction((tx) => database.bindings.incrementTurnCount(tx, key))).toBe(1);
 	} finally {
 		database.close();
 	}
@@ -77,13 +77,14 @@ async function startGateway(options: {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	attachTestBrokerOwnership(database, options.sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, ...options, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
@@ -160,13 +161,14 @@ test("a message arriving during an active persistent turn is steered without a s
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

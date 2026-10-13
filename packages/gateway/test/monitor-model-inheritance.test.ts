@@ -5,8 +5,7 @@ import { join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 const responseFor = (prompt: string) =>
@@ -17,7 +16,7 @@ const responseFor = (prompt: string) =>
 test("monitors inherit gateway model/tier by default and may override both per monitor", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-model-"));
 	try {
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const inherited = registry.add({
 			name: "inherited",
@@ -42,7 +41,7 @@ test("monitors inherit gateway model/tier by default and may override both per m
 			registry,
 			sessionPort: port,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 			repo: join(home, "workspace"),
 			model: { preset: "gpt-heavy" },

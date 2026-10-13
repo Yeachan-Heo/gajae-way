@@ -23,6 +23,9 @@ export interface DiscordGuildLike {
 /** A message we can put a reaction on; duck-typed from `channel.messages.fetch()`. */
 export interface DiscordReactableMessageLike {
 	react(emoji: string): Promise<unknown>;
+	readonly reactions?: {
+		resolve(emoji: string): { users: { remove(userId: string): Promise<unknown> } } | null | undefined;
+	};
 }
 
 /** The channel slice a reaction needs: the target message and the owning guild, if any. */
@@ -210,8 +213,9 @@ function firstFiniteNumber(candidates: readonly unknown[]): number | undefined {
  * uses, and reaction-specific failures are marked with the same permanent codes:
  * a missing channel (10003) or a deleted target message (10008) is definitive,
  * so the gateway must not redeliver. Anything else is ambiguous and safe to
- * retry, because a reaction is a PUT on Discord and therefore idempotent —
- * reacting twice with the same emoji leaves exactly one reaction.
+ * retry, because a reaction is a PUT/DELETE on Discord and therefore idempotent —
+ * reacting twice with the same emoji leaves exactly one reaction, and removing
+ * a reaction that is already gone succeeds silently.
  */
 export async function settleDiscordReaction(
 	gateway: Pick<GatewayClientLike, "request">,
@@ -223,7 +227,7 @@ export async function settleDiscordReaction(
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId || !message.reaction) return;
 	const deliveryId = message.deliveryId;
-	const { targetMessageId, emoji, emojiName } = message.reaction;
+	const { targetMessageId, emoji, emojiName, action = "add" } = message.reaction;
 	const conversationId = message.origin.conversationId;
 	try {
 		const channel = await discord.channels.fetch(conversationId);
@@ -240,12 +244,24 @@ export async function settleDiscordReaction(
 			throw Object.assign(new Error(`Discord message ${targetMessageId} cannot be reacted to`), { code: 10008 });
 		}
 		const spelling = resolver.resolve(channel.guild, emojiName, emoji);
-		await limiter.run(conversationId, () => target.react(spelling));
+		if (action === "remove") {
+			// Remove the reaction. Discord treats removing a non-existent reaction as idempotent success.
+			const bot = typeof discord === "object" && discord !== null && "user" in discord ? discord.user : undefined;
+			const botId = bot && typeof bot === "object" && bot !== null && "id" in bot ? String(bot.id) : undefined;
+			if (botId && target.reactions) {
+				const reaction = target.reactions.resolve(spelling);
+				if (reaction) {
+					await limiter.run(conversationId, () => reaction.users.remove(botId));
+				}
+			}
+		} else {
+			await limiter.run(conversationId, () => target.react(spelling));
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
 		// A silently dropped reaction is the failure mode to avoid: every path lands here.
-		log.error(`Discord reaction ${emojiName} on ${targetMessageId} failed: ${reason}`);
+		log.error(`Discord reaction ${action} ${emojiName} on ${targetMessageId} failed: ${reason}`);
 		await gateway.request("delivery.fail", { deliveryId, reason, ambiguous: deliveryFailureIsAmbiguous(error) });
 	}
 }

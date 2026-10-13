@@ -6,14 +6,13 @@ import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 test("event-type sessions persist until their explicit epoch is bumped", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-eventtype-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "events",
@@ -37,7 +36,7 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 			registry,
 			sessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 		});
 		pipeline.submit(monitor.monitorId, "build", {});
@@ -48,8 +47,9 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 			originKey(monitorSessionOrigin(monitor.monitorId, "build")),
 		]);
 		expect(calls.map((call) => call.epoch)).toEqual([0, 0]);
-		database.withTransaction(() =>
-			database.bumpEpoch(
+		database.transaction((tx) =>
+			database.bindings.rotateEpoch(
+				tx,
 				originKey(monitorSessionOrigin(monitor.monitorId, "build")),
 				JSON.stringify(monitorSessionOrigin(monitor.monitorId, "build")),
 			),

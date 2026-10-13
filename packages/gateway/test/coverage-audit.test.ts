@@ -3,8 +3,8 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import type { InboundTurn } from "../src/store/db";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
+import type { InboundTurn } from "../src/store/groups/inbox";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "coverage" } as const;
@@ -19,7 +19,7 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 }
 
 type Fixture = {
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly manager: PersonaSessionManager;
 	readonly port: ScriptedSessionPort;
 	readonly turns: Map<string, InboundTurn>;
@@ -36,7 +36,7 @@ async function fixture(
 	} = {},
 ): Promise<Fixture> {
 	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-coverage-audit-")));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(
 		database,
 		options.port ?? new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
@@ -70,31 +70,28 @@ async function fixture(
 	};
 }
 
-function enqueue(
-	database: GatewayDatabase,
-	messageId: string,
-	body: string,
-	receivedAt = new Date().toISOString(),
-): void {
+function enqueue(database: Store, messageId: string, body: string, receivedAt = new Date().toISOString()): void {
 	expect(
-		database.inboundEnqueue({
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		}),
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
 function assertCoverage(fixture: Fixture, messageIds: readonly string[]): void {
-	const rows = [...fixture.turns.values()].flatMap((turn) => fixture.database.inboundTurnRows(turn.opRef));
+	const rows = [...fixture.turns.values()].flatMap((turn) => fixture.database.inbox.turnRows(turn.opRef));
 	expect(rows.map((row) => row.message_id).sort()).toEqual([...messageIds].sort());
 	for (const row of rows) {
 		expect(row.turn_role === "trigger" || row.turn_role === "steer").toBe(true);
 		expect(row).toMatchObject({ state: "done", turn_state: "done", turn_op_ref: expect.any(String) });
 	}
-	expect(fixture.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+	expect(fixture.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 }
 
 test("coverage audit attributes a message arriving exactly at the settle fire boundary", async () => {
@@ -115,7 +112,7 @@ test("coverage audit attributes a message arriving exactly at the settle fire bo
 		await eventually(() => fixtureState.port.sends.length === 1, "boundary batch did not dispatch");
 		fixtureState.port.complete(fixtureState.port.sends[0]!.opRef, "done");
 		await eventually(
-			() => fixtureState.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => fixtureState.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"boundary message remained pending past settle plus grace",
 		);
 		assertCoverage(fixtureState, ["boundary-trigger", "boundary-member"]);
@@ -152,19 +149,19 @@ test("coverage audit: a refused steer waits for terminal and is sent once on the
 		expect(port.steerAttempts).toBe(1);
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
-		expect(fixtureState.database.inboundNonterminalTurns(ORIGIN_KEY)).toHaveLength(1);
-		expect(fixtureState.database.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
-		expect(fixtureState.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-failure" });
+		expect(fixtureState.database.inbox.nonterminalTurns(ORIGIN_KEY)).toHaveLength(1);
+		expect(fixtureState.database.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(fixtureState.database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-failure" });
 		port.complete(first.opRef, "first done");
 		await eventually(() => port.sends.length === 2, "refused steer was not sent after terminal");
 		const second = port.sends[1]!;
 		expect(second.text).toBe("must not disappear");
 		expect(second.sessionId).toBe(first.sessionId);
 		expect(port.binds).toHaveLength(1);
-		expect(fixtureState.database.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
+		expect(fixtureState.database.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
 		port.complete(second.opRef, "second done");
 		await eventually(
-			() => fixtureState.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => fixtureState.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"a turn remained pending after both terminals",
 		);
 		assertCoverage(fixtureState, ["steer-trigger", "steer-failure"]);
@@ -195,7 +192,7 @@ test("coverage audit preserves attribution when a broker generation changes mid-
 
 		fixtureState.port.complete(running.opRef, "restarted done");
 		await eventually(
-			() => fixtureState.database.inboundPendingCount(ORIGIN_KEY) === 0,
+			() => fixtureState.database.inbox.pendingCount(ORIGIN_KEY) === 0,
 			"post-restart message remained pending past settle plus grace",
 		);
 		assertCoverage(fixtureState, ["restart-trigger", "restart-steer"]);

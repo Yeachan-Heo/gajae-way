@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -201,39 +201,6 @@ test("map trimming never emits a partial markdown link line", async () => {
 	for (const line of map.split("\n")) if (line.includes("](")) expect(line).toMatch(/^- \[[^\]]+\]\([^)]+\)$/);
 });
 
-test("concurrent add+commit pairs on one corpus serialize instead of colliding on index.lock", async () => {
-	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-"));
-	await initializeMemory(home);
-	const root = join(home, "memory");
-	// Two writers (closure queue + autolink sweep) racing on the same repo: without
-	// per-root serialization one of them hits the other's .git/index.lock (live:
-	// 100 failures on gaebal, 2026-09-05).
-	const writers = Array.from({ length: 6 }, async (_, index) => {
-		await writeFile(join(root, `w${index}.md`), `writer ${index}\n`);
-		await memoryGit(root, ["add", "--all", "."]);
-		await memoryGit(root, ["commit", "-m", `writer ${index}`, "--allow-empty"]);
-	});
-	await Promise.all(writers);
-	const log = await memoryGit(root, ["log", "--format=%s"]);
-	for (let index = 0; index < 6; index++) expect(log).toContain(`writer ${index}`);
-});
-
-test("an orphaned index.lock older than the grace is removed once and the operation retried", async () => {
-	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-lock-"));
-	await initializeMemory(home);
-	const root = join(home, "memory");
-	const lock = join(root, ".git", "index.lock");
-	await writeFile(lock, "");
-	// Backdate well past the grace so the retry treats it as orphaned.
-	const old = new Date(Date.now() - 60_000);
-	await utimes(lock, old, old);
-	await writeFile(join(root, "note.md"), "hello\n");
-	await memoryGit(root, ["add", "--all", "."]);
-	await memoryGit(root, ["commit", "-m", "after orphaned lock"]);
-	expect(await memoryGit(root, ["log", "--format=%s", "-1"])).toBe("after orphaned lock");
-	await expect(stat(lock)).rejects.toThrow();
-}, 20_000);
-
 test("a failed git operation reports argv, exit status and stdout, never a bare `failed:` (#192)", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-reason-"));
 	await initializeMemory(home);
@@ -253,23 +220,20 @@ test("a failed git operation reports argv, exit status and stdout, never a bare 
 	expect(error?.message).toMatch(/nothing (added )?to commit/);
 });
 
-test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommit lock", async () => {
-	// Regression test: intent enqueued via closure.enqueue() triggers #process,
-	// which calls appendDaily then coordinateCommit. Meanwhile, afterWrite hook
-	// starts autolinkCorpus. Both must serialize through coordinateCommit lock.
-	// Without lock: intent's add --all picks up autolink's uncommitted changes (#341).
-	// With lock: each owns its changes, separate commits.
+test("issue #341: autolinkCorpus and closure intents serialize on the shared FIFO", async () => {
+	// The autolink write joins the same queue as intent append, map generation and commit.
+	// The intent commit must not absorb edits that autolink has not yet committed.
 	home = await mkdtemp(join(tmpdir(), "issue-341-"));
 	const root = await initializeMemory(home);
 	const { MemoryClosureQueue } = await import("../src/memory/closure");
 	const { autolinkCorpus } = await import("../src/memory/autolink");
-	const { GatewayDatabase } = await import("../src/store/db");
+	const { Store } = await import("../src/store");
 
 	const intentText = "Captured text";
 	let autoPromise: Promise<unknown> | undefined;
 
 	// Create closure with afterWrite hook that triggers autolinkCorpus
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const closure = new MemoryClosureQueue(database, home, {
 		afterWrite: async () => {
 			// Start autolink after appendDaily, before intent's commit (potential #341 race)
@@ -287,7 +251,7 @@ test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommi
 	await memoryGit(root, ["commit", "-m", "setup"]);
 
 	// Enqueue real daily_capture intent through the actual API
-	closure.enqueue({
+	const intentId = closure.enqueue({
 		kind: "daily_capture",
 		originRefJson: JSON.stringify({ platform: "test", kind: "test" }),
 		userText: intentText,
@@ -297,22 +261,17 @@ test("issue #341: autolinkCorpus + closure.enqueue serialize via coordinateCommi
 	// Process queue and wait for autolink
 	await closure.drain();
 	if (autoPromise) await autoPromise;
+
+	const intentState = database.memory.get(intentId)?.state;
 	database.close();
-
-	// Read receipts to find the intent's commit
-	const receiptsFile = join(home, "memory-receipts.jsonl");
-	const receiptsContent = await readFile(receiptsFile, "utf8");
-	const receipts = receiptsContent
+	expect(intentState).toBe("receipted");
+	const intentCommit = (await memoryGit(root, ["log", "--format=%H", "--grep", `Gajaeway-Mutation-Id: ${intentId}`]))
 		.split("\n")
-		.filter(Boolean)
-		.map((line) => JSON.parse(line) as { id: string; commit: string; state: string });
+		.find(Boolean);
+	if (!intentCommit) throw new Error(`missing commit for memory intent ${intentId}`);
 
-	expect(receipts.length).toBeGreaterThan(0);
-	const intentReceipt = receipts[receipts.length - 1];
-	expect(intentReceipt.commit).toBeDefined();
-
-	// Verify: intent's commit contains the appended text
-	const show = await memoryGit(root, ["show", intentReceipt.commit]);
+	// Verify: the DB settlement is backed by the commit carrying its mutation ID.
+	const show = await memoryGit(root, ["show", intentCommit]);
 	expect(show).toContain(intentText);
 
 	// CRITICAL #341 FIX: intent commit must NOT contain autolink's link edits

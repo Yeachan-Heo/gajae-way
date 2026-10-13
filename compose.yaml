@@ -1,0 +1,161 @@
+# Docker Compose configuration for gajae-way runtime
+# Usage: docker compose up (gjc is built-in; optionally mount host credentials)
+
+services:
+  gajaeway-gateway:
+    build: .
+    container_name: gajaeway-gateway
+    environment:
+      GAJAEWAY_HOME: /home/gajaeway/.gajaeway
+      HOME: /home/gajaeway
+      GJC_EXECUTABLE: /usr/local/bin/gjc
+      GJC_CODING_AGENT_DIR: /home/gajaeway/.gjc
+    volumes:
+      # Persistent home directory with all state, config, memory, and database
+      - gajaeway_home:/home/gajaeway/.gajaeway
+      # (Optional) Mount host's gjc credentials/models for model access
+      # This allows reusing your host's configured providers (Claude, etc.)
+      # Uncomment one of these:
+      # - ${GJC_AGENT_DIR:-~/.gjc}:/home/gajaeway/.gjc:ro
+      # or just credentials:
+      # - ${GJC_CREDENTIALS_PATH:-~/.gjc/credentials}:/home/gajaeway/.gjc/credentials:ro
+    ports:
+      # Gateway socket is local-only (Unix domain socket), not exposed to Docker bridge
+      # Use 'docker compose exec' or volume mount for client connections
+      - "127.0.0.1::9000"  # placeholder; actual socket is at ~/.gajaeway/gateway.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "gajaeway", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Adapter services (only enabled ones start; see .env.example or setup output)
+  gajaeway-discord:
+    build: .
+    container_name: gajaeway-discord
+    environment:
+      GAJAEWAY_HOME: /home/gajaeway/.gajaeway
+      HOME: /home/gajaeway
+      GJC_EXECUTABLE: /usr/local/bin/gjc
+      GJC_CODING_AGENT_DIR: /home/gajaeway/.gjc
+    volumes:
+      - gajaeway_home:/home/gajaeway/.gajaeway
+      # (Optional) Mount host's gjc credentials/models
+      # - ${GJC_AGENT_DIR:-~/.gjc}:/home/gajaeway/.gjc:ro
+    restart: unless-stopped
+    depends_on:
+      gajaeway-gateway:
+        condition: service_healthy
+    command: ["gajaeway-discord"]
+    profiles:
+      - discord
+
+  gajaeway-slack:
+    build: .
+    container_name: gajaeway-slack
+    environment:
+      GAJAEWAY_HOME: /home/gajaeway/.gajaeway
+      HOME: /home/gajaeway
+      GJC_EXECUTABLE: /usr/local/bin/gjc
+      GJC_CODING_AGENT_DIR: /home/gajaeway/.gjc
+    volumes:
+      - gajaeway_home:/home/gajaeway/.gajaeway
+      # (Optional) Mount host's gjc credentials/models
+      # - ${GJC_AGENT_DIR:-~/.gjc}:/home/gajaeway/.gjc:ro
+    restart: unless-stopped
+    depends_on:
+      gajaeway-gateway:
+        condition: service_healthy
+    command: ["gajaeway-slack"]
+    profiles:
+      - slack
+
+  gajaeway-telegram:
+    build: .
+    container_name: gajaeway-telegram
+    environment:
+      GAJAEWAY_HOME: /home/gajaeway/.gajaeway
+      HOME: /home/gajaeway
+      GJC_EXECUTABLE: /usr/local/bin/gjc
+      GJC_CODING_AGENT_DIR: /home/gajaeway/.gjc
+    volumes:
+      - gajaeway_home:/home/gajaeway/.gajaeway
+      # (Optional) Mount host's gjc credentials/models
+      # - ${GJC_AGENT_DIR:-~/.gjc}:/home/gajaeway/.gjc:ro
+    restart: unless-stopped
+    depends_on:
+      gajaeway-gateway:
+        condition: service_healthy
+    command: ["gajaeway-telegram"]
+    profiles:
+      - telegram
+
+  # Setup helper: runs one-time setup if config doesn't exist
+  setup-check:
+    build: .
+    container_name: gajaeway-setup
+    environment:
+      GAJAEWAY_HOME: /home/gajaeway/.gajaeway
+      HOME: /home/gajaeway
+    volumes:
+      - gajaeway_home:/home/gajaeway/.gajaeway
+    stdin_open: true
+    tty: true
+    # This runs setup if no config exists; otherwise just exits
+    entrypoint: sh
+    command:
+      - -c
+      - |
+        if [ ! -f $$GAJAEWAY_HOME/config.json ]; then
+          echo "Welcome to gajae-way!"
+          echo "Running first-time setup..."
+          gajaeway setup
+        else
+          echo "Configuration found. Skipping setup."
+        fi
+    profiles:
+      - setup
+
+volumes:
+  gajaeway_home:
+    name: gajaeway_home
+    driver: local
+
+# Usage:
+#
+# First run (interactive setup):
+#   docker compose run --rm -it setup gajaeway setup
+#
+# Or with environment file:
+#   docker compose run --rm -it --env-file .env.gajaeway setup gajaeway setup
+#
+# Or interactively (no env vars needed):
+#   docker compose run --rm -it setup gajaeway setup
+#
+# Start gateway and enabled adapters:
+#   docker compose up
+#
+# Start with host's gjc credentials (optional):
+#   GJC_AGENT_DIR=~/.gjc docker compose up
+#
+# List configured adapters:
+#   docker compose exec gajaeway-gateway gajaeway setup --status
+#
+# Test gjc is available:
+#   docker compose exec gajaeway-gateway gjc --version
+#
+# Access the shell inside gateway container:
+#   docker compose exec gajaeway-gateway sh
+#
+# View logs:
+#   docker compose logs -f gajaeway-gateway
+#
+# Restart just the Discord adapter:
+#   docker compose restart gajaeway-discord
+#
+# Start with specific adapter(s) only:
+#   docker compose --profile discord up    # just Discord
+#   docker compose --profile slack up      # just Slack
+#   docker compose --profile discord,slack up  # Discord + Slack

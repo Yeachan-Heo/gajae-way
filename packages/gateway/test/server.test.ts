@@ -3,15 +3,15 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
-import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { originKey, WORK_JOBS_DEFAULT_LIMIT, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
+import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import { memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
-import { ACK_TIMEOUT_MS, DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -84,6 +84,7 @@ async function startDeliveryServer(
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -91,7 +92,7 @@ async function startDeliveryServer(
 		dmPolicy: "open",
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => "the single reply body",
@@ -117,6 +118,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -124,7 +126,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => "mock reply",
@@ -214,7 +216,7 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 		params: { deliveryId, reason: "platform_rejected", ambiguous: false },
 	});
 	await waitFrame(client.frames, "first-fail");
-	expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
+	expect(database.outbox.rows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
 		state: "pending",
 		attempts: 1,
 		last_error: "other",
@@ -268,7 +270,7 @@ test("inflight rows are not re-broadcast by the timed sweep within ack timeout",
 	const deliveryId = initial.payload.deliveryId as string;
 
 	// Manually mark the delivery as inflight (simulating an in-flight state)
-	const ledger = new DeliveryLedger(database);
+	const ledger = new DeliveryService(database);
 	ledger.markInflight(deliveryId);
 	const row = ledger.get(deliveryId);
 	const updatedAt = Date.parse(row!.updatedAt);
@@ -334,7 +336,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 			});
 			await waitFrame(client.frames, id);
 		}
-		expect(database.deliveryRows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
+		expect(database.outbox.rows().find((row) => row.delivery_id === deliveryId)).toMatchObject({
 			state: "expired",
 			attempts: 5,
 		});
@@ -374,7 +376,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 			});
 			await waitFrame(client.frames, id);
 		}
-		expect(database.deliveryRows().find((row) => row.delivery_id === noticeId)?.state).toBe("expired");
+		expect(database.outbox.rows().find((row) => row.delivery_id === noticeId)?.state).toBe("expired");
 		expect(
 			client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId?.startsWith("gw-x-")),
 		).toHaveLength(1);
@@ -396,18 +398,20 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 	});
 	const batchId = crypto.randomUUID();
 	const eventId = crypto.randomUUID();
-	database.monitorEventCreate({
-		eventId,
-		monitorId: monitor.monitorId,
-		eventType: "memory.canonicalize",
-		payloadJson: "{}",
-		firedAt: new Date().toISOString(),
+	database.transaction((tx) => {
+		database.monitors.eventCreate(tx, {
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "memory.canonicalize",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+		database.monitors.eventUpdate(tx, eventId, "authored", batchId);
+		database.monitors.authoredOutputCreate(tx, eventId, "report");
 	});
-	database.monitorEventUpdate(eventId, "authored", batchId);
-	database.authoredOutputCreate(eventId, "report");
 	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
 	const deliveryId = "monitor-delivery";
-	new DeliveryLedger(database).createPending({
+	new DeliveryService(database).createPending({
 		deliveryId,
 		turnId: batchId,
 		originKey: originKey(origin),
@@ -431,13 +435,13 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 		});
 		await waitFrame(client.frames, id);
 	}
-	const eventStage = () => database.monitorEventRows().find((row) => row.event_id === eventId)?.stage;
+	const eventStage = () => database.monitors.eventRows().find((row) => row.event_id === eventId)?.stage;
 	expect(eventStage()).toBe("failed_no_retry");
-	expect(database.monitorFailure(eventId)).toMatchObject({
+	expect(database.monitors.failure(eventId)).toMatchObject({
 		code: "delivery_expired",
 		detail: `delivery ${deliveryId} expired after 5 attempts: discord_503`,
 	});
-	expect(database.authoredOutput(eventId)).toBe("report");
+	expect(database.monitors.authoredOutput(eventId)).toBe("report");
 
 	client.send({ v: "0.1", type: "request", id: "redrive", verb: "ops.redeliver", params: { deliveryId } });
 	await waitFrame(client.frames, "redrive");
@@ -456,19 +460,20 @@ test("the sweep expires a stale unsettled row and alerts once even with no adapt
 		const config: GatewayConfig = {
 			schemaVersion: 1,
 			home: directory,
+			gjc: { agentDir: join(directory, "agent") },
 			configPath: join(directory, "config.json"),
 			socketPath: join(directory, "gateway.sock"),
 			dbPath: join(directory, "gateway.db"),
 			logVerbosity: "info",
 			dmPolicy: "open",
 		};
-		const database = await GatewayDatabase.open(config.dbPath);
+		const database = await Store.open(config.dbPath);
 		const sessionPort = sessionPortFromResponder({
 			bind: (key, epoch) => bindWorkFixture(key, epoch),
 			respond: async () => "unused",
 		});
 		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
-		const ledger = new DeliveryLedger(database);
+		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "orphan", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.fail("orphan", false, "socket hang up");
 		ledger.fail("orphan", false, "socket hang up");
@@ -502,7 +507,7 @@ test("the sweep expires a stale unsettled row and alerts once even with no adapt
 
 test("ops.redeliver requeues expired rows by id or since and immediately publishes them", async () => {
 	const { client, database } = await startDeliveryServer();
-	const ledger = new DeliveryLedger(database);
+	const ledger = new DeliveryService(database);
 	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
 	const createExpired = (deliveryId: string) => {
 		ledger.createPending({
@@ -587,6 +592,7 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -595,7 +601,7 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 		mentionAllowlist: ["allowed"],
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -621,8 +627,8 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 	await waitFor(client.frames, 3);
 	expect(client.frames.filter((frame) => frame.type === "response" && frame.result?.engaged === false)).toHaveLength(2);
 	expect(sessionPort.binds).toEqual([]);
-	expect(database.getSessionRecord("discord/dm/private/peer=intruder")).toBeUndefined();
-	expect(database.conversationModelGet("discord/dm/private/peer=intruder")).toBeUndefined();
+	expect(database.bindings.getSessionRecord("discord/dm/private/peer=intruder")).toBeUndefined();
+	expect(database.bindings.modelGet("discord/dm/private/peer=intruder")).toBeUndefined();
 	client.close();
 });
 
@@ -631,6 +637,7 @@ test("a mention-less /new inside an engaged thread is authorised", async () => {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -638,7 +645,7 @@ test("a mention-less /new inside an engaged thread is authorised", async () => {
 		dmPolicy: "open" as const,
 		channels: { "slack:C1": { engagement: "mention-open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	const origin = {
@@ -648,21 +655,25 @@ test("a mention-less /new inside an engaged thread is authorised", async () => {
 		parentId: "C1",
 	};
 	const originKey = "slack/thread/C1:1700000000.000100/parent=C1";
-	database.inboundEnqueue({
-		messageId: "thread-opening",
-		originKey,
-		originRefJson: JSON.stringify(origin),
-		body: "@persona start",
-	});
-	database.inboundBindTurn({
-		messageId: "thread-opening",
-		originKey,
-		epoch: 0,
-		opRef: "thread-opening-op",
-		sessionId: "thread-opening-session",
-	});
-	database.inboundTurnAccept("thread-opening-op");
-	expect(database.inboundTurnComplete("thread-opening-op")).toBe(1);
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "thread-opening",
+			originKey,
+			originRefJson: JSON.stringify(origin),
+			body: "@persona start",
+		}),
+	);
+	database.transaction((tx) =>
+		database.inbox.bindTurn(tx, {
+			messageId: "thread-opening",
+			originKey,
+			epoch: 0,
+			opRef: "thread-opening-op",
+			sessionId: "thread-opening-session",
+		}),
+	);
+	database.transaction((tx) => database.inbox.turnAccept(tx, "thread-opening-op"));
+	expect(database.transaction((tx) => database.inbox.turnComplete(tx, "thread-opening-op"))).toBe(1);
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -691,6 +702,7 @@ test("a mention-less /new at the channel root remains refused", async () => {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -702,7 +714,7 @@ test("a mention-less /new at the channel root remains refused", async () => {
 			"slack:C2": { engagement: "closed" },
 		},
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -726,7 +738,7 @@ test("a mention-less /new at the channel root remains refused", async () => {
 		type: "response",
 		result: { turnId: null, engaged: false },
 	});
-	expect(database.getSessionRecord("slack/channel/C1")).toBeUndefined();
+	expect(database.bindings.getSessionRecord("slack/channel/C1")).toBeUndefined();
 	const closedOrigin = { platform: "slack" as const, kind: "channel" as const, conversationId: "C2" };
 	client.send({
 		v: "0.1",
@@ -744,7 +756,7 @@ test("a mention-less /new at the channel root remains refused", async () => {
 		type: "response",
 		result: { turnId: null, engaged: false },
 	});
-	expect(database.getSessionRecord("slack/channel/C2")).toBeUndefined();
+	expect(database.bindings.getSessionRecord("slack/channel/C2")).toBeUndefined();
 	client.close();
 });
 
@@ -753,6 +765,7 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -760,7 +773,7 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
 		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.fail(input.opRef, "session operation stalled without terminal evidence"),
@@ -796,6 +809,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -803,7 +817,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, _text, _preamble, onProgress) => {
@@ -860,6 +874,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -873,7 +888,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 			join(root, `orphan-${index.toString().padStart(4, "0")}.md`),
 			`orphan ${index} ${"x".repeat(80)}\n`,
 		);
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, _text, _preamble, onProgress) => {
@@ -935,6 +950,7 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -945,7 +961,7 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	let release!: () => void;
 	const turnEntered = new Promise<void>((resolve) => (entered = resolve));
 	const turnRelease = new Promise<void>((resolve) => (release = resolve));
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => {
@@ -997,6 +1013,7 @@ test("unengaged messages before a mention arrive as the unread diff with speaker
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1005,7 +1022,7 @@ test("unengaged messages before a mention arrive as the unread diff with speaker
 		dmPolicy: "open" as const,
 		channels: { c1: { engagement: "mention-open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
@@ -1058,13 +1075,14 @@ test("a DM burst is never coalesced: the first fragment is the turn and the rest
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	let release!: () => void;
 	const running = new Promise<void>((resolve) => {
@@ -1121,6 +1139,7 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1128,7 +1147,7 @@ test("an open-channel burst from several authors: the first is the turn, later o
 		dmPolicy: "open" as const,
 		channels: { c1: { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	let release!: () => void;
 	let running = new Promise<void>((resolve) => {
@@ -1173,7 +1192,7 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	} finally {
 		release();
 	}
-	for (let attempt = 0; attempt < 400 && database.inboundPendingCount("discord/channel/c1") > 0; attempt++)
+	for (let attempt = 0; attempt < 400 && database.inbox.pendingCount("discord/channel/c1") > 0; attempt++)
 		await Bun.sleep(5);
 	// The steered messages were read inside turn 1: the next turn must not get
 	// them again as "unread".
@@ -1192,13 +1211,14 @@ test("an inbound ledger write failure fails the mention closed and logs a drop n
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { townhall: { engagement: "mention-open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
@@ -1208,7 +1228,7 @@ test("an inbound ledger write failure fails the mention closed and logs a drop n
 		},
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
-	database.inboundEnqueue = () => {
+	database.inbox.enqueue = () => {
 		throw new Error("database is locked");
 	};
 	const origin = { platform: "discord", kind: "channel", conversationId: "townhall" };
@@ -1252,13 +1272,14 @@ test("a backlog left pending across an outage is answered on boot, never expired
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
@@ -1275,13 +1296,15 @@ test("a backlog left pending across an outage is answered on boot, never expired
 	// never seen by the model, so it must reach the session now (live: four DMs
 	// were deleted behind an 85-minute wedge by the old 10-minute floor).
 	expect(
-		database.inboundEnqueue({
-			messageId: "stale-1",
-			originKey: key,
-			originRefJson: JSON.stringify(origin),
-			body: "from before the outage",
-			receivedAt: old,
-		}),
+		database.transaction((tx) =>
+			database.inbox.enqueue(tx, {
+				messageId: "stale-1",
+				originKey: key,
+				originRefJson: JSON.stringify(origin),
+				body: "from before the outage",
+				receivedAt: old,
+			}),
+		),
 	).toBe(true);
 	const logs: string[] = [];
 	const original = console.error;
@@ -1308,7 +1331,7 @@ test("a backlog left pending across an outage is answered on boot, never expired
 			expect.stringContaining("fresh after the outage"),
 		]);
 		expect(logs.some((line) => line.includes("inbound_expired"))).toBe(false);
-		expect(database.inboundPendingCount(key)).toBe(0);
+		expect(database.inbox.pendingCount(key)).toBe(0);
 		client.close();
 	} finally {
 		console.error = original;
@@ -1320,6 +1343,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1327,7 +1351,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 		dmPolicy: "open" as const,
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => "unused",
@@ -1383,6 +1407,7 @@ test("group turns name the [SILENT] mechanism but never rule on whether the pers
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1391,7 +1416,7 @@ test("group turns name the [SILENT] mechanism but never rule on whether the pers
 		dmPolicy: "open" as const,
 		channels: { c1: { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
@@ -1435,6 +1460,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1442,7 +1468,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
@@ -1481,6 +1507,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1488,7 +1515,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
 		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
@@ -1526,6 +1553,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1533,7 +1561,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => "worker result",
@@ -1571,7 +1599,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(jobs.result.jobs[0].checkpoints).toBe(0);
 
 	// The stored authority carries the closed attempt; the record is restart-safe.
-	const raw = database.laneJobJson(jobId);
+	const raw = database.work.laneJobJson(jobId);
 	expect(typeof raw).toBe("string");
 	const parsed = parseLaneJobRecord(raw as string);
 	expect(parsed.attempts).toHaveLength(1);
@@ -1581,16 +1609,21 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 
 	// Reopening a settled tombstone by editing history is corruption, not a
 	// crash predecessor. Neither an ordinary request nor resume may repair it.
-	database.putLaneJob({
-		jobId: parsed.jobId,
-		laneKey: "work-Repo.Fix-2",
-		state: "running",
-		createdAt: parsed.createdAt,
-		updatedAt: new Date().toISOString(),
-		lane: parsed.lane,
-		json: JSON.stringify({ ...parsed, attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }] }),
-	});
-	const damaged = database.laneJobJson(jobId);
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: parsed.jobId,
+			laneKey: "work-Repo.Fix-2",
+			state: "running",
+			createdAt: parsed.createdAt,
+			updatedAt: new Date().toISOString(),
+			lane: parsed.lane,
+			json: JSON.stringify({
+				...parsed,
+				attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }],
+			}),
+		}),
+	);
+	const damaged = database.work.laneJobJson(jobId);
 	for (const resume of [false, true]) {
 		const id = `corrupt-${resume}`;
 		client.send({
@@ -1606,8 +1639,79 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 			error: { code: "verb_failed", detail: { reasonCode: "lane_state_corrupt", name: "Repo.Fix-2" } },
 		});
 	}
-	expect(database.laneJobJson(jobId)).toBe(damaged);
+	expect(database.work.laneJobJson(jobId)).toBe(damaged);
 	expect(sessionPort.sends).toHaveLength(1);
+	client.close();
+});
+
+test("work.jobs pages newest-first so a home with many jobs stays under the frame cap", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await Store.open(config.dbPath);
+	// Each projected job is ~700 bytes, so 1600 of them exceed the 1 MiB frame unpaged.
+	const total = 1600;
+	database.transaction((tx) => {
+		for (let index = 0; index < total; index++) {
+			// Pairs share updated_at, so only the job_id tiebreak keeps pages disjoint.
+			const at = new Date(Date.UTC(2026, 0, 1) + (index >> 1) * 1000);
+			const record = createLaneJobRecord({
+				jobId: `lanejob-${index.toString(16).padStart(4, "0")}`,
+				branch: "main",
+				worktreePath: join(directory, "missing-worktree"),
+				now: () => at,
+			});
+			database.work.putLaneJob(tx, { ...record, laneKey: `work-job${index}`, json: JSON.stringify(record) });
+		}
+	});
+	const sessionPort = sessionPortFromResponder({
+		bind: async () => ({ sessionId: "unused" }),
+		respond: async () => "",
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const request = async (id: string, params?: unknown) => {
+		client.send({ v: "0.1", type: "request", id, verb: "work.jobs", ...(params === undefined ? {} : { params }) });
+		await waitFor(client.frames, client.frames.length + 1);
+		return client.frames.find((frame) => frame.id === id);
+	};
+
+	const first = await request("default");
+	expect(first.type).toBe("response");
+	expect(first.result.total).toBe(total);
+	expect(first.result.offset).toBe(0);
+	expect(first.result.jobs).toHaveLength(WORK_JOBS_DEFAULT_LIMIT);
+	expect(first.result.jobs[0].lane_key).toBe(`work-job${total - 1}`);
+
+	const tail = await request("tail", { limit: WORK_JOBS_MAX_LIMIT, offset: total - 2 });
+	expect(tail.result.jobs.map((job: { lane_key: string }) => job.lane_key)).toEqual(["work-job1", "work-job0"]);
+	expect(tail.result.offset).toBe(total - 2);
+	const seen = new Set<string>();
+	for (let offset = 0; offset < total; offset += WORK_JOBS_MAX_LIMIT) {
+		const page = await request(`page-${offset}`, { limit: WORK_JOBS_MAX_LIMIT, offset });
+		for (const job of page.result.jobs) seen.add(job.job_id);
+	}
+	expect(seen.size).toBe(total);
+
+	for (const [id, params] of [
+		["zero", { limit: 0 }],
+		["over", { limit: WORK_JOBS_MAX_LIMIT + 1 }],
+		["negative", { offset: -1 }],
+		["fraction", { limit: 1.5 }],
+	] as const) {
+		const refused = await request(id, params);
+		expect(refused.type).toBe("error");
+		expect(refused.error.code).toBe("invalid_params");
+	}
 	client.close();
 });
 
@@ -1636,13 +1740,14 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	let committed = false;
 	const sessionPort = sessionPortFromResponder({
 		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch) }),
@@ -1682,7 +1787,7 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	await waitFrame(client.frames, "jobs");
 	const jobs = client.frames.find((frame) => frame.id === "jobs").result.jobs;
 	const row = jobs.find((job: { lane_key: string }) => job.lane_key === "work-row");
-	const record = parseLaneJobRecord(database.laneJobJson(row.job_id) as string);
+	const record = parseLaneJobRecord(database.work.laneJobJson(row.job_id) as string);
 	expect(row.accepted_at).toBe(record.createdAt);
 	expect(row.attempt).toEqual({
 		op_ref: run.result.opRef,
@@ -1705,6 +1810,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1712,7 +1818,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	let turns = 0;
 	const sessionPort = sessionPortFromResponder({
 		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
@@ -1731,17 +1837,19 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
 	// Simulate the reconciliation outcome after repeated stalled continuations.
 	const first = parseLaneJobRecord(
-		database.laneJobJson(`lanejob-${Buffer.from("stall-out", "utf8").toString("hex")}`) as string,
+		database.work.laneJobJson(`lanejob-${Buffer.from("stall-out", "utf8").toString("hex")}`) as string,
 	);
-	database.putLaneJob({
-		jobId: first.jobId,
-		laneKey: `work-stall-out`,
-		state: "stalled",
-		createdAt: first.createdAt,
-		updatedAt: new Date().toISOString(),
-		lane: first.lane,
-		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
-	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: first.jobId,
+			laneKey: `work-stall-out`,
+			state: "stalled",
+			createdAt: first.createdAt,
+			updatedAt: new Date().toISOString(),
+			lane: first.lane,
+			json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+		}),
+	);
 	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
 	async function waitId2(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
@@ -1772,6 +1880,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -1779,7 +1888,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	let turns = 0;
 	const sessionPort = sessionPortFromResponder({
 		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
@@ -1804,16 +1913,18 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	await waitId3("w1");
 
 	// Force the stalled hold, as reconciliation would after repeat stalls.
-	const first = parseLaneJobRecord(database.laneJobJson(jobId) as string);
-	database.putLaneJob({
-		jobId: first.jobId,
-		laneKey: "work-stall-clear",
-		state: "stalled",
-		createdAt: first.createdAt,
-		updatedAt: new Date().toISOString(),
-		lane: first.lane,
-		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
-	});
+	const first = parseLaneJobRecord(database.work.laneJobJson(jobId) as string);
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			jobId: first.jobId,
+			laneKey: "work-stall-clear",
+			state: "stalled",
+			createdAt: first.createdAt,
+			updatedAt: new Date().toISOString(),
+			lane: first.lane,
+			json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+		}),
+	);
 
 	// Ordinary call: held.
 	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
@@ -1837,7 +1948,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 		held: false,
 		text: "worker result",
 	});
-	const afterResume = parseLaneJobRecord(database.laneJobJson(jobId) as string);
+	const afterResume = parseLaneJobRecord(database.work.laneJobJson(jobId) as string);
 	expect(afterResume.stalledContinuations).toBe(0);
 	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
 
@@ -1856,12 +1967,13 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
 		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "model result"),
@@ -1910,13 +2022,14 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		work: { maxLanes: 1 },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
 		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
@@ -1936,7 +2049,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	await waitFor(client.frames, 2);
 	const first = client.frames.find((frame) => frame.id === "first");
 	expect(first).toMatchObject({ type: "response", result: { held: false, sessionKey: "work/task/a" } });
-	const sessionId = database.getSessionRecord("work/task/a")!.sessionId;
+	const sessionId = database.bindings.getSessionRecord("work/task/a")!.sessionId;
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -1981,7 +2094,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 		result: { retired: true, sessionKey: "work/task/a", sessionId, closed: true },
 	});
 	expect(sessionPort.closes).toEqual([{ sessionId, repo: directory }]);
-	expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: 1 });
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -2003,12 +2116,13 @@ test("responses larger than one socket buffer arrive intact (backpressure outbox
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	// A ~700KB reply forces multiple kernel-buffer writes on the unix socket.
 	const bigReply = `big:${"x".repeat(700_000)}:end`;
 	const sessionPort = sessionPortFromResponder({
@@ -2042,13 +2156,14 @@ test("every turn preamble carries the attachment-scope rule", async () => {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
@@ -2083,13 +2198,14 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
@@ -2101,23 +2217,27 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	const key = "discord/dm/d-hist/peer=owner";
 	for (let i = 1; i <= 3; i++)
-		database.contextRecord({
-			messageId: `old-${i}`,
+		database.transaction((tx) =>
+			database.inbox.contextRecord(tx, {
+				messageId: `old-${i}`,
+				originKey: key,
+				authorId: "owner",
+				authorName: "bellman",
+				body: `earlier message ${i}`,
+				receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString(),
+			}),
+		);
+	database.transaction((tx) =>
+		database.inbox.contextRecord(tx, {
+			messageId: "old-img",
 			originKey: key,
 			authorId: "owner",
 			authorName: "bellman",
-			body: `earlier message ${i}`,
-			receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString(),
-		});
-	database.contextRecord({
-		messageId: "old-img",
-		originKey: key,
-		authorId: "owner",
-		authorName: "bellman",
-		body: "[image · shot.png · 20.1 KB · https://cdn.discordapp.com/attachments/1/2/shot.png]",
-		receivedAt: new Date(Date.now() - 30_000).toISOString(),
-	});
-	database.contextCommitWindow(key, ["old-1", "old-2", "old-3", "old-img"], 0);
+			body: "[image · shot.png · 20.1 KB · https://cdn.discordapp.com/attachments/1/2/shot.png]",
+			receivedAt: new Date(Date.now() - 30_000).toISOString(),
+		}),
+	);
+	database.transaction((tx) => database.inbox.contextCommitWindow(tx, key, ["old-1", "old-2", "old-3", "old-img"], 0));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -2155,6 +2275,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -2162,7 +2283,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 		dmPolicy: "open" as const,
 		channels: { c1: { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const replies = [
 		"Pure geopolitics chat, not addressed to me, nothing to add.\n\n[SILENT]",
 		"This is a real bug report.\n\n[REPLY:1544704223634260038] 알겠고 인정",
@@ -2206,6 +2327,7 @@ async function workSocketFixture() {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -2213,7 +2335,7 @@ async function workSocketFixture() {
 		work: { maxLanes: 2 },
 		ownerTarget: { origin: target },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	let openAtShutdown = -1;
@@ -2222,7 +2344,7 @@ async function workSocketFixture() {
 		database,
 		sessionPort: port,
 		onStop: () => {
-			openAtShutdown = database.workAttemptOpen().length;
+			openAtShutdown = database.work.workAttemptOpen().length;
 			database.close();
 		},
 	});
@@ -2252,7 +2374,7 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 	await waitFrame(f.client.frames, "start");
 	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
 	expect(receipt.started).toBe(true);
-	expect(f.database.workAttemptGet(receipt.opRef)?.settledAt).toBeNull();
+	expect(f.database.work.workAttemptGet(receipt.opRef)?.settledAt).toBeNull();
 	f.client.send({ v: "0.1", type: "request", id: "status", verb: "work.status", params: { name: "a" } });
 	f.client.send({
 		v: "0.1",
@@ -2316,8 +2438,8 @@ test("one socket disconnect leaves its work observable while another run waits i
 	for (const send of f.port.sends) f.port.complete(send.opRef, "continued");
 	await waitFrame(second.frames, "run-b");
 	expect(second.frames.find((frame) => frame.id === "run-b").result.text).toBe("continued");
-	for (let i = 0; i < 600 && f.database.workAttemptOpen().length; i++) await Bun.sleep(5);
-	expect(f.database.workAttemptOpen()).toHaveLength(0);
+	for (let i = 0; i < 600 && f.database.work.workAttemptOpen().length; i++) await Bun.sleep(5);
+	expect(f.database.work.workAttemptOpen()).toHaveLength(0);
 	expect(second.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
 	second.close();
 });
@@ -2353,11 +2475,11 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 	const code = `
 		import { join } from "node:path";
 		import { startStdioServer } from "./packages/gateway/src/server/server.ts";
-		import { GatewayDatabase } from "./packages/gateway/src/store/db.ts";
+		import { Store } from "./packages/gateway/src/store/index.ts";
 		import { attachTestBrokerOwnership, ScriptedSessionPort } from "./packages/gateway/test/session-port.fake.ts";
 		const home = process.env.WORK_TEST_HOME;
-		const config = { schemaVersion: 1, home, configPath: join(home, "config.json"), socketPath: join(home, "gateway.sock"), dbPath: join(home, "gateway.db"), logVerbosity: "info" };
-		const database = await GatewayDatabase.open(config.dbPath);
+		const config = { schemaVersion: 1, home, configPath: join(home, "config.json"), socketPath: join(home, "gateway.sock"), dbPath: join(home, "gateway.db"), logVerbosity: "info", gjc: { agentDir: join(home, "agent") } };
+		const database = await Store.open(config.dbPath);
 		const sessionIds = new Map();
 		const port = new ScriptedSessionPort({ onBind: (input) => {
 			const key = input.originKey + "#" + input.epoch;
@@ -2429,11 +2551,11 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 			type: "error",
 			error: { code: "gateway_shutting_down" },
 		});
-		const reopened = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const reopened = await Store.open(join(directory, "gateway.db"));
 		try {
-			expect(reopened.workAttemptOpen()).toHaveLength(1);
+			expect(reopened.work.workAttemptOpen()).toHaveLength(1);
 			expect(
-				parseLaneJobRecord(reopened.laneJobJson(reopened.workAttemptOpen()[0]!.jobId)!).attempts[0]?.endedAt,
+				parseLaneJobRecord(reopened.work.laneJobJson(reopened.work.workAttemptOpen()[0]!.jobId)!).attempts[0]?.endedAt,
 			).toBeUndefined();
 		} finally {
 			reopened.close();
@@ -2457,10 +2579,10 @@ for (const verb of ["work.start", "work.run"] as const) {
 		for (const phase of ["open", "settled"] as const) {
 			if (phase === "settled") {
 				f.port.complete(opRef, "identity retained");
-				for (let i = 0; i < 600 && f.database.workAttemptGet(opRef)?.settledAt === null; i++) await Bun.sleep(5);
-				expect(f.database.workAttemptGet(opRef)?.settledAt).not.toBeNull();
+				for (let i = 0; i < 600 && f.database.work.workAttemptGet(opRef)?.settledAt === null; i++) await Bun.sleep(5);
+				expect(f.database.work.workAttemptGet(opRef)?.settledAt).not.toBeNull();
 				await waitFrame(f.client.frames, "worker");
-			} else expect(f.database.workAttemptGet(opRef)?.settledAt).toBeNull();
+			} else expect(f.database.work.workAttemptGet(opRef)?.settledAt).toBeNull();
 			const id = `sessions-${phase}`;
 			f.client.send({ v: "0.1", type: "request", id, verb: "session.list" });
 			await waitFrame(f.client.frames, id);
@@ -2478,12 +2600,13 @@ test("status reports each connected client's generation and flags an adapter old
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => "mock reply",

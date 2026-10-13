@@ -4,10 +4,11 @@ import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { isTerminalStatus } from "@gajae-gateway/subsession";
-import { GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
+import { GJC_ATTACH_ONLY_ENV, GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
 import { BrokerSessionPort, SessionTerminalError } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
+import { superviseLiveBroker } from "./live-broker";
 
 const liveTest = process.env.GAJAEWAY_E2E_GJC === "1" ? test : test.skip;
 
@@ -96,11 +97,13 @@ liveTest(
 		await mkdir(repo, { mode: 0o700 });
 		const initialized = Bun.spawn(["git", "init", "--quiet", repo], { stdout: "ignore", stderr: "pipe" });
 		expect(await initialized.exited).toBe(0);
-		const database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const database = await Store.open(join(home, "gateway.db"));
 		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000 });
 		const canonicalAgentDir = await realpath(agentDir);
 		const brokerAuthority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-		database.assertBrokerAuthority(brokerAuthority, { initializeEmpty: true });
+		database.transaction((tx) =>
+			database.bindings.initializeAuthority(tx, brokerAuthority, database.inspectBrokerAuthority().populated),
+		);
 		const beforeConfig = await configSnapshot(agentDir);
 		const failures: Record<string, unknown>[] = [];
 		const preservation: Record<string, unknown>[] = [];
@@ -131,10 +134,8 @@ liveTest(
 				cwd: repo,
 				env: {
 					...process.env,
-					GJC_EXECUTABLE: executable,
+					[GJC_ATTACH_ONLY_ENV]: "0",
 					GJC_CODING_AGENT_DIR: agentDir,
-					PI_CODING_AGENT_DIR: agentDir,
-					GJC_AGENT_DIR: agentDir,
 				},
 				stdin: "ignore",
 				stdout: "pipe",
@@ -151,6 +152,7 @@ liveTest(
 				clearTimeout(timer);
 			}
 		};
+		const supervisor = await superviseLiveBroker(executable, agentDir);
 		try {
 			await broker.preflight();
 			await broker.start();
@@ -304,6 +306,11 @@ liveTest(
 				}
 			} catch {
 				failures.push({ stage: "unrelated-session-preservation" });
+			}
+			try {
+				await supervisor.stop();
+			} catch {
+				failures.push({ stage: "broker-supervisor-stop" });
 			}
 			try {
 				database.close();

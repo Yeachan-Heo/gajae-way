@@ -1,8 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readlink, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
+	acquireLease,
+	homeLayout,
+	type Lease,
+	LeaseHeldError,
+	type LeaseName,
+	leaseHeld,
+	readLeaseOwner,
+} from "@gajae-gateway/home";
+
+import {
+	BROKER_UNIT,
 	currentPlatform,
 	launchAgentPlistPath,
 	restartOrder,
@@ -31,7 +42,7 @@ export type RestartState = "queued" | "running" | "ok" | "stale" | "failed";
 
 export interface RestartStep {
 	readonly label: string;
-	/** Absent on systemd, where the gateway unit's restart carries its dependents. */
+	/** The final service-manager command; update broker receipts separately record agent sync. */
 	command?: readonly string[];
 	exitStatus?: number;
 	result: RestartStepResult;
@@ -39,11 +50,13 @@ export interface RestartStep {
 	processStartedAt?: string;
 	binary?: string;
 	binaryModifiedAt?: string;
+	agentSync?: { readonly command: readonly string[]; readonly exitStatus: number; readonly error?: string };
 	detail?: string;
 }
 
 export interface RestartReceipt {
 	readonly id: string;
+	readonly trigger: "update" | "manual";
 	state: RestartState;
 	readonly platform: ServicePlatform;
 	readonly requestedAt: string;
@@ -54,21 +67,20 @@ export interface RestartReceipt {
 	readonly steps: RestartStep[];
 }
 
-/** A running service process as the service manager and `ps` report it. */
+/** The main PID reported by the service manager. */
 export interface ServiceProcess {
 	readonly pid: number;
-	/** Epoch ms; `ps` reports whole seconds. */
-	readonly startedAt: number;
-	readonly binary: string;
 }
 
 export type CommandRunner = (command: readonly string[]) => number | PromiseLike<number>;
 export type ServiceProbe = (label: string) => Promise<ServiceProcess | undefined>;
 export type IsServiceInstalled = (label: string) => Promise<boolean>;
 
+/** The trigger is explicit so only update receipts synchronize provisioned agent state. */
 export interface RunRestartOptions {
 	readonly home: string;
 	readonly id: string;
+	readonly trigger?: "update" | "manual";
 	readonly platform?: ServicePlatform;
 	readonly uid?: number;
 	readonly runner?: CommandRunner;
@@ -86,7 +98,7 @@ export interface RunRestartOptions {
 	readonly env?: NodeJS.ProcessEnv;
 	/** LaunchAgents directory on darwin. Defaults to ~/Library/LaunchAgents. */
 	readonly launchAgentsDir?: string;
-	/** systemd unit directory on linux. Defaults to $XDG_CONFIG_HOME/systemd/user. */
+	readonly binDir?: string;
 	readonly unitDir?: string;
 }
 
@@ -117,16 +129,29 @@ async function writeReceipt(home: string, receipt: RestartReceipt): Promise<void
 	await rename(temporary, path);
 }
 
-function newReceipt(id: string, platform: ServicePlatform, uid: number | undefined, now: number): RestartReceipt {
+function newReceipt(
+	id: string,
+	platform: ServicePlatform,
+	uid: number | undefined,
+	now: number,
+	trigger: "update" | "manual",
+): RestartReceipt {
 	const commands = restartStackCommands(platform, uid);
 	return {
 		id,
+		trigger,
 		state: "queued",
 		platform,
 		requestedAt: new Date(now).toISOString(),
 		steps: restartOrder().map((spec, index) => ({
 			label: spec.label,
-			...(platform === "darwin" ? { command: commands[index] } : index === 0 ? { command: commands[0] } : {}),
+			...(platform === "darwin"
+				? { command: commands[index] }
+				: spec.id === "broker"
+					? { command: commands[0] }
+					: spec.id === "gateway"
+						? { command: commands[1] }
+						: {}),
 			result: "pending",
 		})),
 	};
@@ -148,32 +173,19 @@ async function capture(command: readonly string[]): Promise<string | undefined> 
 	return (await child.exited) === 0 ? output : undefined;
 }
 
-/** Reads the live pid from the service manager, then its start time and executable from `ps`. */
-export function defaultServiceProbe(platform: ServicePlatform): ServiceProbe {
+/** Reads the current main PID directly from launchd or systemd. */
+export function defaultServiceProbe(platform: ServicePlatform, uid = process.getuid?.() ?? 0): ServiceProbe {
 	return async (label) => {
 		const spec = serviceSpecs().find((candidate) => candidate.label === label);
 		if (spec === undefined) throw new Error(`unknown service label: ${label}`);
-		let pid: number | undefined;
-		if (platform === "darwin") {
-			const listed = await capture(["launchctl", "list", label]);
-			const match = listed?.match(/"PID"\s*=\s*(\d+);/);
-			pid = match ? Number(match[1]) : undefined;
-		} else {
-			const shown = await capture(["systemctl", "--user", "show", "-p", "MainPID", "--value", systemdUnitName(spec)]);
-			pid = shown === undefined ? undefined : Number(shown.trim());
-		}
-		if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return undefined;
-		const lstart = await capture(["ps", "-o", "lstart=", "-p", String(pid)]);
-		const args = await capture(["ps", "-ww", "-o", "args=", "-p", String(pid)]);
-		if (lstart === undefined || args === undefined) return undefined;
-		const startedAt = Date.parse(lstart.trim());
-		if (!Number.isFinite(startedAt)) return undefined;
-		// The service definitions exec `<bin-dir>/<binary> <fixed args>`; stripping
-		// the known arguments keeps a bin dir containing spaces intact.
-		const suffix = spec.args.length > 0 ? ` ${spec.args.join(" ")}` : "";
-		const line = args.trim();
-		const binary = suffix && line.endsWith(suffix) ? line.slice(0, -suffix.length) : line;
-		return { pid, startedAt, binary };
+		const shown =
+			platform === "darwin"
+				? await capture(["launchctl", "print", `gui/${uid}/${label}`])
+				: await capture(["systemctl", "--user", "show", "-p", "MainPID", "--value", systemdUnitName(spec)]);
+		const rawPid = platform === "darwin" ? shown?.match(/^\s*pid = (\d+);?\s*$/m)?.[1] : shown?.trim();
+		const pid = rawPid === undefined ? undefined : Number(rawPid);
+		if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+		return { pid };
 	};
 }
 
@@ -217,27 +229,59 @@ function defaultIsServiceInstalled(options: {
 	};
 }
 
-/**
- * `ps -o lstart` is whole seconds, and on Linux it is derived from the boot
- * time plus clock ticks, so it can read up to one second EARLY. Measured on
- * gaebal-gajae 2026-09-30: systemd logged `Started` at 10:55:50.170 while
- * `ps` reported 10:55:49, and the freshly restarted gateway was judged stale,
- * aborting the rest of the stack. The bound is floored and allowed that second.
- */
-function psStartBound(ms: number): number {
-	return Math.floor(ms / 1_000) * 1_000 - PS_START_SKEW_MS;
-}
-const PS_START_SKEW_MS = 1_000;
+const SERVICE_LEASES: Partial<Record<string, LeaseName>> = {
+	broker: "broker",
+	gateway: "gateway",
+	"adapter-discord": "adapter-discord",
+	"adapter-slack": "adapter-slack",
+	"adapter-telegram": "adapter-telegram",
+};
 
+function serviceStopCommand(platform: ServicePlatform, uid: number | undefined): readonly string[] {
+	if (platform === "linux") return ["systemctl", "--user", "stop", BROKER_UNIT];
+	const target = uid ?? process.getuid?.() ?? 0;
+	return ["launchctl", "bootout", `gui/${target}/dev.gajaeway.broker`];
+}
+
+function serviceBootstrapCommand(
+	options: RunRestartOptions,
+	platform: ServicePlatform,
+	label: string,
+): readonly string[] {
+	if (platform === "linux") return ["systemctl", "--user", "start", BROKER_UNIT];
+	const target = options.uid ?? process.getuid?.() ?? 0;
+	const userHome = options.env?.HOME || homedir();
+	const agentsDir = options.launchAgentsDir ?? join(userHome, "Library", "LaunchAgents");
+	const spec = serviceSpecs().find((candidate) => candidate.label === label);
+	if (spec === undefined) throw new Error(`unknown service label: ${label}`);
+	return ["launchctl", "bootstrap", `gui/${target}`, launchAgentPlistPath(spec, agentsDir)];
+}
 /**
  * Runs the ordered restart, verifying each service before the next command,
  * and persists the receipt after every transition. The first service that is
  * stale or missing aborts the remainder.
  */
 export async function runRestartStack(options: RunRestartOptions): Promise<RestartReceipt> {
+	let lease: Lease;
+	try {
+		lease = await acquireLease(options.home, "update");
+		console.info(`lease_acquired name=update pid=${process.pid}`);
+	} catch (error) {
+		if (error instanceof LeaseHeldError) console.error(error.message);
+		else console.error(`lease_failed name=update detail=${error instanceof Error ? error.message : String(error)}`);
+		throw error;
+	}
+	try {
+		return await runRestartStackWithLease(options);
+	} finally {
+		await lease.release();
+	}
+}
+
+async function runRestartStackWithLease(options: RunRestartOptions): Promise<RestartReceipt> {
 	const platform = options.platform ?? currentPlatform();
 	const runner = options.runner ?? defaultCommandRunner;
-	const probe = options.probe ?? defaultServiceProbe(platform);
+	const probe = options.probe ?? defaultServiceProbe(platform, options.uid);
 	const modifiedAt = options.binaryModifiedAt ?? defaultBinaryModifiedAt;
 	const isInstalled =
 		options.isServiceInstalled ??
@@ -251,12 +295,19 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const timeoutMs = options.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS;
 	const pollMs = options.pollMs ?? POLL_MS;
+	const binDir = options.binDir ?? process.env.GAJAEWAY_BIN_DIR ?? dirname(process.execPath);
+
+	const originalPids = new Map<string, number | undefined>();
+	for (const spec of restartOrder()) {
+		if (SERVICE_LEASES[spec.id] === undefined && (await isInstalled(spec.label)))
+			originalPids.set(spec.label, (await probe(spec.label))?.pid);
+	}
 
 	const existing = await readRestartReceipt(options.home);
 	const receipt =
 		existing?.id === options.id && existing.state === "queued"
 			? existing
-			: newReceipt(options.id, platform, options.uid, now());
+			: newReceipt(options.id, platform, options.uid, now(), options.trigger ?? "manual");
 	receipt.state = "running";
 	receipt.supervisorPid = process.pid;
 	await writeReceipt(options.home, receipt);
@@ -268,7 +319,15 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 			continue;
 		}
 		try {
-			// Check if the service is installed before trying to restart it
+			if (
+				step.label === "dev.gajaeway.broker" &&
+				!(await Bun.file(homeLayout(options.home).brokerProvisionManifest).exists())
+			) {
+				step.result = "skipped";
+				step.detail = "broker agent is not provisioned";
+				await writeReceipt(options.home, receipt);
+				continue;
+			}
 			const installed = await isInstalled(step.label);
 			if (!installed) {
 				step.result = "skipped";
@@ -277,16 +336,76 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 				continue;
 			}
 
-			if (step.command !== undefined) {
-				issuedAt = now();
-				const status = await runner(step.command);
-				step.exitStatus = status;
-				if (status !== 0) {
+			if (step.label === "dev.gajaeway.broker" && receipt.trigger === "update") {
+				const stopCommand = serviceStopCommand(platform, options.uid);
+				const stopStatus = await runner(stopCommand);
+				if (stopStatus !== 0 && !(platform === "darwin" && (await probe(step.label)) === undefined))
+					throw new Error(`${stopCommand.join(" ")} exited with status ${stopStatus}`);
+
+				const provisionCommand = [
+					join(binDir, "gajaeway-gateway"),
+					"broker-agent",
+					"provision",
+					"--mode",
+					"update",
+					"--lease-wait-ms",
+					"35000",
+				];
+				const provisionStatus = await runner(provisionCommand);
+				step.agentSync = {
+					command: provisionCommand,
+					exitStatus: provisionStatus,
+					...(provisionStatus === 1 || provisionStatus === 3
+						? { error: `broker-agent provision exited with status ${provisionStatus}` }
+						: provisionStatus === 4
+							? { error: "broker_agent_unrecoverable" }
+							: {}),
+				};
+				if (provisionStatus === 4) {
+					delete step.command;
+					step.exitStatus = 4;
 					step.result = "failed";
-					step.detail = `${step.command.join(" ")} exited with status ${status}`;
+					step.detail = "broker left stopped: broker_agent_unrecoverable; run gajaeway setup --broker-agent";
+				} else if (provisionStatus === 0 || provisionStatus === 1 || provisionStatus === 3) {
+					const startCommand = serviceBootstrapCommand(options, platform, step.label);
+					step.command = startCommand;
+					issuedAt = now();
+					const startStatus = await runner(startCommand);
+					step.exitStatus = startStatus;
+					if (startStatus !== 0) {
+						step.result = "failed";
+						step.detail = `${startCommand.join(" ")} exited with status ${startStatus}`;
+					} else await verifyStep(step, issuedAt);
+				} else {
+					delete step.command;
+					step.exitStatus = provisionStatus;
+					step.result = "failed";
+					step.detail = `broker-agent provision exited with unexpected status ${provisionStatus}`;
 				}
+			} else {
+				if (step.command !== undefined) {
+					issuedAt = now();
+					let command = step.command;
+					let status = await runner(command);
+					if (
+						status !== 0 &&
+						receipt.trigger === "update" &&
+						platform === "darwin" &&
+						(await probe(step.label)) === undefined
+					) {
+						command = serviceBootstrapCommand(options, platform, step.label);
+						step.command = command;
+						issuedAt = now();
+						status = await runner(command);
+					}
+					step.exitStatus = status;
+					if (status !== 0) {
+						step.result = "failed";
+						step.detail = `${command.join(" ")} exited with status ${status}`;
+					}
+				}
+				if (step.result === "pending") await verifyStep(step, issuedAt);
 			}
-			if (step.result === "pending") await verifyStep(step, issuedAt);
 		} catch (error) {
 			step.result = "failed";
 			step.detail = error instanceof Error ? error.message : String(error);
@@ -302,32 +421,58 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 	return receipt;
 
 	async function verifyStep(step: RestartStep, since: number): Promise<void> {
+		const spec = serviceSpecs().find((candidate) => candidate.label === step.label);
+		if (spec === undefined) throw new Error(`unknown service label: ${step.label}`);
+		const leaseName = SERVICE_LEASES[spec.id];
+		const binary = join(binDir, spec.binary);
+		const binaryModifiedAt = leaseName === undefined ? undefined : await modifiedAt(binary);
 		const deadline = now() + timeoutMs;
 		for (;;) {
 			const running = await probe(step.label);
-			let binaryModifiedAt = 0;
-			if (running !== undefined) {
-				binaryModifiedAt = await modifiedAt(running.binary);
-				step.pid = running.pid;
-				step.processStartedAt = new Date(running.startedAt).toISOString();
-				step.binary = running.binary;
-				step.binaryModifiedAt = new Date(binaryModifiedAt).toISOString();
-				if (running.startedAt >= psStartBound(Math.max(binaryModifiedAt, since))) {
+			const owner = leaseName === undefined ? undefined : await readLeaseOwner(options.home, leaseName);
+			if (running !== undefined) step.pid = running.pid;
+
+			if (leaseName !== undefined) {
+				step.binary = binary;
+				step.binaryModifiedAt = new Date(binaryModifiedAt as number).toISOString();
+				if (owner !== undefined) step.processStartedAt = owner.startedAt;
+				const startedAt = owner === undefined ? Number.NaN : Date.parse(owner.startedAt);
+				if (
+					running !== undefined &&
+					owner !== undefined &&
+					running.pid === owner.pid &&
+					Number.isFinite(startedAt) &&
+					startedAt >= Math.max(since, binaryModifiedAt as number)
+				) {
 					step.result = "ok";
 					delete step.detail;
 					return;
 				}
+			} else if (running !== undefined && running.pid !== originalPids.get(step.label)) {
+				step.result = "ok";
+				delete step.detail;
+				return;
 			}
+
 			if (now() >= deadline) {
 				if (running === undefined) {
 					step.result = "failed";
 					step.detail = "no running process after restart";
+				} else if (leaseName === undefined) {
+					step.result = "stale";
+					step.detail = "MainPID did not change after restart";
+				} else if (owner === undefined) {
+					step.result = "stale";
+					step.detail = "no lease owner after restart";
+				} else if (running.pid !== owner.pid) {
+					step.result = "stale";
+					step.detail = "lease owner PID does not match service MainPID";
+				} else if (Date.parse(owner.startedAt) < (binaryModifiedAt as number)) {
+					step.result = "stale";
+					step.detail = "process started before the deployed binary was modified";
 				} else {
 					step.result = "stale";
-					step.detail =
-						running.startedAt < binaryModifiedAt
-							? "process started before the deployed binary was modified"
-							: "process was not restarted by this sequence";
+					step.detail = "lease owner predates this restart sequence";
 				}
 				return;
 			}
@@ -338,8 +483,11 @@ export async function runRestartStack(options: RunRestartOptions): Promise<Resta
 
 export interface LaunchRestartOptions {
 	readonly home: string;
+	readonly trigger?: "update" | "manual";
 	readonly platform?: ServicePlatform;
 	readonly uid?: number;
+	/** Installed service binary directory used for lease verification. */
+	readonly binDir?: string;
 	/** Argv that re-enters the CLI; `--run <id>` is appended. */
 	readonly worker?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
@@ -350,16 +498,6 @@ export function cliCommand(): string[] {
 	return Bun.main.startsWith("/$bunfs/") ? [process.execPath] : [process.execPath, Bun.main];
 }
 
-function alive(pid: number | undefined): boolean {
-	if (pid === undefined) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /**
  * Queues a restart and hands it to a detached supervisor, returning as soon as
  * the supervisor is spawned so the caller may be killed by the restart itself.
@@ -368,13 +506,12 @@ export async function launchRestartStack(
 	options: LaunchRestartOptions,
 ): Promise<{ readonly receipt: RestartReceipt; readonly supervisorPid: number }> {
 	const platform = options.platform ?? currentPlatform();
-	const existing = await readRestartReceipt(options.home);
-	if (existing?.state === "running" && alive(existing.supervisorPid))
-		throw new Error(`restart-stack ${existing.id} is still running (supervisor pid ${existing.supervisorPid})`);
-	const receipt = newReceipt(randomUUID(), platform, options.uid, Date.now());
+	if (await leaseHeld(options.home, "update"))
+		throw new LeaseHeldError("update", await readLeaseOwner(options.home, "update"));
+	const receipt = newReceipt(randomUUID(), platform, options.uid, Date.now(), options.trigger ?? "manual");
 	await writeReceipt(options.home, receipt);
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
-	const argv = supervisorArgv(platform, worker, options.home, receipt.id);
+	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir);
 	let child: Bun.Subprocess;
 	try {
 		child = Bun.spawn(argv, {
@@ -382,7 +519,11 @@ export async function launchRestartStack(
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
-			env: { ...(options.env ?? process.env), GAJAEWAY_HOME: options.home },
+			env: {
+				...(options.env ?? process.env),
+				GAJAEWAY_HOME: options.home,
+				...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
+			},
 		});
 	} catch (error) {
 		// Nothing will ever pick this receipt up: leaving it `queued` reads as a
@@ -411,6 +552,7 @@ export function supervisorArgv(
 	worker: readonly string[],
 	home: string,
 	id: string,
+	binDir?: string,
 ): string[] {
 	if (platform === "darwin") return [...worker];
 	return [
@@ -420,6 +562,7 @@ export function supervisorArgv(
 		"--quiet",
 		`--unit=gajaeway-restart-stack-${id}`,
 		`--setenv=GAJAEWAY_HOME=${home}`,
+		...(binDir === undefined ? [] : [`--setenv=GAJAEWAY_BIN_DIR=${binDir}`]),
 		"--",
 		...worker,
 	];
@@ -429,14 +572,20 @@ export function supervisorArgv(
  * The receipt's state, except that an unfinished sequence whose supervisor is
  * gone is reported as interrupted rather than left looking in progress.
  */
-export function effectiveRestartState(receipt: RestartReceipt): RestartState | "interrupted" {
-	if (receipt.state === "running" && !alive(receipt.supervisorPid)) return "interrupted";
+export async function effectiveRestartState(
+	receipt: RestartReceipt,
+	home: string,
+): Promise<RestartState | "interrupted"> {
+	if (receipt.state === "running" && !(await leaseHeld(home, "update"))) return "interrupted";
 	return receipt.state;
 }
 
-export function renderRestartReceipt(receipt: RestartReceipt): string[] {
+export function renderRestartReceipt(
+	receipt: RestartReceipt,
+	state: RestartState | "interrupted" = receipt.state,
+): string[] {
 	const lines = [
-		`restart-stack ${receipt.id}: ${effectiveRestartState(receipt)}`,
+		`restart-stack ${receipt.id}: ${state}`,
 		`requestedAt: ${receipt.requestedAt}`,
 		`finishedAt: ${receipt.finishedAt ?? "-"}`,
 		...(receipt.detail === undefined ? [] : [`detail: ${receipt.detail}`]),
@@ -446,6 +595,7 @@ export function renderRestartReceipt(receipt: RestartReceipt): string[] {
 			step.pid === undefined ? undefined : `pid=${step.pid}`,
 			step.processStartedAt === undefined ? undefined : `started=${step.processStartedAt}`,
 			step.binaryModifiedAt === undefined ? undefined : `binary=${step.binaryModifiedAt}`,
+			step.agentSync?.error === undefined ? undefined : `agentSync.error=${step.agentSync.error}`,
 			step.detail,
 		].filter((fact) => fact !== undefined);
 		lines.push(`${step.label}: ${step.result}${facts.length > 0 ? ` ${facts.join(" ")}` : ""}`);

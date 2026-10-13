@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
 import { BrokerSessionPort, parseRunningJobs } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { noRelay } from "./session-port.fake";
 
 /**
@@ -16,9 +16,11 @@ import { noRelay } from "./session-port.fake";
  */
 async function harness(pidFor: (sessionId: string) => number | undefined, live = true) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-terminate-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	const run: CliRunner = async (args) => {
 		if (args.includes("inspect")) {
 			const sessionId = args[args.indexOf("inspect") + 1]!;
@@ -49,13 +51,15 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 	// The port refuses any session it does not own (#assertOwned): register the
 	// ids these tests will name, exactly as bind() would have.
 	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5"]) {
-		const owned = database.recordOwnedBinding({
-			authority,
-			sessionId,
-			originKey: `loopback/loopback/${sessionId}`,
-			epoch: 0,
-			repo,
-		});
+		const owned = database.transaction((tx) =>
+			database.bindings.recordOwnedBinding(tx, {
+				authority,
+				sessionId,
+				originKey: `loopback/loopback/${sessionId}`,
+				epoch: 0,
+				repo,
+			}),
+		);
 		if (!owned) throw new Error(`could not register ownership of ${sessionId}`);
 	}
 	return {

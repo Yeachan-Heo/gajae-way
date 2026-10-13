@@ -6,8 +6,7 @@ import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 // #177: two monitors declaring one event type used to share one
@@ -16,7 +15,7 @@ import { sessionPortFromScript } from "./session-port.fake";
 test("monitors sharing an event type each own a separate session and failure domain", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-scope-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const way = registry.add({
 			name: "way-backlog-watch",
@@ -56,7 +55,7 @@ test("monitors sharing an event type each own a separate session and failure dom
 			registry,
 			sessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 		});
 		await pipeline.submitAwaitable(way.monitorId, "backlog.watch", {});
@@ -73,10 +72,10 @@ test("monitors sharing an event type each own a separate session and failure dom
 		poisoned = waySession;
 		const wayFailed = await pipeline.submitAwaitable(way.monitorId, "backlog.watch", {});
 		const otherOk = await pipeline.submitAwaitable(other.monitorId, "backlog.watch", {});
-		const stages = new Map(database.monitorEventRows().map((row) => [row.event_id, row.stage]));
+		const stages = new Map(database.monitors.eventRows().map((row) => [row.event_id, row.stage]));
 		expect(stages.get(wayFailed)).toBe("failed");
 		expect(stages.get(otherOk)).not.toBe("failed");
-		expect(database.authoredOutput(otherOk)).toBe("ok");
+		expect(database.monitors.authoredOutput(otherOk)).toBe("ok");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

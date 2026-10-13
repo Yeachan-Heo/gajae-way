@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { DeliveryService } from "../src/delivery/delivery";
+import { Store } from "../src/store";
 
 let home = "";
 let child: ReturnType<typeof Bun.spawn> | undefined;
@@ -96,18 +96,18 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	first.close();
 	// The child must have obtained ownership through the real SessionPort create
 	// path. Reopening here only inspects; it never initializes or adopts authority.
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	try {
 		const authority = database.inspectBrokerAuthority().authority;
-		// Boot respects broker.agentDir from test dependencies (testOnlyBrokerDependencies.agentDir)
-		expect(authority?.canonicalAgentDir).toBe("/test-only/gjc-agent");
+		// The agent dir comes only from gateway config, which defaults to the home's private broker dir.
+		expect(authority?.canonicalAgentDir).toBe(join(await realpath(home), "broker", "agent"));
 		if (!authority) throw new Error("child did not initialize broker authority");
-		const delivery = new DeliveryLedger(database).get(deliveryId);
+		const delivery = new DeliveryService(database).get(deliveryId);
 		expect(delivery?.state).toBe("inflight");
 		if (!delivery) throw new Error("child did not persist the delivery");
-		const binding = database.getSessionRecord(delivery.originKey);
+		const binding = database.bindings.getSessionRecord(delivery.originKey);
 		if (!binding?.sessionId) throw new Error("child did not persist the created session");
-		expect(database.assertOwnedSession(binding.sessionId, join(home, "workspace"), authority)).toMatchObject({
+		expect(database.bindings.assertOwnedSession(binding.sessionId, join(home, "workspace"), authority)).toMatchObject({
 			originKey: delivery.originKey,
 			epoch: binding.epoch,
 		});

@@ -1,6 +1,7 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
 
 const CONFIG_SCHEMA_VERSION = 1;
@@ -34,6 +35,10 @@ export interface InstallServicesOptions {
 	/** Service manager to generate for; defaults to the running platform. */
 	readonly platform?: ServicePlatform;
 	readonly env?: NodeJS.ProcessEnv;
+	/** Render adapter units only when their adapter-<platform>.json exists. */
+	readonly configuredAdaptersOnly?: boolean;
+	/** Leave unchanged unit files untouched. */
+	readonly compareAndWrite?: boolean;
 	/** Test seam for the `${SHELL} -lc` invocation used by the default path. */
 	readonly loginPathRunner?: LoginPathRunner;
 	/** Test seam for counting or inspecting the definition writes. */
@@ -55,9 +60,17 @@ interface ServiceSpec {
 	readonly dependsOnGateway: boolean;
 }
 
+export const BROKER_UNIT = "gajaeway-broker.service";
 export const GATEWAY_UNIT = "gajaeway-gateway.service";
 
 const SERVICE_SPECS: readonly ServiceSpec[] = [
+	{
+		id: "broker",
+		label: "dev.gajaeway.broker",
+		binary: "gajaeway-gateway",
+		args: ["broker"],
+		dependsOnGateway: false,
+	},
 	{
 		id: "gateway",
 		label: "dev.gajaeway.gateway",
@@ -76,6 +89,13 @@ const SERVICE_SPECS: readonly ServiceSpec[] = [
 		id: "adapter-slack",
 		label: "dev.gajaeway.adapter-slack",
 		binary: "gajaeway-slack",
+		args: [],
+		dependsOnGateway: true,
+	},
+	{
+		id: "adapter-telegram",
+		label: "dev.gajaeway.adapter-telegram",
+		binary: "gajaeway-telegram",
 		args: [],
 		dependsOnGateway: true,
 	},
@@ -203,35 +223,50 @@ export function systemdUnitName(spec: ServiceSpec): string {
 	return `gajaeway-${spec.id}.service`;
 }
 
+/**
+ * `EnvironmentFile=` and `ConditionPathExists=` take one literal absolute path:
+ * systemd does not unquote them, so a quoted value is "not absolute" and the
+ * directive is silently ignored. Only `%` specifiers need escaping.
+ */
+function unitPath(path: string): string {
+	if (!path.startsWith("/") || /[\n\r\0]/.test(path))
+		throw new Error(`unit path must be absolute and single-line: ${path}`);
+	return path.replaceAll("%", "%%");
+}
+
+function unitEnvironmentFile(path: string): string {
+	return `EnvironmentFile=-${unitPath(path)}`;
+}
+
 export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: string, path: string): string {
 	const execStart = [join(binDir, spec.binary), ...spec.args].join(" ");
 	const unit = [
 		"[Unit]",
 		`Description=gajaeway ${spec.id}`,
-		// BindsTo restarts and stops this unit with the gateway; PartOf propagates a
-		// gateway restart even when this unit is started on its own; After orders
-		// the boot so the adapter connects to a listening socket.
-		...(spec.dependsOnGateway ? [`BindsTo=${GATEWAY_UNIT}`, `After=${GATEWAY_UNIT}`, `PartOf=${GATEWAY_UNIT}`] : []),
+		...(spec.id === "broker"
+			? [`ConditionPathExists=${unitPath(homeLayout(home).brokerProvisionManifest)}`]
+			: spec.id === "gateway"
+				? [`Wants=${BROKER_UNIT}`, `After=${BROKER_UNIT}`]
+				: spec.dependsOnGateway
+					? [`BindsTo=${GATEWAY_UNIT}`, `After=${GATEWAY_UNIT}`, `PartOf=${GATEWAY_UNIT}`]
+					: []),
 		"",
 		"[Service]",
 		`ExecStart=${execStart}`,
 		`WorkingDirectory=${binDir}`,
 		unitEnvironment("GAJAEWAY_HOME", home),
 		unitEnvironment("PATH", path),
+		...(spec.id === "broker" ? [unitEnvironmentFile(join(home, "broker.env"))] : []),
 		"Restart=always",
-		"RestartSec=2",
-		// Only the gateway: SIGTERM its main process for an ordered shutdown, then
-		// kill whatever is left in its cgroup so no child outlives the unit and
-		// gets re-adopted by the next start (#183). The gateway exits on its own
-		// inside 25s (SHUTDOWN_DEADLINE_MS in the gateway main); the unit's stop
-		// window is pinned so that ceiling always fits (#225). The gateway moves a GJC broker
-		// it autostarted into a scope of its own, so this never reaches the shared
-		// broker or its session hosts.
-		...(spec.dependsOnGateway ? [] : ["KillMode=mixed", "TimeoutStopSec=30s"]),
+		spec.id === "broker" ? "RestartSec=2s" : "RestartSec=2",
+		...(spec.id === "broker"
+			? // The host propagates `gjc sdk broker run`'s exit code: 143 is its clean SIGTERM stop.
+				["KillMode=control-group", "TimeoutStopSec=30s", "SuccessExitStatus=143"]
+			: spec.id === "gateway"
+				? ["KillMode=mixed", "TimeoutStopSec=30s"]
+				: []),
 		"",
 		"[Install]",
-		// Enabling the gateway pulls the whole stack in; a dependent is never
-		// wanted by default.target on its own, because it cannot run without one.
 		`WantedBy=${spec.dependsOnGateway ? GATEWAY_UNIT : "default.target"}`,
 		"",
 	];
@@ -256,14 +291,16 @@ export function systemdUnitPath(spec: ServiceSpec, unitDir: string): string {
 /**
  * The ordered commands that realign the whole stack.
  *
- * systemd expresses the dependency itself, so one restart of the gateway unit
- * is the entire operation. launchd has no BindsTo/PartOf equivalent and
- * `WatchPaths` does not restart an already-running job, so the ordering is
- * explicit here instead — and `bootout` never appears, because removing a job
- * leaves it with no automatic recovery.
+ * systemd restarts the broker before the gateway; gateway dependencies restart
+ * their adapters. launchd has no dependency propagation, so every job is
+ * kicked explicitly in the same order.
  */
 export function restartStackCommands(platform: ServicePlatform, uid?: number): readonly (readonly string[])[] {
-	if (platform === "linux") return [["systemctl", "--user", "restart", GATEWAY_UNIT]];
+	if (platform === "linux")
+		return [
+			["systemctl", "--user", "restart", BROKER_UNIT],
+			["systemctl", "--user", "restart", GATEWAY_UNIT],
+		];
 	if (platform === "darwin") {
 		const target = uid ?? process.getuid?.() ?? 0;
 		return restartOrder().map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
@@ -271,7 +308,7 @@ export function restartStackCommands(platform: ServicePlatform, uid?: number): r
 	throw new Error(`unsupported service platform: ${platform}`);
 }
 
-/** The gateway first, then every job that holds a connection to it. */
+/** Broker, gateway, then every job that holds a connection to the gateway. */
 export function restartOrder(): readonly ServiceSpec[] {
 	return [
 		...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
@@ -336,7 +373,15 @@ export async function installServices(options: InstallServicesOptions): Promise<
 		loginPathRunner: options.loginPathRunner,
 	});
 	await mkdir(targetDir, { recursive: true, mode: 0o700 });
-	const definitions = SERVICE_SPECS.map((spec) =>
+	const specs: ServiceSpec[] = [];
+	for (const spec of SERVICE_SPECS) {
+		if (options.configuredAdaptersOnly && spec.id.startsWith("adapter-")) {
+			const adapter = spec.id.slice("adapter-".length);
+			if (!(await Bun.file(join(home, `adapter-${adapter}.json`)).exists())) continue;
+		}
+		specs.push(spec);
+	}
+	const definitions = specs.map((spec) =>
 		platform === "darwin"
 			? {
 					path: join(targetDir, `dev.gajaeway.${spec.id}.plist`),
@@ -346,6 +391,13 @@ export async function installServices(options: InstallServicesOptions): Promise<
 	);
 	const write = options.writeFile;
 	for (const definition of definitions) {
+		if (options.compareAndWrite) {
+			try {
+				if ((await readFile(definition.path, "utf8")) === definition.contents) continue;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
 		if (write) await write(definition.path, definition.contents);
 		else {
 			await writeFile(definition.path, definition.contents, { encoding: "utf8", mode: 0o600 });

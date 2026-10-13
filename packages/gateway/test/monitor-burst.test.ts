@@ -5,14 +5,13 @@ import { join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 test("coalesce preserves every event identity while using one authoring turn", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "burst",
@@ -41,14 +40,14 @@ test("coalesce preserves every event identity while using one authoring turn", a
 			registry,
 			sessionPort,
 			memory: memory as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 		});
 		for (let i = 0; i < 200; i++) pipeline.submit(monitor.monitorId, "changed", { i });
 		await Bun.sleep(350);
-		expect(database.monitorEventRows().length).toBe(200);
+		expect(database.monitors.eventRows().length).toBe(200);
 		// Intents are now admitted atomically at the DB level: count durable rows.
-		expect(database.memoryIntentRows().length).toBe(200);
+		expect(database.memory.rows().length).toBe(200);
 		expect(turns).toBe(1);
 		database.close();
 	} finally {

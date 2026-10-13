@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 /** Remove broker-authority and v22-v24 schema objects before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
@@ -35,7 +35,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		);
 		legacy.close();
 
-		const database = await GatewayDatabase.open(path);
+		const database = await Store.open(path);
 		expect(database.schemaVersion).toBe(32);
 		database.close();
 
@@ -69,16 +69,18 @@ test("upgrades a deployed lane-jobs schema 10 database to combined schema 12 wit
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v10-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
-		latest.putLaneJob({
-			jobId: "lanejob-test",
-			laneKey: "work/task/test",
-			state: "running",
-			createdAt: "2026-08-28T00:00:00.000Z",
-			updatedAt: "2026-08-28T00:00:00.000Z",
-			lane: { branch: "feat/test", worktreePath: "/tmp/test" },
-			json: '{"schemaVersion":1}',
-		});
+		const latest = await Store.open(path);
+		latest.transaction((tx) =>
+			latest.work.putLaneJob(tx, {
+				jobId: "lanejob-test",
+				laneKey: "work/task/test",
+				state: "running",
+				createdAt: "2026-08-28T00:00:00.000Z",
+				updatedAt: "2026-08-28T00:00:00.000Z",
+				lane: { branch: "feat/test", worktreePath: "/tmp/test" },
+				json: '{"schemaVersion":1}',
+			}),
+		);
 		latest.close();
 
 		// Recreate the exact pre-monitor-recovery shape: schema 10 already has
@@ -98,10 +100,10 @@ DELETE FROM schema_migrations WHERE version > 10;
 `);
 		v10.close();
 
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 
-		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
+		expect(upgraded.work.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
 				.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -120,18 +122,20 @@ test("upgrades live schema 12 through bootstrap schema 14 without losing current
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v12-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
-		latest.putLaneJob({
-			jobId: "lanejob-v12",
-			laneKey: "work/task/v12",
-			state: "running",
-			createdAt: "2026-08-28T00:00:00.000Z",
-			updatedAt: "2026-08-28T00:00:00.000Z",
-			lane: { branch: "fix/v12", worktreePath: "/tmp/v12" },
-			json: '{"schemaVersion":1}',
-		});
-		latest.metaSet("rebind_budget:discord/channel/c1", '{"used":2,"lifetime":7}');
-		latest.putSession("discord/channel/c1", "session-v12");
+		const latest = await Store.open(path);
+		latest.transaction((tx) =>
+			latest.work.putLaneJob(tx, {
+				jobId: "lanejob-v12",
+				laneKey: "work/task/v12",
+				state: "running",
+				createdAt: "2026-08-28T00:00:00.000Z",
+				updatedAt: "2026-08-28T00:00:00.000Z",
+				lane: { branch: "fix/v12", worktreePath: "/tmp/v12" },
+				json: '{"schemaVersion":1}',
+			}),
+		);
+		latest.core.metaSet("rebind_budget:discord/channel/c1", '{"used":2,"lifetime":7}');
+		latest.transaction((tx) => latest.bindings.bind(tx, "discord/channel/c1", "session-v12"));
 		latest.close();
 
 		const v12 = new Database(path);
@@ -146,15 +150,15 @@ DELETE FROM schema_migrations WHERE version > 12;
 `);
 		v12.close();
 
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 
-		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
-		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
-		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
-		expect(upgraded.getSessionBootstrap("missing")).toBeUndefined();
-		expect(upgraded.getSessionRecord("discord/channel/c1")).toEqual({ sessionId: "session-v12", epoch: 0 });
-		expect(upgraded.getSessionBootstrap("discord/channel/c1")).toMatchObject({
+		expect(upgraded.work.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
+		expect(upgraded.core.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
+		expect(upgraded.monitors.slotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
+		expect(upgraded.bindings.getSessionBootstrap("missing")).toBeUndefined();
+		expect(upgraded.bindings.getSessionRecord("discord/channel/c1")).toEqual({ sessionId: "session-v12", epoch: 0 });
+		expect(upgraded.bindings.getSessionBootstrap("discord/channel/c1")).toMatchObject({
 			epoch: 0,
 			lastBootstrappedEpoch: -1,
 			appliedAt: null,
@@ -177,7 +181,7 @@ test("upgrades a schema 14 monitors table to 15 without losing existing monitors
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v14-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
+		const latest = await Store.open(path);
 		latest.close();
 
 		// Recreate the deployed schema-14 monitors table: no `instruction` column,
@@ -193,10 +197,10 @@ DELETE FROM schema_migrations WHERE version > 14;
 `);
 		v14.close();
 
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 
-		const rows = upgraded.monitorRows();
+		const rows = upgraded.monitors.rows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
 		expect(rows[0]?.monitor_id).toBe("monitor-v14");
@@ -214,9 +218,9 @@ test("online backup copy retains a session row", async () => {
 	const path = join(directory, "gateway.db");
 	const backupPath = join(directory, "gateway-backup.db");
 	try {
-		const database = await GatewayDatabase.open(path);
-		database.withTransaction(() => database.putSession("loopback/loopback/loopback", "session-1"));
-		database.backupInto(backupPath);
+		const database = await Store.open(path);
+		database.transaction((tx) => database.bindings.bind(tx, "loopback/loopback/loopback", "session-1"));
+		database.core.writeBackup(backupPath);
 		database.close();
 
 		const backup = new Database(backupPath, { readonly: true });
@@ -236,7 +240,7 @@ test("online backup copy retains a session row", async () => {
 test("upgrades a schema 15 database to 16 and keeps a per-conversation model override usable", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-16-"));
 	const path = join(directory, "gateway.db");
-	const latest = await GatewayDatabase.open(path);
+	const latest = await Store.open(path);
 	latest.close();
 
 	// Recreate a deployed schema-15 database: no conversation_model table.
@@ -249,11 +253,11 @@ DELETE FROM schema_migrations WHERE version > 15;
 `);
 	v15.close();
 
-	const upgraded = await GatewayDatabase.open(path);
+	const upgraded = await Store.open(path);
 	expect(upgraded.schemaVersion).toBe(32);
 
-	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
-	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
+	upgraded.transaction((tx) => upgraded.bindings.modelSet(tx, "discord:c1", { preset: "gpt-heavy" }, "owner"));
+	expect(upgraded.bindings.modelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
 });
 
@@ -261,7 +265,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-19-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
+		const latest = await Store.open(path);
 		expect(latest.schemaVersion).toBe(32);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
@@ -300,7 +304,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		).toBe(18);
 		raw.close();
 
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 
 		const after = new Database(path, { readonly: true });
@@ -326,7 +330,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		expect(total).toBe(9);
 
 		// Accepted trigger: turn intact, floor and terminal claim preserved.
-		expect(upgraded.inboundTurnRow("gw-p-live")).toMatchObject({
+		expect(upgraded.inbox.turnRow("gw-p-live")).toMatchObject({
 			message_id: "live-trigger",
 			state: "pending",
 			turn_role: "trigger",
@@ -336,21 +340,21 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 			dispatched_at: "2026-09-02T00:00:01.000Z",
 			terminal_delivery_id: '{"0":"gw-t-x"}',
 		});
-		expect(upgraded.inboundTurnDispatchedAt("gw-p-live")).toBe("2026-09-02T00:00:01.000Z");
-		expect(upgraded.inboundTurnClaimTerminal("gw-p-live", 0, "gw-t-late")).toBe("gw-t-x");
+		expect(upgraded.inbox.turnDispatchedAt("gw-p-live")).toBe("2026-09-02T00:00:01.000Z");
+		expect(upgraded.transaction((tx) => upgraded.inbox.claimTerminal(tx, "gw-p-live", 0, "gw-t-late"))).toBe("gw-t-x");
 		// The steer AND the accepted member stay attributed to that turn as done
 		// input: both were in the prompt the runtime holds, so neither is ever
 		// sent again.
-		expect(upgraded.inboundTurnRows("gw-p-live").map((row) => [row.message_id, row.turn_role, row.state])).toEqual([
+		expect(upgraded.inbox.turnRows("gw-p-live").map((row) => [row.message_id, row.turn_role, row.state])).toEqual([
 			["live-trigger", "trigger", "pending"],
 			["live-member", "steer", "done"],
 			["live-steer", "steer", "done"],
 		]);
-		expect(upgraded.inboundPendingOldest("o1")).toMatchObject({ message_id: "wedged-unbatched", turn_state: null });
-		expect(upgraded.inboundPendingCount("o1")).toBe(2);
+		expect(upgraded.inbox.pendingOldest("o1")).toMatchObject({ message_id: "wedged-unbatched", turn_state: null });
+		expect(upgraded.inbox.pendingCount("o1")).toBe(2);
 		// Settled + bound -> bound turn; its never-sent member returns to plain
 		// pending (the model never saw it); settled + never bound -> plain pending.
-		expect(upgraded.inboundNonterminalTurns("o2")).toEqual([
+		expect(upgraded.inbox.nonterminalTurns("o2")).toEqual([
 			{
 				originKey: "o2",
 				epoch: 0,
@@ -362,37 +366,39 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		]);
 		// The settled+bound member rides with its trigger (pending, attributed) and
 		// is decided with it: never sent again on its own, never lost.
-		expect(upgraded.inboundPendingOldest("o2")).toBeUndefined();
+		expect(upgraded.inbox.pendingOldest("o2")).toBeUndefined();
 		expect(
-			upgraded.inboundTurnRows("gw-p-sb").map((row) => [row.message_id, row.turn_role, row.state, row.turn_state]),
+			upgraded.inbox.turnRows("gw-p-sb").map((row) => [row.message_id, row.turn_role, row.state, row.turn_state]),
 		).toEqual([
 			["settled-bound", "trigger", "pending", "bound"],
 			["settled-member", "steer", "pending", "bound"],
 		]);
 		// Recovery proves the send landed: both become done input together.
-		expect(upgraded.inboundTurnAccept("gw-p-sb")).toBe(true);
-		expect(upgraded.inboundTurnRows("gw-p-sb").map((row) => [row.message_id, row.state, row.turn_state])).toEqual([
+		expect(upgraded.transaction((tx) => upgraded.inbox.turnAccept(tx, "gw-p-sb"))).toBe(true);
+		expect(upgraded.inbox.turnRows("gw-p-sb").map((row) => [row.message_id, row.state, row.turn_state])).toEqual([
 			["settled-bound", "pending", "accepted"],
 			["settled-member", "done", "done"],
 		]);
-		expect(upgraded.inboundTurnComplete("gw-p-sb")).toBe(1);
-		expect(upgraded.inboundPendingCount("o2")).toBe(0);
+		expect(upgraded.transaction((tx) => upgraded.inbox.turnComplete(tx, "gw-p-sb"))).toBe(1);
+		expect(upgraded.inbox.pendingCount("o2")).toBe(0);
 		// A legacy processing row is pending again, not stranded.
-		expect(upgraded.inboundPendingOldest("o5")).toMatchObject({ message_id: "legacy-processing", state: "pending" });
-		expect(upgraded.inboundNonterminalTurns("o3")).toEqual([]);
-		expect(upgraded.inboundPendingOldest("o3")).toMatchObject({ message_id: "settled-unbound", turn_op_ref: null });
+		expect(upgraded.inbox.pendingOldest("o5")).toMatchObject({ message_id: "legacy-processing", state: "pending" });
+		expect(upgraded.inbox.nonterminalTurns("o3")).toEqual([]);
+		expect(upgraded.inbox.pendingOldest("o3")).toMatchObject({ message_id: "settled-unbound", turn_op_ref: null });
 		// A finished turn is history and stays done.
-		expect(upgraded.inboundTurnRow("gw-p-done")).toMatchObject({ state: "done", turn_state: "done" });
-		expect(upgraded.inboundNonterminalTurnCount()).toBe(1);
+		expect(upgraded.inbox.turnRow("gw-p-done")).toMatchObject({ state: "done", turn_state: "done" });
+		expect(upgraded.inbox.nonterminalTurnCount()).toBe(1);
 		// The uniqueness the actor relies on survives the rebuild.
 		expect(() =>
-			upgraded.inboundBindTurn({
-				messageId: "wedged-unbatched",
-				originKey: "o1",
-				epoch: 3,
-				opRef: "gw-p-dup",
-				sessionId: "s-live",
-			}),
+			upgraded.transaction((tx) =>
+				upgraded.inbox.bindTurn(tx, {
+					messageId: "wedged-unbatched",
+					originKey: "o1",
+					epoch: 3,
+					opRef: "gw-p-dup",
+					sessionId: "s-live",
+				}),
+			),
 		).toThrow("already has a nonterminal turn");
 		upgraded.close();
 	} finally {
@@ -404,7 +410,7 @@ test("upgrades schema 23 to the latest: overlap column, skipped stage, rows and 
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v23-"));
 	const path = join(directory, "gateway.db");
 	try {
-		(await GatewayDatabase.open(path)).close();
+		(await Store.open(path)).close();
 		// Rebuild the deployed v23 shape: no overlap column, no skipped stage/skipped_by.
 		const raw = new Database(path);
 		raw.exec(`
@@ -420,18 +426,18 @@ INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fire
 DELETE FROM schema_migrations WHERE version > 23;
 `);
 		raw.close();
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 
-		expect(upgraded.monitorRows()[0]).toMatchObject({ monitor_id: "m1", overlap: "queue" });
-		expect(upgraded.monitorEventRows("m1")[0]).toMatchObject({
+		expect(upgraded.monitors.rows()[0]).toMatchObject({ monitor_id: "m1", overlap: "queue" });
+		expect(upgraded.monitors.eventRows("m1")[0]).toMatchObject({
 			event_id: "e1",
 			stage: "failed",
 			batch_id: "b1",
 			dispatch_attempts: 2,
 			skipped_by: null,
 		});
-		upgraded.monitorEventUpdate("e1", "skipped");
+		upgraded.transaction((tx) => upgraded.monitors.eventUpdate(tx, "e1", "skipped"));
 		upgraded.close();
 		const after = new Database(path, { readonly: true });
 		const triggers = after
@@ -452,7 +458,7 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-drill-agents-md-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const current = await GatewayDatabase.open(path);
+		const current = await Store.open(path);
 		current.close();
 		// The state every host that applied migration 25 before `agents_md_epoch`
 		// and `agents_md_digest` were added to it is in: the version row is
@@ -463,7 +469,7 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		);
 		raw.close();
 
-		const upgraded = await GatewayDatabase.open(path);
+		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
 		upgraded.close();
 

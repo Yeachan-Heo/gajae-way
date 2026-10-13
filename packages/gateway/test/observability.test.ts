@@ -6,7 +6,7 @@ import type { LogLevel } from "@gajae-gateway/log";
 import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { noRelay, ScriptedSessionPort } from "./session-port.fake";
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
@@ -33,20 +33,24 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 	console.warn = capture("warn");
 	console.info = capture("info");
 	console.log = capture("info");
-	let database: GatewayDatabase | undefined;
+	let database: Store | undefined;
 	let manager: PersonaSessionManager | undefined;
 	let broker: GlobalGjcClient | undefined;
 	try {
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		database = await Store.open(join(home, "gateway.db"));
 		const ownedDatabase = database;
 		const canonicalAgentDir = join(home, "fake-user-agent");
 		const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-		ownedDatabase.assertBrokerAuthority(authority, { initializeEmpty: true });
+		ownedDatabase.transaction((tx) =>
+			ownedDatabase.bindings.initializeAuthority(tx, authority, ownedDatabase.inspectBrokerAuthority().populated),
+		);
 		const port = new ScriptedSessionPort();
 		const bind = port.bind.bind(port);
 		port.bind = async (input) => {
 			const binding = await bind(input);
-			expect(ownedDatabase.recordOwnedBinding({ ...binding, authority })).toBe(true);
+			expect(
+				ownedDatabase.transaction((tx) => ownedDatabase.bindings.recordOwnedBinding(tx, { ...binding, authority })),
+			).toBe(true);
 			return binding;
 		};
 		const originKey = "loopback/loopback/observability";
@@ -59,25 +63,29 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 		});
 		expect(
-			database.inboundEnqueue({
-				messageId: "m-1",
-				originKey,
-				originRefJson: JSON.stringify(origin),
-				body: "first",
-				receivedAt: new Date().toISOString(),
-			}),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-1",
+					originKey,
+					originRefJson: JSON.stringify(origin),
+					body: "first",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound(originKey);
 		await eventually(() => port.sends.length === 1, "initial persistent operation was not sent");
 		const first = port.sends[0]!;
 		expect(
-			database.inboundEnqueue({
-				messageId: "m-2",
-				originKey,
-				originRefJson: JSON.stringify(origin),
-				body: "steer this",
-				receivedAt: new Date().toISOString(),
-			}),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
+					messageId: "m-2",
+					originKey,
+					originRefJson: JSON.stringify(origin),
+					body: "steer this",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
 		).toBe(true);
 		await manager.notifyInbound(originKey);
 		await eventually(() => port.steers.length === 1, "steer was not delivered");

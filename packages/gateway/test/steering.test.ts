@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { PersonaSessionManager, renderSteer } from "../src/orchestrator/persona-session";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "steering" } as const;
 const ORIGIN_KEY = "loopback/loopback/steering";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let manager: PersonaSessionManager | undefined;
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
@@ -31,13 +31,15 @@ class SteeringTranscriptPort extends ScriptedSessionPort {
 
 function enqueue(messageId: string, body: string): void {
 	expect(
-		database?.inboundEnqueue({
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt: new Date().toISOString(),
-		}),
+		database?.transaction((tx) =>
+			database?.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt: new Date().toISOString(),
+			}),
+		),
 	).toBe(true);
 }
 
@@ -52,7 +54,7 @@ afterEach(async () => {
 
 test("a mid-turn message issues one steer, keeps one send, and is attributed in the running tail transcript", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(
 		database,
 		new SteeringTranscriptPort({
@@ -82,7 +84,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send did not become accepted");
 	const running = port.sends[0]!;
-	const batch = database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
+	const batch = database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 
 	enqueue("correction", "mention the rollback caveat");
 	await manager.notifyInbound(ORIGIN_KEY);
@@ -106,7 +108,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 			}),
 		]),
 	);
-	expect(database.inboundTurnRows(batch.opRef)).toEqual(
+	expect(database.inbox.turnRows(batch.opRef)).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({
 				message_id: "correction",
@@ -120,7 +122,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	port.complete(running.opRef, "done");
 	await eventually(
 		() =>
-			database?.inboundTurnRows(batch.opRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
+			database?.inbox.turnRows(batch.opRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"running batch did not complete after its tail terminal event",
 	);
 });
@@ -135,7 +137,7 @@ test("the steer header asks for the steered message's own reply instead of foldi
 
 test("a steered message is answered in its own mid-work reply, which closes the turn's steer window", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-reply-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(
 		database,
 		new ScriptedSessionPort({
@@ -177,12 +179,12 @@ test("a steered message is answered in its own mid-work reply, which closes the 
 	enqueue("third", "third request");
 	await manager.notifyInbound(ORIGIN_KEY);
 	expect(port.steers).toHaveLength(1);
-	expect(database.inboundPendingOldest(ORIGIN_KEY)?.message_id).toBe("third");
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)?.message_id).toBe("third");
 });
 
 test("a message arriving after a consumer-visible reply waits for the next turn instead of steering the answered turn", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-post-reply-boundary-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(
 		database,
 		new ScriptedSessionPort({
@@ -217,7 +219,7 @@ test("a message arriving after a consumer-visible reply waits for the next turn 
 	await manager.notifyInbound(ORIGIN_KEY);
 	expect(port.steers).toHaveLength(0);
 	expect(port.sends).toHaveLength(1);
-	expect(database.inboundPendingOldest(ORIGIN_KEY)?.message_id).toBe("follow-up");
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)?.message_id).toBe("follow-up");
 
 	port.complete(first.opRef, "first visible reply");
 	await eventually(() => port.sends.length === 2, "follow-up did not start as a fresh turn after settlement");
@@ -248,7 +250,7 @@ class TornSteerPort extends ScriptedSessionPort {
 
 test("a torn steer transport is replayed on the same clientRef, never rebinds the session, and the message is steered once", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(
 		database,
 		new TornSteerPort({
@@ -278,14 +280,14 @@ test("a torn steer transport is replayed on the same clientRef, never rebinds th
 	expect(logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 	expect(port.sends).toHaveLength(1);
 	expect(
-		database.inboundTurnRows(database.inboundNonterminalTurns(ORIGIN_KEY)[0]!.opRef).map((r) => r.message_id),
+		database.inbox.turnRows(database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!.opRef).map((r) => r.message_id),
 	).toEqual(["trigger", "torn"]);
-	expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 });
 
 test("a steer transport that stays torn HOLDS the row - the message may already be in the turn, so it is never re-sent elsewhere", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	class DeadTransportPort extends ScriptedSessionPort {
 		attempts = 0;
 		constructor() {
@@ -321,15 +323,15 @@ test("a steer transport that stays torn HOLDS the row - the message may already 
 	expect(logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 	expect(port.sends).toHaveLength(1);
 	// Held = durably attributed to the running turn, not an ordinary pending row.
-	expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 	const opRef = port.sends[0]!.opRef;
-	expect(database.inboundSteersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
+	expect(database.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
 	// The next admission retries the same clientRef; once the transport answers
 	// (here: the recorded acceptance), the row is attributed without a duplicate.
 	port.steer = async () => {};
 	await manager.notifyInbound(ORIGIN_KEY);
-	await eventually(() => database?.inboundSteersHeld(opRef).length === 0, "held steer was not retried");
-	expect(database.inboundTurnRows(opRef).map((r) => [r.message_id, r.turn_state])).toEqual([
+	await eventually(() => database?.inbox.steersHeld(opRef).length === 0, "held steer was not retried");
+	expect(database.inbox.turnRows(opRef).map((r) => [r.message_id, r.turn_state])).toEqual([
 		["trigger", "accepted"],
 		["maybe-landed", "done"],
 	]);
@@ -338,7 +340,7 @@ test("a steer transport that stays torn HOLDS the row - the message may already 
 
 test("a held steer survives the old turn's terminal and a restart: it is never dispatched as a new turn while its outcome is unknown", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	class TornPort extends ScriptedSessionPort {
 		torn = true;
 		attempts = 0;
@@ -376,18 +378,18 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 	// The old turn ends while the steer is still unresolved: it is NOT sent as
 	// a new turn (it may already be inside the answer) and stays held.
 	port.complete(opRef, "answer one");
-	await eventually(() => database?.inboundTurnRow(opRef)?.turn_state === "done", "old turn did not complete");
+	await eventually(() => database?.inbox.turnRow(opRef)?.turn_state === "done", "old turn did not complete");
 	expect(logs.some((line) => line.includes("reason=unresolved_at_terminal"))).toBe(true);
 	expect(port.sends).toHaveLength(1);
-	expect(database.inboundSteersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
-	expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	expect(database.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 	// A restart finds the hold in SQLite and does not dispatch it either.
 	await manager.stop();
 	manager = make();
 	await manager.recover();
 	await Bun.sleep(50);
 	expect(port.sends).toHaveLength(1);
-	expect(database.inboundSteersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
+	expect(database.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
 	// A definitive refusal on the same clientRef releases it: it is then an
 	// ordinary pending message and becomes the next turn, exactly once.
 	port.torn = false;
@@ -406,7 +408,7 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 // every sweep for an hour with `host hello did not arrive` - their session was gone.
 test("a held steer on a finished turn whose session is gone is closed with that turn, never re-sent or held forever", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	class DeadAfterTurnPort extends ScriptedSessionPort {
 		torn = true;
 		gone = false;
@@ -443,8 +445,8 @@ test("a held steer on a finished turn whose session is gone is closed with that 
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => logs.some((line) => line.startsWith("steer_hold")), "torn steer was not held");
 	port.complete(opRef, "answer one");
-	await eventually(() => database?.inboundTurnRow(opRef)?.turn_state === "done", "old turn did not complete");
-	expect(database.inboundSteersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
+	await eventually(() => database?.inbox.turnRow(opRef)?.turn_state === "done", "old turn did not complete");
+	expect(database.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["maybe-landed"]);
 
 	// A broker restart takes the session away; the replay can never be answered.
 	port.gone = true;
@@ -453,8 +455,8 @@ test("a held steer on a finished turn whose session is gone is closed with that 
 		() => logs.some((line) => line.startsWith("steer_abandoned") && line.includes("message=maybe-landed")),
 		"held steer on a dead session was not closed",
 	);
-	expect(database.inboundSteersHeld(opRef)).toEqual([]);
-	expect(database.inboundTurnRows(opRef).find((row) => row.message_id === "maybe-landed")).toMatchObject({
+	expect(database.inbox.steersHeld(opRef)).toEqual([]);
+	expect(database.inbox.turnRows(opRef).find((row) => row.message_id === "maybe-landed")).toMatchObject({
 		state: "done",
 		turn_state: "done",
 	});
@@ -469,7 +471,7 @@ for (const outcome of ["accepted", "refused"] as const) {
 	test(`recovery alone resolves a terminal turn's only held steer as ${outcome} on the original clientRef`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-held-only-recovery-"));
 		const dbPath = join(home, "gateway.db");
-		database = await GatewayDatabase.open(dbPath);
+		database = await Store.open(dbPath);
 		class HeldPort extends ScriptedSessionPort {
 			decidable = false;
 			readonly attempts: Parameters<ScriptedSessionPort["steer"]>[0][] = [];
@@ -499,19 +501,19 @@ for (const outcome of ["accepted", "refused"] as const) {
 		const running = port.sends[0]!;
 		enqueue("held-only", "second");
 		await manager.notifyInbound(ORIGIN_KEY);
-		expect(database.inboundSteersHeld(running.opRef).map((row) => row.message_id)).toEqual(["held-only"]);
+		expect(database.inbox.steersHeld(running.opRef).map((row) => row.message_id)).toEqual(["held-only"]);
 		port.complete(running.opRef, "first answer");
-		await eventually(() => database?.inboundTurnRow(running.opRef)?.turn_state === "done", "trigger did not settle");
+		await eventually(() => database?.inbox.turnRow(running.opRef)?.turn_state === "done", "trigger did not settle");
 		await manager.stop();
-		const epoch = database.getSessionRecord(ORIGIN_KEY)?.epoch;
+		const epoch = database.bindings.getSessionRecord(ORIGIN_KEY)?.epoch;
 		database.close();
-		database = await GatewayDatabase.open(dbPath);
+		database = await Store.open(dbPath);
 		port.bind = bind;
 		port.resume = resume;
 		attachTestBrokerOwnership(database, port, join(home, "agent"));
-		expect(database.inboundNonterminalOrigins()).toEqual([]);
-		expect(database.inboundPendingOrigins()).toEqual([]);
-		expect(database.inboundHeldSteerOrigins()).toEqual([ORIGIN_KEY]);
+		expect(database.inbox.nonterminalOrigins()).toEqual([]);
+		expect(database.inbox.pendingOrigins()).toEqual([]);
+		expect(database.inbox.heldSteerOrigins()).toEqual([ORIGIN_KEY]);
 		const attemptsBeforeRecovery = port.attempts.length;
 		const originalAttempt = port.attempts[0]!;
 		port.decidable = true;
@@ -525,10 +527,10 @@ for (const outcome of ["accepted", "refused"] as const) {
 		const { relay: _replayRelay, ...replayRequest } = port.attempts.at(-1)!;
 		expect(replayRequest).toEqual(originalRequest);
 		expect(originalAttempt.sessionId).toBe(running.sessionId);
-		expect(database.inboundSteersHeld(running.opRef)).toEqual([]);
-		expect(database.inboundHeldSteerOrigins()).toEqual([]);
+		expect(database.inbox.steersHeld(running.opRef)).toEqual([]);
+		expect(database.inbox.heldSteerOrigins()).toEqual([]);
 		if (outcome === "accepted") {
-			expect(database.inboundTurnRows(running.opRef)).toEqual(
+			expect(database.inbox.turnRows(running.opRef)).toEqual(
 				expect.arrayContaining([
 					expect.objectContaining({
 						message_id: "held-only",
@@ -545,14 +547,14 @@ for (const outcome of ["accepted", "refused"] as const) {
 			expect(port.sends[1]?.sessionId).toBe(running.sessionId);
 		}
 		expect(port.binds).toHaveLength(1);
-		expect(database.getSessionRecord(ORIGIN_KEY)?.epoch).toBe(epoch);
-		expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+		expect(database.bindings.getSessionRecord(ORIGIN_KEY)?.epoch).toBe(epoch);
+		expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 	});
 }
 
 test("a torn steer whose replay returns a definitive refusal waits for terminal then sends once on the same session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	class TornThenRefusedPort extends ScriptedSessionPort {
 		attempts = 0;
 		constructor() {
@@ -585,7 +587,7 @@ test("a torn steer whose replay returns a definitive refusal waits for terminal 
 	enqueue("refused", "second");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(
-		() => port.attempts === 2 && database?.inboundPendingOldest(ORIGIN_KEY)?.message_id === "refused",
+		() => port.attempts === 2 && database?.inbox.pendingOldest(ORIGIN_KEY)?.message_id === "refused",
 		"refused message was not returned to pending",
 	);
 	expect(port.attempts).toBe(2);
@@ -593,7 +595,7 @@ test("a torn steer whose replay returns a definitive refusal waits for terminal 
 	expect(port.steers.every((steer) => steer.sessionId === running.sessionId)).toBe(true);
 	expect(port.binds).toHaveLength(1);
 	expect(port.sends).toHaveLength(1);
-	expect(database.inboundTurnRow(running.opRef)?.turn_state).toBe("accepted");
+	expect(database.inbox.turnRow(running.opRef)?.turn_state).toBe("accepted");
 	expect(logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(0);
 	port.complete(running.opRef, "first answer");
 	await eventually(() => port.sends.length === 2, "refused message did not start after current terminal");
@@ -601,5 +603,5 @@ test("a torn steer whose replay returns a definitive refusal waits for terminal 
 	expect(port.sends[1]!.sessionId).toBe(running.sessionId);
 	expect(port.sends[1]!.opRef).not.toBe(running.opRef);
 	expect(port.binds).toHaveLength(1);
-	expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 });

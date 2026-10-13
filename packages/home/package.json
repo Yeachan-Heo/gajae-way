@@ -1,0 +1,13 @@
+{
+	"name": "@gajae-gateway/home",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "GAJAEWAY_HOME layout and the single kernel-flock lease primitive every gajae-way process uses to own a resource.",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"test": "bun test"
+	}
+}

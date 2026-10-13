@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type PersonaBindHoldInput, PersonaSessionManager } from "../src/orchestrator/persona-session";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 let manager: PersonaSessionManager | undefined;
 
 afterEach(async () => {
@@ -36,7 +36,7 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 
 async function harness(options: { maxLiveHosts: number; hostIdleRetireMs?: number; now?: () => number }) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-host-cap-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
 	const logs: string[] = [];
 	const holds: PersonaBindHoldInput[] = [];
@@ -62,7 +62,15 @@ async function harness(options: { maxLiveHosts: number; hostIdleRetireMs?: numbe
 	const send = async (name: string, body: string) => {
 		const { key, ref } = origin(name);
 		expect(
-			db.inboundEnqueue({ messageId: `${name}:${body}`, originKey: key, originRefJson: ref, body, source: "platform" }),
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, {
+					messageId: `${name}:${body}`,
+					originKey: key,
+					originRefJson: ref,
+					body,
+					source: "platform",
+				}),
+			),
 		).toBe(true);
 		await active.notifyInbound(key);
 	};
@@ -80,7 +88,7 @@ async function harness(options: { maxLiveHosts: number; hostIdleRetireMs?: numbe
 		port.complete(input.opRef, `answer to ${body}`);
 		await active.tick(key);
 		await eventually(
-			() => db.inboundTurnRow(input.opRef)?.turn_state === "done" && active.state(key) === "idle",
+			() => db.inbox.turnRow(input.opRef)?.turn_state === "done" && active.state(key) === "idle",
 			`turn ${body} did not settle`,
 		);
 	};

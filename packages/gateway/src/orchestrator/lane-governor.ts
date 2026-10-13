@@ -2,7 +2,7 @@ import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
-import type { GatewayDatabase } from "../store/db";
+import type { Store } from "../store";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 
@@ -74,7 +74,7 @@ export type LaneForceRetireReason = "session_dead" | "session_disowned";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
 export interface LaneGovernorOptions {
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly sessionPort: SessionPort;
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
@@ -92,7 +92,7 @@ export interface LaneGovernorOptions {
  * name creates a fresh session instead of resuming a stale one.
  */
 export class LaneGovernor {
-	readonly #database: GatewayDatabase;
+	readonly #database: Store;
 	readonly #port: SessionPort;
 	readonly maxLanes: number;
 	readonly idleRetireMs: number;
@@ -129,7 +129,7 @@ export class LaneGovernor {
 	}
 
 	activeLanes(now = this.#now()): ActiveLane[] {
-		return this.#database.workLaneRows().map((row) => {
+		return this.#database.bindings.workLaneRows().map((row) => {
 			const name = row.origin_key.slice(WORK_LANE_PREFIX.length);
 			const job = this.#job(name);
 			const activityMs = row.last_activity_at ? Date.parse(row.last_activity_at) : Number.NaN;
@@ -153,7 +153,7 @@ export class LaneGovernor {
 	 */
 	assertAdmission(name: string): void {
 		const { jobId } = laneJobIdentity(name);
-		if (this.#database.isBrokerQuarantined("work", jobId))
+		if (this.#database.bindings.isQuarantined("work", jobId))
 			throw new ProtocolError("verb_failed", "work lane belongs to a quarantined broker authority", {
 				reasonCode: "broker_authority_quarantined",
 				jobId,
@@ -162,7 +162,7 @@ export class LaneGovernor {
 		const allLanes = this.activeLanes();
 		// Filter out quarantined lanes from capacity count
 		const lanes = allLanes.filter(
-			(lane) => !this.#database.isBrokerQuarantined("work", laneJobIdentity(lane.name).jobId),
+			(lane) => !this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId),
 		);
 		if (lanes.some((lane) => lane.name === name)) return;
 		if (lanes.length < this.maxLanes) return;
@@ -196,7 +196,7 @@ export class LaneGovernor {
 	 * rebound to a new one is left alone.
 	 */
 	retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
-		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
 				sessionKey: workSessionKey(name),
@@ -220,7 +220,7 @@ export class LaneGovernor {
 
 	#retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
-		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
 		// Refuse an unsettled lane now rather than queuing retirement behind its
 		// turn; the same check repeats under the lock because a run may start
@@ -228,7 +228,7 @@ export class LaneGovernor {
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (preflight?.attemptOpen) return Promise.resolve(unsettled(sessionKey, preflight));
 		return this.#port.runExclusive(sessionKey, async () => {
-			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
@@ -247,13 +247,13 @@ export class LaneGovernor {
 			// In singleton mode: process.cwd() is safe (no broker enforcing repo matching).
 			let repo = record?.lane.worktreePath;
 			if (!repo) {
-				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+				repo = this.#database.bindings.workLaneRepoBySessionId(lane.sessionId);
 			}
 			if (!repo) {
 				// No job record and no owned binding repo.
 				// Check if we're in broker mode: if so, this is an orphan.
 				// If not, fall back to process.cwd() (safe in singleton mode).
-				if (this.#database.isBrokerMode()) {
+				if (this.#database.bindings.isBrokerMode()) {
 					// Broker mode: cannot close safely without knowing the repo.
 					this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
 					return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
@@ -293,7 +293,45 @@ export class LaneGovernor {
 					"error",
 				);
 			}
-			this.#database.rebindEpoch(sessionKey);
+			// Only a non-forced operator retirement (no sweep nomination) deletes the
+			// runtime-created worktree and branch. A sweep is unattended: the lane must stay
+			// resumable and its unpushed commits must survive.
+			if (!expected && record?.lane.worktreePath && record.lane.repository) {
+				try {
+					// Remove the worktree using git worktree remove --force
+					const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", record.lane.worktreePath], {
+						cwd: record.lane.repository,
+						stdout: "ignore",
+						stderr: "ignore",
+					});
+
+					// Delete the branch using git branch -D
+					if (removeResult.exitCode === 0) {
+						const branchName = `work/${name.toLowerCase()}`;
+						const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
+							cwd: record.lane.repository,
+							stdout: "ignore",
+							stderr: "ignore",
+						});
+						if (branchResult.exitCode !== 0) {
+							this.#log(
+								`lane_branch_delete_failed name=${name} session=${lane.sessionId} branch=${branchName}`,
+								"warn",
+							);
+						}
+					} else {
+						this.#log(
+							`lane_worktree_remove_failed name=${name} session=${lane.sessionId} path=${record.lane.worktreePath}`,
+							"warn",
+						);
+					}
+				} catch (error) {
+					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
+					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "warn");
+				}
+			}
+
+			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
 			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${reason} closed=${closed}`, "info");
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed };
 		});
@@ -330,7 +368,7 @@ export class LaneGovernor {
 	 * the epoch with reason operator_force.
 	 */
 	forceRetire(name: string): Promise<LaneRetireOutcome> {
-		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
 				sessionKey: workSessionKey(name),
@@ -360,14 +398,14 @@ export class LaneGovernor {
 
 	#forceRetire(name: string): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
-		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
 		// Unlike normal retire, we check the lane exists but do NOT check if an attempt is open.
 		// We will only close if liveness proves the session is dead/disowned.
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (!preflight) return Promise.resolve({ retired: false, sessionKey, reason: "no bound lane for that name" });
 		return this.#port.runExclusive(sessionKey, async () => {
-			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			const lane = this.activeLanes().find((candidate) => candidate.name === name);
@@ -376,10 +414,10 @@ export class LaneGovernor {
 			const record = job === "corrupt" ? undefined : job;
 			let repo = record?.lane.worktreePath;
 			if (!repo) {
-				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+				repo = this.#database.bindings.workLaneRepoBySessionId(lane.sessionId);
 			}
 			if (!repo) {
-				if (this.#database.isBrokerMode()) {
+				if (this.#database.bindings.isBrokerMode()) {
 					this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
 					return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
 				}
@@ -417,7 +455,7 @@ export class LaneGovernor {
 				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
 				// For force retire, we proceed even if close fails since we have liveness proof.
 			}
-			this.#database.rebindEpoch(sessionKey);
+			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
 			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=operator_force closed=${closed}`);
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed, forced: true };
 		});
@@ -431,15 +469,15 @@ export class LaneGovernor {
 		if (this.#stopped) return { count: 0, names: [] };
 		const retired: string[] = [];
 		for (const lane of this.activeLanes(now)) {
-			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(lane.name).jobId)) continue;
+			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId)) continue;
 			const job = this.#job(lane.name);
 			const record = job === "corrupt" ? undefined : job;
 			let repo = record?.lane.worktreePath;
 			if (!repo) {
-				repo = this.#database.workLaneRepoBySessionId(lane.sessionId);
+				repo = this.#database.bindings.workLaneRepoBySessionId(lane.sessionId);
 			}
 			if (!repo) {
-				if (this.#database.isBrokerMode()) {
+				if (this.#database.bindings.isBrokerMode()) {
 					continue; // Skip orphan lanes
 				}
 				repo = process.cwd();
@@ -525,7 +563,7 @@ export class LaneGovernor {
 
 	/** `undefined` when no job row exists; `"corrupt"` when one exists but cannot be trusted. */
 	#job(name: string): LaneJobRecord | "corrupt" | undefined {
-		const json = this.#database.laneJobJson(laneJobIdentity(name).jobId);
+		const json = this.#database.work.laneJobJson(laneJobIdentity(name).jobId);
 		// A row that exists with an empty body is damage, not absence.
 		if (json === undefined) return undefined;
 		try {

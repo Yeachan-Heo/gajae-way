@@ -8,8 +8,11 @@ import {
 	type TriggerSpec,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
-import type { GatewayDatabase } from "../store/db";
+import type { Store } from "../store";
+import type { MonitorCronState } from "../store/groups/monitors";
 import { validateProcedureFiles } from "./procedure";
+
+const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
 const OVERLAP_POLICIES = new Set(["queue", "skip"]);
@@ -30,8 +33,8 @@ const MONITOR_UPDATE_FIELDS = new Set([
 export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
 
 export class MonitorRegistry {
-	readonly #database: GatewayDatabase;
-	constructor(database: GatewayDatabase) {
+	readonly #database: Store;
+	constructor(database: Store) {
 		this.#database = database;
 	}
 	add(spec: MonitorSpec): MonitorRecord {
@@ -55,8 +58,8 @@ export class MonitorRegistry {
 			procedureFiles,
 			createdAt: new Date().toISOString(),
 		};
-		this.#database.withTransaction(() =>
-			this.#database.monitorCreate({
+		this.#database.transaction((tx) =>
+			this.#database.monitors.create(tx, {
 				id: record.monitorId,
 				name: record.name,
 				triggerJson: JSON.stringify(record.trigger),
@@ -75,7 +78,7 @@ export class MonitorRegistry {
 	}
 	list(): MonitorRecord[] {
 		const records: MonitorRecord[] = [];
-		for (const row of this.#database.monitorRows()) {
+		for (const row of this.#database.monitors.rows()) {
 			try {
 				records.push(rowToRecord(row));
 			} catch {
@@ -98,7 +101,7 @@ export class MonitorRegistry {
 			throw new Error("use either schedule or trigger when updating a monitor");
 		if (schedule === undefined && Object.keys(patch).length === 0) throw new Error("monitor update requires a change");
 
-		return this.#database.withTransaction(() => {
+		return this.#database.transaction((tx) => {
 			const current = this.get(monitorId);
 			if (!current) return undefined;
 			let trigger = current.trigger;
@@ -129,7 +132,7 @@ export class MonitorRegistry {
 			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
-			const persisted = this.#database.monitorUpdate({
+			const persisted = this.#database.monitors.update(tx, {
 				id: current.monitorId,
 				name: updated.name,
 				triggerJson: JSON.stringify(updated.trigger),
@@ -146,11 +149,45 @@ export class MonitorRegistry {
 		});
 	}
 	remove(monitorId: string): boolean {
-		return this.#database.withTransaction(() => this.#database.monitorDelete(monitorId));
+		return this.#database.transaction((tx) => {
+			const deleted = this.#database.monitors.delete(tx, monitorId);
+			this.#database.core.metaDelete(monitorCronMetaKey(monitorId));
+			return deleted;
+		});
+	}
+
+	cronCursor(monitorId: string): string | undefined {
+		const claimed = this.#database.monitors.slotCursor(monitorId);
+		const skipped = this.cronState(monitorId)?.cursor;
+		if (!claimed) return skipped;
+		if (!skipped) return claimed;
+		return Date.parse(skipped) > Date.parse(claimed) ? skipped : claimed;
+	}
+
+	cronState(monitorId: string): MonitorCronState | undefined {
+		const raw = this.#database.core.metaGet(monitorCronMetaKey(monitorId));
+		return raw === undefined ? undefined : (JSON.parse(raw) as MonitorCronState);
+	}
+
+	recordCronSkip(
+		monitorId: string,
+		skip: { count: number; oldest: string; newest: string },
+		recordedAt: string,
+	): MonitorCronState {
+		return this.#database.transaction(() => {
+			const previous = this.cronState(monitorId);
+			const state: MonitorCronState = {
+				cursor: skip.newest,
+				skippedTotal: (previous?.skippedTotal ?? 0) + skip.count,
+				lastSkip: { ...skip, recordedAt },
+			};
+			this.#database.core.metaSet(monitorCronMetaKey(monitorId), JSON.stringify(state));
+			return state;
+		});
 	}
 }
 
-function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): MonitorRecord {
+function rowToRecord(row: ReturnType<Store["monitors"]["rows"]>[number]): MonitorRecord {
 	const trigger = JSON.parse(row.trigger_json) as TriggerSpec;
 	const record: MonitorRecord = {
 		monitorId: row.monitor_id,

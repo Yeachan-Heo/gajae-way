@@ -1,14 +1,14 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryClosureQueue } from "../src/memory/closure";
 import { memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { validateMemory } from "../src/memory/validator";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 
 let home = "";
-let database: GatewayDatabase | undefined;
+let database: Store | undefined;
 afterEach(async () => {
 	database?.close();
 	database = undefined;
@@ -18,7 +18,7 @@ afterEach(async () => {
 
 test("serializes concurrent memory mutations into receipted linear commits", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const queue = new MemoryClosureQueue(database, home);
 	await queue.initialize();
 	await Promise.all(
@@ -34,13 +34,16 @@ test("serializes concurrent memory mutations into receipted linear commits", asy
 		),
 	);
 	await queue.drain();
-	expect(database.memoryIntentRows().every((intent) => intent.state === "receipted")).toBe(true);
-	expect((await readFile(join(home, "memory-receipts.jsonl"), "utf8")).trim().split("\n")).toHaveLength(20);
+	const intents = database.memory.rows();
+	expect(intents).toHaveLength(20);
+	expect(intents.every((intent) => intent.state === "receipted")).toBe(true);
+	const mutationCommits = await memoryGit(memoryRoot(home), ["log", "--format=%H", "--grep", "Gajaeway-Mutation-Id:"]);
+	expect(mutationCommits.split("\n").filter(Boolean)).toHaveLength(20);
 	expect(await validateMemory(memoryRoot(home))).toEqual([]);
 });
 test("a closure commit tracks every axis, not only the capture axis", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const queue = new MemoryClosureQueue(database, home);
 	await queue.initialize();
 	const root = memoryRoot(home);
@@ -63,12 +66,14 @@ test("a closure commit tracks every axis, not only the capture axis", async () =
 
 test("a failing memory intent is contained at the worker and later intents still close (#227)", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const queue = new MemoryClosureQueue(database, home);
 	await queue.initialize();
 
 	const broken = crypto.randomUUID();
-	database.memoryIntentCreate({ id: broken, kind: "daily_capture", payloadJson: "{}" });
+	database!.transaction((tx) =>
+		database!.memory.createIntent(tx, { id: broken, kind: "daily_capture", payloadJson: "{}" }),
+	);
 	queue.enqueueExistingId(broken);
 	const good = queue.enqueue({ kind: "daily_capture", originRefJson: "{}", userText: "u", replyText: "r" });
 
@@ -76,7 +81,7 @@ test("a failing memory intent is contained at the worker and later intents still
 	// and the good intent behind it never ran.
 	await queue.drain();
 	expect(queue.failures).toBe(1);
-	const states = new Map(database.memoryIntentRows().map((row) => [row.id, row.state]));
+	const states = new Map(database.memory.rows().map((row) => [row.id, row.state]));
 	expect(states.get(good)).toBe("receipted");
 	// The failed intent stays non-terminal so boot recovery retries it.
 	expect(states.get(broken)).toBe("queued");
@@ -84,7 +89,7 @@ test("a failing memory intent is contained at the worker and later intents still
 
 test("a rejected memory git commit is contained, keeps its reason, and later intents still close (#192)", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	database = await Store.open(join(home, "gateway.db"));
 	const queue = new MemoryClosureQueue(database, home);
 	await queue.initialize();
 	const root = memoryRoot(home);
@@ -118,7 +123,7 @@ test("a rejected memory git commit is contained, keeps its reason, and later int
 	// The process is alive (we are still running), the git failure was recorded
 	// with its reason, and the queue moved on to the next intent.
 	expect(queue.failures).toBe(1);
-	const states = new Map(database.memoryIntentRows().map((row) => [row.id, row.state]));
+	const states = new Map(database.memory.rows().map((row) => [row.id, row.state]));
 	expect(states.get(rejected)).toBe("written");
 	expect(states.get(good)).toBe("receipted");
 	const report = errors.find((line) => line.includes(`memory intent ${rejected} failed`));

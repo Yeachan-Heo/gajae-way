@@ -1,14 +1,14 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatProgressPayload } from "@gajae-gateway/protocol";
-import { AdapterAlreadyRunningError, AdapterLock } from "../../adapter-discord/src/lock";
+
 import { liveGateway, stopLiveGatewaysAfterEach } from "../../adapter-slack/test/live-gateways";
 import { GajaewayClient } from "../../sdk/src/index";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
 
 stopLiveGatewaysAfterEach();
@@ -34,6 +34,7 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
@@ -41,7 +42,7 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 		channels,
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = attachTestBrokerOwnership(
 		database,
@@ -66,6 +67,9 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 		async addReaction(...args: [string, string, string]) {
 			reactions.push(args);
 		},
+		async removeReaction(_channel: string, _ts: string, _name: string) {
+			// Mock remove
+		},
 	});
 	await adapter.connect();
 	client = await GajaewayClient.connectSocket(config.socketPath);
@@ -79,7 +83,7 @@ test("RT-SLACK-20 unconfigured unmentioned Slack channel is context only", async
 	await settle();
 	expect(f.turns).toEqual([]);
 	expect(f.posts).toEqual([]);
-	expect(f.database.deliveryRows()).toEqual([]);
+	expect(f.database.outbox.rows()).toEqual([]);
 });
 
 test("RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary", async () => {
@@ -89,7 +93,7 @@ test("RT-SLACK-21 mention-open engages and persona markup is escaped at Slack bo
 	expect(f.turns).toHaveLength(1);
 	// A channel mention is answered in a thread rooted at the triggering message.
 	expect(f.posts).toEqual([["C1", "&lt;script&gt;&amp;", "1.0"]]);
-	expect(f.database.deliveryRows()[0]?.state).toBe("confirmed");
+	expect(f.database.outbox.rows()[0]?.state).toBe("confirmed");
 });
 
 test("RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram", async () => {
@@ -100,7 +104,7 @@ test("RT-SLACK-22 check reaction token delivers on Slack and is refused on Teleg
 	await f.adapter.requestInbound("C1:1.0", origin, "check", engagement);
 	await settle();
 	expect(f.reactions).toEqual([["C1", "1.0", "white_check_mark"]]);
-	expect(f.database.deliveryRows()[0]?.state).toBe("confirmed");
+	expect(f.database.outbox.rows()[0]?.state).toBe("confirmed");
 	await f.client.request("chat.send", {
 		origin: { platform: "telegram", kind: "channel", conversationId: "C2" },
 		messageId: "2",
@@ -110,8 +114,8 @@ test("RT-SLACK-22 check reaction token delivers on Slack and is refused on Teleg
 	await settle();
 	expect(f.turns).toHaveLength(2);
 	expect(
-		f.database
-			.deliveryRows()
+		f.database.outbox
+			.rows()
 			.filter((row) => row.origin_key.startsWith("telegram") && JSON.parse(row.payload_json).reaction),
 	).toEqual([]);
 	await expect(
@@ -132,7 +136,7 @@ test("RT-SLACK-23 monitor and loopback cannot chat.react", async () => {
 		await expect(
 			f.client.request("chat.react", { origin: blocked, targetMessageId: "C1:1.0", emoji: "✅" }),
 		).rejects.toThrow();
-	expect(f.database.deliveryRows()).toEqual([]);
+	expect(f.database.outbox.rows()).toEqual([]);
 });
 
 test("RT-SLACK-24 thread and channel isolate sessions and route replies", async () => {
@@ -146,7 +150,7 @@ test("RT-SLACK-24 thread and channel isolate sessions and route replies", async 
 	);
 	await settle();
 	expect(
-		f.database
+		f.database.bindings
 			.sessionRows()
 			.map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId)
 			.sort(),
@@ -156,7 +160,7 @@ test("RT-SLACK-24 thread and channel isolate sessions and route replies", async 
 		["C1", "answer", "1.0"],
 		["C1", "answer", "1.0"],
 	]);
-	expect(f.database.deliveryRows().map((row) => row.state)).toEqual(["confirmed", "confirmed"]);
+	expect(f.database.outbox.rows().map((row) => row.state)).toEqual(["confirmed", "confirmed"]);
 });
 
 for (const explicit of [false, true]) {
@@ -180,7 +184,7 @@ for (const explicit of [false, true]) {
 			expect(post[2]).toBe(explicit ? "9.0" : "1.0");
 		}
 		expect(f.posts.map((post) => post[1]).join("")).toBe(text);
-		expect(f.database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+		expect(f.database.outbox.rows().every((row) => row.state === "confirmed")).toBe(true);
 	});
 }
 
@@ -195,24 +199,6 @@ test("RT-SLACK-34 plain channel reply threads under the triggering message; an e
 	expect(explicit.posts).toEqual([["C1", "elsewhere", "9.0"]]);
 });
 
-test("RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims", async () => {
-	const lockHome = await mkdtemp(join(tmpdir(), "slack-discord-lock-redteam-"));
-	try {
-		const path = join(lockHome, "adapter-discord.pid");
-		await writeFile(path, "99999\n");
-		const results = await Promise.allSettled(
-			Array.from({ length: 20 }, (_, i) => AdapterLock.acquire(lockHome, { pid: i + 1, alive: () => false })),
-		);
-		const winners = results.filter((r) => r.status === "fulfilled");
-		expect(winners).toHaveLength(1);
-		for (const result of results)
-			if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
-		expect((await readFile(path, "utf8")).trim()).toBe(String(winners[0]?.value.pid));
-	} finally {
-		await rm(lockHome, { recursive: true, force: true });
-	}
-});
-
 for (const platform of ["slack", "discord", "telegram"] as const) {
 	test(`RT-SLACK-46 ${platform} channel triggering root preserves platform routing on redelivery`, async () => {
 		const f = await fixture({ [`${platform}:C1`]: { engagement: "mention-open" } }, "answer");
@@ -222,7 +208,7 @@ for (const platform of ["slack", "discord", "telegram"] as const) {
 		await settle();
 		await f.client.request("chat.send", params);
 		await settle();
-		const rows = f.database.deliveryRows();
+		const rows = f.database.outbox.rows();
 		expect(rows).toHaveLength(1);
 		const payload = JSON.parse(rows[0]!.payload_json);
 		expect(payload.replyToMessageId).toBe(platform === "slack" ? messageId : undefined);
@@ -248,6 +234,7 @@ test("RT-SLACK-50 real socket activity bounds burst details thinking writing and
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
@@ -255,7 +242,7 @@ test("RT-SLACK-50 real socket activity bounds burst details thinking writing and
 		dmPolicy: "open",
 		channels: { "slack:C1": { engagement: "mention-open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
 	server = await startUnixServer({
 		config,
@@ -302,45 +289,6 @@ test("RT-SLACK-50 real socket activity bounds burst details thinking writing and
 	expect(progress.filter((p) => p.final)).toHaveLength(1);
 });
 
-for (const live of [true, false]) {
-	test(`RT-SLACK-45 discord ${live ? "live marker survives and timeout names pidfile holder" : "dead marker elects one of two waiters"}`, async () => {
-		home = await mkdtemp(join(tmpdir(), "discord-marker-g4-"));
-		const path = join(home, "adapter-discord.pid");
-		const marker = `${path}.reclaim.d`;
-		await writeFile(path, "99999\n");
-		await mkdir(marker);
-		await writeFile(join(marker, "owner"), "88888\n");
-		const aged = new Date(Date.now() - (live ? 900 : 2000));
-		await utimes(marker, aged, aged);
-		const inode = (await stat(marker)).ino;
-		const pending = Promise.allSettled(
-			[1, 2].map((pid) =>
-				AdapterLock.acquire(home, { pid, alive: (owner) => live && (owner === 88888 || owner === 77777) }),
-			),
-		);
-		if (live) {
-			await Bun.sleep(30);
-			await writeFile(path, "77777\n");
-		}
-		const results = await pending;
-		if (live) {
-			expect((await stat(marker)).ino).toBe(inode);
-			for (const result of results) {
-				expect(result.status).toBe("rejected");
-				if (result.status === "rejected") {
-					expect(result.reason.holderPid).toBe(77777);
-					expect(result.reason.message).toContain("77777");
-				}
-			}
-		} else {
-			const winners = results.filter((result) => result.status === "fulfilled");
-			expect(winners).toHaveLength(1);
-			expect(await readFile(path, "utf8")).toBe(`${winners[0]?.value.pid}\n`);
-			await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
-		}
-	});
-}
-
 for (const silent of [false, true])
 	test(`RT-SLACK-56 real gateway presence precedes progress and clears ${silent ? "silent final" : "thread delivery"}`, async () => {
 		const { WorkingStatus } = await import("../../adapter-slack/src/status");
@@ -348,6 +296,7 @@ for (const silent of [false, true])
 		const config: GatewayConfig = {
 			schemaVersion: 1,
 			home,
+			gjc: { agentDir: join(home, "agent") },
 			configPath: join(home, "config.json"),
 			socketPath: join(home, "gateway.sock"),
 			dbPath: join(home, "gateway.db"),
@@ -355,7 +304,7 @@ for (const silent of [false, true])
 			dmPolicy: "open",
 			channels: { "slack:C1": { engagement: "mention-open" } },
 		};
-		const database = await GatewayDatabase.open(config.dbPath);
+		const database = await Store.open(config.dbPath);
 		const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
 		server = await startUnixServer({
 			config,
@@ -395,7 +344,7 @@ for (const silent of [false, true])
 		await settle();
 		expect(removed).toEqual(added);
 		expect(posts).toEqual(silent ? [] : [["C1", "answer", "1.0"]]);
-		expect(database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+		expect(database.outbox.rows().every((row) => row.state === "confirmed")).toBe(true);
 	});
 
 test("RT-SLACK-63 edited channel response uses original root and slash new remains unthreaded", async () => {

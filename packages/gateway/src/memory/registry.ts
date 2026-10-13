@@ -69,7 +69,7 @@ const ID = /^[a-z][a-z0-9-]*$/;
 // name the same directory while the registry believed they were two axes.
 const SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
 /** Names the corpus already owns; an axis rooted at one of them would collide with a file. */
-const RESERVED_ROOTS = new Set(["memory.md", "axes.json", "memory-receipts.jsonl", ".git"]);
+const RESERVED_ROOTS = new Set(["memory.md", "axes.json", ".git"]);
 
 export class AxisRegistryError extends Error {
 	readonly code:

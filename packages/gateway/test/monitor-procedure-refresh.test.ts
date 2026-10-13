@@ -6,8 +6,7 @@ import { DeliveryService } from "../src/delivery/delivery";
 import { MONITOR_PROCEDURE_MAX_BYTES } from "../src/monitors/procedure";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 /** Real registry + propagator over one long-lived event-type session (no roll between firings). */
@@ -16,7 +15,7 @@ async function harness(home: string) {
 	await mkdir(join(home, "memory", "ops"), { recursive: true });
 	await mkdir(workspace, { recursive: true });
 	await symlink("../memory", join(workspace, "memory"), "dir");
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const prompts: string[] = [];
 	const sessions = new Set<string>();
@@ -41,7 +40,7 @@ async function harness(home: string) {
 		sessionPort,
 		repo: workspace,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-		delivery: new DeliveryService(new DeliveryLedger(database)),
+		delivery: new DeliveryService(database),
 		emit: () => {},
 	});
 	return { database, registry, pipeline, prompts, sessions, workspace };
@@ -82,7 +81,7 @@ test("a procedure edit reaches the very next firing of a long-lived event-type s
 		expect(prompts[1]).toContain(sha256(after).slice(0, 12));
 
 		// Each authored event records the procedure version that produced it.
-		const [second, first] = database.monitorEventRows(monitor.monitorId);
+		const [second, first] = database.monitors.eventRows(monitor.monitorId);
 		expect(first?.stage).toBe("authored_no_delivery");
 		expect(JSON.parse(first!.procedure_json!)).toEqual([
 			expect.objectContaining({ path: "memory/ops/gajaeway-feedback.md", status: "ok", sha256: sha256(before) }),
@@ -113,7 +112,7 @@ test("procedure files are confined to the workspace and report their state inste
 		await pipeline.submitAwaitable(monitor.monitorId, "confined.check", {});
 		expect(prompts).toHaveLength(1);
 		expect(prompts[0]).not.toContain("secret doctrine");
-		const [row] = database.monitorEventRows(monitor.monitorId);
+		const [row] = database.monitors.eventRows(monitor.monitorId);
 		expect(row?.stage).toBe("authored_no_delivery");
 		expect(JSON.parse(row!.procedure_json!).map((entry: { status: string }) => entry.status)).toEqual([
 			"outside_root",
@@ -153,7 +152,7 @@ test("a monitor without procedure files keeps the pre-existing prompt and record
 		});
 		await pipeline.submitAwaitable(monitor.monitorId, "p", {});
 		expect(prompts[0]!.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
-		expect(database.monitorEventRows(monitor.monitorId)[0]?.procedure_json).toBeNull();
+		expect(database.monitors.eventRows(monitor.monitorId)[0]?.procedure_json).toBeNull();
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });

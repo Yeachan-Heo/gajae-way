@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
@@ -20,13 +20,14 @@ test("chat.progress emits periodically from turn start even before tail frames, 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
@@ -121,13 +122,14 @@ test("chat.progress without tail frames for >90s still yields periodic progress 
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
@@ -203,13 +205,14 @@ test("a started server drives the persona tail stall heartbeat and stops it on s
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
@@ -237,13 +240,14 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	// SessionPort no longer has a progress() member at all; a compile-time
@@ -307,13 +311,14 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
@@ -372,13 +377,14 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort({ onBind: ({ epoch }) => `session-${epoch}` });
 	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({

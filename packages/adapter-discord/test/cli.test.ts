@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AdapterAlreadyRunningError, AdapterLock, processIsAlive } from "../src/lock";
+
 import { DISCORD_USAGE, parseDiscordArgs, USAGE_EXIT_CODE } from "../src/main";
 
 describe("argv is resolved before any connection work", () => {
@@ -39,8 +40,10 @@ describe("the binary answers --help without booting an adapter", () => {
 				new Response(child.stderr).text(),
 				child.exited,
 			]);
-			// Booting would have written the lock and then failed on the missing config.
-			expect(await Bun.file(join(home, "adapter-discord.pid")).exists()).toBe(false);
+			// Usage-only invocation must not create an adapter lease.
+
+			expect(await Bun.file(join(home, "leases", "adapter-discord")).exists()).toBe(false);
+
 			return { code, stdout, stderr };
 		} finally {
 			await rm(home, { recursive: true, force: true });
@@ -64,152 +67,4 @@ describe("the binary answers --help without booting an adapter", () => {
 		expect(result.code).toBe(USAGE_EXIT_CODE);
 		expect(result.stderr).toContain(DISCORD_USAGE);
 	}, 30_000);
-});
-
-describe("a second adapter instance refuses to boot", () => {
-	/** Whether this platform lets a directory's mtime be refreshed (darwin returned EINVAL under Bun). */
-	async function directoryTouchSupported(): Promise<boolean> {
-		const probe = await mkdtemp(join(tmpdir(), "discord-touch-probe-"));
-		try {
-			const seconds = Date.now() / 1000;
-			await utimes(probe, seconds, seconds);
-			return true;
-		} catch {
-			return false;
-		} finally {
-			await rm(probe, { recursive: true, force: true });
-		}
-	}
-
-	async function withHome(body: (home: string) => Promise<void>): Promise<void> {
-		const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-lock-"));
-		try {
-			await body(home);
-		} finally {
-			await rm(home, { recursive: true, force: true });
-		}
-	}
-
-	test("the first instance records its pid in the home", async () => {
-		await withHome(async (home) => {
-			const lock = await AdapterLock.acquire(home, { pid: 4242, alive: () => true });
-			expect(lock.path).toBe(join(home, "adapter-discord.pid"));
-			expect((await readFile(lock.path, "utf8")).trim()).toBe("4242");
-		});
-	});
-
-	test("a second instance is refused while the holder is alive", async () => {
-		await withHome(async (home) => {
-			await AdapterLock.acquire(home, { pid: 4242, alive: () => true });
-			const attempt = AdapterLock.acquire(home, { pid: 5353, alive: () => true });
-			await expect(attempt).rejects.toBeInstanceOf(AdapterAlreadyRunningError);
-			await expect(attempt).rejects.toThrow(/pid 4242/);
-			// The refusal must not have stolen the lock from the live holder.
-			expect((await readFile(join(home, "adapter-discord.pid"), "utf8")).trim()).toBe("4242");
-		});
-	});
-
-	test("a pidfile from a dead process is reclaimed, not a permanent block", async () => {
-		await withHome(async (home) => {
-			await writeFile(join(home, "adapter-discord.pid"), "4242\n");
-			const lock = await AdapterLock.acquire(home, { pid: 5353, alive: () => false });
-			expect((await readFile(lock.path, "utf8")).trim()).toBe("5353");
-		});
-	});
-
-	test("a winner slower than the reclaim window keeps its election", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "adapter-discord.pid");
-			await writeFile(path, "99999\n");
-			let reachedPidfileWrite = 0;
-			const results = await Promise.allSettled(
-				Array.from({ length: 20 }, (_, i) =>
-					AdapterLock.acquire(home, {
-						pid: i + 1,
-						alive: () => false,
-						beforePidfileWrite: async () => {
-							reachedPidfileWrite++;
-							await Bun.sleep(1250);
-						},
-					}),
-				),
-			);
-			const winners = results.filter((result) => result.status === "fulfilled");
-			expect(winners).toHaveLength(1);
-			// An election refreshed by its live owner is never reclaimable, so no
-			// second contender is ever elected into the pidfile write. The touch is
-			// advisory, so this is asserted only where the platform supports it.
-			if (await directoryTouchSupported()) expect(reachedPidfileWrite).toBe(1);
-			for (const result of results)
-				if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
-			const winner = winners[0]!.value;
-			expect(await readFile(path, "utf8")).toBe(`${winner.pid}\n`);
-			expect((await readdir(home)).filter((name) => name.includes(".reclaim.d") || name.endsWith(".dead"))).toEqual([]);
-			await winner.release();
-		});
-	}, 10000);
-
-	test("a displaced winner never overwrites the pidfile of the contender that replaced it", async () => {
-		await withHome(async (home) => {
-			const path = join(home, "adapter-discord.pid");
-			const election = `${path}.reclaim.d`;
-			await writeFile(path, "99999\n");
-			let backdated = false;
-			const results = await Promise.allSettled(
-				Array.from({ length: 20 }, (_, i) =>
-					AdapterLock.acquire(home, {
-						pid: i + 1,
-						alive: () => false,
-						beforePidfileWrite: async () => {
-							if (backdated) return;
-							backdated = true;
-							// Outrun this winner's own heartbeat so a waiting contender really
-							// does reclaim the election mid-critical-section.
-							for (let tick = 0; tick < 80; tick++) {
-								const aged = new Date(Date.now() - 5000);
-								await utimes(election, aged, aged).catch(() => {});
-								await Bun.sleep(50);
-							}
-						},
-					}),
-				),
-			);
-			const winners = results.filter((result) => result.status === "fulfilled");
-			expect(winners).toHaveLength(1);
-			for (const result of results)
-				if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
-			const winner = winners[0]!.value;
-			expect(await readFile(path, "utf8")).toBe(`${winner.pid}\n`);
-			await winner.release();
-		});
-	}, 30000);
-
-	test("an unparseable pidfile is stale, not a live holder", async () => {
-		await withHome(async (home) => {
-			await writeFile(join(home, "adapter-discord.pid"), "");
-			const lock = await AdapterLock.acquire(home, {
-				pid: 5353,
-				alive: () => {
-					throw new Error("liveness must not be consulted for an unreadable holder");
-				},
-			});
-			expect((await readFile(lock.path, "utf8")).trim()).toBe("5353");
-		});
-	});
-
-	test("release drops the lock, and only when this process still holds it", async () => {
-		await withHome(async (home) => {
-			const lock = await AdapterLock.acquire(home, { pid: 4242, alive: () => true });
-			await lock.release();
-			expect(await Bun.file(lock.path).exists()).toBe(false);
-			const next = await AdapterLock.acquire(home, { pid: 5353, alive: () => true });
-			await lock.release();
-			expect(await Bun.file(next.path).exists()).toBe(true);
-		});
-	});
-
-	test("liveness of this very process is observable, an absurd pid is not", () => {
-		expect(processIsAlive(process.pid)).toBe(true);
-		expect(processIsAlive(0x7ff_ffff)).toBe(false);
-	});
 });

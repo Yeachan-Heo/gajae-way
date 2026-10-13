@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
 import type { SessionRelayStream } from "./broker";
 import { isSessionGoneCode } from "./gjc-contract";
-import { sanitizeDiagnostic } from "./rebind";
+import { runtimeErrorOfLine, sanitizeDiagnostic } from "./rebind";
 
 /**
  * Relay-owned session transport.
@@ -660,6 +660,20 @@ class ManagedTailHandle implements TailHandle {
 	#receiveLine(line: string): void {
 		const trimmed = line.trim();
 		if (!trimmed) return;
+		// gjc >= 0.18 renders the serve refusal in text mode as
+		// `ERROR {"code":"broker_unavailable",…}` on stderr, then exits.
+		const rendered = trimmed.startsWith("ERROR {") ? runtimeErrorOfLine(trimmed) : undefined;
+		if (rendered) {
+			if (!this.#connectionId && !this.#refusal) {
+				this.#refusal = new RelayRefusedError(
+					this.sessionId,
+					sanitizeDiagnostic(rendered.code ?? "") || "relay_refused",
+					rendered.message ? sanitizeDiagnostic(rendered.message).slice(0, 200) : undefined,
+				);
+				this.#helloResolve?.();
+			}
+			return;
+		}
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(trimmed);
@@ -1130,4 +1144,36 @@ export function deterministicInterimDeliveryId(
  */
 export function deterministicTerminalDeliveryId(originKey: string, triggerMessageId: string, part: number): string {
 	return `gw-t-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${part}`).digest("hex").slice(0, 32)}`;
+}
+
+/**
+ * Identity of a terminal part posted to ANOTHER conversation ([POST:]): the
+ * turn's part slot plus the target origin, so the row can never collide with
+ * the same slot's reply in the current room or with a post to another target.
+ */
+export function deterministicPostDeliveryId(
+	originKey: string,
+	targetOriginKey: string,
+	triggerMessageId: string,
+	part: number,
+): string {
+	return `gw-po-${createHash("sha256").update(`${originKey}|${targetOriginKey}|${triggerMessageId}|${part}`).digest("hex").slice(0, 32)}`;
+}
+
+/**
+ * Identity of a [POST:] part that appeared only in mid-work speech and is
+ * posted when the turn ends: keyed on the text, like an interim part, so a
+ * second terminal pass over the same held part collides in the ledger.
+ */
+export function deterministicHeldPostDeliveryId(
+	originKey: string,
+	targetOriginKey: string,
+	triggerMessageId: string,
+	text: string,
+): string {
+	const digest = createHash("sha256")
+		.update(`${originKey}|${targetOriginKey}|${triggerMessageId}|held|`)
+		.update(text)
+		.digest("hex");
+	return `gw-ph-${digest.slice(0, 32)}`;
 }

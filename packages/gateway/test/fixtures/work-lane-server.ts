@@ -12,7 +12,9 @@ import type {
 } from "../../src/orchestrator/session-port";
 import type { TailAttachInput } from "../../src/orchestrator/tail-runner";
 import { startUnixServer } from "../../src/server/server";
-import { type BrokerAuthority, GatewayDatabase } from "../../src/store/db";
+import { Store } from "../../src/store";
+import type { BrokerAuthority } from "../../src/store/groups/bindings";
+import type { WriteTx } from "../../src/store/tx";
 import { ScriptedSessionPort, steerRefused } from "../session-port.fake";
 
 export const repository = resolve(import.meta.dir, "../../../..");
@@ -53,11 +55,12 @@ class PersistentPort extends ScriptedSessionPort {
 	constructor(
 		readonly home: string,
 		readonly hit: (point: Barrier) => void,
-		readonly database: GatewayDatabase,
+		readonly database: Store,
 		readonly authority: BrokerAuthority,
 	) {
 		super({
-			sessionIdForBind: (input) => database.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID(),
+			sessionIdForBind: (input) =>
+				database.bindings.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID(),
 		});
 	}
 	private record(method: string, input: object) {
@@ -83,7 +86,11 @@ class PersistentPort extends ScriptedSessionPort {
 	override async bind(input: SessionBindInput) {
 		this.record("bind", input);
 		const binding = await super.bind(input);
-		if (!this.database.recordOwnedBinding({ ...binding, authority: this.authority }))
+		if (
+			!this.database.transaction((tx) =>
+				this.database.bindings.recordOwnedBinding(tx, { ...binding, authority: this.authority }),
+			)
+		)
 			throw new Error("fixture session bind lost its epoch");
 		writeFileSync(join(this.home, `${binding.sessionId}.session.json`), JSON.stringify(binding));
 		return binding;
@@ -185,79 +192,97 @@ async function serve(home: string, barrier?: Barrier) {
 		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
 		throw new Error(`fixture barrier ${point} was not killed within 30 seconds`);
 	};
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const agentDir = resolve(join(home, "agent"));
 	const authority = { canonicalAgentDir: agentDir, identity: `gjc:${agentDir}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	let acceptanceBarrierPending = false;
-	const withTransaction = database.withTransaction.bind(database);
-	database.withTransaction = <T>(operation: () => T): T =>
-		withTransaction(() => {
-			const result = operation();
-			if (acceptanceBarrierPending) {
-				acceptanceBarrierPending = false;
-				hit("report-consume");
+	let settlementCommitPending = false;
+	let settling = false;
+	const committedBarriers: Barrier[] = [];
+	const withTransaction = database.transaction.bind(database);
+	database.transaction = <T>(operation: (tx: WriteTx) => T): T => {
+		try {
+			const result = withTransaction((tx) => {
+				const committed = operation(tx);
+				if (acceptanceBarrierPending) {
+					acceptanceBarrierPending = false;
+					hit("report-consume");
+				}
+				return committed;
+			});
+			if (settlementCommitPending) {
+				settlementCommitPending = false;
+				hit("settle-commit");
 			}
+			for (const point of committedBarriers.splice(0)) hit(point);
 			return result;
-		});
-	const prepare = database.workAttemptPrepare.bind(database);
-	database.workAttemptPrepare = (...args) => {
-		prepare(...args);
-		hit("prepared");
+		} finally {
+			settling = false;
+			settlementCommitPending = false;
+			acceptanceBarrierPending = false;
+			committedBarriers.length = 0;
+		}
 	};
-	const update = database.workAttemptUpdate.bind(database);
-	database.workAttemptUpdate = (...args) => {
-		if (args[2].terminal) hit("terminal-before");
-		const prior = database.workAttemptGet(args[0]);
+	const prepare = database.work.workAttemptPrepare.bind(database.work);
+	database.work.workAttemptPrepare = (...args) => {
+		prepare(...args);
+		committedBarriers.push("prepared");
+	};
+	const update = database.work.workAttemptUpdate.bind(database.work);
+	database.work.workAttemptUpdate = (...args) => {
+		if (args[3].terminal) hit("terminal-before");
+		const prior = database.work.workAttemptGet(args[1]);
 		if (
 			prior?.wakeReportId &&
-			(args[2].sendPhase === "accepted" ||
-				args[2].output?.proof !== undefined ||
-				args[2].output?.knownSilence !== undefined)
+			(args[3].sendPhase === "accepted" ||
+				args[3].output?.proof !== undefined ||
+				args[3].output?.knownSilence !== undefined)
 		)
 			acceptanceBarrierPending = true;
 		const previousReads = prior?.output.reads ?? 0;
 		const result = update(...args);
-		if (result && args[2].terminal) hit("terminal-after");
-		if (result && result.output.reads > previousReads) hit("output-claim");
-		if (result?.output.knownSilence) hit("silence-after");
+		if (result && args[3].terminal) committedBarriers.push("terminal-after");
+		if (result && result.output.reads > previousReads) committedBarriers.push("output-claim");
+		if (result?.output.knownSilence) committedBarriers.push("silence-after");
 		return result;
 	};
-	let settling = false;
-	const settle = database.workAttemptSettle.bind(database);
-	database.workAttemptSettle = (...args) => {
+	const settle = database.work.workAttemptSettle.bind(database.work);
+	database.work.workAttemptSettle = (...args) => {
 		hit("settle-before");
 		settling = true;
-		try {
-			const result = settle(...args);
-			if (result) hit("settle-commit");
-			return result;
-		} finally {
-			settling = false;
-		}
-	};
-	const enqueue = database.inboundEnqueueInTransaction.bind(database);
-	database.inboundEnqueueInTransaction = (...args) => {
-		const result = enqueue(...args);
-		if (settling && args[0].source === "lane_report") hit("settle-report");
+		const result = settle(...args);
+		if (result) settlementCommitPending = true;
 		return result;
 	};
-	const claimReport = database.laneReportClaim.bind(database);
-	database.laneReportClaim = (...args) => {
+	const enqueue = database.inbox.enqueue.bind(database.inbox);
+	database.inbox.enqueue = (tx, row) => {
+		const result = enqueue(tx, row);
+		if (settling && row.source === "lane_report") hit("settle-report");
+		return result;
+	};
+	const claimReport = database.work.laneReportClaim.bind(database.work);
+	database.work.laneReportClaim = (...args) => {
 		const result = claimReport(...args);
-		if (result) hit("report-claim");
+		if (result) committedBarriers.push("report-claim");
 		return result;
 	};
-	const history = database.putLaneJob.bind(database);
-	database.putLaneJob = (...args) => {
+	const history = database.work.putLaneJob.bind(database.work);
+	database.work.putLaneJob = (...args) => {
 		if (settling) hit("settle-cas");
 		history(...args);
 		if (settling) hit("settle-history");
 	};
-	const delivery = database.deliveryCreateInTransaction.bind(database);
-	database.deliveryCreateInTransaction = (...args) => {
+	const touch = database.bindings.touchWorkSession.bind(database.bindings);
+	database.bindings.touchWorkSession = (...args) => {
 		if (settling) hit("settle-activity");
-		const result = delivery(...args);
+		return touch(...args);
+	};
+	const outboxEnqueue = database.outbox.enqueue.bind(database.outbox);
+	database.outbox.enqueue = (...args) => {
+		const result = outboxEnqueue(...args);
 		if (settling) hit("settle-ledger");
 		return result;
 	};
@@ -265,6 +290,7 @@ async function serve(home: string, barrier?: Barrier) {
 	const config = {
 		schemaVersion: 1 as const,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
@@ -391,7 +417,7 @@ export class WorkFixture {
 	}
 	async seedPersonaSession(): Promise<string> {
 		const sessionId = crypto.randomUUID();
-		const database = await GatewayDatabase.open(join(this.home, "gateway.db"));
+		const database = await Store.open(join(this.home, "gateway.db"));
 		try {
 			const authority = database.inspectBrokerAuthority().authority;
 			if (!authority) throw new Error("fixture broker authority missing");
@@ -402,7 +428,8 @@ export class WorkFixture {
 				repo: join(this.home, "workspace"),
 				authority,
 			};
-			if (!database.recordOwnedBinding(binding)) throw new Error("persona fixture binding lost its epoch");
+			if (!database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding)))
+				throw new Error("persona fixture binding lost its epoch");
 			writeFileSync(join(this.home, `${sessionId}.session.json`), JSON.stringify(binding));
 		} finally {
 			database.close();

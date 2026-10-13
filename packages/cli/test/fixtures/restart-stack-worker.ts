@@ -3,7 +3,9 @@
 // asked for it, as a gateway restart kills its persona child.
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
+import { acquireLease, type Lease, type LeaseName } from "@gajae-gateway/home";
 import { runRestartStack } from "../../src/restart-stack";
+import { serviceSpecs } from "../../src/services";
 
 const home = process.env.GAJAEWAY_HOME;
 const callerGroup = Number(process.env.FIXTURE_CALLER_PGID);
@@ -11,12 +13,14 @@ const id = process.argv[process.argv.indexOf("--run") + 1];
 if (!home || !id || !Number.isInteger(callerGroup))
 	throw new Error("fixture needs GAJAEWAY_HOME, caller pgid, --run id");
 
-const started = new Map<string, number>();
+const leases = new Map<LeaseName, Lease>();
+let adminPid = process.pid + 1;
 await runRestartStack({
 	home,
 	id,
 	platform: "darwin",
 	uid: 501,
+	binDir: process.execPath.slice(0, process.execPath.lastIndexOf("/")),
 	pollMs: 10,
 	runner: async (command) => {
 		const label = command.at(-1)?.split("/").at(-1) ?? "";
@@ -26,13 +30,19 @@ await runRestartStack({
 				process.kill(-callerGroup, "SIGKILL");
 			} catch {}
 		}
-		started.set(label, Date.now() + 1_000);
+		const spec = serviceSpecs().find((candidate) => candidate.label === label);
+		if (spec?.id === "admin") adminPid++;
+		const leaseName =
+			spec?.id === "broker" || spec?.id === "gateway" || spec?.id.startsWith("adapter-")
+				? (spec.id as LeaseName)
+				: undefined;
+		if (leaseName !== undefined) {
+			await leases.get(leaseName)?.release();
+			leases.set(leaseName, await acquireLease(home, leaseName));
+		}
 		return 0;
 	},
-	probe: async (label) => {
-		const startedAt = started.get(label);
-		return startedAt === undefined ? undefined : { pid: 4242, startedAt, binary: `/opt/bin/${label}` };
-	},
+	probe: async (label) => ({ pid: label === "dev.gajaeway.admin" ? adminPid : process.pid }),
 	binaryModifiedAt: async () => 0,
 	isServiceInstalled: async () => true,
 });

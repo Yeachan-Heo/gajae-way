@@ -5,10 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
-import { PersonaSessionManager, type PersonaSessionManagerOptions } from "../src/orchestrator/persona-session";
+import {
+	PersonaSessionManager,
+	type PersonaSessionManagerOptions,
+	retryInboundTurn,
+} from "../src/orchestrator/persona-session";
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import { type GatewayServer, messageEditId, renderMessageEdit, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "generation-5" } as const;
@@ -36,7 +40,7 @@ type ScheduledTimer = { readonly work: () => void; readonly delayMs: number };
 type DirectFixture = {
 	readonly home: string;
 	readonly clock: FixtureClock;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly port: ScriptedSessionPort;
 	readonly manager: PersonaSessionManager;
 	readonly logs: string[];
@@ -87,7 +91,7 @@ function timerSeam(timers: ScheduledTimer[]) {
 
 async function directFixture(options: DirectFixtureOptions = {}): Promise<DirectFixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-generation5-"));
-	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const database = await Store.open(join(home, "gateway.db"));
 	const clock = options.clock ?? new FixtureClock();
 	const port =
 		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
@@ -130,13 +134,15 @@ function enqueue(fixture: DirectFixture, messageId: string, body: string): void 
 	const receivedAt = fixture.clock.iso();
 	fixture.clock.advance();
 	expect(
-		fixture.database.inboundEnqueue({
-			messageId,
-			originKey: ORIGIN_KEY,
-			originRefJson: JSON.stringify(ORIGIN),
-			body,
-			receivedAt,
-		}),
+		fixture.database.transaction((tx) =>
+			fixture.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: ORIGIN_KEY,
+				originRefJson: JSON.stringify(ORIGIN),
+				body,
+				receivedAt,
+			}),
+		),
 	).toBe(true);
 }
 
@@ -243,14 +249,14 @@ test("G1: a held steer blocks later pending steers until its clientRef resolves"
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.steerAttempts).toHaveLength(3);
 		const firstClientRef = required(port.steerAttempts[0], "first steer attempt missing").clientRef;
-		expect(fixture.database.inboundSteersHeld(send.opRef).map((row) => row.message_id)).toEqual(["steer-a"]);
+		expect(fixture.database.inbox.steersHeld(send.opRef).map((row) => row.message_id)).toEqual(["steer-a"]);
 
 		enqueue(fixture, "steer-b", "second follow-up");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.steerAttempts).toHaveLength(6);
 		expect(port.steerAttempts.map((attempt) => attempt.clientRef)).toEqual(Array(6).fill(firstClientRef));
-		expect(fixture.database.inboundSteersHeld(send.opRef).map((row) => row.message_id)).toEqual(["steer-a"]);
-		expect(fixture.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
+		expect(fixture.database.inbox.steersHeld(send.opRef).map((row) => row.message_id)).toEqual(["steer-a"]);
+		expect(fixture.database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({
 			message_id: "steer-b",
 			body: "second follow-up",
 			turn_state: null,
@@ -264,8 +270,8 @@ test("G1: a held steer blocks later pending steers until its clientRef resolves"
 			required(port.steerAttempts.at(-1), "second steer acceptance missing").clientRef,
 		]);
 		expect(port.steers.map((steer) => steer.text.split("\n").at(-1))).toEqual(["first follow-up", "second follow-up"]);
-		expect(fixture.database.inboundSteersHeld(send.opRef)).toEqual([]);
-		expect(fixture.database.inboundTurnRows(send.opRef).map((row) => [row.message_id, row.turn_state])).toEqual([
+		expect(fixture.database.inbox.steersHeld(send.opRef)).toEqual([]);
+		expect(fixture.database.inbox.turnRows(send.opRef).map((row) => [row.message_id, row.turn_state])).toEqual([
 			["trigger", "accepted"],
 			["steer-a", "done"],
 			["steer-b", "done"],
@@ -284,31 +290,31 @@ test("G2: /new retains a held steer on its retired turn instead of discarding or
 		const oldTurn = required(port.sends[0], "old turn was not sent");
 		enqueue(fixture, "held", "maybe already received");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
 
 		const resetFloor = fixture.clock.iso();
 		fixture.clock.advance();
 		await fixture.manager.reset(ORIGIN_KEY, JSON.stringify(ORIGIN), resetFloor);
 		expect(fixture.discarded).not.toContain("held");
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
 		expect(port.sends).toHaveLength(1);
 
 		port.complete(oldTurn.opRef, "retired answer");
 		await fixture.manager.tick(ORIGIN_KEY);
 		await fixture.manager.tick(ORIGIN_KEY);
 		await eventually(
-			() => fixture.database.inboundTurnRow(oldTurn.opRef)?.turn_state === "done",
+			() => fixture.database.inbox.turnRow(oldTurn.opRef)?.turn_state === "done",
 			"retired turn did not close",
 		);
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
-		expect(fixture.database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
+		expect(fixture.database.inbox.pendingOldest(ORIGIN_KEY)).toBeUndefined();
 		expect(port.sends).toHaveLength(1);
 
 		port.torn = false;
 		await fixture.manager.tick(ORIGIN_KEY);
 		// RED-TEAM FINDING: once the retired turn is terminal, tick() never enters #resolveStaleHolds(), so a healthy replay is stranded until unrelated later dispatch work exists.
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef)).toEqual([]);
-		expect(fixture.database.inboundTurnRows(oldTurn.opRef).map((row) => [row.message_id, row.turn_state])).toEqual([
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef)).toEqual([]);
+		expect(fixture.database.inbox.turnRows(oldTurn.opRef).map((row) => [row.message_id, row.turn_state])).toEqual([
 			["trigger", "done"],
 			["held", "done"],
 		]);
@@ -327,7 +333,7 @@ test("G3: a terminal-time definitive steer refusal releases the original body fo
 		const oldTurn = required(port.sends[0], "old turn was not sent");
 		enqueue(fixture, "held", "preserve this body");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
 
 		port.mode = "refused";
 		port.complete(oldTurn.opRef, "old answer");
@@ -336,9 +342,9 @@ test("G3: a terminal-time definitive steer refusal releases the original body fo
 		expect(replacement.text).toBe("preserve this body");
 		expect(replacement.opRef).not.toBe(oldTurn.opRef);
 		expect(port.sendAttempts).toHaveLength(2);
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef)).toEqual([]);
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef)).toEqual([]);
 		expect(
-			fixture.database.inboundTurnRows(replacement.opRef).map((row) => [row.message_id, row.turn_role, row.body]),
+			fixture.database.inbox.turnRows(replacement.opRef).map((row) => [row.message_id, row.turn_role, row.body]),
 		).toEqual([["held", "trigger", "preserve this body"]]);
 		await fixture.manager.tick(ORIGIN_KEY);
 		expect(port.sends).toHaveLength(2);
@@ -362,12 +368,12 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 		const oldTurn = required(port.sends[0], "old turn was not sent");
 		enqueue(fixture, "held", "accepted after replay");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["held"]);
 
 		port.torn = false;
 		port.complete(oldTurn.opRef, "old answer");
 		await eventually(
-			() => fixture.database.inboundTurnRows(oldTurn.opRef).every((row) => row.turn_state === "done"),
+			() => fixture.database.inbox.turnRows(oldTurn.opRef).every((row) => row.turn_state === "done"),
 			"terminal-time acceptance did not finalize",
 		);
 		await fixture.manager.tick(ORIGIN_KEY);
@@ -380,7 +386,7 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 		).toHaveLength(1);
 		expect(port.steerAttempts).toHaveLength(4);
 		expect(
-			fixture.database.inboundTurnRows(oldTurn.opRef).map((row) => [row.message_id, row.state, row.turn_state]),
+			fixture.database.inbox.turnRows(oldTurn.opRef).map((row) => [row.message_id, row.state, row.turn_state]),
 		).toEqual([
 			["trigger", "done", "done"],
 			["held", "done", "done"],
@@ -402,7 +408,7 @@ test("G5: accepted turns are closed (never re-sent) on positive death evidence, 
 
 		await accepted.manager.tick(ORIGIN_KEY);
 		expect(accepted.manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(accepted.database.inboundTurnRow(first.opRef)).toMatchObject({ turn_state: "accepted" });
+		expect(accepted.database.inbox.turnRow(first.opRef)).toMatchObject({ turn_state: "accepted" });
 		expect(acceptedPort.sends).toHaveLength(1);
 
 		acceptedPort.live = false;
@@ -410,7 +416,7 @@ test("G5: accepted turns are closed (never re-sent) on positive death evidence, 
 		// The model may already have run and acted: positive death evidence closes
 		// the accepted turn with a notice instead of re-sending it under a new opRef.
 		await eventually(
-			() => accepted.database.inboundTurnRow(first.opRef)?.turn_state === "done",
+			() => accepted.database.inbox.turnRow(first.opRef)?.turn_state === "done",
 			"positive dead evidence did not close the accepted turn",
 		);
 		expect(accepted.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
@@ -432,7 +438,7 @@ test("G5: accepted turns are closed (never re-sent) on positive death evidence, 
 		expect(boundPort.failedOpRef).not.toBe("");
 		expect(released.opRef).not.toBe(boundPort.failedOpRef);
 		expect(boundPort.sendAttempts).toHaveLength(2);
-		expect(bound.database.inboundTurnRow(boundPort.failedOpRef)).toBeUndefined();
+		expect(bound.database.inbox.turnRow(boundPort.failedOpRef)).toBeUndefined();
 		await bound.manager.tick(ORIGIN_KEY);
 		expect(boundPort.sends).toHaveLength(1);
 	} finally {
@@ -466,7 +472,7 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 		await eventually(() => port.sends.length === 1, "armed retry did not send after recovery");
 		const recovered = required(port.sends[0], "recovered send missing");
 		port.complete(recovered.opRef, "first answer");
-		await eventually(() => fixture.database.inboundPendingCount(ORIGIN_KEY) === 0, "recovered turn did not complete");
+		await eventually(() => fixture.database.inbox.pendingCount(ORIGIN_KEY) === 0, "recovered turn did not complete");
 
 		port.remainingFailures = 1;
 		enqueue(fixture, "second", "second request");
@@ -490,9 +496,9 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 test("G7: migration 19 requeues a settled-bound trigger and ride-along member together in arrival order", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-generation5-migrate-"));
 	const path = join(home, "gateway.db");
-	let upgraded: GatewayDatabase | undefined;
+	let upgraded: Store | undefined;
 	try {
-		(await GatewayDatabase.open(path)).close();
+		(await Store.open(path)).close();
 		const raw = new Database(path);
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
@@ -532,21 +538,19 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 
-		upgraded = await GatewayDatabase.open(path);
+		upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(32);
-		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
-			[
-				["ride-trigger", "trigger", "bound"],
-				["ride-member", "steer", "bound"],
-			],
-		);
-		expect(upgraded.inboundTurnRequeue("gw-p-ride")).toBe(1);
-		expect(upgraded.inboundNonterminalTurns("migration/ride")).toEqual([]);
-		expect(upgraded.inboundPendingOldest("migration/ride")).toMatchObject({
+		expect(upgraded.inbox.turnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual([
+			["ride-trigger", "trigger", "bound"],
+			["ride-member", "steer", "bound"],
+		]);
+		expect(upgraded!.transaction((tx) => retryInboundTurn(upgraded!, tx, "gw-p-ride"))).toBe(1);
+		expect(upgraded.inbox.nonterminalTurns("migration/ride")).toEqual([]);
+		expect(upgraded.inbox.pendingOldest("migration/ride")).toMatchObject({
 			message_id: "ride-trigger",
 			body: "first",
 		});
-		expect(upgraded.inboundPendingCount("migration/ride")).toBe(2);
+		expect(upgraded.inbox.pendingCount("migration/ride")).toBe(2);
 
 		const verification = new Database(path, { readonly: true });
 		const rows = verification
@@ -630,7 +634,7 @@ async function connect(socketPath: string): Promise<SocketClient> {
 
 type ServerFixture = {
 	readonly home: string;
-	readonly database: GatewayDatabase;
+	readonly database: Store;
 	readonly port: TornReplayPort;
 	readonly client: SocketClient;
 	readonly server: GatewayServer;
@@ -642,13 +646,14 @@ async function serverFixture(port: TornReplayPort): Promise<ServerFixture> {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home,
+		gjc: { agentDir: join(home, "agent") },
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
@@ -698,7 +703,7 @@ test("G8: a server-side edit of a held steer remains a pointer row and cannot du
 
 		chatSend(fixture.client, "held", "m-2", "follow-up before edit");
 		await eventually(() => port.steerAttempts.length === 3, "follow-up was not held after torn retries");
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
 
 		chatEdit(fixture.client, "edit", "m-2", "follow-up after edit");
 		await eventually(() => fixture.client.response("edit") !== undefined, "edit did not receive a server response");
@@ -707,8 +712,8 @@ test("G8: a server-side edit of a held steer remains a pointer row and cannot du
 			"edit admission did not replay the pre-existing hold first",
 		);
 		const editId = messageEditId("m-2", "follow-up after edit");
-		expect(fixture.database.inboundSteersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
-		expect(fixture.database.inboundPendingOldest(SERVER_ORIGIN_KEY)).toMatchObject({
+		expect(fixture.database.inbox.steersHeld(oldTurn.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
+		expect(fixture.database.inbox.pendingOldest(SERVER_ORIGIN_KEY)).toMatchObject({
 			message_id: editId,
 			body: renderMessageEdit("m-2", "follow-up after edit"),
 			turn_state: null,
@@ -723,19 +728,19 @@ test("G8: a server-side edit of a held steer remains a pointer row and cannot du
 		expect(pointerTurn.text).toContain("[MESSAGE POINTER: m-2]");
 		expect(pointerTurn.text).toContain("follow-up after edit");
 		expect(
-			fixture.database.inboundTurnRows(oldTurn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state]),
+			fixture.database.inbox.turnRows(oldTurn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state]),
 		).toEqual([
 			["m-1", "trigger", "done"],
 			["m-2", "steer", "done"],
 		]);
 		expect(
-			fixture.database.inboundTurnRows(pointerTurn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state]),
+			fixture.database.inbox.turnRows(pointerTurn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state]),
 		).toEqual([[editId, "trigger", "accepted"]]);
 		expect(port.sendAttempts).toHaveLength(2);
 
 		port.complete(pointerTurn.opRef, "pointer answer");
 		await eventually(
-			() => fixture.database.inboundPendingCount(SERVER_ORIGIN_KEY) === 0,
+			() => fixture.database.inbox.pendingCount(SERVER_ORIGIN_KEY) === 0,
 			"pointer turn did not complete",
 		);
 		expect(port.sends).toHaveLength(2);

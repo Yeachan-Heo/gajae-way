@@ -1,5 +1,46 @@
 # Deployment
 
+## Quick Start
+
+### Option 1: Docker Compose (recommended for first-time users)
+
+The fastest way to get running: a one-command setup experience with persistent volumes and healthchecks.
+
+```sh
+# Clone the repository
+git clone https://github.com/Yeachan-Heo/gajae-way.git
+cd gajae-way
+
+# Run interactive setup (choose Discord, Slack, or Telegram)
+docker compose run --rm -it setup gajaeway setup
+
+# Start the gateway and adapters
+docker compose up
+```
+
+Then send your bot a DM and start chatting. For details on environment variables and configuration, see [Docker Compose](#docker-compose) below.
+
+### Option 2: Local Installation (Bun)
+
+If you prefer a local installation, build the binaries and use the one-command `up` workflow:
+
+```sh
+# Requirements: Bun ≥1.4.0, gjc ≥0.16.0 on PATH
+git clone https://github.com/Yeachan-Heo/gajae-way.git
+cd gajae-way
+
+bun install
+bun run build
+
+# One-command setup and status check
+GAJAEWAY_HOME=~/.gajaeway ./dist/gajaeway up
+```
+
+The `gajaeway up` command:
+- Prompts for credentials if `config.json` doesn't exist
+- Validates tokens against each platform API
+- Reports next steps (daemon start, service installation, etc.)
+
 ## Production unit
 
 Production runs the compiled standalone binaries. Build them on a machine with Bun:
@@ -19,16 +60,15 @@ dist/gajaeway-admin
 dist/gajaeway
 ```
 
-Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord`, `gajaeway-telegram`, and `gajaeway-slack` run in the foreground with no arguments; `gajaeway-discord --help` / `gajaeway-slack --help` and `--version` answer without connecting, and a second `gajaeway-discord` (or `gajaeway-slack`) refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` (`adapter-slack.pid`) names a live process.
+Each adapter binary runs in the foreground. Discord and Slack `--help` and `--version` return without connecting. Every adapter acquires its own non-blocking home lease (`adapter-discord`, `adapter-slack`, or `adapter-telegram`) and refuses a second owner for the same `$GAJAEWAY_HOME`; no PID file decides ownership.
 
-A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It does need the same global-user `gjc` executable and canonical agent directory/broker used by the operator's interactive SDK. Verify `command -v gjc` in that user's normal shell and set the service's `GJC_EXECUTABLE` explicitly to the verified absolute executable path. Run the service as that same user with the same canonical profile environment (`HOME`, and any intentional `GJC_CONFIG_DIR`/`PI_CONFIG_DIR` or `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` selection). Do not introduce gateway-private overrides, copy model/provider configuration, or seed settings. The default profile is `~/.gjc/agent`; using the same executable with a different agent directory is not the same runtime. GJC owns its daemon; the gateway is an SDK client only. Credentials belong in the user's established protected environment, not in copied broker settings.
+The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.18.11`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
 
-The gateway requires GJC 0.16.0 or newer. Its error-code handling is verified through the gjc minor named by `VERIFIED_GJC_THROUGH` (`packages/gateway/src/orchestrator/gjc-contract.ts`); a newer minor still runs but raises the `gjc_unverified_version` cycle gate until `GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/gjc-contract.e2e.test.ts` passes against it and the constant is raised. After upgrading gjc on a host, run that test there; the gateway ends a pre-upgrade `gjc` process that keeps killing the shared broker on its own (see the runbook). GJC 0.17.6 requires `--json` for machine-readable `sdk session` errors; the gateway adds it to those commands. The `sdk serve --stdio` relay arguments and environment binding are unchanged.
-The pin travels with the binaries: the gateway package's own `package.json` (which `bun run build` copies to `dist/package.json`) is the only place an installed binary can read `gjc.version` from, and a release tarball must ship it beside the binaries. A compiled binary keeps the *build machine's* source path in `__filename`, so a binary carried to another host cannot read the pin from a checkout there and exits at boot naming a path that does not exist on it.
+The gateway and broker host pass `GJC_SDK_BROKER_AUTOSTART=0` to GJC child processes. GJC 0.18.9 and later honor this attach-only contract: a client that finds no live broker fails with `broker_unavailable` instead of spawning, retiring, or restarting one, and `gjc doctor` refuses broker restarts. The gateway refuses any GJC older than 0.18.9. The broker service runs the public foreground command `gjc sdk broker run --agent-dir <gjc.agentDir>` as its child; the broker never detaches, a live incumbent makes it exit 1 without being touched, and its exit code propagates to the service manager.
 
 ## Upgrades
 
-`gajaeway update` upgrades a binary install in place from the project's GitHub releases — the same model `gjc update` uses — so a production host never needs the source checkout it was first installed from:
+`gajaeway update` upgrades an installed binary release and serializes its installation with the `update` home lease:
 
 ```sh
 gajaeway update --check                 # report only; touches nothing
@@ -37,13 +77,13 @@ gajaeway update --no-restart            # replace binaries; restart later with o
 gajaeway update --bin-dir /opt/gajaeway # when driving the update from elsewhere
 ```
 
-The update resolves the latest `vX.Y.Z` release, downloads this platform's `gajaeway-<platform>-<arch>.tar.gz`, stages and size-checks the binaries, backs the previous ones up into `<bin-dir>/backup-<version>-<timestamp>/`, replaces them in place, records the installed release in `<bin-dir>/.gajaeway-release`, and queues the existing `ops restart-stack` supervisor (gateway first, then adapters). A release carries `package.json` beside the binaries — the gateway cannot boot without the pinned gjc version in it. Only binaries the host already installed are replaced, plus the `gajaeway`/`gajaeway-gateway` core pair; a release never installs adapters the operator did not choose. One update runs at a time per bin dir (`.gajaeway-update.lock`; a lock naming a live pid refuses, a stale one is taken over), and `--force` reinstalls the current release.
+The updater stages the platform release, backs up replaced binaries, reads the staged gateway package's GJC pin, installs and verifies that exact version in the private prefix, then installs service definitions. When a broker manifest exists and restart is enabled, it enables the broker unit on Linux and queues the restart supervisor. The supervisor restarts the broker, gateway, and connected services in order. `--force` reinstalls the current release and its pinned GJC version. `GAJAEWAY_UPDATE_REPO=owner/name` redirects release checks to a fork.
 
-A source checkout keeps upgrading through `git` + `bun run build` + `services repair`; `update` refuses to guess a bin dir when run under `bun`, so pass `--bin-dir` in that case. `GAJAEWAY_UPDATE_REPO=owner/name` redirects update checks at a fork's releases; the default comes from the package's declared repository.
+A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`; when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
 
 ## Home and configuration
 
-`GAJAEWAY_HOME` selects the state directory; it defaults to `~/.gajaeway`. The gateway makes the home directory private (`0700`). A typical layout is:
+`GAJAEWAY_HOME` selects the state directory; it defaults to `~/.gajaeway`. The gateway makes it private (`0700`). A typical layout is:
 
 ```text
 $GAJAEWAY_HOME/
@@ -51,20 +91,44 @@ $GAJAEWAY_HOME/
   adapter-discord.json
   adapter-telegram.json
   adapter-slack.json
-  adapter-discord.pid        # single-instance lock, held by the running Discord adapter
-  adapter-slack.pid          # same, for the Slack adapter
-  adapters/slack/recovery-cursor.json  # Slack missed-message watermarks
+  adapters/discord/recovery-cursor.json
+  broker.env                 # optional protected environment for the broker service
+  adapters/slack/recovery-cursor.json
   gateway.sock
-  gateway.db
-  workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory
+  gateway.db                 # live SQLite WAL/SHM sidecars may also be present
+  leases/
+    gateway                   # permanent flock files; never unlink them
+    broker
+    update
+    memory
+    adapter-discord
+    adapter-slack
+    adapter-telegram
+  broker/
+    agent/                    # private pinned-GJC agent directory
+    provision/
+      manifest.json
+      journal.json            # present while generation recovery is needed
+      gen-*/                  # staged generation
+      prev-*/                 # preserved generation
+  gjc/
+    current -> <version>
+    <version>/bin/gjc
+  backups/
+    *.db
+    *.open-work.json          # cutover evidence alongside its backup
+    pre-restore-<id>/         # preserved database and sidecars
+  restore.journal.json        # present while a restore is incomplete
+  workspace/                 # SOUL.md, AGENTS.md, USER.md; GJC working directory
   memory/                    # Markdown files and private Git repository
-  memory-receipts.jsonl
   secrets/
     discord-token
     telegram-token
     slack-bot-token          # xoxb-…
     slack-app-token          # xapp-… (Socket Mode)
 ```
+
+`restore.journal.json` and the broker provision journal are transient recovery records. A live database may have `gateway.db-wal` and `gateway.db-shm`; do not copy those files as a backup. The cutover export is written next to its `.db` backup.
 
 Use `config.json` schema version 1. Every configured secret is a credential-file reference; a credential file may be referenced by only one configured credential.
 
@@ -94,19 +158,215 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 
 `monitorCatchUp` bounds cron replay after downtime: `maxSlots` is the newest due slots to admit (1–1000, default 24), and `maxAgeMs` excludes slots older than the lookback (60000–604800000 ms, default 86400000 / 24 hours). Refused slots advance the durable monitor cursor, are counted and logged, and appear in `gajaeway monitors inspect <id>` as `catchUp`; the setting is restart-required.
 
-### GJC agent directory
+### Private broker runtime
 
-The gateway communicates with the operator's shared GJC broker through its agent directory. The agent directory is resolved in this order:
+`gjc.agentDir` is optional and must be absolute when set. Its default is `$GAJAEWAY_HOME/broker/agent`, the private directory owned by the broker service. The gateway uses the pinned GJC executable from `$GAJAEWAY_HOME/gjc/current/bin/gjc`; it does not fall back to a system executable or mutate the operator's source profile.
 
-1. Deployment seam: `options.broker.agentDir` (test/deployment override only).
-2. `config.json` `gjc.agentDir` (must be an absolute path; optional).
-3. `GJC_CODING_AGENT_DIR` or `PI_CODING_AGENT_DIR` environment variable (if set).
-4. Established home authority: existing databases keep the agent directory they were created with (read from `broker_authority` table).
-5. Default: `$GAJAEWAY_HOME/gjc-agent` for fresh deployments.
+Provision the private directory with `gajaeway setup --broker-agent` while the broker is stopped. By default, the command reads the operator's `~/.gjc/agent` profile; `--from DIR` selects another source. It copies only the source allowlist: required `agent.db` credentials (captured with a read-only SQLite snapshot), optional `models.yml` and `config.yml`, and the supported `model-presets` files (`state.json`, `state.backup.json`, `control.json`). Symlinks and live broker URL settings are refused. Gajaeway reads the source for provisioning and drift checks but does not write it.
 
-The gateway checks broker authority (based on the resolved agent directory) before running schema migrations. If the authority does not match an existing home's recorded authority, the boot fails with `authority_mismatch` and leaves the database schema unchanged, allowing offline corrective action.
+Provisioning uses the `broker` lease and journaled generations under `broker/provision/`. A staged `gen-*` generation is swapped into the private agent directory while the old files are held in `prev-*`; a manifest records the generation and entry fingerprints. If provisioning is interrupted, the broker host or next provisioning command recovers the journal under the same lease by finishing the manifest-committed generation or rolling back to the previous files.
 
-**Existing homes and pre-#321 upgrade paths:** A home established against the shared `~/.gjc/agent` keeps that directory automatically on upgrade (step 4), with its sessions and lanes intact; setting `gjc.agentDir` or `GJC_CODING_AGENT_DIR` makes that choice explicit. Keeping the shared directory gives up the isolation #321 added: an interactive gjc upgrade can affect the gateway. To move an established home onto the isolated `$GAJAEWAY_HOME/gjc-agent`, use a deliberate cutover instead (copy provider auth and model presets into the new directory first). The operator runbook documents the `gjc-authority-cutover` script for explicit migration between agent directories, including quarantine disposition for durable history.
+Inspect the provision result with `gajaeway-gateway broker-agent status` (or `--json`). Entry states distinguish source changes, private-copy changes, divergence, and missing inputs. `gajaeway ops cycle` projects that drift under `brokerAgent`; it raises `broker_agent_unprovisioned` for an unprovisioned/interrupted state or a missing required `agent.db` copy. Review other drift before forcing a new snapshot, since a changed private copy may contain broker-refreshed state.
+
+## Docker Compose
+
+The repository includes a `compose.yaml` for containerized deployment with persistent volumes and health checks.
+
+### First-time setup with Docker Compose
+
+```sh
+# Interactive setup (choose adapters and enter credentials)
+docker compose run --rm -it setup gajaeway setup
+
+# Or with environment variables (non-interactive)
+docker compose run --rm -it \
+  -e GAJAEWAY_DISCORD_TOKEN=$DISCORD_TOKEN \
+  -e GAJAEWAY_OWNER_IDS=$YOUR_ID \
+  setup gajaeway setup --from-env --adapters discord
+```
+
+### Start the services
+
+```sh
+# Start gateway and enabled adapters
+docker compose up
+
+# Start specific adapters only
+docker compose --profile discord up          # Discord only
+docker compose --profile slack up            # Slack only
+docker compose --profile discord,slack up    # Discord + Slack
+```
+
+### Common commands
+
+```sh
+# Check configuration
+docker compose exec gajaeway-gateway gajaeway setup --status
+
+# View logs
+docker compose logs -f gajaeway-gateway
+
+# Access shell
+docker compose exec gajaeway-gateway sh
+
+# Restart adapters
+docker compose restart gajaeway-discord
+```
+
+Configuration and state are stored in the `gajaeway_home` volume, which persists across container restarts.
+
+### Model Credentials for GJC
+
+The Docker image includes gjc (the AI coding agent) installed at `/usr/local/bin/gjc`. To enable gjc to access AI models (Claude, etc.), you must mount your gjc agent directory with credentials from the host:
+
+**Option 1: Mount gjc agent directory** (recommended)
+
+Edit `compose.yaml` and uncomment the gjc volume mount:
+
+```yaml
+services:
+  gajaeway-gateway:
+    volumes:
+      - gajaeway_home:/home/gajaeway/.gajaeway
+      # Uncomment to share model credentials with gjc inside container:
+      - ${GJC_AGENT_DIR:-~/.gjc}:/home/gajaeway/.gjc:ro
+```
+
+Then start with:
+```bash
+GJC_AGENT_DIR=~/.gjc docker compose up
+```
+
+**Option 2: Mount credentials only** (if gjc config is elsewhere)
+
+```yaml
+services:
+  gajaeway-gateway:
+    volumes:
+      - gajaeway_home:/home/gajaeway/.gajaeway
+      # Mount just the credentials directory:
+      - ${GJC_CREDENTIALS_PATH:-~/.gjc/credentials}:/home/gajaeway/.gjc/credentials:ro
+```
+
+**Option 3: Separate compose override file**
+
+Create `compose.credentials.yaml`:
+
+```yaml
+services:
+  gajaeway-gateway:
+    volumes:
+      - ~/.gjc:/home/gajaeway/.gjc:ro
+  gajaeway-discord:
+    volumes:
+      - ~/.gjc:/home/gajaeway/.gjc:ro
+  gajaeway-slack:
+    volumes:
+      - ~/.gjc:/home/gajaeway/.gjc:ro
+  gajaeway-telegram:
+    volumes:
+      - ~/.gjc:/home/gajaeway/.gjc:ro
+```
+
+Then start with:
+```bash
+docker compose -f compose.yaml -f compose.credentials.yaml up
+```
+
+**Without model credentials**
+
+If you do not mount credentials, gjc will fall back to configured models in the Docker container's isolated gjc config at `/home/gajaeway/.gjc`, but most users will want to reuse their host's gjc configuration with authenticated providers (see above).
+
+**Read-only mounts**
+
+All gjc mounts should be read-only (`:ro`) to prevent the container from accidentally modifying your host's credentials.
+
+## Manual Configuration
+
+If you prefer not to use the interactive `gajaeway setup` command, you can manually create the configuration files:
+
+### 1. Create the home directory
+
+```sh
+mkdir -p $GAJAEWAY_HOME/secrets
+chmod 0700 $GAJAEWAY_HOME
+```
+
+### 2. Create credential files
+
+Store each credential in a separate file (0600 permissions):
+
+```sh
+# Discord
+echo "YOUR_DISCORD_BOT_TOKEN" > $GAJAEWAY_HOME/secrets/discord-token
+chmod 0600 $GAJAEWAY_HOME/secrets/discord-token
+
+# Slack
+echo "xoxb-YOUR-SLACK-BOT-TOKEN" > $GAJAEWAY_HOME/secrets/slack-bot-token
+echo "xapp-YOUR-SLACK-APP-TOKEN" > $GAJAEWAY_HOME/secrets/slack-app-token
+chmod 0600 $GAJAEWAY_HOME/secrets/slack-*
+
+# Telegram
+echo "123456:YOUR_TELEGRAM_BOT_TOKEN" > $GAJAEWAY_HOME/secrets/telegram-token
+chmod 0600 $GAJAEWAY_HOME/secrets/telegram-token
+```
+
+### 3. Create config.json
+
+```json
+{
+  "schemaVersion": 1,
+  "logVerbosity": "info",
+  "credentials": {
+    "discord": { "credentialFile": "$GAJAEWAY_HOME/secrets/discord-token" }
+  }
+}
+```
+
+Save this as `$GAJAEWAY_HOME/config.json`.
+
+### 4. Create adapter configurations
+
+For each enabled adapter, create a configuration file:
+
+**Discord** (`$GAJAEWAY_HOME/adapter-discord.json`):
+```json
+{
+  "tokenFile": "$GAJAEWAY_HOME/secrets/discord-token",
+  "intents": ["GUILDS", "GUILD_MESSAGES", "DIRECT_MESSAGES", "MESSAGE_CONTENT"]
+}
+```
+
+**Slack** (`$GAJAEWAY_HOME/adapter-slack.json`):
+```json
+{
+  "botTokenFile": "$GAJAEWAY_HOME/secrets/slack-bot-token",
+  "appTokenFile": "$GAJAEWAY_HOME/secrets/slack-app-token",
+  "socketMode": true
+}
+```
+
+**Telegram** (`$GAJAEWAY_HOME/adapter-telegram.json`):
+```json
+{
+  "tokenFile": "$GAJAEWAY_HOME/secrets/telegram-token",
+  "pollingTimeout": 30
+}
+```
+
+### 5. Start the gateway
+
+```sh
+dist/gajaeway-gateway daemon
+```
+
+Then start your adapters in separate terminals:
+
+```sh
+dist/gajaeway-discord
+dist/gajaeway-slack
+dist/gajaeway-telegram
+```
 
 ## Slack adapter
 
@@ -171,111 +431,26 @@ On startup and gateway reconnect, the adapter backfills each configured Discord 
 
 Keep token files out of version control and restrict their permissions. Replace a token file and restart the relevant service to rotate it.
 
-## Service manager: launchd example
+## Service manager: leases and broker unit
 
-Install binaries and state outside macOS TCC-protected directories such as Desktop, Documents, and Downloads. A launchd process can hang when its working directory, `gjc`, or a symlink target lies there. Put the binaries, `gjc`, and `$GAJAEWAY_HOME` somewhere such as `~/gajaeway`.
+Keep binaries and state outside macOS TCC-protected directories such as Desktop, Documents, and Downloads. A launchd process can hang when its working directory or GJC executable is under a protected path. The generated definitions use the installed binaries and `$GAJAEWAY_HOME`; configure service secrets through protected environment or credential files as appropriate for the host.
 
-A user agent can launch the gateway:
+`gajaeway services install --bin-dir DIR` writes service definitions for the broker, gateway, adapters, and admin. Linux systemd user units are named `gajaeway-broker.service` and `gajaeway-gateway.service`; the macOS LaunchAgent labels are `dev.gajaeway.broker` and `dev.gajaeway.gateway`. On Linux, the broker unit runs `gajaeway-gateway broker` and has `ConditionPathExists` for the broker provision manifest. Provision the private agent first with `gajaeway setup --broker-agent`; a systemd unit without a manifest does not start a broker. The broker host takes the `broker` lease for its lifetime, validates the provisioned directory and exact GJC pin, then launches the pinned executable against that private directory.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.gajaeway.gateway</string>
-  <key>ProgramArguments</key><array>
-    <string>/Users/me/gajaeway/bin/gajaeway-gateway</string><string>daemon</string>
-  </array>
-  <key>WorkingDirectory</key><string>/Users/me/gajaeway</string>
-  <key>EnvironmentVariables</key><dict>
-    <key>GAJAEWAY_HOME</key><string>/Users/me/gajaeway/state</string>
-    <key>PATH</key><string>/Users/me/gajaeway/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>GJC_EXECUTABLE</key><string>/Users/me/gajaeway/bin/gjc</string>
-    <key>HOME</key><string>/Users/me</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ExitTimeOut</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/Users/me/gajaeway/gateway.stdout.log</string>
-  <key>StandardErrorPath</key><string>/Users/me/gajaeway/gateway.stderr.log</string>
-</dict></plist>
-```
+The gateway takes the `gateway` lease followed by the `memory` lease and holds both for its lifetime. Each adapter takes its own lease. All use the same kernel-backed, non-blocking flock implementation and permanent files under `$GAJAEWAY_HOME/leases`; a diagnostic owner record or service-manager PID is not the ownership authority. Offline census, cutover, and restore also require the `gateway` lease and refuse while the daemon holds it. The `update` lease serializes binary updates and the restart supervisor.
 
-### The service owns its own log sink
-
-Each daemon writes its own rotating sink under `$GAJAEWAY_HOME`: `gateway.log`, `adapter-discord.log`, `adapter-slack.log`. Every line begins with an ISO-8601 UTC timestamp and a level, identical consecutive events collapse into one `x<N> (identical, first=… last=…)` line, the live file rotates to `.1`…`.5` at 10 MB, and an hourly `service_alive uptime=…` line makes log silence distinguishable from service silence.
-
-The service manager's own stdout/stderr redirect must therefore NOT point at those paths - it would double-write every line. Point it at a separate file (as above) or leave it to the journal; the owned sink is the one to read during an incident.
-
-This launchd example is macOS-specific, not a deployment command for the systemd host reached on SSH port 24. Before installing it, set its executable and profile paths to the verified interactive user's values. A launchd job does not inherit your shell: supply the same canonical profile environment and required model-key variables through a protected mechanism. An already-running shared GJC daemon retains its own environment; restarting the gateway does not rotate that daemon's credentials. Protect the plist:
-
-```sh
-chmod 600 ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
-```
-
-Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway. `gajaeway services install --bin-dir DIR` writes definitions for the gateway, the Discord and Slack adapters, and the admin console; Telegram is run under your own service definition. The CLI is an on-demand client; it does not start the daemon. The definitions it writes follow the host: launchd plists in `~/Library/LaunchAgents` on macOS, systemd user units in `${XDG_CONFIG_HOME:-~/.config}/systemd/user` on Linux. `--platform darwin|linux` with `--launch-agents-dir`/`--unit-dir` generates for the other host.
-
-### The adapters restart with the gateway
-
-A gateway restart does not kill an adapter. The adapter reconnects and keeps serving the previous generation: nothing dies, nothing is lost, `delivery.pending` stays 0, and the only symptom is replies arriving a beat late. The service definitions therefore bind the stack together instead of relying on an operator following a restart order.
-
-On systemd each adapter and the admin unit carry `BindsTo=`, `After=`, and `PartOf=gajaeway-gateway.service`, so `systemctl --user restart gajaeway-gateway` realigns the whole stack in one command, and `WantedBy=gajaeway-gateway.service` means enabling the gateway enables them. Only the gateway unit carries `KillMode=mixed` and `TimeoutStopSec=30s`; see below for why that cannot reach the shared GJC broker.
-
-launchd has no `BindsTo`/`PartOf` equivalent, and `WatchPaths` does not restart an already-running job. Use the single entry point instead, on either host:
+On Linux, the gateway unit has `Wants=` and `After=` for the broker unit; adapters and admin are bound to the gateway unit. The broker uses `KillMode=control-group` and a 30-second stop timeout. The gateway uses `KillMode=mixed` and `TimeoutStopSec=30s` so its own relays and commands stop with it; the broker is a different service and is not in the gateway unit's cgroup. A normal gateway restart does not restart the broker. On macOS, use the service manager definitions and the supervisor below; launchd does not propagate systemd dependencies.
 
 ```sh
 gajaeway ops restart-stack
 gajaeway ops restart-stack --status
 ```
 
-On Linux that is the one `systemctl --user restart gajaeway-gateway`; on macOS it kickstarts the gateway and then every dependent job, in order. It never uses `launchctl bootout`, which removes the job and leaves it with no automatic recovery.
+The command returns after a detached supervisor is queued. The supervisor restarts the broker, gateway, then connected adapters and admin; on Linux it restarts the broker and gateway units and lets gateway dependencies restart clients, while on macOS it kickstarts each job in order. It verifies process start and deployed binary; lease-backed services additionally require the lease owner's PID to match the service manager's main PID. The receipt is `$GAJAEWAY_HOME/restart-stack.json`; `--status` is successful only when it reports `ok` and exits 0.
 
-The command returns as soon as it has queued the sequence. A detached supervisor carries it out: on macOS a process in a new session, on Linux a transient `systemd-run --user` unit outside the gateway cgroup. Restarting the gateway kills a persona turn that invoked it, but not the supervisor. After each command the supervisor checks every service against its deployed binary. The check reads the pid from the service manager and the start time from `ps`, and passes only when the process started after both the binary's modification time and the restart command. A service that fails is recorded as `stale` and the remaining labels are skipped. The receipt is `$GAJAEWAY_HOME/restart-stack.json`, and `--status` prints it. `--status` exits 0 only for a verified `ok`. A sequence whose supervisor died reports `interrupted`.
+An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 
-To diagnose a stack that is already mismatched, read `clients` in `gajaeway status`: every connected client reports its process `startedAt` and a `staleGeneration` flag that is true when the client process predates the running gateway process. That replaces comparing `ps -o lstart` by hand.
-
-### One gateway per home, owned by the service manager
-
-The gateway daemon is always started and stopped by launchd or systemd; never start a second copy by hand while a managed one runs. On boot the daemon settles ownership of `$GAJAEWAY_HOME` before touching its socket or database, using `$GAJAEWAY_HOME/daemon.pid`. This is gateway-home ownership, not ownership of the shared GJC broker:
-
-- If the record names a live `gajaeway-gateway daemon` for the same home, the newcomer **waits** (up to 20s) for it to finish its ordered shutdown. It never signals that process - the service manager owns its lifecycle. If the predecessor is still alive at the deadline the newcomer exits 1 and the service manager retries under its own throttle.
-- `daemon --only-new` skips the wait: any live same-home gateway is an immediate refusal (exit 1). Use it in scripts that must not disturb a running instance.
-- A record whose process is dead, is not a gateway, or belongs to a different home is stale and is replaced.
-
-Restart with the host's service manager: on the systemd deployment reached on SSH port 24, use `systemctl --user restart gajaeway-gateway`; on macOS launchd, use `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway`. These are alternatives, not consecutive steps. Give ordered shutdown at least 30 seconds with systemd `TimeoutStopSec` or launchd `ExitTimeOut`. Two gateways on one home can race over the database and delivery state even though neither owns the user broker.
-
-### systemd: no gateway child outlives the unit
-
-The gateway unit must use:
-
-```ini
-[Service]
-KillMode=mixed
-TimeoutStopSec=30s
-```
-
-`TimeoutStopSec` must be at least 30 seconds; the installed unit pins it. On SIGTERM/SIGINT the gateway stops admitting work, waits up to 10 seconds for in-flight monitor authoring turns, marks any that are still running as `gateway_shutdown` (failure detail names the session and the stop time; lease released so the next boot's reconcile re-dispatches them at once), and exits by itself within 25 seconds, logging `gateway_shutdown_timeout` if teardown could not settle. A stop that reaches the service manager's SIGKILL is therefore a defect, not the expected path.
-
-`KillMode=mixed` sends SIGTERM to the gateway main process for its ordered shutdown, then SIGKILLs everything still left in the unit's cgroup. Without it, every `gjc sdk serve` relay and `gjc sdk session` command the gateway spawned outlived each stop, and the next start re-adopted them (`Found left-over process ... in control group while starting unit. Ignoring.`). Those orphans held gigabytes of memory for days and kept writing into state owned by the new incarnation (#183, #227). `KillMode=process` is what caused this, and it is not supported.
-
-The shared GJC broker is not the gateway's child to kill. GJC autostarts it detached from whichever SDK command first finds it absent. When the broker is discovered to be absent or dead, the gateway sends a read-only `sdk session list --scope all` command to trigger GJC's normal autostart mechanism. This nudge command is identical to the one used during boot readiness probing and does not attempt to kill, restart, or replace the broker—it is a passive observe-only probe consistent with the gateway's client-only relationship to the shared broker. The nudge respects a 45-second backoff between attempts to avoid hammering a broker that is repeatedly failing.
-
-When that autostart command is the gateway's, the broker and every session host it forks would otherwise land in the gateway cgroup. The gateway therefore checks each broker generation it observes. If that broker runs inside the gateway's own unit, the gateway moves it and its descendants into a transient `gajaeway-gjc-broker-<pid>.scope` and logs `broker_scope_released`. A broker started anywhere else is never touched. SDK turns outlive gateway restarts because they run in the broker's scope, not because the unit spares its children.
-
-Upgrading a host that still has `KillMode=process` in the unit or in a drop-in: deploy this gateway first, and confirm `broker_scope_released` in its log (or `systemd-cgls --user-unit gajaeway-gateway.service` no longer listing `broker-internal`). Only then change the drop-in to `KillMode=mixed`, run `systemctl --user daemon-reload`, and restart. Changing the kill mode before the broker has been released stops the broker along with the gateway.
-
-Normal gateway stop/start closes its own SDK calls and relays and reconnects as a client. It never kills the shared user broker, reaps old hosts, deletes discovery files, copies settings, or runs global session GC. A readiness failure is not permission to repair or replace the user's daemon. If the shared broker is unavailable at boot (for example while it clears a stale lock after a host reboot), the gateway does not exit: it retries the preflight and readiness steps with exponential backoff (1s doubling to 30s) for up to 10 minutes, logging one `gateway_boot_waiting_for_broker step=… attempt=… retry_in_ms=…` line per retry, and exits 1 only after that deadline. A wrong gjc version or a rejected relay argv is still fatal immediately. For a database changing broker authority, complete the explicit cutover in the runbook before starting recovery; changing service environment alone does not migrate old work.
-
-The implemented administrative entry point requires the checkout and Bun. Stop the managed gateway and disable automatic restart throughout inspection and apply; keep the shared GJC daemon running. Use the verified absolute gateway home (`ABS`) and canonical absolute user agent directory (`CANONICAL`):
-
-```sh
-bun scripts/gjc-authority-cutover.ts inspect --home ABS --agent-dir CANONICAL
-bun scripts/gjc-authority-cutover.ts apply --home ABS --agent-dir CANONICAL --expected-authority 'null' --quarantine --evidence 'operatorreference' --backup UNIQUEABS
-```
-
-Use `'null'` only when inspection reports `oldAuthority: null`; otherwise supply the exact inspected `oldAuthority` JSON as one shell-quoted argument. Supply an actual operator evidence reference and a unique, nonexistent absolute backup destination (`UNIQUEABS`) under an existing canonical parent. Both modes refuse a live gateway PID/socket. Apply holds the same kernel-backed home lease as gateway boot, revalidates authority, and creates an integrity-checked, non-overwriting backup before database migration. The runbook details the receipt and census to retain. Immutable old history stays quarantined without replay; old worker names remain reserved, so new work requires new names. Re-enable managed startup only after successful apply and executable/profile verification. Do not globally restore configuration, reap hosts, or delete sessions as part of cutover.
-
-Deployment acceptance requires a newly gateway-created session to be visible through the normal user's SDK and the gateway with the exact same session ID. Record unrelated user session IDs and configuration fingerprints before deployment; verify they remain unchanged afterward. The current blocker is that SDK global model controls can modify user configuration: verify configuration invariance through session creation and model controls, not just executable/profile parity or a successful cutover. Do not mask a failure with automatic global configuration restore. Verify the existing user daemon survives a gateway restart and owned work remains observable without resend. These are required observations, not a claim that production is deployed or healthy.
+`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply. Migration 33 (L4h), which removes `broker_quarantine` and `broker_cutovers`, remains pending.
 
 ## Speech gate
 

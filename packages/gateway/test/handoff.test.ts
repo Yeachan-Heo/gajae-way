@@ -12,7 +12,7 @@ import {
 	resolveHandoffTarget,
 } from "../src/server/handoff";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 const A = { platform: "discord", kind: "channel", conversationId: "chan-a" } as const;
@@ -65,6 +65,7 @@ async function gateway(replies: Replies) {
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
 		configPath: join(directory, "config.json"),
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
@@ -72,7 +73,7 @@ async function gateway(replies: Replies) {
 		channels: { "chan-a": { engagement: "open" }, "chan-b": { engagement: "open" }, "chan-c": { engagement: "open" } },
 		handoffTargets: { "gajae-way-dev": B, ops: C, marketing: A },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const turns: Array<{ originKey: string; text: string }> = [];
 	const sessions = new Map<string, string>();
 	const sessionPort = sessionPortFromResponder({

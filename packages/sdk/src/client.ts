@@ -4,6 +4,10 @@ import type {
 	ChatSendResult,
 	GatewayStatusResult,
 	OpsCycleResult,
+	OpsDeliveriesParams,
+	OpsDeliveriesResult,
+	OpsSloParams,
+	OpsSloResult,
 	WorkRunParams,
 	WorkRunResult,
 } from "@gajae-gateway/protocol";
@@ -34,6 +38,13 @@ export interface GajaewayClientOptions {
 	requestTimeoutMs?: number;
 	/** Identifies this process in `gateway.status` generation diagnostics. */
 	clientName?: string;
+}
+
+export interface ConnectSocketWithBackoffOptions extends GajaewayClientOptions {
+	initialMs?: number;
+	maxMs?: number;
+	deadlineMs?: number;
+	onRetry?: (attempt: number, delayMs: number, error: unknown) => void;
 }
 
 /** Process start time, so the gateway can compare client and gateway generations. */
@@ -96,6 +107,32 @@ export class GajaewayClient {
 		};
 		await client.#negotiate();
 		return client;
+	}
+
+	static async connectSocketWithBackoff(
+		path: string,
+		options: ConnectSocketWithBackoffOptions = {},
+	): Promise<GajaewayClient> {
+		const { initialMs = 1_000, maxMs = 30_000, deadlineMs, onRetry, ...clientOptions } = options;
+		const startedAt = Date.now();
+		let delayMs = Math.min(initialMs, maxMs);
+		let attempt = 0;
+
+		for (;;) {
+			try {
+				return await GajaewayClient.connectSocket(path, clientOptions);
+			} catch (error) {
+				const remainingMs = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - (Date.now() - startedAt);
+				if (remainingMs <= 0) throw error;
+				const waitMs = Math.min(delayMs, remainingMs);
+				if (waitMs <= 0) throw error;
+				attempt++;
+				onRetry?.(attempt, waitMs, error);
+				await Bun.sleep(waitMs);
+				if (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs) throw error;
+				delayMs = Math.min(delayMs * 2, maxMs);
+			}
+		}
 	}
 
 	static async connectStdio(transport: StdioTransport, options?: GajaewayClientOptions): Promise<GajaewayClient> {
@@ -200,6 +237,12 @@ export class GajaewayClient {
 	}
 	opsCycle(): Promise<OpsCycleResult> {
 		return this.request("ops.cycle");
+	}
+	opsSlo(params: OpsSloParams = {}): Promise<OpsSloResult> {
+		return this.request("ops.slo", params);
+	}
+	opsDeliveries(params: OpsDeliveriesParams = {}): Promise<OpsDeliveriesResult> {
+		return this.request("ops.deliveries", params);
 	}
 
 	async close(): Promise<void> {

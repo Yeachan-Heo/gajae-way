@@ -6,14 +6,13 @@ import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 test("reconciliation uses retained authored output and otherwise re-dispatches", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-reconcile-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "reconcile",
@@ -46,24 +45,24 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 				},
 				enqueueExistingId: () => {},
 			} as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 		});
 		const retained = crypto.randomUUID();
-		database.withTransaction(() => {
-			database.monitorEventCreate({
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
 				eventId: retained,
 				monitorId: monitor.monitorId,
 				eventType: "changed",
 				payloadJson: "{}",
 				firedAt: new Date().toISOString(),
 			});
-			database.authoredOutputCreate(retained, "retained authored knowledge");
-			database.monitorEventUpdate(retained, "authored");
+			database.monitors.authoredOutputCreate(tx, retained, "retained authored knowledge");
+			database.monitors.eventUpdate(tx, retained, "authored");
 		});
 		const missing = crypto.randomUUID();
-		database.withTransaction(() =>
-			database.monitorEventCreate({
+		database.transaction((tx) =>
+			database.monitors.eventCreate(tx, {
 				eventId: missing,
 				monitorId: monitor.monitorId,
 				eventType: "changed",
@@ -72,13 +71,13 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 			}),
 		);
 		await pipeline.reconcile();
-		const intents = database.memoryIntentRowsByRowid().filter((row) => row.kind === "monitor-event");
+		const intents = database.memory.rowsByRowid().filter((row) => row.kind === "monitor-event");
 		expect(intents).toHaveLength(2);
 		const replyTexts = intents.map((row) => (JSON.parse(row.payload_json) as { replyText: string }).replyText);
 		expect(replyTexts.some((text) => text.includes("retained authored knowledge"))).toBe(true);
 		expect(replyTexts.some((text) => text.includes("authored by model"))).toBe(true);
 		expect(dispatches).toContain(originKey(monitorSessionOrigin(monitor.monitorId, "changed")));
-		expect(database.authoredOutput(missing)).toBe("authored by model");
+		expect(database.monitors.authoredOutput(missing)).toBe("authored by model");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -88,7 +87,7 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 test("reconcile replays same-millisecond events oldest-first", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-reconcile-order-"));
 	try {
-		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "order",
@@ -103,30 +102,30 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 				respond: async () => "[]",
 			}),
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(new DeliveryLedger(database)),
+			delivery: new DeliveryService(database),
 			emit: () => {},
 		});
 		// One fired_at for both rows: ordering must come from insertion order, not row layout.
 		const firedAt = new Date().toISOString();
 		const ids = [crypto.randomUUID(), crypto.randomUUID()];
-		database.withTransaction(() => {
+		database.transaction((tx) => {
 			for (const [index, eventId] of ids.entries()) {
-				database.monitorEventCreate({
+				database.monitors.eventCreate(tx, {
 					eventId,
 					monitorId: monitor.monitorId,
 					eventType: "changed",
 					payloadJson: "{}",
 					firedAt,
 				});
-				database.authoredOutputCreate(eventId, `authored-${index}`);
-				database.monitorEventUpdate(eventId, "authored");
+				database.monitors.authoredOutputCreate(tx, eventId, `authored-${index}`);
+				database.monitors.eventUpdate(tx, eventId, "authored");
 			}
 		});
 		await pipeline.reconcile();
 		// Insertion order (rowid) preserves the oldest-first replay; the
 		// (created_at, id) index scrambles same-millisecond UUID ties.
-		const intents = database
-			.memoryIntentRowsByRowid()
+		const intents = database.memory
+			.rowsByRowid()
 			.filter((row) => row.kind === "monitor-event")
 			.map((row) => (JSON.parse(row.payload_json) as { replyText: string }).replyText);
 		expect(intents).toEqual(["authored-0", "authored-1"]);
@@ -140,20 +139,19 @@ test("a monitor without its own channel target reports authored notes to the own
 	const { mkdtemp } = await import("node:fs/promises");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
-	const { GatewayDatabase } = await import("../src/store/db");
+	const { Store } = await import("../src/store");
 	const { MonitorRegistry } = await import("../src/monitors/registry");
 	const { MonitorPropagator } = await import("../src/monitors/propagate");
 	const { DeliveryService } = await import("../src/delivery/delivery");
-	const { DeliveryLedger } = await import("../src/store/ledger");
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ownertarget-"));
-	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const database = await Store.open(join(directory, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const monitor = registry.add({
 		name: "targetless",
 		trigger: { kind: "cron", schedule: "* * * * *" },
 		eventTypes: ["memory.canonicalize"],
 	});
-	const delivery = new DeliveryService(new DeliveryLedger(database));
+	const delivery = new DeliveryService(database);
 	const pushed: unknown[] = [];
 	const pipeline = new MonitorPropagator({
 		database,
@@ -186,7 +184,7 @@ test("a monitor without its own channel target reports authored notes to the own
 	expect((pushed[0] as { text: string }).text).toBe("owner-target note");
 
 	// Verify the note is persisted in the ledger as inflight (awaiting confirmation).
-	const rows = database.deliveryRows();
+	const rows = database.outbox.rows();
 	expect(rows).toHaveLength(1);
 	expect(rows[0]).toMatchObject({
 		state: "inflight",
