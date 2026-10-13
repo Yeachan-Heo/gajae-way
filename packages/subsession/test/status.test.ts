@@ -32,12 +32,15 @@ describe("isPromptStatus", () => {
 		}
 	});
 
-	test.each(["completed", "cancelled", "error", "running", "wait_timeout"])(
-		"rejects %p, which is not a top-level status",
-		(status) => {
-			expect(isPromptStatus(status)).toBe(false);
-		},
-	);
+	test.each([
+		"completed",
+		"cancelled",
+		"error",
+		"running",
+		"wait_timeout",
+	])("rejects %p, which is not a top-level status", (status) => {
+		expect(isPromptStatus(status)).toBe(false);
+	});
 });
 
 describe("parseStatusReport", () => {
