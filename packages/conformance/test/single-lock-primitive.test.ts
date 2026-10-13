@@ -26,7 +26,7 @@ const RULES: readonly Rule[] = [
 		description: "flock/dlopen outside the lease helper",
 		pattern: /\bflock\b|\bdlopen\(/,
 		allowed: [LEASE],
-		positive: `const lib = dlopen("libc.so.6", { flock: {} });`,
+		positive: 'const lib = dlopen("libc.so.6", { flock: {} });',
 	},
 	{
 		id: "R2",
@@ -40,7 +40,7 @@ const RULES: readonly Rule[] = [
 		description: "pidfiles",
 		pattern: /daemon\.pid|\bPID_FILE\b|["'`][^"'`\n]*\.pid["'`]/,
 		allowed: [],
-		positive: "const path = join(home, `adapter-discord.pid`);",
+		positive: "const path = join(home, " + "`adapter-discord.pid`" + ");",
 	},
 	{
 		id: "R4",
@@ -52,7 +52,7 @@ const RULES: readonly Rule[] = [
 			"packages/cli/src/setup.ts",
 			"packages/adapter-slack/src/recovery.ts",
 		],
-		positive: `await writeFile(lockPath, pid, { flag: "wx" });`,
+		positive: 'await writeFile(lockPath, pid, { flag: "wx" });',
 	},
 	{
 		id: "R5",
@@ -66,7 +66,7 @@ const RULES: readonly Rule[] = [
 		description: "elections and link/mkdir CAS",
 		pattern: /\.reclaim\.d|\blinkNoReplace\b|\.candidate["'`]|\bmkdir\([^)\n]*\.lock\b/,
 		allowed: [],
-		positive: "const election = `${path}.reclaim.d`;",
+		positive: "const election = `\$" + "{path}.reclaim.d`;",
 	},
 	{
 		id: "R7",

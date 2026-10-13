@@ -622,13 +622,7 @@ test("an interim delivery keeps the working status and re-pulses typing; only th
 	await Bun.sleep(5);
 	const beforeInterim = typingCount;
 	// Interim delivery arrives
-	await settleDiscordDelivery(
-		gateway,
-		discord,
-		{ ...delivery("still working"), final: false },
-		typing,
-		status,
-	);
+	await settleDiscordDelivery(gateway, discord, { ...delivery("still working"), final: false }, typing, status);
 	await Bun.sleep(5);
 	// Typing should continue pulsing (not stop) after interim delivery
 	expect(typingCount).toBeGreaterThan(beforeInterim);
