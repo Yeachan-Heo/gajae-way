@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
@@ -1066,6 +1066,37 @@ test("issue #480: base cannot be selected without a repository binding", async (
 		detail: { reasonCode: "base_requires_repo" },
 	});
 	expect(f.port.binds).toHaveLength(0);
+});
+
+test("issue #480: repository URLs with embedded credentials are rejected", async () => {
+	const f = await fixture();
+	for (const repo of ["https://user:password@example.test/project.git", "https://user@example.test/project.git"]) {
+		await expect(f.manager.start({ name: "credentials", text: "work", repo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "invalid_work_params", field: "repo" },
+		});
+	}
+	expect(f.port.binds).toHaveLength(0);
+});
+
+test("issue #480: an existing managed repository path is not removed on collision", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-collision");
+	try {
+		const f = await fixture();
+		const repositoryPath = join(f.gajaewayHome, "repositories", "occupied");
+		await mkdir(repositoryPath, { recursive: true });
+		const sentinelPath = join(repositoryPath, "keep.txt");
+		await Bun.write(sentinelPath, "preserve");
+
+		await expect(f.manager.start({ name: "occupied", text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "lane_repository_path_exists" },
+		});
+		expect(await Bun.file(sentinelPath).text()).toBe("preserve");
+		expect(f.port.binds).toHaveLength(0);
+	} finally {
+		await cleanup();
+	}
 });
 
 test("issue #480: repo URL creates a cwd-independent worktree with the bound push remote", async () => {
@@ -2880,6 +2911,25 @@ test("issue #480: a generated worktree inside the service checkout is refused", 
 			detail: { reasonCode: "cwd_inside_service_dir" },
 		});
 		expect(await Bun.file(join(f.serviceDirectory, "lanes-root", "repositories", "a")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: a managed repository symlink into the service checkout is refused", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("svc-repository");
+	try {
+		const f = await fixture();
+		const laneRoot = join(f.gajaewayHome, "lanes-root");
+		await mkdir(laneRoot, { recursive: true });
+		await symlink(f.serviceDirectory, join(laneRoot, "repositories"));
+		const manager = await f.restart({ laneRoot });
+		await expect(manager.start({ name: "a", text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir" },
+		});
+		expect(f.port.binds).toHaveLength(0);
+		expect(await Bun.file(join(f.serviceDirectory, "a")).exists()).toBe(false);
 	} finally {
 		await cleanup();
 	}

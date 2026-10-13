@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	type ChatMessagePayload,
@@ -716,6 +716,11 @@ export class WorkLaneManager {
 			job?.lane.worktreePath ?? (input.repo !== undefined ? join(laneRoot, "lanes", input.name) : input.cwd);
 		if (candidateWorktreePath === undefined) throw new Error("work lane path was not resolved");
 		assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateWorktreePath, input.name);
+		const candidateRepositoryPath =
+			job?.lane.repositoryPath ??
+			(!job && input.repo !== undefined ? join(laneRoot, "repositories", input.name.toLowerCase()) : undefined);
+		if (candidateRepositoryPath !== undefined)
+			assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateRepositoryPath, input.name);
 		const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
 		if (open)
 			throw new ProtocolError("invalid_params", "attempt already open; use work.steer or wait", {
@@ -740,7 +745,13 @@ export class WorkLaneManager {
 			let worktreePath = input.cwd;
 			let repositoryPath: string | undefined;
 			if (input.repo !== undefined) {
-				createdWorktree = await createWorktreeFromRepo(laneRoot, input.name, input.repo, input.base);
+				createdWorktree = await createWorktreeFromRepo(
+					laneRoot,
+					this.#options.serviceDirectory,
+					input.name,
+					input.repo,
+					input.base,
+				);
 				worktreePath = createdWorktree.worktreePath;
 				repositoryPath = createdWorktree.repositoryPath;
 			}
@@ -2066,12 +2077,13 @@ function parseInput(params: unknown): WorkInput {
 		if (typeof input.repo !== "string" || !input.repo) invalid("repo");
 		if (!isAbsolute(input.repo) && !isGitRemoteUrl(input.repo)) invalid("repo");
 		if (isGitRemoteUrl(input.repo)) {
+			let url: URL | undefined;
 			try {
-				const url = new URL(input.repo);
-				if (url.password || (["https:", "git:"].includes(url.protocol) && url.username)) invalid("repo");
+				url = new URL(input.repo);
 			} catch {
 				// SCP-style SSH remotes do not use URL userinfo parsing.
 			}
+			if (url && (url.password || (["https:", "git:"].includes(url.protocol) && url.username))) invalid("repo");
 		}
 		repo = input.repo;
 	}
@@ -2420,6 +2432,16 @@ function canonicalPathIncludingMissing(target: string): string {
 		try {
 			return resolve(realpathSync(current), ...missing.reverse());
 		} catch (error) {
+			let pathIsMissing = false;
+			try {
+				lstatSync(current);
+			} catch (lstatError) {
+				const code =
+					typeof lstatError === "object" && lstatError !== null && "code" in lstatError ? lstatError.code : undefined;
+				if (code !== "ENOENT" && code !== "ENOTDIR") throw lstatError;
+				pathIsMissing = true;
+			}
+			if (!pathIsMissing) throw error;
 			const parent = dirname(current);
 			if (parent === current) throw error;
 			missing.push(basename(current));
@@ -2431,10 +2453,10 @@ function canonicalPathIncludingMissing(target: string): string {
 function assertOutsideServiceDirectory(serviceDirectory: string, lanePath: string, name: string): void {
 	try {
 		const servicePath = canonicalPathIncludingMissing(serviceDirectory);
-		const worktreePath = canonicalPathIncludingMissing(lanePath);
+		const candidatePath = canonicalPathIncludingMissing(lanePath);
 		const servicePrefix = servicePath.endsWith(sep) ? servicePath : `${servicePath}${sep}`;
-		if (worktreePath === servicePath || worktreePath.startsWith(servicePrefix)) {
-			throw new ProtocolError("invalid_params", "lane worktree cannot be inside service directory", {
+		if (candidatePath === servicePath || candidatePath.startsWith(servicePrefix)) {
+			throw new ProtocolError("invalid_params", "lane path cannot be inside service directory", {
 				reasonCode: "cwd_inside_service_dir",
 				name,
 			});
@@ -2462,6 +2484,7 @@ async function pathExists(path: string): Promise<boolean> {
 /** Creates an isolated bare repository and worktree whose origin is the bound repository. */
 async function createWorktreeFromRepo(
 	laneRoot: string,
+	serviceDirectory: string,
 	laneName: string,
 	repo: string,
 	base?: string,
@@ -2471,6 +2494,8 @@ async function createWorktreeFromRepo(
 	const worktreePath = join(lanesDir, laneName);
 	const isRemote = isGitRemoteUrl(repo);
 	const repositoryPath = join(absoluteLaneRoot, "repositories", laneName.toLowerCase());
+	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
+	assertOutsideServiceDirectory(serviceDirectory, repositoryPath, laneName);
 	const { mkdir, rm, rmdir } = await import("node:fs/promises");
 	let ownsRepositoryPath = false;
 	let ownsWorktreePath = false;
@@ -2521,7 +2546,11 @@ async function createWorktreeFromRepo(
 			}
 		}
 		await mkdir(dirname(repositoryPath), { recursive: true });
-		if (await pathExists(repositoryPath)) {
+		try {
+			await mkdir(repositoryPath);
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+			if (code !== "EEXIST") throw error;
 			throw new ProtocolError("invalid_params", "lane repository path already exists", {
 				reasonCode: "lane_repository_path_exists",
 				name: laneName,
