@@ -7,17 +7,19 @@ export interface ProcessReaperOptions {
 	readonly timeoutMs?: number;
 	/** Log function for diagnostics. */
 	readonly log?: (line: string) => void;
-	/** Optional injected process discovery (for testing). */
+	/** Optional injected process table for testing. */
 	readonly processTable?: ProcessTableEntry[];
 	/** Optional kill function for testing. If not provided, uses process.kill. */
 	readonly kill?: (pid: number, signal: string) => Promise<void>;
+	/** Optional procRoot for testing (/proc filesystem root). */
+	readonly procRoot?: string;
 }
 
 export interface ProcessTableEntry {
 	readonly pid: number;
 	readonly ppid: number;
-	readonly command: string;
-	readonly environ?: Record<string, string>;
+	readonly argv: string[];
+	readonly agentDir: string | undefined;
 }
 
 export interface ReapResult {
@@ -30,11 +32,9 @@ export interface ReapResult {
  * Identifies and kills leftover child processes from the previous gateway epoch.
  *
  * Only reaps processes that are:
- * 1. bun processes spawned by the exact gjcExecutable (resolved from home)
- * 2. Orphaned (parent process is no longer alive, not just ppid === 1)
- * 3. With GJC_CODING_AGENT_DIR exactly matching our broker agent directory
- * 4. NOT running as the current gateway process (by matching parent process)
- * 5. Matching exact argv tokens ("sdk serve" or "session" token match, not substring)
+ * 1. Spawned with exactly argv = [gjcPath (or bun gjcPath), "sdk", "serve", "--stdio", "--session", <id>]
+ * 2. With agentDir exactly matching our broker agent directory
+ * 3. With ppid !== current process.pid (orphaned from this gateway instance)
  *
  * This ensures we never kill unrelated bun processes system-wide.
  */
@@ -50,19 +50,20 @@ export async function reapLeftoverWorkers(home: string, options: ProcessReaperOp
 		const gjcExecutable = await resolvePath(layout.gjcExecutable());
 		const brokerAgentDir = layout.brokerAgentDir;
 
-		// Get current process's ppid to avoid matching our own children
-		const gatewayPpid = process.ppid;
+		// Get current process's PID; orphaned workers will have ppid !== this
+		const selfPid = process.pid;
 
-		const foundPids = await findOrphanedWorkers({
-			gjcExecutable,
+		// Read process table (from injection or /proc or ps)
+		const processTable = options.processTable ?? (await readProcessTable(options.procRoot));
+
+		// Classify which processes are orphaned workers we should reap
+		const foundPids = selectOrphanedWorkers(processTable, {
+			gjcPath: gjcExecutable,
 			brokerAgentDir,
-			gatewayPpid,
-			log,
-			processTable: options.processTable,
-			kill: options.kill,
+			selfPid,
 		});
-		found = foundPids.length;
 
+		found = foundPids.length;
 		if (foundPids.length === 0) return { found, killed, failed };
 
 		log(`process-reaper: found ${foundPids.length} orphaned worker processes to reap`);
@@ -96,205 +97,144 @@ async function resolvePath(path: string): Promise<string> {
 	}
 }
 
-interface WorkerSearchOptions {
-	readonly gjcExecutable: string;
-	readonly brokerAgentDir: string;
-	readonly gatewayPpid: number;
-	readonly log: (line: string) => void;
-	readonly processTable?: ProcessTableEntry[];
-	readonly isProcessAliveOverride?: (pid: number) => Promise<boolean>;
-	readonly kill?: (pid: number, signal: string) => Promise<void>;
-}
-
 /**
- * Checks if a process with the given PID is alive.
- */
-async function isProcessAlive(pid: number, processTable?: ProcessTableEntry[]): Promise<boolean> {
-	if (processTable) {
-		return processTable.some((entry) => entry.pid === pid);
-	}
-	try {
-		if (process.platform === "linux") {
-			const stat = await readFile(`/proc/${pid}/stat`, "utf-8").catch(() => "");
-			return stat.length > 0;
-		} else {
-			const proc = Bun.spawn(["kill", "-0", String(pid)], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
-			await proc.exited;
-			return proc.exitCode === 0;
-		}
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Checks if a process is a gajaeway gateway process by checking its command for exact tokens.
- * A gateway process must have both "sdk" and "broker" tokens in its command.
- */
-function isGatewayProcess(processTable: ProcessTableEntry[], parentPid: number): boolean {
-	const parent = processTable.find((entry) => entry.pid === parentPid);
-	if (!parent) return false;
-
-	// Check for exact token match: must have "sdk" followed by "broker" somewhere in the command
-	const cmdTokens = parent.command.split(/\s+/);
-	let foundSdk = false;
-	for (let i = 0; i < cmdTokens.length; i++) {
-		if (cmdTokens[i] === "sdk") {
-			foundSdk = true;
-		}
-		if (foundSdk && cmdTokens[i] === "broker") {
-			return true;
-		}
-	}
-	return false;
-}
-
-/**
- * Finds processes that are orphaned (parent process no longer exists or is not a gateway)
- * and spawned by the exact gjcExecutable.
- * Uses platform-specific discovery: /proc on Linux, ps on Unix/macOS.
- */
-async function findOrphanedWorkers(options: WorkerSearchOptions): Promise<number[]> {
-	if (process.platform === "linux") {
-		return await findOrphanedLinux(options);
-	} else {
-		return await findOrphanedUnix(options);
-	}
-}
-
-/**
- * Linux-specific process discovery using /proc filesystem or injected test data.
+ * Pure classifier: identifies orphaned workers from a process table.
  *
- * Strategy: Read /proc/[pid]/stat to find ppid, and /proc/[pid]/cmdline + /proc/[pid]/environ
- * to verify the process matches our gjcExecutable and is for our agent directory.
- * A process is reaped if its parent is no longer alive or is not the current gateway.
+ * A worker is selected for reaping if:
+ * 1. Its argv matches [gjcPath or "bun" + gjcPath, "sdk", "serve", "--stdio", "--session", <id>]
+ *    (argv is an exact token match, not substring or prefix)
+ * 2. Its agentDir === brokerAgentDir (exact equality)
+ * 3. Its ppid !== selfPid (not a child of the current gateway instance)
  */
-async function findOrphanedLinux(options: WorkerSearchOptions): Promise<number[]> {
+export function selectOrphanedWorkers(
+	table: ProcessTableEntry[],
+	options: { readonly gjcPath: string; readonly brokerAgentDir: string; readonly selfPid: number },
+): number[] {
 	const result: number[] = [];
 
-	// Use injected process table for testing if available
-	if (options.processTable) {
-		for (const entry of options.processTable) {
-			if (!entry.command.includes("bun")) continue;
-			if (entry.ppid === process.pid) continue;
-			if (!entry.environ) continue;
+	for (const entry of table) {
+		// Check argv token match: [gjcPath or bun+gjcPath, "sdk", "serve", "--stdio", "--session", id]
+		if (!isWorkerArgv(entry.argv, options.gjcPath)) continue;
 
-			const agentDirValue = entry.environ.GJC_CODING_AGENT_DIR;
-			if (agentDirValue !== options.brokerAgentDir) continue;
+		// Check agentDir exact equality
+		if (entry.agentDir !== options.brokerAgentDir) continue;
 
-			const cmdline = entry.command.split(" ");
-			const hasExactSdkServe = cmdline.some((arg, idx) => arg === "sdk" && cmdline[idx + 1] === "serve");
-			const hasSessionToken = cmdline.includes("session") || cmdline.includes("--session");
-			if (!hasExactSdkServe && !hasSessionToken) continue;
+		// Check if orphaned: ppid !== selfPid
+		if (entry.ppid === options.selfPid) continue;
 
-			// Check if parent is a live gateway process
-			const parentIsGateway = isGatewayProcess(options.processTable, entry.ppid);
-			if (parentIsGateway) continue; // Skip if parent is a live gateway
-
-			result.push(entry.pid);
-		}
-		return result;
+		result.push(entry.pid);
 	}
 
+	return result;
+}
+
+/**
+ * Checks if argv matches the exact pattern for a spawned worker.
+ * Pattern: [gjcPath or "bun" + gjcPath, "sdk", "serve", "--stdio", "--session", <id>]
+ */
+function isWorkerArgv(argv: string[], gjcPath: string): boolean {
+	if (argv.length < 6) return false;
+
+	let idx = 0;
+
+	// Check first token: either gjcPath directly or "bun" followed by gjcPath
+	if (argv[0] === "bun") {
+		if (argv[1] !== gjcPath) return false;
+		idx = 2;
+	} else {
+		if (argv[0] !== gjcPath) return false;
+		idx = 1;
+	}
+
+	// Remaining argv must be exactly: "sdk", "serve", "--stdio", "--session", <id>
+	if (argv.length !== idx + 5) return false;
+	if (argv[idx] !== "sdk") return false;
+	if (argv[idx + 1] !== "serve") return false;
+	if (argv[idx + 2] !== "--stdio") return false;
+	if (argv[idx + 3] !== "--session") return false;
+	// argv[idx + 4] is the session ID, which can be any string
+
+	return true;
+}
+
+/**
+ * Reads the process table from /proc (Linux) or ps (macOS/Unix).
+ * On Linux, reads /proc/[pid]/stat, /proc/[pid]/cmdline, /proc/[pid]/environ.
+ * On macOS, uses `ps eww` (environment may be incomplete; skip agentDir if not present).
+ * Returns empty array if the system doesn't provide process information.
+ */
+async function readProcessTable(procRoot?: string): Promise<ProcessTableEntry[]> {
+	if (process.platform === "linux") {
+		return await readProcessTableLinux(procRoot);
+	} else {
+		return await readProcessTableUnix();
+	}
+}
+
+/**
+ * Linux-specific process discovery from /proc filesystem.
+ * Reads /proc/[pid]/stat for ppid, /proc/[pid]/cmdline for argv, /proc/[pid]/environ for GJC_CODING_AGENT_DIR.
+ */
+async function readProcessTableLinux(procRoot: string = "/proc"): Promise<ProcessTableEntry[]> {
+	const result: ProcessTableEntry[] = [];
+
 	try {
-		const procEntries = await readdir("/proc").catch(() => []);
-		for (const entry of procEntries) {
+		const entries = await readdir(procRoot);
+
+		for (const entry of entries) {
 			const pid = Number(entry);
 			if (!Number.isSafeInteger(pid) || pid <= 0) continue;
 
 			try {
-				// Read stat to get parent PID (field 3, 0-indexed)
-				const stat = await readFile(join("/proc", entry, "stat"), "utf-8").catch(() => "");
+				// Read /proc/[pid]/stat to extract ppid (field 3)
+				const stat = await readFile(join(procRoot, entry, "stat"), "utf-8").catch(() => "");
 				if (!stat) continue;
 
-				const parts = stat.split(" ");
-				const ppid = Number(parts[3]);
+				const statParts = stat.split(" ");
+				const ppid = Number(statParts[3]);
+				if (!Number.isSafeInteger(ppid)) continue;
 
-				// Skip processes that are children of the current gateway
-				if (ppid === process.pid) continue;
+				// Read /proc/[pid]/cmdline (NUL-separated argv)
+				const cmdlineStr = await readFile(join(procRoot, entry, "cmdline"), "utf-8").catch(() => "");
+				const argv = cmdlineStr.split("\0").filter(Boolean);
+				if (argv.length === 0) continue;
 
-				// Read command line to check for bun
-				const cmdline: string[] = await readFile(join("/proc", entry, "cmdline"), "utf-8")
-					.then((s) => s.split("\0").filter(Boolean))
-					.catch(() => []);
+				// Read /proc/[pid]/environ to extract GJC_CODING_AGENT_DIR
+				const environStr = await readFile(join(procRoot, entry, "environ"), "utf-8").catch(() => "");
+				const environ = environStr.split("\0");
+				let agentDir: string | undefined;
+				for (const envVar of environ) {
+					if (envVar.startsWith("GJC_CODING_AGENT_DIR=")) {
+						agentDir = envVar.substring("GJC_CODING_AGENT_DIR=".length);
+						break;
+					}
+				}
 
-				if (cmdline.length === 0 || !cmdline[0]?.endsWith("bun")) continue;
-
-				// Check if this process was spawned by our gateway (has exact argv tokens)
-				// Look for exact token matches of "sdk" with "serve" or "session" followed by gateway identifier
-				const hasExactSdkServe = cmdline.some((arg, idx) => arg === "sdk" && cmdline[idx + 1] === "serve");
-				const hasSessionToken = cmdline.includes("session");
-				if (!hasExactSdkServe && !hasSessionToken) continue;
-
-				// Verify environment contains GJC_CODING_AGENT_DIR pointing EXACTLY to our broker agent dir
-				const environ: string[] = await readFile(join("/proc", entry, "environ"), "utf-8")
-					.then((s) => s.split("\0").filter(Boolean))
-					.catch(() => []);
-
-				const agentDirMatch = environ.find((e) => e.startsWith("GJC_CODING_AGENT_DIR="));
-				if (!agentDirMatch) continue;
-
-				// Extract the actual path value and compare for exact equality
-				const agentDirValue = agentDirMatch.substring("GJC_CODING_AGENT_DIR=".length);
-				if (agentDirValue !== options.brokerAgentDir) continue;
-
-				// Check if the parent process is still alive and is a gateway
-				// On real /proc systems, we can't easily check if parent is a gateway,
-				// so we only check if parent is alive; if not alive, reap it
-				const parentAlive = await isProcessAlive(ppid);
-				if (parentAlive) continue;
-
-				// This is an orphaned process spawned by our gateway
-				result.push(pid);
+				result.push({ pid, ppid, argv, agentDir });
 			} catch {
 				// Ignore errors reading proc entries (permission denied, process died, etc)
 			}
 		}
 	} catch {
-		// /proc not available
+		// /proc not available or other error; return empty table
 	}
+
 	return result;
 }
 
 /**
- * Unix-specific process discovery using ps command or injected test data.
- * Less precise than /proc, but works on macOS and other Unix systems.
- * A process is reaped if its parent is no longer alive or is not the current gateway.
+ * Unix-specific process discovery using `ps eww` command.
+ * Returns ppid, pid, argv, and environment variables.
+ * Note: On macOS/Unix, environment may be incomplete or unavailable; this is best-effort.
+ * If GJC_CODING_AGENT_DIR is not present in ps output, agentDir will be undefined.
  */
-async function findOrphanedUnix(options: WorkerSearchOptions): Promise<number[]> {
-	const result: number[] = [];
-
-	// Use injected process table for testing if available
-	if (options.processTable) {
-		for (const entry of options.processTable) {
-			if (!entry.command.includes("bun")) continue;
-			if (entry.ppid === process.pid) continue;
-
-			const hasExactSdkServe = entry.command.includes(" sdk serve") || entry.command.startsWith("sdk serve");
-			const hasSessionToken =
-				entry.command.includes(" --session ") ||
-				entry.command.includes(" session ") ||
-				entry.command.includes(" session$") ||
-				entry.command.endsWith(" session") ||
-				entry.command === "session";
-			if (!hasExactSdkServe && !hasSessionToken) continue;
-
-			if (!entry.command.includes(options.gjcExecutable)) continue;
-
-			// Check if parent is a live gateway process
-			const parentIsGateway = isGatewayProcess(options.processTable, entry.ppid);
-			if (parentIsGateway) continue; // Skip if parent is a live gateway
-
-			result.push(entry.pid);
-		}
-		return result;
-	}
+async function readProcessTableUnix(): Promise<ProcessTableEntry[]> {
+	const result: ProcessTableEntry[] = [];
 
 	try {
-		const proc = Bun.spawn(["ps", "-eo", "ppid=,pid=,command="], {
+		// ps eww output: all processes with all environment variables
+		// Format: PPID PID COMMAND [with embedded environ]
+		const proc = Bun.spawn(["ps", "eww"], {
 			stdout: "pipe",
 			stderr: "ignore",
 		});
@@ -302,42 +242,44 @@ async function findOrphanedUnix(options: WorkerSearchOptions): Promise<number[]>
 		const output = await new Response(proc.stdout as ReadableStream).text();
 		const lines = output.trim().split("\n");
 
-		for (const line of lines) {
+		// Skip header line
+		for (let i = 1; i < lines.length; i++) {
+			const line = lines[i];
+			if (!line) continue;
+
+			// ps eww format: leading columns are PPID PID, followed by COMMAND
+			// COMMAND may contain spaces and environment variables (space-separated)
+			// We need to parse: PPID PID command args...
 			const parts = line.trim().split(/\s+/);
 			if (parts.length < 3) continue;
 
 			const ppid = Number(parts[0]);
 			const pid = Number(parts[1]);
-			const command = parts.slice(2).join(" ");
+			if (!Number.isSafeInteger(ppid) || !Number.isSafeInteger(pid)) continue;
 
-			if (!Number.isSafeInteger(pid)) continue;
+			// The rest is the command and environment, space-separated
+			// For simplicity, treat the remaining parts as argv + environ
+			// argv[0] is the command name, argv[1:] are the arguments
+			const argv = [parts[2]];
+			let agentDir: string | undefined;
 
-			// Skip processes that are children of the current gateway
-			if (ppid === process.pid) continue;
+			// Scan remaining parts for the session ID and environment
+			for (let j = 3; j < parts.length; j++) {
+				const part = parts[j];
+				if (part.startsWith("GJC_CODING_AGENT_DIR=")) {
+					agentDir = part.substring("GJC_CODING_AGENT_DIR=".length);
+				} else if (!part.includes("=")) {
+					// Argument (not an environment variable)
+					argv.push(part);
+				}
+			}
 
-			// Must be a bun process
-			if (!command.includes("bun")) continue;
-
-			// Must be running exact token matches of "sdk serve" or contain "--session"
-			const hasExactSdkServe = command.includes(" sdk serve") || command.startsWith("sdk serve");
-			const hasSessionToken = command.includes(" --session ") || command.includes("--session=");
-			if (!hasExactSdkServe && !hasSessionToken) continue;
-
-			// On Unix systems, verify the command contains our gjcExecutable path
-			if (!command.includes(options.gjcExecutable)) continue;
-
-			// Check if the parent process is still alive
-			// On real systems without process table injection, we can't easily check gateway status,
-			// so we only check if parent is alive; if not alive, reap it
-			const parentAlive = await isProcessAlive(ppid);
-			if (parentAlive) continue;
-
-			result.push(pid);
+			result.push({ pid, ppid, argv, agentDir });
 		}
 
 		await proc.exited;
 	} catch {
-		// ps not available or other error
+		// ps not available or other error; return empty table
 	}
 
 	return result;
