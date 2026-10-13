@@ -439,7 +439,7 @@ test("a held turn in recovery_hold must not absorb new inbound as steers; new in
 	// Only the first failed attempt, no new send yet
 	expect(port.sends).toHaveLength(0);
 	// The second message should still be pending in the database
-	const pending = database?.inboundPendingOldest(KEY);
+	const pending = database?.inbox.pendingOldest(KEY);
 	expect(pending?.message_id).toBe("second-msg");
 	// It should not have been associated with the first turn
 	expect(pending?.turn_op_ref).toBeNull();
