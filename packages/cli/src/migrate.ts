@@ -1,11 +1,6 @@
 import { randomUUID } from "node:crypto";
-<<<<<<< HEAD
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-=======
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
->>>>>>> gajae-way/main
 import { join } from "node:path";
-import { acquireLease, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { detectHermes, readHermes } from "./migrate/hermes";
 import { detectOpenClaw, readOpenClaw } from "./migrate/openclaw";
 import {
@@ -29,26 +24,9 @@ export interface MigrateOptions {
  * reads its configuration, and writes the gajae-way-compatible output.
  */
 export async function migrate(options: MigrateOptions): Promise<void> {
-	const targetHome = expandHome(options.target ?? process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`);
-	if (options.dryRun) return migrateUnlocked(options, targetHome);
-
-	let lease: Lease;
-	try {
-		lease = await acquireLease(targetHome, "memory");
-	} catch (error) {
-		if (error instanceof LeaseHeldError)
-			throw new Error(`${error.message}; stop the gateway first before importing memory data`, { cause: error });
-		throw error;
-	}
-	try {
-		await migrateUnlocked(options, targetHome);
-	} finally {
-		await lease.release();
-	}
-}
-
-async function migrateUnlocked(options: MigrateOptions, targetHome: string): Promise<void> {
 	const sourceRoot = expandHome(options.source ?? ".");
+	const targetHome = expandHome(options.target ?? `${process.env.HOME ?? "~"}/.gajaeway`);
+
 	// Detect source type
 	let sourceType: MigrationSource | undefined;
 	if (await detectHermes(sourceRoot)) {
@@ -136,11 +114,16 @@ async function migrateUnlocked(options: MigrateOptions, targetHome: string): Pro
 			// Atomic 0600 write for secrets
 			const temporary = `${filePath}.${randomUUID()}.tmp`;
 			try {
-				await writeFile(temporary, file.content, { mode: 0o600 });
+				await writeFile(temporary, file.content, { flag: "wx", mode: 0o600 });
 				await chmod(temporary, 0o600);
 				await rename(temporary, filePath);
 			} catch (error) {
-				await rm(temporary, { force: true });
+				// Clean up temporary file on error
+				try {
+					await rm(temporary, { force: true });
+				} catch {
+					// Ignore cleanup errors
+				}
 				throw error;
 			}
 		} else {

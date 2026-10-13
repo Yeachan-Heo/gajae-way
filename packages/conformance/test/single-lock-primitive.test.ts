@@ -66,7 +66,7 @@ const RULES: readonly Rule[] = [
 		description: "elections and link/mkdir CAS",
 		pattern: /\.reclaim\.d|\blinkNoReplace\b|\.candidate["'`]|\bmkdir\([^)\n]*\.lock\b/,
 		allowed: [],
-		positive: "const election = `${path}.reclaim.d`;",
+		positive: "const election = `$" + "{path}.reclaim.d`;",
 	},
 	{
 		id: "R7",
