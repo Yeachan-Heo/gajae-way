@@ -2219,7 +2219,7 @@ function terminalEvidence(status: PromptStatusBody, observedAt: string): WorkAtt
 					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
 						? "end_turn"
 						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
-							? status.outcome?.reason!
+							? (status.outcome?.reason ?? "stopped_incomplete")
 							: "stopped_incomplete";
 	return { kind: "broker", observedAt, reasonCode, status };
 }

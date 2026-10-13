@@ -2106,7 +2106,8 @@ test("#308 streamed turn frames advance lane activity past the attempt start", a
 	const f = await fixture({ now: () => now });
 	const result = await started(f);
 	const row = f.db.bindings.workLaneRows()[0];
-	const startedAt = row?.last_activity_at!;
+	const activityAt = row?.last_activity_at;
+	const startedAt = activityAt!;
 	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)?.startedAt);
 	now += 5_000;
 	f.port.emitTool(result.sessionId, { toolName: "bash" });

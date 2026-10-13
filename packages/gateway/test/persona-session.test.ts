@@ -284,9 +284,7 @@ for (const answer of ["owned original answer", ""])
 		expect(port.workerOutputReads).toHaveLength(1);
 		expect(port.workerOutputReads[0]).toMatchObject({ sessionId: send.sessionId, opRef: send.opRef });
 		const dispatchedAt = database?.inbox.turnDispatchedAt(send.opRef);
-		expect(port.workerOutputReads[0]?.notBeforeMs).toBeGreaterThanOrEqual(
-			Date.parse(dispatchedAt!),
-		);
+		expect(port.workerOutputReads[0]?.notBeforeMs).toBeGreaterThanOrEqual(Date.parse(dispatchedAt!));
 		const turnRow = database?.inbox.turnRow(send.opRef);
 		expect(turnRow?.turn_state).toBe("done");
 		expect(port.sends).toHaveLength(1);

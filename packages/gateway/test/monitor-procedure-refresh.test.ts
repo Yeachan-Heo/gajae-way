@@ -88,9 +88,7 @@ test("a procedure edit reaches the very next firing of a long-lived event-type s
 			expect.objectContaining({ path: "memory/ops/gajaeway-feedback.md", status: "ok", sha256: sha256(before) }),
 		]);
 		const secondJson = second?.procedure_json;
-		expect(JSON.parse(secondJson!)).toEqual([
-			expect.objectContaining({ status: "ok", sha256: sha256(after) }),
-		]);
+		expect(JSON.parse(secondJson!)).toEqual([expect.objectContaining({ status: "ok", sha256: sha256(after) })]);
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
