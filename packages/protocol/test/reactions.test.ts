@@ -69,6 +69,9 @@ describe("reaction allowlist", () => {
 			expect(platformSupportsReaction("discord", name)).toBe(true);
 		}
 		expect(reactionAllowlistFor("telegram")).toHaveLength(REACTION_ALLOWLIST.length - 3);
+		expect(platformSupportsReaction("telegram", "custom_emoji_name")).toBe(false);
+		expect(platformSupportsReaction("discord", "custom_emoji_name")).toBe(true);
+		expect(platformSupportsReaction("slack", "custom_emoji_name")).toBe(true);
 		// Slack reacts by emoji name and has a name for every allowlist entry.
 		expect(reactionAllowlistFor("slack")).toEqual(REACTION_ALLOWLIST);
 		for (const entry of REACTION_ALLOWLIST) expect(platformSupportsReaction("slack", entry.name)).toBe(true);

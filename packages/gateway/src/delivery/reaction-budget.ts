@@ -48,13 +48,15 @@ export class ReactionBudget {
 		readonly originKey: string;
 		readonly targetMessageId: string;
 		readonly emoji: string;
+		readonly emojiName: string;
 	}): ReactionRejection | undefined {
 		const messageKey = `${input.originKey}\u0000${input.targetMessageId}`;
+		const emojiKey = input.emoji || input.emojiName;
 		const applied = this.#messages.get(messageKey);
-		if (applied?.has(input.emoji))
+		if (applied?.has(emojiKey))
 			return {
 				reason: "duplicate",
-				detail: `${input.emoji} is already applied to message ${input.targetMessageId}`,
+				detail: `${emojiKey} is already applied to message ${input.targetMessageId}`,
 			};
 		if (applied && applied.size >= REACTIONS_PER_MESSAGE_CAP)
 			return {
@@ -68,9 +70,9 @@ export class ReactionBudget {
 				detail: `turn ${input.turnId} already emitted ${used} reaction(s), cap is ${REACTIONS_PER_TURN_CAP}`,
 			};
 		if (input.turnId) this.#remember(this.#turns, input.turnId, used + 1);
-		this.#remember(this.#messages, messageKey, (applied ?? new Set<string>()).add(input.emoji));
+		this.#remember(this.#messages, messageKey, (applied ?? new Set<string>()).add(emojiKey));
 		// Mark as owned by the persona so remove can verify ownership
-		this.#remember(this.#owned, messageKey, (this.#owned.get(messageKey) ?? new Set<string>()).add(input.emoji));
+		this.#remember(this.#owned, messageKey, (this.#owned.get(messageKey) ?? new Set<string>()).add(emojiKey));
 		return undefined;
 	}
 
@@ -78,15 +80,21 @@ export class ReactionBudget {
 	 * Releases budget for a removed reaction. Returns true if the reaction was owned
 	 * by the persona (already added and tracked), false if the persona cannot remove it.
 	 */
-	release(input: { readonly originKey: string; readonly targetMessageId: string; readonly emoji: string }): boolean {
+	release(input: {
+		readonly originKey: string;
+		readonly targetMessageId: string;
+		readonly emoji: string;
+		readonly emojiName: string;
+	}): boolean {
 		const messageKey = `${input.originKey}\u0000${input.targetMessageId}`;
+		const emojiKey = input.emoji || input.emojiName;
 		const owned = this.#owned.get(messageKey);
-		if (!owned?.has(input.emoji)) return false;
+		if (!owned?.has(emojiKey)) return false;
 		// Remove from owned and applied
-		owned.delete(input.emoji);
+		owned.delete(emojiKey);
 		const applied = this.#messages.get(messageKey);
 		if (applied) {
-			applied.delete(input.emoji);
+			applied.delete(emojiKey);
 		}
 		return true;
 	}

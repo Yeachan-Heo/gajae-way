@@ -1549,6 +1549,8 @@ async function handleRequest(
 						"invalid_params",
 						`${origin.platform} does not support custom emoji; it accepts: ${reactionAllowlistDescription(origin.platform)}`,
 					);
+				if (origin.platform === "discord" && origin.kind === "dm")
+					throw new ProtocolError("invalid_params", "Discord custom emoji reactions require a guild channel or thread");
 			} else {
 				// Allowlisted is not the same as deliverable: Telegram accepts only its own
 				// reaction set, so asking for one it cannot express would be a guaranteed dead
@@ -1556,10 +1558,11 @@ async function handleRequest(
 				if (!platformSupportsReaction(origin.platform, resolved.name))
 					throw new ProtocolError(
 						"invalid_params",
-						`${origin.platform} cannot react with ${(resolved as any).unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+						`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
 					);
 			}
-			const unicode = !isCustom ? (resolved as any).unicode : "";
+			const unicode = resolved.isCustom === true ? "" : resolved.unicode;
+			const emojiLabel = unicode || `:${resolved.name}:`;
 			const reaction: ReactionRef = {
 				targetMessageId: params.targetMessageId.trim(),
 				emoji: unicode,
@@ -1572,17 +1575,19 @@ async function handleRequest(
 					originKey: originKey(origin),
 					targetMessageId: reaction.targetMessageId,
 					emoji: reaction.emoji,
+					emojiName: reaction.emojiName,
 				});
 				if (!owned)
 					throw new ProtocolError(
 						"invalid_params",
-						`cannot remove ${unicode}: the persona did not add this reaction`,
+						`cannot remove ${emojiLabel}: the persona did not add this reaction`,
 					);
 			} else {
 				const rejection = runtime.reactions.claim({
 					originKey: originKey(origin),
 					targetMessageId: reaction.targetMessageId,
 					emoji: reaction.emoji,
+					emojiName: reaction.emojiName,
 				});
 				// Cap violations are reported, never silently dropped: the caller must be able
 				// to tell "not sent" from "sent and invisible".
@@ -2522,10 +2527,13 @@ async function createInboundTurnLifecycle(
 			reactionsClaimedFor.add(rawMessage);
 			reactionTokensSeen = true;
 			for (const wanted of reactionReply.reactions) {
-				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-					console.warn(
-						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
-					);
+				const unsupportedDiscordDmCustom =
+					wanted.isCustom === true && origin.platform === "discord" && origin.kind === "dm";
+				if (!platformSupportsReaction(origin.platform, wanted.emojiName) || unsupportedDiscordDmCustom) {
+					const reason = unsupportedDiscordDmCustom
+						? "Discord custom emoji reactions require a guild channel or thread"
+						: `${origin.platform} cannot react with ${wanted.emoji || wanted.emojiName} (${wanted.emojiName})`;
+					console.warn(`gateway reaction skipped for ${key}: ${reason}`);
 					continue;
 				}
 				if (wanted.action === "remove") {
@@ -2538,6 +2546,7 @@ async function createInboundTurnLifecycle(
 						originKey: key,
 						targetMessageId: wanted.targetMessageId,
 						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
 					});
 					if (!released) {
 						console.error(
@@ -2561,7 +2570,13 @@ async function createInboundTurnLifecycle(
 						continue;
 					}
 					const targetMessageId = wanted.targetMessageId ?? row.message_id;
-					const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
+					const rejection = runtime.reactions.claim({
+						turnId,
+						originKey: key,
+						targetMessageId,
+						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
+					});
 					if (rejection) {
 						console.error(
 							`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
@@ -3236,6 +3251,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 			originKey: key,
 			targetMessageId,
 			emoji: eyes.unicode,
+			emojiName: eyes.name,
 		});
 		if (rejection) {
 			console.error(

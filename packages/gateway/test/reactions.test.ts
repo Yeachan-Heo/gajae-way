@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { OriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -56,7 +57,7 @@ interface Harness {
 }
 
 /** An open channel, so every human message reaches a turn (same shape as silence.test.ts). */
-async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
+async function gateway(reply: string, hold?: Promise<void>, origin: OriginRef = ORIGIN): Promise<Harness> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-reactions-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -66,6 +67,7 @@ async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		dmPolicy: origin.kind === "dm" ? "open" : "allowlist",
 		// Both keys: a bare id only resolves for discord, so telegram needs the prefixed form.
 		channels: {
 			"chan-1": { engagement: "open" },
@@ -98,6 +100,7 @@ function sendMessage(
 	text = "형님 이거 봐주세요",
 	messageId = "m1",
 	engagement: Record<string, unknown> = { mentioned: true, group: true, authorId: "human-1", authorName: "형님" },
+	origin: OriginRef = ORIGIN,
 ): void {
 	client.send({
 		v: "0.1",
@@ -105,7 +108,7 @@ function sendMessage(
 		id,
 		verb: "chat.send",
 		params: {
-			origin: ORIGIN,
+			origin,
 			text,
 			messageId,
 			engagement,
@@ -419,6 +422,43 @@ test("chat.react reacts to one named message and returns its ledger delivery id"
 	});
 	expect(event.payload.deliveryId).toBe(response.result.deliveryId);
 	expect(database.outbox.rows()).toHaveLength(1);
+});
+
+test("chat.react keys custom emoji ownership by name and rejects Discord DM custom emoji", async () => {
+	const { client, database } = await gateway("unused");
+	for (const [id, origin, emoji, action] of [
+		["k1", ORIGIN, "custom_emoji_name", "add"],
+		["k2", ORIGIN, "other_custom_emoji", "remove"],
+		["k3", ORIGIN, "custom_emoji_name", "remove"],
+		["k4", ORIGIN, "other_custom_emoji", "add"],
+		["k5", { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "peer-1" }, "custom_emoji_name", "add"],
+		["k6", { platform: "slack", kind: "channel", conversationId: "C1" }, "slack_custom_name", "add"],
+	] as const) {
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.react",
+			params: { origin, targetMessageId: "custom-message", emoji, action },
+		});
+		await Bun.sleep(10);
+	}
+	await settle();
+	const wrongRemoval = client.frames.find((frame) => frame.type === "error" && frame.id === "k2");
+	expect(wrongRemoval.error.message).toContain("did not add this reaction");
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "k3")).toBeDefined();
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "k4")).toBeDefined();
+	const dmError = client.frames.find((frame) => frame.type === "error" && frame.id === "k5");
+	expect(dmError.error.message).toContain("require a guild channel or thread");
+	expect(
+		reactionEvents(client.frames).map((frame) => [frame.payload.reaction.emojiName, frame.payload.reaction.action]),
+	).toEqual([
+		["custom_emoji_name", "add"],
+		["custom_emoji_name", "remove"],
+		["other_custom_emoji", "add"],
+		["slack_custom_name", "add"],
+	]);
+	expect(database.outbox.rows()).toHaveLength(4);
 });
 
 test("chat.react rejects a disallowed emoji with an error that names the allowlist", async () => {
@@ -835,4 +875,43 @@ test("custom emoji names are allowed on Discord and reach the adapter with empty
 	expect(reaction.targetMessageId).toBe("m1");
 	expect(reaction.emoji).toBe("");
 	expect(reaction.emojiName).toBe("custom_emoji_name");
+});
+
+test("reply-token removals only release the matching custom emoji name", async () => {
+	const { client } = await gateway(
+		"[REACT:custom_emoji_name@same][UNREACT:other_custom_emoji@same][UNREACT:custom_emoji_name@same][REACT:other_custom_emoji@same]",
+	);
+	sendMessage(client, "c1");
+	await settle();
+	const reactions = reactionEvents(client.frames);
+	expect(reactions.map((frame) => [frame.payload.reaction.emojiName, frame.payload.reaction.action])).toEqual([
+		["custom_emoji_name", undefined],
+		["custom_emoji_name", "remove"],
+		["other_custom_emoji", undefined],
+	]);
+});
+
+test("reply-token custom emoji are skipped on Telegram while the text is delivered", async () => {
+	const telegram: OriginRef = { platform: "telegram", kind: "channel", conversationId: "chan-1" };
+	const { client, database } = await gateway("[REACT:custom_emoji_name] still here", undefined, telegram);
+	sendMessage(client, "c1", "message", "m1", { mentioned: true, group: true, authorId: "human-1" }, telegram);
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["still here"]);
+	expect(database.outbox.rows()).toHaveLength(1);
+});
+
+test("reply-token custom emoji are skipped in Discord DMs while the text is delivered", async () => {
+	const discordDm: OriginRef = {
+		platform: "discord",
+		kind: "dm",
+		conversationId: "dm-1",
+		peerId: "peer-1",
+	};
+	const { client, database } = await gateway("[REACT:custom_emoji_name] still here", undefined, discordDm);
+	sendMessage(client, "c1", "message", "m1", { mentioned: false, group: false, authorId: "human-1" }, discordDm);
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["still here"]);
+	expect(database.outbox.rows()).toHaveLength(1);
 });

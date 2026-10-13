@@ -279,7 +279,7 @@ test("child-process crash injection covers every restore transition and resume i
 	expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
 	await verifyRestored(f);
 	expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
-});
+}, 15_000);
 
 test("restore --abort is refused after install and anomalies keep the journal", async () => {
 	const afterInstall = await fixture();

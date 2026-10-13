@@ -117,16 +117,17 @@ export function resolveReactionEmoji(
  *
  * The allowlist says what a persona may ASK for; this says what a platform can
  * actually deliver. Telegram's Bot API accepts only its own server-provided
- * reaction set, so three allowlist entries are unreachable there and asking for
- * one is a guaranteed dead delivery — the persona would believe it acknowledged
- * while the human saw nothing. The Telegram adapter owns the authoritative
- * 73-emoji set and its tests assert that this list is exactly the set of
- * allowlist entries that set rejects, so the two cannot drift apart silently.
+ * reaction set, so custom emoji and three allowlist entries are unreachable
+ * there. Asking for one is a guaranteed dead delivery — the persona would
+ * believe it acknowledged while the human saw nothing. The Telegram adapter
+ * owns the authoritative 73-emoji set and its tests assert that this list is
+ * exactly the set of allowlist entries that set rejects, so the two cannot
+ * drift apart silently.
  */
 const TELEGRAM_INCAPABLE = new Set(["check", "cross", "lobster"]);
 
 export function platformSupportsReaction(platform: OriginPlatform, emojiName: string): boolean {
-	return platform === "telegram" ? !TELEGRAM_INCAPABLE.has(emojiName) : true;
+	return platform === "telegram" ? BY_NAME.has(emojiName) && !TELEGRAM_INCAPABLE.has(emojiName) : true;
 }
 
 /** The allowlist a specific platform can actually deliver. */
