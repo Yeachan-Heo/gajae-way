@@ -18,6 +18,7 @@ import {
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
+import { createLaneCliRunner } from "./orchestrator/lane-cli-runner";
 import { PersonaLoader } from "./persona/persona";
 import { type GatewayServer, startStdioServer, startUnixServer } from "./server/server";
 import { Store } from "./store";
@@ -226,6 +227,15 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 				tailRunner,
 				authority,
 			});
+			// Lane sessions get a guarded CLI runner that prevents merge operations
+			const laneCliRunner = createLaneCliRunner(broker.cli);
+			const lanePort = new BrokerSessionPort({
+				database,
+				cli: laneCliRunner,
+				instanceId: database.instanceId,
+				tailRunner,
+				authority,
+			});
 			const close = async () => {
 				try {
 					await slo.stop();
@@ -243,6 +253,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						config,
 						database,
 						sessionPort,
+						lanePort,
 						persona,
 						broker,
 						slo,
@@ -256,6 +267,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 						config,
 						database,
 						sessionPort,
+						lanePort,
 						persona,
 						broker,
 						slo,
