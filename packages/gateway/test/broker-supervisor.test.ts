@@ -207,6 +207,54 @@ test("unconfirmed child can restart once exit is confirmed", async () => {
 	}
 }, 10_000);
 
+test("a broker still restarting when an unconfirmed child exits does not strand the client", async () => {
+	// gaebal-gajae 2026-10-14: a CLI child outlived its termination, and when it
+	// finally exited the broker was mid-restart. The one-shot recovery start()
+	// failed and the client stayed unavailable for 18 hours with no observation
+	// and no outage exit.
+	let finish = (_code: number) => {};
+	const stuck = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	let spawned = 0;
+	const spawn = (() => ({
+		exited: ++spawned === 1 ? stuck : Promise.resolve(0),
+		stdout: new Blob(["[]"]).stream(),
+		stderr: new Blob([]).stream(),
+		kill() {},
+	})) as unknown as SpawnFn;
+	let brokerUp = true;
+	const logs: string[] = [];
+	const value = client({
+		spawn,
+		command: undefined,
+		healthProbe: async () => brokerUp,
+		readinessAttempts: 2,
+		readinessDelayMs: 1,
+		healthIntervalMs: 5,
+		reconnectBackoff: { initialMs: 5, maxMs: 10 },
+		log: (line) => logs.push(line),
+	});
+	await value.start();
+	await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toThrow("termination failed");
+	brokerUp = false;
+	finish(0);
+	await stuck;
+	await eventually(() => logs.some((line) => line.includes("recovery after confirmed child exit failed")));
+	// Session relays are what persona turns use; they refuse while unavailable.
+	expect(() => value.openStream("owned-session")).toThrow("broker unavailable");
+	brokerUp = true;
+	const opened = (): boolean => {
+		try {
+			value.openStream("owned-session").close();
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	await eventually(opened);
+}, 10_000);
+
 test("normal owned relay exit is observed and allows clean idempotent stop", async () => {
 	let finish = (_code: number) => {};
 	const exited = new Promise<number>((resolve) => {

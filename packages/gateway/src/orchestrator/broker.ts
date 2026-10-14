@@ -506,8 +506,23 @@ export class GlobalGjcClient {
 				if (this.#stoppedAtEpoch !== undefined && this.#children.size === 0) {
 					this.#stoppedAtEpoch = undefined;
 					this.#stoppedAtTime = undefined;
-					// Attempt to restart; if it fails, the client stays stopped for diagnostics.
-					void this.start().catch(() => {});
+					// start() gives the broker only its readiness budget. A broker that is
+					// restarting at that moment would otherwise leave this client
+					// unavailable forever with no observation running and no outage exit
+					// (gaebal-gajae, 2026-10-14: 18 hours without a reply). On failure,
+					// keep observing with backoff like any other outage.
+					void this.start().catch((error: unknown) => {
+						this.#log(
+							new GjcCliUnavailableError(
+								`recovery after confirmed child exit failed: ${error instanceof Error ? error.message : String(error)}`,
+							),
+						);
+						if (this.#stopped) return;
+						// A timer left from the fenced epoch would fire as a no-op; replace it.
+						if (this.#timer) clearTimeout(this.#timer);
+						this.#timer = undefined;
+						this.#schedule(this.#epoch);
+					});
 				}
 			},
 			() => {},
