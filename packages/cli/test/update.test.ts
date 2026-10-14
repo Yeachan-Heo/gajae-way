@@ -177,6 +177,8 @@ describe("runUpdate", () => {
 	async function binDirWith(marker: string, binaries: readonly string[]): Promise<string> {
 		const dir = await mkdtemp(join(tmpdir(), "gajaeway-update-bin-"));
 		for (const name of binaries) await writeFile(join(dir, name), `old-${name}`);
+		// A host installed by an older release carries that release's gjc pin beside its binaries.
+		await writeFile(join(dir, "package.json"), JSON.stringify({ gjc: { version: "0.18.8" } }));
 		if (marker !== "") await writeFile(join(dir, ".gajaeway-release"), `${marker}\n`);
 		return dir;
 	}
@@ -269,10 +271,14 @@ describe("runUpdate", () => {
 			}
 			expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
 			expect(await readlink(homeLayout(home).gjcCurrent)).toBe(PINNED_GJC);
+			// The pin the new binaries read beside themselves matches the gjc just installed.
+			expect(JSON.parse(await readFile(join(dir, "package.json"), "utf8")).gjc.version).toBe(PINNED_GJC);
+			expect((await stat(join(dir, "package.json"))).mode & 0o777).toBe(0o644);
 			const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
 			expect(backups).toHaveLength(1);
 			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
 				expect(await readFile(join(dir, backups[0], name), "utf8")).toBe(`old-${name}`);
+			expect(JSON.parse(await readFile(join(dir, backups[0], "package.json"), "utf8")).gjc.version).toBe("0.18.8");
 			for (const entry of await readdir(dir)) expect(entry.startsWith(".update-")).toBe(false);
 			expect(await readdir(dir)).not.toContain("gajaeway-admin");
 			const lines = renderUpdate(result);

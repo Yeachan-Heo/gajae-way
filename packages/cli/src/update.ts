@@ -39,6 +39,8 @@ export const UPDATE_USAGE = "usage: gajaeway update [--check] [--force] [--bin-d
 
 export const DEFAULT_RELEASE_REPO = "Yeachan-Heo/gajae-way";
 const RELEASE_REPO_OVERRIDE_ENV = "GAJAEWAY_UPDATE_REPO";
+/** The release manifest carrying the gjc pin; installed beside the binaries. */
+const PIN_MANIFEST = "package.json";
 /** A fork can point updates at its own releases; the declared upstream stays the default. */
 export function releaseRepo(env: NodeJS.ProcessEnv = process.env): string {
 	const override = env[RELEASE_REPO_OVERRIDE_ENV]?.trim();
@@ -360,7 +362,7 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 				throw new Error(`release tarball is missing core binaries: ${missingCore.join(", ")}`);
 			await assertStagedBinariesUsable(staged, toInstall);
 
-			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, "package.json"));
+			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, PIN_MANIFEST));
 			await installPinnedGjc({
 				home: options.home,
 				version: gjcVersion,
@@ -370,15 +372,18 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, "").slice(0, 15);
 			const backupDir = join(binDir, `backup-${current}-${stamp}Z`);
 			await mkdir(backupDir, { recursive: false });
-			for (const name of toInstall) {
+			// The compiled gateway and broker host read the gjc pin from the package.json
+			// beside them; a stale one makes the new binaries refuse the gjc just installed.
+			const replaced = [...toInstall, PIN_MANIFEST];
+			for (const name of replaced) {
 				const target = join(binDir, name);
 				if (await exists(target)) await copyFile(target, join(backupDir, name));
 			}
-			for (const name of toInstall) {
+			for (const name of replaced) {
 				const stagedPath = join(staged.dir, name);
 				const tempPath = join(binDir, `.update-${name}`);
 				await copyFile(stagedPath, tempPath);
-				await chmod(tempPath, 0o755);
+				await chmod(tempPath, name === PIN_MANIFEST ? 0o644 : 0o755);
 				await rename(tempPath, join(binDir, name));
 			}
 			await writeFile(releaseMarkerPath(binDir), `${latest}\n`, "utf8");
