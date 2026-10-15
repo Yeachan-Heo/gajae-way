@@ -749,6 +749,43 @@ test("provider quota exhaustion gives a safe notice and does not reset or rebind
 	expect(activeDatabase.inbox.turnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+test("a provider policy refusal names its category, keeps provider prose private and does not reset the session", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
+	const activeManager = manager;
+	const activeDatabase = database;
+	if (!activeManager || !activeDatabase) throw new Error("test harness did not initialize");
+	enqueue("provider-refusal", "summarize this exploit write-up");
+	await activeManager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("refused turn was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_refusal", undefined, "cyber");
+	// 2026-10-13 shape: gajae-code redacts the post-start failure to its fixed sentence.
+	port.fail(first.opRef, "Agent run failed after execution started.", {
+		code: "agent_error",
+		outcome: {
+			code: "agent_error",
+			providerCode: "untrusted_safety_stop",
+			phase: "post_start",
+			category: "unknown",
+			provenance: "agent_failed",
+		},
+	});
+	await eventually(() => activeManager.state(KEY) === "idle", "refusal did not settle");
+
+	expect(notices).toEqual([
+		"[turn failed] provider_refusal: the model provider refused this request under its usage policy (cyber); rephrase or narrow the request",
+	]);
+	expect(logs).toContain(`failed_turn_classified origin=${KEY} opRef=${first.opRef} reason=provider_refusal`);
+	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
+	expect(logs.some((line) => line.startsWith("agent_error_retry "))).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(activeDatabase.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+	expect(activeDatabase.inbox.turnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+});
+
 // A submission failure that is not a wedged agent run (that one resets on the
 // first failure, see WEDGED_SUBMISSION) resets only when it repeats.
 const REPEATABLE_SUBMISSION = {

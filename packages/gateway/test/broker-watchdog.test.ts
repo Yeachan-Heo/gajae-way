@@ -1,4 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runForegroundBroker } from "../src/broker-host";
 import { watchBrokerLiveness } from "../src/broker-watchdog";
 
@@ -20,6 +23,15 @@ function quiet<T>(run: () => Promise<T>): Promise<T> {
 		log.mockRestore();
 		error.mockRestore();
 	});
+}
+
+async function waitForFile(path: string, timeoutMs = 1_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await Bun.file(path).exists()) return true;
+		await Bun.sleep(5);
+	}
+	return await Bun.file(path).exists();
 }
 
 test("trips once every probe has failed for the unresponsive window", async () => {
@@ -122,6 +134,77 @@ test("a throwing probe counts as a failure and abort stops the watch quietly", a
 	expect(aborted).toBeUndefined();
 	expect(calls).toBe(3);
 });
+
+test("a watchdog restart ends session-host descendants with the broker process group", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-broker-process-group-"));
+	const brokerPath = join(directory, "broker.sh");
+	const hostPath = join(directory, "session-host.sh");
+	const readyPath = join(directory, "ready");
+	const stoppedPath = join(directory, "stopped");
+	const hostPidPath = join(directory, "host.pid");
+	await writeFile(
+		hostPath,
+		[
+			"#!/bin/sh",
+			"exec 2>/dev/null",
+			`trap 'touch "$BROKER_TEST_DIR/stopped"; exit 0' TERM`,
+			`printf '%s\\n' "$$" > "$BROKER_TEST_DIR/host.pid"`,
+			`touch "$BROKER_TEST_DIR/ready"`,
+			"while :; do sleep 0.05; done",
+			"",
+		].join("\n"),
+		{ mode: 0o700 },
+	);
+	await writeFile(
+		brokerPath,
+		["#!/bin/sh", "exec 2>/dev/null", `"$BROKER_TEST_DIR/session-host.sh" &`, "wait", ""].join("\n"),
+		{ mode: 0o700 },
+	);
+	let hostPid: number | undefined;
+	try {
+		const code = await quiet(() =>
+			runForegroundBroker(
+				"/bin/sh",
+				"/unused",
+				{ PATH: process.env.PATH ?? "", BROKER_TEST_DIR: directory },
+				process.cwd(),
+				{
+					watchdog: async (_pid, signal) => {
+						const deadline = Date.now() + 2_000;
+						while (!signal.aborted && Date.now() < deadline) {
+							if (await Bun.file(readyPath).exists()) return "simulated broker wedge";
+							await Bun.sleep(5);
+						}
+						return undefined;
+					},
+					stopGraceMs: 500,
+				},
+				["/bin/sh", brokerPath],
+			),
+		);
+		hostPid = Number((await readFile(hostPidPath, "utf8")).trim());
+		expect(Number.isSafeInteger(hostPid)).toBe(true);
+		expect(code).toBe(1);
+		expect(await waitForFile(stoppedPath)).toBe(true);
+	} finally {
+		if (hostPid && Number.isSafeInteger(hostPid) && !(await Bun.file(stoppedPath).exists())) {
+			try {
+				process.kill(hostPid, "SIGTERM");
+			} catch {
+				// The group cleanup already reaped it.
+			}
+			await Bun.sleep(100);
+			if (!(await Bun.file(stoppedPath).exists())) {
+				try {
+					process.kill(hostPid, "SIGKILL");
+				} catch {
+					// The host already exited.
+				}
+			}
+		}
+		await rm(directory, { recursive: true, force: true });
+	}
+}, 10_000);
 
 test("an unresponsive broker is stopped and the host exits non-zero for a service restart", async () => {
 	const lines: string[] = [];

@@ -72,8 +72,12 @@ const RULES: readonly Rule[] = [
 		id: "R7",
 		description: "process.kill(pid, 0) liveness probes",
 		pattern: /process\.kill\([^,\n]+,\s*0\s*\)/,
-		// gjc discovery liveness (not gajaeway ownership) and scratch-dir GC.
-		allowed: ["packages/gateway/src/orchestrator/broker.ts", "packages/conformance/src/scratch-tmp.ts"],
+		// GJC discovery liveness, scratch-dir GC, and the broker host's private process-group drain; none establishes gateway ownership.
+		allowed: [
+			"packages/gateway/src/orchestrator/broker.ts",
+			"packages/gateway/src/broker-host.ts",
+			"packages/conformance/src/scratch-tmp.ts",
+		],
 		positive: "process.kill(record.pid, 0);",
 	},
 ];

@@ -174,6 +174,43 @@ test("agent_error quota failures are classified without retry", async () => {
 	expect(port.sends).toHaveLength(1);
 });
 
+test("a provider refusal reported as provider_transport is delivered once, never retried", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+
+	await setupHarness(port);
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				failures.push(formatFailureNotice(error));
+			},
+		}),
+	});
+
+	enqueue("provider-refusal", "summarize this exploit write-up");
+	await manager.notifyInbound(KEY);
+	const first = port.sends[0];
+	if (!first) throw new Error("initial refused request was not dispatched");
+	port.setFailedTurnEvidence(first.sessionId, "provider_refusal", undefined, "cyber");
+
+	// A refusal is deterministic: replaying the same request only earns the same refusal.
+	port.fail(first.opRef, "Agent run failed after execution started.", {
+		code: "agent_error",
+		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
+	});
+
+	await manager.tick(KEY);
+	await eventually(() => failures.length === 1, "refusal not delivered");
+	expect(failures[0]).toContain("provider_refusal");
+	expect(failures[0]).toContain("(cyber)");
+	expect(port.sends).toHaveLength(1);
+});
+
 test("non-retryable errors fail immediately without retry", async () => {
 	const port = new ScriptedSessionPort();
 	const failures: string[] = [];

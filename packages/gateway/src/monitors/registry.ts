@@ -157,12 +157,31 @@ export class MonitorRegistry {
 			return updated;
 		});
 	}
+	/**
+	 * Removes the monitor together with everything that would otherwise keep
+	 * firing in its name: the cron cursor, its claimed slots, and every event
+	 * still waiting for a dispatcher. Left in place, each of those events was
+	 * picked up later, found its monitor gone and ended as
+	 * `monitor dispatch rejected missing or invalid monitor` at error level
+	 * (2026-10-14: five such lines for one removed work-nudge monitor). An
+	 * event whose turn is already in flight keeps its own terminal disposition.
+	 */
 	remove(monitorId: string): boolean {
 		return this.#database.transaction((tx) => {
 			const deleted = this.#database.monitors.delete(tx, monitorId);
 			this.#database.core.metaDelete(monitorCronMetaKey(monitorId));
 			this.#database.core.metaDelete(monitorReportToMetaKey(monitorId));
-			return deleted;
+			if (!deleted) return false;
+			for (const event of this.#database.monitors.eventsAwaitingDispatch(monitorId)) {
+				this.#database.monitors.eventTerminalFail(
+					tx,
+					event.event_id,
+					"monitor_removed",
+					"monitor removed before the event was dispatched",
+				);
+			}
+			this.#database.monitors.slotsDelete(tx, monitorId);
+			return true;
 		});
 	}
 

@@ -3,6 +3,7 @@ import type {
 	ChatReactResult,
 	ChatSendResult,
 	GatewayStatusResult,
+	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
 	OpsDeliveriesResult,
@@ -328,8 +329,8 @@ export class GajaewayClient {
 	workRun(params: WorkRunParams): Promise<WorkRunResult> {
 		return this.request("work.run", params);
 	}
-	opsCycle(): Promise<OpsCycleResult> {
-		return this.request("ops.cycle");
+	opsCycle(params?: OpsCycleParams): Promise<OpsCycleResult> {
+		return this.request("ops.cycle", params);
 	}
 	opsSlo(params: OpsSloParams = {}): Promise<OpsSloResult> {
 		return this.request("ops.slo", params);

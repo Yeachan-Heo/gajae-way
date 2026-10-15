@@ -145,7 +145,7 @@ async function versionOf(exe: string, env: NodeJS.ProcessEnv, cwd: string): Prom
 	return (stdout || stderr).match(/\b(\d+\.\d+\.\d+)\b/)?.[1];
 }
 
-/** How long the broker gets to stop on SIGTERM before the host kills it. Under TimeoutStopSec=30s. */
+/** How long the broker process group gets to stop on SIGTERM before the host escalates to SIGKILL. Under TimeoutStopSec=30s. */
 export const BROKER_STOP_GRACE_MS = 20_000;
 
 /** Test seams; production uses the real watchdog and grace. */
@@ -162,25 +162,33 @@ export async function runForegroundBroker(
 	options: ForegroundBrokerOptions = {},
 	args: readonly string[] = [exe, "sdk", "broker", "run", "--agent-dir", agentDir],
 ): Promise<number> {
-	const child = Bun.spawn([...args], { cwd, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+	// The broker and SDK hosts share this private group, so watchdog restarts can
+	// stop them together. Linux also retains systemd's cgroup cleanup fence.
+	const child = Bun.spawn([...args], {
+		cwd,
+		env,
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+		detached: true,
+	});
 	const stopGraceMs = options.stopGraceMs ?? BROKER_STOP_GRACE_MS;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
-	// SIGTERM, then SIGKILL if the broker has not exited within the grace, so a
-	// wedged broker can never hold the broker lease past the service stop timeout.
+	let stopRequested = false;
+	let killSent = false;
+	const forceKill = () => {
+		if (killSent || !processGroupExists(child.pid)) return;
+		killSent = true;
+		console.error(`broker_host_stop_timeout pid=${child.pid} graceMs=${stopGraceMs} action=SIGKILL`);
+		signalProcessGroup(child.pid, "SIGKILL");
+	};
+	// SIGTERM, then SIGKILL if the broker group has not exited within the grace,
+	// so a wedged broker or surviving session host cannot outlive its lease.
 	const stop = (signal: NodeJS.Signals) => {
-		try {
-			child.kill(signal);
-		} catch {
-			// The child may have exited between the signal and this callback.
-		}
-		killTimer ??= setTimeout(() => {
-			console.error(`broker_host_stop_timeout pid=${child.pid} graceMs=${stopGraceMs} action=SIGKILL`);
-			try {
-				child.kill("SIGKILL");
-			} catch {
-				// Already gone.
-			}
-		}, stopGraceMs);
+		if (stopRequested) return;
+		stopRequested = true;
+		signalProcessGroup(child.pid, signal);
+		killTimer = setTimeout(forceKill, stopGraceMs);
 	};
 	// Publish startup only after signal forwarding is installed; supervisors may stop on this marker.
 	process.on("SIGTERM", stop);
@@ -209,8 +217,47 @@ export async function runForegroundBroker(
 		return unresponsive === undefined ? exitCode : 1;
 	} finally {
 		watching.abort();
+		// A broker may exit without a watchdog or service signal while its session
+		// hosts remain alive. Reap the private group on every exit path.
+		if (!stopRequested) stop("SIGTERM");
+		if (!(await waitForProcessGroupExit(child.pid, stopGraceMs))) {
+			forceKill();
+			if (!(await waitForProcessGroupExit(child.pid, 1_000)))
+				console.error(`broker_host_group_cleanup_failed pid=${child.pid} action=service_restart`);
+		}
 		if (killTimer) clearTimeout(killTimer);
 		process.off("SIGTERM", stop);
 		process.off("SIGINT", stop);
 	}
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+	try {
+		process.kill(-pid, signal);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH")
+			console.error(
+				`broker_host_group_signal_failed pid=${pid} signal=${signal} code=${(error as NodeJS.ErrnoException).code ?? "unknown"}`,
+			);
+	}
+}
+
+function processGroupExists(pid: number): boolean {
+	// `pid` is the broker's private process-group id; this only waits for that
+	// group to drain and is never used as proof of session or lease ownership.
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (processGroupExists(pid)) {
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(Math.min(25, deadline - Date.now()));
+	}
+	return true;
 }

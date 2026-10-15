@@ -76,6 +76,31 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 	}
 }
 
+async function runOpsCycleCli(result: OpsCycleResult, args: readonly string[]) {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const lines: string[] = [];
+	const errors: string[] = [];
+	const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+	client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+		requests.push({ verb, params });
+		return result as T;
+	};
+	client.close = async () => {};
+	const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(client);
+	const log = spyOn(console, "log").mockImplementation((line) => lines.push(String(line)));
+	const error = spyOn(console, "error").mockImplementation((line) => errors.push(String(line)));
+	const previousExit = process.exitCode;
+	try {
+		await main(["--socket", "/test/ops-cycle.sock", "ops", "cycle", ...args]);
+		return { requests, lines, errors, exitCode: process.exitCode, connections: connect.mock.calls.length };
+	} finally {
+		connect.mockRestore();
+		log.mockRestore();
+		error.mockRestore();
+		process.exitCode = previousExit ?? 0;
+	}
+}
+
 function sampleSloResult(status: "ok" | "failed" | "insufficient" | "pending"): OpsSloResult {
 	return {
 		days: [
@@ -144,6 +169,61 @@ describe("ops slo exit contract", () => {
 		expect(insufficient.stderr).toBe("");
 		expect(insufficient.stdout).toBe(`${renderSlo(insufficientResult).join("\n")}\n`);
 		expect(insufficient.stdout).toContain("SLO insufficient");
+	});
+});
+
+describe("ops cycle paging CLI", () => {
+	test("sends bounded page parameters and preserves the full-home gate in JSON", async () => {
+		const result = cycleResult({
+			phase: "degraded",
+			gates: ["stale_session_identity"],
+			sessionsTotal: 1_200,
+			sessionsOffset: 100,
+		});
+		const output = await runOpsCycleCli(result, ["--limit", "25", "--offset", "100", "--json"]);
+		expect(output.requests).toEqual([{ verb: "ops.cycle", params: { limit: 25, offset: 100 } }]);
+		expect(output.lines).toEqual([JSON.stringify(result)]);
+		expect(output.exitCode).toBe(1);
+		expect(output.errors).toEqual([]);
+		const defaultPage = await runOpsCycleCli(result, []);
+		expect(defaultPage.requests).toEqual([{ verb: "ops.cycle", params: {} }]);
+	});
+
+	test("rejects responses from a pre-pagination gateway instead of rendering invalid page metadata", async () => {
+		const session = {
+			originKey: "discord/channel/c1",
+			epoch: 0,
+			sessionId: "session-1",
+			pendingInbound: 0,
+			unsettledDeliveries: 0,
+			oldestUnsettledAgeMs: null,
+		} as OpsCycleResult["sessions"][number];
+		const paged = cycleResult({ sessions: [session], sessionsTotal: 1 });
+		const legacy = { ...paged, sessionsTotal: undefined, sessionsOffset: undefined } as unknown as OpsCycleResult;
+		for (const args of [[], ["--limit", "25"]]) {
+			const output = await runOpsCycleCli(legacy, args);
+			expect(output.lines).toEqual([]);
+			expect(output.errors[0]).toContain("paging is unsupported by the running gateway");
+			expect(output.exitCode).toBe(1);
+		}
+		expect(() => renderCycle(legacy)).toThrow("paging is unsupported by the running gateway");
+	});
+
+	test("rejects malformed paging options before connecting", async () => {
+		for (const args of [
+			["--limit"],
+			["--limit", "0"],
+			["--limit", "501"],
+			["--offset", "-1"],
+			["--offset", "1.5"],
+			["--offset", "1", "--offset", "2"],
+			["--json", "--json"],
+		]) {
+			const output = await runOpsCycleCli(cycleResult(), args);
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.errors[0]).toContain("usage: gajaeway ops cycle");
+		}
 	});
 });
 describe("cli arguments", () => {
@@ -752,6 +832,8 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		generatedAt: "2026-08-26T00:00:00.000Z",
 		instanceId: "inst-1",
 		memoryClosing: false,
+		sessionsTotal: 0,
+		sessionsOffset: 0,
 		sessions: [],
 		memoryIntents: { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 },
 		memoryGitIndexLock: null,
@@ -828,6 +910,8 @@ describe("cycle rendering", () => {
 		const lines = renderCycle(
 			cycleResult({
 				gates: ["stale_session_identity"],
+				sessionsTotal: 120,
+				sessionsOffset: 100,
 				sessions: [
 					{
 						originKey: "discord/dm/c1/peer=p1",
@@ -862,6 +946,8 @@ describe("cycle rendering", () => {
 		).join("\n");
 		expect(lines).toContain("(rebinding)");
 		expect(lines).toContain("discord/dm/c1/peer=p1");
+		expect(lines).toContain("sessions: 101-101 of 120 (next: --offset 101)");
+		expect(lines).toContain("100    discord/dm/c1/peer=p1");
 		expect(lines).toContain("42s");
 	});
 

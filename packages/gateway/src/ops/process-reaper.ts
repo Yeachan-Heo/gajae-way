@@ -420,8 +420,16 @@ function findUnixEnvironmentStart(commandAndEnvironment: string, agentDirIndex: 
 	return firstVariable ? sessionEnd + firstVariable.index : agentDirIndex;
 }
 
+/**
+ * The BSD `ps` scan for hosts without `/proc`. `-E` appends each process's environment
+ * after its argv, which the parser needs to find the configured agent directory. The
+ * procps-style `eww` word is not an option on macOS (`ps: illegal argument: eww`), so a
+ * scan spelled that way exits 1 and the boot-time reaper never ran there.
+ */
+export const UNIX_PROCESS_TABLE_COMMAND = ["ps", "-A", "-ww", "-E", "-o", "ppid=,pid=,lstart=,command="] as const;
+
 async function readProcessTableUnix(matchOptions?: WorkerMatchOptions): Promise<ProcessTableEntry[]> {
-	const proc = Bun.spawn(["ps", "-A", "-ww", "eww", "-o", "ppid=,pid=,lstart=,command="], {
+	const proc = Bun.spawn([...UNIX_PROCESS_TABLE_COMMAND], {
 		env: { ...process.env, LC_ALL: "C" },
 		stdout: "pipe",
 		stderr: "ignore",

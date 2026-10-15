@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import type {
 	MonitorEventOperatorResult,
@@ -8,6 +8,7 @@ import type {
 	MonitorRecord,
 	MonitorScheduleProjection,
 	MonitorSpec,
+	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
 	OpsDeliveriesResult,
@@ -22,7 +23,7 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -85,7 +86,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -309,10 +310,24 @@ function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSec
  * - The aggregate phase line always prints.
  * - Any gate prints under `gates:` and forces exit code 1 — a gated cycle is
  *   never reported as healthy, so scripting cannot mistake it for idle.
+ * - Session details are paged; gates and census totals cover the full home.
  * - `--json` emits the typed OpsCycleResult verbatim; the exit-code contract
  *   is identical.
  */
+const OPS_CYCLE_PAGING_UNSUPPORTED =
+	"ops.cycle paging is unsupported by the running gateway; restart the gateway after updating it";
+
+function hasCyclePagingMetadata(cycle: OpsCycleResult): boolean {
+	return (
+		Number.isSafeInteger(cycle.sessionsTotal) &&
+		cycle.sessionsTotal >= 0 &&
+		Number.isSafeInteger(cycle.sessionsOffset) &&
+		cycle.sessionsOffset >= 0
+	);
+}
+
 export function renderCycle(cycle: OpsCycleResult): string[] {
+	if (!hasCyclePagingMetadata(cycle)) throw new Error(OPS_CYCLE_PAGING_UNSUPPORTED);
 	const lines: string[] = [];
 	lines.push(`phase: ${cycle.phase}`);
 	if (cycle.gates.length > 0) lines.push(`gates: ${cycle.gates.join(", ")}`);
@@ -363,15 +378,20 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
 		);
-	if (cycle.sessions.length > 0) {
-		lines.push("sessions:");
+	if (cycle.sessionsTotal > 0 && cycle.sessions.length === 0) {
+		lines.push(`sessions: none at offset ${cycle.sessionsOffset} of ${cycle.sessionsTotal}`);
+	} else if (cycle.sessions.length > 0) {
+		const shownEnd = cycle.sessionsOffset + cycle.sessions.length;
+		lines.push(
+			`sessions: ${cycle.sessionsOffset + 1}-${shownEnd} of ${cycle.sessionsTotal}${shownEnd < cycle.sessionsTotal ? ` (next: --offset ${shownEnd})` : ""}`,
+		);
 		lines.push("INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST");
 		for (const [index, session] of cycle.sessions.entries()) {
 			const sessionId = session.sessionId === "" ? "(rebinding)" : session.sessionId.slice(0, 11);
 			const oldest =
 				session.oldestUnsettledAgeMs === null ? "-" : `${Math.round(session.oldestUnsettledAgeMs / 1000)}s`;
 			lines.push(
-				`${String(index).padEnd(6)} ${session.originKey.padEnd(43)} ${String(session.epoch).padEnd(6)} ${sessionId.padEnd(12)} ${String(session.pendingInbound).padEnd(8)} ${String(session.unsettledDeliveries).padEnd(10)} ${oldest}`,
+				`${String(cycle.sessionsOffset + index).padEnd(6)} ${session.originKey.padEnd(43)} ${String(session.epoch).padEnd(6)} ${sessionId.padEnd(12)} ${String(session.pendingInbound).padEnd(8)} ${String(session.unsettledDeliveries).padEnd(10)} ${oldest}`,
 			);
 		}
 	}
@@ -410,7 +430,36 @@ export function sloExitCode(result: OpsSloResult): number {
 }
 
 const OPS_USAGE =
-	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--json]|integrity|restart-stack [--status]";
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status]";
+
+const OPS_CYCLE_USAGE = "usage: gajaeway ops cycle [--limit N] [--offset N] [--json]";
+
+function parseOpsCycleArgs(args: readonly string[]): { params: OpsCycleParams; json: boolean } {
+	const params: { limit?: number; offset?: number } = {};
+	const seen = new Set<string>();
+	let json = false;
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		if (flag === "--json") {
+			if (json) throw new Error(OPS_CYCLE_USAGE);
+			json = true;
+			continue;
+		}
+		if (flag !== "--limit" && flag !== "--offset") throw new Error(OPS_CYCLE_USAGE);
+		if (seen.has(flag)) throw new Error(OPS_CYCLE_USAGE);
+		seen.add(flag);
+		const value = args[++index];
+		if (!value || value.startsWith("--") || !/^\d+$/.test(value)) throw new Error(OPS_CYCLE_USAGE);
+		const number = Number(value);
+		if (!Number.isSafeInteger(number)) throw new Error(OPS_CYCLE_USAGE);
+		if (flag === "--limit") {
+			if (number < 1 || number > OPS_CYCLE_MAX_LIMIT) throw new Error(OPS_CYCLE_USAGE);
+			params.limit = number;
+		} else params.offset = number;
+	}
+	return { params, json };
+}
+
 function parseOpsSloArgs(args: readonly string[]): { params: OpsSloParams; json: boolean } {
 	let days = 7;
 	let json = false;
@@ -700,6 +749,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					throw new Error(`unknown ops command: ${command ?? "(missing)"}\n${OPS_USAGE}`);
 				const deliveries = command === "deliveries" ? parseOpsDeliveriesArgs(parsed.rest.slice(1)) : undefined;
 				const slo = command === "slo" ? parseOpsSloArgs(parsed.rest.slice(1)) : undefined;
+				const cycle = command === "cycle" ? parseOpsCycleArgs(parsed.rest.slice(1)) : undefined;
 				if (command === "restart-stack") {
 					// Deliberately socket-free: the reason to run this is a gateway that
 					// has to come back, so it must not need the gateway to answer first.
@@ -752,14 +802,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					} else if (redeliverParams)
 						console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
-					else if (command === "cycle") {
-						const cycle = await client.opsCycle();
-						if (parsed.rest[1] === "--json") console.log(JSON.stringify(cycle));
-						else if (parsed.rest[1]) throw new Error("usage: gajaeway ops cycle [--json]");
-						else for (const line of renderCycle(cycle)) console.log(line);
+					else if (cycle) {
+						const result = await client.opsCycle(cycle.params);
+						if (!hasCyclePagingMetadata(result)) throw new Error(OPS_CYCLE_PAGING_UNSUPPORTED);
+						if (cycle.json) console.log(JSON.stringify(result));
+						else for (const line of renderCycle(result)) console.log(line);
 						// Fail-closed: a gated/degraded cycle exits non-zero even though the
 						// request itself succeeded, so scripts can never read it as healthy.
-						process.exitCode = cycleExitCode(cycle);
+						process.exitCode = cycleExitCode(result);
 					} else if (slo) {
 						const result = await client.opsSlo(slo.params);
 						if (slo.json) console.log(JSON.stringify(result));

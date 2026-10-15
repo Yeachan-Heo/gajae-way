@@ -162,6 +162,41 @@ for (const errorStatus of [400, 413]) {
 	});
 }
 
+test("HTTP 500 untrusted_safety_stop (2026-10-13 shape) classifies a provider refusal by its policy token only", async () => {
+	const refused = (fields: Row = {}) =>
+		failure("user", {
+			errorStatus: undefined,
+			errorMessage:
+				"Refusal (cyber): This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.",
+			transportFailure: { kind: "transport", status: 500, providerCode: "untrusted_safety_stop" },
+			...fields,
+		});
+	await save([prompt(), refused()]);
+	expect(await evidence()).toEqual({ reason: "provider_refusal", refusalCategory: "cyber" });
+	expect(JSON.stringify(await evidence())).not.toContain("Anthropic");
+	expect(JSON.stringify(await evidence())).not.toContain("blocked");
+	// The token is whatever the provider names; the prose after it never leaves.
+	await save([
+		prompt(),
+		refused({
+			errorMessage:
+				"Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service.",
+			errorStatus: 500,
+		}),
+	]);
+	expect(await evidence()).toEqual({ reason: "provider_refusal", refusalCategory: "reasoning_extraction" });
+	// A 500 without the safety-stop code, or without the refusal line, is an ordinary provider failure.
+	await save([prompt(), refused({ transportFailure: { kind: "transport", status: 500 } })]);
+	expect(await evidence()).toBeUndefined();
+	await save([prompt(), refused({ errorMessage: "500 internal server error" })]);
+	expect(await evidence()).toBeUndefined();
+	await save([prompt(), refused({ errorMessage: "Refusal (Cyber Attack): nope" })]);
+	expect(await evidence()).toBeUndefined();
+	// Conflicting status facts are no evidence either.
+	await save([prompt(), refused({ errorStatus: 400 })]);
+	expect(await evidence()).toBeUndefined();
+});
+
 test("user and tool prose are never provider evidence", async () => {
 	await save([
 		prompt(),

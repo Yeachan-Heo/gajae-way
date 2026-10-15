@@ -349,8 +349,17 @@ export class ScriptedSessionPort implements SessionPort {
 		}
 	>();
 
-	setFailedTurnEvidence(sessionId: string, reason: FailedTurnEvidence["reason"], retryAfterMs?: number): void {
-		this.failureEvidence.set(sessionId, retryAfterMs === undefined ? { reason } : { reason, retryAfterMs });
+	setFailedTurnEvidence(
+		sessionId: string,
+		reason: FailedTurnEvidence["reason"],
+		retryAfterMs?: number,
+		refusalCategory?: string,
+	): void {
+		this.failureEvidence.set(sessionId, {
+			reason,
+			...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+			...(refusalCategory === undefined ? {} : { refusalCategory }),
+		});
 	}
 
 	setFailedTransportCause(

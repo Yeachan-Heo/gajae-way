@@ -21,6 +21,8 @@ import {
 	type MonitorRecord,
 	type MonitorScheduleProjection,
 	negotiate,
+	OPS_CYCLE_DEFAULT_LIMIT,
+	OPS_CYCLE_MAX_LIMIT,
 	OrderedFrameWriter,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
@@ -748,6 +750,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
 		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
@@ -1515,14 +1518,30 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
-		case "ops.cycle":
+		case "ops.cycle": {
+			const parameterless = request.params === undefined;
+			const value = parameterless ? {} : request.params;
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new ProtocolError("invalid_params", "ops.cycle parameters must be an object");
+			const { limit = OPS_CYCLE_DEFAULT_LIMIT, offset = 0 } = value as { limit?: unknown; offset?: unknown };
+			if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > OPS_CYCLE_MAX_LIMIT)
+				throw new ProtocolError("invalid_params", `limit must be an integer from 1 to ${OPS_CYCLE_MAX_LIMIT}`);
+			if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0)
+				throw new ProtocolError("invalid_params", "offset must be a non-negative integer");
+			const result = runtime.cycle.project(new Date(), { limit, offset });
+			if (parameterless && result.sessionsTotal > result.sessions.length)
+				throw new ProtocolError(
+					"invalid_params",
+					`ops.cycle has ${result.sessionsTotal} sessions; request limit/offset paging to retrieve a complete session list`,
+				);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: runtime.cycle.project(),
+				result,
 			});
 			return;
+		}
 		case "ops.integrity":
 			connection.write({
 				v: PROFILE_VERSION,

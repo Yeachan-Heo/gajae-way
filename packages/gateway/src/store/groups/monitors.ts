@@ -788,6 +788,23 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.all() as MonitorEventDbRow[];
 	}
 
+	/**
+	 * One monitor's events that are waiting for a dispatcher: admitted, or failed
+	 * and due for another attempt. Batched and dispatched events have a turn in
+	 * flight and are left to its own terminal disposition.
+	 */
+	eventsAwaitingDispatch(monitorId: string): MonitorEventDbRow[] {
+		return this.#db
+			.prepare(
+				"SELECT * FROM monitor_events WHERE monitor_id = ? AND stage IN ('admitted','failed') ORDER BY fired_at, rowid",
+			)
+			.all(monitorId) as MonitorEventDbRow[];
+	}
+
+	slotsDelete(tx: WriteTx, monitorId: string): number {
+		return this.#db.prepare("DELETE FROM monitor_slots WHERE monitor_id = ?").run(tx, monitorId).changes;
+	}
+
 	authoredBatchIds(): string[] {
 		return this.#db
 			.prepare(

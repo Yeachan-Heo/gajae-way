@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.1] - 2026-10-15
+
+### Fixes
+- **gateway**: Reap SDK session hosts with the broker on watchdog restart so replacements do not crash-loop (#573, #587)
+- **gateway**: Page `ops cycle` session details so large homes stay under the 1 MiB frame limit (#574, #585)
+- **gateway**: Use BSD `ps -E` so the boot reaper runs on macOS (#583)
+- **gateway**: Settle a removed monitor's waiting events and slots (#576)
+
+### Features
+- **gateway**: Name provider policy refusals in the delivered turn failure (#575)
+
 ## [0.3.0] - 2026-10-15
 
 ### Features

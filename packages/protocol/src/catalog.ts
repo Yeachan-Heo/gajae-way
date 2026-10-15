@@ -1031,6 +1031,19 @@ export interface OpsSloParams {
 	readonly days?: number;
 }
 
+/**
+ * One bounded page of per-session cycle details; cycle gates cover every session.
+ * A parameterless legacy request errors rather than returning a partial session list.
+ */
+export interface OpsCycleParams {
+	/** 1..OPS_CYCLE_MAX_LIMIT; defaults to OPS_CYCLE_DEFAULT_LIMIT. */
+	readonly limit?: number;
+	/** Rows to skip; defaults to 0. */
+	readonly offset?: number;
+}
+export const OPS_CYCLE_DEFAULT_LIMIT = 100;
+export const OPS_CYCLE_MAX_LIMIT = 500;
+
 export interface OpsCycleResult {
 	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
 	readonly phase: CyclePhase;
@@ -1044,6 +1057,10 @@ export interface OpsCycleResult {
 	readonly instanceId: string;
 	/** True when a memory-closure drain is in flight at snapshot time. */
 	readonly memoryClosing: boolean;
+	/** Number of session rows in the home, independent of the requested page. */
+	readonly sessionsTotal: number;
+	/** Requested offset into the session rows; defaults to 0. */
+	readonly sessionsOffset: number;
 	readonly sessions: readonly CycleSessionView[];
 	/** Settlement census of durable memory intents. */
 	readonly memoryIntents: {
@@ -1192,7 +1209,7 @@ export interface VerbCatalogV01 {
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
 	"ops.slo": { params: OpsSloParams; result: OpsSloResult };
 
-	"ops.cycle": { params: undefined; result: OpsCycleResult };
+	"ops.cycle": { params: OpsCycleParams | undefined; result: OpsCycleResult };
 }
 
 /** Event catalog: event name -> payload. */

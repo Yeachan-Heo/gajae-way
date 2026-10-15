@@ -320,8 +320,10 @@ test("broker-unavailable CLI and relay refusals share the SLO recorder callback"
 		onUnavailable: (at) => timestamps.push(at),
 	});
 	await value.start();
+	expect(value.isAvailable).toBe(true);
 	await expect(value.cli(["sdk", "session", "list"])).rejects.toMatchObject({ code: "broker_unavailable" });
 	expect(timestamps).toHaveLength(1);
+	expect(value.isAvailable).toBe(false);
 	await value.stop();
 	expect(() => value.openStream("owned-session")).toThrow("broker_unavailable");
 	expect(timestamps).toHaveLength(2);

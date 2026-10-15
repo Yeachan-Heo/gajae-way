@@ -382,6 +382,10 @@ export class GlobalGjcClient {
 	get generation(): number {
 		return this.#generation;
 	}
+	/** True only after the current broker passed its endpoint health probe. */
+	get isAvailable(): boolean {
+		return this.#available && !this.#stopped;
+	}
 	get gjcVersion(): string | undefined {
 		return this.#gjcVersion;
 	}
@@ -809,6 +813,7 @@ export class GlobalGjcClient {
 	}
 
 	#unavailable(reason: string): never {
+		this.#available = false;
 		try {
 			this.#options.onUnavailable?.(Date.now());
 		} catch (error) {

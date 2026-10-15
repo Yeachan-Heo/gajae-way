@@ -8,6 +8,8 @@ import {
 	type CycleSessionView,
 	LOOPBACK_ORIGIN,
 	monitorSessionOrigin,
+	OPS_CYCLE_DEFAULT_LIMIT,
+	type OpsCycleParams,
 	type OpsCycleResult,
 	type OpsSloResult,
 	originKey,
@@ -221,9 +223,9 @@ export class RuntimeCycleProjector {
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
-	project(now = new Date()): OpsCycleResult {
+	project(now = new Date(), pagination: OpsCycleParams = {}): OpsCycleResult {
 		const sources = this.#sources(now.getTime());
-		return projectRuntimeCycle(sources, now.toISOString());
+		return projectRuntimeCycle(sources, now.toISOString(), pagination);
 	}
 
 	#sources(nowMs: number): RuntimeCycleSources {
@@ -327,12 +329,21 @@ function parseDeclaredEventTypes(json: string | null): string[] | undefined {
 }
 
 /** Pure projection over already-snapshotted sources — independently unit-testable. */
-export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: string): OpsCycleResult {
+export function projectRuntimeCycle(
+	sources: RuntimeCycleSources,
+	generatedAt: string,
+	pagination: OpsCycleParams = {},
+): OpsCycleResult {
 	const gates = new Set<CycleGateReason>();
 	const cutoverMs = sources.latestCutoverAt === null ? Number.NaN : Date.parse(sources.latestCutoverAt);
 
-	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
-		const origin = parseOriginRef(row.origin_ref_json);
+	const sessionsTotal = sources.sessionRows.length;
+	const sessionsOffset = pagination.offset ?? 0;
+	const limit = pagination.limit ?? OPS_CYCLE_DEFAULT_LIMIT;
+	const pageStart = Math.min(sessionsOffset, sessionsTotal);
+	const pageEnd = Math.min(sessionsTotal, pageStart + limit);
+	const sessions: CycleSessionView[] = [];
+	sources.sessionRows.forEach((row, index) => {
 		// A retired worker lane keeps its row (the epoch derives the next create
 		// key) with no bound session; that is the designed idle state, not a
 		// persona origin stuck mid-rebind. Retirement is proven only by a
@@ -351,7 +362,9 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			row.gjc_session_id === "" && lastActivityMs <= cutoverMs && !sources.addressedSinceCutover.has(row.origin_key);
 		if ((row.gjc_session_id === "" && !retiredLane && !cutoverRetired) || row.epoch < 0)
 			gates.add("stale_session_identity");
-		return {
+		if (index < pageStart || index >= pageEnd) return;
+		const origin = parseOriginRef(row.origin_ref_json);
+		sessions.push({
 			originKey: row.origin_key,
 			origin,
 			epoch: row.epoch,
@@ -378,7 +391,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 				truncated: row.bootstrap_truncated === 1,
 				diagnostics: parseStringList(row.bootstrap_diagnostics_json),
 			},
-		};
+		});
 	});
 
 	if (sources.unknownDeliveryStates.length > 0 || sources.unknownInboundStates.length > 0)
@@ -449,6 +462,8 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		generatedAt,
 		instanceId: sources.instanceId,
 		memoryClosing,
+		sessionsTotal,
+		sessionsOffset,
 		sessions,
 		memoryIntents: {
 			queued,

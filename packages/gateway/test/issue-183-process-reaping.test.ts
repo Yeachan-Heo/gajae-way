@@ -7,6 +7,7 @@ import {
 	parseUnixProcessTable,
 	reapLeftoverWorkers,
 	selectOrphanedWorkers,
+	UNIX_PROCESS_TABLE_COMMAND,
 } from "../src/ops/process-reaper";
 import { GJC_ATTACH_ONLY_ENV } from "../src/orchestrator/broker";
 
@@ -494,3 +495,33 @@ test("reaper revalidates process identity before escalating a stale PID", async 
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test.skipIf(process.platform !== "darwin")(
+	"the BSD ps scan runs on macOS and appends the environment after argv",
+	async () => {
+		const marker = `GJC_REAPER_PROBE_${process.pid}`;
+		const child = Bun.spawn([process.execPath, "-e", "await Bun.sleep(10_000)"], {
+			env: { ...process.env, [marker]: "1" },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		try {
+			await Bun.sleep(200);
+			const proc = Bun.spawn([...UNIX_PROCESS_TABLE_COMMAND], {
+				env: { ...process.env, LC_ALL: "C" },
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			const output = await new Response(proc.stdout as ReadableStream).text();
+			expect(await proc.exited).toBe(0);
+			const line = output.split("\n").find((candidate) => new RegExp(`^\\s*\\d+\\s+${child.pid}\\s`).test(candidate));
+			expect(line).toBeDefined();
+			expect(line).toContain("await Bun.sleep(10_000)");
+			expect(line).toContain(`${marker}=1`);
+		} finally {
+			child.kill();
+			await child.exited;
+		}
+	},
+);

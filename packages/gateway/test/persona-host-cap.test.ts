@@ -34,7 +34,12 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 	expect(predicate(), message).toBe(true);
 }
 
-async function harness(options: { maxLiveHosts: number; hostIdleRetireMs?: number; now?: () => number }) {
+async function harness(options: {
+	maxLiveHosts: number;
+	hostIdleRetireMs?: number;
+	now?: () => number;
+	brokerAvailable?: () => boolean;
+}) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-host-cap-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
@@ -49,6 +54,7 @@ async function harness(options: { maxLiveHosts: number; hostIdleRetireMs?: numbe
 		maxLiveHosts: options.maxLiveHosts,
 		...(options.hostIdleRetireMs === undefined ? {} : { hostIdleRetireMs: options.hostIdleRetireMs }),
 		...(options.now ? { now: options.now } : {}),
+		...(options.brokerAvailable ? { brokerAvailable: options.brokerAvailable } : {}),
 		log: (line) => {
 			logs.push(line);
 		},
@@ -168,4 +174,25 @@ test("idle hosts past the retire window are ended by the sweep and busy ones are
 	expect(h.manager.liveHostCount()).toBe(1);
 	expect(h.logs.some((line) => line.includes("reason=host_idle"))).toBe(true);
 	expect(await h.manager.sweepIdleHosts()).toBe(0);
+});
+
+test("an idle host refused during broker outage stops consuming host capacity", async () => {
+	let brokerAvailable = true;
+	const h = await harness({ maxLiveHosts: 1, brokerAvailable: () => brokerAvailable });
+	await h.send("a", "a1");
+	await h.complete("a", "a1");
+	h.port.terminateHost = async () => {
+		brokerAvailable = false;
+		return { outcome: "refused", reason: "inspect_failed: broker_unavailable" };
+	};
+
+	await h.send("b", "b1");
+	expect(h.sent("b1")).toBeUndefined();
+	expect(h.manager.liveHostCount()).toBe(0);
+	expect(h.logs.some((line) => line.includes("outcome=refused") && line.includes("broker_unavailable"))).toBe(true);
+
+	await h.send("c", "c1");
+	await eventually(() => h.sent("c1") !== undefined, "c1 did not bind after the broker went unavailable");
+	expect(h.port.binds.map((bind) => bind.originKey)).toContain(origin("c").key);
+	expect(h.manager.liveHostCount()).toBe(1);
 });

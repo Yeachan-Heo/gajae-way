@@ -1,8 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OriginRef } from "@gajae-gateway/protocol";
+import {
+	encodeFrame,
+	MAX_FRAME_BYTES,
+	OPS_CYCLE_DEFAULT_LIMIT,
+	OPS_CYCLE_MAX_LIMIT,
+	type OpsCycleResult,
+	type OriginRef,
+	originKey,
+} from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
@@ -553,5 +561,156 @@ test("ops.cycle serves a fresh fail-closed snapshot and broker provisioning stat
 		else process.env.HOME = previousHome;
 		if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
 		else process.env.XDG_DATA_HOME = previousXdgDataHome;
+	}
+});
+
+test("ops.cycle pages 1200 session rows under the frame cap without hiding whole-home gates (#574)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-574-"));
+	const config = testConfig(directory);
+	const database = await Store.open(config.dbPath);
+	let databaseClosed = false;
+	const closeDatabase = () => {
+		if (databaseClosed) return;
+		database.close();
+		databaseClosed = true;
+	};
+	try {
+		const lastOrigin: OriginRef = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: `channel-${String(1_199).padStart(4, "0")}${"c".repeat(244)}`,
+			parentId: `parent-${String(1_199).padStart(4, "0")}${"p".repeat(245)}`,
+		};
+		const lastOriginKey = originKey(lastOrigin);
+		database.transaction((tx) => {
+			for (let index = 0; index < 1_200; index++) {
+				const suffix = String(index).padStart(4, "0");
+				const origin: OriginRef = {
+					platform: "discord",
+					kind: "thread",
+					conversationId: `channel-${suffix}${"c".repeat(244)}`,
+					parentId: `parent-${suffix}${"p".repeat(245)}`,
+				};
+				const key = originKey(origin);
+				const epoch = database.bindings.rotateEpoch(tx, key, JSON.stringify(origin));
+				if (index < 1_199) database.bindings.bindAtEpoch(tx, key, `session-${suffix}`, epoch);
+			}
+		});
+
+		server = await startUnixServer({
+			config,
+			database,
+			sessionPort: sessionPortFromResponder({ respond: async () => "" }),
+			onStop: closeDatabase,
+		});
+		const decoder = new TextDecoder();
+		const frames: Array<{
+			frame: {
+				type?: string;
+				id?: string;
+				result?: OpsCycleResult;
+				error?: { code?: string; message?: string };
+			};
+			bytes: number;
+		}> = [];
+		let buffer = "";
+		const conn = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					buffer += decoder.decode(data, { stream: true });
+					for (;;) {
+						const newline = buffer.indexOf("\n");
+						if (newline < 0) break;
+						const line = buffer.slice(0, newline);
+						buffer = buffer.slice(newline + 1);
+						if (line) frames.push({ frame: JSON.parse(line), bytes: Buffer.byteLength(line, "utf8") });
+					}
+				},
+			},
+		});
+		try {
+			const send = (frame: unknown) => conn.write(`${JSON.stringify(frame)}\n`);
+			send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			send({ v: "0.1", type: "request", id: "default", verb: "ops.cycle", params: {} });
+			send({ v: "0.1", type: "request", id: "legacy", verb: "ops.cycle" });
+			for (const [id, offset] of [
+				["page-0", 0],
+				["page-500", 500],
+				["page-1000", 1_000],
+			] as const)
+				send({
+					v: "0.1",
+					type: "request",
+					id,
+					verb: "ops.cycle",
+					params: { limit: OPS_CYCLE_MAX_LIMIT, offset },
+				});
+			send({
+				v: "0.1",
+				type: "request",
+				id: "invalid-limit",
+				verb: "ops.cycle",
+				params: { limit: OPS_CYCLE_MAX_LIMIT + 1 },
+			});
+			const responseIds = ["default", "legacy", "page-0", "page-500", "page-1000", "invalid-limit"];
+			for (
+				let attempt = 0;
+				attempt < 600 && responseIds.some((id) => !frames.some((entry) => entry.frame.id === id));
+				attempt++
+			)
+				await Bun.sleep(5);
+		} finally {
+			conn.end();
+		}
+
+		const resultFor = (id: string): OpsCycleResult => {
+			const frame = frames.find((entry) => entry.frame.id === id)?.frame;
+			if (frame?.type !== "response" || !frame.result) throw new Error(`missing ops.cycle response ${id}`);
+			return frame.result;
+		};
+		const defaultPage = resultFor("default");
+		const legacy = frames.find((entry) => entry.frame.id === "legacy")?.frame;
+		const pages = [resultFor("page-0"), resultFor("page-500"), resultFor("page-1000")];
+		expect(defaultPage.sessions).toHaveLength(OPS_CYCLE_DEFAULT_LIMIT);
+		expect(defaultPage.sessionsTotal).toBe(1_200);
+		expect(defaultPage.sessionsOffset).toBe(0);
+		expect(defaultPage.sessions.every((session) => session.sessionId !== "")).toBe(true);
+		expect(defaultPage.gates).toContain("stale_session_identity");
+		expect(legacy?.type).toBe("error");
+		expect(legacy?.error?.code).toBe("invalid_params");
+		expect(legacy?.error?.message).toContain("request limit/offset paging");
+		expect(pages.map((page) => page.sessions.length)).toEqual([500, 500, 200]);
+		expect(pages.map((page) => page.sessionsOffset)).toEqual([0, 500, 1_000]);
+		expect(pages.every((page) => page.sessionsTotal === 1_200 && page.gates.includes("stale_session_identity"))).toBe(
+			true,
+		);
+		const allSessions = pages.flatMap((page) => page.sessions);
+		expect(new Set(allSessions.map((session) => session.originKey)).size).toBe(1_200);
+		expect(allSessions.at(-1)).toMatchObject({ originKey: lastOriginKey, sessionId: "" });
+
+		for (const id of ["default", "page-0", "page-500", "page-1000"]) {
+			const frame = frames.find((entry) => entry.frame.id === id);
+			expect(frame?.bytes).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		}
+		const firstPage = pages[0];
+		if (!firstPage) throw new Error("first session page missing");
+		expect(() =>
+			encodeFrame({
+				v: "0.1",
+				type: "response",
+				id: "legacy-unpaged",
+				result: { ...firstPage, sessions: allSessions },
+			}),
+		).toThrow(`frame exceeds ${MAX_FRAME_BYTES} bytes`);
+		const invalid = frames.find((entry) => entry.frame.id === "invalid-limit")?.frame;
+		expect(invalid?.type).toBe("error");
+		expect(invalid?.error?.code).toBe("invalid_params");
+	} finally {
+		await server?.stop("test teardown");
+		server = undefined;
+		closeDatabase();
+		await rm(directory, { recursive: true, force: true });
+		directory = "";
 	}
 });

@@ -7,9 +7,12 @@ export type FailedTurnEvidence = {
 		| "unsupported_input_status"
 		| "context_exhausted"
 		| "provider_quota_exhausted"
-		| "provider_rate_limited";
+		| "provider_rate_limited"
+		| "provider_refusal";
 	/** provider_rate_limited only: the provider's `retry-after` header (whole seconds) in milliseconds. */
 	readonly retryAfterMs?: number;
+	/** provider_refusal only: the policy token the provider named, e.g. `cyber`; never its prose. */
+	readonly refusalCategory?: string;
 };
 
 export type FailedTransportCause = {
@@ -55,6 +58,17 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	if (status === 429) {
 		if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== 429)) return undefined;
 		return record(message.providerDiagnostic)?.category === "rate_limit" ? "provider_rate_limited" : undefined;
+	}
+	if (status === 500) {
+		// Anthropic reports a policy refusal as a 500 whose transport facts carry
+		// `untrusted_safety_stop` and whose text starts `Refusal (<category>):`
+		// (2026-10-13, home-gajae: 14 identical rows). The gateway delivered each
+		// one as `agent_error: Agent run failed after execution started.`, which
+		// reads as an outage; naming the refusal is the whole diagnosis.
+		if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== 500)) return undefined;
+		return facts?.providerCode === "untrusted_safety_stop" && refusalCategory(message) !== undefined
+			? "provider_refusal"
+			: undefined;
 	}
 	if (status !== 400 && status !== 413) return undefined;
 	if ([message.errorStatus, facts?.status].some((value) => value !== undefined && value !== status)) return undefined;
@@ -286,9 +300,25 @@ export async function readFailedTurnEvidence(
 	if (!message) return undefined;
 	const failureReason = reason(message);
 	if (!failureReason) return undefined;
+	if (failureReason === "provider_refusal") {
+		const category = refusalCategory(message);
+		return category === undefined ? { reason: failureReason } : { reason: failureReason, refusalCategory: category };
+	}
 	if (failureReason !== "provider_rate_limited") return { reason: failureReason };
 	const retryAfterMs = retryAfterHeaderMs(record(record(message.transportFailure)?.headers)?.["retry-after"]);
 	return retryAfterMs === undefined ? { reason: failureReason } : { reason: failureReason, retryAfterMs };
+}
+
+/**
+ * The bounded policy token of a `Refusal (<category>): ...` first line, e.g.
+ * `cyber` or `reasoning_extraction`. Only the token leaves the transcript: the
+ * sentence after it is provider prose and stays private like every other
+ * errorMessage.
+ */
+function refusalCategory(message: Row): string | undefined {
+	if (typeof message.errorMessage !== "string") return undefined;
+	const firstLine = message.errorMessage.split(/\r?\n/, 1)[0] ?? "";
+	return /^Refusal \(([a-z][a-z0-9_]{0,63})\):/.exec(firstLine)?.[1];
 }
 
 /** A delta-seconds `retry-after` only (digits); an HTTP-date or anything else is no evidence. */

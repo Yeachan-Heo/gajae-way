@@ -83,6 +83,72 @@ test("durable monitor cron cursor combines slot claims and skips, then clears on
 	}
 });
 
+test("removing a monitor settles its waiting events and slots; an in-flight event keeps its turn", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-monitor-remove-"));
+	try {
+		const database = await Store.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "work-nudge",
+			trigger: { kind: "cron", schedule: "*/30 * * * *" },
+			eventTypes: ["work.nudge"],
+			reportTo: { platform: "discord", kind: "channel", conversationId: "cleanup-room" },
+			enabled: true,
+		});
+		const other = registry.add({
+			name: "untouched",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["other.nudge"],
+			enabled: true,
+		});
+		const slotAt = (minutes: number) => new Date(Date.UTC(2026, 9, 14, 9, minutes)).toISOString();
+		const admit = (monitorId: string, eventType: string, at: string) => {
+			const eventId = crypto.randomUUID();
+			const claim = database.transaction((tx) =>
+				database.monitors.slotClaimWithEvent(tx, { monitorId, slotAt: at, eventId, eventType, payloadJson: "{}" }),
+			);
+			expect(claim.admitted).toBe(true);
+			return eventId;
+		};
+		const waiting = admit(monitor.monitorId, "work.nudge", slotAt(0));
+		const retrying = admit(monitor.monitorId, "work.nudge", slotAt(30));
+		const inFlight = admit(monitor.monitorId, "work.nudge", slotAt(60));
+		const unrelated = admit(other.monitorId, "other.nudge", slotAt(0));
+		database.transaction((tx) => {
+			database.monitors.eventUpdate(tx, retrying, "failed");
+			database.monitors.eventUpdate(tx, inFlight, "dispatched", "batch-1");
+		});
+
+		expect(database.core.metaGet(`monitor_report_to:${monitor.monitorId}`)).toBe(
+			JSON.stringify({ platform: "discord", kind: "channel", conversationId: "cleanup-room" }),
+		);
+		expect(registry.remove(monitor.monitorId)).toBe(true);
+		expect(database.core.metaGet(`monitor_report_to:${monitor.monitorId}`)).toBeUndefined();
+
+		for (const eventId of [waiting, retrying]) {
+			expect(database.monitors.eventGet(eventId)).toMatchObject({ stage: "failed_no_retry" });
+			expect(database.monitors.failure(eventId)).toMatchObject({ code: "monitor_removed" });
+		}
+		expect(database.monitors.eventGet(inFlight)).toMatchObject({ stage: "dispatched", batch_id: "batch-1" });
+		expect(database.monitors.failure(inFlight)).toBeUndefined();
+		expect(database.monitors.eventGet(unrelated)).toMatchObject({ stage: "admitted" });
+		expect(database.monitors.slotExists(monitor.monitorId, slotAt(0))).toBe(false);
+		expect(database.monitors.slotExists(monitor.monitorId, slotAt(60))).toBe(false);
+		expect(database.monitors.slotExists(other.monitorId, slotAt(0))).toBe(true);
+		// Nothing is left for a dispatcher to reject in the removed monitor's name.
+		expect(
+			database.monitors
+				.eventsOpen()
+				.map((row) => row.event_id)
+				.sort(),
+		).toEqual([inFlight, unrelated].sort());
+		expect(registry.remove(monitor.monitorId)).toBe(false);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("adds quarantine diagnostics to existing memory intents", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-migration-"));
 	const path = join(directory, "gateway.db");

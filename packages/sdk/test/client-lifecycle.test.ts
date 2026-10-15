@@ -8,7 +8,7 @@ import { GajaewayClient } from "../src/client";
 type Peer = { end(): void; write(data: string): unknown };
 
 async function withSocket(
-	configure: (socket: Peer, frame: { type: string; id?: string; verb?: string }) => void,
+	configure: (socket: Peer, frame: { type: string; id?: string; verb?: string; params?: unknown }) => void,
 	body: (path: string, peers: Set<Peer>) => Promise<void>,
 ): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-sdk-lifecycle-"));
@@ -86,6 +86,29 @@ test("invalid request params do not leak pending work or disconnect the client",
 			expect(requests).toBe(2);
 			expect(disconnects).toBe(0);
 			await client.close();
+		},
+	);
+});
+
+test("opsCycle without paging params stays parameterless for older-gateway safety", async () => {
+	let request: { type: string; verb?: string; params?: unknown } | undefined;
+	await withSocket(
+		(socket, frame) => {
+			if (frame.type === "hello") socket.write(negotiated());
+			if (frame.type !== "request") return;
+			if (!frame.id) throw new Error("request missing id");
+			request = frame;
+			socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "response", id: frame.id, result: {} })}\n`);
+		},
+		async (path) => {
+			const client = await GajaewayClient.connectSocket(path);
+			try {
+				await client.opsCycle();
+				expect(request?.verb).toBe("ops.cycle");
+				expect(Object.hasOwn(request ?? {}, "params")).toBe(false);
+			} finally {
+				await client.close();
+			}
 		},
 	);
 });
