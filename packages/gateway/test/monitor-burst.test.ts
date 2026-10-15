@@ -10,8 +10,13 @@ import { sessionPortFromScript } from "./session-port.fake";
 
 test("coalesce preserves every event identity while using one authoring turn", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
+	let database: Store | undefined;
+	let pipeline: MonitorPropagator | undefined;
+	let resolveIntentsEnqueued!: () => void;
+	const intentsEnqueued = new Promise<void>((resolve) => (resolveIntentsEnqueued = resolve));
+	let enqueuedIntents = 0;
 	try {
-		const database = await Store.open(join(directory, "gateway.db"));
+		database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "burst",
@@ -33,9 +38,12 @@ test("coalesce preserves every event identity while using one authoring turn", a
 		});
 		const memory = {
 			enqueue: () => crypto.randomUUID(),
-			enqueueExistingId: () => {},
+			enqueueExistingId: () => {
+				enqueuedIntents++;
+				if (enqueuedIntents === 200) resolveIntentsEnqueued();
+			},
 		};
-		const pipeline = new MonitorPropagator({
+		pipeline = new MonitorPropagator({
 			database,
 			registry,
 			sessionPort,
@@ -44,13 +52,15 @@ test("coalesce preserves every event identity while using one authoring turn", a
 			emit: () => {},
 		});
 		for (let i = 0; i < 200; i++) pipeline.submit(monitor.monitorId, "changed", { i });
-		await Bun.sleep(350);
+		await intentsEnqueued;
+		await pipeline.drain();
 		expect(database.monitors.eventRows().length).toBe(200);
 		// Intents are now admitted atomically at the DB level: count durable rows.
 		expect(database.memory.rows().length).toBe(200);
 		expect(turns).toBe(1);
-		database.close();
 	} finally {
+		await pipeline?.drain();
+		database?.close();
 		await rm(directory, { recursive: true, force: true });
 	}
 });

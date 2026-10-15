@@ -163,8 +163,6 @@ export async function runForegroundBroker(
 	args: readonly string[] = [exe, "sdk", "broker", "run", "--agent-dir", agentDir],
 ): Promise<number> {
 	const child = Bun.spawn([...args], { cwd, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-	const envKeys = Object.keys(env).sort().join(",");
-	console.log(`broker_host_started gjc=${exe} agentDir=${agentDir} pid=${child.pid} env_keys=${envKeys}`);
 	const stopGraceMs = options.stopGraceMs ?? BROKER_STOP_GRACE_MS;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
 	// SIGTERM, then SIGKILL if the broker has not exited within the grace, so a
@@ -184,8 +182,11 @@ export async function runForegroundBroker(
 			}
 		}, stopGraceMs);
 	};
+	// Publish startup only after signal forwarding is installed; supervisors may stop on this marker.
 	process.on("SIGTERM", stop);
 	process.on("SIGINT", stop);
+	const envKeys = Object.keys(env).sort().join(",");
+	console.log(`broker_host_started gjc=${exe} agentDir=${agentDir} pid=${child.pid} env_keys=${envKeys}`);
 	const watching = new AbortController();
 	const watchdog =
 		options.watchdog ??

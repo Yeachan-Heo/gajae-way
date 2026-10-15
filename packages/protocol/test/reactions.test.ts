@@ -27,8 +27,24 @@ describe("reaction allowlist", () => {
 		expect(resolveReactionEmoji("❤")).toEqual({ name: "heart", unicode: "❤" });
 	});
 
-	test("anything outside the bounded set is rejected, not coerced", () => {
-		for (const input of ["🚀", "", "   ", ":rocket:", "shrug", "👍👍", "<:lobster:123>"])
+	test("custom emoji names are accepted if they follow Slack naming rules", () => {
+		// Valid custom names match Slack rules (lowercase, digits, _, -, ', +, 2-80 chars)
+		expect(resolveReactionEmoji("rocket")).toEqual({ name: "rocket", isCustom: true });
+		expect(resolveReactionEmoji("gajae-salute")).toEqual({ name: "gajae-salute", isCustom: true });
+		expect(resolveReactionEmoji(":custom_emoji:")).toEqual({ name: "custom_emoji", isCustom: true });
+		expect(resolveReactionEmoji("custom_2024")).toEqual({ name: "custom_2024", isCustom: true });
+		expect(resolveReactionEmoji("custom+emoji")).toEqual({ name: "custom+emoji", isCustom: true });
+
+		// Invalid inputs: unicode, too short, uppercase, special chars, etc.
+		for (const input of ["🚀", "", "   ", "👍👍", "<:lobster:123>", "Rocket", "rocket!", "a", "CUSTOM"]) {
+			const result = resolveReactionEmoji(input);
+			if (result !== undefined) {
+				throw new Error(`Expected ${input} to be undefined, but got ${JSON.stringify(result)}`);
+			}
+		}
+
+		// Prototype pollution attempts are rejected
+		for (const input of ["constructor", "__proto__", "prototype", "toString", "valueOf"])
 			expect(resolveReactionEmoji(input)).toBeUndefined();
 	});
 
@@ -53,6 +69,9 @@ describe("reaction allowlist", () => {
 			expect(platformSupportsReaction("discord", name)).toBe(true);
 		}
 		expect(reactionAllowlistFor("telegram")).toHaveLength(REACTION_ALLOWLIST.length - 3);
+		expect(platformSupportsReaction("telegram", "custom_emoji_name")).toBe(false);
+		expect(platformSupportsReaction("discord", "custom_emoji_name")).toBe(true);
+		expect(platformSupportsReaction("slack", "custom_emoji_name")).toBe(true);
 		// Slack reacts by emoji name and has a name for every allowlist entry.
 		expect(reactionAllowlistFor("slack")).toEqual(REACTION_ALLOWLIST);
 		for (const entry of REACTION_ALLOWLIST) expect(platformSupportsReaction("slack", entry.name)).toBe(true);
@@ -179,5 +198,45 @@ describe("reaction reply token", () => {
 			"unreact [UNREACT:\ud83d\udc4d]", // not at start
 		])
 			expect(parseReactionReply(text)).toBeUndefined();
+	});
+
+	test("custom emoji in reaction tokens are parsed with validation", () => {
+		// Valid custom emoji names follow Slack rules
+		const validCustom = parseReactionReply("[REACT:gajae-salute] こんにちは");
+		expect(validCustom?.reactions).toEqual([{ emoji: "", emojiName: "gajae-salute", isCustom: true }]);
+		expect(validCustom?.body).toBe("こんにちは");
+
+		// Custom emoji with message id target
+		const targeted = parseReactionReply("[REACT:custom_2024@C1:1.2] done");
+		expect(targeted?.reactions).toEqual([
+			{ emoji: "", emojiName: "custom_2024", targetMessageId: "C1:1.2", isCustom: true },
+		]);
+		expect(targeted?.body).toBe("done");
+	});
+
+	test("custom emoji edge cases are rejected as malformed tokens", () => {
+		// Whitespace in custom emoji names is invalid
+		expect(parseReactionReply("[REACT:custom emoji]")).toBeUndefined();
+		// Uppercase custom names are invalid (Slack rules require lowercase)
+		expect(parseReactionReply("[REACT:CustomEmoji]")).toBeUndefined();
+		// Discord-style markup never parses
+		expect(parseReactionReply("[REACT:<:custom:123>]")).toBeUndefined();
+		// Too long (exceeds 80 char Slack limit)
+		const toolong = "a".repeat(81);
+		expect(parseReactionReply(`[REACT:${toolong}]`)).toBeUndefined();
+		// Too short (less than 2 chars)
+		expect(parseReactionReply("[REACT:a]")).toBeUndefined();
+		// Prototype keys are rejected
+		for (const proto of ["constructor", "__proto__", "prototype", "toString"])
+			expect(parseReactionReply(`[REACT:${proto}]`)).toBeUndefined();
+	});
+
+	test("multiple custom emoji tokens in one reply are all parsed", () => {
+		const multi = parseReactionReply("[REACT:gajae-1][REACT:custom_2@msg-1] 완료");
+		expect(multi?.reactions).toEqual([
+			{ emoji: "", emojiName: "gajae-1", isCustom: true },
+			{ emoji: "", emojiName: "custom_2", targetMessageId: "msg-1", isCustom: true },
+		]);
+		expect(multi?.body).toBe("완료");
 	});
 });

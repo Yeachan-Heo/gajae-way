@@ -1,8 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -28,14 +28,6 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-slo-"));
 	const path = join(home, "gateway.sock");
 	const requests: Array<{ verb: string; params: unknown }> = [];
-	const output: string[] = [];
-	const errors: string[] = [];
-	const originalLog = console.log;
-	const originalError = console.error;
-	const previousExit = process.exitCode;
-	console.log = (line: unknown) => output.push(String(line));
-	console.error = (line: unknown) => errors.push(String(line));
-	process.exitCode = 0;
 	const listener = Bun.listen<{ buffer: string }>({
 		unix: path,
 		socket: {
@@ -52,7 +44,8 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 					if (frame.type === "hello")
 						socket.write(`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`);
 					else if (frame.type === "request") {
-						requests.push({ verb: frame.verb!, params: frame.params });
+						if (frame.verb === undefined) throw new Error("gateway request omitted verb");
+						requests.push({ verb: frame.verb, params: frame.params });
 						socket.write(`${JSON.stringify({ v: "0.1", type: "response", id: frame.id, result })}\n`);
 					}
 					newline = socket.data.buffer.indexOf("\n");
@@ -61,12 +54,23 @@ async function runOpsSloCli(result: OpsSloResult, args: readonly string[]) {
 		},
 	});
 	try {
-		await main(["--socket", path, "ops", "slo", ...args]);
-		return { requests, output, errors, exitCode: process.exitCode ?? 0 };
+		const child = Bun.spawn(
+			[process.execPath, join(import.meta.dir, "../src/main.ts"), "--socket", path, "ops", "slo", ...args],
+			{
+				cwd: join(import.meta.dir, "../../.."),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, GAJAEWAY_HOME: home },
+			},
+		);
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		return { requests, stdout, stderr, exitCode };
 	} finally {
-		console.log = originalLog;
-		console.error = originalError;
-		process.exitCode = previousExit;
 		listener.stop(true);
 		await rm(home, { recursive: true, force: true });
 	}
@@ -109,26 +113,37 @@ describe("ops slo exit contract", () => {
 		const run = await runOpsSloCli(result, ["--days", "1", "--json"]);
 		expect(run.requests).toEqual([{ verb: "ops.slo", params: { days: 1 } }]);
 		expect(run.exitCode).toBe(0);
-		expect(JSON.parse(run.output[0]!)).toEqual(result);
+		expect(run.stderr).toBe("");
+		expect(run.stdout).toBe(`${JSON.stringify(result)}\n`);
+		expect(JSON.parse(run.stdout)).toEqual(result);
 		expect(sloExitCode(result)).toBe(0);
 		expect(renderSlo(result).join("\\n")).toContain("verified=true");
 		expect(renderSlo(result).join("\\n")).toContain("over_cap_ms=60000");
 	});
 
 	test("pending has a rerun-later message and a nonzero exit", async () => {
-		const run = await runOpsSloCli(sampleSloResult("pending"), ["--days", "1"]);
+		const result = sampleSloResult("pending");
+		const run = await runOpsSloCli(result, ["--days", "1"]);
 		expect(run.exitCode).toBe(1);
-		expect(run.output[0]).toContain("SLO pending");
-		expect(run.output[0]).toContain("rerun later");
+		expect(run.stderr).toBe("");
+		expect(run.stdout).toBe(`${renderSlo(result).join("\n")}\n`);
+		expect(run.stdout).toContain("SLO pending");
+		expect(run.stdout).toContain("rerun later");
 	});
 
 	test("failed and insufficient are distinct nonzero outcomes", async () => {
-		const failed = await runOpsSloCli(sampleSloResult("failed"), []);
-		const insufficient = await runOpsSloCli(sampleSloResult("insufficient"), []);
+		const failedResult = sampleSloResult("failed");
+		const insufficientResult = sampleSloResult("insufficient");
+		const failed = await runOpsSloCli(failedResult, []);
+		const insufficient = await runOpsSloCli(insufficientResult, []);
 		expect(failed.exitCode).toBe(1);
-		expect(failed.output[0]).toContain("SLO failed");
+		expect(failed.stderr).toBe("");
+		expect(failed.stdout).toBe(`${renderSlo(failedResult).join("\n")}\n`);
+		expect(failed.stdout).toContain("SLO failed");
 		expect(insufficient.exitCode).toBe(1);
-		expect(insufficient.output[0]).toContain("SLO insufficient");
+		expect(insufficient.stderr).toBe("");
+		expect(insufficient.stdout).toBe(`${renderSlo(insufficientResult).join("\n")}\n`);
+		expect(insufficient.stdout).toContain("SLO insufficient");
 	});
 });
 describe("cli arguments", () => {
@@ -140,7 +155,10 @@ describe("cli arguments", () => {
 	test("--version prints the package version without requiring a gateway", async () => {
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (text === pkg.version) output.push(text);
+		};
 		try {
 			await main(["--version"]);
 			expect(output).toEqual([pkg.version]);
@@ -174,7 +192,10 @@ describe("cli arguments", () => {
 		const received: Array<{ verb: string; params: unknown }> = [];
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (text === JSON.stringify({ requeued: [] })) output.push(text);
+		};
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
 			socket: {
@@ -233,11 +254,20 @@ describe("cli arguments", () => {
 			turnId: "turn-42",
 			originKey: "discord:channel:channel-42",
 			conversationId: "channel-42",
-			state: "confirmed",
+			state: "expired",
 			createdAt: "2026-10-01T00:00:00.000Z",
+			lastError: "not_found",
 			textPrefix: "delivery text",
 		};
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			if (
+				text === JSON.stringify({ rows: [row] }) ||
+				text.startsWith("deliveries: ") ||
+				text.startsWith(`${row.createdAt} ${row.state} `)
+			)
+				output.push(text);
+		};
 		console.error = (line: unknown) => errors.push(String(line));
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
@@ -281,7 +311,7 @@ describe("cli arguments", () => {
 				"--since",
 				"2026-10-01T00:00:00.000Z",
 				"--state",
-				"confirmed",
+				"expired",
 				"--limit",
 				"25",
 				"--json",
@@ -290,14 +320,14 @@ describe("cli arguments", () => {
 			expect(received).toEqual([
 				{
 					verb: "ops.deliveries",
-					params: { since: "2026-10-01T00:00:00.000Z", state: "confirmed", limit: 25 },
+					params: { since: "2026-10-01T00:00:00.000Z", state: "expired", limit: 25 },
 				},
 				{ verb: "ops.deliveries", params: {} },
 			]);
 			expect(output).toEqual([
 				JSON.stringify({ rows: [row] }),
 				"deliveries: 1",
-				'2026-10-01T00:00:00.000Z confirmed delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 text="delivery text"',
+				'2026-10-01T00:00:00.000Z expired delivery=delivery-42 turn=turn-42 origin=discord:channel:channel-42 conversation=channel-42 lastError=not_found text="delivery text"',
 			]);
 			expect(CLI_USAGE).toContain("ops deliveries [--since ISO]");
 			expect(CLI_USAGE).not.toContain("ops restore");
@@ -316,7 +346,21 @@ describe("cli arguments", () => {
 		const received: string[] = [];
 		const output: string[] = [];
 		const originalLog = console.log;
-		console.log = (line: unknown) => output.push(String(line));
+		console.log = (line: unknown) => {
+			const text = String(line);
+			try {
+				const value = JSON.parse(text) as { eventId?: unknown; stage?: unknown };
+				if (
+					typeof value.eventId === "string" &&
+					value.eventId.startsWith("event-") &&
+					typeof value.stage === "string"
+				) {
+					output.push(text);
+				}
+			} catch {
+				// Other tests share the process console.
+			}
+		};
 		const listener = Bun.listen<{ buffer: string }>({
 			unix: path,
 			socket: {
@@ -527,7 +571,10 @@ describe("service installation", () => {
 					runtime: { path: ["~/custom", "/usr/bin"] },
 				}),
 			);
-			const env = { HOME: "/Users/operator", GAJAEWAY_HOME: home };
+			const env = { HOME: home, GAJAEWAY_HOME: home };
+			const binDir = join(home, "gaja&<bin>");
+			await mkdir(binDir);
+			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
 			const writes: Array<{ path: string; contents: string }> = [];
 			const writer = async (path: string, contents: string): Promise<void> => {
 				writes.push({ path, contents });
@@ -1051,6 +1098,26 @@ describe("work operator commands", () => {
 			sessionId: "s",
 		});
 		expect(output.requests).toEqual([{ verb: "work.start", params: { name: "fix", text: "task" } }]);
+	});
+
+	test("work start resolves relative repo paths in the CLI process", async () => {
+		const output = await run(["start", "fix", "--repo", ".", "task"], {
+			started: true,
+			jobId: "j",
+			opRef: "o",
+			sessionKey: "k",
+			sessionId: "s",
+		});
+		expect(output.requests).toEqual([
+			{ verb: "work.start", params: { name: "fix", repo: resolve("."), text: "task" } },
+		]);
+	});
+
+	test("work start rejects --base without --repo before connecting", async () => {
+		const output = await run(["start", "fix", "--cwd", "/repo", "--base", "dev", "task"], {});
+		expect(output.requests).toEqual([]);
+		expect(output.connections).toBe(0);
+		expect(output.errors.join(" ")).toContain("--repo");
 	});
 
 	for (const command of ["run", "start"]) {

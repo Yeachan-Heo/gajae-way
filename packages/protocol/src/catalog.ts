@@ -541,6 +541,8 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/** Inject each reportable authored result as an internal report into this conversation session. */
+	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
 }
 
@@ -647,7 +649,7 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
-	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
+	/** Absolute local Git repository path or Git URL used for the worktree and its push remote (issue #480). */
 	readonly repo?: string;
 	/** Base branch or ref for worktree creation when repo is specified (issue #480). */
 	readonly base?: string;
@@ -720,6 +722,7 @@ export interface WorkStatusResult {
 	readonly op: PromptStatusBody | null;
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
+		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */
 		readonly url: string;
 		readonly branch: string;
 		readonly base?: string;
@@ -891,7 +894,7 @@ export interface EngagementReactionParams {
 	readonly origin: OriginRef;
 	/** Platform id of the message that was reacted to. */
 	readonly targetMessageId: string;
-	/** Raw platform emoji as the reactor sent it; not restricted to the allowlist. */
+	/** Raw platform emoji as the reactor sent it; custom emoji without Unicode use `custom:<name>`. */
 	readonly emoji: string;
 	readonly action: ReactionAction;
 	readonly engagement: EngagementContext;
@@ -1111,6 +1114,7 @@ export interface OpsDeliveryRow {
 	readonly conversationId: string;
 	readonly state: string;
 	readonly createdAt: string;
+	readonly lastError: DeliveryErrorCode | null;
 	readonly textPrefix: string;
 }
 
@@ -1268,20 +1272,42 @@ export function isSilenceToken(text: string): boolean {
 const MARKDOWN_CODE = /```[\s\S]*?```|(`+)[^\n]*?\1/g;
 
 /**
- * Existing embedded marker grammar; inspect original content before clipping.
+ * Embedded marker grammar; inspect original content before clipping.
  *
- * A marker inside markdown code is a quoted mention, not a directive: a reply
- * explaining the protocol ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a
- * real answer. Counting it silenced two fully written Discord replies whole
- * (live pilot, 2026-09-29).
+ * Models routinely wrap the control token in a reasoning preamble instead of
+ * emitting it alone ("...nothing to add.\n\n[SILENT]", "Nothing to report.
+ * [SILENT]"; #260, #338). Such a part is a decision not to speak, so it is
+ * silent when the marker CLOSES it: `[SILENT]` / `[silent]` is the last thing
+ * on the last non-empty line. A part made only of bracketed control tokens
+ * ("[SILENT][REACT:🔥]") carries no prose either and is silent as well, so a
+ * misplaced control token never reaches the room verbatim (live leak,
+ * 2026-09-02).
+ *
+ * A marker anywhere else is a mention, not a directive:
+ *
+ *   - inside markdown code: a reply explaining the protocol
+ *     ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a real answer. Counting
+ *     it silenced two fully written Discord replies whole (live pilot,
+ *     2026-09-29);
+ *   - inside a sentence, or followed by more prose: a persona that explained
+ *     its own rules ("...reply with exactly [SILENT] when the message is not for
+ *     you...") lost a 1,590-character answer as {"none":"silent"} (live,
+ *     2026-10-12) while any occurrence counted. A marker on its own line with
+ *     prose after it is the same shape (the reply went on, so the marker was
+ *     not the decision to stop) and is likewise delivered.
  */
+const SILENCE_MARKER = /\[(?:SILENT|silent)\]/;
+const CLOSING_SILENCE_MARKER = /\[(?:SILENT|silent)\]\s*$/;
+const CONTROL_TOKENS_ONLY = /^(?:\s*\[[^[\]\n]*\])+\s*$/;
+
 export function containsSilenceToken(text: string): boolean {
-	return /\[(SILENT|silent)\]/.test(text.replace(MARKDOWN_CODE, ""));
+	const prose = text.replace(MARKDOWN_CODE, "");
+	return CLOSING_SILENCE_MARKER.test(prose) || (CONTROL_TOKENS_ONLY.test(prose) && SILENCE_MARKER.test(prose));
 }
 
 /**
  * Unified silence check: a note is silent if it is EITHER an exact match to
- * a silence token OR contains an embedded [SILENT] marker (issue #338).
+ * a silence token OR closes with an embedded [SILENT] marker (issue #338).
  * Use this in all delivery and recovery paths to prevent silent content from
  * leaking into deliveries while preserving authored notes in records.
  */

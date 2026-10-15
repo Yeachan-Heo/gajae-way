@@ -132,6 +132,18 @@ test("maps guild channels, threads, and DMs to canonical Discord origins", () =>
 		conversationId: "thread-1",
 		parentId: "channel-1",
 	});
+	expect(
+		discordMessageOrigin({ author, channel: { id: "public-thread", parentId: "channel-1", type: 11 } }),
+	).toMatchObject({
+		kind: "thread",
+		threadVisibility: "public",
+	});
+	expect(
+		discordMessageOrigin({ author, channel: { id: "private-thread", parentId: "channel-1", type: 12 } }),
+	).toMatchObject({
+		kind: "thread",
+		threadVisibility: "private",
+	});
 	expect(discordMessageOrigin({ author, channel: { id: "dm-1", isDMBased: () => true } })).toEqual({
 		platform: "discord",
 		kind: "dm",
@@ -197,6 +209,189 @@ test("chunks Discord messages at the 2000 character limit", () => {
 	expect(chunks.map((chunk) => chunk.length)).toEqual([2_000, 2_000, 1]);
 });
 
+// Purpose: prove an explicit MEDIA directive becomes a real Discord upload and is not exposed as text.
+// Expected: one captioned native file upload is sent without exposing the path; completion requires delivery confirmation.
+test("uploads an explicit MEDIA path as a Discord attachment", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-"));
+	try {
+		const filePath = join(home, "chatting_client.cpp");
+		const bytes = Buffer.from("int main() {}\n");
+		await writeFile(filePath, bytes);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`Source file:\nMEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(1);
+		const upload = sent[0] as { content: string; files: Array<{ name: string; attachment: Buffer }> };
+		expect(upload.content).toBe("Source file:");
+		expect(upload.files[0]?.name).toBe("chatting_client.cpp");
+		expect(upload.files[0]?.attachment).toEqual(bytes);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: verify a file-only reply still reaches Discord when removing MEDIA leaves no caption.
+// Expected: one empty-content upload is sent and the delivery confirms; both are required for completion.
+test("sends a MEDIA attachment without an empty text-only message", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-only-"));
+	try {
+		const filePath = join(home, "report.pdf");
+		await writeFile(filePath, Buffer.from("pdf"));
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`MEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({ content: "", files: [{ name: "report.pdf" }] });
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: ensure redelivery metadata never hides a leading MEDIA directive or exposes its local path.
+// Expected: the recovered warning and attachment are delivered together and the ledger confirms the send.
+test("preserves MEDIA uploads on ambiguous redelivery", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-retry-"));
+	try {
+		const filePath = join(home, "retry.cpp");
+		await writeFile(filePath, Buffer.from("source"));
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		let failFirstSend = true;
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async () => ({
+					send: async (payload: unknown) => {
+						if (failFirstSend) {
+							failFirstSend = false;
+							throw Object.assign(new Error("connection reset after dispatch"), { code: "ECONNRESET" });
+						}
+						void sent.push(payload);
+					},
+				}),
+			},
+		};
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`MEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			{
+				...delivery(`MEDIA:${filePath}`),
+				duplicateWarning: true,
+			},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(1);
+		const upload = sent[0] as { content: string; files: Array<{ name: string }> };
+		expect(upload.content).toContain("[recovered - may be a duplicate]");
+		expect(upload.content).not.toContain(filePath);
+		expect(upload.files[0]?.name).toBe("retry.cpp");
+		expect(requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "delivery-1",
+					reason: "connection reset after dispatch",
+					ambiguous: true,
+				},
+			},
+			{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: ensure long captions keep their upload attached to the first Discord chunk.
+// Expected: the first chunk carries both reply metadata and files; remaining chunks contain text only.
+test("keeps files and reply metadata with the first chunk of a long caption", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-long-"));
+	try {
+		const filePath = join(home, "long.txt");
+		await writeFile(filePath, Buffer.from("long"));
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			{
+				...delivery(`${"x".repeat(2_001)}\nMEDIA:${filePath}`),
+				replyToMessageId: "message-1",
+			},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(2);
+		expect(sent[0]).toMatchObject({
+			content: "x".repeat(2_000),
+			reply: { messageReference: "message-1", failIfNotExists: false },
+			files: [{ name: "long.txt" }],
+		});
+		expect(sent[1]).toBe("x");
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: ensure missing requested files fail visibly instead of confirming a caption-only send.
+// Expected: no Discord message is sent and the delivery ledger receives a failure; that is the completion condition.
+test("fails delivery before posting when a MEDIA file is missing", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("Caption\nMEDIA:/not/a/real/gajaeway-file.bin"));
+	expect(sent).toEqual([]);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]?.verb).toBe("delivery.fail");
+});
+
 test("settles a delivery after sending all chunks", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const sent: string[] = [];
@@ -230,7 +425,13 @@ test("prefixes ambiguous redelivery and records failed settlement", async () => 
 
 const threadDelivery = (text: string): ChatMessagePayload => ({
 	...delivery(text),
-	origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+	origin: {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+		threadVisibility: "public",
+	},
 });
 
 test("an archived thread is unarchived before delivery and the reply lands in the thread", async () => {
@@ -287,6 +488,139 @@ test("an archived thread that cannot be unarchived falls back to its parent chan
 		"Discord delivery delivery-1: thread thread-1 is archived and could not be unarchived (Missing Permissions); delivered to parent channel channel-1 instead.",
 	]);
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a missing public thread falls back to its parent channel and drops the thread reply reference", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const fetched: string[] = [];
+	const sent: Array<[string, unknown]> = [];
+	const errors: string[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				fetched.push(id);
+				if (id === "thread-1") throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+				return { send: async (payload: unknown) => void sent.push([id, payload]) };
+			},
+		},
+	};
+	const original = console.error;
+	console.error = (line: string) => void errors.push(line);
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, {
+			...threadDelivery("reply text"),
+			replyToMessageId: "message-in-thread",
+		});
+	} finally {
+		console.error = original;
+	}
+	expect(fetched).toEqual(["thread-1", "channel-1"]);
+	expect(sent).toEqual([["channel-1", "[thread <#thread-1> does not exist; posting here instead]\nreply text"]]);
+	expect(errors).toEqual([
+		"Discord delivery delivery-1: thread thread-1 does not exist; delivered to parent channel channel-1 instead.",
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("missing synthetic handoff and lane-report threads fall back to their parent channel", async () => {
+	for (const conversationId of [`handoff:${"a".repeat(32)}`, `lane-report-${"b".repeat(64)}`]) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const fetched: string[] = [];
+		const sent: Array<[string, unknown]> = [];
+		const origin: ChatMessagePayload["origin"] = {
+			platform: "discord",
+			kind: "thread",
+			conversationId,
+			parentId: "channel-1",
+		};
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async (id: string) => {
+					fetched.push(id);
+					if (id === conversationId) throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+					return { send: async (payload: unknown) => void sent.push([id, payload]) };
+				},
+			},
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("work result"), origin });
+		expect(fetched).toEqual([conversationId, "channel-1"]);
+		expect(sent).toEqual([
+			["channel-1", `[synthetic thread ${conversationId} does not exist; posting here instead]\nwork result`],
+		]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	}
+});
+
+test("missing private or unclassified threads never leak replies into the parent channel", async () => {
+	const origins: Array<ChatMessagePayload["origin"]> = [
+		{
+			platform: "discord",
+			kind: "thread",
+			conversationId: "thread-1",
+			parentId: "channel-1",
+			threadVisibility: "private",
+		},
+		{ platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+		{
+			platform: "discord",
+			kind: "thread",
+			conversationId: `handoff:${"a".repeat(32)}`,
+			parentId: "channel-1",
+			threadVisibility: "private",
+		},
+	];
+	for (const origin of origins) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const fetched: string[] = [];
+		const sent: Array<[string, unknown]> = [];
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async (id: string) => {
+					fetched.push(id);
+					if (id !== "channel-1") throw Object.assign(new Error("Unknown Channel"), { code: 10003 });
+					return { send: async (payload: unknown) => void sent.push([id, payload]) };
+				},
+			},
+		};
+		await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("private reply"), origin });
+		expect(fetched).toEqual([origin.conversationId]);
+		expect(sent).toEqual([]);
+		expect(requests).toEqual([
+			{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Unknown Channel", ambiguous: false } },
+		]);
+	}
+});
+
+test("an archived private thread that cannot be reopened never falls back to its parent", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const fetched: string[] = [];
+	const sent: Array<[string, unknown]> = [];
+	const privateThread = {
+		archived: true,
+		setArchived: async () => Promise.reject(Object.assign(new Error("Missing Permissions"), { code: 50013 })),
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				fetched.push(id);
+				return id === "thread-1" ? privateThread : { send: async (payload: unknown) => void sent.push([id, payload]) };
+			},
+		},
+	};
+	const privateDelivery: ChatMessagePayload = {
+		...threadDelivery("private reply"),
+		origin: { ...threadDelivery("private reply").origin, threadVisibility: "private" },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, privateDelivery);
+	expect(fetched).toEqual(["thread-1"]);
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "Missing Permissions", ambiguous: false },
+		},
+	]);
 });
 
 test("an active thread and a plain channel deliver exactly as before", async () => {
@@ -1407,6 +1741,7 @@ test("channel mention with default policy (unset threadOnMention) creates thread
 	expect(result.kind).toBe("thread");
 	expect(result.conversationId).toBe("thread-new-1");
 	expect(result.parentId).toBe("channel-1");
+	expect(result.threadVisibility).toBe("public");
 });
 
 test("channel mention with threadOnMention: true creates thread", async () => {
@@ -1435,6 +1770,7 @@ test("channel mention with threadOnMention: true creates thread", async () => {
 	expect(result.kind).toBe("thread");
 	expect(result.conversationId).toBe("thread-new-2");
 	expect(result.parentId).toBe("channel-2");
+	expect(result.threadVisibility).toBe("public");
 });
 
 test("channel mention with threadOnMention: false skips thread creation", async () => {

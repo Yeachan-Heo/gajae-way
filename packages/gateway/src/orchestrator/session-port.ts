@@ -408,6 +408,20 @@ export class SessionTerminalError extends Error {
 	}
 }
 
+export const MODEL_NOT_SELECTED_CODE = "model_not_selected";
+
+/** Authenticated `turn.prompt` refusal: no model is selected and no turn was accepted. */
+export class ModelNotSelectedError extends Error {
+	readonly opRef: string;
+	readonly code = MODEL_NOT_SELECTED_CODE;
+
+	constructor(opRef: string) {
+		super("turn.prompt explicitly refused: model_not_selected");
+		this.name = "ModelNotSelectedError";
+		this.opRef = opRef;
+	}
+}
+
 export interface BrokerSessionPortOptions {
 	readonly database: Store;
 	readonly cli: CliRunner;
@@ -932,6 +946,7 @@ export class BrokerSessionPort implements SessionPort {
 					};
 				}
 				const error = relayFailure("turn.prompt", response);
+				if (envelopeErrorCode(error.details) === MODEL_NOT_SELECTED_CODE) throw new ModelNotSelectedError(input.opRef);
 				if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
 					throw new OpRefRejectedError(input.opRef, CLIENT_REF_CONFLICT_CODE, error.details);
 				if (!isSessionBusy(error)) throw error;

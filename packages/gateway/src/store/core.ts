@@ -3,6 +3,7 @@ import { lstatSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { isSqliteJournalMode, SQLITE_JOURNAL_MODES, type SqliteJournalMode } from "../sqlite-journal";
 import { BrokerAuthorityError, DatabaseStartupError } from "./errors";
 import { BindingsGroup } from "./groups/bindings";
 import { WorkAttemptStateError, WorkGroup } from "./groups/work";
@@ -18,6 +19,7 @@ type RawStatement = ReturnType<Database["query"]>;
 export interface StoreOpenOptions {
 	readonly canonicalAgentDir?: string;
 	readonly backupsDir?: string;
+	readonly journalMode?: SqliteJournalMode;
 }
 
 export interface GroupStatement extends Omit<RawStatement, "all" | "get" | "run"> {
@@ -43,6 +45,7 @@ const AUTHORITY_CENSUS_TABLES = [
 	"monitor_events",
 	"authored_outputs",
 	"inbound_messages",
+	"cross_session_watches",
 	"conversation_context",
 	"lane_jobs",
 	"monitor_failures",
@@ -74,13 +77,21 @@ export class StoreCore {
 	}
 
 	static async open(path: string, options: StoreOpenOptions = {}): Promise<StoreCore> {
+		const journalMode = options.journalMode ?? "WAL";
+		if (!isSqliteJournalMode(journalMode))
+			throw new TypeError(`sqlite.journalMode must be one of ${SQLITE_JOURNAL_MODES.join(", ")}`);
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
 		const core = new StoreCore(database, options.backupsDir);
 		try {
-			database.exec(
-				"PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;",
-			);
+			const actualJournalMode = database
+				.query<{ journal_mode: string }, []>(`PRAGMA journal_mode = ${journalMode}`)
+				.get()?.journal_mode;
+			if (actualJournalMode !== journalMode.toLowerCase() && !(path === ":memory:" && actualJournalMode === "memory"))
+				throw new Error(
+					`SQLite journal_mode is ${actualJournalMode ?? "unknown"}, expected ${journalMode.toLowerCase()}`,
+				);
+			database.exec("PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864;");
 			database.exec(
 				"CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS broker_authority (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), authority_key TEXT NOT NULL);",
 			);
@@ -131,6 +142,10 @@ export class StoreCore {
 			if ((error as Error).message.includes("no such table: schema_migrations")) return 0;
 			throw error;
 		}
+	}
+
+	getJournalMode(): string {
+		return this.#database.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode ?? "unknown";
 	}
 
 	get instanceId(): string {
@@ -324,7 +339,7 @@ export class StoreCore {
 			),
 			...work,
 			monitors: read<OpenWorkRows["monitors"][number]>(
-				`SELECT monitor_events.event_id, monitor_events.monitor_id, monitors.name AS monitor_name, monitor_events.event_type, monitor_events.stage, monitor_events.batch_id, monitor_events.fired_at, (SELECT cutover_id FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id) AS cutover_id FROM monitor_events LEFT JOIN monitors ON monitors.monitor_id = monitor_events.monitor_id WHERE monitor_events.stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND ${quarantine("monitor", "monitor_events", "event_id")} ORDER BY monitor_events.fired_at, monitor_events.event_id`,
+				`SELECT monitor_events.event_id, monitor_events.monitor_id, monitors.name AS monitor_name, monitor_events.event_type, monitor_events.stage, monitor_events.batch_id, monitor_events.fired_at, (SELECT cutover_id FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id) AS cutover_id FROM monitor_events LEFT JOIN monitors ON monitors.monitor_id = monitor_events.monitor_id WHERE monitor_events.stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND ${quarantine("monitor", "monitor_events", "event_id")} ORDER BY monitor_events.fired_at, monitor_events.event_id`,
 			),
 		};
 	}
@@ -403,7 +418,7 @@ export class StoreCore {
 		try {
 			this.#database
 				.query<{ n: number }, []>(
-					"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+					"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 				)
 				.get();
 		} catch (error) {

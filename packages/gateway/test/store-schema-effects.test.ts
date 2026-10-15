@@ -8,7 +8,7 @@ import { classifySql } from "../src/store/sql-classify";
 
 type SchemaState = { readonly name: string; readonly open: (path: string) => Promise<Store> };
 
-// L4h will append its post-migration-33 state here after the host cutover makes that schema real.
+// L4h will append its post-migration-35 state here after the host cutover makes that schema real.
 const schemaStates: readonly SchemaState[] = [{ name: "fully migrated schema", open: (path) => Store.open(path) }];
 
 type TriggerRow = { readonly name: string; readonly tbl_name: string; readonly sql: string };

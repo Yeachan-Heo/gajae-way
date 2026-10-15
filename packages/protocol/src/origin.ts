@@ -38,6 +38,8 @@ export interface OriginRef {
 	readonly conversationId: string;
 	/** Present for thread/topic origins: the parent conversation id. */
 	readonly parentId?: string;
+	/** Discord thread access metadata; absent when the adapter cannot determine visibility. */
+	readonly threadVisibility?: "public" | "private";
 	/** Present for DM origins: the platform-scoped peer id. */
 	readonly peerId?: string;
 }
@@ -75,6 +77,12 @@ export function validateOriginRef(ref: OriginRef): OriginRef {
 		requireSegment(ref.parentId, "parentId");
 	} else if (ref.parentId !== undefined) {
 		throw new OriginRefError(`${ref.kind} origin must not carry parentId`);
+	}
+	if (ref.threadVisibility !== undefined) {
+		if (ref.platform !== "discord" || ref.kind !== "thread")
+			throw new OriginRefError("threadVisibility is only valid for Discord thread origins");
+		if (ref.threadVisibility !== "public" && ref.threadVisibility !== "private")
+			throw new OriginRefError(`invalid Discord thread visibility: ${String(ref.threadVisibility)}`);
 	}
 	if (ref.kind === "dm") {
 		if (!ref.peerId) throw new OriginRefError("dm origin requires peerId");

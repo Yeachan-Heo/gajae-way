@@ -297,6 +297,37 @@ test("RT-SLACK-06 file-only body survives and empty body drops", async () => {
 	expect(sends[0]!.params.text).toContain("report.pdf");
 });
 
+test("RT-SLACK-06b same-named image-only messages in two threads reach the gateway each naming its own file id", async () => {
+	// Live (sandoh, 2026-10-13): thread A's image.png (F0C8P71RK54) was downloaded by
+	// a turn that then failed; thread B's image.png (F0C8PPGAV7G) was answered with
+	// thread A's file. Each forwarded body must name the file it carries.
+	const f = await fixture();
+	const image = (id: string) => ({
+		id,
+		name: "image.png",
+		mimetype: "image/png",
+		size: 120 * 1024,
+		url_private: `https://files.slack.com/files-pri/T1-${id}/image.png`,
+	});
+	await f.event({ ts: "2.0", thread_ts: "1.0", text: "", files: [image("F0C8P71RK54")] });
+	await f.event({ ts: "4.0", thread_ts: "3.0", text: "", files: [image("F0C8PPGAV7G")] });
+	// A partial file object (`file_access: check_file_info`) has no url: the id is the only handle.
+	await f.event({
+		ts: "6.0",
+		thread_ts: "5.0",
+		text: "",
+		files: [{ id: "F0C8PARTIAL", file_access: "check_file_info" }],
+	});
+	const texts = f.client.calls.filter((c) => c.verb === "chat.send").map((c) => String(c.params.text));
+	expect(texts).toHaveLength(3);
+	expect(texts[0]).toBe(
+		"[image · image.png · id F0C8P71RK54 · 120 KB · https://files.slack.com/files-pri/T1-F0C8P71RK54/image.png]",
+	);
+	expect(texts[1]).toContain("id F0C8PPGAV7G");
+	expect(texts[1]).not.toContain("F0C8P71RK54");
+	expect(texts[2]).toBe("[file · id F0C8PARTIAL]");
+});
+
 test("RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send", async () => {
 	const f = await fixture();
 	for (const extra of [
@@ -366,7 +397,7 @@ test("RT-SLACK-10 all three chunks keep thread and duplicate warning", async () 
 test("RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms", async () => {
 	for (const reaction of [
 		{ targetMessageId: "bad", emoji: "✅", emojiName: "check" },
-		{ targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "unknown" },
+		{ targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "INVALID" },
 	]) {
 		const api = new Api();
 		const client = new Client();
@@ -826,7 +857,7 @@ test("RT-SLACK-41 unknown rocket reaction fails definitively without a Slack cal
 		client,
 		api,
 		delivery({
-			reaction: { targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "rocket" },
+			reaction: { targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "rocket!invalid" },
 		} as Partial<ChatMessagePayload>),
 	);
 	expect(api.reactions).toEqual([]);

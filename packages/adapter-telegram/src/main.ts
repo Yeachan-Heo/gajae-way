@@ -2,14 +2,23 @@ import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gaja
 
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import {
+	describeInboundBody,
+	pruneTelegramAttachments,
+	type TelegramAttachmentCarrier,
+	type TelegramAttachmentSaver,
+	TelegramAttachmentStore,
+	type TelegramFileApi,
+	telegramAttachment,
+} from "./attachments";
 import { adapterHome, type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
-
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
 import { TelegramAdapterState } from "./state";
 
 const TELEGRAM_MESSAGE_LIMIT = 4_096;
+const ATTACHMENT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
@@ -17,9 +26,11 @@ export interface GatewayClientLike {
 	close?(): Promise<void>;
 }
 
-export interface TelegramMessage extends TelegramMessageOriginShape {
+export interface TelegramMessage extends TelegramMessageOriginShape, TelegramAttachmentCarrier {
 	readonly message_id: number;
 	readonly text?: string;
+	/** Media messages carry their text here instead of in `text`. */
+	readonly caption?: string;
 	readonly reply_to_message?: TelegramReplyMessageShape;
 }
 
@@ -67,17 +78,18 @@ export class TelegramApiError extends Error {
 	}
 }
 
-export class TelegramBotApi {
+export class TelegramBotApi implements TelegramFileApi {
 	constructor(
 		readonly token: string,
 		readonly fetcher: FetchLike = fetch,
 	) {}
 
-	async call<T>(method: string, parameters: Record<string, unknown> = {}): Promise<T> {
+	async call<T>(method: string, parameters: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
 		const response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(parameters),
+			signal,
 		});
 		let body: unknown;
 		try {
@@ -122,6 +134,15 @@ export class TelegramBotApi {
 			message_id: Number(messageId),
 			reaction: emoji ? [{ type: "emoji", emoji }] : [],
 		});
+	}
+
+	getFile(fileId: string, signal: AbortSignal): Promise<{ readonly file_path?: string; readonly file_size?: number }> {
+		return this.call("getFile", { file_id: fileId }, signal);
+	}
+
+	/** The url embeds the bot token: callers must never log or forward it. */
+	downloadFile(filePath: string, signal: AbortSignal): Promise<Response> {
+		return this.fetcher(`https://api.telegram.org/file/bot${this.token}/${filePath}`, { signal });
 	}
 }
 
@@ -230,6 +251,7 @@ export class TelegramAdapter {
 		readonly botUsername: string,
 		readonly botUserId: string,
 		readonly config: Pick<LoadedTelegramAdapterConfig, "chats">,
+		readonly attachments: TelegramAttachmentSaver,
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
@@ -242,7 +264,11 @@ export class TelegramAdapter {
 			return true;
 		}
 		const message = update.message;
-		if (!message?.from || !message.text) return true;
+		if (!message?.from) return true;
+		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
+		const content = message.text ?? message.caption ?? "";
+		const attachment = telegramAttachment(message);
+		if (content === "" && !attachment) return true;
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
 		const baseEngagement = engagementForMessage(message, origin, this.botUsername, this.botUserId);
@@ -250,9 +276,12 @@ export class TelegramAdapter {
 			origin.kind !== "dm" && this.config.chats?.[origin.parentId ?? origin.conversationId]?.engagement === "open"
 				? { ...baseEngagement, mentioned: true }
 				: baseEngagement;
+		const stored = attachment
+			? await this.attachments.save(attachment, String(message.chat.id), message.message_id)
+			: undefined;
 		await gateway.request("chat.send", {
 			origin,
-			text: message.text,
+			text: describeInboundBody(content, attachment, stored),
 			engagement,
 		});
 		return true;
@@ -324,7 +353,7 @@ export function engagementForMessage(
 	// A reply to our own message is the same "addressed to us" signal as an @mention,
 	// so it keeps reading as one — derived from replyTo instead of a second identity check.
 	const mentioned =
-		message.text?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true ||
+		(message.text ?? message.caption)?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true ||
 		replyTo?.fromSelf === true;
 	const authorName = message.from?.username ?? message.from?.first_name;
 	return {
@@ -343,7 +372,20 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 	const bot = new TelegramBotApi(config.token);
 	const identity = await bot.call<{ id: number | string; username?: string }>("getMe");
 	if (!identity.username) throw new Error("Telegram bot account has no username");
-	const adapter = new TelegramAdapter(state, identity.username, String(identity.id), config);
+	const attachmentDirectory = `${adapterHome()}/attachments/telegram`;
+	const pruneAttachments = () =>
+		void pruneTelegramAttachments(attachmentDirectory).catch((error) =>
+			console.error(`Telegram attachment prune failed: ${error instanceof Error ? error.message : String(error)}`),
+		);
+	pruneAttachments();
+	setInterval(pruneAttachments, ATTACHMENT_PRUNE_INTERVAL_MS).unref();
+	const adapter = new TelegramAdapter(
+		state,
+		identity.username,
+		String(identity.id),
+		config,
+		new TelegramAttachmentStore(attachmentDirectory, bot),
+	);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
 	await gateway.connectInitial();
 

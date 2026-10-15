@@ -980,6 +980,7 @@ test("a throwing history fetch is contained in the outcome instead of thrown", a
 	const outcome = await recoverConversation(channel, { cursor: "10", nowMs: 0, deliver: async () => "acked" });
 	expect(outcome.failed).toBe(true);
 	expect(outcome.fetchError).toBe("discord history 500");
+	expect(outcome.fetchErrorPermanent).toBe(false);
 	expect(outcome.advancedTo).toBe("10");
 });
 
@@ -1255,6 +1256,46 @@ test("a channel that lost access is quarantined without blocking healthy recover
 	expect(gateway.recoveryRetryPending).toBe(false);
 	const retained = await loadRecoveryCursors(cursorPath);
 	expect(retained.recoveredThrough["channel-1"]).toBe(inbound.id);
+});
+
+test("a forbidden history read is quarantined instead of retried every pass", async () => {
+	const cursorPath = join(home, "history-forbidden", "recovery-cursor.json");
+	// discord.js surfaces the REST failure with its code; recovery must classify it as the
+	// kind of error a retry cannot fix (live: a channel the bot lost access to kept the
+	// pass loop and its "could not read history" line running for days).
+	const forbidden = Object.assign(new Error("Missing Access"), { code: 50_001 });
+	const channel: RecoverableChannel = {
+		messages: {
+			fetch: async () => {
+				throw forbidden;
+			},
+		},
+	};
+	const gateway = wiredGateway(channel, { request: async () => ({}) }, cursorPath);
+	const errors: string[] = [];
+	const warnings: string[] = [];
+	const originalError = console.error;
+	const originalWarn = console.warn;
+	console.error = (...args: unknown[]) => void errors.push(args.map(String).join(" "));
+	console.warn = (...args: unknown[]) => void warnings.push(args.map(String).join(" "));
+	try {
+		await gateway.recoverMissedMessages();
+		expect(gateway.recoveryRetryPending).toBe(true);
+		await gateway.recoverMissedMessages();
+		expect(gateway.recoveryRetryPending).toBe(true);
+		// The third unreadable pass reaches the quarantine bound: the pass completes and the
+		// 60s retry loop stops, while the conversation stays probeable on reconnect.
+		await gateway.recoverMissedMessages();
+		expect(gateway.recoveryRetryPending).toBe(false);
+		expect(warnings.some((line) => line.includes("quarantined unreadable conversation"))).toBe(true);
+		expect(errors.filter((line) => line.includes("could not read conversation"))).toHaveLength(2);
+		await gateway.recoverMissedMessages();
+		expect(gateway.recoveryRetryPending).toBe(false);
+		expect(errors.filter((line) => line.includes("could not read conversation"))).toHaveLength(2);
+	} finally {
+		console.error = originalError;
+		console.warn = originalWarn;
+	}
 });
 
 test("gateway liveness monitor reconnects only after three consecutive status failures", () => {

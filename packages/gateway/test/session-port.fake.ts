@@ -146,6 +146,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
 	readonly closes: Array<{ sessionId: string; repo: string }> = [];
+	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
 	readonly #resumeFailures = new Map<string, Error>();
@@ -376,7 +377,9 @@ export class ScriptedSessionPort implements SessionPort {
 		return this.failedTransportCauseMap.get(input.sessionId);
 	}
 
-	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
+	async status(input: { sessionId: string; repo: string; opRef: string; relay?: unknown }): Promise<StatusReport> {
+		const relayUsed = input.relay !== undefined;
+		this.statusReads.push({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, relayUsed });
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)
 			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
@@ -662,6 +665,22 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	emitTurnEnd(sessionId: string, opRef: string, kind: "agent_end" | "agent_failed"): void {
+		const operation = this.#operations.get(opRef);
+		const frame: TailFrame = {
+			kind,
+			rawKind: kind,
+			commandId: operation?.commandId ?? `command-${opRef}`,
+			turnId: operation?.turnId ?? `turn-${opRef}`,
+			payload: kind === "agent_end" ? { outcome: { reason: "end_turn" } } : { error: { code: "sdk_failed" } },
+			steerEcho: false,
+			idle: true,
+		};
+		for (const tail of this.#tails.get(sessionId) ?? []) {
+			if (tail.opRef === opRef) tail.emit(frame);
+		}
+	}
+
 	emitActivity(sessionId: string, progress: { readonly toolCalls: number; readonly outputTokens: number }): void {
 		// Correlated to the in-flight turn: progress counters attributed to a turn
 		// only reach the relay that owns it, like every other turn frame.
@@ -886,9 +905,11 @@ export function sessionPortFromScript(script: {
 		input: SessionBindInput,
 	) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>;
 	readonly respond: SessionPortResponder;
+	readonly onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 }): ScriptedSessionPort {
 	return new ScriptedSessionPort({
 		onBind: (input) => script.bind?.(input.originKey, input.epoch, input) ?? `session-${input.epoch}`,
+		onSteer: script.onSteer,
 		onSend: (input, port) => {
 			void (async () => {
 				try {

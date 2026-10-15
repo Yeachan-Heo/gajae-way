@@ -20,6 +20,7 @@ function monitor(overrides: Partial<MonitorRecord> = {}): MonitorRecord {
 		createdAt: "2026-08-29T00:00:00.000Z",
 		enabled: true,
 		channelTarget: { origin: { platform: "discord", kind: "channel", conversationId: "999" } },
+		reportTo: { platform: "discord", kind: "channel", conversationId: "111" },
 		...overrides,
 	} as MonitorRecord;
 }
@@ -111,6 +112,7 @@ describe("monitors list rendering", () => {
 					trigger: { kind: "webhook", route: "r-1" },
 					eventTypes: ["push", "issue"],
 					channelTarget: null,
+					reportTo: null,
 					enabled: false,
 				}),
 				monitorSchedule({ effectiveTimezone: null, nextFireAt: null }),
@@ -119,13 +121,14 @@ describe("monitors list rendering", () => {
 		const lines = renderList(MONITOR_COLUMNS, rows, parseListOptions([], MONITOR_COLUMNS), monitorEnvelope(rows));
 		expect(lines).toHaveLength(3);
 		expect(lines[0]).toBe(
-			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               ENABLED",
+			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               REPORT_TO            ENABLED",
 		);
 		expect(lines[1]).toContain("mon-1234");
 		expect(lines[1]).toContain("0 3 * * *");
 		expect(lines[1]).toContain("Asia/Seoul");
 		expect(lines[1]).toContain("2026-08-30 03:00:00 / 2026-08-29T18:00Z");
 		expect(lines[1]).toContain("cron.tick");
+		expect(lines[1]).toContain("discord/channel/111");
 		expect(lines[1]).toEndWith("true");
 		expect(lines[2]).toContain("webhook:r-1");
 		expect(lines[2]).toContain("push,issue");
@@ -165,7 +168,7 @@ describe("monitors list rendering", () => {
 
 	test("empty list renders a header plus an explicit (none) marker", () => {
 		expect(renderList(MONITOR_COLUMNS, [], parseListOptions([], MONITOR_COLUMNS), monitorEnvelope([]))).toEqual([
-			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  ENABLED",
+			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  REPORT_TO  ENABLED",
 			"(none)",
 		]);
 	});

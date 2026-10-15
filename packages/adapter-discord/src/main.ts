@@ -31,6 +31,7 @@ import {
 } from "./config";
 import { GatewayDownAlarm, lastLogLine } from "./down-alert";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+import { loadDiscordMedia, parseDiscordMedia } from "./outgoing-attachments";
 import {
 	type DiscordInboundReaction,
 	type DiscordReactingUser,
@@ -43,6 +44,7 @@ import {
 	classifyRecoveryFailure,
 	clearAttempt,
 	recoveryCursorPath as defaultRecoveryCursorPath,
+	isPermanentDiscordUnreadable,
 	loadRecoveryCursors,
 	pruneKnownDms,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
@@ -154,7 +156,12 @@ export interface DiscordTextChannelLike {
 			| string
 			| { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } }
 			// A voice message carries no content: only the attachment and the flag.
-			| { files: readonly unknown[]; flags: number },
+			| { files: readonly unknown[]; flags: number }
+			| {
+					files: readonly unknown[];
+					content?: string;
+					reply?: { messageReference: string; failIfNotExists?: boolean };
+			  },
 	): Promise<unknown>;
 }
 
@@ -381,6 +388,7 @@ export async function maybeCreateThreadOnMention(
 			kind: "thread",
 			conversationId: thread.id,
 			parentId: origin.conversationId,
+			threadVisibility: "public",
 		};
 	} catch (error) {
 		// Thread creation failed (permissions, rate limits, etc.); continue with channel origin.
@@ -905,6 +913,7 @@ export async function settleDiscordDelivery(
 	status?: WorkingStatus,
 	reactions: DiscordReactionPorts = createReactionPorts(),
 	speech?: DiscordSpeechPorts,
+	mediaDirectories: readonly string[] = [],
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -915,24 +924,46 @@ export async function settleDiscordDelivery(
 	}
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
-		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const parsed = parseDiscordMedia(message.text);
+		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const text = notice ? `${notice}\n${body}` : body;
-		const chunks = chunkDiscordMessage(text);
-		for (let index = 0; index < chunks.length; index++) {
-			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-			// deleted target from failing the whole delivery.
-			const chunk = chunks[index] as string;
-			// A reply reference points into the thread, so it is dropped on parent fallback.
-			try {
-				if (index === 0 && message.replyToMessageId && !notice)
-					await channel.send({
-						content: chunk,
-						reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-					});
-				else await channel.send(chunk);
-			} finally {
-				if (!message.final) typing?.refresh(message.origin.conversationId);
+		const chunks = text === "" ? [] : chunkDiscordMessage(text);
+		const files = await loadDiscordMedia(parsed.paths, mediaDirectories);
+		try {
+			if (files.length > 0 && chunks.length === 0) {
+				const reply =
+					message.replyToMessageId && !notice
+						? { messageReference: message.replyToMessageId, failIfNotExists: false }
+						: undefined;
+				await channel.send({
+					files,
+					content: chunks[0] ?? "",
+					...(reply ? { reply } : {}),
+				});
+			} else {
+				for (let index = 0; index < chunks.length; index++) {
+					// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+					// deleted target from failing the whole delivery.
+					const chunk = chunks[index] as string;
+					// A reply reference points into the thread, so it is dropped on parent fallback.
+					if (index === 0 && files.length > 0)
+						await channel.send({
+							content: chunk,
+							files,
+							...(message.replyToMessageId && !notice
+								? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
+								: {}),
+						});
+					else if (index === 0 && message.replyToMessageId && !notice)
+						await channel.send({
+							content: chunk,
+							reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+						});
+					else await channel.send(chunk);
+				}
 			}
+		} finally {
+			if (!message.final) typing?.refresh(message.origin.conversationId);
 		}
 		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
 		// Voice rides AFTER the text, and only after the text actually landed:
@@ -971,6 +1002,14 @@ function isArchivedThread(value: unknown): value is ArchivableThreadLike {
 	);
 }
 
+function isChannelNotFoundError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
+	return (
+		candidate.code === 10_003 || candidate.code === "10003" || candidate.status === 404 || candidate.httpStatus === 404
+	);
+}
+
 /** Posts with the adapter's own bot: it keeps its Discord session while the gateway is the thing that is down. */
 function gatewayDownAlarm(discord: DiscordClientLike, alert: GatewayDownAlertConfig): GatewayDownAlarm {
 	return new GatewayDownAlarm(alert, {
@@ -996,19 +1035,45 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
  * so an archived thread is explicitly unarchived first. When that fails the
  * reply goes to the parent channel with a visible notice and a log line: a
  * monitor result that silently vanishes behind an archived thread is the worst
- * outcome, because its schedule still looks healthy.
+ * outcome, because its schedule still looks healthy. Public threads may fall
+ * back to their parent. Synthetic handoff/work ids are not Discord thread ids,
+ * so they also fall back when visibility is unknown; explicitly private threads
+ * never fall back into a broader channel.
  */
 async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
 	origin: ChatMessagePayload["origin"],
 	deliveryId: string,
 ): Promise<{ readonly channel: DiscordTextChannelLike; readonly notice?: string }> {
-	const channel = await fetchTextChannel(discord, origin.conversationId);
+	let channel: DiscordTextChannelLike;
+	try {
+		channel = await fetchTextChannel(discord, origin.conversationId);
+	} catch (error) {
+		const syntheticThread = isSyntheticDiscordThreadId(origin.conversationId);
+		if (
+			origin.kind !== "thread" ||
+			(origin.threadVisibility !== "public" && !(syntheticThread && origin.threadVisibility !== "private")) ||
+			!origin.parentId ||
+			!isChannelNotFoundError(error)
+		)
+			throw error;
+		const reason = `${syntheticThread ? "synthetic " : ""}thread ${origin.conversationId} does not exist`;
+		const noticeThread = syntheticThread
+			? `synthetic thread ${origin.conversationId}`
+			: `thread <#${origin.conversationId}>`;
+		const parent = await fetchTextChannel(discord, origin.parentId);
+		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		return {
+			channel: parent,
+			notice: `[${noticeThread} does not exist; posting here instead]`,
+		};
+	}
 	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
 	try {
 		await channel.setArchived(false);
 		return { channel };
 	} catch (error) {
+		if (origin.threadVisibility !== "public") throw error;
 		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
 		const parent = await fetchTextChannel(discord, origin.parentId);
 		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
@@ -1017,6 +1082,11 @@ async function resolveDeliveryChannel(
 			notice: `[thread <#${origin.conversationId}> is archived and could not be unarchived (${errorMessage(error)}); posting here instead]`,
 		};
 	}
+}
+
+/** Synthetic work/handoff ids name internal origins, not Discord thread snowflakes. */
+function isSyntheticDiscordThreadId(conversationId: string): boolean {
+	return /^handoff:[0-9a-f]{32}$/.test(conversationId) || /^lane-report-[0-9a-f]{64}$/.test(conversationId);
 }
 
 /**
@@ -1052,15 +1122,17 @@ export function subscribeDiscordDeliveries(
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
 	speech?: DiscordSpeechPorts,
+	mediaDirectories: readonly string[] = [],
 ): () => void {
 	// One reaction port pair per subscription: the emoji cache and the throttle are
 	// only useful across deliveries, and a live adapter has exactly one subscription.
 	const reactions = createReactionPorts();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech).catch((error) =>
-			log.error(
-				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech, mediaDirectories).catch(
+			(error) =>
+				log.error(
+					`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
 		);
 	});
 }
@@ -1521,6 +1593,7 @@ export class ReconnectingGateway {
 				this.status,
 				console,
 				this.speech,
+				this.config.mediaDirectories,
 			);
 			this.#progressOff?.();
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;
@@ -1670,7 +1743,6 @@ export class ReconnectingGateway {
 				threadIds: [],
 			};
 		}
-		this.clearUnreadableRecoveryTarget(channelId);
 		const threadIds = discoverThreads ? await discoverRecoveryThreadIds(fetched, channelId, Date.now()) : [];
 
 		const cursors = this.#cursors;
@@ -1746,6 +1818,11 @@ export class ReconnectingGateway {
 		// id, so the replay cannot double-count a discard.
 		this.advanceRecovered(channelId, outcome.advancedTo);
 		if (outcome.fetchError) {
+			// A conversation the bot cannot read must not drive the 60s pass loop forever:
+			// quarantine it under the same bound the channel-fetch path uses, so healthy
+			// conversations can complete and the dead one is probed again on reconnect.
+			if (outcome.fetchErrorPermanent)
+				return { incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError), threadIds };
 			console.error(
 				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
 			);
@@ -1776,6 +1853,10 @@ export class ReconnectingGateway {
 				`Discord recovery backfilled ${outcome.delivered} fresh message(s), found ${outcome.duplicates} duplicate(s), skipped ${outcome.skipped}, and discarded ${outcome.discarded} for channel ${channelId}.`,
 			);
 		}
+		// A conversation is re-admitted only once a pass read it end to end: the counter that
+		// quarantines an unreadable conversation has to survive a pass whose fetch or history
+		// read failed, or the bound would never be reached.
+		this.clearUnreadableRecoveryTarget(channelId);
 		return { incomplete: false, threadIds };
 	}
 
@@ -2200,19 +2281,6 @@ function isRecoverableChannel(value: unknown): value is RecoverableChannel {
 	);
 }
 
-function isPermanentDiscordUnreadable(error: unknown): boolean {
-	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
-	return (
-		candidate?.code === 10_003 ||
-		candidate?.code === 50_001 ||
-		candidate?.code === 50_013 ||
-		candidate?.status === 403 ||
-		candidate?.status === 404 ||
-		candidate?.httpStatus === 403 ||
-		candidate?.httpStatus === 404
-	);
-}
-
 interface RecoveryThreadLike extends RecoverableChannel {
 	readonly id: string;
 	readonly parentId?: string | null;
@@ -2378,7 +2446,9 @@ if (import.meta.main) {
 			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
 			console.error(error instanceof Error ? error.message : String(error));
 			disposeLogging();
-			process.exitCode = 1;
+			// Startup may already own recovery/monitor timers. Exit now so the service
+			// manager can retry login rather than keeping a permanently offline process.
+			process.exit(1);
 		});
 	}
 }

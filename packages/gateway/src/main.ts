@@ -8,6 +8,7 @@ import { runBrokerHost } from "./broker-host";
 import { gatewayHome, loadConfig } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { DEFAULT_EXIT_WRITER, installExitReporter } from "./exit-report";
+import { SecretGuard, secretSourcesFromEnv } from "./guard/secret-guard";
 import { assertNoRestoreJournal } from "./offline";
 import { runCensus } from "./ops/census";
 import { runCutover } from "./ops/cutover";
@@ -28,6 +29,11 @@ if (command === "config" && args[0] === "check") {
 	const result = await checkConfigFile(args[1] ?? defaultConfigPath());
 	for (const line of renderConfigCheck(result)) console.log(line);
 	process.exitCode = configCheckExitCode(result);
+} else if (command === "redact") {
+	// The daemon's outbound redaction as a filter, for tools that post to chat
+	// without the gateway (a bot-token Slack API wrapper): stdin -> stdout.
+	const guard = new SecretGuard(secretSourcesFromEnv(process.env, undefined, gatewayHome()), { log: () => {} });
+	process.stdout.write(guard.redact(await Bun.stdin.text()).text);
 } else if (command === "broker") {
 	if (args.length > 0) {
 		console.error("usage: gajaeway-gateway broker");
@@ -178,7 +184,7 @@ if (command === "config" && args[0] === "check") {
 	}
 } else {
 	console.error(
-		"usage: gajaeway-gateway daemon [--stdio] | broker | broker-agent ... | cutover --agent-dir <dir> | census | restore <backup> [--abort] | config check [path]",
+		"usage: gajaeway-gateway daemon [--stdio] | broker | broker-agent ... | cutover --agent-dir <dir> | census | restore <backup> [--abort] | config check [path] | redact < text",
 	);
 	process.exitCode = 2;
 }

@@ -6,9 +6,10 @@ import type { OriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
+import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { sessionPortFromResponder } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -111,6 +112,170 @@ test("projector reads durable rows through the database and stays fail-closed", 
 		expect(age as number).toBeGreaterThanOrEqual(1000);
 		expect(age as number).toBeLessThan(Date.now() - created + 5_000);
 		expect(aged.deliveries.pending).toBe(1);
+	} finally {
+		database.close();
+	}
+});
+
+test("origins unbound by a broker cutover stay ungated until a later rebind touches them", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-cutover-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	try {
+		const key = "discord/dm/c1/peer=p1";
+		database.transaction((tx) => {
+			database.bindings.rotateEpoch(tx, key, JSON.stringify(discordDm));
+			database.bindings.bind(tx, key, "sess-pre-cutover-0000");
+		});
+		expect(database.bindings.latestBrokerCutoverAt()).toBeNull();
+		database.transaction((tx) =>
+			database.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: null,
+				targetAuthority: { canonicalAgentDir: "/srv/gateway/agent", identity: "gateway-private" },
+				evidence: "cycle projection test",
+				disposition: "quarantine",
+			}),
+		);
+		expect(database.bindings.latestBrokerCutoverAt()).toBeString();
+
+		const afterCutover = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(afterCutover.sessions[0]).toMatchObject({ originKey: key, sessionId: "" });
+		expect(afterCutover.gates).not.toContain("stale_session_identity");
+
+		// The next rebind stamps activity past the cutover: mid-rebind is gated again.
+		await Bun.sleep(5);
+		database.transaction((tx) => database.bindings.rotateEpoch(tx, key, JSON.stringify(discordDm)));
+		const rebinding = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(rebinding.gates).toContain("stale_session_identity");
+	} finally {
+		database.close();
+	}
+});
+
+class FailingBindPort extends ScriptedSessionPort {
+	bindAttempts = 0;
+	async bind(_input: Parameters<ScriptedSessionPort["bind"]>[0]): ReturnType<ScriptedSessionPort["bind"]> {
+		this.bindAttempts++;
+		throw new Error("gjc sdk request failed: spawn_failed");
+	}
+}
+
+test("a cutover origin whose post-cutover inbound turn fails its first bind is gated again", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-cutover-bind-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	const canonicalAgentDir = join(directory, "canonical-agent");
+	const key = "discord/dm/c1/peer=p1";
+	let manager: PersonaSessionManager | undefined;
+	try {
+		database.transaction((tx) => {
+			database.bindings.rotateEpoch(tx, key, JSON.stringify(discordDm));
+			database.bindings.bind(tx, key, "sess-pre-cutover-0000");
+		});
+		database.transaction((tx) =>
+			database.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: null,
+				targetAuthority: { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` },
+				evidence: "cycle projection test",
+				disposition: "quarantine",
+			}),
+		);
+		const cutoverActivity = database.bindings.sessionIdentityRows()[0]?.last_activity_at;
+		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project().gates).toEqual([]);
+
+		const port = new FailingBindPort();
+		attachTestBrokerOwnership(database, port, canonicalAgentDir);
+		const logs: string[] = [];
+		manager = new PersonaSessionManager({
+			database,
+			port,
+			instanceId: "cycle-cutover-test",
+			repo: join(directory, "workspace"),
+			onTurnStart: ({ trigger }) => ({ text: trigger.body, onTerminal: () => undefined }),
+			log: (line) => logs.push(line),
+		});
+		expect(
+			database.transaction((tx) =>
+				database.inbox.enqueue(tx, {
+					messageId: "after-cutover",
+					originKey: key,
+					originRefJson: JSON.stringify(discordDm),
+					body: "hello after cutover",
+				}),
+			),
+		).toBe(true);
+		await manager.notifyInbound(key);
+		for (let attempt = 0; attempt < 200 && port.bindAttempts === 0; attempt++) await Bun.sleep(5);
+		expect(logs.some((line) => line.startsWith(`persona_bind_failed origin=${key}`))).toBe(true);
+
+		// The failed bind left the session row exactly as the cutover did...
+		expect(database.bindings.sessionIdentityRows()[0]).toMatchObject({
+			gjc_session_id: "",
+			last_activity_at: cutoverActivity,
+		});
+		// ...so the accepted inbound row is what brings the gate back.
+		const failed = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(failed.gates).toContain("stale_session_identity");
+		expect(failed.phase).toBe("degraded");
+	} finally {
+		await manager?.stop();
+		database.close();
+	}
+});
+
+test("monitor events admitted after a cutover gate exactly the session origin dispatch would bind", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-cutover-monitor-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	try {
+		const key = "monitor/eventtype/build.done/parent=m1";
+		database.transaction((tx) => {
+			database.bindings.rotateEpoch(
+				tx,
+				key,
+				JSON.stringify({ platform: "monitor", kind: "eventtype", conversationId: "build.done", parentId: "m1" }),
+			);
+			database.bindings.bind(tx, key, "sess-build-done-pre-cutover");
+			database.monitors.create(tx, {
+				id: "m1",
+				name: "builds",
+				triggerJson: JSON.stringify({ kind: "webhook" }),
+				eventTypesJson: JSON.stringify(["build.done"]),
+				burstPolicy: "batch",
+				channelTargetJson: null,
+				enabled: true,
+				instruction: null,
+				modelJson: null,
+				serviceTier: null,
+			});
+		});
+		const event = (eventId: string, eventType: string) =>
+			database.transaction((tx) =>
+				database.monitors.eventCreate(tx, {
+					eventId,
+					monitorId: "m1",
+					eventType,
+					payloadJson: "{}",
+					firedAt: new Date().toISOString(),
+				}),
+			);
+		// A pre-cutover event is quarantined history and vouches for nothing.
+		event("e-old", "build.done");
+		database.transaction((tx) =>
+			database.bindings.cutoverBrokerAuthority(tx, {
+				expectedAuthority: null,
+				targetAuthority: { canonicalAgentDir: "/srv/gateway/agent", identity: "gateway-private" },
+				evidence: "cycle projection test",
+				disposition: "quarantine",
+			}),
+		);
+		const gates = () => new RuntimeCycleProjector(database, { queueDepth: 0 }).project().gates;
+		expect(gates()).toEqual([]);
+
+		// An undeclared type dispatches to the monitor's catch-all session, not this one.
+		event("e-undeclared", "deploy.done");
+		expect(gates()).toEqual([]);
+
+		// A declared type dispatches to this origin: it was asked to rebind.
+		event("e-declared", "build.done");
+		expect(gates()).toContain("stale_session_identity");
 	} finally {
 		database.close();
 	}
@@ -267,6 +432,52 @@ test("issue #189: consecutive failed_no_retry monitor events degrade the project
 		expect(projector.project().gates).toEqual([]);
 		const churning = new RuntimeCycleProjector(database, { queueDepth: 0 }, { brokerRespawnChurn: () => true });
 		expect(churning.project().gates).toEqual(["broker_respawn_churn"]);
+	} finally {
+		database.close();
+	}
+});
+
+test("issue #369: contract-unmet events are terminal dispatch failures, not pre-author losses", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-contract-unmet-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	try {
+		const fire = (id: string) =>
+			database.transaction((tx) =>
+				database.monitors.eventCreate(tx, {
+					eventId: id,
+					monitorId: "m1",
+					eventType: "digest",
+					payloadJson: "{}",
+					firedAt: new Date().toISOString(),
+				}),
+			);
+		fire("lost-before-authoring");
+		database.transaction((tx) =>
+			database.monitors.eventTerminalFail(tx, "lost-before-authoring", "internal_error", "authoring turn failed"),
+		);
+		fire("contract-unmet-1");
+		database.transaction((tx) => database.monitors.eventUpdate(tx, "contract-unmet-1", "contract_unmet"));
+		database.transaction((tx) => database.monitors.eventUpdate(tx, "contract-unmet-1", "delivered"));
+		expect(database.monitors.eventGet("contract-unmet-1")?.stage).toBe("contract_unmet");
+		expect(
+			database.transaction((tx) =>
+				database.monitors.eventTerminalFail(tx, "contract-unmet-1", "internal_error", "late failure"),
+			),
+		).toBe(false);
+		expect(database.monitors.authoringLossStreaks("2026-01-01T00:00:00.000Z")).toEqual([]);
+
+		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
+		for (const id of ["contract-unmet-2", "contract-unmet-3"]) {
+			fire(id);
+			database.transaction((tx) => database.monitors.eventUpdate(tx, id, "contract_unmet"));
+		}
+		expect(database.monitors.consecutiveTerminalFailures()).toBe(4);
+		expect(projector.project().gates).toEqual(["monitor_dispatch_failing"]);
+		await Bun.sleep(2);
+		fire("recovered");
+		database.transaction((tx) => database.monitors.eventUpdate(tx, "recovered", "delivered"));
+		expect(database.monitors.consecutiveTerminalFailures()).toBe(0);
+		expect(projector.project().gates).toEqual([]);
 	} finally {
 		database.close();
 	}

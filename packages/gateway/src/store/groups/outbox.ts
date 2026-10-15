@@ -1,6 +1,13 @@
 import type { DeliveryErrorCode } from "@gajae-gateway/protocol";
 import type { GroupDb, StoreCore } from "../core";
 import type { WriteTx } from "../tx";
+import {
+	JOURNAL_PROJECTIONS,
+	JournalGroup,
+	type JournalRows,
+	staleJournalKeys,
+	type WorkJournalEventType,
+} from "./journal";
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
 export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
@@ -72,9 +79,11 @@ const DELIVERY_COLUMNS =
 /** Persistence and retry policy for the durable delivery outbox. */
 export class OutboxGroup {
 	readonly #db: GroupDb;
+	readonly #journal: JournalGroup;
 
 	constructor(core: StoreCore) {
 		this.#db = core.groupDb("outbox");
+		this.#journal = new JournalGroup(core);
 	}
 
 	/** Strict deduplicating enqueue used by composites: a reused id must name the same obligation. */
@@ -106,6 +115,7 @@ export class OutboxGroup {
 				"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
 			)
 			.run(tx, row.deliveryId, row.turnId, row.originKey, row.payloadJson, at, at);
+		this.#journal.record(tx, "delivery", row.deliveryId, "delivery_queued");
 		return true;
 	}
 
@@ -121,19 +131,20 @@ export class OutboxGroup {
 		now = Date.now(),
 	): boolean {
 		const at = new Date(now).toISOString();
-		return (
+		const created =
 			this.#db
 				.prepare(
 					"INSERT OR IGNORE INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
 				)
-				.run(tx, row.deliveryId, row.turnId, row.originKey, row.payloadJson, at, at).changes === 1
-		);
+				.run(tx, row.deliveryId, row.turnId, row.originKey, row.payloadJson, at, at).changes === 1;
+		if (created) this.#journal.record(tx, "delivery", row.deliveryId, "delivery_queued");
+		return created;
 	}
 
 	markInflight(tx: WriteTx, deliveryId: string): void {
 		const row = this.get(deliveryId);
 		if (!row || row.state === "confirmed" || row.state === "expired") return;
-		this.#update(tx, deliveryId, "inflight", row.attempts);
+		this.#update(tx, deliveryId, "delivery_inflight", "inflight", row.attempts);
 	}
 
 	/** Terminal states are monotonic: late duplicate confirms/fails cannot rewrite them. */
@@ -141,7 +152,7 @@ export class OutboxGroup {
 		const row = this.get(deliveryId);
 		if (!row) return "unknown";
 		if (row.state === "confirmed" || row.state === "expired") return "already_terminal";
-		this.#update(tx, deliveryId, "confirmed");
+		this.#update(tx, deliveryId, "delivery_confirmed", "confirmed");
 		return "transitioned";
 	}
 
@@ -155,7 +166,7 @@ export class OutboxGroup {
 			: attempts >= MAX_DEFINITIVE_FAILURES
 				? "expired"
 				: "pending";
-		this.#update(tx, deliveryId, state, attempts, classifyDeliveryError(reason));
+		this.#update(tx, deliveryId, "delivery_failed", state, attempts, classifyDeliveryError(reason));
 		return "transitioned";
 	}
 
@@ -217,6 +228,7 @@ export class OutboxGroup {
 				"UPDATE deliveries SET state = 'expired', updated_at = ? WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
 			)
 			.run(tx, expiredAt, before);
+		for (const row of rows) this.#journal.record(tx, "delivery", row.delivery_id, "delivery_expired");
 		return rows.map((row) => ({
 			deliveryId: row.delivery_id,
 			originKey: row.origin_key,
@@ -232,7 +244,9 @@ export class OutboxGroup {
 				"UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE delivery_id = ? AND state IN ('expired', 'failed_ambiguous', 'pending')",
 			)
 			.run(tx, new Date().toISOString(), deliveryId).changes;
-		return changed === 1 ? [deliveryId] : [];
+		if (changed !== 1) return [];
+		this.#journal.record(tx, "delivery", deliveryId, "delivery_requeued");
+		return [deliveryId];
 	}
 
 	requeueSince(tx: WriteTx, since: string): string[] {
@@ -247,6 +261,7 @@ export class OutboxGroup {
 				"UPDATE deliveries SET state = 'pending', attempts = 0, updated_at = ? WHERE state IN ('expired', 'failed_ambiguous', 'pending') AND updated_at >= ?",
 			)
 			.run(tx, new Date().toISOString(), since);
+		for (const row of rows) this.#journal.record(tx, "delivery", row.delivery_id, "delivery_requeued");
 		return rows.map((row) => row.delivery_id);
 	}
 
@@ -258,9 +273,10 @@ export class OutboxGroup {
 	}
 
 	prune(tx: WriteTx, deliveredOlderThanMs: number, now = Date.now()): number {
-		return this.#db
-			.prepare("DELETE FROM deliveries WHERE state = 'confirmed' AND updated_at < ?")
-			.run(tx, new Date(now - deliveredOlderThanMs).toISOString()).changes;
+		const ids = this.#db
+			.prepare("SELECT delivery_id FROM deliveries WHERE state = 'confirmed' AND updated_at < ?")
+			.all(new Date(now - deliveredOlderThanMs).toISOString()) as Array<{ delivery_id: string }>;
+		return this.#delete(tx, ids);
 	}
 
 	counts(now = Date.now()): {
@@ -371,16 +387,62 @@ export class OutboxGroup {
 	}
 
 	sweep(tx: WriteTx, cutoffs: { deliveryCutoff: string; historyCutoff: string; batch: number }): number {
-		return this.#db
+		const ids = this.#db
 			.prepare(
-				"DELETE FROM deliveries WHERE rowid IN (SELECT rowid FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) LIMIT ?)",
+				"SELECT delivery_id FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) ORDER BY rowid LIMIT ?",
 			)
-			.run(tx, cutoffs.deliveryCutoff, cutoffs.historyCutoff, cutoffs.batch).changes;
+			.all(cutoffs.deliveryCutoff, cutoffs.historyCutoff, cutoffs.batch) as Array<{ delivery_id: string }>;
+		return this.#delete(tx, ids);
+	}
+
+	/** Every column of every delivery row, as the journal snapshots them. */
+	projectionRows(): DeliveryDbRow[] {
+		return this.#db
+			.prepare(`SELECT ${JOURNAL_PROJECTIONS.delivery.columns.join(", ")} FROM deliveries ORDER BY delivery_id`)
+			.all() as DeliveryDbRow[];
+	}
+
+	/** Make the outbox projection equal to the journaled snapshots; returns the number of rows rewritten. */
+	replayProjection(tx: WriteTx, deliveries: ReadonlyMap<string, JournalRows["delivery"] | null>): number {
+		const stale = staleJournalKeys("delivery", this.projectionRows(), deliveries);
+		for (const deliveryId of stale)
+			this.#db.prepare("DELETE FROM deliveries WHERE delivery_id = ?").run(tx, deliveryId);
+		for (const deliveryId of stale) {
+			const row = deliveries.get(deliveryId);
+			if (row)
+				this.#db
+					.prepare(
+						"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					)
+					.run(
+						tx,
+						row.delivery_id,
+						row.turn_id,
+						row.origin_key,
+						row.payload_json,
+						row.state,
+						row.attempts,
+						row.created_at,
+						row.updated_at,
+						row.last_error,
+					);
+		}
+		return stale.length;
+	}
+
+	#delete(tx: WriteTx, rows: readonly { readonly delivery_id: string }[]): number {
+		const remove = this.#db.prepare("DELETE FROM deliveries WHERE delivery_id = ?");
+		for (const row of rows) {
+			remove.run(tx, row.delivery_id);
+			this.#journal.record(tx, "delivery", row.delivery_id, "delivery_deleted");
+		}
+		return rows.length;
 	}
 
 	#update(
 		tx: WriteTx,
 		deliveryId: string,
+		eventType: WorkJournalEventType,
 		state: DeliveryState,
 		attempts?: number,
 		lastError?: DeliveryErrorCode,
@@ -390,6 +452,7 @@ export class OutboxGroup {
 				"UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = COALESCE(?, last_error), updated_at = ? WHERE delivery_id = ?",
 			)
 			.run(tx, state, attempts ?? null, lastError ?? null, new Date().toISOString(), deliveryId);
+		this.#journal.record(tx, "delivery", deliveryId, eventType);
 	}
 
 	unsettledRows(): DeliveryRow[] {

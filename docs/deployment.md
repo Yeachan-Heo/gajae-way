@@ -81,7 +81,27 @@ gajaeway update --bin-dir /opt/gajaeway # when driving the update from elsewhere
 
 The updater stages the platform release, backs up replaced binaries, reads the staged gateway package's GJC pin, installs and verifies that exact version in the private prefix, then installs service definitions. When a broker manifest exists and restart is enabled, it enables the broker unit on Linux and queues the restart supervisor. The supervisor restarts the broker, gateway, and connected services in order. `--force` reinstalls the current release and its pinned GJC version. `GAJAEWAY_UPDATE_REPO=owner/name` redirects release checks to a fork.
 
+With `--no-restart`, stale service definitions for missing binaries are left alone so a healthy running process is not stopped during the staged update. The later `gajaeway ops restart-stack` stops and removes those stale services before restarting the installed stack.
+
 A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`; when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
+
+### macOS upgrade from 0.1.x to 0.2.0
+
+When migrating the broker to its private GJC agent directory, keep the updated gateway stopped until provisioning and the authority cutover are complete:
+
+```sh
+export GAJAEWAY_HOME=/absolute/path/to/gajaeway-home
+gajaeway update --no-restart
+gajaeway setup --broker-agent
+gajaeway-gateway census
+gajaeway-gateway cutover --agent-dir CANONICAL
+gajaeway ops restart-stack
+gajaeway ops restart-stack --status
+```
+
+Before census, stop the gateway service and disable managed startup for the entire cutover window; follow [Explicit broker-authority cutover](runbooks/gajaeway-v1.md#explicit-broker-authority-cutover) and retain its census and cutover evidence. The final restart loads a missing macOS LaunchAgent from its plist, including `dev.gajaeway.broker` once its provision manifest exists.
+
+Check `schemaVersion` in the census report before cutover. This procedure requires the current schema 35; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
 
 ## Home and configuration
 
@@ -95,7 +115,8 @@ $GAJAEWAY_HOME/
   adapter-slack.json
   adapters/discord/recovery-cursor.json
   broker.env                 # optional protected environment for the broker service
-  adapters/slack/recovery-cursor.json
+  adapters/slack/recovery-cursor.json  # Slack missed-message watermarks
+  attachments/telegram/<chat>/  # inbound Telegram photos/files (owner-only, pruned after 7 days)
   gateway.sock
   gateway.db                 # live SQLite WAL/SHM sidecars may also be present
   leases/
@@ -134,6 +155,8 @@ $GAJAEWAY_HOME/
 
 Use `config.json` schema version 1. Every configured secret is a credential-file reference; a credential file may be referenced by only one configured credential.
 
+Outbound secret redaction is always on and is configured only through the gateway's environment, never `config.json`: it indexes secret-named environment variables, `$GAJAEWAY_HOME/secrets/`, the gjc `agent.db` credentials, plus `GAJAEWAY_SECRET_GUARD_FILES` (colon-separated files or directories, e.g. Kubernetes secret mounts) and `GAJAEWAY_SECRET_GUARD_ENV` (comma-separated extra variable names). See the architecture notes for what is matched.
+
 ```json
 {
   "schemaVersion": 1,
@@ -152,11 +175,19 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
   "stallTimeoutMs": 120000,
-  "monitorCatchUp": { "maxSlots": 24, "maxAgeMs": 86400000 }
+  "sessions": { "idleResetMs": 86400000 },
+  "monitorCatchUp": { "maxSlots": 24, "maxAgeMs": 86400000 },
+  "sqlite": { "journalMode": "WAL" }
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, `stallTimeoutMs`, `sessions`, and `sqlite` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`.
+
+`sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. The `sessions` object is reloadable.
+
+`sqlite.journalMode` accepts `DELETE`, `TRUNCATE`, `PERSIST`, or `WAL` (default `WAL`); `MEMORY` and `OFF` are rejected to preserve database durability. Use `DELETE` or `TRUNCATE` for a single gateway instance on an NFS volume, and change this setting only while the gateway is stopped.
+
+`interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 `monitorCatchUp` bounds cron replay after downtime: `maxSlots` is the newest due slots to admit (1–1000, default 24), and `maxAgeMs` excludes slots older than the lookback (60000–604800000 ms, default 86400000 / 24 hours). Refused slots advance the durable monitor cursor, are counted and logged, and appear in `gajaeway monitors inspect <id>` as `catchUp`; the setting is restart-required.
 
@@ -409,8 +440,8 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
-- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]`, `[WAKE:<alias>]`, and `[WATCH:<alias>]`). Verify the next event through the path consuming the changed policy.
+- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, `gjc`, `sqlite`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
@@ -422,9 +453,12 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 {
   "tokenFile": "/Users/me/gajaeway/secrets/discord-token",
   "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
-  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } }
+  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } },
+  "mediaDirectories": ["/Users/me/gajaeway/shared-files"]
 }
 ```
+
+Outbound `MEDIA:/absolute/path` attachments are disabled unless `mediaDirectories` is configured. Relative entries resolve from the directory containing `adapter-discord.json`; uploads are accepted only when the file's resolved real path remains inside one of those directories. Keep this allowlist limited to files that may be exposed in Discord.
 
 `engagement` selects how messages become turns: `open` admits them without addressing, `mention-open` requires a real mention or native reply to this bot, and `closed` requires both addressing and owner/allowlist authorization. `audience` independently restricts authors to `all`, `human-only`, or `bot-only`; `closed` ignores it. Omitting `audience` keeps the safe `human-only` default (humans follow the mode; bots stay on the closed gate).
 
@@ -449,11 +483,11 @@ gajaeway ops restart-stack
 gajaeway ops restart-stack --status
 ```
 
-The command returns after a detached supervisor is queued. The supervisor restarts the broker, gateway, then connected adapters and admin; on Linux it restarts the broker and gateway units and lets gateway dependencies restart clients, while on macOS it kickstarts each job in order. It verifies process start and deployed binary; lease-backed services additionally require the lease owner's PID to match the service manager's main PID. The receipt is `$GAJAEWAY_HOME/restart-stack.json`; `--status` is successful only when it reports `ok` and exits 0.
+The command returns after a detached supervisor is queued. The supervisor restarts the broker, gateway, then connected adapters and admin; on Linux it restarts the broker and gateway units and lets gateway dependencies restart clients, while on macOS it kickstarts each job in order and bootstraps the LaunchAgent plist when a job has not been loaded. It verifies process start and deployed binary; lease-backed services additionally require the lease owner's PID to match the service manager's main PID. The receipt is `$GAJAEWAY_HOME/restart-stack.json`; `--status` is successful only when it reports `ok` and exits 0.
 
 An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 
-`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply. Migration 33 (L4h), which removes `broker_quarantine` and `broker_cutovers`, remains pending.
+`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply. The current schema is 35; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
 
 ## Speech gate
 

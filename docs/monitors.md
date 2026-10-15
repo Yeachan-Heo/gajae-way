@@ -1,6 +1,6 @@
 # Monitors
 
-A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one output target. A cron is simply a monitor whose trigger is periodic.
+A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one external channel-delivery target. A cron is simply a monitor whose trigger is periodic.
 
 ## MonitorSpec and triggers
 
@@ -17,13 +17,14 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
     "origin": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
     "mentionUserIds": ["1468532331001413743"]
   },
+  "reportTo": { "platform": "discord", "kind": "channel", "conversationId": "1470204268933022023" },
   "enabled": true
 }
 ```
 
 `instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note. Write it as prose sentences, not a tag bundle: it reaches the authoring session verbatim.
 
-Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Keep `eventTypes` short, stable identifiers that are safe to group by.
+Destination and pings are typed fields, never part of the event type or the instruction. `channelTarget.origin` is where authored notes are delivered; `channelTarget.mentionUserIds` (Discord snowflakes or Slack `U…`/`W…` ids; other platforms reject it) are prefixed to every delivered note as `<@id>` by the gateway, so the author never has to remember who to ping. Optional `reportTo` identifies a chat or loopback conversation whose persona session should also receive each reportable authored note as a durable internal report. Silent outputs and contract-only echoes suppressed by channel delivery are not injected. This is context injection, not a chat delivery: it lets the conversation session know what the separate monitor session did, without posting another message to the channel. `reportTo` may match `channelTarget.origin`; omitting it preserves the existing behavior. Monitor execution origins are not valid report targets. Keep `eventTypes` short, stable identifiers that are safe to group by.
 
 `procedureFiles` (optional, at most 8) lists the procedure/doctrine files the monitor follows, relative to `$GAJAEWAY_HOME/workspace` (`memory/ops/...` reaches the memory corpus through the workspace link). The event-type session is long-lived and never re-reads files it saw at session start, so these files are re-read from disk at **every** firing and their current content goes into that firing's authoring prompt. A doctrine edit therefore takes effect on the very next firing, without a session roll or restart. Each file is inlined up to 24 KiB; a larger one is versioned and the session is told to read it from disk. Paths must stay inside the workspace (symlinks may resolve into the memory corpus only); a missing or escaping file is reported, not fatal.
 
@@ -71,7 +72,7 @@ The durable propagation path is:
 1. **Admitted** — persist the incoming event before work begins and emit its systematic event record.
 2. **Batched** — apply the monitor burst policy and assign a batch.
 3. **Session selected** — choose the monitor's declared-type session or its catch-all session.
-4. **Authored** — ask Gajae for exactly one note per event, then persist each authored output.
+4. **Authored** — ask Gajae for exactly one note per event, persist each authored output, and atomically enqueue it as an internal report to `reportTo` when configured.
 5. **Memory queued** — create a durable `monitor-event` memory intent for the authored note.
 6. **Delivered** — when a `channelTarget` exists, prepare and mark an outbound ledger delivery.
 7. **Reconciled** — startup and periodic reconciliation replays unfinished admitted, dispatched, or failed events, and repairs authored events missing their memory intent. A `failed` event is reclaimed on a backoff measured from its last failure — immediately, then after 10 minutes, 1 hour, 4 hours and 12 hours — so the five-attempt budget spans ~17 hours and a slot survives a multi-hour dispatch outage. Only after that does it land on the terminal `failed_no_retry`. A `session_busy`, `session_host_unavailable`, or `gateway_shutdown` failure is not evidence of a dispatch outage, so it is reclaimed on the next sweep without waiting out the backoff; it still counts against the budget.

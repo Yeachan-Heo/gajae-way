@@ -62,7 +62,10 @@ async function eventually(predicate: () => boolean, message: string): Promise<vo
 	expect(predicate(), message).toBe(true);
 }
 
-async function start(respond: (text: string) => Promise<string>) {
+async function start(
+	respond: (text: string) => Promise<string>,
+	onSteer?: NonNullable<ScriptedSessionPort["onSteer"]>,
+) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-message-edit-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -79,6 +82,7 @@ async function start(respond: (text: string) => Promise<string>) {
 	const port = sessionPortFromScript({
 		bind: (key, epoch) => `${key}#${epoch}`,
 		respond: (_session, text) => respond(text),
+		onSteer,
 	});
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
@@ -104,37 +108,61 @@ async function start(respond: (text: string) => Promise<string>) {
 	return { client, port, send, edit };
 }
 
+// This socket/SQLite integration exceeded Bun's 5s default on darwin-arm64 CI;
+// leave scheduling headroom while bounding the event wait below the test timeout.
 test("an edit during the running turn is steered into it as a [MESSAGE POINTER] update", async () => {
 	let release!: () => void;
 	const running = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const turns: string[] = [];
-	const { client, port, send, edit } = await start(async (text) => {
-		turns.push(text);
-		await running;
-		return "ok";
+	let markSteered!: () => void;
+	const steered = new Promise<void>((resolve) => {
+		markSteered = resolve;
 	});
-	send("s1", "m-1", "book a table for 2");
-	await eventually(() => turns.length === 1, "original was not sent");
-	edit("e1", "m-1", "book a table for 4");
-	await eventually(() => port.steers.length === 1, "edit was not steered into the running turn");
-	expect(port.sends).toHaveLength(1);
-	expect(port.steers[0]!.text).toContain("[MESSAGE POINTER: m-1]");
-	expect(port.steers[0]!.text).toContain("book a table for 4");
-	expect(client.response("e1")?.result).toMatchObject({ engaged: true });
-	expect(client.response("e1")?.result.turnId).toBeString();
-	// The edit is attributed to the running turn, and the context ledger now
-	// carries the new body under the original message id.
-	const turn = database!.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
-	expect(database!.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role])).toEqual([
-		["m-1", "trigger"],
-		[messageEditId("m-1", "book a table for 4"), "steer"],
-	]);
-	release();
-	await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not complete");
-	client.close();
-});
+	const turns: string[] = [];
+	const { client, port, send, edit } = await start(
+		async (text) => {
+			turns.push(text);
+			await running;
+			return "ok";
+		},
+		() => markSteered(),
+	);
+	let steerTimeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		send("s1", "m-1", "book a table for 2");
+		await eventually(() => turns.length === 1, "original was not sent");
+		edit("e1", "m-1", "book a table for 4");
+		// Observe the actual steer call instead of polling shared mutable state.
+		// Bound the wait below the explicit test timeout so failures still release
+		// the parked turn and let afterEach shut the server down cleanly.
+		await Promise.race([
+			steered,
+			new Promise<never>((_resolve, reject) => {
+				steerTimeout = setTimeout(() => reject(new Error("edit was not steered into the running turn")), 10_000);
+			}),
+		]);
+		expect(port.sends).toHaveLength(1);
+		expect(port.steers[0]!.text).toContain("[MESSAGE POINTER: m-1]");
+		expect(port.steers[0]!.text).toContain("book a table for 4");
+		await eventually(() => client.response("e1") !== undefined, "edit response was not received");
+		expect(client.response("e1")?.result).toMatchObject({ engaged: true });
+		expect(client.response("e1")?.result.turnId).toBeString();
+		// The edit is attributed to the running turn, and the context ledger now
+		// carries the new body under the original message id.
+		const turn = database!.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
+		expect(database!.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role])).toEqual([
+			["m-1", "trigger"],
+			[messageEditId("m-1", "book a table for 4"), "steer"],
+		]);
+		release();
+		await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not complete");
+	} finally {
+		if (steerTimeout !== undefined) clearTimeout(steerTimeout);
+		release();
+		client.close();
+	}
+}, 15_000);
 
 test("an edit while idle is sent as the next turn, pointing at the original message", async () => {
 	const turns: string[] = [];

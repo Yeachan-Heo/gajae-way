@@ -1,7 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
-import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DatabaseStartupError } from "./errors";
+import { JOURNAL_PROJECTIONS, type JournalEntity, journalSnapshotSql } from "./groups/journal";
 import type { WorkAttemptRuntime, WorkParent } from "./groups/work";
 import { validateWorkRuntime, workAssert, workAttemptReportId } from "./groups/work";
 
@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 32;
+export const LATEST_SCHEMA_VERSION = 36;
 
 export interface MigrationHost {
 	readonly database: {
@@ -684,6 +684,121 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(32, new Date().toISOString());
+		});
+	}
+	if (current < 33) {
+		// Issue #369: Add the terminal contract_unmet stage while retaining every monitor index.
+		host.withTransaction(() => {
+			host.database.execute(`CREATE TABLE monitor_events_v33 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped','contract_unmet')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT);
+INSERT INTO monitor_events_v33 (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, skipped_by, updated_at, procedure_json) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, skipped_by, updated_at, procedure_json FROM monitor_events ORDER BY rowid;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_v33 RENAME TO monitor_events;
+CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
+CREATE INDEX monitor_events_gc ON monitor_events(updated_at) WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet');
+CREATE INDEX monitor_events_open ON monitor_events(fired_at) WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet');
+CREATE INDEX monitor_events_batch ON monitor_events(batch_id);
+CREATE INDEX monitor_events_authored ON monitor_events(batch_id) WHERE stage = 'authored';
+CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
+			for (const action of ["UPDATE", "DELETE"])
+				host.database.execute(`CREATE TRIGGER monitor_events_quarantine_${action.toLowerCase()} BEFORE ${action} ON monitor_events
+				WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = OLD.event_id)
+				BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(33, new Date().toISOString());
+		});
+	}
+	if (current < 34) {
+		host.withTransaction(() => {
+			host.database.execute(`CREATE TABLE IF NOT EXISTS cross_session_watches (
+				watch_id TEXT PRIMARY KEY,
+				watcher_origin_key TEXT NOT NULL,
+				watcher_origin_ref_json TEXT NOT NULL,
+				watched_origin_key TEXT NOT NULL,
+				watched_origin_ref_json TEXT NOT NULL,
+				handoff_chain_json TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('pending','fired','expired')),
+				registered_at TEXT NOT NULL,
+				triggered_message_id TEXT,
+				triggered_at TEXT,
+				CHECK((state = 'fired' AND triggered_message_id IS NOT NULL AND triggered_at IS NOT NULL) OR (state <> 'fired' AND triggered_message_id IS NULL AND triggered_at IS NULL))
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS cross_session_watches_pending_pair ON cross_session_watches(watcher_origin_key, watched_origin_key) WHERE state = 'pending';
+			CREATE INDEX IF NOT EXISTS cross_session_watches_pending_target ON cross_session_watches(watched_origin_key, expires_at) WHERE state = 'pending';
+			CREATE INDEX IF NOT EXISTS cross_session_watches_retention ON cross_session_watches(state, expires_at, triggered_at);`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(34, new Date().toISOString());
+		});
+	}
+	if (current < 35) {
+		// Issue #481: Add awaiting_checks without rewriting the already-deployed v33/v34 migrations.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE lane_jobs_v35 (
+					job_id TEXT PRIMARY KEY,
+					lane_key TEXT NOT NULL UNIQUE,
+					branch TEXT NOT NULL,
+					worktree_path TEXT NOT NULL,
+					state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','awaiting_checks','stalled','done','aborted')),
+					record_json TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);
+				INSERT INTO lane_jobs_v35 SELECT * FROM lane_jobs;
+				DROP TABLE lane_jobs;
+				ALTER TABLE lane_jobs_v35 RENAME TO lane_jobs;
+			`);
+			host.database.execute(`
+				CREATE TRIGGER lane_jobs_quarantine_update BEFORE UPDATE ON lane_jobs
+				WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+				BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+				CREATE TRIGGER lane_jobs_quarantine_delete BEFORE DELETE ON lane_jobs
+				WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = OLD.job_id)
+				BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(35, new Date().toISOString());
+		});
+	}
+	if (current < 36) {
+		// Issue #567: durable journal of work-attempt, lane-job and outbox row snapshots. Existing
+		// rows are seeded as baseline events so replay from the journal alone covers pre-v36 state.
+		// A database whose v36 record was removed restarts its journal from the current projections.
+		host.withTransaction(() => {
+			host.database.execute(
+				`DROP TABLE IF EXISTS work_journal;
+				CREATE TABLE work_journal (
+					seq INTEGER PRIMARY KEY AUTOINCREMENT,
+					entity TEXT NOT NULL CHECK(entity IN ('attempt','lane_job','delivery')),
+					entity_key TEXT NOT NULL,
+					event_type TEXT NOT NULL CHECK(event_type IN (
+						'baseline',
+						'attempt_started','attempt_accepted','attempt_terminal','attempt_updated','attempt_settled','attempt_reconciled',
+						'lane_job_running','lane_job_attempt_ended','lane_job_awaiting_operator','lane_job_awaiting_checks','lane_job_stalled','lane_job_done','lane_job_aborted',
+						'delivery_queued','delivery_inflight','delivery_confirmed','delivery_failed','delivery_expired','delivery_requeued','delivery_deleted'
+					)),
+					row_json TEXT CHECK(row_json IS NULL OR json_valid(row_json)),
+					recorded_at TEXT NOT NULL
+				);
+				CREATE INDEX work_journal_entity_key ON work_journal(entity, entity_key, seq);
+				CREATE INDEX work_journal_recorded_at ON work_journal(recorded_at);`,
+			);
+			const seededAt = new Date().toISOString();
+			for (const entity of ["lane_job", "attempt", "delivery"] as const satisfies readonly JournalEntity[]) {
+				const { table, key } = JOURNAL_PROJECTIONS[entity];
+				host.database
+					.statement(
+						`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at) SELECT ?, ${key}, 'baseline', ${journalSnapshotSql(entity)}, ? FROM ${table} ORDER BY ${key}`,
+					)
+					.run(entity, seededAt);
+			}
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(36, new Date().toISOString());
 		});
 	}
 }

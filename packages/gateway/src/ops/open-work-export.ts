@@ -15,7 +15,7 @@ import type { BrokerAuthority } from "../store/groups/bindings";
 import type { OpenWorkReport } from "../store/open-work";
 
 export interface OpenWorkExportInput extends OpenWorkReport {
-	readonly reason: "cutover" | "migration-33";
+	readonly reason: "cutover" | "migration-35";
 	readonly schemaVersion: number;
 	readonly authority: BrokerAuthority | null;
 	readonly createdAt?: string;

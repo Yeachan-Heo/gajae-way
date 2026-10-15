@@ -382,3 +382,76 @@ export function buildMonitorCompactionDigest(input: MonitorDigestInput): string 
 	// instruction); a hard clip is the last resort so the bound always holds.
 	return trimmed.length <= maxTotalLength ? trimmed : clip(trimmed, maxTotalLength);
 }
+
+const NON_SUBSTANTIVE_ECHO_WORDS = new Set([
+	"a",
+	"an",
+	"and",
+	"as",
+	"at",
+	"by",
+	"do",
+	"for",
+	"from",
+	"here",
+	"in",
+	"is",
+	"it",
+	"of",
+	"on",
+	"or",
+	"please",
+	"should",
+	"task",
+	"the",
+	"this",
+	"to",
+	"what",
+	"we",
+	"will",
+	"with",
+	"your",
+	"run",
+]);
+
+/** Detect likely contract restatements without treating copied prompt numbers as evidence of work. */
+export function isAuthoredEchoSuspected(contractText: string | undefined, note: string): boolean {
+	if (!contractText || !note) return false;
+
+	const tokenize = (text: string): string[] => text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+	const contractTokens = tokenize(contractText);
+	const noteTokens = tokenize(note);
+	if (contractTokens.length === 0 || noteTokens.length === 0) return false;
+
+	// Token overlap alone can discard a finding appended to a copied instruction.
+	// Require broad contract coverage and no novel content words before suppressing.
+	const contractContent = contractTokens.filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token));
+	const noteContent = noteTokens.filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token));
+	if (contractContent.length === 0 || noteContent.length === 0) return false;
+	const remainingContractTokens = new Map<string, number>();
+	for (const token of contractContent)
+		remainingContractTokens.set(token, (remainingContractTokens.get(token) ?? 0) + 1);
+	for (const token of noteContent) {
+		const remaining = remainingContractTokens.get(token) ?? 0;
+		if (remaining === 0) return false;
+		remainingContractTokens.set(token, remaining - 1);
+	}
+	const contractSet = new Set(contractContent);
+	const noteSet = new Set(noteContent);
+	const sharedTokens = [...noteSet].filter((token) => contractSet.has(token)).length;
+	if (sharedTokens / contractSet.size < 0.7) return false;
+
+	const evidenceMarkers = (text: string): string[] =>
+		(text.match(/(?:https?:\/\/|www\.)[^\s<>()]+|#\d+|\b[A-Z]+-\d+\b|\b\d+\b|```|`[^`]+`/gi) ?? []).map((marker) =>
+			marker.toLowerCase().replace(/[),.;!?]+$/g, ""),
+		);
+	const remainingContractEvidence = new Map<string, number>();
+	for (const marker of evidenceMarkers(contractText))
+		remainingContractEvidence.set(marker, (remainingContractEvidence.get(marker) ?? 0) + 1);
+	for (const marker of evidenceMarkers(note)) {
+		const remaining = remainingContractEvidence.get(marker) ?? 0;
+		if (remaining === 0) return false;
+		remainingContractEvidence.set(marker, remaining - 1);
+	}
+	return true;
+}

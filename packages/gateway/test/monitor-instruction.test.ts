@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
+import { isAuthoredEchoSuspected } from "../src/monitors/compaction";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors/registry";
 import { Store } from "../src/store";
@@ -166,7 +167,7 @@ test("monitor.add refuses an event type that cannot be an executing-session orig
 	}
 });
 
-test("#180: channel and mention targets are typed fields that survive a restart and reach the delivery", async () => {
+test("#180/#369: typed targets survive restart and echoed instructions retain appended findings", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-typed-target-"));
 	try {
 		const instruction =
@@ -197,6 +198,7 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 
 		const prompts: string[] = [];
 		const delivered: ChatMessagePayload[] = [];
+		const note = `${instruction} Release blocked.`;
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
@@ -204,7 +206,7 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 				onSend: (input, scripted) => {
 					prompts.push(input.text);
 					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "No new friction." }]));
+					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note }]));
 				},
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
@@ -218,11 +220,88 @@ test("#180: channel and mention targets are typed fields that survive a restart 
 		expect(delivered).toHaveLength(1);
 		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
 		// The mention comes from the typed field, not from the author remembering it.
-		expect(delivered[0]!.text).toBe("<@1468532331001413743> No new friction.");
+		expect(delivered[0]!.text).toBe(`<@1468532331001413743> ${note}`);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+test("#369: contract-only notes are terminal and never delivered", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-contract-echo-"));
+	try {
+		const database = await Store.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const instruction =
+			"Review the last 24 hours of runtime operation. Report actual friction, failures and latency with public-safe evidence only.";
+		const monitor = registry.add({
+			name: "runtime-feedback",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["gajaeway.runtime-feedback.daily"],
+			instruction,
+			channelTarget: {
+				origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
+				mentionUserIds: [],
+			},
+		});
+		const delivered: ChatMessagePayload[] = [];
+		const sessionPort = new ScriptedSessionPort({
+			onSend: (input, scripted) => {
+				const payload = input.text.match(/\[.*\]$/s)?.[0];
+				if (!payload) throw new Error("monitor event payload is missing");
+				const [event] = JSON.parse(payload) as Array<{ eventId: string }>;
+				if (!event) throw new Error("monitor event is missing");
+				scripted.complete(input.opRef, JSON.stringify([{ eventId: event.eventId, note: instruction }]));
+			},
+		});
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			deliver: (payload) => delivered.push(payload),
+		});
+
+		pipeline.submit(monitor.monitorId, "gajaeway.runtime-feedback.daily", {});
+		await Bun.sleep(250);
+
+		expect(delivered).toHaveLength(0);
+		const [event] = database.monitors.eventRows(monitor.monitorId);
+		expect(event?.stage).toBe("contract_unmet");
+		expect(event && database.monitors.failure(event.event_id)?.code).toBe("authored_echo_suspected");
+		expect(database.monitors.openCount()).toBe(0);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("#369: reused event-tag text and copied numbers are not novel work evidence", () => {
+	const instruction = "Review the last 24 hours and inspect issue #369.";
+	expect(isAuthoredEchoSuspected(instruction, instruction)).toBe(true);
+	expect(isAuthoredEchoSuspected(instruction, `What the run should do: ${instruction}`)).toBe(true);
+	expect(isAuthoredEchoSuspected("runtime.feedback.daily", "Runtime feedback daily")).toBe(true);
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} #370`)).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			"Review the last 24 hours of runtime activity and report blockers and failures.",
+			"Review the last 24 hours of runtime activity and report blockers and failures. Release blocked.",
+		),
+	).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			"Review the last 24 hours of runtime activity and report blockers and failures.",
+			"Review the last 24 hours of runtime activity and report blockers and failures. Blockers remain.",
+		),
+	).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			"Review the last 24 hours of runtime activity and report blockers and failures.",
+			"Review the last 24 hours.",
+		),
+	).toBe(false);
 });
 
 test("#180: mention targets are validated as platform ids", async () => {

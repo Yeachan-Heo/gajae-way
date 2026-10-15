@@ -14,6 +14,9 @@ import {
 	planContinuation,
 	projectAttemptOutcome,
 	type RepositoryFacts,
+	recordChecksRetry,
+	settleAwaitingChecks,
+	transitionToAwaitingChecks,
 } from "../src/job";
 import { ATTEMPT_ENDED_CODES, projectOpState } from "../src/status";
 
@@ -117,7 +120,7 @@ describe("op projection: error.code surfaces and deadline kills are attempt_ende
 });
 
 describe("durable record schema: versioned, frozen, fail-closed", () => {
-	test("createLaneJobRecord produces a v1 record with identity that outlives ops", () => {
+	test("createLaneJobRecord produces a v3 record with identity that outlives ops", () => {
 		const created = record();
 		expect(created.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
 		expect(created.jobId).toBe("lanejob-project-issue-10-lane-jobs");
@@ -139,16 +142,60 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		expect(parsed.checkpoints[0].sha).toBe("a".repeat(40));
 	});
 
+	test("round-trips repository identity and its managed repository path", () => {
+		const created = createLaneJobRecord({
+			jobId: "lanejob-project-issue-10-lane-jobs",
+			branch: "work/lane-jobs",
+			worktreePath: "/wt/lane-jobs",
+			repository: "https://example.test/project.git",
+			repositoryPath: "/home/user/.gajaeway/repositories/lane-jobs",
+			now: () => NOW,
+		});
+		const parsed = parseLaneJobRecord(JSON.stringify(created));
+		expect(parsed.schemaVersion).toBe(3);
+		expect(parsed.lane.repository).toBe("https://example.test/project.git");
+		expect(parsed.lane.repositoryPath).toBe("/home/user/.gajaeway/repositories/lane-jobs");
+	});
+
 	test("refuses an unknown schemaVersion (migration boundary, fail closed)", () => {
 		const raw = JSON.stringify({ ...JSON.parse(JSON.stringify(record())), schemaVersion: 999 });
 		expect(() => parseLaneJobRecord(raw)).toThrow(/schemaVersion/);
 	});
 
-	test("reads a version-1 record as version 2 (v2 only added optional lane.repository)", () => {
+	test("reads a version-1 record as version 3 without repository metadata", () => {
 		const raw = JSON.stringify({ ...JSON.parse(JSON.stringify(record())), schemaVersion: 1 });
 		const parsed = parseLaneJobRecord(raw);
 		expect(parsed.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
 		expect(parsed.lane.repository).toBeUndefined();
+	});
+
+	test("reads a version-2 record with repository identity but without a managed path", () => {
+		const created = record();
+		const raw = JSON.stringify({
+			...created,
+			schemaVersion: 2,
+			lane: { ...created.lane, repository: "https://example.test/project.git" },
+		});
+		const parsed = parseLaneJobRecord(raw);
+		expect(parsed.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);
+		expect(parsed.lane.repository).toBe("https://example.test/project.git");
+		expect(parsed.lane.repositoryPath).toBeUndefined();
+	});
+
+	test("rejects relative managed repository paths at creation and parse", () => {
+		expect(() =>
+			createLaneJobRecord({
+				jobId: "lanejob-project-issue-10-lane-jobs",
+				branch: "work/lane-jobs",
+				worktreePath: "/wt/lane-jobs",
+				repositoryPath: "relative/repository",
+			}),
+		).toThrow(/absolute path/);
+		const raw = JSON.stringify({
+			...record(),
+			lane: { branch: "work/lane-jobs", worktreePath: "/wt/lane-jobs", repositoryPath: "relative/repository" },
+		});
+		expect(() => parseLaneJobRecord(raw)).toThrow(/absolute path/);
 	});
 
 	test("refuses corrupt JSON and structural garbage instead of coercing", () => {
@@ -549,5 +596,84 @@ describe("restart and recovery", () => {
 		expect(stored.stalledContinuations).toBe(0);
 		// The next prompt may continue the same job - which is exactly how this
 		// very slice was continued by its supervisor.
+	});
+});
+
+describe("awaiting_checks cycle (#481)", () => {
+	const HEAD = "c".repeat(40);
+	function awaiting() {
+		const closed = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		return transitionToAwaitingChecks({ record: closed, at: NOW.toISOString(), prNumber: 7, headSha: HEAD });
+	}
+
+	test("the cycle persists PR, head, start and retries, and retries survive a re-steered attempt", () => {
+		const parked = awaiting();
+		expect(parked.state).toBe("awaiting_checks");
+		expect(parseLaneJobRecord(JSON.stringify(parked))).toEqual(parked);
+		const resteered = appendAttempt(recordChecksRetry(parked, NOW.toISOString()), attempt({ opRef: "gw-lanejob-02" }));
+		expect(resteered.state).toBe("running");
+		const closed = closeAttempt({
+			record: resteered,
+			opRef: "gw-lanejob-02",
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		const reparked = transitionToAwaitingChecks({ record: closed, at: NOW.toISOString(), prNumber: 7, headSha: HEAD });
+		expect(reparked.awaitingChecks?.retries).toBe(1);
+	});
+
+	test("a lookup-pending cycle can bind its PR later without resetting the deadline", () => {
+		const closed = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		const startedAt = NOW.toISOString();
+		const discovering = transitionToAwaitingChecks({
+			record: closed,
+			at: startedAt,
+			prNumber: null,
+			headSha: HEAD,
+		});
+		const discovered = transitionToAwaitingChecks({
+			record: discovering,
+			at: new Date(NOW.getTime() + 60_000).toISOString(),
+			prNumber: 7,
+			headSha: HEAD,
+		});
+		expect(parseLaneJobRecord(JSON.stringify(discovering))).toEqual(discovering);
+		expect(discovered.awaitingChecks).toEqual({ prNumber: 7, headSha: HEAD, since: startedAt, retries: 0 });
+	});
+
+	test("settling closes the cycle: passed is done, failed holds for an operator, ended is continuable", () => {
+		const at = NOW.toISOString();
+		expect(settleAwaitingChecks(awaiting(), at, { kind: "passed" })).toMatchObject({ state: "done" });
+		const failed = settleAwaitingChecks(awaiting(), at, { kind: "failed", reason: "checks=red(lint)" });
+		expect(failed.state).toBe("awaiting_operator");
+		expect(failed.escalations.at(-1)).toBe(`${at} awaiting_checks failed: checks=red(lint)`);
+		const ended = settleAwaitingChecks(awaiting(), at, { kind: "ended", reason: "timeout" });
+		expect(ended.state).toBe("attempt_ended");
+		for (const settled of [failed, ended]) expect(settled.awaitingChecks).toBeUndefined();
+	});
+
+	test("continuation planning holds an awaiting_checks record until the cycle settles", () => {
+		const parked = awaiting();
+		const decision = planContinuation(planInput({ record: parked, latestAttempt: parked.attempts[0] }));
+		expect(decision.action).toBe("hold_for_operator");
+		expect(decision.reason).toMatch(/checks are still pending/);
+	});
+
+	test("an awaiting_checks record without its cycle, or with a corrupt one, fails closed", () => {
+		const { awaitingChecks: _, ...missing } = awaiting();
+		expect(() => parseLaneJobRecord(JSON.stringify(missing))).toThrow(/awaitingChecks/);
+		const corrupt = { ...awaiting(), awaitingChecks: { ...awaiting().awaitingChecks, retries: -1 } };
+		expect(() => parseLaneJobRecord(JSON.stringify(corrupt))).toThrow(/retries/);
+		expect(() => recordChecksRetry(record(), NOW.toISOString())).toThrow(LaneJobError);
 	});
 });

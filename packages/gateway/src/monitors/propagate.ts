@@ -33,6 +33,7 @@ import {
 	RECONCILABLE_STAGES,
 	TERMINAL_STAGES,
 } from "../store/groups/monitors";
+import type { WriteTx } from "../store/tx";
 import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
@@ -43,6 +44,7 @@ import {
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
+	isAuthoredEchoSuspected,
 	isOrphanedExecutorFailure,
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
@@ -55,6 +57,8 @@ import {
 } from "./compaction";
 import { readMonitorProcedure } from "./procedure";
 import type { MonitorRegistry } from "./registry";
+
+export const MONITOR_REPORT_MESSAGE_ID_PREFIX = "monitor-report:";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
 const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
@@ -224,6 +228,7 @@ export class MonitorPropagator {
 	readonly #emit: (event: MonitorEventRecord) => void;
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
+	readonly #notifyInbound: ((originKey: string) => Promise<void>) | undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -266,6 +271,8 @@ export class MonitorPropagator {
 		ownerTarget?: { readonly origin: OriginRef };
 		/** Broadcasts a prepared chat.message to live adapter connections. */
 		deliver?: (payload: ChatMessagePayload) => void;
+		/** Wakes the persona actor after a durable monitor report is enqueued. */
+		notifyInbound?: (originKey: string) => Promise<void>;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -307,6 +314,7 @@ export class MonitorPropagator {
 		this.#emit = options.emit;
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
+		this.#notifyInbound = options.notifyInbound;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -1110,6 +1118,9 @@ export class MonitorPropagator {
 						const row = this.#database.monitors.eventGet(entry.eventId);
 						if (!row) continue;
 						const intentId = `monitor-event-intent:${entry.eventId}`;
+						const reportable = Boolean(
+							monitor.reportTo && this.#isReportableResult(monitor, row.event_type, entry.note),
+						);
 						const authoredOk = this.#database.transaction((tx) => {
 							const authored = this.#database.monitors.authorFenced(
 								tx,
@@ -1130,12 +1141,14 @@ export class MonitorPropagator {
 										replyText: entry.note,
 									}),
 								});
+							if (reportable) this.#enqueueMonitorReport(tx, monitor, row, entry.note as string);
 							return true;
 						});
 						if (!authoredOk) continue;
 						// Wake the closure queue so the atomically admitted intent is
 						// processed in the same run (no restart needed).
 						this.#memory.enqueueExistingId(intentId);
+						if (reportable && monitor.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 						this.#emit({
 							eventId: entry.eventId,
 							monitorId: monitor.monitorId,
@@ -1190,8 +1203,29 @@ export class MonitorPropagator {
 						this.#database.monitors.eventFencedUpdate(tx, entry.eventId, leaseId, "authored_no_delivery", batchId),
 					);
 				}
-				// Deliver only non-silent notes; silent entries were already marked as authored_no_delivery.
-				const deliveryText = nonSilentEntries.map((entry) => entry.note).join("\n");
+				const validDeliveryEntries: typeof nonSilentEntries = [];
+				for (const entry of nonSilentEntries) {
+					const eventRow = fenced.find((row) => row.event_id === entry.eventId);
+					const isEcho = this.#isContractEcho(monitor, eventRow?.event_type, entry.note);
+					if (!isEcho) {
+						validDeliveryEntries.push(entry);
+						continue;
+					}
+					const updated = this.#database.transaction((tx) =>
+						this.#database.monitors.eventFencedContractUnmet(
+							tx,
+							entry.eventId,
+							leaseId,
+							batchId,
+							"authored_echo_suspected",
+							"delivery suppressed: note echoes the monitor contract without new evidence",
+							this.#now(),
+						),
+					);
+					if (updated && eventRow) this.#emitStage(eventRow, "contract_unmet");
+				}
+				// Deliver only non-silent notes that contain information beyond the contract.
+				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
 				if (deliveryText.length > 0) {
 					const origin = target.origin;
 					// Typed mentions (issue #180) are added here, in code: the author is
@@ -1587,6 +1621,8 @@ export class MonitorPropagator {
 	): void {
 		const eventRow = row ?? this.#database.monitors.eventGet(eventId);
 		if (!eventRow) return;
+		const monitor = this.#registry.get(eventRow.monitor_id);
+		const reportable = Boolean(monitor?.reportTo && this.#isReportableResult(monitor, eventRow.event_type, note));
 		const intentId = `monitor-event-intent:${eventId}`;
 		const authored = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
@@ -1603,12 +1639,49 @@ export class MonitorPropagator {
 						replyText: note,
 					}),
 				});
+			if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
 			return true;
 		});
 		if (!authored) return;
 		// Wake the closure queue for the intent admitted above.
 		this.#memory.enqueueExistingId(intentId);
+		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+	}
+	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
+		if (isSilentOutput(note)) return false;
+		if (!monitor.channelTarget && !this.#ownerTarget) return true;
+		return !this.#isContractEcho(monitor, eventType, note);
+	}
+	#isContractEcho(monitor: MonitorRecord, eventType: string | undefined, note: string): boolean {
+		return isAuthoredEchoSuspected(monitor.instruction, note) || isAuthoredEchoSuspected(eventType, note);
+	}
+	#enqueueMonitorReport(
+		tx: WriteTx,
+		monitor: MonitorRecord,
+		event: { readonly event_id: string; readonly event_type: string },
+		note: string,
+	): void {
+		const target = monitor.reportTo;
+		if (!target) return;
+		this.#database.inbox.enqueue(tx, {
+			messageId: `${MONITOR_REPORT_MESSAGE_ID_PREFIX}${event.event_id}`,
+			originKey: originKey(target),
+			originRefJson: JSON.stringify(target),
+			body: `Monitor ${JSON.stringify(monitor.name)} result for ${event.event_type} (${event.event_id}):\n\n${note}`,
+			source: "lane_report",
+		});
+	}
+	#notifyMonitorReport(target: OriginRef): void {
+		if (!this.#notifyInbound) return;
+		const key = originKey(target);
+		try {
+			void this.#notifyInbound(key).catch(() => {
+				console.error(`monitor report notify failed origin=${key}`);
+			});
+		} catch {
+			console.error(`monitor report notify failed origin=${key}`);
+		}
 	}
 	#emitStage(row: { event_id: string; monitor_id: string; event_type: string; fired_at: string }, stage: string): void {
 		this.#emit({

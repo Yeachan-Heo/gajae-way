@@ -42,7 +42,7 @@ describe("GJC version pinning", () => {
 			preflightGjcRuntime(mockRun, "0.16.0", undefined, {
 				pinnedVersion,
 			}),
-		).rejects.toThrow("version mismatch");
+		).rejects.toThrow(/version mismatch.*Run 'gajaeway ops upgrade'/);
 	});
 
 	it("treats the pin as a floor so a gjc upgraded underneath the gateway still boots", async () => {

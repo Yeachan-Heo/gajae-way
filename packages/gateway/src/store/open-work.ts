@@ -141,7 +141,13 @@ export interface OpenWorkReport {
 	readonly monitors: readonly OpenMonitorEvent[];
 }
 
-const OPEN_MONITOR_STAGES = new Set(["delivered", "authored_no_delivery", "failed_no_retry", "skipped"]);
+const OPEN_MONITOR_STAGES = new Set([
+	"delivered",
+	"authored_no_delivery",
+	"failed_no_retry",
+	"skipped",
+	"contract_unmet",
+]);
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");

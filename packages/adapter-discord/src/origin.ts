@@ -32,7 +32,15 @@ export function discordMessageOrigin(message: DiscordMessageOriginShape): Origin
 		channel.type === "THREAD"
 	) {
 		if (!channel.parentId) throw new Error(`Discord thread ${channel.id} has no parent channel id`);
-		return { platform: "discord", kind: "thread", conversationId: channel.id, parentId: channel.parentId };
+		const threadVisibility =
+			channel.type === 10 || channel.type === 11 ? "public" : channel.type === 12 ? "private" : undefined;
+		return {
+			platform: "discord",
+			kind: "thread",
+			conversationId: channel.id,
+			parentId: channel.parentId,
+			...(threadVisibility ? { threadVisibility } : {}),
+		};
 	}
 	return { platform: "discord", kind: "channel", conversationId: channel.id };
 }

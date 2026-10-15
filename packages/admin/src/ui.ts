@@ -609,7 +609,12 @@ __SHARED__
   }
 
   function applySnapshot(next){
+    if (gatewayConnected === false && (!next.gateway || next.gateway.reachable !== false)) {
+      reportStream();
+      return;
+    }
     snapshot = next;
+    awaitingRecoverySnapshot = false;
     var at = new Date(next.at).getTime();
     var bar = document.getElementById("statusbar");
     setAttr(bar, "data-tone", next.status.tone);
@@ -633,11 +638,16 @@ __SHARED__
   var streamOpen = false;
   var streamEverOpen = false;
   var stopping = false;
+  var gatewayConnected;
+  var awaitingRecoverySnapshot = false;
 
   function streamMessage(){
     var origin = snapshot.at ? formatClockSeconds(new Date(snapshot.at)) : "??:??:??";
+    if (gatewayConnected === false) return { tone: "danger", text: "\u26a0 gateway disconnected \u2014 showing data from " + origin };
     if (stopping) return { tone: "danger", text: "\u26a0 gateway is stopping \u2014 showing data from " + origin };
+    if (awaitingRecoverySnapshot) return { tone: "warn", text: "gateway reconnected \u2014 waiting for a fresh snapshot; showing data from " + origin };
     if (snapshot.gateway && snapshot.gateway.reachable === false) {
+      if (snapshot.gateway.error === "gateway disconnected") return { tone: "danger", text: "gateway disconnected \u2014 showing data from " + origin };
       return { tone: "danger", text: "\u26a0 gateway unreachable \u2014 the daemon may be down. Data from " + origin };
     }
     if (!streamOpen) {
@@ -676,10 +686,33 @@ __SHARED__
 
   function openStream(){
     var source = new EventSource("/api/stream");
-    source.addEventListener("open", function(){ streamOpen = true; streamEverOpen = true; stopping = false; reportStream(); });
+    source.addEventListener("open", function(){
+      var reconnecting = streamEverOpen;
+      streamOpen = true;
+      streamEverOpen = true;
+      stopping = false;
+      if (reconnecting) {
+        gatewayConnected = undefined;
+        awaitingRecoverySnapshot = true;
+      }
+      reportStream();
+    });
     source.addEventListener("error", function(){ streamOpen = false; reportStream(); });
     source.addEventListener("snapshot", function(event){ streamOpen = true; applySnapshot(JSON.parse(event.data)); });
     source.addEventListener("gateway.stopping", function(){ stopping = true; reportStream(); });
+    source.addEventListener("gateway.connection", function(event){
+      var state = JSON.parse(event.data);
+      if (state.connected === false) {
+        gatewayConnected = false;
+        stopping = false;
+        awaitingRecoverySnapshot = false;
+      } else if (state.connected === true) {
+        gatewayConnected = true;
+        stopping = false;
+        awaitingRecoverySnapshot = true;
+      }
+      reportStream();
+    });
     source.addEventListener("monitor.event", function(){ lastData = Date.now(); });
   }
 

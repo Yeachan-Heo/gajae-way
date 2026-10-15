@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
@@ -16,9 +16,12 @@ import {
 	type WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import {
+	type AwaitingChecks,
 	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
+	type ChecksSettlement,
+	clearAwaitingChecks,
 	closeAttempt,
 	createLaneJobRecord,
 	envelopeErrorCode,
@@ -28,10 +31,13 @@ import {
 	newOpRef,
 	OpRefRejectedError,
 	parseLaneJobRecord,
+	recordChecksRetry,
+	settleAwaitingChecks,
+	transitionToAwaitingChecks,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
-import type { Store } from "../store";
+import { BrokerAuthorityError, type Store } from "../store";
 import {
 	type LaneReportRow,
 	resolveLaneReportOrigin,
@@ -45,20 +51,31 @@ import {
 	type WorkReportRoot,
 	workAssert,
 	workAttemptDeliveryId,
+	workAttemptEndState,
 	workAttemptReportId,
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import {
+	type LaneForceRetireReason,
+	type LaneGovernor,
+	laneJobIdentity,
+	managedLaneBranchName,
+	managedLaneRepositoryPath,
+	managedLaneWorktreePath,
+	workSessionKey,
+} from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionPort } from "./session-port";
-import type { TailHandle } from "./tail-runner";
+import { isRelayTransportFailure, type TailHandle } from "./tail-runner";
 
 const owners = new WeakSet<Store>();
 /** Consecutive failed reconciliations between authority re-checks through recovery. */
 const FAILURES_PER_READOPTION = 8;
 /** Ceiling for the failure backoff between reconciliation polls. */
 const MAX_FAILURE_BACKOFF_MS = 30_000;
+const REMOTE_REF_PROBE_TIMEOUT_MS = 5_000;
+const REMOTE_REPO_CLONE_TIMEOUT_MS = 30_000;
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -80,6 +97,12 @@ const reasons = new Set([
 /** Minimum spacing between streamed-frame activity writes for one attempt. */
 const ACTIVITY_TOUCH_MS = 1_000;
 const HOST_LOST_GRACE_MS = 30_000;
+/** Re-steers on red PR checks before the lane settles failed (#481). */
+const AWAITING_CHECKS_RETRY_LIMIT = 2;
+/** How long a lane may wait in awaiting_checks before it settles with a timeout. */
+const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
+/** Bound concurrent GitHub/remote probes so one slow lane does not serialize recovery. */
+const AWAITING_CHECKS_POLL_CONCURRENCY = 16;
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -100,19 +123,6 @@ const pendingOutput = () => ({
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
-function workAttemptEndState(
-	reason: string,
-): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
-	return reason === "end_turn"
-		? "completed"
-		: reason === "terminal_missing_receipt"
-			? "terminal_missing_receipt"
-			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
-				? "terminal_uncertain"
-				: ["sdk_failed", "send_rejected"].includes(reason)
-					? "failed"
-					: "attempt_ended";
-}
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
 	readonly generation: number;
@@ -125,6 +135,7 @@ interface Observer {
 	wakeRequested?: boolean;
 	text?: string;
 	touchedAt?: number;
+	turnEndObservedAt?: string;
 	/** First of an unbroken run of host-gone verdicts; any other observation resets it. */
 	goneSince?: number;
 }
@@ -134,13 +145,20 @@ interface Waiter {
 }
 export interface CheckStatusSnapshot {
 	readonly prNumber: number;
+	/** The PR head for which this rollup was computed. */
+	readonly headSha: string;
 	readonly status: "pending" | "green" | "red";
 	readonly failingChecks: readonly string[];
+	/** Lifecycle of the PR returned by discovery; merged PRs are terminal success. */
+	readonly prState?: "open" | "closed";
+	readonly merged?: boolean;
+	/** Bounded, sanitized tail from failed GitHub Actions checks when available. */
+	readonly failureLogTail?: string;
 }
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the checks of the open PR for `branch`: null when no PR is open,
+	 * Snapshot the PR head and its checks for `branch`: null when no matching PR exists,
 	 * undefined when the lookup failed or timed out. Must not throw.
 	 */
 	getCheckStatus(branch: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
@@ -171,7 +189,7 @@ export interface WorkLaneManagerOptions {
 interface WorkInput {
 	name: string;
 	text: string;
-	cwd: string;
+	cwd?: string;
 	repo?: string;
 	base?: string;
 	resume: boolean;
@@ -182,6 +200,8 @@ interface StartContext {
 	readonly parent: WorkParent | null;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
+	/** Only the check-polling path may add an attempt while the lane is parked. */
+	readonly checksRetry?: boolean;
 }
 
 /**
@@ -304,6 +324,37 @@ export class WorkLaneManager {
 			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
+	}
+	#rollbackUnpersistedWorktree(
+		name: string,
+		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
+	): void {
+		try {
+			const remove = Bun.spawnSync(["git", "worktree", "remove", "--force", worktree.path], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: worktree.repository,
+			});
+			const deleteBranch = Bun.spawnSync(["git", "branch", "-D", worktree.branch], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: worktree.repository,
+			});
+			const failures = [
+				remove.exitCode === 0
+					? undefined
+					: `git worktree remove failed: ${remove.stderr?.toString().trim() || "unknown error"}`,
+				deleteBranch.exitCode === 0
+					? undefined
+					: `git branch delete failed: ${deleteBranch.stderr?.toString().trim() || "unknown error"}`,
+			].filter((failure): failure is string => failure !== undefined);
+			if (failures.length > 0) throw new Error(failures.join("; "));
+		} catch (error) {
+			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
+				.replace(/\s+/gu, " ")
+				.slice(0, 200);
+			console.error(`work_setup_rollback_failed name=${name} reason=${reason || "unknown"}`);
+		}
 	}
 
 	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
@@ -456,6 +507,7 @@ export class WorkLaneManager {
 			runtime.output.disposition === "pending"
 				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
 				: runtime.output;
+		const awaitingChecks = record.awaitingChecks;
 		const closed = closeAttempt({
 			record,
 			opRef,
@@ -463,7 +515,25 @@ export class WorkLaneManager {
 			errorCode,
 			endedAt,
 		});
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
+		const settledRecord = clearAwaitingChecks(closed);
+		const reportFacts = awaitingChecks
+			? {
+					headSha: awaitingChecks.headSha,
+					dirtyFiles: 0,
+					pushed: null,
+					...(awaitingChecks.prNumber !== null
+						? {
+								checkStatus: {
+									prNumber: awaitingChecks.prNumber,
+									headSha: awaitingChecks.headSha,
+									status: "pending" as const,
+									failingChecks: [],
+								},
+							}
+						: {}),
+				}
+			: undefined;
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -512,7 +582,7 @@ export class WorkLaneManager {
 		const settled = this.#settleAttempt(
 			opRef,
 			runtime.version,
-			closed,
+			settledRecord,
 			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
 			admission,
 		);
@@ -710,19 +780,43 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
-		assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
+		if (input.cwd !== undefined) assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
-		// A repo-bound lane is identified by its repository; its cwd is the generated worktree.
-		if (
-			job &&
-			(job.lane.repository !== undefined ? job.lane.repository !== input.repo : job.lane.worktreePath !== input.cwd)
-		)
+		// A supplied repository identifies a repo-backed lane; otherwise an explicit
+		// cwd must match the durable worktree path. Omitting both resumes by lane name.
+		if (job && input.repo !== undefined && job.lane.repository !== input.repo)
+			throw new ProtocolError("invalid_params", "work lane repository mismatch", {
+				reasonCode: "lane_repository_mismatch",
+				name: input.name,
+			});
+		if (job && input.repo === undefined && input.cwd !== undefined && job.lane.worktreePath !== input.cwd)
 			throw new ProtocolError("invalid_params", "work lane cwd mismatch", {
 				reasonCode: "lane_cwd_mismatch",
 				name: input.name,
 			});
+		if (job && input.base !== undefined)
+			throw new ProtocolError("invalid_params", "base can only be selected when creating a work lane", {
+				reasonCode: "lane_base_already_bound",
+				name: input.name,
+			});
+		if (!job && input.cwd === undefined && input.repo === undefined)
+			throw new ProtocolError("invalid_params", "work lane requires cwd or repo", {
+				reasonCode: "repo_or_cwd_required",
+				name: input.name,
+			});
+
+		const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
+		const candidateWorktreePath =
+			job?.lane.worktreePath ?? (input.repo !== undefined ? managedLaneWorktreePath(laneRoot, input.name) : input.cwd);
+		if (candidateWorktreePath === undefined) throw new Error("work lane path was not resolved");
+		assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateWorktreePath, input.name);
+		const candidateRepositoryPath =
+			job?.lane.repositoryPath ??
+			(!job && input.repo !== undefined ? managedLaneRepositoryPath(laneRoot, input.name) : undefined);
+		if (candidateRepositoryPath !== undefined)
+			assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateRepositoryPath, input.name);
 		const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
 		if (open)
 			throw new ProtocolError("invalid_params", "attempt already open; use work.steer or wait", {
@@ -731,6 +825,22 @@ export class WorkLaneManager {
 				opRef: open.opRef,
 				sessionId: open.sessionId,
 			});
+		if (job?.state === "awaiting_checks" && !context.checksRetry)
+			return {
+				started: false,
+				held: true,
+				jobId,
+				state: job.state,
+				reason: "the lane is awaiting PR checks; wait for check polling to settle it",
+			};
+		if (job?.state === "done")
+			return {
+				started: false,
+				held: true,
+				jobId,
+				state: job.state,
+				reason: "the lane is complete; retire it before creating another lane with this name",
+			};
 		if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
 			if (!input.resume)
 				return {
@@ -742,43 +852,71 @@ export class WorkLaneManager {
 				};
 			job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
 		}
+		let createdWorktree: CreatedRepoWorktree | undefined;
 		if (!job) {
-			// If repo binding is provided, create a worktree from that repo
 			let worktreePath = input.cwd;
+			let repositoryPath: string | undefined;
 			if (input.repo !== undefined) {
-				const laneRoot = this.#options.laneRoot ?? this.#options.gajaewayHome;
-				worktreePath = await createWorktreeFromRepo(laneRoot, input.name, input.repo, input.base);
-				assertOutsideServiceDirectory(this.#options.serviceDirectory, worktreePath, input.name);
+				createdWorktree = await createWorktreeFromRepo(
+					laneRoot,
+					this.#options.serviceDirectory,
+					input.name,
+					input.repo,
+					input.base,
+				);
+				worktreePath = createdWorktree.worktreePath;
+				repositoryPath = createdWorktree.repositoryPath;
 			}
-			const facts = await collectRepoFacts(worktreePath);
+			if (worktreePath === undefined) throw new Error("work lane path was not resolved");
+			const facts = await collectRepoFacts(worktreePath, undefined, false);
 			job = createLaneJobRecord({
 				jobId,
-				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
+				branch: facts?.branch ?? managedLaneBranchName(input.name),
 				worktreePath,
-				baselineSha: facts?.headSha,
+				baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
+				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
 		}
-		// The session and the attempt share one path: the lane's recorded worktree (issue #480).
-		input = { ...input, cwd: job.lane.worktreePath };
-		const binding = await this.#port.runExclusive("work/admission", async () => {
-			this.#live();
-			this.#options.lanes.assertAdmission(input.name);
-			try {
-				return await this.#port.bind({
-					originKey: sessionKey,
-					epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-					repo: input.cwd,
-					codingRegister: true,
-					...(input.model ? { model: input.model } : {}),
-				});
-			} catch {
-				throw new ProtocolError("verb_failed", "work lane bind failed", {
-					reasonCode: "bind_failed",
-					name: input.name,
-				});
+		const worktreePath = job.lane.worktreePath;
+		input = { ...input, cwd: worktreePath };
+		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
+		try {
+			binding = await this.#port.runExclusive("work/admission", async () => {
+				this.#live();
+				this.#options.lanes.assertAdmission(input.name);
+				try {
+					return await this.#port.bind({
+						originKey: sessionKey,
+						epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+						repo: worktreePath,
+						codingRegister: true,
+						...(input.model ? { model: input.model } : {}),
+					});
+				} catch (error) {
+					const cause = workBindFailureCause(error);
+					console.error(
+						`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${worktreePath} cause=${cause} error=${workBindFailureMessage(error)}`,
+					);
+					throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
+						reasonCode: "bind_failed",
+						cause,
+						name: input.name,
+					});
+				}
+			});
+		} catch (error) {
+			if (createdWorktree) {
+				try {
+					await discardCreatedWorktree(input.name, createdWorktree);
+				} catch (cleanupError) {
+					console.error(
+						`worktree_creation_cleanup_failed name=${input.name} reason=${sanitizeDiagnostic(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))}`,
+					);
+				}
 			}
-		});
+			throw error;
+		}
 		this.#live();
 		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
 		const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
@@ -787,7 +925,7 @@ export class WorkLaneManager {
 			input.name,
 			binding.sessionId,
 			binding.epoch,
-			input.cwd,
+			worktreePath,
 			this.#at(),
 			opRef,
 			mode,
@@ -838,7 +976,7 @@ export class WorkLaneManager {
 		let latest = this.#db.work.workAttemptGet(opRef)!;
 		if (!accepted && !rejected) {
 			try {
-				accepted = provesAcceptance(await this.#query(latest));
+				accepted = provesAcceptance(await this.#query(latest, observer.tail));
 				source = "status";
 			} catch {
 				/* Observation owns recovery; never replay. */
@@ -878,12 +1016,17 @@ export class WorkLaneManager {
 		let op: PromptStatusBody | null = null;
 		if (attempt && binding?.sessionId === attempt.sessionId) {
 			try {
-				op = await this.#query({
-					jobId: job.jobId,
-					opRef: attempt.opRef,
-					sessionId: attempt.sessionId,
-					cwd: job.lane.worktreePath,
-				});
+				const observer = this.#observers.get(attempt.opRef);
+				const tail = observer && this.#writeCurrent(observer) ? observer.tail : undefined;
+				op = await this.#query(
+					{
+						jobId: job.jobId,
+						opRef: attempt.opRef,
+						sessionId: attempt.sessionId,
+						cwd: job.lane.worktreePath,
+					},
+					tail,
+				);
 			} catch (error) {
 				// A settled attempt whose host is gone has no live op to report.
 				if (attempt.endedAt === undefined || !isSessionUnavailable(error))
@@ -959,14 +1102,29 @@ export class WorkLaneManager {
 			return { steered: true, clientRef };
 		});
 	}
-	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
+	async #query(
+		runtime: { jobId: string; sessionId: string; cwd: string; opRef: string },
+		tail?: TailHandle,
+	): Promise<PromptStatusBody> {
 		this.#assertNotQuarantined(runtime.jobId);
-		const report = await this.#port.status({
+		const base = {
 			sessionId: runtime.sessionId,
 			repo: runtime.cwd,
 			opRef: runtime.opRef,
-			priority: "background",
-		});
+			priority: "background" as const,
+		};
+		let report: Awaited<ReturnType<SessionPort["status"]>>;
+		if (tail) {
+			try {
+				report = await this.#port.status({ ...base, relay: tail });
+			} catch (error) {
+				if (!isRelayTransportFailure(error)) throw error;
+				// Relay failed; fall back to CLI
+				report = await this.#port.status(base);
+			}
+		} else {
+			report = await this.#port.status(base);
+		}
 		if (
 			report.operationRef !== runtime.opRef ||
 			!report.status ||
@@ -985,6 +1143,7 @@ export class WorkLaneManager {
 			generation: this.#options.brokerGeneration?.() ?? 0,
 			abort: new AbortController(),
 			binding: binding ? { sessionId: binding.sessionId, epoch: binding.epoch } : undefined,
+			...(runtime.turnEndObservedAt ? { turnEndObservedAt: runtime.turnEndObservedAt } : {}),
 		};
 		this.#observers.set(runtime.opRef, observer);
 		return observer;
@@ -1099,8 +1258,22 @@ export class WorkLaneManager {
 				brokerGeneration: observer.generation,
 				repo: runtime.cwd,
 				originKey: runtime.sessionKey,
-				onFrame: () => {
+				onFrame: (frame) => {
 					if (!this.#writeCurrent(observer)) return;
+					if (
+						(frame.kind === "agent_end" || frame.kind === "agent_failed") &&
+						(frame.commandId !== undefined || frame.turnId !== undefined)
+					) {
+						observer.turnEndObservedAt ??= this.#at();
+						const current = this.#db.work.workAttemptGet(runtime.opRef);
+						if (current && current.settledAt === null && current.turnEndObservedAt === undefined)
+							this.#updateAttempt(current.opRef, current.version, {
+								turnEndObservedAt: observer.turnEndObservedAt,
+							});
+						observer.tail?.setTurnRunning(false);
+					} else if (frame.kind === "agent_start") {
+						observer.tail?.setTurnRunning(true);
+					}
 					this.#schedule(observer, 0);
 					this.#touch(observer);
 				},
@@ -1113,7 +1286,7 @@ export class WorkLaneManager {
 			await tail.ready;
 			if (this.#writeCurrent(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt === null) {
 				tail.beginTurn(runtime.opRef);
-				tail.setTurnRunning(true);
+				tail.setTurnRunning(observer.turnEndObservedAt === undefined);
 			}
 		})()
 			.catch(async () => {
@@ -1159,11 +1332,15 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		if (!runtime.terminal) {
+		if (
+			!runtime.terminal ||
+			(runtime.terminal.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined)
+		)
 			this.#attach(observer);
+		if (!runtime.terminal) {
 			let status: PromptStatusBody | undefined;
 			try {
-				status = await this.#query(runtime);
+				status = await this.#query(runtime, observer.tail);
 				observer.goneSince = undefined;
 			} catch (error) {
 				if (!(await this.#hostGone(runtime, error))) {
@@ -1181,6 +1358,13 @@ export class WorkLaneManager {
 			const terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			if (
+				terminal?.reasonCode === "terminal_missing_receipt" &&
+				runtime.turnEndObservedAt === undefined &&
+				observer.turnEndObservedAt === undefined
+			)
+				return;
+			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			runtime =
 				this.#updateAttempt(runtime.opRef, runtime.version, {
 					...(status && provesAcceptance(status)
@@ -1189,9 +1373,19 @@ export class WorkLaneManager {
 								sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
 							}
 						: {}),
+					...(turnEndObservedAt && runtime.turnEndObservedAt === undefined ? { turnEndObservedAt } : {}),
 					...(terminal ? { terminal } : {}),
 				}) ?? runtime;
 			if (!runtime.terminal) return;
+		}
+		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
+			const turnEndObservedAt = observer.turnEndObservedAt;
+			if (!turnEndObservedAt) return;
+			runtime =
+				this.#updateAttempt(runtime.opRef, runtime.version, { turnEndObservedAt }) ??
+				this.#db.work.workAttemptGet(runtime.opRef) ??
+				runtime;
+			if (runtime.turnEndObservedAt === undefined) return;
 		}
 		if (runtime.output.disposition === "pending" && runtime.output.knownSilence) {
 			const silent = this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -1335,6 +1529,35 @@ export class WorkLaneManager {
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
 			}
+			if (endState === "completed") {
+				const checks = facts?.checkStatus;
+				const previousCycle = job.awaitingChecks;
+				if (previousCycle !== undefined) {
+					job = transitionToAwaitingChecks({
+						record: job,
+						at,
+						prNumber: previousCycle.prNumber ?? (facts?.pushed !== false ? (checks?.prNumber ?? null) : null),
+						headSha: facts?.pushed === true && facts.headSha !== undefined ? facts.headSha : previousCycle.headSha,
+					});
+				} else if (facts?.headSha && checks) {
+					job = transitionToAwaitingChecks({
+						record: job,
+						at,
+						prNumber: checks.prNumber,
+						headSha: facts.headSha,
+					});
+				} else if (
+					facts?.headSha &&
+					facts.branch &&
+					facts.branch !== "HEAD" &&
+					facts.pushed !== false &&
+					checks === undefined &&
+					this.#options.checkStatusClient
+				) {
+					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
+				}
+			}
+			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
 			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
@@ -1452,6 +1675,211 @@ export class WorkLaneManager {
 	#finishWaiters(opRef: string): void {
 		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
+	/**
+	 * Drives every awaiting_checks lane one step (#481): red re-steers the lane
+	 * (bounded), green settles it done, a third red settles it failed, and a
+	 * timeout, closed PR or moved HEAD settles it with that reason. Checks that
+	 * are temporarily unavailable keep it waiting.
+	 */
+	async #pollAwaitingChecks(): Promise<void> {
+		const client = this.#options.checkStatusClient;
+		if (this.#stopped || !client) return;
+		const rows = this.#db.work
+			.laneJobRows()
+			.filter((row) => row.state === "awaiting_checks" && row.lane_key.startsWith("work-"));
+		for (let offset = 0; offset < rows.length && !this.#stopped; offset += AWAITING_CHECKS_POLL_CONCURRENCY) {
+			const batch = rows.slice(offset, offset + AWAITING_CHECKS_POLL_CONCURRENCY);
+			await Promise.all(
+				batch.map(async (row) => {
+					try {
+						await this.#pollLaneChecks(row.lane_key.slice("work-".length), client);
+					} catch (error) {
+						console.error(`awaiting_checks_poll_error jobId=${row.job_id} reason=${failureReason(error)}`);
+					}
+				}),
+			);
+		}
+	}
+	async #pollLaneChecks(name: string, client: CheckStatusClient): Promise<void> {
+		const observed = this.#job(name);
+		const cycle = observed?.awaitingChecks;
+		if (observed?.state !== "awaiting_checks" || !cycle) return;
+		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true, true);
+		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
+			if (this.#stopped) return undefined;
+			let job = this.#job(name);
+			// Another writer moved the lane on while the checks were read.
+			const currentCycle = job?.awaitingChecks;
+			if (
+				!job ||
+				job.state !== "awaiting_checks" ||
+				!currentCycle ||
+				currentCycle.since !== cycle.since ||
+				currentCycle.prNumber !== cycle.prNumber ||
+				currentCycle.headSha !== cycle.headSha ||
+				currentCycle.retries !== cycle.retries
+			)
+				return undefined;
+			if (currentCycle.prNumber === null && facts?.checkStatus) {
+				job = transitionToAwaitingChecks({
+					record: job,
+					at: this.#at(),
+					prNumber: facts.checkStatus.prNumber,
+					headSha: currentCycle.headSha,
+				});
+				this.#putJob(name, job);
+			}
+			const activeCycle = job.awaitingChecks!;
+			const outcome = checksOutcome(activeCycle, facts, this.#now());
+			if (outcome.kind === "wait") return undefined;
+			if (outcome.kind === "red") {
+				if (activeCycle.prNumber === null) return undefined;
+				if (activeCycle.retries < AWAITING_CHECKS_RETRY_LIMIT) {
+					await this.#resteerRedChecks(name, job, outcome.failingChecks, outcome.failureLogTail);
+					return undefined;
+				}
+				return this.#settleChecks(
+					name,
+					job,
+					{
+						kind: "failed",
+						reason: `checks=red(${outcome.failingChecks.join(",")}) after ${activeCycle.retries} re-steers`,
+					},
+					facts,
+				);
+			}
+			return this.#settleChecks(name, job, outcome, facts);
+		});
+		if (!effects) return;
+		if (effects.fallback) {
+			try {
+				this.#options.deliverFallback?.(effects.fallback);
+			} catch {
+				console.error(`work_fallback_delivery_failed deliveryId=${effects.fallback.deliveryId}`);
+			}
+		}
+		if (effects.persona) {
+			try {
+				this.#options.notifyPersona?.(effects.persona);
+			} catch {
+				console.error(`work_persona_nudge_failed origin=${effects.persona}`);
+			}
+		}
+		if (effects.laneParent) await this.#drainLaneReports(effects.laneParent);
+	}
+	/** Spends one retry, then continues the lane's session with the failing check names. */
+	async #resteerRedChecks(
+		name: string,
+		job: LaneJobRecord,
+		failingChecks: readonly string[],
+		failureLogTail?: string,
+	): Promise<void> {
+		const cycle = job.awaitingChecks!;
+		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
+		const counted = recordChecksRetry(job, this.#at());
+		this.#putJob(name, counted);
+		const retries = counted.awaitingChecks!.retries;
+		const names = failingChecks.length > 0 ? failingChecks.join(", ") : "unnamed checks";
+		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 3_200)}` : "";
+		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
+		const last = job.attempts.at(-1);
+		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		try {
+			await this.#startLocked({ name, text, cwd: job.lane.worktreePath, resume: false }, "start", {
+				parent,
+				checksRetry: true,
+			});
+			console.error(`awaiting_checks_resteered jobId=${job.jobId} pr=${cycle.prNumber} retry=${retries}`);
+		} catch (error) {
+			// The retry stays spent, so a lane that cannot be re-steered still reaches its bound.
+			console.error(`awaiting_checks_resteer_failed jobId=${job.jobId} reason=${failureReason(error)}`);
+		}
+	}
+	/** Settles the checks cycle and admits the outcome report to the lane's parent in one transaction. */
+	#settleChecks(
+		name: string,
+		job: LaneJobRecord,
+		outcome: ChecksSettlement,
+		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+	): ChecksReportEffects {
+		const cycle = job.awaitingChecks!;
+		const at = this.#at();
+		const settled = settleAwaitingChecks(job, at, outcome);
+		const last = job.attempts.at(-1);
+		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const text = checksReportText(name, cycle, outcome, facts);
+		const reportRef = newOpRef(`checks-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
+		const deliveryId = workAttemptDeliveryId(this.#db.instanceId, job.jobId, reportRef);
+		const effects = this.#db.transaction((tx): ChecksReportEffects => {
+			this.#putJob(name, settled, tx);
+			if (parent?.kind === "persona") {
+				const refused =
+					Boolean(this.#options.personaHold?.(parent.originKey)) ||
+					this.#db.bindings.getSessionRecord(parent.originKey) === undefined;
+				if (!refused) {
+					workAssert(
+						this.#db.inbox.enqueue(tx, {
+							messageId: reportId,
+							originKey: parent.originKey,
+							originRefJson: resolveLaneReportOrigin(parent, JSON.stringify(parent.origin)),
+							body: text,
+							receivedAt: at,
+							source: "lane_report",
+						}),
+					);
+					return { persona: parent.originKey };
+				}
+				return { fallback: this.#enqueueFallback(tx, reportRef, parent.origin, text, deliveryId) };
+			}
+			if (parent?.kind === "lane") {
+				if (this.#db.work.laneParentAvailable(parent.name)) {
+					this.#db.work.laneReportInsert(
+						tx,
+						{
+							reportId,
+							parentName: parent.name,
+							childName: name,
+							childOpRef: reportRef,
+							body: text,
+							root: parent.root,
+						},
+						at,
+					);
+					return { laneParent: parent.name };
+				}
+				if (parent.root)
+					return { fallback: this.#enqueueFallback(tx, reportRef, parent.root.origin, text, deliveryId) };
+			}
+			return {};
+		});
+		console.error(
+			`awaiting_checks_settled jobId=${job.jobId} pr=${cycle.prNumber} outcome=${outcome.kind}${outcome.kind === "passed" ? "" : ` reason=${outcome.reason}`}`,
+		);
+		return effects;
+	}
+	#enqueueFallback(
+		tx: WriteTx,
+		turnId: string,
+		origin: OriginRef,
+		text: string,
+		deliveryId: string,
+	): ChatMessagePayload {
+		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId)!;
+		this.#db.outbox.enqueue(tx, {
+			deliveryId,
+			turnId,
+			originKey: originKey(origin),
+			payloadJson: JSON.stringify(payload),
+		});
+		return payload;
+	}
+	#putJob(name: string, job: LaneJobRecord, tx?: WriteTx): void {
+		const write = (inner: WriteTx) =>
+			this.#db.work.putLaneJob(inner, { ...job, laneKey: laneJobIdentity(name).laneKey, json: JSON.stringify(job) });
+		if (tx) write(tx);
+		else this.#db.transaction(write);
+	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;
 		await this.#port.runExclusive(workSessionKey(parentName), async () => {
@@ -1494,6 +1922,15 @@ export class WorkLaneManager {
 							continue;
 						this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_open");
 						row = this.#db.work.laneReportGet(row.report_id)!;
+					} else if (job.state === "awaiting_checks" || job.state === "done") {
+						if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!)))
+							continue;
+						this.#logLaneReportTransition(row, "claimed", "pending", "wake_parent_parked");
+						this.#fallbackLaneReport(
+							this.#db.work.laneReportGet(row.report_id)!,
+							job.state === "done" ? "parent_done" : "parent_awaiting_checks",
+						);
+						continue;
 					} else {
 						await this.#wakeLaneReport(row, job);
 						try {
@@ -1510,6 +1947,10 @@ export class WorkLaneManager {
 					continue;
 				}
 				if (row.state !== "pending") continue;
+				if (job.state === "aborted") {
+					this.#fallbackLaneReport(row, "parent_aborted");
+					continue;
+				}
 				const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
 				if (open) {
 					const runtime = this.#attemptByOpRef(open.opRef);
@@ -1519,6 +1960,10 @@ export class WorkLaneManager {
 				}
 				if (job.state === "awaiting_operator" || job.state === "stalled") {
 					this.#fallbackLaneReport(row, "parent_held");
+					continue;
+				}
+				if (job.state === "awaiting_checks" || job.state === "done") {
+					this.#fallbackLaneReport(row, job.state === "done" ? "parent_done" : "parent_awaiting_checks");
 					continue;
 				}
 				await this.#wakeLaneReport(row, job);
@@ -1707,8 +2152,14 @@ export class WorkLaneManager {
 		if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, opRef))) return;
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
-		if (parentJob && (parentJob.state === "awaiting_operator" || parentJob.state === "stalled"))
+		if (parentJob?.state === "awaiting_operator" || parentJob?.state === "stalled") {
 			this.#fallbackLaneReport(this.#db.work.laneReportGet(row.report_id)!, "parent_held");
+		} else if (parentJob?.state === "awaiting_checks" || parentJob?.state === "done") {
+			this.#fallbackLaneReport(
+				this.#db.work.laneReportGet(row.report_id)!,
+				parentJob.state === "done" ? "parent_done" : "parent_awaiting_checks",
+			);
+		}
 	}
 
 	/** Registers recovery work, never waits for a worker's terminal transition. */
@@ -1792,14 +2243,16 @@ export class WorkLaneManager {
 				let status: PromptStatusBody | undefined;
 				let statusError: unknown;
 				try {
-					status = await this.#query(runtime);
+					status = await this.#query(runtime, observer.tail);
 				} catch (error) {
 					/* Liveness decides whether authority can be recovered. */
 					statusError = error;
 				}
 				if (!this.#current(observer)) continue;
 				const terminal = status && terminalEvidence(status, this.#at());
-				if (terminal && this.#writeCurrent(observer)) {
+				const terminalStillRunning =
+					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+				if (terminal && !terminalStillRunning && this.#writeCurrent(observer)) {
 					this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(provesAcceptance(status!)
 							? {
@@ -1820,6 +2273,11 @@ export class WorkLaneManager {
 				}
 				if (!this.#current(observer)) continue;
 				if (live.live === true && !live.disowned && this.#binding(runtime)) {
+					this.#attach(observer);
+					this.#schedule(observer, 0);
+					continue;
+				}
+				if (terminalStillRunning && live.live === undefined && !live.disowned && this.#binding(runtime)) {
 					this.#attach(observer);
 					this.#schedule(observer, 0);
 					continue;
@@ -1860,6 +2318,7 @@ export class WorkLaneManager {
 			if (this.#stopped) return;
 			await this.#drainLaneReports(parentName);
 		}
+		if (!this.#stopped) await this.#pollAwaitingChecks();
 	}
 	onBrokerGeneration(): Promise<void> {
 		if (this.#generationRecovery) return this.#generationRecovery;
@@ -2054,12 +2513,25 @@ function parseInput(params: unknown): WorkInput {
 	let repo: string | undefined;
 	if (input.repo !== undefined) {
 		if (typeof input.repo !== "string" || !input.repo) invalid("repo");
-		// repo must be a local git repository path; only local file paths are accepted
+		if (!isAbsolute(input.repo) && !isGitRemoteUrl(input.repo)) invalid("repo");
+		if (isGitRemoteUrl(input.repo)) {
+			let url: URL | undefined;
+			try {
+				url = new URL(input.repo);
+			} catch {
+				// SCP-style SSH remotes do not use URL userinfo parsing.
+			}
+			if (url && (url.password || (["https:", "git:"].includes(url.protocol) && url.username))) invalid("repo");
+		}
 		repo = input.repo;
 	}
 	let base: string | undefined;
 	if (input.base !== undefined) {
 		if (typeof input.base !== "string" || !input.base) invalid("base");
+		if (repo === undefined)
+			throw new ProtocolError("invalid_params", "base requires a repository binding", {
+				reasonCode: "base_requires_repo",
+			});
 		// base can be a branch name, tag, or commit SHA
 		base = input.base;
 	}
@@ -2087,7 +2559,7 @@ function parseInput(params: unknown): WorkInput {
 	return {
 		name,
 		text: input.text,
-		cwd: (input.cwd as string) ?? process.cwd(),
+		...(input.cwd === undefined ? {} : { cwd: input.cwd as string }),
 		...(repo === undefined ? {} : { repo }),
 		...(base === undefined ? {} : { base }),
 		resume: input.resume === true,
@@ -2109,6 +2581,76 @@ function workError(
 		...(clientRef ? { clientRef } : {}),
 	});
 }
+
+type WorkBindFailureCause = "broker_unavailable" | "timeout" | "cwd_rejected" | "epoch_conflict" | "unknown";
+
+function workBindFailureCause(error: unknown): WorkBindFailureCause {
+	const message = error instanceof Error ? error.message : String(error);
+	if (
+		/\b(?:timed out|timeout)\b/i.test(message) ||
+		/\bdid not complete within \d+ms\b/i.test(message) ||
+		/\bwas created but never became live\b/.test(message)
+	)
+		return "timeout";
+	// BrokerSessionPort's SDK sanitizer can drop GjcCliUnavailableError.code while
+	// retaining this stable prefix on the plain Error it returns.
+	if (/^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(message)) return "broker_unavailable";
+	if (error instanceof BrokerAuthorityError) {
+		if (error.code === "unowned_session") return "cwd_rejected";
+		if (error.code === "authority_mismatch" || error.code === "cutover_required") return "epoch_conflict";
+	}
+	const detail = error instanceof ProtocolError ? workBindErrorRecord(error.detail) : undefined;
+	const sdkCode = error instanceof GjcCliError ? envelopeErrorCode(error.details) : undefined;
+	const record = workBindErrorRecord(error);
+	for (const code of [
+		detail?.cause,
+		detail?.reasonCode,
+		detail?.code,
+		error instanceof ProtocolError ? error.code : undefined,
+		sdkCode,
+		record?.code,
+	]) {
+		const cause = workBindFailureCauseFromCode(code);
+		if (cause) return cause;
+	}
+	if (/^session bind for .+ epoch \d+ lost to (?:epoch \d+|a concurrent durable epoch change)$/.test(message))
+		return "epoch_conflict";
+	return "unknown";
+}
+
+function workBindFailureCauseFromCode(value: unknown): WorkBindFailureCause | undefined {
+	if (typeof value !== "string") return undefined;
+	switch (value) {
+		case "broker_unavailable":
+		case "unavailable":
+		case "session_unavailable":
+		case "endpoint_stale":
+		case "not_found":
+			return "broker_unavailable";
+		case "timeout":
+			return "timeout";
+		case "unowned_session":
+		case "managed_append_identity_mismatch":
+			return "cwd_rejected";
+		case "authority_mismatch":
+		case "cutover_required":
+			return "epoch_conflict";
+		default:
+			return undefined;
+	}
+}
+
+function workBindErrorRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function workBindFailureMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return sanitizeDiagnostic(message).replace(/\s+/gu, " ").slice(0, 200) || "unknown";
+}
+
 /** Bounded, secret-free error class and message for a log line. */
 function failureReason(error: unknown): string {
 	const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
@@ -2266,7 +2808,16 @@ export function reportText(
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
 ): string {
-	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
+	const checks = facts?.checkStatus;
+	const checksVerified =
+		!facts ||
+		checks === null ||
+		(checks?.status === "green" &&
+			facts.pushed === true &&
+			facts.remoteHeadSha === facts.headSha &&
+			checks.headSha === facts.remoteHeadSha);
+	const label =
+		endState === "completed" && checksVerified ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
@@ -2288,47 +2839,183 @@ export function reportText(
 		body = parts.join(" ");
 	}
 
-	// Append repository facts if available
+	// Reserve the suffix for repository facts so large output excerpts cannot hide check evidence.
 	const factsLines: string[] = [];
 	if (facts?.headSha) {
 		factsLines.push(`head=${facts.headSha.slice(0, 12)}`);
 	}
 	if (facts?.pushed !== undefined) {
-		factsLines.push(`pushed=${facts.pushed}`);
+		factsLines.push(`pushed=${facts.pushed === null ? "unknown" : facts.pushed}`);
+	}
+	if (facts?.remoteHeadSha) {
+		factsLines.push(`remoteHead=${facts.remoteHeadSha.slice(0, 12)}`);
 	}
 	if (facts?.checkStatus) {
-		const checks = facts.checkStatus;
-		factsLines.push(`pr=${checks.prNumber}`);
+		const checkStatus = facts.checkStatus;
+		factsLines.push(`pr=${checkStatus.prNumber}`);
 		const checkStr =
-			checks.status === "green"
+			checkStatus.status === "green"
 				? "checks=green"
-				: checks.status === "red"
-					? `checks=red(${checks.failingChecks.slice(0, 3).join(",")})`
+				: checkStatus.status === "red"
+					? `checks=red(${checkStatus.failingChecks
+							.slice(0, 3)
+							.map((name) => utf8Prefix(name, 96))
+							.join(",")})`
 					: "checks=pending";
 		factsLines.push(checkStr);
+		factsLines.push(`prHead=${checkStatus.headSha.slice(0, 12)}`);
 	}
-
-	if (factsLines.length > 0 && body) {
-		body = body + " " + factsLines.join(" ");
-	} else if (factsLines.length > 0) {
-		body = factsLines.join(" ");
-	}
-
-	const content = utf8Prefix(body, 2048 - Buffer.byteLength(head, "utf8"));
-	const text = head + content;
+	const factsText = factsLines.join(" ");
+	const factsSuffix = factsText ? ` ${factsText}` : "";
+	const bodyBudget = Math.max(0, 2048 - Buffer.byteLength(head, "utf8") - Buffer.byteLength(factsSuffix, "utf8"));
+	const content = utf8Prefix(body, bodyBudget);
+	const text = head + content + factsSuffix;
 	if (Buffer.byteLength(text, "utf8") > 2048) throw new Error("lane report exceeded its UTF-8 byte budget");
 	return text;
 }
+type ChecksOutcome =
+	| { readonly kind: "wait" }
+	| { readonly kind: "red"; readonly failingChecks: readonly string[]; readonly failureLogTail?: string }
+	| { readonly kind: "passed" }
+	| { readonly kind: "ended"; readonly reason: string };
+
+/** What one checks observation means for an awaiting_checks cycle; evidence beats the deadline. */
+function checksOutcome(
+	cycle: AwaitingChecks,
+	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+	now: number,
+): ChecksOutcome {
+	const checks = facts?.checkStatus;
+	if (
+		checks?.prState === "closed" &&
+		checks.merged &&
+		checks.headSha === cycle.headSha &&
+		(cycle.prNumber === null || checks.prNumber === cycle.prNumber)
+	)
+		return { kind: "passed" };
+	if (facts?.headSha && facts.headSha !== cycle.headSha)
+		return { kind: "ended", reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.headSha.slice(0, 12)}` };
+	if (facts?.remoteHeadSha && facts.remoteHeadSha !== cycle.headSha)
+		return {
+			kind: "ended",
+			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
+		};
+	if (cycle.prNumber === null) {
+		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
+		if (checks?.prState === "closed") {
+			if (checks.merged)
+				return {
+					kind: "ended",
+					reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
+				};
+			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
+		}
+		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
+		if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+			return { kind: "wait" };
+		}
+		if (checks?.status === "green") return { kind: "passed" };
+		if (checks?.status === "red")
+			return {
+				kind: "red",
+				failingChecks: checks.failingChecks,
+				...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
+			};
+		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+		return { kind: "wait" };
+	}
+	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
+	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
+		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	if (checks?.prState === "closed") {
+		if (checks.merged)
+			return {
+				kind: "ended",
+				reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${checks.headSha.slice(0, 12)}`,
+			};
+		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	}
+	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
+	if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+		return { kind: "wait" };
+	}
+	if (checks?.status === "green") return { kind: "passed" };
+	if (checks?.status === "red")
+		return {
+			kind: "red",
+			failingChecks: checks.failingChecks,
+			...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
+		};
+	// Pending, or unavailable (lookup failed): keep waiting until the deadline.
+	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+	return { kind: "wait" };
+}
+
+function checksHeadNotCurrent(
+	cycle: AwaitingChecks,
+	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+	now: number,
+): ChecksOutcome {
+	if (facts?.remoteHeadSha && facts.remoteHeadSha !== cycle.headSha)
+		return {
+			kind: "ended",
+			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
+		};
+	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
+		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
+	return { kind: "wait" };
+}
+
+interface ChecksReportEffects {
+	readonly fallback?: ChatMessagePayload;
+	readonly persona?: string;
+	readonly laneParent?: string;
+}
+
+/** The parent's report for a concluded checks cycle. */
+function checksReportText(
+	name: string,
+	cycle: AwaitingChecks,
+	outcome: ChecksSettlement,
+	facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+): string {
+	const lead =
+		outcome.kind === "passed"
+			? `[lane ${name}] checks passed:`
+			: `[lane ${name}] ${outcome.kind === "failed" ? "failed" : "attempt_ended"}: awaiting_checks ${outcome.reason}`;
+	const checks = outcome.kind === "passed" ? " checks=green" : "";
+	const observedFacts = [
+		`head=${cycle.headSha.slice(0, 12)}`,
+		`pr=${cycle.prNumber ?? "unknown"}${checks}`,
+		`prHead=${facts?.checkStatus?.headSha.slice(0, 12) ?? "unknown"}`,
+		...(facts?.remoteHeadSha ? [`remoteHead=${facts.remoteHeadSha.slice(0, 12)}`] : []),
+	].join(" ");
+	const suffix = ` ${observedFacts}`;
+	return utf8Prefix(lead, 2048 - Buffer.byteLength(suffix, "utf8")) + suffix;
+}
+
 async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
+	includePushStatus = true,
+	checkWhenUnpushed = false,
 ): Promise<
 	| {
 			headSha?: string;
 			dirtyFiles: number;
 			branch?: string;
-			pushed?: boolean;
-			checkStatus?: CheckStatusSnapshot;
+			/** true/false when known; null when remote probes were unavailable. */
+			pushed?: boolean | null;
+			/** Known branch head shared by every configured push URL. */
+			remoteHeadSha?: string;
+			/** null: no open PR for the branch; absent: not pushed, no client, or the lookup failed. */
+			checkStatus?: CheckStatusSnapshot | null;
 	  }
 	| undefined
 > {
@@ -2354,19 +3041,44 @@ async function collectRepoFacts(
 				.filter((line) => line.trim()).length,
 			branch: branchName,
 		};
+		const checksBeforeRemoteProbe =
+			checkWhenUnpushed && branchName && branchName !== "HEAD" && checkClient
+				? await checkClient.getCheckStatus(branchName, worktreePath)
+				: undefined;
 
-		// Check if HEAD is pushed to origin/<branch>
-		if (branchName && branchName !== "HEAD") {
-			const upstream = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", `origin/${branchName}`], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			result.pushed = upstream.exitCode === 0 && upstream.stdout.toString().trim() === headSha;
+		// Bare clones do not create remote-tracking refs, so verify every configured push URL directly.
+		if (includePushStatus && branchName && branchName !== "HEAD") {
+			const pushUrlsResult = Bun.spawnSync(
+				["git", "-C", worktreePath, "remote", "get-url", "--push", "--all", "origin"],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			const pushUrls = pushUrlsResult.stdout
+				.toString()
+				.split(/\r?\n/)
+				.map((url) => url.trim())
+				.filter(Boolean);
+			if (pushUrlsResult.exitCode !== 0) {
+				result.pushed = null;
+			} else if (pushUrls.length === 0) {
+				result.pushed = false;
+			} else {
+				const upstreamHeads = await Promise.all(pushUrls.map((url) => remoteBranchSha(url, branchName)));
+				if (upstreamHeads.some((probe) => probe.kind === "missing")) result.pushed = false;
+				else if (upstreamHeads.some((probe) => probe.kind === "unknown")) result.pushed = null;
+				else {
+					const shas = upstreamHeads.map((probe) => (probe.kind === "found" ? probe.sha : undefined));
+					if (shas.every((sha) => sha !== undefined && sha === shas[0])) result.remoteHeadSha = shas[0];
+					result.pushed = shas.every((sha) => sha === headSha);
+				}
+			}
 
-			// Try to get PR number and check status via check client
-			if (result.pushed && checkClient) {
-				const checkStatus = await checkClient.getCheckStatus(branchName, worktreePath);
-				if (checkStatus) result.checkStatus = checkStatus;
+			// Query even when the source ref is absent: GitHub retains merged PRs after branch deletion.
+			if (checkClient) {
+				const checkStatus =
+					checksBeforeRemoteProbe !== undefined
+						? checksBeforeRemoteProbe
+						: await checkClient.getCheckStatus(branchName, worktreePath);
+				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
 		}
 
@@ -2376,122 +3088,510 @@ async function collectRepoFacts(
 	}
 }
 
-/**
- * Creates a git worktree from a local git repository for a work lane.
- * Stores the worktree in <laneRoot>/lanes/<laneName>.
- * The lane is created on a new branch work/<laneName> from the specified base,
- * or from the remote default branch if no base is specified.
- * @param repo Local filesystem path to a git repository (required)
- * @throws ProtocolError if repo is not a git repository or worktree creation fails
- */
+type RemoteBranchProbe =
+	| { readonly kind: "found"; readonly sha: string }
+	| { readonly kind: "missing" }
+	| { readonly kind: "unknown" };
+
+async function remoteBranchSha(remoteUrl: string, branchName: string): Promise<RemoteBranchProbe> {
+	try {
+		const child = Bun.spawn(["git", "ls-remote", "--exit-code", "--heads", remoteUrl, `refs/heads/${branchName}`], {
+			stdout: "pipe",
+			stderr: "ignore",
+			signal: AbortSignal.timeout(REMOTE_REF_PROBE_TIMEOUT_MS),
+		});
+		const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+		const [sha, ref] = output.trim().split(/\s+/, 2);
+		if (exitCode === 2 && output.trim() === "") return { kind: "missing" };
+		if (exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? ""))
+			return { kind: "found", sha: sha! };
+		return { kind: "unknown" };
+	} catch {
+		return { kind: "unknown" };
+	}
+}
+
+type CreatedRepoWorktree = {
+	readonly worktreePath: string;
+	readonly repositoryPath: string;
+	readonly baseSha: string;
+};
+
+function isGitRemoteUrl(value: string): boolean {
+	try {
+		const url = new URL(value);
+		return ["file:", "git:", "https:", "ssh:"].includes(url.protocol) && (url.protocol === "file:" || !!url.hostname);
+	} catch {
+		return /^[^/@\s]+@[^:/\s]+:.+/.test(value);
+	}
+}
+
+function resolveLocalRemoteUrl(sourceRepository: string, remoteUrl: string): string {
+	const windowsDrivePath = /^[A-Za-z]:/.test(remoteUrl);
+	const windowsAbsolutePath = /^[A-Za-z]:[\\/]/.test(remoteUrl) || remoteUrl.startsWith("\\\\");
+	const transportUrl = !windowsDrivePath && /^[A-Za-z][A-Za-z\d+.-]*:/.test(remoteUrl);
+	const scpLikeUrl = !windowsDrivePath && /^(?:[^/@:\s]+@)?[^/:\\\s]+:.+/.test(remoteUrl);
+	if (isAbsolute(remoteUrl) || windowsAbsolutePath || transportUrl || scpLikeUrl) return remoteUrl;
+	return resolve(sourceRepository, remoteUrl);
+}
+
+function canonicalPathIncludingMissing(target: string): string {
+	let current = resolve(target);
+	const missing: string[] = [];
+	while (true) {
+		try {
+			return resolve(realpathSync(current), ...missing.reverse());
+		} catch (error) {
+			let pathIsMissing = false;
+			try {
+				lstatSync(current);
+			} catch (lstatError) {
+				const code =
+					typeof lstatError === "object" && lstatError !== null && "code" in lstatError ? lstatError.code : undefined;
+				if (code !== "ENOENT" && code !== "ENOTDIR") throw lstatError;
+				pathIsMissing = true;
+			}
+			if (!pathIsMissing) throw error;
+			const parent = dirname(current);
+			if (parent === current) throw error;
+			missing.push(basename(current));
+			current = parent;
+		}
+	}
+}
+
+async function pathExists(path: string): Promise<boolean> {
+	const { lstat } = await import("node:fs/promises");
+	try {
+		await lstat(path);
+		return true;
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+/** Creates an isolated bare repository and worktree whose origin is the bound repository. */
 async function createWorktreeFromRepo(
 	laneRoot: string,
+	serviceDirectory: string,
 	laneName: string,
 	repo: string,
 	base?: string,
-): Promise<string> {
-	try {
-		// Validate that repo is a git repository
-		const gitCheckResult = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--git-dir"], {
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+): Promise<CreatedRepoWorktree> {
+	const absoluteLaneRoot = resolve(laneRoot);
+	const lanesDir = join(absoluteLaneRoot, "lanes");
+	const worktreePath = managedLaneWorktreePath(absoluteLaneRoot, laneName);
+	const isRemote = isGitRemoteUrl(repo);
+	let sourceRepository = repo;
+	let sourceHasOrigin = false;
+	const repositoryPath = managedLaneRepositoryPath(absoluteLaneRoot, laneName);
+	assertOutsideServiceDirectory(serviceDirectory, worktreePath, laneName);
+	assertOutsideServiceDirectory(serviceDirectory, repositoryPath, laneName);
+	const { mkdir, rm } = await import("node:fs/promises");
+	let ownsRepositoryPath = false;
+	let ownsWorktreePath = false;
+	let worktreeAddAttempted = false;
+	let defaultRef: string | undefined;
 
-		if (gitCheckResult.exitCode !== 0) {
-			const stderr = gitCheckResult.stderr?.toString().trim() || "not a git repository";
-			throw new ProtocolError("invalid_params", `repo must be a local git repository: ${stderr}`, {
-				reasonCode: "repo_not_git",
-				repo,
-				stderr,
+	try {
+		await mkdir(lanesDir, { recursive: true });
+		try {
+			await mkdir(worktreePath);
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+			if (code !== "EEXIST") throw error;
+			throw new ProtocolError("invalid_params", "lane worktree path already exists", {
+				reasonCode: "lane_worktree_path_exists",
+				name: laneName,
 			});
 		}
+		ownsWorktreePath = true;
 
-		// Create lane root structure
-		const { mkdir, rm } = await import("node:fs/promises");
-		const lanesDir = join(laneRoot, "lanes");
-		await mkdir(lanesDir, { recursive: true });
-
-		// Path for this lane's worktree
-		const worktreePath = join(lanesDir, laneName);
-
-		// Determine the base ref to use
-		let baseRef = base;
-		if (!baseRef) {
-			// Try to determine the default branch from the bare/regular repo
-			const symrefResult = Bun.spawnSync(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], {
+		if (!isRemote) {
+			const gitCheckResult = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--git-dir"], {
+				stdout: "ignore",
+				stderr: "pipe",
+			});
+			if (gitCheckResult.exitCode !== 0) {
+				const stderr = gitCheckResult.stderr?.toString().trim() || "not a git repository";
+				throw new ProtocolError("invalid_params", `repo must be a local git repository: ${stderr}`, {
+					reasonCode: "repo_not_git",
+					repo,
+					stderr,
+				});
+			}
+			const sourceRoot = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--show-toplevel"], {
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			sourceRepository = sourceRoot.exitCode === 0 ? resolve(sourceRoot.stdout.toString().trim()) : resolve(repo);
+			const remoteHead = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], {
 				stdout: "pipe",
 				stderr: "pipe",
-				cwd: repo,
+				cwd: sourceRepository,
 			});
-
-			if (symrefResult.exitCode === 0) {
-				const output = symrefResult.stdout?.toString().trim() || "";
-				const match = output.match(/refs\/remotes\/origin\/(.*)/);
-				if (match?.[1]) {
-					baseRef = match[1];
-				}
+			if (remoteHead.exitCode === 0) {
+				const match = remoteHead.stdout
+					?.toString()
+					.trim()
+					.match(/^refs\/remotes\/origin\/(.+)$/);
+				if (match?.[1]) defaultRef = match[1];
 			}
-
-			// For bare repositories, check HEAD directly
-			if (!baseRef) {
-				const headResult = Bun.spawnSync(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+			if (!defaultRef) {
+				const head = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
 					stdout: "pipe",
 					stderr: "pipe",
-					cwd: repo,
+					cwd: sourceRepository,
 				});
-
-				if (headResult.exitCode === 0) {
-					const head = headResult.stdout?.toString().trim();
-					if (head && head !== "HEAD") {
-						baseRef = head;
-					}
-				}
-			}
-
-			// Fallback to common default branch names
-			if (!baseRef) {
-				for (const defaultBranch of ["main", "master", "trunk"]) {
-					const checkResult = Bun.spawnSync(["git", "rev-parse", `--verify=${defaultBranch}`], {
-						stdout: "ignore",
-						stderr: "ignore",
-						cwd: repo,
-					});
-
-					if (checkResult.exitCode === 0) {
-						baseRef = defaultBranch;
-						break;
-					}
-				}
+				if (head.exitCode === 0) defaultRef = head.stdout?.toString().trim() || undefined;
 			}
 		}
-
-		if (!baseRef) {
-			throw new Error("could not determine default branch from repository");
+		await mkdir(dirname(repositoryPath), { recursive: true });
+		try {
+			await mkdir(repositoryPath);
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+			if (code !== "EEXIST") throw error;
+			throw new ProtocolError("invalid_params", "lane repository path already exists", {
+				reasonCode: "lane_repository_path_exists",
+				name: laneName,
+			});
 		}
-
-		// Create the worktree with git worktree add from the bound repo
-		const addResult = Bun.spawnSync(
-			["git", "worktree", "add", "-b", `work/${laneName.toLowerCase()}`, worktreePath, baseRef],
-			{
+		ownsRepositoryPath = true;
+		const cloneArgs = ["git", "clone", "--bare", "--", sourceRepository, repositoryPath];
+		let cloneExitCode: number;
+		let cloneStderr: string;
+		try {
+			if (isRemote) {
+				const clone = Bun.spawn(cloneArgs, {
+					stdout: "pipe",
+					stderr: "pipe",
+					signal: AbortSignal.timeout(REMOTE_REPO_CLONE_TIMEOUT_MS),
+				});
+				const [exitCode, , stderr] = await Promise.all([
+					clone.exited,
+					new Response(clone.stdout).arrayBuffer(),
+					new Response(clone.stderr).text(),
+				]);
+				cloneExitCode = exitCode;
+				cloneStderr = stderr.trim();
+			} else {
+				const clone = Bun.spawnSync(cloneArgs, { stdout: "pipe", stderr: "pipe" });
+				cloneExitCode = clone.exitCode;
+				cloneStderr = clone.stderr?.toString().trim() ?? "";
+			}
+		} catch (error) {
+			const stderr = error instanceof Error ? error.message : String(error);
+			throw new ProtocolError("invalid_params", `failed to clone lane repository: ${stderr || "unknown error"}`, {
+				reasonCode: "repo_clone_failed",
+				repo,
+			});
+		}
+		if (cloneExitCode !== 0) {
+			const stderr = cloneStderr || "unknown error";
+			throw new ProtocolError("invalid_params", `failed to clone lane repository: ${stderr}`, {
+				reasonCode: "repo_clone_failed",
+				repo,
+			});
+		}
+		if (!isRemote) {
+			// Cloning a local checkout makes that path origin; retain its configured upstream URLs instead.
+			const sourceFetchUrls = Bun.spawnSync(["git", "-C", sourceRepository, "remote", "get-url", "--all", "origin"], {
 				stdout: "pipe",
 				stderr: "pipe",
-				cwd: repo,
-			},
-		);
-
-		if (addResult.exitCode === 0) {
-			return worktreePath;
+			});
+			if (sourceFetchUrls.exitCode === 0) {
+				const fetchUrls = sourceFetchUrls.stdout
+					.toString()
+					.split(/\r?\n/)
+					.map((url) => url.trim())
+					.filter(Boolean)
+					.map((url) => resolveLocalRemoteUrl(sourceRepository, url));
+				sourceHasOrigin = fetchUrls.length > 0;
+				for (const [index, fetchUrl] of fetchUrls.entries()) {
+					const setFetchUrl = Bun.spawnSync(
+						index === 0
+							? ["git", "remote", "set-url", "origin", fetchUrl]
+							: ["git", "remote", "set-url", "--add", "origin", fetchUrl],
+						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					);
+					if (setFetchUrl.exitCode !== 0) {
+						throw new ProtocolError("invalid_params", "failed to preserve repository fetch remote", {
+							reasonCode: "repo_fetch_remote_failed",
+							repo,
+						});
+					}
+				}
+			}
+			const sourcePushUrls = Bun.spawnSync(
+				["git", "-C", sourceRepository, "remote", "get-url", "--push", "--all", "origin"],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			if (sourcePushUrls.exitCode === 0) {
+				for (const pushUrl of sourcePushUrls.stdout
+					.toString()
+					.split(/\r?\n/)
+					.map((url) => url.trim())
+					.filter(Boolean)
+					.map((url) => resolveLocalRemoteUrl(sourceRepository, url))) {
+					const setPushUrl = Bun.spawnSync(["git", "remote", "set-url", "--add", "--push", "origin", pushUrl], {
+						stdout: "pipe",
+						stderr: "pipe",
+						cwd: repositoryPath,
+					});
+					if (setPushUrl.exitCode !== 0) {
+						throw new ProtocolError("invalid_params", "failed to preserve repository push remote", {
+							reasonCode: "repo_push_remote_failed",
+							repo,
+						});
+					}
+				}
+			}
+		}
+		const fetchRefspec = "+refs/heads/*:refs/remotes/origin/*";
+		const configureFetch = Bun.spawnSync(["git", "config", "--replace-all", "remote.origin.fetch", fetchRefspec], {
+			stdout: "pipe",
+			stderr: "pipe",
+			cwd: repositoryPath,
+		});
+		if (configureFetch.exitCode !== 0) {
+			throw new ProtocolError("invalid_params", "failed to configure lane repository fetch refspec", {
+				reasonCode: "repo_fetch_refspec_failed",
+				repo,
+			});
 		}
 
-		// If worktree creation failed, clean up the directory and throw with git stderr
-		await rm(worktreePath, { recursive: true, force: true });
-		const stderr = addResult.stderr?.toString().trim() || "unknown error";
-		throw new ProtocolError("invalid_params", `failed to create lane worktree from repo: ${stderr}`, {
-			reasonCode: "repo_worktree_failed",
-			repo,
-			stderr,
+		const copySourceTrackingRefs = !isRemote && sourceHasOrigin;
+		const refSource = copySourceTrackingRefs ? sourceRepository : repositoryPath;
+		const sourceRefPrefix = copySourceTrackingRefs ? "refs/remotes/origin" : "refs/heads";
+		const availableRefs = Bun.spawnSync(
+			["git", "-C", refSource, "for-each-ref", "--format=%(refname)", sourceRefPrefix],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		if (availableRefs.exitCode !== 0) {
+			throw new ProtocolError("invalid_params", "failed to inspect lane repository refs", {
+				reasonCode: "repo_fetch_refs_failed",
+				repo,
+			});
+		}
+		const refspecs = availableRefs.stdout
+			.toString()
+			.split(/\r?\n/)
+			.map((ref) => ref.trim())
+			.filter(
+				(ref) =>
+					ref.startsWith(`${sourceRefPrefix}/`) && !(copySourceTrackingRefs && ref === "refs/remotes/origin/HEAD"),
+			)
+			.map((ref) => {
+				const branch = ref.slice(sourceRefPrefix.length + 1);
+				return `+${ref}:refs/remotes/origin/${branch}`;
+			});
+		if (refspecs.length > 0) {
+			const fetchSource = copySourceTrackingRefs ? sourceRepository : ".";
+			const populateTrackingRefs = Bun.spawnSync(["git", "fetch", "--no-tags", "--", fetchSource, ...refspecs], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: repositoryPath,
+			});
+			if (populateTrackingRefs.exitCode !== 0) {
+				throw new ProtocolError("invalid_params", "failed to populate lane repository remote-tracking refs", {
+					reasonCode: "repo_fetch_refs_failed",
+					repo,
+				});
+			}
+		}
+		if (!isRemote && base === undefined && defaultRef) {
+			const localDefaultBranch = `refs/heads/${defaultRef}`;
+			const localDefaultBranchCheck = Bun.spawnSync(
+				["git", "rev-parse", "--verify", "--quiet", `${localDefaultBranch}^{commit}`],
+				{ stdout: "ignore", stderr: "ignore", cwd: repositoryPath },
+			);
+			if (localDefaultBranchCheck.exitCode !== 0) {
+				const sourceDefaultRef = `refs/remotes/origin/${defaultRef}`;
+				const sourceDefaultRefCheck = Bun.spawnSync(
+					["git", "-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceDefaultRef}^{commit}`],
+					{ stdout: "ignore", stderr: "ignore" },
+				);
+				if (sourceDefaultRefCheck.exitCode === 0) {
+					const materializeDefault = Bun.spawnSync(
+						["git", "fetch", "--no-tags", "--", sourceRepository, `+${sourceDefaultRef}:${localDefaultBranch}`],
+						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					);
+					if (materializeDefault.exitCode !== 0) {
+						throw new ProtocolError(
+							"invalid_params",
+							"default remote-tracking ref could not be copied to the lane repository",
+							{ reasonCode: "repo_base_not_found", repo },
+						);
+					}
+				}
+			}
+		}
+		if (defaultRef) {
+			const symbolicHead = Bun.spawnSync(["git", "symbolic-ref", "HEAD", `refs/heads/${defaultRef}`], {
+				cwd: repositoryPath,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (symbolicHead.exitCode !== 0) defaultRef = undefined;
+		}
+
+		let baseRef = base ?? defaultRef;
+		if (!baseRef) {
+			const headResult = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: repositoryPath,
+			});
+			if (headResult.exitCode === 0) baseRef = headResult.stdout?.toString().trim() || undefined;
+		}
+		if (!baseRef) {
+			throw new ProtocolError("invalid_params", "could not determine the repository default branch", {
+				reasonCode: "repo_default_branch_unresolved",
+				repo,
+			});
+		}
+		if (baseRef.startsWith("origin/")) {
+			const localBranch = `refs/heads/${baseRef.slice("origin/".length)}`;
+			let fetchedRemoteTrackingBase = false;
+			if (!isRemote) {
+				const sourceRef = `refs/remotes/${baseRef}`;
+				const sourceRefCheck = Bun.spawnSync(
+					["git", "-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceRef}^{commit}`],
+					{ stdout: "ignore", stderr: "ignore" },
+				);
+				if (sourceRefCheck.exitCode === 0) {
+					const fetch = Bun.spawnSync(
+						["git", "fetch", "--no-tags", "--", sourceRepository, `+${sourceRef}:${localBranch}`],
+						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					);
+					if (fetch.exitCode !== 0) {
+						throw new ProtocolError(
+							"invalid_params",
+							"base remote-tracking ref could not be copied to the lane repository",
+							{
+								reasonCode: "repo_base_not_found",
+								repo,
+							},
+						);
+					}
+					baseRef = localBranch;
+					fetchedRemoteTrackingBase = true;
+				}
+			}
+			if (!fetchedRemoteTrackingBase) {
+				const branchCheck = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `${localBranch}^{commit}`], {
+					stdout: "ignore",
+					stderr: "ignore",
+					cwd: repositoryPath,
+				});
+				if (branchCheck.exitCode === 0) baseRef = localBranch;
+			}
+		}
+		if (baseRef.startsWith("-")) {
+			throw new ProtocolError("invalid_params", "base must be a branch, tag, or commit ref", {
+				reasonCode: "repo_base_invalid",
+				repo,
+			});
+		}
+
+		const baseResult = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], {
+			stdout: "pipe",
+			stderr: "pipe",
+			cwd: repositoryPath,
 		});
+		const baseSha = baseResult.stdout?.toString().trim() || "";
+		if (baseResult.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
+			throw new ProtocolError("invalid_params", "base does not resolve to a commit in the repository", {
+				reasonCode: "repo_base_not_found",
+				repo,
+			});
+		}
+
+		worktreeAddAttempted = true;
+		const addResult = Bun.spawnSync(
+			["git", "worktree", "add", "-b", managedLaneBranchName(laneName), worktreePath, baseSha],
+			{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+		);
+		if (addResult.exitCode !== 0) {
+			const stderr = addResult.stderr?.toString().trim() || "unknown error";
+			throw new ProtocolError("invalid_params", `failed to create lane worktree from repo: ${stderr}`, {
+				reasonCode: "repo_worktree_failed",
+				repo,
+			});
+		}
+		return {
+			worktreePath,
+			repositoryPath,
+			baseSha,
+		};
 	} catch (error) {
+		let partialWorktreeCleanupFailed = false;
+		if (ownsWorktreePath) {
+			if (worktreeAddAttempted && ownsRepositoryPath) {
+				Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
+					cwd: repositoryPath,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				try {
+					if (await pathExists(worktreePath)) await rm(worktreePath, { recursive: true, force: true });
+				} catch {
+					partialWorktreeCleanupFailed = true;
+				}
+				if (!partialWorktreeCleanupFailed) {
+					const prune = Bun.spawnSync(["git", "worktree", "prune"], {
+						cwd: repositoryPath,
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					const list = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+						cwd: repositoryPath,
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					if (prune.exitCode !== 0 || list.exitCode !== 0) {
+						partialWorktreeCleanupFailed = true;
+					} else {
+						const expectedWorktreePath = canonicalPathIncludingMissing(worktreePath);
+						partialWorktreeCleanupFailed = list.stdout
+							.toString()
+							.split(/\r?\n/)
+							.some((line) => {
+								if (!line.startsWith("worktree ")) return false;
+								try {
+									return canonicalPathIncludingMissing(line.slice("worktree ".length)) === expectedWorktreePath;
+								} catch {
+									return true;
+								}
+							});
+					}
+				}
+			} else {
+				try {
+					await rm(worktreePath, { recursive: true, force: true });
+				} catch {
+					partialWorktreeCleanupFailed = true;
+				}
+			}
+		}
+		if (ownsRepositoryPath && !partialWorktreeCleanupFailed)
+			try {
+				await rm(repositoryPath, { recursive: true, force: true });
+			} catch {
+				partialWorktreeCleanupFailed = true;
+			}
+		if (partialWorktreeCleanupFailed) {
+			throw new ProtocolError(
+				"invalid_params",
+				"failed to clean up partial lane worktree; managed repository was retained",
+				{
+					reasonCode: "repo_worktree_cleanup_failed",
+					repo,
+				},
+			);
+		}
 		if (error instanceof ProtocolError) throw error;
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ProtocolError("invalid_params", `failed to create lane worktree: ${message}`, {
@@ -2499,4 +3599,21 @@ async function createWorktreeFromRepo(
 			repo,
 		});
 	}
+}
+
+async function discardCreatedWorktree(name: string, created: CreatedRepoWorktree): Promise<void> {
+	const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", created.worktreePath], {
+		cwd: created.repositoryPath,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (removeResult.exitCode !== 0)
+		throw new Error(removeResult.stderr?.toString().trim() || "git worktree remove failed");
+	Bun.spawnSync(["git", "branch", "-D", managedLaneBranchName(name)], {
+		cwd: created.repositoryPath,
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	const { rm } = await import("node:fs/promises");
+	await rm(created.repositoryPath, { recursive: true, force: true });
 }

@@ -93,7 +93,7 @@ services:
       - telegram
 
   # Setup helper: runs one-time setup if config doesn't exist
-  setup-check:
+  setup:
     build: .
     container_name: gajaeway-setup
     environment:
@@ -104,8 +104,8 @@ services:
     stdin_open: true
     tty: true
     # This runs setup if no config exists; otherwise just exits
-    entrypoint: sh
     command:
+      - sh
       - -c
       - |
         if [ ! -f $$GAJAEWAY_HOME/config.json ]; then

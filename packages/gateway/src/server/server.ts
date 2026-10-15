@@ -57,12 +57,13 @@ import {
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
+import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory, memoryRoot } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
-import { MonitorPropagator } from "../monitors/propagate";
+import { MONITOR_REPORT_MESSAGE_ID_PREFIX, MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
@@ -103,15 +104,31 @@ import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachme
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
+	extractHandoffAtBlockStart,
+	extractWakeLines,
+	extractWatchLines,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
 	parseHandoffReply,
+	parseWatchTtl,
 	readHandoffProvenance,
 	renderHandoffFailure,
 	renderHandoffPointer,
 	renderHandoffTurn,
+	renderWakeFailure,
+	renderWakeTurn,
+	renderWatchedInputTurn,
+	renderWatchFailure,
+	renderWatchRegistered,
 	resolveHandoffTarget,
+	sanitizeHandoffTokens,
+	WATCH_REASON_MAX_LENGTH,
+	type WakeLine,
+	type WatchLine,
+	wakeMessageId,
+	watchRegistrationId,
+	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
@@ -255,6 +272,8 @@ export interface GatewayServerOptions {
 	readonly deliverySweepIntervalMs?: number;
 	/** Mid-work speech gating configuration (issue #71). */
 	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
+	/** Test seam: outbound secret redaction; production reads its sources from the process env and the broker agent dir. */
+	readonly secretGuard?: SecretGuard;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -394,6 +413,8 @@ function startMemoryOperation(runtime: Runtime, opRef: string, work: () => Promi
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
+	/** Canonical persona workspace shared by session binding and outbound file checks. */
+	readonly workspace: string;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
@@ -431,6 +452,8 @@ interface Runtime {
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
 	readonly permissionPanels: PermissionPanels;
+	/** Redacts secrets from every chat-bound frame at the connection writer; not configurable from chat or config.json. */
+	readonly secretGuard: SecretGuard;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -506,7 +529,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
-					write: (frame) => writer.write(frame),
+					write: (frame) => writer.write(runtime.secretGuard.guardFrame(frame)),
 					close: () => writer.close(),
 					settle: () => writer.settled(),
 				};
@@ -561,7 +584,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const connection: Connection = {
 		decoder: new FrameDecoder(),
 		negotiated: false,
-		write: (frame) => process.stdout.write(encodeFrame(frame)),
+		write: (frame) => process.stdout.write(encodeFrame(runtime.secretGuard.guardFrame(frame))),
 		close: () => process.stdin.pause(),
 		settle: async () => {},
 	};
@@ -648,6 +671,54 @@ async function settleMemory(runtime: Runtime): Promise<void> {
 			`gateway memory settle failed during shutdown; intents remain durable for next boot: ${diagnostic(error)}`,
 		);
 	}
+}
+
+/** A row whose stored origin ref names another conversation is logged once, not on every sweep. */
+const idleResetMismatchesLogged = new Set<string>();
+
+/**
+ * Rotate idle persona sessions like `/new`. This drops the old GJC context while
+ * leaving the next turn to bind a fresh session. Host retirement is different:
+ * it ends only the host and preserves the session history. Loopback and monitor
+ * origins, active turns, and rows with no bound GJC session are never reset.
+ */
+export async function sweepIdleSessions(
+	runtime: Pick<Runtime, "config" | "personaSessions">,
+	database: Pick<Store, "bindings">,
+	now: number = Date.now(),
+): Promise<readonly string[]> {
+	const idleMs = runtime.config.sessions?.idleResetMs;
+	if (idleMs === undefined) return [];
+	const rotated: string[] = [];
+	for (const row of database.bindings.sessionIdentityRows()) {
+		if (!row.origin_ref_json || row.gjc_session_id === "") continue;
+		let origin: OriginRef;
+		try {
+			origin = validateOriginRef(JSON.parse(row.origin_ref_json) as OriginRef);
+		} catch {
+			continue;
+		}
+		if (origin.platform === "loopback" || origin.platform === "monitor") continue;
+		const lastActivity = Date.parse(row.last_activity_at ?? row.created_at);
+		if (!Number.isFinite(lastActivity) || now - lastActivity < idleMs) continue;
+		const key = originKey(origin);
+		if (key !== row.origin_key) {
+			if (!idleResetMismatchesLogged.has(row.origin_key)) {
+				idleResetMismatchesLogged.add(row.origin_key);
+				console.error(`session_idle_reset_skipped origin=${row.origin_key} ref=${key} reason=origin_ref_mismatch`);
+			}
+			continue;
+		}
+		if (runtime.personaSessions.state(key) === "turn-running") continue;
+		try {
+			await runtime.personaSessions.reset(key, JSON.stringify(origin));
+			console.error(`session_idle_reset origin=${key} epoch=${row.epoch} idleMs=${now - lastActivity}`);
+			rotated.push(key);
+		} catch (error) {
+			console.error(`session_idle_reset_failed origin=${key} detail=${diagnostic(error)}`);
+		}
+	}
+	return rotated;
 }
 
 function createRuntime(options: GatewayServerOptions): Runtime {
@@ -748,6 +819,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
+		notifyInbound: (originKey) => personaSessions.notifyInbound(originKey),
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
@@ -777,6 +849,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const lanes = new LaneGovernor({
 		database: options.database,
 		sessionPort,
+		laneRoot: options.config.home,
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
 	});
@@ -802,6 +875,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.recover()
 			.then(async () => {
 				await personaSessions.sweepIdleHosts();
+				await sweepIdleSessions(runtime, options.database);
 			})
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 		void work
@@ -917,6 +991,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			: undefined;
 	runtime = {
 		config: options.config,
+		workspace,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		sessionPort,
@@ -952,6 +1027,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		permissionPanels,
 		memoryOps: new Map(),
 		memoryOperationTasks: new Set(),
+		secretGuard:
+			options.secretGuard ??
+			new SecretGuard(secretSourcesFromEnv(process.env, options.broker?.agentDir, options.config.home)),
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1416,6 +1494,7 @@ async function handleRequest(
 						conversationId: projection.conversationId,
 						state: row.state,
 						createdAt: row.createdAt,
+						lastError: row.lastError,
 						textPrefix: projection.text.slice(0, 80),
 					};
 				});
@@ -1715,19 +1794,33 @@ async function handleRequest(
 			if (!resolved)
 				throw new ProtocolError(
 					"invalid_params",
-					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist: ${reactionAllowlistDescription(origin.platform)}`,
+					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist or custom emoji rules: ${reactionAllowlistDescription(origin.platform)}`,
 				);
-			// Allowlisted is not the same as deliverable: Telegram accepts only its own
-			// reaction set, so asking for one it cannot express would be a guaranteed dead
-			// delivery. Refuse it here instead of letting the persona believe it acknowledged.
-			if (!platformSupportsReaction(origin.platform, resolved.name))
-				throw new ProtocolError(
-					"invalid_params",
-					`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
-				);
+			// Custom emoji are allowed on Discord and Slack; Telegram rejects them as unsupported.
+			const isCustom = resolved.isCustom === true;
+			if (isCustom) {
+				if (origin.platform === "telegram")
+					throw new ProtocolError(
+						"invalid_params",
+						`${origin.platform} does not support custom emoji; it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+					);
+				if (origin.platform === "discord" && origin.kind === "dm")
+					throw new ProtocolError("invalid_params", "Discord custom emoji reactions require a guild channel or thread");
+			} else {
+				// Allowlisted is not the same as deliverable: Telegram accepts only its own
+				// reaction set, so asking for one it cannot express would be a guaranteed dead
+				// delivery. Refuse it here instead of letting the persona believe it acknowledged.
+				if (!platformSupportsReaction(origin.platform, resolved.name))
+					throw new ProtocolError(
+						"invalid_params",
+						`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+					);
+			}
+			const unicode = resolved.isCustom === true ? "" : resolved.unicode;
+			const emojiLabel = unicode || `:${resolved.name}:`;
 			const reaction: ReactionRef = {
 				targetMessageId: params.targetMessageId.trim(),
-				emoji: resolved.unicode,
+				emoji: unicode,
 				emojiName: resolved.name,
 				action,
 			};
@@ -1737,17 +1830,19 @@ async function handleRequest(
 					originKey: originKey(origin),
 					targetMessageId: reaction.targetMessageId,
 					emoji: reaction.emoji,
+					emojiName: reaction.emojiName,
 				});
 				if (!owned)
 					throw new ProtocolError(
 						"invalid_params",
-						`cannot remove ${resolved.unicode}: the persona did not add this reaction`,
+						`cannot remove ${emojiLabel}: the persona did not add this reaction`,
 					);
 			} else {
 				const rejection = runtime.reactions.claim({
 					originKey: originKey(origin),
 					targetMessageId: reaction.targetMessageId,
 					emoji: reaction.emoji,
+					emojiName: reaction.emojiName,
 				});
 				// Cap violations are reported, never silently dropped: the caller must be able
 				// to tell "not sent" from "sent and invisible".
@@ -1800,7 +1895,8 @@ async function handleRequest(
 			// The reactor's emoji is untrusted text that ends up in the turn's context
 			// block: bound it and strip control characters so it cannot forge extra lines
 			// (a newline here would look like another context entry to the persona).
-			const emoji = stripControlCharacters(params.emoji).trim().slice(0, 64);
+			// Slack custom emoji names can be 80 chars; preserve all of `custom:<name>`.
+			const emoji = clipByCodePoints(stripControlCharacters(params.emoji).trim(), 87);
 			if (!emoji) throw new ProtocolError("invalid_params", "engagement.reaction requires a non-empty emoji");
 			const targetMessageId = params.targetMessageId.trim();
 			const authorId = params.engagement.authorId;
@@ -1936,6 +2032,9 @@ async function handleRequest(
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
 }
+function isInternalReportMessageId(messageId: string): boolean {
+	return messageId.startsWith("lane-report-") || messageId.startsWith(MONITOR_REPORT_MESSAGE_ID_PREFIX);
+}
 async function sendChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -1954,8 +2053,8 @@ async function sendChat(
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
-	if (typeof params.messageId === "string" && params.messageId.startsWith("lane-report-"))
-		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be sent to chat");
+	if (typeof params.messageId === "string" && isInternalReportMessageId(params.messageId))
+		throw new ProtocolError("invalid_params", "internal report identifiers cannot be sent to chat");
 	const userText: string = params.text;
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
@@ -2127,6 +2226,8 @@ async function sendChat(
 				mentioned?: boolean;
 				authorId?: string;
 				authorName?: unknown;
+				authorHandle?: string;
+				authorServerTag?: string;
 				channelLabel?: string;
 				serverLabel?: string;
 				replyTo?: { fromSelf?: boolean };
@@ -2243,10 +2344,11 @@ async function sendChat(
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
-	// per-origin actor receives the notification only after this transaction wins.
-	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.transaction((tx) =>
-			options.database.inbox.enqueue(tx, {
+	// per-origin actor and any one-shot watch targets are notified only after this
+	// transaction commits. Auto-wakes carry metadata, never the source message.
+	const admission = ingestOrReportDrop(key, messageId, true, () =>
+		options.database.transaction((tx) => {
+			const accepted = options.database.inbox.enqueue(tx, {
 				messageId,
 				originKey: key,
 				originRefJson: JSON.stringify(origin),
@@ -2256,10 +2358,69 @@ async function sendChat(
 				engagementJson: params.engagement
 					? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
 					: undefined,
-			}),
-		),
+			});
+			if (!accepted || !nonLoopback || authorIsBot)
+				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
+
+			const matchedAt = new Date().toISOString();
+			const sourceAt = receivedAt ?? matchedAt;
+			const watchSender = composeSpeakerLabel({
+				authorId: engagement?.authorId,
+				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+				authorHandle: engagement?.authorHandle,
+				authorServerTag: engagement?.authorServerTag,
+			});
+			const watchWakeOrigins: string[] = [];
+			const memoryIntentIds: string[] = [];
+			for (const watch of options.database.inbox.claimWatchesForOrigin(tx, key, messageId, matchedAt)) {
+				const watcherOrigin = validateOriginRef(JSON.parse(watch.watcher_origin_ref_json) as OriginRef);
+				if (originKey(watcherOrigin) !== watch.watcher_origin_key)
+					throw new Error(`watch ${watch.watch_id} origin key does not match its origin reference`);
+				const chain = JSON.parse(watch.handoff_chain_json) as unknown;
+				if (!Array.isArray(chain) || !chain.every((entry) => typeof entry === "string"))
+					throw new Error(`watch ${watch.watch_id} has invalid handoff provenance`);
+				const provenance: HandoffProvenance = {
+					chain: chain as string[],
+					sourceOriginKey: key,
+					sourceMessageId: messageId,
+					...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+					...(watchSender ? { requesterName: watchSender } : {}),
+					at: sourceAt,
+				};
+				const wakeId = watchWakeMessageId(watch.watch_id, messageId);
+				const wakeAccepted = options.database.inbox.enqueue(tx, {
+					messageId: wakeId,
+					originKey: watch.watcher_origin_key,
+					originRefJson: watch.watcher_origin_ref_json,
+					body: renderWatchedInputTurn({
+						provenance,
+						sourcePlace:
+							[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
+							`${origin.platform} ${origin.kind} ${origin.conversationId}`,
+						sender: watchSender ?? "unknown sender",
+					}),
+					engagementJson: JSON.stringify({ mentioned: false, group: watcherOrigin.kind !== "dm", handoff: provenance }),
+					receivedAt: matchedAt,
+				});
+				if (!wakeAccepted) throw new Error(`watch wake ${wakeId} already exists before watch ${watch.watch_id} fired`);
+				const intentId = `watch-audit:fired:${watch.watch_id}`;
+				options.database.memory.createIntent(tx, {
+					id: intentId,
+					kind: "daily_capture",
+					payloadJson: JSON.stringify({
+						kind: "daily_capture",
+						originRefJson: JSON.stringify(origin),
+						userText: `Cross-session watch ${watch.watch_id} matched msg:${messageId} from ${watchSender ?? "unknown sender"}`,
+						replyText: `An information-only wake was enqueued for ${watch.watcher_origin_key}. Message text, attachments, watch reason, and secrets were omitted.`,
+					}),
+				});
+				watchWakeOrigins.push(watch.watcher_origin_key);
+				memoryIntentIds.push(intentId);
+			}
+			return { accepted, watchWakeOrigins, memoryIntentIds };
+		}),
 	);
-	if (!accepted) {
+	if (!admission.accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2269,6 +2430,11 @@ async function sendChat(
 		});
 		return;
 	}
+	for (const intentId of admission.memoryIntentIds) runtime.memory.enqueueExistingId(intentId);
+	for (const watchOriginKey of admission.watchWakeOrigins)
+		void runtime.personaSessions
+			.notifyInbound(watchOriginKey)
+			.catch((error) => console.error(`gateway watch wake dispatch deferred to recovery: ${diagnostic(error)}`));
 	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, {
 		turnId,
@@ -2322,8 +2488,8 @@ async function editChat(
 		throw new ProtocolError("invalid_params", "chat.edit requires non-empty text");
 	if (typeof params.messageId !== "string" || !params.messageId)
 		throw new ProtocolError("invalid_params", "chat.edit requires the edited messageId");
-	if (params.messageId.startsWith("lane-report-"))
-		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be edited");
+	if (isInternalReportMessageId(params.messageId))
+		throw new ProtocolError("invalid_params", "internal report identifiers cannot be edited");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -2539,6 +2705,7 @@ async function createInboundTurnLifecycle(
 		currentConversationNotice(origin),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
+		SECRET_GUARD_SYSTEM_NOTICE,
 	].join("\n\n");
 	const modelOverride = options.database.bindings.modelGet(key)?.selection;
 	const effectiveModel = modelOverride ?? runtime.config.model;
@@ -2591,11 +2758,11 @@ async function createInboundTurnLifecycle(
 	 * Delivers one line into THIS conversation under the trigger's terminal slot,
 	 * so a replayed or reconciled answer can never post it twice.
 	 */
-	const deliverTerminalLine = (text: string) => {
-		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
+	const deliverTerminalLine = (text: string, partIndex = 0) => {
+		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, partIndex);
 		if (
 			options.database.transaction((tx) =>
-				options.database.inbox.claimTerminal(tx, input.turn.opRef, 0, deliveryId),
+				options.database.inbox.claimTerminal(tx, input.turn.opRef, partIndex, deliveryId),
 			) !== deliveryId
 		)
 			return;
@@ -2610,33 +2777,39 @@ async function createInboundTurnLifecycle(
 	 * one durable, relayed inbound row and answers there; this conversation gets
 	 * a pointer. Anything that cannot be handed off is said here, and nothing runs.
 	 */
+	/** The target and hop for a relay out of this conversation, or the refusal reason. */
+	const planRelay = (target: string) => {
+		const resolved = resolveHandoffTarget(target, runtime.config);
+		if (!resolved.ok) return resolved;
+		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey);
+		return hop.ok ? { ...resolved, chain: hop.chain } : hop;
+	};
+	const relaySourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+	const relayProvenance = (chain: readonly string[]): HandoffProvenance => ({
+		chain,
+		sourceOriginKey: key,
+		sourceMessageId: relaySourceMessageId,
+		...(incomingHandoff
+			? {
+					...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
+					...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
+				}
+			: {
+					...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+					...(speaker ? { requesterName: speaker } : {}),
+				}),
+		at: row.received_at,
+	});
 	const handOff = async (handoff: HandoffReply) => {
-		const resolved = resolveHandoffTarget(handoff.target, runtime.config);
-		const hop = resolved.ok
-			? extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey)
-			: { ok: false as const, reason: resolved.reason };
-		if (!hop.ok || !resolved.ok) {
-			const reason = hop.ok ? "unresolvable target" : hop.reason;
-			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
-			deliverTerminalLine(renderHandoffFailure(handoff.target, reason));
+		const relay = planRelay(handoff.target);
+		if (!relay.ok) {
+			console.error(
+				`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${relay.reason}`,
+			);
+			deliverTerminalLine(renderHandoffFailure(handoff.target, relay.reason), deliveredParts.length);
 			return;
 		}
-		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
-		const provenance: HandoffProvenance = {
-			chain: hop.chain,
-			sourceOriginKey: key,
-			sourceMessageId,
-			...(incomingHandoff
-				? {
-						...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
-						...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
-					}
-				: {
-						...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
-						...(speaker ? { requesterName: speaker } : {}),
-					}),
-			at: row.received_at,
-		};
+		const provenance = relayProvenance(relay.chain);
 		const digest = buildHandoffDigest(
 			recentConversation(
 				options.database,
@@ -2650,21 +2823,154 @@ async function createInboundTurnLifecycle(
 		// sent it, so it must not read (or authorise) as the requester speaking there.
 		const accepted = options.database.transaction((tx) =>
 			options.database.inbox.enqueue(tx, {
-				messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
-				originKey: resolved.originKey,
-				originRefJson: JSON.stringify(resolved.origin),
+				messageId: handoffMessageId(key, relaySourceMessageId, relay.originKey),
+				originKey: relay.originKey,
+				originRefJson: JSON.stringify(relay.origin),
 				body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
-				engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
+				engagementJson: JSON.stringify({ mentioned: false, group: relay.origin.kind !== "dm", handoff: provenance }),
 			}),
 		);
 		if (accepted) {
-			console.error(`gateway handoff enqueued origin=${key} target=${resolved.originKey} chain=${hop.chain.length}`);
+			console.error(`gateway handoff enqueued origin=${key} target=${relay.originKey} chain=${relay.chain.length}`);
 			// Not awaited: the target actor runs its own turn under its own serialization.
 			void runtime.personaSessions
-				.notifyInbound(resolved.originKey)
+				.notifyInbound(relay.originKey)
 				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
 		}
-		deliverTerminalLine(renderHandoffPointer(handoff.target));
+		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
+	};
+	/**
+	 * A `[WAKE:<origin>] <summary>` line (#442): the target conversation's session
+	 * gets one durable internal turn carrying the summary as information only, over
+	 * the handoff relay (same hop chain and limit). This conversation keeps its
+	 * reply and gets no pointer; only a refused wake is said here.
+	 */
+	const wake = (line: WakeLine) => {
+		const relay = planRelay(line.target);
+		if (!relay.ok) {
+			console.error(`gateway wake refused origin=${key} target=${safeDiagnosticField(line.target)}: ${relay.reason}`);
+			deliverTerminalLine(renderWakeFailure(line.target, relay.reason), deliveredParts.length);
+			return;
+		}
+		const provenance = relayProvenance(relay.chain);
+		// Like a handoff row: no author identity, so it never reads as anyone speaking there.
+		const wakeId = wakeMessageId(key, relaySourceMessageId, relay.originKey, line.summary);
+		const outcome = options.database.transaction((tx) => {
+			const accepted = options.database.inbox.enqueue(tx, {
+				messageId: wakeId,
+				originKey: relay.originKey,
+				originRefJson: JSON.stringify(relay.origin),
+				body: renderWakeTurn({ provenance, sourcePlace: place, summary: line.summary }),
+				engagementJson: JSON.stringify({ mentioned: false, group: relay.origin.kind !== "dm", handoff: provenance }),
+			});
+			if (!accepted) return { accepted, auditIntentId: undefined };
+			const auditIntentId = `wake-audit:enqueued:${wakeId}`;
+			options.database.memory.createIntent(tx, {
+				id: auditIntentId,
+				kind: "daily_capture",
+				payloadJson: JSON.stringify({
+					kind: "daily_capture",
+					originRefJson: JSON.stringify(origin),
+					userText: `Cross-session wake enqueued for ${relay.originKey}`,
+					replyText: `Information-only wake ${wakeId} was created from ${key}. Wake summary omitted from audit.`,
+				}),
+			});
+			return { accepted, auditIntentId };
+		});
+		if (!outcome.accepted) return;
+		if (outcome.auditIntentId) runtime.memory.enqueueExistingId(outcome.auditIntentId);
+		console.error(`gateway wake enqueued origin=${key} target=${relay.originKey} chain=${relay.chain.length}`);
+		void runtime.personaSessions
+			.notifyInbound(relay.originKey)
+			.catch((error) => console.error(`gateway wake dispatch deferred to recovery: ${diagnostic(error)}`));
+	};
+	/** A one-shot [WATCH:] directive waits for the next human input at another origin. */
+	const watch = (line: WatchLine) => {
+		const relay = resolveHandoffTarget(line.target, runtime.config);
+		if (!relay.ok) {
+			deliverTerminalLine(renderWatchFailure(line.target, relay.reason), deliveredParts.length);
+			return;
+		}
+		const ttl = parseWatchTtl(line.ttl);
+		if (!ttl.ok) {
+			deliverTerminalLine(renderWatchFailure(line.target, ttl.reason), deliveredParts.length);
+			return;
+		}
+		const reason = stripControlCharacters(line.reason).replace(/\s+/g, " ").trim();
+		if (!reason || Array.from(reason).length > WATCH_REASON_MAX_LENGTH) {
+			deliverTerminalLine(
+				renderWatchFailure(line.target, `reason must be 1-${WATCH_REASON_MAX_LENGTH} characters after trimming`),
+				deliveredParts.length,
+			);
+			return;
+		}
+		if (incomingHandoff?.chain.includes(relay.originKey)) {
+			deliverTerminalLine(
+				renderWatchFailure(
+					line.target,
+					`${relay.originKey} is already in this handoff chain (${incomingHandoff.chain.join(" -> ")})`,
+				),
+				deliveredParts.length,
+			);
+			return;
+		}
+		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], relay.originKey, key);
+		if (!hop.ok) {
+			deliverTerminalLine(renderWatchFailure(line.target, hop.reason), deliveredParts.length);
+			return;
+		}
+		const registeredAtDate = new Date();
+		const registeredAt = registeredAtDate.toISOString();
+		const expiresAt = new Date(registeredAtDate.getTime() + ttl.ttlMs).toISOString();
+		const watchId = watchRegistrationId(key, relaySourceMessageId, relay.originKey, line.ttl);
+		const outcome = options.database.transaction((tx) => {
+			const registration = options.database.inbox.registerWatch(tx, {
+				watchId,
+				watcherOriginKey: key,
+				watcherOriginRefJson: JSON.stringify(origin),
+				watchedOriginKey: relay.originKey,
+				watchedOriginRefJson: JSON.stringify(relay.origin),
+				handoffChainJson: JSON.stringify(hop.chain),
+				reason,
+				registeredAt,
+				expiresAt,
+			});
+			if (registration.kind !== "registered") return { registration, auditIntentId: undefined };
+			const auditIntentId = `watch-audit:registered:${watchId}`;
+			options.database.memory.createIntent(tx, {
+				id: auditIntentId,
+				kind: "daily_capture",
+				payloadJson: JSON.stringify({
+					kind: "daily_capture",
+					originRefJson: JSON.stringify(origin),
+					userText: `Cross-session watch ${watchId} registered for ${relay.originKey}`,
+					replyText: `Waiting for the next human message until ${expiresAt}. Watch reason is stored in the durable watch record.`,
+				}),
+			});
+			return { registration, auditIntentId };
+		});
+		if (outcome.auditIntentId) runtime.memory.enqueueExistingId(outcome.auditIntentId);
+		if (outcome.registration.kind === "already_watching") {
+			deliverTerminalLine(
+				renderWatchFailure(
+					line.target,
+					`this conversation is already watching until ${outcome.registration.watch.expires_at}`,
+				),
+				deliveredParts.length,
+			);
+			return;
+		}
+		if (outcome.registration.kind === "replayed" && outcome.registration.watch.state !== "pending") {
+			deliverTerminalLine(
+				`Watch for ${line.target} was already handled (${outcome.registration.watch.state}); it was not reopened.`,
+				deliveredParts.length,
+			);
+			return;
+		}
+		deliverTerminalLine(
+			renderWatchRegistered(line.target, outcome.registration.watch.expires_at),
+			deliveredParts.length,
+		);
 	};
 	/** [POST:] parts seen in mid-work speech, keyed `<target key>\n<body>`, posted at the turn's end. */
 	const heldPosts = new Map<string, { body: string; post: NonNullable<PlannedPart["post"]> }>();
@@ -2700,7 +3006,7 @@ async function createInboundTurnLifecycle(
 			}
 			const checked = await checkOutboundFile(requested, {
 				home: runtime.config.home,
-				workspace: join(runtime.config.home, "workspace"),
+				workspace: runtime.workspace,
 				...(runtime.config.outboundFileRoots ? { roots: runtime.config.outboundFileRoots } : {}),
 			});
 			if (!checked.ok) {
@@ -2719,25 +3025,57 @@ async function createInboundTurnLifecycle(
 	};
 	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
-		const handoff = parseHandoffReply(rawMessage);
-		if (handoff) {
+		let messageToProcess = rawMessage;
+		let handoffAfterDelivery: HandoffReply | undefined;
+
+		// Check if message STARTS with a handoff token
+		const handoffAtStart = parseHandoffReply(rawMessage);
+		if (handoffAtStart) {
 			// The work itself never posts here; only the final answer hands off.
-			if (source === "terminal") await handOff(handoff);
+			if (source === "terminal") await handOff(handoffAtStart);
 			return;
 		}
-		let message = rawMessage;
+
+		// A token can open a later [BREAK]-delimited block. Deliver earlier blocks
+		// first, then hand off; tokens on ordinary lines remain non-directive text.
+		const blockHandoff = extractHandoffAtBlockStart(rawMessage);
+		if (blockHandoff) {
+			// Process only the text before the token
+			messageToProcess = blockHandoff.textBefore;
+			// Save handoff to trigger after delivery
+			if (source === "terminal") {
+				handoffAfterDelivery = blockHandoff.handoff;
+			}
+		}
+		const sanitized = sanitizeHandoffTokens(messageToProcess);
+		let message = sanitized.text;
+		const reportInvalidHandoff = () => {
+			if (source === "terminal" && sanitized.strippedToken) {
+				deliverTerminalLine(
+					"A handoff token was removed because it did not form a valid reply-block directive; no handoff was sent.",
+					deliveredParts.length,
+				);
+			}
+		};
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
 			message = reactionReply.body;
-			if (!message) return;
+			if (!message) {
+				reportInvalidHandoff();
+				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				return;
+			}
 		} else if (reactionReply) {
 			reactionsClaimedFor.add(rawMessage);
 			reactionTokensSeen = true;
 			for (const wanted of reactionReply.reactions) {
-				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-					console.warn(
-						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
-					);
+				const unsupportedDiscordDmCustom =
+					wanted.isCustom === true && origin.platform === "discord" && origin.kind === "dm";
+				if (!platformSupportsReaction(origin.platform, wanted.emojiName) || unsupportedDiscordDmCustom) {
+					const reason = unsupportedDiscordDmCustom
+						? "Discord custom emoji reactions require a guild channel or thread"
+						: `${origin.platform} cannot react with ${wanted.emoji || wanted.emojiName} (${wanted.emojiName})`;
+					console.warn(`gateway reaction skipped for ${key}: ${reason}`);
 					continue;
 				}
 				if (wanted.action === "remove") {
@@ -2750,6 +3088,7 @@ async function createInboundTurnLifecycle(
 						originKey: key,
 						targetMessageId: wanted.targetMessageId,
 						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
 					});
 					if (!released) {
 						console.error(
@@ -2773,7 +3112,13 @@ async function createInboundTurnLifecycle(
 						continue;
 					}
 					const targetMessageId = wanted.targetMessageId ?? row.message_id;
-					const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
+					const rejection = runtime.reactions.claim({
+						turnId,
+						originKey: key,
+						targetMessageId,
+						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
+					});
 					if (rejection) {
 						console.error(
 							`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
@@ -2791,7 +3136,11 @@ async function createInboundTurnLifecycle(
 				}
 			}
 			message = reactionReply.body;
-			if (!message) return;
+			if (!message) {
+				reportInvalidHandoff();
+				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				return;
+			}
 		}
 		// MEDIA:<path> lines become their own deliveries after the text parts, on
 		// platforms whose upload goes through the ledger. Elsewhere the lines stay in
@@ -2800,9 +3149,12 @@ async function createInboundTurnLifecycle(
 		if (fileReply) message = fileReply.body;
 		// Control tokens are internal protocol, never user-visible. Models routinely
 		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
-		// part is judged by whether it CONTAINS the token, not whether it equals it:
-		// any part carrying a silence token is dropped whole, and [REPLY:id] is
-		// honoured wherever it appears and always stripped from the delivered text.
+		// part is judged by whether it CLOSES with the token, not whether it equals
+		// it: a part whose last line ends in a silence token is dropped whole. A
+		// token merely mentioned (mid-sentence, in code, or followed by more prose)
+		// is prose: a persona explaining its own rules lost a whole answer when any
+		// occurrence counted (live, 2026-10-12). [REPLY:id] is honoured wherever it
+		// appears and always stripped from the delivered text.
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
@@ -2939,6 +3291,10 @@ async function createInboundTurnLifecycle(
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
 		if (fileReply) await deliverFiles(fileReply.paths, planned.at(-1)?.replyTo ?? inboundThreadRoot);
+		if (handoffAfterDelivery) {
+			await handOff(handoffAfterDelivery);
+		}
+		reportInvalidHandoff();
 	};
 	/**
 	 * Sends one [POST:] part to its target conversation through the ordinary
@@ -2976,8 +3332,14 @@ async function createInboundTurnLifecycle(
 	 * repeat (text-keyed id, so a second terminal pass cannot post it again).
 	 */
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
-		await deliverTurnText(rawMessage, source);
+		// Cross-session directives never reach this conversation; only final replies
+		// register watches or enqueue wakes.
+		const wakeOutput = extractWakeLines(rawMessage);
+		const watchOutput = extractWatchLines(wakeOutput.text);
+		await deliverTurnText(watchOutput.text, source);
 		if (source !== "terminal" || !nonLoopback) return;
+		for (const line of watchOutput.watches) watch(line);
+		for (const line of wakeOutput.wakes) wake(line);
 		for (const [postKey, held] of heldPosts) {
 			if (terminalPosts.has(postKey)) continue;
 			postElsewhere(
@@ -3202,6 +3564,32 @@ async function createInboundTurnLifecycle(
 		}
 	};
 
+	const onModelRefusal = ({ error }: PersonaFailureInput) => {
+		const notice = `${formatFailureNotice(error)} Send /model <id> or /new`;
+		console.error(notice);
+		if (nonLoopback) {
+			// A refused prompt is still pending. Its diagnostic must not occupy
+			// the eventual answer's delivery identity or terminal reply slot.
+			const deliveryId = `gw-m-${createHash("sha256")
+				.update(JSON.stringify([key, input.turn.triggerMessageId, "model_not_selected"]))
+				.digest("hex")
+				.slice(0, 32)}`;
+			const payload = runtime.delivery.prepare(turnId, origin, notice, undefined, deliveryId);
+			if (payload) {
+				runtime.delivery.markInflight(deliveryId);
+				broadcastDelivery(runtime, payload);
+			}
+		} else if (connection) {
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "event",
+				event: "chat.message",
+				...(context ? { id: context.requestId } : {}),
+				payload: { turnId, origin, role: "assistant", text: notice, final: true },
+			});
+		}
+	};
+
 	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
 		try {
 			const failureNotice = formatFailureNotice(error);
@@ -3273,6 +3661,7 @@ async function createInboundTurnLifecycle(
 		onSteerAccepted,
 		onFrame,
 		onTerminal,
+		onModelRefusal,
 		onFailure,
 		onSettled,
 		// Neither path ever reaches onTerminal/onFailure for THIS lifecycle: a
@@ -3306,7 +3695,7 @@ function reportTerminalLinkAudit(database: Store): void {
 }
 
 function laneReportTriggerText(body: string): string {
-	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
+	return `[Internal report from another Gajae session, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
 }
 function deliveryProjection(payloadJson: string): { readonly conversationId: string; readonly text: string } {
 	try {
@@ -3445,13 +3834,14 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");
-		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
+		if (!eyes || eyes.isCustom === true || !platformSupportsReaction(origin.platform, eyes.name)) return;
 		const key = originKey(origin);
 		const rejection = runtime.reactions.claim({
 			...(turnId ? { turnId } : {}),
 			originKey: key,
 			targetMessageId,
 			emoji: eyes.unicode,
+			emojiName: eyes.name,
 		});
 		if (rejection) {
 			console.error(
@@ -3621,13 +4011,15 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
+					"Waking another conversation: when another conversation's session should KNOW something but the work stays here, put a line [WAKE:<target>] <one-line summary> (a configured handoff alias or an origin such as discord:<channel id>) at the start of a line in your final reply. That line is removed from what this conversation sees, the rest of your reply is delivered here as usual, and the target session gets an internal turn carrying the summary as information only - it grants that session no permission and is not an instruction. Wakes use the handoff chain: they stop after 2 hops, a target already in the chain is refused, and a refused or unknown target is reported here.",
+					"Watching another conversation: when you need to wait for its next human message, put [WATCH:<target>] <ttl> <short reason> on a line in your final reply (for example [WATCH:discord/dm/peer=<id>] 30m waiting for the Harbor credential). Targets use a configured handoff alias or a canonical chat origin key; TTL is 1m-7d and the reason is 1-240 characters. The watch is one-shot and expires automatically. On a matching human message, this conversation gets an internal information-only turn with the sender, origin, reason and queue status; the original message, attachments and secrets are not copied. The source session handles the message independently, and this watch grants no permission. Only one active watch per target is allowed; the 2-hop limit and loop checks still apply.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence
 		// guidance because the persona chooses between exactly these three shapes.
 		...(isChatPlatform(origin.platform)
 			? [
-					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. Remove a reaction you added earlier with [UNREACT:<emoji>@<message id>]; removal frees up your reaction budget and allows you to add a different emoji to the same message (e.g. change 🔥 to ❤). With nothing after the tokens you acknowledge with a reaction and say nothing; text after the tokens is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. Remove a reaction you added earlier with [UNREACT:<emoji>@<message id>]; removal frees up your reaction budget and allows you to add a different emoji to the same message (e.g. change 🔥 to ❤). With nothing after the tokens you acknowledge with a reaction and say nothing; text after the tokens is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. Custom emoji names (Slack-valid: lowercase, digits, underscores, hyphens, 2-80 chars) are also accepted on Slack and Discord and will be validated server-side. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
 		...(platformSupportsFiles(origin.platform)
@@ -3641,7 +4033,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// A conversation turn is the owner's line to the persona; it must not be
 		// spent waiting. Waits are backgrounded or handed to a lane that reports to its parent.
 		"## Staying responsive while you work",
-		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> "<task>"`; its result returns here as an internal report, not a chat post. Say what you started and end the turn.',
+		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> --cwd "$PWD" "<task>"` from the target checkout, or use `--repo <path-or-url>` to create an isolated repository worktree. Its result returns here as an internal report, not a chat post. Say what you started and end the turn.',
 		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
 }

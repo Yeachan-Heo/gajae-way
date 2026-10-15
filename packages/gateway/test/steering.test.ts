@@ -3,8 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import { PersonaSessionManager, renderSteer } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, renderSteer, steerDirectedAtPersona } from "../src/orchestrator/persona-session";
 import { Store } from "../src/store";
+import type { InboundMessageRow } from "../src/store/groups/inbox";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "steering" } as const;
@@ -29,7 +30,7 @@ class SteeringTranscriptPort extends ScriptedSessionPort {
 	}
 }
 
-function enqueue(messageId: string, body: string): void {
+function enqueue(messageId: string, body: string, engagement?: Record<string, unknown>): void {
 	expect(
 		database?.transaction((tx) =>
 			database?.inbox.enqueue(tx, {
@@ -38,6 +39,7 @@ function enqueue(messageId: string, body: string): void {
 				originRefJson: JSON.stringify(ORIGIN),
 				body,
 				receivedAt: new Date().toISOString(),
+				...(engagement ? { engagementJson: JSON.stringify(engagement) } : {}),
 			}),
 		),
 	).toBe(true);
@@ -133,6 +135,68 @@ test("the steer header asks for the steered message's own reply instead of foldi
 	expect(framed).toMatch(/^\[Additional message[^\n]*\]\nmention the rollback caveat$/);
 	expect(framed).toContain("Answer this message now, in its own reply");
 	expect(framed).toContain("Do not wait until the end");
+	expect(framed).not.toContain("[SILENT]");
+});
+
+test("a steer that did not address the persona may be left unanswered with [SILENT] instead of forcing a reply", () => {
+	const framed = renderSteer("혜원: 예찬님 그건 내일 봐요", false);
+	// Same one-line header contract (#167) as an addressed steer.
+	expect(framed).toMatch(/^\[[^\n]*\]\n혜원: 예찬님 그건 내일 봐요$/);
+	expect(framed).not.toContain("Answer this message now");
+	expect(framed).toContain("If it is meant for you, answer it now in its own reply");
+	expect(framed).toContain("If it is not meant for you");
+	expect(framed).toContain("reply with exactly [SILENT] and nothing else");
+	expect(framed).toContain("continue the previous request");
+});
+
+test("only a group message without a mention or a reply to the persona counts as undirected", () => {
+	const row = (engagement: Record<string, unknown> | undefined) =>
+		({ engagement_json: engagement ? JSON.stringify(engagement) : null }) as InboundMessageRow;
+	expect(steerDirectedAtPersona(row(undefined))).toBe(true);
+	expect(steerDirectedAtPersona(row({ group: false, mentioned: false, authorId: "U1" }))).toBe(true);
+	expect(steerDirectedAtPersona(row({ group: true, mentioned: true, authorId: "U1" }))).toBe(true);
+	expect(
+		steerDirectedAtPersona(row({ group: true, mentioned: false, authorId: "U1", replyTo: { fromSelf: true } })),
+	).toBe(true);
+	expect(steerDirectedAtPersona(row({ group: true, mentioned: false, authorId: "U1" }))).toBe(false);
+	expect(
+		steerDirectedAtPersona(row({ group: true, mentioned: false, authorId: "U1", replyTo: { fromSelf: false } })),
+	).toBe(false);
+});
+
+test("a mid-turn group message that did not address the persona is steered with the may-stay-silent framing", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-undirected-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(home, "agent"),
+	);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+
+	enqueue("trigger", "draft the release note", { group: true, mentioned: true, authorId: "U1" });
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial send did not become accepted");
+	const running = port.sends.at(0);
+	if (!running) throw new Error("initial send missing");
+
+	enqueue("aside", "예찬님 그건 내일 봐요", { group: true, mentioned: false, authorId: "U2" });
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.steers.length === 1, "undirected message was not steered");
+	enqueue("addressed", "also add the date", { group: true, mentioned: true, authorId: "U1" });
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.steers.length === 2, "addressed message was not steered");
+
+	expect(port.sends).toHaveLength(1);
+	expect(port.steers[0]?.text).toBe(renderSteer("예찬님 그건 내일 봐요", false));
+	expect(port.steers[1]?.text).toBe(renderSteer("also add the date"));
+	port.complete(running.opRef, "done");
 });
 
 test("a steered message is answered in its own mid-work reply, which closes the turn's steer window", async () => {

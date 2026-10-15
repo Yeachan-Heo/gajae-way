@@ -1,7 +1,9 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import { type ChatMessagePayload, type OriginRef, originKey, ProtocolError } from "@gajae-gateway/protocol";
 import {
 	appendAttempt,
@@ -11,13 +13,25 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { classifyCheckRollup } from "../src/orchestrator/gh-checks";
-import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
+import {
+	classifyCheckRollup,
+	failedCheckLogTargets,
+	sanitizedFailureLogStreamTail,
+} from "../src/orchestrator/gh-checks";
+import {
+	LaneGovernor,
+	laneJobIdentity,
+	managedLaneBranchName,
+	managedLaneRepositoryPath,
+	managedLaneWorktreePath,
+	workSessionKey,
+} from "../src/orchestrator/lane-governor";
 import {
 	parseWorkerOutputResponse,
 	type SessionBindInput,
 	type WorkerOutputResult,
 } from "../src/orchestrator/session-port";
+import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import {
 	assertOutsideServiceDirectory,
 	type CheckStatusClient,
@@ -30,7 +44,7 @@ import {
 	WorkLaneManager,
 	type WorkLaneManagerOptions,
 } from "../src/orchestrator/work-lane";
-import { Store } from "../src/store";
+import { BrokerAuthorityError, Store } from "../src/store";
 import { WorkAttemptStateError } from "../src/store/groups/work";
 import { ScriptedSessionPort } from "./session-port.fake";
 
@@ -39,6 +53,15 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 const origin: OriginRef = { platform: "discord", kind: "channel", conversationId: "work-results" };
+
+test("managed repository and worktree paths preserve exact lane-name identity", () => {
+	const root = "/tmp/gajaeway";
+	expect(managedLaneRepositoryPath(root, "Foo")).not.toBe(managedLaneRepositoryPath(root, "foo"));
+	expect(managedLaneRepositoryPath(root, "Foo")).toBe(join(root, "repositories", Buffer.from("Foo").toString("hex")));
+	expect(managedLaneWorktreePath(root, "Foo")).not.toBe(managedLaneWorktreePath(root, "foo"));
+	expect(managedLaneWorktreePath(root, "Foo")).toBe(join(root, "lanes", Buffer.from("Foo").toString("hex")));
+});
+
 async function until(predicate: () => boolean): Promise<void> {
 	for (let i = 0; i < 600 && !predicate(); i++) await Bun.sleep(5);
 	expect(predicate()).toBe(true);
@@ -54,7 +77,9 @@ async function fixture(
 	options: Partial<WorkLaneManagerOptions> = {},
 	portOptions: ConstructorParameters<typeof ScriptedSessionPort>[0] = {},
 ) {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-work-lane-"));
+	let directory = await mkdtemp(join(tmpdir(), "gajaeway-work-lane-"));
+	// Normalize path to resolve macOS /var -> /private/var symlink
+	directory = await realpath(directory);
 	const gajaewayHome = join(directory, "gajaeway");
 	// Create gajaewayHome directory for service directory validation tests
 	await mkdir(gajaewayHome, { recursive: true });
@@ -71,7 +96,7 @@ async function fixture(
 		},
 	});
 	const notices: ChatMessagePayload[] = [];
-	const lanes = new LaneGovernor({ database: db, sessionPort: port, maxLanes: 2 });
+	const lanes = new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome, maxLanes: 2 });
 	let implicitOwner: OriginRef | undefined;
 	const ownerTarget = options.ownerTarget ?? (() => implicitOwner);
 	let manager = new WorkLaneManager({
@@ -133,6 +158,65 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	return result;
 }
 
+test("bind failures map causes and emit one redacted diagnostic each", async () => {
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const failures = [
+		["broker unavailable", "broker_unavailable", () => new GjcCliUnavailableError("broker unavailable")],
+		[
+			"sanitized broker unavailable",
+			"broker_unavailable",
+			() => new Error("gjc sdk request failed: broker_unavailable (broker unavailable)"),
+		],
+		["timeout", "timeout", () => new GjcCliUnavailableError("request timed out after 1000ms")],
+		["session-create timeout", "timeout", () => new Error("gjc session.create did not complete within 60000ms")],
+		["cwd rejected", "cwd_rejected", () => new BrokerAuthorityError("unowned_session")],
+		["epoch conflict", "epoch_conflict", () => new BrokerAuthorityError("authority_mismatch")],
+		[
+			"ProtocolError reasonCode",
+			"broker_unavailable",
+			() => new ProtocolError("verb_failed", "bind rejected", { reasonCode: "session_unavailable" }),
+		],
+		[
+			"unknown fallback",
+			"unknown",
+			() => new Error(`authentication failed token=sk_live_123456789abcdef\n${"x".repeat(240)}`),
+		],
+	] as const;
+	for (const [label, cause, makeError] of failures) {
+		const f = await fixture();
+		f.port.bind = async () => {
+			throw makeError();
+		};
+
+		errors.mockClear();
+		let failure: unknown;
+		try {
+			await f.manager.start({ name: "a", text: "work", cwd: f.directory });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(ProtocolError);
+		expect(failure).toMatchObject({
+			code: "verb_failed",
+			message: `work lane bind failed (cause: ${cause})`,
+			detail: { reasonCode: "bind_failed", cause, name: "a" },
+		});
+
+		const lines = errors.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("work_bind_failed"));
+		expect(lines).toHaveLength(1);
+		const line = lines[0];
+		expect(line).toBeDefined();
+		if (line === undefined) throw new Error("bind failure diagnostic was not captured");
+		expect(line).toStartWith(
+			`work_bind_failed name=a origin=${workSessionKey("a")} cwd=${f.directory} cause=${cause} error=`,
+		);
+		expect(line).not.toMatch(/[\r\n]/);
+		const errorMessage = line.slice(line.indexOf(" error=") + " error=".length);
+		expect(errorMessage.length).toBeLessThanOrEqual(200);
+		if (label === "unknown fallback") expect(line).not.toContain("sk_live_123456789abcdef");
+	}
+});
 for (const model of ["startup-model", { preset: "startup-preset" }]) {
 	test(`proven startup model skips only the newly bound session's duplicate send model: ${JSON.stringify(model)}`, async () => {
 		const f = await fixture();
@@ -1048,9 +1132,64 @@ test("nested starts refuse self and ancestor cycles before binding", async () =>
 	expect(f.port.sendAttempts).toHaveLength(sends);
 });
 
-test("issue #480: repository binding is stored in job record", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-binding-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-binding-"));
+test("issue #480: a new lane requires either cwd or repo", async () => {
+	const f = await fixture();
+	await expect(f.manager.start({ name: "missing-location", text: "work" })).rejects.toMatchObject({
+		code: "invalid_params",
+		detail: { reasonCode: "repo_or_cwd_required" },
+	});
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.db.work.laneJobJson(laneJobIdentity("missing-location").jobId)).toBeUndefined();
+});
+
+test("issue #480: base cannot be selected without a repository binding", async () => {
+	const f = await fixture();
+	await expect(
+		f.manager.start({ name: "base-without-repo", text: "work", cwd: f.directory, base: "dev" }),
+	).rejects.toMatchObject({
+		code: "invalid_params",
+		detail: { reasonCode: "base_requires_repo" },
+	});
+	expect(f.port.binds).toHaveLength(0);
+});
+
+test("issue #480: repository URLs with embedded credentials are rejected", async () => {
+	const f = await fixture();
+	for (const repo of ["https://user:password@example.test/project.git", "https://user@example.test/project.git"]) {
+		await expect(f.manager.start({ name: "credentials", text: "work", repo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "invalid_work_params", field: "repo" },
+		});
+	}
+	expect(f.port.binds).toHaveLength(0);
+});
+
+test("issue #480: an existing managed repository path is not removed on collision", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-collision");
+	try {
+		const f = await fixture();
+		const repositoryPath = managedLaneRepositoryPath(f.gajaewayHome, "occupied");
+		await mkdir(repositoryPath, { recursive: true });
+		const sentinelPath = join(repositoryPath, "keep.txt");
+		await Bun.write(sentinelPath, "preserve");
+
+		await expect(f.manager.start({ name: "occupied", text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "lane_repository_path_exists" },
+		});
+		expect(await Bun.file(sentinelPath).text()).toBe("preserve");
+		expect(f.port.binds).toHaveLength(0);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: repo URL creates a cwd-independent worktree with the bound push remote", async () => {
+	let repoDir = await mkdtemp(join(tmpdir(), "test-repo-binding-"));
+	let bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-binding-"));
+	// Normalize paths to resolve macOS /var -> /private/var symlink
+	repoDir = await realpath(repoDir);
+	bareRepo = await realpath(bareRepo);
 	try {
 		const git = (...args: string[]) =>
 			Bun.spawnSync(["git", "-C", repoDir, ...args], {
@@ -1071,22 +1210,66 @@ test("issue #480: repository binding is stored in job record", async () => {
 			stderr: "ignore",
 		});
 
-		const f = await fixture();
+		const repositoryUrl = pathToFileURL(bareRepo).href;
+		const f = await fixture({ serviceDirectory: process.cwd() });
 		const result = await f.manager.start({
-			name: "a",
+			name: "remote-binding",
 			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
+			repo: repositoryUrl,
 		});
 		if (!result.started) throw new Error("work did not start");
-		const job = f.job();
-		expect(job.lane.repository).toBe(bareRepo);
+		const job = f.job("remote-binding");
+		expect(job.lane.worktreePath).toBe(managedLaneWorktreePath(f.gajaewayHome, "remote-binding"));
+		expect(job.lane.repository).toBe(repositoryUrl);
+		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(f.gajaewayHome, "remote-binding"));
+		expect(job.baselineSha).toMatch(/^[0-9a-f]{40}$/);
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(originUrl.exitCode).toBe(0);
+		expect(originUrl.stdout?.toString().trim()).toBe(repositoryUrl);
+		expect(f.port.binds.at(-1)?.repo).toBe(job.lane.worktreePath);
+		expect(await f.manager.status({ name: "remote-binding" })).toMatchObject({
+			repository: { url: repositoryUrl, branch: managedLaneBranchName("remote-binding"), base: job.baselineSha },
+		});
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
 	}
 });
 
+test("remote clones are asynchronous, preserve repo_clone_failed, and clean up managed paths", async () => {
+	const requestReceived = deferred<void>();
+	const server = createServer((socket) => {
+		socket.once("data", () => {
+			requestReceived.resolve(undefined);
+			setTimeout(() => socket.end("0014ERR unavailable\n"), 50);
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	try {
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("local git server did not bind a TCP port");
+		const f = await fixture();
+		const name = "missing-remote-clone";
+		const remoteUrl = `git://127.0.0.1:${address.port}/missing.git`;
+		const clone = f.manager.start({ name, text: "work", repo: remoteUrl });
+		await requestReceived.promise;
+		await Bun.sleep(10);
+		await expect(clone).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "repo_clone_failed", repo: remoteUrl },
+		});
+		await expect(lstat(managedLaneWorktreePath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(lstat(managedLaneRepositoryPath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
+});
 test("run of the caller's own open lane is attempt_open, not a cycle", async () => {
 	const f = await fixture({ allowNested: () => true });
 	const parent = await f.manager.start({ name: "same", text: "parent task", cwd: f.directory });
@@ -1190,6 +1373,60 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 	expect(f.notices).toHaveLength(1);
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
+});
+
+test("#562 a missing receipt stays open during turn activity and recovery until lifecycle end", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	let statusReads = 0;
+	let outputReads = 0;
+	const result = await started(f, "a", origin);
+	f.port.status = async (input) => {
+		statusReads++;
+		return {
+			operationRef: input.opRef,
+			status: { status: "terminal_ok", receiptState: "missing", outcome: { reason: "end_turn" } },
+			summaryCompleted: true,
+		};
+	};
+	f.port.fetchWorkerOutput = async () => {
+		outputReads++;
+		return { status: "absent", code: "output_pending" };
+	};
+	await until(() => statusReads > 0);
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => statusReads > 1);
+	await Bun.sleep(30);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		settledAt: null,
+		terminal: null,
+		output: { reads: 0, disposition: "pending" },
+	});
+	expect(outputReads).toBe(0);
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toEqual([]);
+
+	await f.restart();
+	await until(() => f.port.tailsOf(result.sessionId).some((tail) => tail.opRef === result.opRef && tail.running));
+	await Bun.sleep(30);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null, terminal: null });
+	expect(outputReads).toBe(0);
+	expect(f.notices).toEqual([]);
+
+	// Only the turn lifecycle end begins the bounded missing-receipt retrieval budget.
+	f.port.emitTurnEnd(result.sessionId, result.opRef, "agent_end");
+	await until(() => outputReads === 1);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		turnEndObservedAt: expect.any(String),
+		terminal: { reasonCode: "terminal_missing_receipt" },
+		settledAt: null,
+	});
+	now += 1000;
+	await until(() => outputReads === 2);
+	now += 5000;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(outputReads).toBe(3);
+	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 });
 
 test("a receipt still missing after the output budget stays held with a non-loss diagnostic (#248)", async () => {
@@ -1358,7 +1595,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	let manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome }),
 		gajaewayHome,
 		serviceDirectory: gajaewayHome,
 		ownerTarget: () => origin,
@@ -1378,7 +1615,7 @@ test("reopening SQLite recovers the same live operation and immutable notificati
 	manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome }),
 		gajaewayHome,
 		serviceDirectory: gajaewayHome,
 		pollMs: 5,
@@ -1430,6 +1667,8 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
 				const opRef = f.job().attempts[0]!.opRef;
+				if (receiptState === "missing")
+					f.port.emitTurnEnd(f.job().attempts[0]!.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
 				const runtime = f.db.work.workAttemptGet(opRef)!;
 				expect(runtime.sendPhase).toBe(receiptState === "present" ? "accepted" : "uncertain");
@@ -1483,6 +1722,65 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(f.notices[0]?.text).toBe(reportText(name, "completed", "end_turn", result.opRef, runtime.output));
 	expect(Buffer.byteLength(f.notices[0]!.text, "utf8")).toBeLessThanOrEqual(2048);
+});
+
+test("repository and PR head facts survive a large completion excerpt", () => {
+	const headSha = "a".repeat(40);
+	const prHeadSha = "b".repeat(40);
+	const output = {
+		disposition: "available" as const,
+		reads: 0,
+		nextReadAt: null,
+		excerpt: "x".repeat(8_000),
+		proof: null,
+		knownSilence: null,
+	};
+	const facts = {
+		headSha,
+		dirtyFiles: 0,
+		pushed: true,
+		remoteHeadSha: headSha,
+		checkStatus: { prNumber: 545, headSha: prHeadSha, status: "green" as const, failingChecks: [] },
+	};
+	const text = reportText("a", "completed", "end_turn", "op-ref", output, facts);
+	expect(text.startsWith("[lane a] attempt_ended:")).toBe(true);
+	expect(text).toContain("head=aaaaaaaaaaaa");
+	expect(text).toContain("pushed=true");
+	expect(text).toContain("remoteHead=aaaaaaaaaaaa");
+	expect(text).toContain("pr=545 checks=green prHead=bbbbbbbbbbbb");
+	expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
+});
+
+test("failed CI logs are redacted incrementally before retaining a bounded tail", async () => {
+	const secret = "z".repeat(4_000);
+	const arraySecret = "array-value-that-must-not-escape";
+	const splitArraySecret = "control-split-array-value";
+	const log = `${"x".repeat(4_000)} secret=${secret}\n{"secrets": [\n  "${arraySecret}",\n  "another-value"\n]}\n{"secr\0ets": [\n  "${splitArraySecret}"\n]}\n`;
+	const bytes = Buffer.from(log, "utf8");
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let offset = 0; offset < bytes.length; offset += 113)
+				controller.enqueue(bytes.subarray(offset, Math.min(offset + 113, bytes.length)));
+			controller.close();
+		},
+	});
+	const result = await sanitizedFailureLogStreamTail(stream);
+	expect(result.overflowed).toBe(false);
+	expect(result.tail).toContain("secret=[redacted]");
+	expect(result.tail).toContain('"secrets": [redacted]');
+	expect(result.tail).not.toContain(secret);
+	expect(result.tail).not.toContain(arraySecret);
+	expect(result.tail).not.toContain(splitArraySecret);
+	expect(Buffer.byteLength(result.tail ?? "", "utf8")).toBeLessThanOrEqual(3_200);
+	const oversized = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(Buffer.from(`${"x".repeat(70 * 1024)} secret=${secret}`));
+			controller.close();
+		},
+	});
+	const bounded = await sanitizedFailureLogStreamTail(oversized);
+	expect(bounded.overflowed).toBe(true);
+	expect(bounded.tail).toBeUndefined();
 });
 
 test("AC-K notice names persona parent", () => {
@@ -1620,6 +1918,82 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	expect(f.port.steers[0]?.text).toContain("Report from child work lane child; not from a human.");
 	expect(f.port.sendAttempts).toHaveLength(2);
 	expect(f.notices).toHaveLength(0);
+});
+
+test("child reports fall back when a nested parent is parked or done", async () => {
+	for (const parentState of ["awaiting_checks", "done"] as const) {
+		const checks = scriptedChecks({ prNumber: 510, status: "pending", failingChecks: [] });
+		const f = await fixture({
+			allowNested: () => true,
+			checkStatusClient: checks.client,
+			ownerTarget: () => origin,
+		});
+		f.setOwnerTarget(origin);
+		await laneRepo(f.directory, `fix/parent-${parentState}`, true);
+		const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+		if (!parent.started) throw new Error("parent did not start");
+		const child = await f.manager.start({
+			name: "child",
+			text: "child work",
+			cwd: f.directory,
+			callerSessionId: parent.sessionId,
+		});
+		if (!child.started) throw new Error("child did not start");
+		f.port.complete(parent.opRef, "parent result");
+		await until(() => f.job("parent").state === "awaiting_checks");
+		if (parentState === "done") {
+			checks.set({ prNumber: 510, status: "green", failingChecks: [] });
+			await pollUntil(f, () => f.job("parent").state === "done");
+		}
+		f.port.complete(child.opRef, "child result after parent parked");
+		await until(() => f.notices.some((notice) => notice.text.includes("child result after parent parked")));
+		expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+		expect(f.notices.at(-1)?.text).toContain(
+			parentState === "done" ? "[lane child] completed" : "[lane child] attempt_ended",
+		);
+	}
+});
+
+test("#481 check-settlement reports fall back when a nested parent was aborted", async () => {
+	const checks = scriptedChecks({ prNumber: 510, status: "pending", failingChecks: [] });
+	const f = await fixture({
+		allowNested: () => true,
+		checkStatusClient: checks.client,
+		ownerTarget: () => origin,
+	});
+	f.setOwnerTarget(origin);
+	await laneRepo(f.directory, "fix/parent-aborted", true);
+	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+	if (!parent.started) throw new Error("parent did not start");
+	const child = await f.manager.start({
+		name: "child",
+		text: "child work",
+		cwd: f.directory,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child did not start");
+	f.port.complete(parent.opRef, "parent result");
+	await until(() => f.job("parent").state === "awaiting_checks");
+	f.port.complete(child.opRef, "child result");
+	await until(() => f.job("child").state === "awaiting_checks");
+	const { awaitingChecks: _, ...parentWithoutChecks } = f.job("parent");
+	const abortedParent = {
+		...parentWithoutChecks,
+		state: "aborted" as const,
+		updatedAt: new Date().toISOString(),
+	};
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, {
+			...abortedParent,
+			laneKey: laneJobIdentity("parent").laneKey,
+			json: JSON.stringify(abortedParent),
+		}),
+	);
+	checks.set({ prNumber: 510, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job("child").state === "done");
+	expect(f.job("parent").state).toBe("aborted");
+	expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+	expect(f.notices.some((notice) => notice.text.startsWith("[lane child] checks passed:"))).toBe(true);
 });
 
 test("torn nested steer replays with the same clientRef after restart and consumes once", async () => {
@@ -2120,6 +2494,7 @@ test("transport failure ECONNRESET without errorStatus yields transport cause in
 		summaryCompleted: true,
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	f.port.fail(result.opRef, "private failure", { code: "sdk_failed" });
 	// Mock the transport failure
 	f.port.setFailedTransportCause(result.sessionId, {
 		kind: "transport",
@@ -2156,6 +2531,7 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 		summaryCompleted: true,
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	f.port.fail(result.opRef, "private failure", { code: "sdk_failed" });
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	const attempt = f.db.work.workAttemptGet(result.opRef);
 	const notice = f.notices[0]?.text ?? "";
@@ -2188,25 +2564,36 @@ async function laneRepo(directory: string, branch: string, push: boolean) {
 	return git(directory, "rev-parse", "HEAD");
 }
 
-function recordingCheckClient(answer: CheckStatusSnapshot | null) {
+type CheckStatusAnswer = Omit<CheckStatusSnapshot, "headSha"> & { readonly headSha?: string };
+
+function withHeadSha(
+	answer: CheckStatusAnswer | null | undefined,
+	cwd: string,
+): CheckStatusSnapshot | null | undefined {
+	if (answer === null || answer === undefined) return answer;
+	const headSha = answer.headSha ?? Bun.spawnSync(["git", "-C", cwd, "rev-parse", "HEAD"]).stdout.toString().trim();
+	return { ...answer, headSha };
+}
+
+function recordingCheckClient(answer: CheckStatusAnswer | null) {
 	const calls: Array<{ branch: string; cwd: string }> = [];
 	const client: CheckStatusClient = {
 		async getCheckStatus(branch, cwd) {
 			calls.push({ branch, cwd });
-			return answer;
+			return withHeadSha(answer, cwd);
 		},
 	};
 	return { calls, client };
 }
 
-async function settledReport(f: Awaited<ReturnType<typeof fixture>>) {
+async function settledReport(f: Awaited<ReturnType<typeof fixture>>, label = "completed") {
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "done");
-	await until(() => f.notices.some((notice) => notice.text.includes("[lane a] completed")));
-	return f.notices.find((notice) => notice.text.includes("[lane a] completed"))?.text ?? "";
+	await until(() => f.notices.some((notice) => notice.text.includes(`[lane a] ${label}`)));
+	return f.notices.find((notice) => notice.text.includes(`[lane a] ${label}`))?.text ?? "";
 }
 
-test("#481 settled report of an unpushed lane carries its head and pushed=false without a PR lookup", async () => {
+test("#481 settled report of an unpushed lane carries its head and pushed=false when no PR is found", async () => {
 	const { calls, client } = recordingCheckClient(null);
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
 	const head = await laneRepo(f.directory, "fix/unpushed", false);
@@ -2214,7 +2601,7 @@ test("#481 settled report of an unpushed lane carries its head and pushed=false 
 	expect(text).toContain(`head=${head.slice(0, 12)}`);
 	expect(text).toContain("pushed=false");
 	expect(text).not.toContain("pr=");
-	expect(calls).toHaveLength(0);
+	expect(calls).toEqual([{ branch: "fix/unpushed", cwd: f.directory }]);
 });
 
 test("#481 settled report of a pushed lane without an open PR says pushed=true and no checks", async () => {
@@ -2228,11 +2615,227 @@ test("#481 settled report of a pushed lane without an open PR says pushed=true a
 	expect(calls).toEqual([{ branch: "fix/no-pr", cwd: f.directory }]);
 });
 
+test("#481 repo-backed bare clones detect pushed branches without remote-tracking refs", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("bare-clone-push-check");
+	const { calls, client } = recordingCheckClient({ prNumber: 484, status: "green", failingChecks: [] });
+	try {
+		const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+		const name = "bare-push";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branch = managedLaneBranchName(name);
+		const trackingRef = Bun.spawnSync(
+			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/remotes/origin/${branch}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(trackingRef.exitCode).not.toBe(0);
+
+		const push = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "push", "-u", "origin", branch], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(push.exitCode).toBe(0);
+
+		f.port.complete(result.opRef, "pushed");
+		await until(() => f.notices.some((notice) => notice.text.includes("[lane bare-push] completed")));
+		const report = f.notices.find((notice) => notice.text.includes("[lane bare-push] completed"))?.text ?? "";
+		expect(report).toContain("pushed=true");
+		expect(report).toContain("pr=484");
+		expect(report).toContain("checks=green");
+		expect(calls).toEqual([{ branch, cwd: job.lane.worktreePath }]);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#481 a local checkout lane pushes to its configured origin push URL", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("checkout-push-target");
+	const { calls, client } = recordingCheckClient({ prNumber: 485, status: "green", failingChecks: [] });
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const fetchUrl = "https://github.com/example/project.git";
+		git(repoDir, "remote", "add", "origin", fetchUrl);
+		git(repoDir, "remote", "set-url", "--push", "origin", bareRepo);
+
+		const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+		const name = "checkout-push";
+		const result = await f.manager.start({ name, text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branch = managedLaneBranchName(name);
+		expect(git(job.lane.worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
+		expect(git(job.lane.worktreePath, "remote", "get-url", "--push", "origin")).toBe(bareRepo);
+		git(job.lane.worktreePath, "push", "-u", "origin", branch);
+		git(bareRepo, "show-ref", "--verify", `refs/heads/${branch}`);
+		const accidentalLocalPush = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${branch}`], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(accidentalLocalPush.exitCode).not.toBe(0);
+
+		f.port.complete(result.opRef, "pushed upstream");
+		await until(() => f.notices.some((notice) => notice.text.includes("[lane checkout-push] completed")));
+		const report = f.notices.find((notice) => notice.text.includes("[lane checkout-push] completed"))?.text ?? "";
+		expect(report).toContain("pushed=true");
+		expect(report).toContain("pr=485");
+		expect(report).toContain("checks=green");
+		expect(calls).toEqual([{ branch, cwd: job.lane.worktreePath }]);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#550 local checkout lanes resolve relative origin fetch and push URLs against the source repository", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("relative-origin-url");
+	let pushRepo = await mkdtemp(join(tmpdir(), "relative-origin-push-"));
+	// Normalize path to resolve macOS /var -> /private/var symlink
+	pushRepo = await realpath(pushRepo);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		Bun.spawnSync(["git", "init", "--bare", "-q", pushRepo], { env });
+		git(repoDir, "remote", "add", "origin", relative(repoDir, bareRepo));
+		git(repoDir, "remote", "set-url", "--push", "origin", relative(repoDir, pushRepo));
+		git(repoDir, "fetch", "origin");
+		const defaultBranch = git(repoDir, "branch", "--show-current");
+		const initialRemoteSha = git(repoDir, "rev-parse", `refs/remotes/origin/${defaultBranch}`);
+
+		const f = await fixture();
+		const name = "relative-remote";
+		const result = await f.manager.start({ name, text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const worktreePath = f.job(name).lane.worktreePath;
+		const branch = managedLaneBranchName(name);
+		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(bareRepo);
+		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushRepo);
+		expect(git(worktreePath, "config", "--get", "remote.origin.fetch")).toBe("+refs/heads/*:refs/remotes/origin/*");
+		expect(git(worktreePath, "rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(initialRemoteSha);
+		git(repoDir, "commit", "--allow-empty", "-m", "advance upstream");
+		const advancedSha = git(repoDir, "rev-parse", "HEAD");
+		git(repoDir, "push", bareRepo, `HEAD:refs/heads/${defaultBranch}`);
+		git(worktreePath, "fetch", "origin");
+		expect(git(worktreePath, "rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(advancedSha);
+		git(worktreePath, "push", "-u", "origin", branch);
+		git(pushRepo, "show-ref", "--verify", `refs/heads/${branch}`);
+	} finally {
+		await cleanup();
+		await rm(pushRepo, { recursive: true, force: true });
+	}
+});
+
+test("#550 local checkout lanes preserve scp-like origin URLs", async () => {
+	const { repoDir, cleanup } = await bareRepoFixture("scp-origin-url");
+	const env = { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@test" };
+	const git = (cwd: string, ...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const fetchUrl = "git@github.com:example/project.git";
+		const pushUrl = "git@example.net:mirror/project.git";
+		git(repoDir, "remote", "add", "origin", fetchUrl);
+		git(repoDir, "remote", "set-url", "--push", "origin", pushUrl);
+
+		const f = await fixture();
+		const result = await f.manager.start({ name: "scp-origin", text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const worktreePath = f.job("scp-origin").lane.worktreePath;
+		expect(git(worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
+		expect(git(worktreePath, "remote", "get-url", "--push", "origin")).toBe(pushUrl);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("#481 remote push probes are asynchronous and bounded", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("bounded-remote-probe");
+	const { calls, client } = recordingCheckClient({ prNumber: 485, status: "red", failingChecks: ["lint"] });
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	let remoteRequests = 0;
+	const slowRemote = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch() {
+			remoteRequests++;
+			await Bun.sleep(250);
+			return new Response("remote unavailable", { status: 503 });
+		},
+	});
+	try {
+		const name = "slow-remote";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const setPushUrl = Bun.spawnSync(
+			[
+				"git",
+				"-C",
+				f.job(name).lane.worktreePath,
+				"remote",
+				"set-url",
+				"--push",
+				"origin",
+				`http://127.0.0.1:${slowRemote.port}/repo.git`,
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(setPushUrl.exitCode).toBe(0);
+		let timerFired = false;
+		const timer = setTimeout(() => {
+			timerFired = true;
+		}, 50);
+		const start = Date.now();
+		f.port.complete(result.opRef, "remote probe");
+		const completionCallMs = Date.now() - start;
+		await Bun.sleep(100);
+		clearTimeout(timer);
+		expect(completionCallMs).toBeLessThan(100);
+		expect(timerFired).toBe(true);
+		await until(() => remoteRequests > 0);
+
+		await until(() => f.job(name).state === "awaiting_checks");
+		const report = f.notices.find((notice) => notice.text.includes("[lane slow-remote] attempt_ended"))?.text ?? "";
+		const headSha = Bun.spawnSync(["git", "-C", f.job(name).lane.worktreePath, "rev-parse", "HEAD"])
+			.stdout.toString()
+			.trim();
+		expect(report).toContain("pushed=unknown");
+		expect(report).toContain("pr=485");
+		expect(f.job(name).awaitingChecks?.headSha).toBe(headSha);
+		expect(calls.length).toBeGreaterThan(0);
+		expect(f.port.sends).toHaveLength(1);
+	} finally {
+		await slowRemote.stop(true);
+		await cleanup();
+	}
+});
+
 test("#481 settled report of a pushed lane with a red PR names the PR and failing checks", async () => {
 	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
 	await laneRepo(f.directory, "fix/red", true);
-	const text = await settledReport(f);
+	const text = await settledReport(f, "attempt_ended");
 	expect(text).toContain("pushed=true");
 	expect(text).toContain("pr=484");
 	expect(text).toContain("checks=red(lint,test)");
@@ -2240,24 +2843,579 @@ test("#481 settled report of a pushed lane with a red PR names the PR and failin
 
 test("#481 check rollup: any failure is red, unfinished is pending, all success is green", () => {
 	const run = (name: string, status: string, conclusion = "") => ({ __typename: "CheckRun", name, status, conclusion });
+	const headSha = "a".repeat(40);
 	expect(
-		classifyCheckRollup(1, [
+		classifyCheckRollup(1, headSha, [
 			run("lint", "COMPLETED", "FAILURE"),
 			run("lint", "COMPLETED", "FAILURE"),
 			run("test", "IN_PROGRESS"),
 		]),
-	).toEqual({ prNumber: 1, status: "red", failingChecks: ["lint"] });
-	expect(classifyCheckRollup(2, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe("pending");
-	expect(classifyCheckRollup(3, []).status).toBe("pending");
+	).toEqual({ prNumber: 1, headSha, status: "red", failingChecks: ["lint"] });
+	expect(classifyCheckRollup(2, headSha, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe(
+		"pending",
+	);
+	expect(classifyCheckRollup(3, headSha, []).status).toBe("pending");
 	expect(
-		classifyCheckRollup(4, [
+		classifyCheckRollup(4, headSha, [
 			run("lint", "COMPLETED", "SUCCESS"),
 			{ __typename: "StatusContext", context: "ci/x", state: "SUCCESS" },
 		]).status,
 	).toBe("green");
 	expect(
-		classifyCheckRollup(5, [{ __typename: "StatusContext", context: "ci/x", state: "ERROR" }]).failingChecks,
+		classifyCheckRollup(5, headSha, [{ __typename: "StatusContext", context: "ci/x", state: "ERROR" }]).failingChecks,
 	).toEqual(["ci/x"]);
+	expect(classifyCheckRollup(6, headSha, [run("lint", "COMPLETED", "STALE")]).status).toBe("pending");
+	expect(classifyCheckRollup(7, headSha, [run("lint", "COMPLETED", "UNKNOWN")]).status).toBe("pending");
+	for (const conclusion of ["NEUTRAL", "SKIPPED"])
+		expect(classifyCheckRollup(9, headSha, [run("optional", "COMPLETED", conclusion)]).status).toBe("green");
+	expect(
+		failedCheckLogTargets([
+			{
+				status: "COMPLETED",
+				conclusion: "FAILURE",
+				detailsUrl: "https://github.com/example/repo/actions/runs/123/job/456",
+			},
+			{
+				status: "COMPLETED",
+				conclusion: "FAILURE",
+				detailsUrl: "https://github.com/example/repo/actions/runs/123junk",
+			},
+		]),
+	).toEqual([{ runId: "123", jobId: "456" }]);
+	expect(() => classifyCheckRollup(8, "invalid", [])).toThrow("PR head SHA is invalid");
+});
+
+/** A check client whose answer the test changes between polls. */
+function scriptedChecks(initial: CheckStatusAnswer | null | undefined) {
+	let answer = initial;
+	const calls: Array<{ branch: string; cwd: string }> = [];
+	const client: CheckStatusClient = {
+		async getCheckStatus(branch, cwd) {
+			calls.push({ branch, cwd });
+			return withHeadSha(answer, cwd);
+		},
+	};
+	return {
+		client,
+		calls,
+		set(next: CheckStatusAnswer | null | undefined) {
+			answer = next;
+		},
+	};
+}
+
+/** Starts lane `a` on a pushed branch and completes its attempt into awaiting_checks. */
+async function awaitingLane(f: Awaited<ReturnType<typeof fixture>>, branch: string, name = "a", cwd = f.directory) {
+	const head = await laneRepo(cwd, branch, true);
+	const result = await started(f, name, origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.job(name).state === "awaiting_checks");
+	return { head, sessionId: result.sessionId };
+}
+
+/** Runs recovery passes (each ends with one awaiting_checks poll) until `predicate` holds. */
+async function pollUntil(f: Awaited<ReturnType<typeof fixture>>, predicate: () => boolean): Promise<void> {
+	for (let i = 0; i < 200 && !predicate(); i++) {
+		await f.manager.recover();
+		await Bun.sleep(5);
+	}
+	expect(predicate()).toBe(true);
+}
+
+/** Runs `passes` complete recovery passes. */
+async function pollTimes(f: Awaited<ReturnType<typeof fixture>>, passes: number): Promise<void> {
+	for (let i = 0; i < passes; i++) {
+		await f.manager.recover();
+		await f.manager.recover();
+	}
+}
+
+function checksNotice(f: Awaited<ReturnType<typeof fixture>>, lead: string): string | undefined {
+	return f.notices.find((notice) => notice.text.startsWith(lead))?.text;
+}
+
+test("#481 a lane with pending PR checks reports an unfinished attempt and waits with its PR and head recorded", async () => {
+	const checks = scriptedChecks({ prNumber: 485, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/pending");
+	const job = f.job();
+	expect(job.awaitingChecks).toMatchObject({ prNumber: 485, headSha: head, retries: 0 });
+	const notice = checksNotice(f, "[lane a] attempt_ended");
+	expect(notice).toContain(`head=${head.slice(0, 12)}`);
+	expect(notice).toContain("pr=485");
+	expect(notice).toContain("checks=pending");
+});
+
+test("#481 multiple awaiting lanes poll GitHub concurrently", async () => {
+	let measure = false;
+	let active = 0;
+	let maximumActive = 0;
+	const client: CheckStatusClient = {
+		async getCheckStatus(branch, cwd) {
+			if (measure) {
+				active++;
+				maximumActive = Math.max(maximumActive, active);
+				await Bun.sleep(50);
+				active--;
+			}
+			const headSha = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "HEAD"]).stdout.toString().trim();
+			return {
+				prNumber: branch.includes("second") ? 502 : 501,
+				headSha,
+				status: "pending",
+				failingChecks: [],
+			};
+		},
+	};
+	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
+	const secondRepo = join(f.directory, "second-repo");
+	await mkdir(secondRepo);
+	await awaitingLane(f, "fix/concurrent-first", "a");
+	await awaitingLane(f, "fix/concurrent-second", "b", secondRepo);
+	measure = true;
+	await f.manager.recover();
+	expect(maximumActive).toBe(2);
+});
+
+test("#481 a temporary initial PR lookup failure stays durable until the PR is discovered", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/pr-appears-later", true);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.job().state === "awaiting_checks");
+	const since = f.job().awaitingChecks?.since;
+	expect(f.job().awaitingChecks).toMatchObject({ prNumber: null, headSha: head, retries: 0 });
+	checks.set({ prNumber: 497, status: "pending", failingChecks: [] });
+	await pollUntil(f, () => f.job().awaitingChecks?.prNumber === 497);
+	expect(f.job().state).toBe("awaiting_checks");
+	expect(f.job().awaitingChecks?.since).toBe(since);
+});
+
+test("#481 awaiting_checks rejects a new external attempt while checks are pending", async () => {
+	const checks = scriptedChecks({ prNumber: 488, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/reject-start-during-checks");
+	const held = await f.manager.start({ name: "a", text: "skip the check wait", cwd: f.directory });
+	expect(held).toMatchObject({ started: false, held: true, state: "awaiting_checks" });
+	expect(f.port.sends).toHaveLength(1);
+	checks.set({ prNumber: 488, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state === "done");
+	const afterDone = await f.manager.start({ name: "a", text: "reopen completed work", cwd: f.directory });
+	expect(afterDone).toMatchObject({ started: false, held: true, state: "done" });
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 a lane whose PR is already red at settle starts the bounded repair cycle", async () => {
+	const checks = scriptedChecks({ prNumber: 486, status: "red", failingChecks: ["test"] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/red-pr", true);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.job().state === "awaiting_checks");
+	await pollUntil(f, () => f.port.sends.length === 2);
+	expect(f.job().state).toBe("running");
+	expect(f.job().awaitingChecks?.retries).toBe(1);
+	expect(f.port.sends[1]?.text).toContain("test");
+	expect(checksNotice(f, "[lane a] completed")).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("checks=red(test)");
+});
+
+test("#481 a lane whose HEAD is unpushed never waits for checks", async () => {
+	const checks = scriptedChecks(null);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/unpushed-head", false);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] completed") !== undefined);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(checksNotice(f, "[lane a] completed")).toContain("pushed=false");
+	expect(checks.calls).toEqual([{ branch: "fix/unpushed-head", cwd: f.directory }]);
+});
+
+test("#481 a failed PR lookup does not park a commit known to be unpushed", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/unpushed-lookup-failed", false);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("pushed=false");
+	expect(checks.calls).toEqual([{ branch: "fix/unpushed-lookup-failed", cwd: f.directory }]);
+});
+
+test("#481 a detached checkout is not parked when no PR lookup can be attempted", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/detached-head", true);
+	const result = await started(f, "a", origin);
+	const worktreePath = f.job().lane.worktreePath;
+	const checkout = Bun.spawnSync(["git", "-C", worktreePath, "checkout", "--detach", "HEAD"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(checkout.exitCode).toBe(0);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checks.calls).toEqual([]);
+});
+
+test("#481 completed lane with already-green checks settles done and reports the checked head", async () => {
+	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/already-green", true);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "[SILENT]");
+	await until(() => f.job().state === "awaiting_checks");
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	await until(() => checksNotice(f, "[lane a] checks passed") !== undefined);
+	expect(f.job().state).toBe("done");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=496 checks=green`);
+});
+
+test("#481 awaiting_checks: green checks settle the lane done and report the pass", async () => {
+	const checks = scriptedChecks({ prNumber: 487, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/pending-to-green");
+	checks.set({ prNumber: 487, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("done");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] checks passed")).toContain("pr=487 checks=green");
+});
+
+test("#481 awaiting_checks: red checks re-steer the lane session with the failing check names and persist retry 1", async () => {
+	const checks = scriptedChecks({ prNumber: 490, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { sessionId } = await awaitingLane(f, "fix/red-resteer");
+	const since = f.job().awaitingChecks?.since;
+	expect(f.port.sends).toHaveLength(1);
+	checks.set({
+		prNumber: 490,
+		status: "red",
+		failingChecks: ["unit-test", "lint-check"],
+		failureLogTail: "FAILED unit-test: expected 2, received 1",
+	});
+	await pollUntil(f, () => f.port.sends.length === 2);
+	const steer = f.port.sends[1];
+	expect(steer.sessionId).toBe(sessionId);
+	expect(steer.text).toContain("PR #490 checks failed");
+	expect(steer.text).toContain("unit-test, lint-check");
+	expect(steer.text).toContain("Failed log tail:\nFAILED unit-test: expected 2, received 1");
+	const job = parseLaneJobRecord(f.db.work.laneJobJson(laneJobIdentity("a").jobId)!);
+	expect(job.awaitingChecks?.retries).toBe(1);
+	expect(job.state).toBe("running");
+	expect(job.attempts.at(-1)?.opRef).toBe(steer.opRef);
+	checks.set({ prNumber: 490, status: "pending", failingChecks: [] });
+	f.port.complete(steer.opRef, "tried a fix");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(f.job().awaitingChecks?.since).toBe(since);
+	expect(f.job().awaitingChecks?.retries).toBe(1);
+});
+
+test("#481 force-retiring a dead red-check retry clears its old checks cycle", async () => {
+	const checks = scriptedChecks({ prNumber: 498, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { sessionId } = await awaitingLane(f, "fix/retire-red-retry");
+	checks.set({ prNumber: 498, status: "red", failingChecks: ["unit-test"] });
+	await pollUntil(f, () => f.port.sends.length === 2);
+	expect(f.job().awaitingChecks?.retries).toBe(1);
+	f.port.setSessionState(sessionId, { live: false });
+	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] completed")).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("pr=498 checks=pending");
+});
+
+test("#481 awaiting_checks: the third red result settles the lane failed with the red checks in its report", async () => {
+	const red: CheckStatusAnswer = { prNumber: 491, status: "red", failingChecks: ["unit-test", "lint-check"] };
+	const checks = scriptedChecks({ prNumber: 491, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/red-exhausted");
+	checks.set(red);
+	for (const retry of [1, 2]) {
+		await pollUntil(f, () => f.port.sends.length === retry + 1);
+		expect(f.job().awaitingChecks?.retries).toBe(retry);
+		// The re-steered attempt ends while its PR is still red: the lane parks again.
+		f.port.complete(f.port.sends[retry].opRef, "tried a fix");
+		await until(() => f.job().state === "awaiting_checks");
+	}
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	const job = f.job();
+	expect(job.state).toBe("awaiting_operator");
+	expect(job.awaitingChecks).toBeUndefined();
+	expect(job.escalations.at(-1)).toContain(
+		"awaiting_checks failed: checks=red(unit-test,lint-check) after 2 re-steers",
+	);
+	expect(f.port.sends).toHaveLength(3);
+	const report = checksNotice(f, "[lane a] failed");
+	expect(report).toContain("checks=red(unit-test,lint-check)");
+	expect(report).toContain("pr=491");
+});
+
+test("#481 awaiting_checks: past one hour on the injected clock the lane settles with a timeout", async () => {
+	let now = Date.parse("2026-10-13T00:00:00.000Z");
+	const checks = scriptedChecks({ prNumber: 492, status: "pending", failingChecks: [] });
+	const f = await fixture({ now: () => now, checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/timeout");
+	now += 3_600_000 - 1;
+	await pollTimes(f, 2);
+	expect(f.job().state).toBe("awaiting_checks");
+	now += 1;
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	const job = f.job();
+	expect(job.state).toBe("attempt_ended");
+	expect(job.escalations.at(-1)).toContain("awaiting_checks ended: timeout after 60m");
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks timeout")).toContain("pr=492");
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 awaiting_checks: a closed PR settles the lane with pr_closed", async () => {
+	const checks = scriptedChecks({ prNumber: 493, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/pr-closed");
+	checks.set(null);
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	const job = f.job();
+	expect(job.state).toBe("attempt_ended");
+	expect(job.escalations.at(-1)).toContain("awaiting_checks ended: pr_closed pr=493");
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks pr_closed")).toContain("pr=493");
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 awaiting_checks: a HEAD other than the recorded one settles the lane with head_moved", async () => {
+	const checks = scriptedChecks({ prNumber: 494, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/head-moved");
+	const env = {
+		...process.env,
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+	};
+	for (const args of [
+		["commit", "-q", "--allow-empty", "-m", "outside push"],
+		["push", "-q", "origin", "fix/head-moved"],
+	])
+		expect(Bun.spawnSync(["git", "-C", f.directory, ...args], { env }).exitCode).toBe(0);
+	const moved = Bun.spawnSync(["git", "-C", f.directory, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(moved).not.toBe(head);
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	const job = f.job();
+	expect(job.state).toBe("attempt_ended");
+	expect(job.escalations.at(-1)).toContain(
+		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${moved.slice(0, 12)}`,
+	);
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain("pr=494");
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 awaiting_checks binds a green rollup to the remote PR head, not the stale local checkout", async () => {
+	const checks = scriptedChecks({ prNumber: 496, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/remote-head-moved");
+	const branch = Bun.spawnSync(["git", "-C", f.job().lane.worktreePath, "branch", "--show-current"])
+		.stdout.toString()
+		.trim();
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const worktree = f.job().lane.worktreePath;
+	expect(
+		Bun.spawnSync(["git", "-C", worktree, "commit", "-q", "--allow-empty", "-m", "move PR head"], { env }).exitCode,
+	).toBe(0);
+	const remoteHead = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(Bun.spawnSync(["git", "-C", worktree, "push", "-q", "origin", branch]).exitCode).toBe(0);
+	expect(Bun.spawnSync(["git", "-C", worktree, "reset", "-q", "--hard", head]).exitCode).toBe(0);
+	checks.set({ prNumber: 496, headSha: remoteHead, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(f.job().escalations.at(-1)).toContain(
+		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${remoteHead.slice(0, 12)}`,
+	);
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain("pr=496");
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 waits when GitHub check metadata still reports the prior head", async () => {
+	const checks = scriptedChecks({ prNumber: 501, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/gh-head-lag");
+	checks.set({ prNumber: 501, headSha: "0".repeat(40), status: "green", failingChecks: [] });
+	await pollTimes(f, 3);
+	expect(f.job().state).toBe("awaiting_checks");
+	expect(f.port.sends).toHaveLength(1);
+	expect(checksNotice(f, "[lane a] checks passed")).toBeUndefined();
+	checks.set({ prNumber: 501, headSha: head, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state === "done");
+});
+
+test("#481 a merged PR settles successfully even when its source branch was deleted", async () => {
+	const checks = scriptedChecks({ prNumber: 502, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/merged-source-deleted";
+	const { head } = await awaitingLane(f, branch);
+	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", "--delete", branch]).exitCode).toBe(0);
+	checks.set({ prNumber: 502, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain("pr=502");
+});
+
+test("#481 initial settlement discovers a merged PR whose source branch was already deleted", async () => {
+	const checks = scriptedChecks({
+		prNumber: 504,
+		status: "pending",
+		failingChecks: [],
+		prState: "closed",
+		merged: true,
+	});
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/deleted-before-settle";
+	const head = await laneRepo(f.directory, branch, true);
+	const result = await started(f, "a", origin);
+	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", "--delete", branch]).exitCode).toBe(0);
+	f.port.complete(result.opRef, "merged deliverable");
+	await pollUntil(f, () => f.job().state === "done");
+	expect(f.job().attempts[0]?.opRef).toBe(result.opRef);
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=504`);
+});
+
+test("#481 an exact merged PR snapshot settles before later source-branch movement", async () => {
+	const checks = scriptedChecks({ prNumber: 503, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/merged-source-advanced";
+	const { head } = await awaitingLane(f, branch);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const advanced = Bun.spawnSync(
+		["git", "-C", f.directory, "commit", "-q", "--allow-empty", "-m", "reuse merged branch"],
+		{ env, stdout: "pipe", stderr: "pipe" },
+	);
+	expect(advanced.exitCode).toBe(0);
+	const advancedHead = Bun.spawnSync(["git", "-C", f.directory, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", branch]).exitCode).toBe(0);
+	expect(Bun.spawnSync(["git", "-C", f.directory, "reset", "-q", "--hard", head]).exitCode).toBe(0);
+	checks.set({ prNumber: 503, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(
+		`pr=503 checks=green prHead=${head.slice(0, 12)} remoteHead=${advancedHead.slice(0, 12)}`,
+	);
+});
+
+test("#481 an exact merged PR snapshot wins over later local HEAD movement", async () => {
+	const checks = scriptedChecks({ prNumber: 505, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const branch = "fix/merged-local-advanced";
+	const { head } = await awaitingLane(f, branch);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const advanced = Bun.spawnSync(
+		["git", "-C", f.directory, "commit", "-q", "--allow-empty", "-m", "unrelated local commit"],
+		{ env, stdout: "pipe", stderr: "pipe" },
+	);
+	expect(advanced.exitCode).toBe(0);
+	const advancedHead = Bun.spawnSync(["git", "-C", f.directory, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(advancedHead).not.toBe(head);
+	checks.set({ prNumber: 505, headSha: head, status: "pending", failingChecks: [], prState: "closed", merged: true });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=505`);
+});
+
+test("#481 green checks cannot settle after the remote branch advances beyond the local head", async () => {
+	const checks = scriptedChecks({ prNumber: 499, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/remote-ref-moved");
+	const worktree = f.job().lane.worktreePath;
+	const branch = Bun.spawnSync(["git", "-C", worktree, "branch", "--show-current"]).stdout.toString().trim();
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const commit = Bun.spawnSync(["git", "-C", worktree, "commit", "-q", "--allow-empty", "-m", "advance remote"], {
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(commit.exitCode).toBe(0);
+	const remoteHead = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "HEAD"]).stdout.toString().trim();
+	expect(Bun.spawnSync(["git", "-C", worktree, "push", "-q", "origin", branch]).exitCode).toBe(0);
+	expect(Bun.spawnSync(["git", "-C", worktree, "reset", "-q", "--hard", head]).exitCode).toBe(0);
+	checks.set({ prNumber: 499, headSha: head, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().escalations.at(-1)).toContain(
+		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${remoteHead.slice(0, 12)}`,
+	);
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks head_moved")).toContain(
+		`prHead=${head.slice(0, 12)} remoteHead=${remoteHead.slice(0, 12)}`,
+	);
+});
+
+test("#481 checks on the old PR head cannot settle a new local commit that was not pushed", async () => {
+	const checks = scriptedChecks({ prNumber: 497, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head } = await awaitingLane(f, "fix/unpushed-new-head");
+	const env = {
+		...process.env,
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+	};
+	expect(
+		Bun.spawnSync(["git", "-C", f.directory, "commit", "-q", "--allow-empty", "-m", "local only"], { env }).exitCode,
+	).toBe(0);
+	const localHead = Bun.spawnSync(["git", "-C", f.directory, "rev-parse", "HEAD"]).stdout.toString().trim();
+	checks.set({ prNumber: 497, headSha: head, status: "green", failingChecks: [] });
+	await pollUntil(f, () => f.job().state !== "awaiting_checks");
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().escalations.at(-1)).toContain(
+		`awaiting_checks ended: head_moved from=${head.slice(0, 12)} to=${localHead.slice(0, 12)}`,
+	);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("#481 awaiting_checks: checks temporarily unavailable keep the lane waiting", async () => {
+	const checks = scriptedChecks({ prNumber: 495, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/checks-unavailable");
+	const before = f.job();
+	const lookups = checks.calls.length;
+	const notices = f.notices.length;
+	checks.set(undefined);
+	await pollTimes(f, 3);
+	expect(checks.calls.length).toBeGreaterThan(lookups);
+	const job = f.job();
+	expect(job.state).toBe("awaiting_checks");
+	expect(job.awaitingChecks).toEqual(before.awaitingChecks);
+	expect(job.escalations).toEqual(before.escalations);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.notices).toHaveLength(notices);
 });
 
 test("#407: laneLastCommits reads each distinct worktree once, concurrently, null for non-repos", async () => {
@@ -2288,7 +3446,7 @@ test("#407: laneLastCommits reads each distinct worktree once, concurrently, nul
 	}
 });
 
-test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a bare git repo", async () => {
+test("work.start with repo creates an encoded worktree path from a bare git repo", async () => {
 	// Create a bare git repo to test against
 	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-"));
 	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-"));
@@ -2327,9 +3485,10 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 
 		expect(result.started).toBe(true);
 		const job = f.job("worktree-test");
-		expect(job.lane.worktreePath).toContain("lanes/worktree-test");
+		expect(job.lane.worktreePath).toBe(managedLaneWorktreePath(laneRoot, "worktree-test"));
 		expect(job.lane.worktreePath.startsWith(join(laneRoot, "lanes"))).toBe(true);
 		expect(job.lane.repository).toBe(bareRepo);
+		expect(job.lane.repositoryPath).toBe(managedLaneRepositoryPath(laneRoot, "worktree-test"));
 
 		// Verify worktree was created with proper branch
 		const branchResult = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -2337,10 +3496,56 @@ test("work.start with repo creates a worktree in <laneRoot>/lanes/<name> from a 
 		});
 		expect(branchResult.exitCode).toBe(0);
 		const branch = branchResult.stdout?.toString().trim();
-		expect(branch).toBe("work/worktree-test");
+		expect(branch).toBe(managedLaneBranchName("worktree-test"));
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+		});
+		expect(originUrl.stdout?.toString().trim()).toBe(repoDir);
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("case-distinct lane names create distinct encoded worktree directories", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("case-distinct-worktrees");
+	try {
+		const f = await fixture();
+		for (const name of ["Foo", "foo"]) {
+			const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+			if (!result.started) throw new Error(`lane ${name} did not start`);
+			expect(f.job(name).lane.worktreePath).toBe(managedLaneWorktreePath(f.gajaewayHome, name));
+		}
+		expect(f.job("Foo").lane.worktreePath).not.toBe(f.job("foo").lane.worktreePath);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("work.start normalizes a nested local repository path to its checkout root", async () => {
+	const { repoDir, cleanup } = await bareRepoFixture("nested-repo-path");
+	try {
+		const nestedPath = join(repoDir, "src");
+		await mkdir(nestedPath);
+		const f = await fixture();
+		const name = "nested-repo-path";
+		const result = await f.manager.start({ name, text: "work", repo: nestedPath });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const sourceHead = Bun.spawnSync(["git", "-C", repoDir, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(sourceHead.exitCode).toBe(0);
+		expect(job.baselineSha).toBe(sourceHead.stdout?.toString().trim());
+		expect(job.lane.repository).toBe(nestedPath);
+		const originUrl = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "remote", "get-url", "origin"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(originUrl.stdout?.toString().trim()).toBe(repoDir);
+	} finally {
+		await cleanup();
 	}
 });
 
@@ -2365,6 +3570,81 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 	// Verify no worktree was created
 	const job = f.db.work.laneJobJson(laneJobIdentity("bad-repo").jobId);
 	expect(job).toBeUndefined();
+});
+
+test("work.start with special characters in lane name uses hex-encoded branch name", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("special-char-lane-name");
+	try {
+		const f = await fixture();
+		const name = "bad..name";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const branchResult = Bun.spawnSync(
+			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/heads/${managedLaneBranchName(name)}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(branchResult.exitCode).toBe(0);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("repo-bound work.start removes a newly created worktree after bind failure so retry can create it", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-bind-retry-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-bind-retry-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial commit");
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], { stdout: "ignore", stderr: "ignore" });
+
+		const f = await fixture();
+		const bind = f.port.bind.bind(f.port);
+		let failFirstBind = true;
+		f.port.bind = async (input) => {
+			if (failFirstBind) {
+				failFirstBind = false;
+				throw new GjcCliUnavailableError("broker unavailable");
+			}
+			return await bind(input);
+		};
+		const input = { name: "bind-retry", text: "work", cwd: f.directory, repo: bareRepo };
+
+		await expect(f.manager.start(input)).rejects.toMatchObject({
+			code: "verb_failed",
+			detail: { reasonCode: "bind_failed", cause: "broker_unavailable" },
+		});
+		const worktreePath = join(f.gajaewayHome, "lanes", Buffer.from("bind-retry", "utf8").toString("hex"));
+		const branch = Bun.spawnSync(
+			["git", "-C", bareRepo, "show-ref", "--verify", "--quiet", "refs/heads/work/bind-retry"],
+			{ stdout: "ignore", stderr: "ignore" },
+		);
+		const worktrees = Bun.spawnSync(["git", "-C", bareRepo, "worktree", "list", "--porcelain"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(branch.exitCode).not.toBe(0);
+		expect(worktrees.stdout?.toString()).not.toContain(worktreePath);
+
+		const retried = await f.manager.start(input);
+		expect(retried.started).toBe(true);
+		expect(f.job("bind-retry").lane.worktreePath).toBe(worktreePath);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
 });
 
 test("work.start with repo and base parameter creates worktree from specified base", async () => {
@@ -2526,16 +3806,14 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job("cleanup-fail");
-		const repository = job.lane.repository;
+		const repository = job.lane.repositoryPath;
 
 		// Complete the work
 		f.port.complete(result.opRef, "test complete");
 		await until(() => f.db.work.workAttemptOpen().length === 0);
 
-		// Corrupt the repository to cause cleanup to fail
-		if (repository) {
-			await rm(join(repository, "objects"), { recursive: true, force: true });
-		}
+		// Remove the managed bare repository so git cannot unlink its registered worktree.
+		if (repository) await rm(repository, { recursive: true, force: true });
 
 		// Attempt to retire should fail due to cleanup failure
 		const retireOutcome = await f.lanes.retire("cleanup-fail", "operator");
@@ -2543,73 +3821,6 @@ test("issue #480: cleanup failure on operator retire fails the retirement", asyn
 		if (!retireOutcome.retired) {
 			expect(retireOutcome.reason).toContain("worktree cleanup failed");
 		}
-	} finally {
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(bareRepo, { recursive: true, force: true });
-	}
-});
-
-test("issue #480: force retire cleans up worktree and branch", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-force-retire-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-force-retire-"));
-	try {
-		const git = (...args: string[]) =>
-			Bun.spawnSync(["git", "-C", repoDir, ...args], {
-				env: {
-					...process.env,
-					GIT_AUTHOR_NAME: "test",
-					GIT_AUTHOR_EMAIL: "test@test",
-					GIT_COMMITTER_NAME: "test",
-					GIT_COMMITTER_EMAIL: "test@test",
-				},
-			});
-
-		git("init", "-q");
-		git("config", "user.name", "test");
-		git("config", "user.email", "test@test");
-		git("commit", "-q", "--allow-empty", "-m", "initial");
-
-		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-
-		const f = await fixture({ hostLostGraceMs: 20 });
-		const result = await f.manager.start({
-			name: "force-retire-test",
-			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
-		});
-		expect(result.started).toBe(true);
-
-		if (!result.started) throw new Error("work did not start");
-		const job = f.job("force-retire-test");
-		const worktreePath = job.lane.worktreePath;
-
-		// Simulate host loss by making session unavailable and marking as dead
-		f.port.status = async () => {
-			throw new Error("Session unavailable");
-		};
-		f.port.setSessionState(result.sessionId, { live: false });
-
-		// Force retire should clean up worktree
-		const retireOutcome = await f.lanes.forceRetire("force-retire-test");
-		expect(retireOutcome.retired).toBe(true);
-
-		// Verify worktree was deleted
-		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(exitsAfter.exitCode).not.toBe(0);
-
-		// Verify branch was deleted
-		const branchCheck = Bun.spawnSync(["git", "-C", bareRepo, "show-ref", "work/force-retire-test"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(branchCheck.exitCode).not.toBe(0);
 	} finally {
 		await rm(repoDir, { recursive: true, force: true });
 		await rm(bareRepo, { recursive: true, force: true });
@@ -2672,91 +3883,6 @@ test("issue #480: session binding uses worktree path, not input cwd", async () =
 	}
 });
 
-test("issue #480: all-dead retirement cleans up worktree", async () => {
-	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-all-dead-"));
-	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-all-dead-"));
-	try {
-		const git = (...args: string[]) =>
-			Bun.spawnSync(["git", "-C", repoDir, ...args], {
-				env: {
-					...process.env,
-					GIT_AUTHOR_NAME: "test",
-					GIT_AUTHOR_EMAIL: "test@test",
-					GIT_COMMITTER_NAME: "test",
-					GIT_COMMITTER_EMAIL: "test@test",
-				},
-			});
-
-		git("init", "-q");
-		git("config", "user.name", "test");
-		git("config", "user.email", "test@test");
-		git("commit", "-q", "--allow-empty", "-m", "initial");
-
-		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-
-		const f = await fixture();
-		const result = await f.manager.start({
-			name: "all-dead-test",
-			text: "work",
-			cwd: f.directory,
-			repo: bareRepo,
-		});
-
-		if (!result.started) throw new Error("work did not start");
-		const job = f.job("all-dead-test");
-		const worktreePath = job.lane.worktreePath;
-
-		// Verify worktree exists before force retire
-		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(existsBefore.exitCode).toBe(0);
-
-		// Make the session dead so it qualifies for all-dead retirement
-		f.port.setSessionState(result.sessionId, { live: false });
-
-		// Force retire should clean up worktree (all-dead retirement path)
-		const retireOutcome = await f.lanes.forceRetire("all-dead-test");
-		expect(retireOutcome.retired).toBe(true);
-
-		// Verify worktree was deleted by all-dead retirement
-		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(exitsAfter.exitCode).not.toBe(0); // Should fail because worktree is gone
-	} finally {
-		await rm(repoDir, { recursive: true, force: true });
-		await rm(bareRepo, { recursive: true, force: true });
-	}
-});
-
-async function bareRepoFixture(prefix: string): Promise<{ bareRepo: string; cleanup: () => Promise<void> }> {
-	const repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
-	const bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
-	const env = {
-		...process.env,
-		GIT_AUTHOR_NAME: "test",
-		GIT_AUTHOR_EMAIL: "test@test",
-		GIT_COMMITTER_NAME: "test",
-		GIT_COMMITTER_EMAIL: "test@test",
-	};
-	Bun.spawnSync(["git", "-C", repoDir, "init", "-q"], { env });
-	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
-	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
-	return {
-		bareRepo,
-		cleanup: async () => {
-			await rm(repoDir, { recursive: true, force: true });
-			await rm(bareRepo, { recursive: true, force: true });
-		},
-	};
-}
-
 test("issue #480: a lane cwd inside the service checkout is refused", async () => {
 	const f = await fixture();
 	const inside = join(f.serviceDirectory, "packages", "gateway");
@@ -2799,7 +3925,723 @@ test("issue #480: re-starting a repo-bound lane is matched by repository, not by
 		// A different repository for the same lane name is a mismatch.
 		await expect(
 			f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: `${bareRepo}-other` }),
-		).rejects.toMatchObject({ detail: { reasonCode: "lane_cwd_mismatch" } });
+		).rejects.toMatchObject({ detail: { reasonCode: "lane_repository_mismatch" } });
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: the production service directory is this source checkout, not the bun runtime", () => {
+	const root = Bun.spawnSync(["git", "-C", import.meta.dir, "rev-parse", "--show-toplevel"])
+		.stdout.toString()
+		.trim();
+	expect(getServiceDirectory()).toBe(root);
+	expect(getServiceDirectory()).not.toBe(dirname(process.execPath));
+});
+
+test("#439 work-lane status reads use relay when tail is attached to avoid CLI spawns", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	for (let i = 0; i < 5; i++) {
+		const readsBefore = f.port.statusReads.filter((read) => read.opRef === result.opRef).length;
+		f.port.emitTool(result.sessionId, { toolName: "bash" });
+		await until(() => f.port.statusReads.filter((read) => read.opRef === result.opRef).length > readsBefore);
+	}
+	const statusReads = f.port.statusReads.filter((r) => r.opRef === result.opRef);
+	expect(statusReads.length).toBeGreaterThanOrEqual(5);
+	expect(statusReads.every((read) => read.relayUsed)).toBe(true);
+});
+
+test("#439 explicit work.status reads use the active observer relay", async () => {
+	const f = await fixture({ pollMs: 60_000 });
+	const result = await started(f);
+	await until(() => f.port.statusReads.some((read) => read.opRef === result.opRef && read.relayUsed));
+	const readsBefore = f.port.statusReads.length;
+	const status = await f.manager.status({ name: "a" });
+	expect(status.attempt?.opRef).toBe(result.opRef);
+	const statusReads = f.port.statusReads.slice(readsBefore).filter((read) => read.opRef === result.opRef);
+	expect(statusReads).toHaveLength(1);
+	expect(statusReads[0]?.relayUsed).toBe(true);
+});
+
+test("#439 relay transport failure triggers exactly one CLI fallback per status call", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const originalStatus = f.port.status.bind(f.port);
+	// Track call sequence for specific opRef
+	let relayCalls = 0;
+	let fallbackCalls = 0;
+	// Inject relay transport failure on first relay attempt
+	f.port.status = async (input) => {
+		const isRelay = input.relay !== undefined;
+		if (input.opRef === result.opRef) {
+			if (isRelay && relayCalls++ === 0) {
+				throw new RelayClosedError(input.sessionId, "test relay failure");
+			}
+			if (!isRelay) {
+				fallbackCalls++;
+			}
+		}
+		return originalStatus(input);
+	};
+	// Trigger one status poll cycle
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => fallbackCalls > 0);
+	// With relay failure, should have triggered both relay attempt and CLI fallback
+	expect(relayCalls).toBeGreaterThanOrEqual(1);
+	expect(fallbackCalls).toBe(1);
+});
+
+test("#439 relay non-transport failure is not caught as transport failure", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const originalStatus = f.port.status.bind(f.port);
+	// Track whether relay was called and if fallback was attempted
+	let relayErrorThrown = false;
+	let fallbackCalled = false;
+	// Inject a non-transport error (regular Error, not RelayClosedError)
+	f.port.status = async (input) => {
+		const isRelay = input.relay !== undefined;
+		if (input.opRef === result.opRef) {
+			if (isRelay && !relayErrorThrown) {
+				relayErrorThrown = true;
+				// This error is NOT a transport failure (not RelayClosedError)
+				throw new Error("non-transport relay error");
+			}
+			if (!isRelay) {
+				fallbackCalled = true;
+			}
+		}
+		return originalStatus(input);
+	};
+	// Trigger one status poll cycle
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	await until(() => f.port.statusReads.some((read) => read.opRef === result.opRef));
+	// Non-transport error should not trigger fallback
+	expect(relayErrorThrown).toBe(true);
+	expect(fallbackCalled).toBe(false);
+	expect(f.port.statusReads.filter((read) => read.opRef === result.opRef).every((read) => read.relayUsed)).toBe(true);
+});
+
+test("work.start resolves origin bases from local remote-tracking refs", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("remote-tracking-base");
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repoDir, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const defaultBranch = git("branch", "--show-current");
+		git("remote", "add", "origin", bareRepo);
+		git("push", "-q", "-u", "origin", defaultBranch);
+		git("checkout", "-q", "-b", "dev");
+		git("commit", "-q", "--allow-empty", "-m", "remote-only dev commit");
+		git("push", "-q", "-u", "origin", "dev");
+		const remoteDevSha = git("rev-parse", "refs/remotes/origin/dev");
+		git("checkout", "-q", defaultBranch);
+		git("branch", "-D", "dev");
+		const localDevBranch = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", "refs/heads/dev"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(localDevBranch.exitCode).not.toBe(0);
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "remote-tracking-base",
+			text: "work",
+			repo: repoDir,
+			base: "origin/dev",
+		});
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("remote-tracking-base");
+		expect(job.baselineSha).toBe(remoteDevSha);
+		expect(git("rev-parse", "refs/remotes/origin/dev")).toBe(remoteDevSha);
+		const worktreeHead = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDevSha);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("work.start defaults to origin/HEAD when its branch exists only as a remote-tracking ref", async () => {
+	const { repoDir, bareRepo, cleanup } = await bareRepoFixture("remote-default-base");
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repoDir, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+		return result.stdout.toString().trim();
+	};
+	try {
+		const defaultBranch = git("branch", "--show-current");
+		git("remote", "add", "origin", bareRepo);
+		git("push", "-q", "-u", "origin", defaultBranch);
+		git("remote", "set-head", "origin", defaultBranch);
+		expect(git("symbolic-ref", "refs/remotes/origin/HEAD")).toBe(`refs/remotes/origin/${defaultBranch}`);
+		const remoteDefaultSha = git("rev-parse", `refs/remotes/origin/${defaultBranch}`);
+		const currentBranch = `${defaultBranch}-current`;
+		git("checkout", "-q", "-b", currentBranch);
+		git("commit", "-q", "--allow-empty", "-m", "current local branch");
+		git("branch", "-D", defaultBranch);
+		const deletedLocalDefault = Bun.spawnSync(
+			["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${defaultBranch}`],
+			{ env, stdout: "pipe", stderr: "pipe" },
+		);
+		expect(deletedLocalDefault.exitCode).not.toBe(0);
+
+		const f = await fixture();
+		const result = await f.manager.start({ name: "remote-default-base", text: "work", repo: repoDir });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("remote-default-base");
+		expect(job.baselineSha).toBe(remoteDefaultSha);
+		expect(git("rev-parse", `refs/remotes/origin/${defaultBranch}`)).toBe(remoteDefaultSha);
+		const managedDefaultSha = Bun.spawnSync(["git", "rev-parse", "--verify", `refs/heads/${defaultBranch}^{commit}`], {
+			cwd: job.lane.repositoryPath,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(managedDefaultSha.exitCode).toBe(0);
+		expect(managedDefaultSha.stdout?.toString().trim()).toBe(remoteDefaultSha);
+		const worktreeHead = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(worktreeHead.stdout?.toString().trim()).toBe(remoteDefaultSha);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: operator retire cleans up worktree and branch", async () => {
+	// Create a bare git repo to test against
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-retire-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-retire-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "retire-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		if (!result.started) throw new Error("work did not start");
+
+		const job = f.job("retire-test");
+		const worktreePath = job.lane.worktreePath;
+		const repositoryPath = job.lane.repositoryPath!;
+		expect(worktreePath).toBeDefined();
+		const branchBefore = Bun.spawnSync(
+			["git", "-C", repositoryPath, "show-ref", "--verify", `refs/heads/${managedLaneBranchName("retire-test")}`],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(branchBefore.exitCode).toBe(0);
+
+		// Verify worktree exists
+		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+		});
+		expect(existsBefore.exitCode).toBe(0);
+
+		// Complete the work and retire the lane
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		const retireOutcome = await f.lanes.retire("retire-test", "operator");
+		expect(retireOutcome.retired).toBe(true);
+
+		// Verify worktree was deleted
+		const exitsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitsAfter.exitCode).not.toBe(0);
+
+		// The per-lane bare repository is removed with the worktree and branch.
+		expect(await Bun.file(join(repositoryPath, "HEAD")).exists()).toBe(false);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: cleanup failure on operator retire fails the retirement", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-cleanup-fail-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-cleanup-fail-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "cleanup-fail",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		expect(result.started).toBe(true);
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("cleanup-fail");
+		const repository = job.lane.repositoryPath;
+
+		// Complete the work
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		// Remove the managed bare repository so git cannot unlink its registered worktree.
+		if (repository) await rm(repository, { recursive: true, force: true });
+
+		// Attempt to retire should fail due to cleanup failure
+		const retireOutcome = await f.lanes.retire("cleanup-fail", "operator");
+		expect(retireOutcome.retired).toBe(false);
+		if (!retireOutcome.retired) {
+			expect(retireOutcome.reason).toContain("worktree cleanup failed");
+		}
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: operator retire refuses a persisted repository path outside its managed lane directory", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("repository-path-corruption");
+	try {
+		const f = await fixture();
+		const name = "corrupt-repository-path";
+		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const managedRepositoryPath = f.job(name).lane.repositoryPath!;
+		const unrelatedDirectory = join(f.directory, "unrelated-repository");
+		await mkdir(unrelatedDirectory);
+		const sentinelPath = join(unrelatedDirectory, "keep.txt");
+		await Bun.write(sentinelPath, "preserve");
+
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		const job = f.job(name);
+		const corrupted = { ...job, lane: { ...job.lane, repositoryPath: unrelatedDirectory } };
+		f.db.transaction((tx) =>
+			f.db.work.putLaneJob(tx, {
+				jobId: corrupted.jobId,
+				laneKey: `work-${name}`,
+				state: corrupted.state,
+				createdAt: corrupted.createdAt,
+				updatedAt: corrupted.updatedAt,
+				lane: { branch: corrupted.lane.branch, worktreePath: corrupted.lane.worktreePath },
+				json: JSON.stringify(corrupted),
+			}),
+		);
+
+		const retired = await f.lanes.retire(name, "operator");
+		expect(retired.retired).toBe(false);
+		if (!retired.retired) expect(retired.reason).toContain("worktree cleanup failed");
+		expect(await Bun.file(sentinelPath).text()).toBe("preserve");
+		expect(await Bun.file(join(managedRepositoryPath, "HEAD")).exists()).toBe(true);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: operator retire tolerates an externally removed worktree", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("external-worktree-removal");
+	try {
+		const f = await fixture();
+		const name = "external-removal";
+		const result = await f.manager.start({ name, text: "work", cwd: f.directory, repo: bareRepo });
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job(name);
+		const repositoryPath = job.lane.repositoryPath!;
+
+		f.port.complete(result.opRef, "test complete");
+		await until(() => f.db.work.workAttemptOpen().length === 0);
+
+		// Simulate an external rm -rf: the worktree directory disappears but Git
+		// still has its administrative entry until `worktree prune` runs.
+		await rm(job.lane.worktreePath, { recursive: true, force: true });
+		const staleRegistration = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+			cwd: repositoryPath,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(staleRegistration.exitCode).toBe(0);
+		const registeredPaths = staleRegistration.stdout
+			?.toString()
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith("worktree "))
+			.map((line) => line.slice("worktree ".length).replace(/\\/g, "/"));
+		expect(registeredPaths?.includes(managedLaneWorktreePath(f.gajaewayHome, name).replace(/\\/g, "/"))).toBe(true);
+
+		const retired = await f.lanes.retire(name, "operator");
+		expect(retired.retired).toBe(true);
+		expect(await Bun.file(join(repositoryPath, "HEAD")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: force retire preserves worktree and branch for resume", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-force-retire-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-force-retire-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture({ hostLostGraceMs: 20 });
+		const result = await f.manager.start({
+			name: "force-retire-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+		expect(result.started).toBe(true);
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("force-retire-test");
+		const worktreePath = job.lane.worktreePath;
+		const repositoryPath = job.lane.repositoryPath!;
+		const unpushedCommit = Bun.spawnSync(
+			[
+				"git",
+				"-C",
+				worktreePath,
+				"-c",
+				"user.name=test",
+				"-c",
+				"user.email=test@test",
+				"commit",
+				"--allow-empty",
+				"-m",
+				"unpushed work",
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(unpushedCommit.exitCode).toBe(0);
+
+		// Simulate host loss by making session unavailable and marking as dead
+		const originalStatus = f.port.status;
+		f.port.status = async () => {
+			throw new Error("Session unavailable");
+		};
+		f.port.setSessionState(result.sessionId, { live: false });
+
+		// Force retire must preserve the managed worktree and branch.
+		const retireOutcome = await f.lanes.forceRetire("force-retire-test");
+		expect(retireOutcome.retired).toBe(true);
+		f.port.status = originalStatus;
+
+		// The durable job record still points to this worktree; forced retirement
+		// must not discard its unpushed branch or make the lane unusable.
+		const existsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsAfter.exitCode).toBe(0);
+		const headSubject = Bun.spawnSync(["git", "-C", worktreePath, "log", "-1", "--format=%s"], { stdout: "pipe" });
+		expect(headSubject.stdout?.toString().trim()).toBe("unpushed work");
+
+		const branchCheck = Bun.spawnSync(
+			["git", "-C", repositoryPath, "show-ref", "--verify", `refs/heads/${managedLaneBranchName("force-retire-test")}`],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		expect(branchCheck.exitCode).toBe(0);
+
+		const resumed = await f.manager.start({ name: "force-retire-test", text: "continue", resume: true });
+		expect(resumed).toMatchObject({ started: true });
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: session binding uses worktree path, not input cwd", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-session-bind-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-session-bind-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		// Create fixture first, then set up bind tracking
+		const f = await fixture();
+		const bindCalls: SessionBindInput[] = [];
+		// Spy on port.bind to capture the input
+		const originalBind = f.port.bind.bind(f.port);
+		f.port.bind = async (input: SessionBindInput) => {
+			bindCalls.push(input);
+			return originalBind(input);
+		};
+
+		const result = await f.manager.start({
+			name: "session-bind-test",
+			text: "work",
+			cwd: f.directory, // This is the input cwd
+			repo: bareRepo,
+		});
+
+		expect(result.started).toBe(true);
+		const job = f.job("session-bind-test");
+		const worktreePath = job.lane.worktreePath;
+
+		// Verify that the bind call received the worktree path, not the input cwd
+		const bindCall = bindCalls[bindCalls.length - 1]; // Last bind call should be for our lane
+		expect(bindCall?.repo).toBe(worktreePath);
+		expect(bindCall?.repo).not.toBe(f.directory);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+test("issue #480: all-dead retirement preserves the worktree", async () => {
+	const repoDir = await mkdtemp(join(tmpdir(), "test-repo-all-dead-"));
+	const bareRepo = await mkdtemp(join(tmpdir(), "bare-repo-all-dead-"));
+	try {
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repoDir, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "test",
+					GIT_AUTHOR_EMAIL: "test@test",
+					GIT_COMMITTER_NAME: "test",
+					GIT_COMMITTER_EMAIL: "test@test",
+				},
+			});
+
+		git("init", "-q");
+		git("config", "user.name", "test");
+		git("config", "user.email", "test@test");
+		git("commit", "-q", "--allow-empty", "-m", "initial");
+
+		Bun.spawnSync(["git", "clone", "--bare", repoDir, bareRepo], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+
+		const f = await fixture();
+		const result = await f.manager.start({
+			name: "all-dead-test",
+			text: "work",
+			cwd: f.directory,
+			repo: bareRepo,
+		});
+
+		if (!result.started) throw new Error("work did not start");
+		const job = f.job("all-dead-test");
+		const worktreePath = job.lane.worktreePath;
+		const repositoryPath = job.lane.repositoryPath!;
+
+		// Verify worktree exists before force retire
+		const existsBefore = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsBefore.exitCode).toBe(0);
+
+		// Make the session dead so it qualifies for all-dead retirement
+		f.port.setSessionState(result.sessionId, { live: false });
+
+		// Unattended all-dead retirement preserves the durable worktree.
+		const retireOutcome = await f.lanes.forceRetire("all-dead-test");
+		expect(retireOutcome.retired).toBe(true);
+
+		const existsAfter = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--git-dir"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(existsAfter.exitCode).toBe(0);
+		expect(await Bun.file(join(repositoryPath, "HEAD")).exists()).toBe(true);
+	} finally {
+		await rm(repoDir, { recursive: true, force: true });
+		await rm(bareRepo, { recursive: true, force: true });
+	}
+});
+
+async function bareRepoFixture(
+	prefix: string,
+): Promise<{ repoDir: string; bareRepo: string; cleanup: () => Promise<void> }> {
+	let repoDir = await mkdtemp(join(tmpdir(), `${prefix}-src-`));
+	let bareRepo = await mkdtemp(join(tmpdir(), `${prefix}-bare-`));
+	// Normalize paths to resolve macOS /var -> /private/var symlink
+	repoDir = await realpath(repoDir);
+	bareRepo = await realpath(bareRepo);
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "test",
+		GIT_AUTHOR_EMAIL: "test@test",
+		GIT_COMMITTER_NAME: "test",
+		GIT_COMMITTER_EMAIL: "test@test",
+	};
+	Bun.spawnSync(["git", "-C", repoDir, "init", "-q"], { env });
+	Bun.spawnSync(["git", "-C", repoDir, "commit", "-q", "--allow-empty", "-m", "initial"], { env });
+	Bun.spawnSync(["git", "clone", "-q", "--bare", repoDir, bareRepo], { env });
+	return {
+		repoDir,
+		bareRepo,
+		cleanup: async () => {
+			await rm(repoDir, { recursive: true, force: true });
+			await rm(bareRepo, { recursive: true, force: true });
+		},
+	};
+}
+
+test("issue #480: a lane cwd inside the service checkout is refused", async () => {
+	const f = await fixture();
+	const inside = join(f.serviceDirectory, "packages", "gateway");
+	await mkdir(inside, { recursive: true });
+	for (const cwd of [f.serviceDirectory, inside, join(f.serviceDirectory, "not-yet-created")]) {
+		await expect(f.manager.start({ name: "a", text: "work", cwd })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir", name: "a" },
+		});
+	}
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.port.sends).toHaveLength(0);
+});
+
+test("issue #480: a generated worktree inside the service checkout is refused", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("svc-worktree");
+	try {
+		const f = await fixture();
+		const manager = await f.restart({ laneRoot: join(f.serviceDirectory, "lanes-root") });
+		await expect(manager.start({ name: "a", text: "work", cwd: f.directory, repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir" },
+		});
+		expect(await Bun.file(managedLaneRepositoryPath(join(f.serviceDirectory, "lanes-root"), "a")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: a managed repository symlink into the service checkout is refused", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("svc-repository");
+	try {
+		const f = await fixture();
+		const laneRoot = join(f.gajaewayHome, "lanes-root");
+		await mkdir(laneRoot, { recursive: true });
+		await symlink(f.serviceDirectory, join(laneRoot, "repositories"));
+		const manager = await f.restart({ laneRoot });
+		await expect(manager.start({ name: "a", text: "work", repo: bareRepo })).rejects.toMatchObject({
+			code: "invalid_params",
+			detail: { reasonCode: "cwd_inside_service_dir" },
+		});
+		expect(f.port.binds).toHaveLength(0);
+		expect(await Bun.file(join(f.serviceDirectory, "a")).exists()).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("issue #480: re-starting a repo-bound lane is matched by repository, not by the caller cwd", async () => {
+	const { bareRepo, cleanup } = await bareRepoFixture("rebind");
+	try {
+		const f = await fixture();
+		const first = await f.manager.start({ name: "a", text: "work", cwd: f.directory, repo: bareRepo });
+		expect(first.started).toBe(true);
+		// Same repository from the same caller cwd: the lane is recognized (its attempt is still
+		// open), not rejected as a cwd mismatch against the generated worktree path.
+		await expect(f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: bareRepo })).rejects.toMatchObject(
+			{ detail: { reasonCode: "attempt_open" } },
+		);
+		// A different repository for the same lane name is a mismatch.
+		await expect(
+			f.manager.start({ name: "a", text: "again", cwd: f.directory, repo: `${bareRepo}-other` }),
+		).rejects.toMatchObject({ detail: { reasonCode: "lane_repository_mismatch" } });
 	} finally {
 		await cleanup();
 	}

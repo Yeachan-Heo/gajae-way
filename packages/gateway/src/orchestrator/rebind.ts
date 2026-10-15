@@ -441,6 +441,103 @@ export function sanitizeDiagnostic(text: string): string {
 	return redactSecrets(stripControl(text, true)).trim();
 }
 
+/** Bounded tail builder that sanitizes complete lines and redacts multiline credential arrays. */
+export class StreamingDiagnosticTail {
+	readonly #maxBytes: number;
+	readonly #maxLineBytes: number;
+	#line: string[] = [];
+	#lineBytes = 0;
+	#tail = "";
+	#bracket: { depth: number; quote: string | null } | undefined;
+	overflowed = false;
+
+	constructor(maxBytes: number, maxLineBytes = 64 * 1024) {
+		this.#maxBytes = maxBytes;
+		this.#maxLineBytes = maxLineBytes;
+	}
+
+	push(text: string): void {
+		if (this.overflowed || text.length === 0) return;
+		let cursor = 0;
+		while (cursor < text.length) {
+			const newline = text.indexOf("\n", cursor);
+			const end = newline < 0 ? text.length : newline;
+			const piece = text.slice(cursor, end);
+			const pieceBytes = Buffer.byteLength(piece, "utf8");
+			if (this.#lineBytes + pieceBytes > this.#maxLineBytes) {
+				this.overflowed = true;
+				this.#line = [];
+				return;
+			}
+			this.#line.push(piece);
+			this.#lineBytes += pieceBytes;
+			if (newline < 0) return;
+			this.#processLine(`${this.#line.join("")}\n`);
+			this.#line = [];
+			this.#lineBytes = 0;
+			cursor = newline + 1;
+		}
+	}
+
+	finish(): string | undefined {
+		if (this.overflowed) return undefined;
+		if (this.#line.length > 0) this.#processLine(this.#line.join(""));
+		return this.#tail.trim() || undefined;
+	}
+
+	#append(text: string): void {
+		if (text.length === 0) return;
+		const bytes = Buffer.from(this.#tail + text, "utf8");
+		this.#tail = bytes.subarray(Math.max(0, bytes.length - this.#maxBytes)).toString("utf8");
+	}
+
+	#processLine(line: string): void {
+		const hasNewline = line.endsWith("\n");
+		const content = stripControl(hasNewline ? line.slice(0, -1) : line, true);
+		let cursor = 0;
+		while (cursor < content.length) {
+			if (this.#bracket) {
+				cursor = this.#scanBracket(content, cursor);
+				if (this.#bracket) {
+					break;
+				}
+			}
+			const open = new RegExp(CREDENTIAL_BRACKET_OPEN.source, "gi");
+			open.lastIndex = cursor;
+			const match = open.exec(content);
+			if (!match) {
+				this.#append(sanitizeDiagnostic(content.slice(cursor)));
+				cursor = content.length;
+				break;
+			}
+			this.#append(sanitizeDiagnostic(content.slice(cursor, match.index)));
+			this.#append(`${match[1]}[redacted]`);
+			this.#bracket = { depth: 1, quote: null };
+			cursor = match.index + match[0].length;
+		}
+		if (hasNewline) this.#append("\n");
+	}
+
+	#scanBracket(text: string, from: number): number {
+		const state = this.#bracket!;
+		let index = from;
+		while (index < text.length) {
+			const character = text[index]!;
+			if (state.quote !== null) {
+				if (character === "\\") index++;
+				else if (character === state.quote) state.quote = null;
+			} else if (character === '"' || character === "'") state.quote = character;
+			else if (character === "[") state.depth++;
+			else if (character === "]" && --state.depth === 0) {
+				this.#bracket = undefined;
+				return index + 1;
+			}
+			index++;
+		}
+		return index;
+	}
+}
+
 /**
  * The runtime code and message an error should be reported with. Truncated, and
  * never erased: a killed or crashed child produces an empty runtime message, and

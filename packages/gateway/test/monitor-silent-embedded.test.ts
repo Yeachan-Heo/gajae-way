@@ -64,8 +64,8 @@ function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 
 const stage = (db: Store, id: string) => db.monitors.eventRows().find((row) => row.event_id === id)?.stage;
 
-describe("isSilentOutput integration (issue #338: propagate.ts must use embedded marker grammar)", () => {
-	test("note starting with [SILENT] plus narration is NOT delivered", async () => {
+describe("isSilentOutput integration (issue #338: propagate.ts must use the closing-marker grammar)", () => {
+	test("note with a reasoning preamble closed by [SILENT] is NOT delivered", async () => {
 		const {
 			propagator,
 			monitor,
@@ -73,7 +73,7 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 		} = await harness(
 			async (_id, text) =>
 				JSON.stringify(
-					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "[SILENT] This is a status update" })),
+					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Nothing new since last sweep.\n\n[SILENT]" })),
 				),
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
@@ -81,12 +81,12 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT] This is a status update");
+		expect(db!.monitors.authoredOutput(eventId)).toBe("Nothing new since last sweep.\n\n[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
 		expect(db!.outbox.rows()).toHaveLength(0);
 	});
 
-	test("note with [SILENT] mid-text is also NOT delivered (grammar: anywhere silences)", async () => {
+	test("note that merely mentions [SILENT] mid-text IS delivered (a mention is not a directive)", async () => {
 		const {
 			propagator,
 			monitor,
@@ -106,9 +106,8 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use embedded
 			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db!.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
-		// [SILENT] anywhere silences (per containsSilenceToken grammar)
-		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db!.outbox.rows()).toHaveLength(0);
+		expect(stage(db!, eventId)).not.toBe("authored_no_delivery");
+		expect(db!.outbox.rows()).toHaveLength(1);
 	});
 
 	test("only [SILENT] token (exact match) is also silent", async () => {

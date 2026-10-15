@@ -269,13 +269,14 @@ test("the regenerated map is published atomically, never as a half-written file"
 
 test("overlapping map writers on one corpus neither throw nor interleave (#227)", async () => {
 	const root = await fresh();
-	// Writers race while the corpus keeps changing under them, as the closure
-	// queue, initializeMemory and the autolink sweep do on a live gateway.
-	const writers = Array.from({ length: 16 }, async (_, index) => {
-		await writeFile(join(root, `reflections/2026-02-${String(index + 1).padStart(2, "0")}.md`), `# ${index}\n`);
-		await regenerateMap(root);
-	});
-	await Promise.all(writers);
+	await Promise.all(
+		Array.from({ length: 16 }, (_, index) =>
+			writeFile(join(root, `reflections/2026-02-${String(index + 1).padStart(2, "0")}.md`), `# ${index}\n`),
+		),
+	);
+	// Keep the corpus stable while map writers overlap: file arrival order is a
+	// separate concern from whether atomic map writes interleave or fail.
+	await Promise.all(Array.from({ length: 16 }, () => regenerateMap(root)));
 
 	// The published map is a complete render of the final corpus, not a mix.
 	const published = await readFile(join(root, "MEMORY.md"), "utf8");

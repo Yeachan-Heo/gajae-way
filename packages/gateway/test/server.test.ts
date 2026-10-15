@@ -14,6 +14,7 @@ import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import { initializeMemory, memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
+import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -35,11 +36,16 @@ afterEach(async () => {
 	directory = "";
 });
 
-async function connect(
-	socketPath: string,
-): Promise<{ send(value: unknown): void; frames: any[]; wireLines: string[]; close(): void }> {
+async function connect(socketPath: string): Promise<{
+	send(value: unknown): void;
+	frames: any[];
+	wireLines: string[];
+	waitForFrame(id: string): Promise<void>;
+	close(): void;
+}> {
 	const frames: any[] = [];
 	const wireLines: string[] = [];
+	const frameWaiters = new Map<string, Array<() => void>>();
 	let buffered = Buffer.alloc(0);
 	const socket = await Bun.connect({
 		unix: socketPath,
@@ -52,14 +58,36 @@ async function connect(
 					buffered = buffered.subarray(newline + 1);
 					if (line) {
 						wireLines.push(line);
-						frames.push(JSON.parse(line));
+						const frame = JSON.parse(line);
+						frames.push(frame);
+						if (typeof frame.id === "string") {
+							const waiters = frameWaiters.get(frame.id);
+							if (waiters) {
+								frameWaiters.delete(frame.id);
+								for (const resolve of waiters) resolve();
+							}
+						}
 					}
 					newline = buffered.indexOf(10);
 				}
 			},
 		},
 	});
-	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, wireLines, close: () => socket.end() };
+	const waitForFrame = (id: string): Promise<void> => {
+		if (frames.some((frame) => frame.id === id)) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			const waiters = frameWaiters.get(id) ?? [];
+			waiters.push(resolve);
+			frameWaiters.set(id, waiters);
+		});
+	};
+	return {
+		send: (value) => socket.write(`${JSON.stringify(value)}\n`),
+		frames,
+		wireLines,
+		waitForFrame,
+		close: () => socket.end(),
+	};
 }
 
 async function waitFor(frames: any[], count: number): Promise<void> {
@@ -153,7 +181,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(32);
+	expect(client.frames[2].result.schemaVersion).toBe(36);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -807,6 +835,107 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	expect(notice.payload.deliveryId).toBe(deterministicTerminalDeliveryId("discord/dm/c1/peer=p1", "failed-message", 0));
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "dm")).toBeUndefined();
 	client.close();
+});
+
+test("model refusals notify once without consuming the pending message's eventual answer", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-model-refusal-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const database = await Store.open(config.dbPath);
+	const port = new ScriptedSessionPort({
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
+		onSend: (input, scripted) => scripted.complete(input.opRef, "the original message is answered"),
+	});
+	const send = port.send.bind(port);
+	let attempts = 0;
+	port.send = async (input) => {
+		attempts++;
+		if (attempts <= 2) throw new ModelNotSelectedError(input.opRef);
+		return send(input);
+	};
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	const origin = { platform: "discord", kind: "dm", conversationId: "model-refusal", peerId: "p1" };
+	const key = "discord/dm/model-refusal/peer=p1";
+	const engagement = { mentioned: false, group: false, authorId: "p1" };
+	const until = async (condition: () => boolean) => {
+		for (let attempt = 0; attempt < 600 && !condition(); attempt++) await Bun.sleep(5);
+		expect(condition()).toBe(true);
+	};
+	const notices = () =>
+		client.frames.filter(
+			(frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed] model_not_selected:"),
+		);
+	try {
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "original",
+			verb: "chat.send",
+			params: { origin, engagement, messageId: "refused-original", text: "please answer this" },
+		});
+		await until(() => notices().length === 1 && database.inbox.pendingOldest(key) !== undefined);
+		const pending = database.inbox.pendingOldest(key);
+		expect(pending).toMatchObject({
+			message_id: "refused-original",
+			state: "pending",
+			turn_state: null,
+			turn_op_ref: null,
+			bound_session_id: null,
+			dispatched_at: null,
+			terminal_delivery_id: null,
+		});
+		expect(notices()[0].payload.text).toEndWith("Send /model <id> or /new");
+		expect(notices()[0].payload.deliveryId).not.toBe(deterministicTerminalDeliveryId(key, "refused-original", 0));
+		const sessionId = database.bindings.getSessionRecord(key)?.sessionId;
+		if (!sessionId) throw new Error("refused message lost its session binding");
+
+		// Successful control alone does not prove the next prompt will be admitted.
+		// A second explicit refusal must not create another logical notice.
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "model-again",
+			verb: "chat.send",
+			params: { origin, engagement, text: "/model next" },
+		});
+		await until(() => attempts === 2 && database.inbox.pendingOldest(key) !== undefined);
+		expect(notices()).toHaveLength(1);
+		expect(database.inbox.pendingOldest(key)?.terminal_delivery_id).toBeNull();
+
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "model-working",
+			verb: "chat.send",
+			params: { origin, engagement, text: "/model working" },
+		});
+		await until(() =>
+			client.frames.some(
+				(frame) => frame.event === "chat.message" && frame.payload.text === "the original message is answered",
+			),
+		);
+		await until(() => database.inbox.turnRow(port.sends[0]!.opRef)?.state === "done");
+		expect(attempts).toBe(3);
+		expect(port.sends).toHaveLength(1);
+		expect(port.sends[0]?.sessionId).toBe(sessionId);
+		expect(port.binds).toHaveLength(1);
+		expect(notices()).toHaveLength(1);
+		expect(database.inbox.turnRow(port.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+	} finally {
+		client.close();
+	}
 });
 
 test("long turns broadcast throttled chat.progress liveness events", async () => {
@@ -1665,6 +1794,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
+	const runResponse = client.waitForFrame("w");
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -1672,15 +1802,18 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		verb: "work.run",
 		params: { cwd: directory, name: "Repo.Fix-2", text: "fix the bug" },
 	});
-	await waitFor(client.frames, 2);
+	await runResponse;
 	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
+	expect(run).toMatchObject({ type: "response", id: "w" });
 	expect(run.result).toMatchObject({ held: false, text: "worker result" });
 	const jobId = run.result.jobId;
 	expect(jobId).toBe(`lanejob-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
 
+	const jobsResponse = client.waitForFrame("jobs");
 	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
-	await waitFor(client.frames, 3);
+	await jobsResponse;
 	const jobs = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs");
+	expect(jobs).toMatchObject({ type: "response", id: "jobs" });
 	expect(jobs.result.jobs).toHaveLength(1);
 	expect(jobs.result.jobs[0].job_id).toBe(jobId);
 	expect(jobs.result.jobs[0].lane_key).toBe("work-Repo.Fix-2");

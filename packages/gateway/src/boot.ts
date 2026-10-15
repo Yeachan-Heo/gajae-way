@@ -146,6 +146,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 	};
 	try {
 		await assertNoRestoreJournal(config.home);
+
 		const layout = homeLayout(config.home);
 		let executable = options.broker?.executable;
 		if (executable === undefined) {
@@ -183,10 +184,12 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		const database = await Store.open(config.dbPath, {
 			canonicalAgentDir: broker.agentDir,
 			backupsDir: layout.backupsDir,
+			journalMode: config.sqlite?.journalMode,
 		});
 		const slo = new SloRecorder(database.core, { home: config.home });
 		sloRecorder = slo;
 		try {
+			database.reconcileWorkAttempts();
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
 			// Authority already checked in Store.open(); this assertion confirms immutability.
 			database.bindings.assertAuthority(authority);

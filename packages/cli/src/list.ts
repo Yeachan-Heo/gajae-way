@@ -159,6 +159,7 @@ export const MONITOR_COLUMNS: readonly Column<MonitorListRow>[] = [
 	},
 	{ name: "events", value: (row) => [...row.monitor.eventTypes] },
 	{ name: "target", value: (row) => (row.monitor.channelTarget ? originKey(row.monitor.channelTarget.origin) : null) },
+	{ name: "reportTo", value: (row) => (row.monitor.reportTo ? originKey(row.monitor.reportTo) : null) },
 	{ name: "enabled", value: (row) => row.monitor.enabled },
 ];
 

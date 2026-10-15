@@ -221,17 +221,29 @@ test("interim speech config parses non-negative integers and requires restart", 
 });
 
 test("sessions host limits parse, omit absent fields, and reload live", async () => {
-	const sessions = { maxLiveHosts: 4, idleRetireMs: 3_600_000 };
+	const sessions = { maxLiveHosts: 4, idleRetireMs: 3_600_000, idleResetMs: 86_400_000 };
 	expect(parseConfigFile({ schemaVersion: 1, sessions }).sessions).toEqual(sessions);
 	expect(parseConfigFile({ schemaVersion: 1, sessions: { maxLiveHosts: 1 } }).sessions).toEqual({ maxLiveHosts: 1 });
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { idleResetMs: 60_000 } }).sessions).toEqual({
+		idleResetMs: 60_000,
+	});
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { idleResetMs: 2_592_000_000 } }).sessions).toEqual({
+		idleResetMs: 2_592_000_000,
+	});
 	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("sessions");
 	const path = await home();
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 8 } }));
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 8, idleResetMs: 120_000 } }),
+	);
 	const current = await loadConfig({ home: path });
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 2 } }));
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 2, idleResetMs: 240_000 } }),
+	);
 	const result = await reloadConfig(current);
 	expect(result).toMatchObject({ ok: true, changed: ["sessions"], restartRequired: [] });
-	if (result.ok) expect(result.config.sessions).toEqual({ maxLiveHosts: 2 });
+	if (result.ok) expect(result.config.sessions).toEqual({ maxLiveHosts: 2, idleResetMs: 240_000 });
 });
 
 for (const [sessions, field] of [
@@ -241,6 +253,10 @@ for (const [sessions, field] of [
 	[{ maxLiveHosts: "8" }, "sessions.maxLiveHosts"],
 	[{ idleRetireMs: 1_000 }, "sessions.idleRetireMs"],
 	[{ idleRetireMs: 8 * 24 * 60 * 60_000 }, "sessions.idleRetireMs"],
+	[{ idleResetMs: 59_999 }, "sessions.idleResetMs"],
+	[{ idleResetMs: 2_592_000_001 }, "sessions.idleResetMs"],
+	[{ idleResetMs: 60_000.5 }, "sessions.idleResetMs"],
+	[{ idleResetMs: "60000" }, "sessions.idleResetMs"],
 	[{ maxHosts: 1 }, "sessions"],
 ] as const) {
 	test(`rejects invalid sessions configuration ${JSON.stringify(sessions)}`, () => {
@@ -249,3 +265,33 @@ for (const [sessions, field] of [
 		expect(parse).toThrow(field);
 	});
 }
+
+test("sqlite journalMode accepts only durable modes and requires restart when changed", async () => {
+	for (const [mode, expected] of [
+		["DELETE", "DELETE"],
+		["delete", "DELETE"],
+		["TRUNCATE", "TRUNCATE"],
+		["PERSIST", "PERSIST"],
+		["wal", "WAL"],
+	] as const) {
+		expect(parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: mode } }).sqlite?.journalMode).toBe(expected);
+	}
+	for (const mode of ["INVALID", "wal2", "MEMORY", "memory", "OFF", "off"])
+		expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: mode } })).toThrow(
+			/sqlite\.journalMode must be one of/,
+		);
+	expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: "" } })).toThrow(
+		"sqlite.journalMode must be a non-empty string",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, sqlite: { journalMode: "WAL", extra: true } })).toThrow(
+		"sqlite may only contain journalMode",
+	);
+
+	const path = await home();
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sqlite: { journalMode: "WAL" } }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sqlite: { journalMode: "DELETE" } }));
+	const result = await reloadConfig(current);
+	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["sqlite"] });
+	if (result.ok) expect(result.config.sqlite).toEqual({ journalMode: "WAL" });
+});

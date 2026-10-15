@@ -26,6 +26,14 @@ test("every attachment kind and a voice message are redacted, several per body",
 	);
 });
 
+test("a Slack attachment keeps its file id when its url is redacted from history", () => {
+	const body =
+		"[image · image.png · id F0C8P71RK54 · 120 KB · https://files.slack.com/files-pri/T1-F0C8P71RK54/image.png]";
+	expect(redactHistoricalAttachments(body)).toBe(
+		"[image · image.png · id F0C8P71RK54 · 120 KB · past attachment; not part of this message, do not fetch]",
+	);
+});
+
 test("plain urls and prose stay untouched", () => {
 	const body = "see https://example.com/page and [not an attachment] and image: foo.png";
 	expect(redactHistoricalAttachments(body)).toBe(body);

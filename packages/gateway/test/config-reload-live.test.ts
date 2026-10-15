@@ -101,6 +101,7 @@ test("the partition is honest and exhaustive: live, restart-only, or unconsumed"
 	expect(RELOADABLE_FIELDS).toContain("mentionAllowlist");
 	expect(RELOADABLE_FIELDS).toContain("channels");
 	expect(RELOADABLE_FIELDS).toContain("stallTimeoutMs");
+	expect(RELOADABLE_FIELDS).toContain("sessions");
 	// Anything bound to a listener, an open database, or the constructed gjc
 	// client is restart-only, and the sets never overlap.
 	for (const field of RESTART_REQUIRED_FIELDS) expect(RELOADABLE_FIELDS).not.toContain(field);

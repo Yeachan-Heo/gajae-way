@@ -1,3 +1,5 @@
+import { existsSync, lstatSync, realpathSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
@@ -28,6 +30,18 @@ const UNPROVEN_END_STATES = new Set(["attempt_ended", "terminal_uncertain", "ter
  */
 export function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
 	return { jobId: `lanejob-${Buffer.from(workName, "utf8").toString("hex")}`, laneKey: `work-${workName}` };
+}
+
+export function managedLaneBranchName(workName: string): string {
+	return `work/${Buffer.from(workName, "utf8").toString("hex")}`;
+}
+
+export function managedLaneRepositoryPath(laneRoot: string, workName: string): string {
+	return join(resolve(laneRoot), "repositories", Buffer.from(workName, "utf8").toString("hex"));
+}
+
+export function managedLaneWorktreePath(laneRoot: string, workName: string): string {
+	return join(resolve(laneRoot), "lanes", Buffer.from(workName, "utf8").toString("hex"));
 }
 
 export function workSessionKey(name: string): string {
@@ -76,6 +90,8 @@ type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceReti
 export interface LaneGovernorOptions {
 	readonly database: Store;
 	readonly sessionPort: SessionPort;
+	/** Configured lane root used to prove managed repository ownership before deletion. */
+	readonly laneRoot?: string;
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
 	readonly now?: () => number;
@@ -94,6 +110,7 @@ export interface LaneGovernorOptions {
 export class LaneGovernor {
 	readonly #database: Store;
 	readonly #port: SessionPort;
+	readonly #laneRoot: string | undefined;
 	readonly maxLanes: number;
 	readonly idleRetireMs: number;
 	readonly #now: () => number;
@@ -106,6 +123,7 @@ export class LaneGovernor {
 	constructor(options: LaneGovernorOptions) {
 		this.#database = options.database;
 		this.#port = options.sessionPort;
+		this.#laneRoot = options.laneRoot === undefined ? undefined : resolve(options.laneRoot);
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
 		this.#now = options.now ?? (() => Date.now());
@@ -294,11 +312,18 @@ export class LaneGovernor {
 				);
 			}
 			// Only a non-forced operator retirement (no sweep nomination) deletes the
-			// runtime-created worktree and branch. A sweep is unattended: the lane must stay
-			// resumable and its unpushed commits must survive.
-			if (!expected && record?.lane.worktreePath && record.lane.repository) {
+			// runtime-created worktree and branch. Unattended sweep/force retirement keeps
+			// the durable lane path and its unpushed commits resumable.
+			const repositoryPath = record?.lane.repositoryPath ?? record?.lane.repository;
+			if (!expected && record?.lane.worktreePath && repositoryPath) {
 				try {
-					this.#cleanupWorktree(name, lane.sessionId, record.lane.worktreePath, record.lane.repository);
+					this.#cleanupWorktree(
+						name,
+						lane.sessionId,
+						record.lane.worktreePath,
+						repositoryPath,
+						record.lane.repositoryPath !== undefined,
+					);
 				} catch (error) {
 					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
 					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
@@ -420,16 +445,8 @@ export class LaneGovernor {
 					return { retired: false, sessionKey, reason: detail };
 				}
 			}
-			// Clean up the worktree for force retire as well (issue #480)
-			if (record?.lane.worktreePath && record.lane.repository) {
-				try {
-					this.#cleanupWorktree(name, lane.sessionId, record.lane.worktreePath, record.lane.repository);
-				} catch (error) {
-					const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
-					this.#log(`lane_worktree_cleanup_failed name=${name} session=${lane.sessionId} reason=${detail}`, "error");
-					return { retired: false, sessionKey, reason: `worktree cleanup failed: ${detail}` };
-				}
-			}
+			// Forced retirement is unattended; preserve the durable worktree and
+			// branch so its commits and the stored worktree path remain resumable.
 			// Close the session and rebind the epoch.
 			let closed = false;
 			try {
@@ -547,7 +564,21 @@ export class LaneGovernor {
 	}
 
 	/** Cleans up a runtime-created worktree and its branch. Throws on error (issue #480). */
-	#cleanupWorktree(name: string, sessionId: string, worktreePath: string, repository: string): void {
+	#cleanupWorktree(
+		name: string,
+		sessionId: string,
+		worktreePath: string,
+		repository: string,
+		removeRepository: boolean,
+	): void {
+		if (removeRepository) assertManagedRepositoryPath(this.#laneRoot, name, repository);
+
+		// A previous cleanup can have removed the managed bare repository before
+		// the binding epoch was rotated. Treat that state as already cleaned up.
+		if (removeRepository && !existsSync(repository)) {
+			if (existsSync(worktreePath)) throw new Error("managed repository is missing while the worktree still exists");
+			return;
+		}
 		// Remove the worktree using git worktree remove --force
 		const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
 			cwd: repository,
@@ -557,11 +588,46 @@ export class LaneGovernor {
 
 		if (removeResult.exitCode !== 0) {
 			const stderr = removeResult.stderr?.toString().trim() || "unknown error";
-			throw new Error(`git worktree remove failed: ${stderr}`);
+			if (existsSync(worktreePath)) throw new Error(`git worktree remove failed: ${stderr}`);
+
+			// External deletion leaves a stale administrative worktree record. Prune
+			// only after confirming the path is absent, then verify it is unregistered.
+			const pruneResult = Bun.spawnSync(["git", "worktree", "prune"], {
+				cwd: repository,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (pruneResult.exitCode !== 0) {
+				const pruneError = pruneResult.stderr?.toString().trim() || "unknown error";
+				throw new Error(`git worktree prune failed: ${pruneError}`);
+			}
+			const listResult = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+				cwd: repository,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (listResult.exitCode !== 0) {
+				const listError = listResult.stderr?.toString().trim() || "unknown error";
+				throw new Error(`git worktree list failed: ${listError}`);
+			}
+			const canonicalWorktreePath = canonicalPathIncludingMissing(worktreePath);
+			const stillRegistered = listResult.stdout
+				?.toString()
+				.split(/\r?\n/)
+				.some((line) => {
+					if (!line.startsWith("worktree ")) return false;
+					try {
+						return canonicalPathIncludingMissing(line.slice("worktree ".length)) === canonicalWorktreePath;
+					} catch {
+						// If a listed path cannot be canonicalized, do not delete the repository.
+						return true;
+					}
+				});
+			if (stillRegistered) throw new Error(`worktree remains registered after pruning: ${stderr}`);
 		}
 
 		// Delete the branch using git branch -D
-		const branchName = `work/${name.toLowerCase()}`;
+		const branchName = managedLaneBranchName(name);
 		const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
 			cwd: repository,
 			stdout: "pipe",
@@ -576,6 +642,7 @@ export class LaneGovernor {
 				"warn",
 			);
 		}
+		if (removeRepository) rmSync(repository, { recursive: true, force: true });
 	}
 
 	/** `undefined` when no job row exists; `"corrupt"` when one exists but cannot be trusted. */
@@ -587,6 +654,49 @@ export class LaneGovernor {
 			return parseLaneJobRecord(json);
 		} catch {
 			return "corrupt";
+		}
+	}
+}
+
+function assertManagedRepositoryPath(laneRoot: string | undefined, name: string, repository: string): void {
+	if (laneRoot === undefined) throw new Error("configured lane root is unavailable for managed repository cleanup");
+	const expectedPath = managedLaneRepositoryPath(laneRoot, name);
+	if (resolve(repository) !== expectedPath) throw new Error("managed repository path does not match its lane name");
+	if (!existsSync(repository)) return;
+
+	const repositoryStat = lstatSync(repository);
+	if (!repositoryStat.isDirectory() || repositoryStat.isSymbolicLink())
+		throw new Error("managed repository path is not a real directory");
+	const canonicalLaneRoot = realpathSync(laneRoot);
+	const canonicalRepositoryRoot = realpathSync(join(laneRoot, "repositories"));
+	const canonicalRepository = realpathSync(repository);
+	const expectedCanonicalPath = join(canonicalRepositoryRoot, Buffer.from(name, "utf8").toString("hex"));
+	const laneRootPrefix = canonicalLaneRoot.endsWith(sep) ? canonicalLaneRoot : `${canonicalLaneRoot}${sep}`;
+	const repositoryRootPrefix = canonicalRepositoryRoot.endsWith(sep)
+		? canonicalRepositoryRoot
+		: `${canonicalRepositoryRoot}${sep}`;
+	if (
+		!canonicalRepository.startsWith(laneRootPrefix) ||
+		!canonicalRepositoryRoot.startsWith(laneRootPrefix) ||
+		canonicalRepository !== expectedCanonicalPath ||
+		!canonicalRepository.startsWith(repositoryRootPrefix)
+	)
+		throw new Error("managed repository path escapes its configured lane root");
+}
+
+function canonicalPathIncludingMissing(target: string): string {
+	let current = resolve(target);
+	const missing: string[] = [];
+	while (true) {
+		try {
+			return resolve(realpathSync(current), ...missing.reverse());
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			const parent = dirname(current);
+			if (parent === current) throw error;
+			missing.push(basename(current));
+			current = parent;
 		}
 	}
 }

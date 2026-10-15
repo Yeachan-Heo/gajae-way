@@ -60,16 +60,24 @@ async function provision(f: Fixture): Promise<void> {
 async function installFakeGjc(
 	f: Fixture,
 	options: { readonly version?: string; readonly waitForTerm?: boolean } = {},
-): Promise<{ readonly argsPath: string; readonly envPath: string; readonly termPath: string }> {
+): Promise<{
+	readonly argsPath: string;
+	readonly envPath: string;
+	readonly termPath: string;
+	readonly termReadyPath: string;
+}> {
 	const layout = homeLayout(f.home);
 	const bin = join(layout.gjcCurrent, "bin");
 	await mkdir(bin, { recursive: true });
 	const argsPath = join(f.root, "gjc-args");
 	const envPath = join(f.root, "gjc-env");
 	const termPath = join(f.root, "gjc-term");
+	const termReadyPath = join(f.root, "gjc-term-ready");
 	const scriptPath = layout.gjcExecutable();
 	const version = options.version ?? readPinnedGjcVersion();
-	const wait = options.waitForTerm ? "while :; do sleep 0.05; done" : "exit 0";
+	const wait = options.waitForTerm
+		? `printf ready > ${shellQuote(termReadyPath)}\nwhile :; do sleep 0.05; done`
+		: "exit 0";
 	const script = [
 		"#!/bin/sh",
 		'if [ "$1" = "--version" ]; then printf \'gjc %s\\n\' ' + shellQuote(version) + "; exit 0; fi",
@@ -80,7 +88,7 @@ async function installFakeGjc(
 	].join("\n");
 	await writeFile(scriptPath, `${script}\n`, { mode: 0o700 });
 	await chmod(scriptPath, 0o700);
-	return { argsPath, envPath, termPath };
+	return { argsPath, envPath, termPath, termReadyPath };
 }
 
 function shellQuote(value: string): string {
@@ -117,6 +125,19 @@ async function waitForFile(path: string): Promise<void> {
 		await Bun.sleep(10);
 	}
 	throw new Error(`timed out waiting for ${path}`);
+}
+
+async function waitForBrokerStarted(child: ReturnType<typeof Bun.spawn>): Promise<void> {
+	const stdout = child.stdout;
+	if (typeof stdout !== "object" || stdout === null) throw new Error("broker host stdout is not piped");
+	const reader = stdout.getReader();
+	const decoder = new TextDecoder();
+	let output = "";
+	while (!output.includes("broker_host_started ")) {
+		const { value, done } = await reader.read();
+		if (done) throw new Error(`broker host exited before its start marker: ${output}`);
+		output += decoder.decode(value, { stream: true });
+	}
 }
 
 async function crashProvision(f: Fixture, marker: string): Promise<void> {
@@ -310,7 +331,7 @@ describe("foreground broker host", () => {
 		await provision(f);
 		const fake = await installFakeGjc(f, { waitForTerm: true });
 		const child = await runHostChild(f);
-		await waitForFile(fake.argsPath);
+		await Promise.all([waitForBrokerStarted(child), waitForFile(fake.termReadyPath)]);
 		const args = await readFile(fake.argsPath, "utf8");
 		expect(args).toBe(`sdk\nbroker\nrun\n--agent-dir\n${f.agentDir}\n`);
 		child.kill("SIGTERM");

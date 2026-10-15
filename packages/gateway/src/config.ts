@@ -16,6 +16,7 @@ import {
 	RuntimeConfigError,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
+import { isSqliteJournalMode, SQLITE_JOURNAL_MODES, type SqliteJournalMode } from "./sqlite-journal";
 
 export type { RuntimeConfig } from "@gajae-gateway/protocol";
 export const CONFIG_SCHEMA_VERSION = 1;
@@ -51,10 +52,14 @@ export const DEFAULT_SESSIONS_MAX_LIVE_HOSTS = 8;
 /** A persona host idle for this long is ended by the sweep; its session resumes with history on the next turn. */
 export const DEFAULT_SESSIONS_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const SESSIONS_MAX_LIVE_HOSTS_MAX = 256;
+const SESSIONS_IDLE_RESET_MIN_MS = 60_000;
+const SESSIONS_IDLE_RESET_MAX_MS = 30 * 24 * 60 * 60_000;
 
 export interface SessionHostConfig {
 	readonly maxLiveHosts?: number;
 	readonly idleRetireMs?: number;
+	/** Idle persona sessions rotate like `/new`; unset disables automatic reset. */
+	readonly idleResetMs?: number;
 }
 export type GjcServiceTier =
 	| "none"
@@ -119,7 +124,7 @@ export interface GatewayConfigFile {
 	readonly runtime?: RuntimeConfig;
 	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
 	readonly work?: WorkLaneConfig;
-	/** Persona-host governance: live-host cap and idle retirement for conversation sessions. */
+	/** Persona-host governance: live-host cap, host retirement, and optional idle session reset. */
 	readonly sessions?: SessionHostConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
@@ -129,6 +134,8 @@ export interface GatewayConfigFile {
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
 	/** Optional absolute path override for the broker agent directory. */
 	readonly gjc?: { readonly agentDir?: string } | undefined;
+	/** SQLite journal mode; defaults to WAL. */
+	readonly sqlite?: { readonly journalMode?: SqliteJournalMode };
 }
 
 export interface MonitorCatchUpConfig {
@@ -549,8 +556,8 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseSessions(value: unknown): SessionHostConfig {
 	const input = requireObject(value, "sessions");
-	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs"))
-		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts and idleRetireMs");
+	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs"))
+		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts, idleRetireMs, and idleResetMs");
 	if (
 		input.maxLiveHosts !== undefined &&
 		(!Number.isInteger(input.maxLiveHosts) ||
@@ -571,9 +578,20 @@ function parseSessions(value: unknown): SessionHostConfig {
 			"config_invalid",
 			`sessions.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
 		);
+	if (
+		input.idleResetMs !== undefined &&
+		(!Number.isInteger(input.idleResetMs) ||
+			(input.idleResetMs as number) < SESSIONS_IDLE_RESET_MIN_MS ||
+			(input.idleResetMs as number) > SESSIONS_IDLE_RESET_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.idleResetMs must be an integer between ${SESSIONS_IDLE_RESET_MIN_MS} and ${SESSIONS_IDLE_RESET_MAX_MS}`,
+		);
 	return {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+		...(input.idleResetMs === undefined ? {} : { idleResetMs: input.idleResetMs as number }),
 	};
 }
 
@@ -595,6 +613,22 @@ function parseGjcConfig(value: unknown): { readonly agentDir?: string } | undefi
 		return agentDir ? { agentDir } : undefined;
 	}
 	return undefined;
+}
+
+function parseSqliteConfig(value: unknown): { readonly journalMode?: SqliteJournalMode } | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "sqlite");
+	if (Object.keys(input).some((key) => key !== "journalMode"))
+		throw new ConfigError("config_invalid", "sqlite may only contain journalMode");
+	const journalMode = optionalString(input.journalMode, "sqlite.journalMode");
+	if (journalMode === undefined) return undefined;
+	const normalized = journalMode.toUpperCase();
+	if (!isSqliteJournalMode(normalized))
+		throw new ConfigError(
+			"config_invalid",
+			`sqlite.journalMode must be one of ${SQLITE_JOURNAL_MODES.join(", ")}, got ${journalMode}`,
+		);
+	return { journalMode: normalized };
 }
 
 export function parseConfigFile(value: unknown): GatewayConfigFile {
@@ -621,6 +655,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const model = parseModel(input.model);
 	const serviceTier = parseServiceTier(input.serviceTier);
 	const runtime = parseRuntimeConfig(input.runtime);
+	const sqlite = parseSqliteConfig(input.sqlite);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -647,6 +682,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.sessions === undefined ? {} : { sessions: parseSessions(input.sessions) }),
+		...(sqlite === undefined ? {} : { sqlite }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
@@ -758,8 +794,8 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
  * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
- * `sessions` (persona host cap and idle retirement, applied to the next bind and
- * sweep). Each applies to the next actor event.
+ * `sessions` (persona host cap, host retirement, and idle session reset, applied
+ * to the next bind and sweep). Each applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
@@ -789,6 +825,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"work",
 	"interimSpeech",
 	"gjc",
+	"sqlite",
 ] as const;
 
 /**

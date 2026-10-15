@@ -13,12 +13,15 @@ const DISCORD_ORIGIN = { platform: "discord", kind: "channel", conversationId: "
 const SLACK_TRIGGER = "C1:1726543210.000100";
 
 let directory = "";
+let externalWorkspace = "";
 let server: GatewayServer | undefined;
 afterEach(async () => {
 	await server?.stop();
 	server = undefined;
 	if (directory) await rm(directory, { recursive: true, force: true });
+	if (externalWorkspace) await rm(externalWorkspace, { recursive: true, force: true });
 	directory = "";
+	externalWorkspace = "";
 });
 
 interface Client {
@@ -69,11 +72,18 @@ async function settle(): Promise<void> {
 }
 
 /** Home with a workspace file and a secret; `reply` gets the home so it can name real paths. */
-async function gateway(reply: (home: string) => string): Promise<{ client: Client; database: Store }> {
+async function gateway(
+	reply: (home: string) => string,
+	setupWorkspace?: (home: string) => Promise<void>,
+): Promise<{ client: Client; database: Store }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-files-"));
-	await mkdir(join(directory, "workspace"), { recursive: true });
+	if (setupWorkspace) {
+		await setupWorkspace(directory);
+	} else {
+		await mkdir(join(directory, "workspace"), { recursive: true });
+		await writeFile(join(directory, "workspace", "report.csv"), "a,b\n1,2\n");
+	}
 	await mkdir(join(directory, "secrets"), { recursive: true });
-	await writeFile(join(directory, "workspace", "report.csv"), "a,b\n1,2\n");
 	await writeFile(join(directory, "secrets", "slack-bot-token"), "xoxb-not-a-real-token");
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -168,6 +178,23 @@ test("a file-only reply uploads the file and speaks no empty message", async () 
 	const delivered = messages(client.frames);
 	expect(delivered).toHaveLength(1);
 	expect(fileMessages(delivered)[0]?.payload.file.name).toBe("report.csv");
+});
+
+test("a MEDIA file in a symlinked persona workspace uploads from the canonical workspace", async () => {
+	const { client } = await gateway(
+		(home) => `보고서입니다\nMEDIA:${join(home, "workspace", "report.csv")}`,
+		async (home) => {
+			externalWorkspace = await mkdtemp(join(tmpdir(), "gajaeway-linked-workspace-"));
+			await writeFile(join(externalWorkspace, "report.csv"), "a,b\n1,2\n");
+			await symlink(externalWorkspace, join(home, "workspace"));
+		},
+	);
+	sendMessage(client, SLACK_ORIGIN, SLACK_TRIGGER);
+	await settle();
+	const delivered = messages(client.frames);
+	expect(delivered.filter((frame) => !frame.payload.file).map((frame) => frame.payload.text)).toEqual(["보고서입니다"]);
+	expect(fileMessages(delivered).map((frame) => frame.payload.file.name)).toEqual(["report.csv"]);
+	expect(delivered.some((frame) => frame.payload.text.includes("outside the workspace"))).toBe(false);
 });
 
 test("a file under the gateway home outside the workspace is refused with a visible note, never uploaded", async () => {

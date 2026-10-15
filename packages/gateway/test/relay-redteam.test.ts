@@ -514,7 +514,7 @@ test("RT14 work start survives observer spawn failure, sends once without relay 
 	const manager = new WorkLaneManager({
 		database: db,
 		port,
-		lanes: new LaneGovernor({ database: db, sessionPort: port, maxLanes: 1 }),
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome, maxLanes: 1 }),
 		gajaewayHome,
 		serviceDirectory: join(home, "service"),
 		pollMs: 5,

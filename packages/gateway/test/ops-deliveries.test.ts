@@ -47,13 +47,49 @@ async function startDeliveryServer() {
 	const seeded = new Database(config.dbPath);
 	try {
 		const insert = seeded.query(
-			"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+			"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		);
 		for (const row of [
-			{ id: "delivery-1", createdAt: new Date(base).toISOString(), state: "confirmed", text: "1".repeat(100) },
-			{ id: "delivery-2", createdAt: new Date(base + 1_000).toISOString(), state: "pending", text: "pending" },
-			{ id: "delivery-3", createdAt: new Date(base + 2_000).toISOString(), state: "confirmed", text: "recent" },
-			{ id: "delivery-4", createdAt: new Date(base + 3_000).toISOString(), state: "confirmed", text: "4".repeat(100) },
+			{
+				id: "delivery-1",
+				createdAt: new Date(base).toISOString(),
+				state: "confirmed",
+				attempts: 0,
+				lastError: null,
+				text: "1".repeat(100),
+			},
+			{
+				id: "delivery-2",
+				createdAt: new Date(base + 1_000).toISOString(),
+				state: "pending",
+				attempts: 1,
+				lastError: "network",
+				text: "pending",
+			},
+			{
+				id: "delivery-3",
+				createdAt: new Date(base + 2_000).toISOString(),
+				state: "confirmed",
+				attempts: 0,
+				lastError: null,
+				text: "recent",
+			},
+			{
+				id: "delivery-4",
+				createdAt: new Date(base + 3_000).toISOString(),
+				state: "confirmed",
+				attempts: 0,
+				lastError: null,
+				text: "4".repeat(100),
+			},
+			{
+				id: "delivery-5",
+				createdAt: new Date(base + 4_000).toISOString(),
+				state: "expired",
+				attempts: 5,
+				lastError: "not_found",
+				text: "expired after adapter failures",
+			},
 		]) {
 			const payloadJson = JSON.stringify({
 				origin: { platform: "discord", kind: "channel", conversationId: "channel-42" },
@@ -65,8 +101,10 @@ async function startDeliveryServer() {
 				"discord:channel:channel-42",
 				payloadJson,
 				row.state,
+				row.attempts,
 				row.createdAt,
 				row.createdAt,
+				row.lastError,
 			);
 		}
 	} finally {
@@ -83,16 +121,23 @@ async function startDeliveryServer() {
 test("ops.deliveries returns newest first and truncates text prefixes at 80 characters", async () => {
 	const { client } = await startDeliveryServer();
 	const result = await client.opsDeliveries();
-	expect(result.rows.map((row) => row.deliveryId)).toEqual(["delivery-4", "delivery-3", "delivery-2", "delivery-1"]);
+	expect(result.rows.map((row) => row.deliveryId)).toEqual([
+		"delivery-5",
+		"delivery-4",
+		"delivery-3",
+		"delivery-2",
+		"delivery-1",
+	]);
+	expect(result.rows[0]).toMatchObject({ state: "expired", lastError: "not_found" });
 	expect(result.rows[0]).toMatchObject({
-		deliveryId: "delivery-4",
-		turnId: "turn-delivery-4",
+		deliveryId: "delivery-5",
+		turnId: "turn-delivery-5",
 		originKey: "discord:channel:channel-42",
 		conversationId: "channel-42",
-		state: "confirmed",
-		textPrefix: "4".repeat(80),
+		textPrefix: "expired after adapter failures",
 	});
-	expect(result.rows[0]?.textPrefix).toHaveLength(80);
+	expect(result.rows[1]).toMatchObject({ lastError: null });
+	expect(result.rows[1]?.textPrefix).toHaveLength(80);
 });
 
 test("ops.deliveries filters by since and state before applying its limit", async () => {

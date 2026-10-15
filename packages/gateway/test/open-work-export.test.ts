@@ -109,7 +109,7 @@ test("open-work export publishes v1 atomically with 0600 mode, backup hash and c
 			kind: "gajaeway.open-work-export",
 			version: 1,
 			reason: "cutover",
-			schemaVersion: 32,
+			schemaVersion: 36,
 			backup: { path: backupPath, sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
 			cutoverIds: ["cutover-inbound", "cutover-invalid"],
 			counts: receipt.counts,

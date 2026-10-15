@@ -410,6 +410,39 @@ test("terminal delivery claims are per-part and first claimant wins", async () =
 	});
 });
 
+test("a proven refusal requeues its bound trigger as plain pending input", async () => {
+	const db = await open();
+	db.transaction((tx) => db.inbox.enqueue(tx, message("refused-trigger", "original")));
+	db.transaction((tx) => db.inbox.enqueue(tx, message("later-trigger", "later")));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, {
+			messageId: "refused-trigger",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef: "gw-p-refused",
+			sessionId: "session-refused",
+			dispatchedAt: new Date().toISOString(),
+		}),
+	);
+
+	expect(db.transaction((tx) => retryInboundTurn(db, tx, "gw-p-refused"))).toBe(1);
+	expect(db.inbox.turnRow("gw-p-refused")).toBeUndefined();
+	expect(freshTurnAttempt(db, ORIGIN_KEY, 0, "refused-trigger")).toBe(1);
+	expect(db.inbox.pendingCount(ORIGIN_KEY)).toBe(2);
+	expect(db.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "refused-trigger",
+		state: "pending",
+		turn_role: null,
+		turn_epoch: null,
+		turn_state: null,
+		turn_op_ref: null,
+		bound_session_id: null,
+		dispatched_at: null,
+		terminal_delivery_id: null,
+	});
+	expect(db.inbox.nonterminalTurns(ORIGIN_KEY)).toEqual([]);
+});
+
 test("an accepted turn with a delivered steer requeues its trigger for fresh attempts", async () => {
 	const db = await open();
 	const now = Date.now();

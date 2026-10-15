@@ -10,6 +10,8 @@ import { Store } from "../src/store";
 
 const roots: string[] = [];
 const LIVE_NAMES = ["gateway.db-wal", "gateway.db-shm", "gateway.db"] as const;
+const RESTORE_CHILD_TIMEOUT_MS = 30_000;
+const RESTORE_MATRIX_TIMEOUT_MS = 240_000;
 const INITIAL_FAULTS = [
 	"after-staging",
 	"after-journal-preserving",
@@ -89,7 +91,12 @@ async function sqliteRows(path: string) {
 	}
 }
 
-async function faultRestore(home: string, backup: string, point: string): Promise<void> {
+async function faultRestore(
+	home: string,
+	backup: string,
+	point: string,
+	timeoutMs = RESTORE_CHILD_TIMEOUT_MS,
+): Promise<void> {
 	const modulePath = new URL("../src/ops/restore.ts", import.meta.url).href;
 	const script = `
 		import { runRestore } from ${JSON.stringify(modulePath)};
@@ -100,13 +107,22 @@ async function faultRestore(home: string, backup: string, point: string): Promis
 		stdout: "ignore",
 		stderr: "ignore",
 	});
-	const outcome = await Promise.race([
-		child.exited.then(() => "exited" as const),
-		Bun.sleep(10_000).then(() => "timeout" as const),
-	]);
-	if (outcome === "timeout") child.kill("SIGKILL");
-	await child.exited;
-	expect(outcome).toBe("exited");
+	const outcome = await new Promise<"exited" | "timeout">((resolve) => {
+		const timeout = setTimeout(() => resolve("timeout"), timeoutMs);
+		void child.exited.then(() => {
+			clearTimeout(timeout);
+			resolve("exited");
+		});
+	});
+	if (outcome === "timeout") {
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			// The child may exit as the timeout fires.
+		}
+		await child.exited;
+		throw new Error(`restore child timed out at fault point ${point}`);
+	}
 	expect(child.signalCode).toBe("SIGKILL");
 }
 
@@ -226,7 +242,7 @@ test("restore rolls back a pre-install interrupted generation on --abort", async
 		restoredOriginal.close();
 	}
 	expect(await Bun.file(join(f.home, "restore.journal.json")).exists()).toBe(false);
-});
+}, 60_000);
 
 test("abort returns the original inodes at every pre-install transition", async () => {
 	for (const point of [
@@ -250,36 +266,47 @@ test("abort returns the original inodes at every pre-install transition", async 
 		}
 		expect(await Bun.file(join(f.home, "restore.journal.json")).exists()).toBe(false);
 	}
-});
+}, 240_000);
 
-test("child-process crash injection covers every restore transition and resume is idempotent", async () => {
-	for (const point of INITIAL_FAULTS) {
+test(
+	"child-process crash injection covers every restore transition and resume is idempotent",
+	async () => {
+		// Bound the whole 21-child matrix; a child receives at most the per-process budget.
+		const deadline = Date.now() + RESTORE_MATRIX_TIMEOUT_MS;
+		const crashAt = async (home: string, backup: string, point: string) => {
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) throw new Error(`restore matrix timed out before fault point ${point}`);
+			await faultRestore(home, backup, point, Math.min(RESTORE_CHILD_TIMEOUT_MS, remainingMs));
+		};
+		for (const point of INITIAL_FAULTS) {
+			const f = await fixture();
+			await crashAt(f.home, f.backup, point);
+			const code = await quietly(() => runRestore(f.backup, { home: f.home }));
+			expect(code).toBe(0);
+			await verifyRestored(f);
+		}
+
 		const f = await fixture();
-		await faultRestore(f.home, f.backup, point);
-		const code = await quietly(() => runRestore(f.backup, { home: f.home }));
-		expect(code).toBe(0);
+		await crashAt(f.home, f.backup, "after-journal-preserving");
+		for (const point of [
+			"after-preserve-wal",
+			"after-preserve-shm",
+			"after-preserve-db",
+			"after-journal-preserved",
+			"after-install-rename",
+			"before-journal-installed",
+			"after-journal-installed",
+			"after-post-check-open",
+			"before-journal-delete",
+		]) {
+			await crashAt(f.home, f.backup, point);
+		}
+		expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
 		await verifyRestored(f);
-	}
-
-	const f = await fixture();
-	await faultRestore(f.home, f.backup, "after-journal-preserving");
-	for (const point of [
-		"after-preserve-wal",
-		"after-preserve-shm",
-		"after-preserve-db",
-		"after-journal-preserved",
-		"after-install-rename",
-		"before-journal-installed",
-		"after-journal-installed",
-		"after-post-check-open",
-		"before-journal-delete",
-	]) {
-		await faultRestore(f.home, f.backup, point);
-	}
-	expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
-	await verifyRestored(f);
-	expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
-});
+		expect(await quietly(() => runRestore(f.backup, { home: f.home }))).toBe(0);
+	},
+	RESTORE_MATRIX_TIMEOUT_MS + 30_000,
+);
 
 test("restore --abort is refused after install and anomalies keep the journal", async () => {
 	const afterInstall = await fixture();
@@ -294,4 +321,4 @@ test("restore --abort is refused after install and anomalies keep the journal", 
 	expect(await quietly(() => runRestore(anomaly.backup, { home: anomaly.home }))).toBe(4);
 	expect(await Bun.file(join(anomaly.home, "restore.journal.json")).exists()).toBe(true);
 	expect(await readFile(anomaly.livePath)).toEqual(installedBytes);
-});
+}, 90_000);

@@ -1,5 +1,6 @@
 import {
 	eventTypeOrigin,
+	isChatPlatform,
 	type MonitorChannelTarget,
 	type MonitorRecord,
 	type MonitorSpec,
@@ -13,6 +14,7 @@ import type { MonitorCronState } from "../store/groups/monitors";
 import { validateProcedureFiles } from "./procedure";
 
 const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
+const monitorReportToMetaKey = (monitorId: string) => `monitor_report_to:${monitorId}`;
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
 const OVERLAP_POLICIES = new Set(["queue", "skip"]);
@@ -26,6 +28,7 @@ const MONITOR_UPDATE_FIELDS = new Set([
 	"instruction",
 	"model",
 	"serviceTier",
+	"reportTo",
 	"enabled",
 	"procedureFiles",
 ]);
@@ -58,7 +61,7 @@ export class MonitorRegistry {
 			procedureFiles,
 			createdAt: new Date().toISOString(),
 		};
-		this.#database.transaction((tx) =>
+		this.#database.transaction((tx) => {
 			this.#database.monitors.create(tx, {
 				id: record.monitorId,
 				name: record.name,
@@ -72,15 +75,17 @@ export class MonitorRegistry {
 				modelJson: record.model ? JSON.stringify(record.model) : null,
 				serviceTier: record.serviceTier ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
-			}),
-		);
+			});
+			if (record.reportTo)
+				this.#database.core.metaSet(monitorReportToMetaKey(record.monitorId), JSON.stringify(record.reportTo));
+		});
 		return record;
 	}
 	list(): MonitorRecord[] {
 		const records: MonitorRecord[] = [];
 		for (const row of this.#database.monitors.rows()) {
 			try {
-				records.push(rowToRecord(row));
+				records.push(rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id))));
 			} catch {
 				console.warn(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
 			}
@@ -145,13 +150,18 @@ export class MonitorRegistry {
 				serviceTier: updated.serviceTier ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
-			return persisted ? updated : undefined;
+			if (!persisted) return undefined;
+			const reportToKey = monitorReportToMetaKey(current.monitorId);
+			if (updated.reportTo) this.#database.core.metaSet(reportToKey, JSON.stringify(updated.reportTo));
+			else this.#database.core.metaDelete(reportToKey);
+			return updated;
 		});
 	}
 	remove(monitorId: string): boolean {
 		return this.#database.transaction((tx) => {
 			const deleted = this.#database.monitors.delete(tx, monitorId);
 			this.#database.core.metaDelete(monitorCronMetaKey(monitorId));
+			this.#database.core.metaDelete(monitorReportToMetaKey(monitorId));
 			return deleted;
 		});
 	}
@@ -187,7 +197,7 @@ export class MonitorRegistry {
 	}
 }
 
-function rowToRecord(row: ReturnType<Store["monitors"]["rows"]>[number]): MonitorRecord {
+function rowToRecord(row: ReturnType<Store["monitors"]["rows"]>[number], reportToJson?: string): MonitorRecord {
 	const trigger = JSON.parse(row.trigger_json) as TriggerSpec;
 	const record: MonitorRecord = {
 		monitorId: row.monitor_id,
@@ -203,6 +213,7 @@ function rowToRecord(row: ReturnType<Store["monitors"]["rows"]>[number]): Monito
 		model: row.model_json ? JSON.parse(row.model_json) : undefined,
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
 		procedureFiles: row.procedure_files_json ? JSON.parse(row.procedure_files_json) : undefined,
+		reportTo: reportToJson ? JSON.parse(reportToJson) : undefined,
 		createdAt: row.created_at,
 	};
 	validateSpec(record);
@@ -239,6 +250,11 @@ export function validateSpec(spec: MonitorSpec): void {
 	if (spec.channelTarget) {
 		validateOriginRef(spec.channelTarget.origin);
 		validateMentionUserIds(spec.channelTarget);
+	}
+	if (spec.reportTo !== undefined && spec.reportTo !== null) {
+		validateOriginRef(spec.reportTo);
+		if (!isChatPlatform(spec.reportTo.platform) && spec.reportTo.platform !== "loopback")
+			throw new Error("monitor reportTo must target a chat or loopback conversation origin");
 	}
 	if (spec.model !== undefined) {
 		const valid =

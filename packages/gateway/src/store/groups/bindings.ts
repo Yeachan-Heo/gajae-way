@@ -285,9 +285,9 @@ export class BindingsGroup {
 	): void {
 		this.#db
 			.prepare(
-				"UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?",
+				"UPDATE sessions SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?",
 			)
-			.run(tx, at, originRefJson, originKey, sessionId, epoch);
+			.run(tx, at, at, originRefJson, originKey, sessionId, epoch);
 	}
 
 	incrementTurnCount(tx: WriteTx, originKey: string, originRefJson?: string): number {
@@ -604,6 +604,16 @@ export class BindingsGroup {
 		)?.snapshot_json;
 	}
 
+	latestBrokerCutoverAt(): string | null {
+		return (
+			(
+				this.#db.prepare("SELECT MAX(created_at) AS created_at FROM broker_cutovers").get() as {
+					created_at: string | null;
+				} | null
+			)?.created_at ?? null
+		);
+	}
+
 	cutoverBrokerAuthority(
 		tx: WriteTx,
 		input: {
@@ -662,7 +672,7 @@ export class BindingsGroup {
 			(
 				this.#db
 					.prepare(
-						"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+						"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 					)
 					.get() as { n: number } | null
 			)?.n ?? 0;

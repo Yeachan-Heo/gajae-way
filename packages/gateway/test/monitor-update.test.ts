@@ -112,12 +112,19 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 		const update = await request("update", "monitor.update", {
 			monitorId: monitor.monitorId,
 			schedule: "0 */2 * * *",
+			reportTo: { platform: "discord", kind: "channel", conversationId: "report-room" },
 		});
 		expect(update).toMatchObject({ type: "response", result: { monitorId: monitor.monitorId } });
 		const inspected = await request("inspect", "monitor.inspect", { monitorId: monitor.monitorId });
 		expect(inspected).toMatchObject({
 			type: "response",
-			result: { monitor: { monitorId: monitor.monitorId, trigger: { kind: "cron", schedule: "0 */2 * * *" } } },
+			result: {
+				monitor: {
+					monitorId: monitor.monitorId,
+					trigger: { kind: "cron", schedule: "0 */2 * * *" },
+					reportTo: { platform: "discord", kind: "channel", conversationId: "report-room" },
+				},
+			},
 		});
 	} finally {
 		socket?.end();

@@ -661,6 +661,11 @@ export interface RecoveryOutcome {
 	readonly failed: boolean;
 	/** Set when the history fetch itself threw; the caller logs it and retries the channel. */
 	readonly fetchError?: string;
+	/**
+	 * True when `fetchError` is the kind no retry can fix (unknown channel, no access);
+	 * the caller quarantines the conversation instead of re-running it every pass.
+	 */
+	readonly fetchErrorPermanent?: boolean;
 }
 
 export interface RecoveryOptions {
@@ -677,6 +682,23 @@ export interface RecoveryOptions {
 	 * non-text: skipped without a send, cursor advances past them. Default: skip.
 	 */
 	readonly skipEmptyContent?: boolean;
+}
+
+/**
+ * Discord failures that no retry can fix: the channel is gone, or the bot no longer has
+ * access to it. Callers quarantine these instead of retrying them forever.
+ */
+export function isPermanentDiscordUnreadable(error: unknown): boolean {
+	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
+	return (
+		candidate?.code === 10_003 ||
+		candidate?.code === 50_001 ||
+		candidate?.code === 50_013 ||
+		candidate?.status === 403 ||
+		candidate?.status === 404 ||
+		candidate?.httpStatus === 403 ||
+		candidate?.httpStatus === 404
+	);
 }
 
 /**
@@ -730,6 +752,7 @@ export async function recoverConversation(
 				truncated: false,
 				failed: true,
 				fetchError: error instanceof Error ? error.message : String(error),
+				fetchErrorPermanent: isPermanentDiscordUnreadable(error),
 			};
 		}
 		// discord.js returns a Collection (entries); fake channels return arrays. Normalize

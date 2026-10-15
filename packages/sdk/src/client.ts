@@ -38,6 +38,8 @@ export interface GajaewayClientOptions {
 	requestTimeoutMs?: number;
 	/** Identifies this process in `gateway.status` generation diagnostics. */
 	clientName?: string;
+	/** Cancels an in-progress socket connection or negotiation. */
+	signal?: AbortSignal;
 }
 
 export interface ConnectSocketWithBackoffOptions extends GajaewayClientOptions {
@@ -53,6 +55,7 @@ export function processStartedAt(): string {
 }
 
 interface Transport {
+	/** Encoding errors throw synchronously; transport failures reject asynchronously. */
 	write(frame: Frame): Promise<void>;
 	close(): void | Promise<void>;
 }
@@ -61,6 +64,30 @@ interface Pending {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
+}
+
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) return Bun.sleep(delayMs);
+	if (signal.aborted) return Promise.reject(new Error("client connection aborted"));
+	return new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+		const onAbort = (): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			cleanup();
+			reject(new Error("client connection aborted"));
+		};
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve();
+		}, delayMs);
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+	});
 }
 
 export class GajaewayClient {
@@ -72,7 +99,21 @@ export class GajaewayClient {
 			close: () => {},
 		};
 		let writer: OrderedFrameWriter;
-		const _socket = await Bun.connect<undefined>({
+		const signal = options?.signal;
+		if (signal?.aborted) throw new Error("client connection aborted");
+		let rejectAbort!: (reason: Error) => void;
+		const aborted = signal
+			? new Promise<never>((_resolve, reject) => {
+					rejectAbort = reject;
+				})
+			: undefined;
+		const onAbort = () => {
+			const error = new Error("client connection aborted");
+			client.#fail(error);
+			rejectAbort(error);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const connecting = Bun.connect<undefined>({
 			unix: path,
 			socket: {
 				open(socket) {
@@ -96,17 +137,42 @@ export class GajaewayClient {
 				},
 			},
 		});
+		let socket: Awaited<typeof connecting>;
+		try {
+			socket = await (aborted ? Promise.race([connecting, aborted]) : connecting);
+		} catch (error) {
+			signal?.removeEventListener("abort", onAbort);
+			void connecting.then(
+				(lateSocket) => lateSocket.end(),
+				() => {},
+			);
+			client.#fail(error instanceof Error ? error : new Error(String(error)));
+			throw error;
+		}
 		client.#transport = {
-			write: async (frame) => {
+			write: (frame) => {
 				writer.write(frame);
-				await writer.settled();
+				return writer.settled();
 			},
 			close: () => {
 				writer?.close();
 			},
 		};
-		await client.#negotiate();
-		return client;
+		if (client.#disconnectError) {
+			client.#transport = undefined;
+			socket.end();
+			signal?.removeEventListener("abort", onAbort);
+			throw client.#disconnectError;
+		}
+		try {
+			await client.#negotiate();
+			return client;
+		} catch (error) {
+			await client.close();
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
 	}
 
 	static async connectSocketWithBackoff(
@@ -122,13 +188,14 @@ export class GajaewayClient {
 			try {
 				return await GajaewayClient.connectSocket(path, clientOptions);
 			} catch (error) {
+				if (clientOptions.signal?.aborted) throw error;
 				const remainingMs = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - (Date.now() - startedAt);
 				if (remainingMs <= 0) throw error;
 				const waitMs = Math.min(delayMs, remainingMs);
 				if (waitMs <= 0) throw error;
 				attempt++;
 				onRetry?.(attempt, waitMs, error);
-				await Bun.sleep(waitMs);
+				await waitForRetry(waitMs, clientOptions.signal);
 				if (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs) throw error;
 				delayMs = Math.min(delayMs * 2, maxMs);
 			}
@@ -138,17 +205,19 @@ export class GajaewayClient {
 	static async connectStdio(transport: StdioTransport, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
 		client.#transport = {
-			write: async (frame) => {
+			write: (frame) => {
 				const data = encodeFrame(frame);
-				const writable = transport.writable;
-				if ("getWriter" in writable) {
-					const writer = writable.getWriter();
-					try {
-						await writer.write(new TextEncoder().encode(data));
-					} finally {
-						writer.releaseLock();
-					}
-				} else await writable.write(data);
+				return (async () => {
+					const writable = transport.writable;
+					if ("getWriter" in writable) {
+						const writer = writable.getWriter();
+						try {
+							await writer.write(new TextEncoder().encode(data));
+						} finally {
+							writer.releaseLock();
+						}
+					} else await writable.write(data);
+				})();
 			},
 			close: () => {
 				if ("getWriter" in transport.writable) transport.writable.getWriter().releaseLock();
@@ -163,6 +232,8 @@ export class GajaewayClient {
 	#decoder = new FrameDecoder();
 	#pending = new Map<string, Pending>();
 	#events = new Map<string, Set<EventHandler>>();
+	#disconnectHandlers = new Set<(error: Error) => void>();
+	#disconnectError?: Error;
 	/**
 	 * Events that arrived before anyone subscribed to them. The gateway writes
 	 * `negotiated` and the pending-delivery replay back to back, and one socket
@@ -197,6 +268,16 @@ export class GajaewayClient {
 		return () => handlers.delete(handler);
 	}
 
+	/** Subscribe to the terminal transport disconnect; this is not a protocol event. */
+	onDisconnect(handler: (error: Error) => void): () => void {
+		if (this.#disconnectError) {
+			handler(this.#disconnectError);
+			return () => {};
+		}
+		this.#disconnectHandlers.add(handler);
+		return () => this.#disconnectHandlers.delete(handler);
+	}
+
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void {
 		return this.on("chat.message", (payload) => handler(payload as ChatMessagePayload));
 	}
@@ -206,7 +287,8 @@ export class GajaewayClient {
 	}
 
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
-		if (!this.#transport) throw new Error("client is not connected");
+		const transport = this.#transport;
+		if (!transport) throw new Error("client is not connected");
 		const id = `${++this.#id}`;
 		const promise = new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -215,7 +297,18 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
-		await this.#transport.write({ v: PROFILE_VERSION, type: "request", id, verb, params });
+		try {
+			void transport.write({ v: PROFILE_VERSION, type: "request", id, verb, params }).catch((error: unknown) => {
+				this.#fail(error instanceof Error ? error : new Error(String(error)));
+			});
+		} catch (error) {
+			const pending = this.#pending.get(id);
+			if (pending) {
+				clearTimeout(pending.timer);
+				this.#pending.delete(id);
+				pending.reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
 		return promise;
 	}
 
@@ -246,23 +339,42 @@ export class GajaewayClient {
 	}
 
 	async close(): Promise<void> {
-		await this.#transport?.close();
-		this.#fail(new Error("client closed"));
+		const transport = this.#fail(new Error("client closed"), false);
+		await transport?.close();
 	}
 
 	async #negotiate(): Promise<void> {
 		if (this.#negotiated) return this.#negotiated;
+		if (this.#disconnectError) throw this.#disconnectError;
 		this.#negotiated = new Promise<void>((resolve, reject) => {
-			const off = this.on("__negotiated", (_payload) => {
-				off();
-				resolve();
-			});
-			const offErr = this.on("__negotiation_error", (payload) => {
-				offErr();
-				reject(payload as Error);
-			});
-			void this.#transport
-				?.write({
+			let settled = false;
+			let offNegotiated = () => {};
+			let offError = () => {};
+			let offDisconnect = () => {};
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const finish = (error?: Error): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				offNegotiated();
+				offError();
+				offDisconnect();
+				if (error) reject(error);
+				else resolve();
+			};
+			offNegotiated = this.on("__negotiated", () => finish());
+			offError = this.on("__negotiation_error", (payload) => finish(payload as Error));
+			offDisconnect = this.onDisconnect((error) => finish(error));
+			const transport = this.#transport;
+			if (!transport) {
+				finish(new Error("client is not connected"));
+				return;
+			}
+			timer = setTimeout(() => {
+				this.#fail(new Error(`gateway negotiation timed out after ${this.#requestTimeoutMs}ms`));
+			}, this.#requestTimeoutMs);
+			void transport
+				.write({
 					v: PROFILE_VERSION,
 					type: "hello",
 					payload: {
@@ -270,18 +382,24 @@ export class GajaewayClient {
 						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
 					},
 				})
-				.catch(reject);
+				.catch((error) => this.#fail(error instanceof Error ? error : new Error(String(error))));
 		});
 		return this.#negotiated;
 	}
 
 	async #readStdio(readable: StdioTransport["readable"]): Promise<void> {
 		const decoder = new TextDecoder();
-		for await (const chunk of readable as AsyncIterable<Uint8Array>)
-			this.#receive(decoder.decode(chunk, { stream: true }));
+		try {
+			for await (const chunk of readable as AsyncIterable<Uint8Array>)
+				this.#receive(decoder.decode(chunk, { stream: true }));
+			this.#fail(new Error("gateway connection closed"));
+		} catch (error) {
+			this.#fail(error instanceof Error ? error : new Error(String(error)));
+		}
 	}
 
-	async #receive(chunk: string): Promise<void> {
+	#receive(chunk: string): void {
+		if (this.#disconnectError) return;
 		let frames: Frame[];
 		try {
 			frames = this.#decoder.feed(chunk);
@@ -290,6 +408,7 @@ export class GajaewayClient {
 			return;
 		}
 		for (const frame of frames) {
+			if (this.#disconnectError) break;
 			if (frame.type === "negotiated") {
 				this.#emit("__negotiated", frame.payload, frame);
 				continue;
@@ -341,12 +460,30 @@ export class GajaewayClient {
 		}
 		for (const handler of handlers) handler(payload, frame);
 	}
-	#fail(error: Error): void {
+	#fail(error: Error, closeTransport = true): Transport | undefined {
+		if (this.#disconnectError) return undefined;
+		this.#disconnectError = error;
+		const transport = this.#transport;
+		this.#transport = undefined;
 		for (const pending of this.#pending.values()) {
 			clearTimeout(pending.timer);
 			pending.reject(error);
 		}
 		this.#pending.clear();
+		if (closeTransport && transport) {
+			try {
+				void Promise.resolve(transport.close()).catch(() => {});
+			} catch {}
+		}
+		for (const handler of this.#disconnectHandlers) {
+			try {
+				handler(error);
+			} catch (callbackError) {
+				console.error("SDK disconnect subscriber failed", callbackError);
+			}
+		}
+		this.#disconnectHandlers.clear();
+		return transport;
 	}
 }
 

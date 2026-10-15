@@ -7,7 +7,7 @@ import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { workAttemptDeliveryId } from "../src/store/groups/work";
+import { resolveLaneReportOrigin, workAttemptDeliveryId } from "../src/store/groups/work";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const rootOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "parent-channel" };
@@ -231,7 +231,7 @@ for (const [label, origin] of [
 		]);
 		expect(chatMessages(f)).toHaveLength(0);
 		expect(f.port.steers).toHaveLength(1);
-		expect(f.port.steers[0]?.text).toContain("Internal lane report that arrived while you were working");
+		expect(f.port.steers[0]?.text).toContain("Internal report that arrived while you were working");
 		expect(f.port.steers[0]?.text).not.toContain("Additional message from the user");
 		expect(f.port.sendAttempts.some((send) => send.sessionId === work.sessionId)).toBe(true);
 		f.port.complete(persona.opRef, "ack");
@@ -282,10 +282,10 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
-		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
+		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"persona wake send",
 	);
-	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
+	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	expect(reportSend.text).toContain("[lane idle-worker] completed: idle report");
 	expect(reportSend.sessionId).toBe(personaSessionId);
 	expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
@@ -314,10 +314,10 @@ test("a lane-report turn can [POST:] its result line to another configured chann
 	await settleLane(f, lane.result.opRef, "deployed");
 	const sends = await eventually(
 		() => f.port.sends,
-		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
+		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"persona wake send",
 	);
-	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
+	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	f.port.complete(
 		reportSend.opRef,
 		"배포 끝났어\n[BREAK]\n[POST:discord/channel/report-room] 완료: 배포 <#parent-channel>",
@@ -348,10 +348,10 @@ for (const [label, callerSessionId] of [
 		expect(runtime.parent).toMatchObject({ kind: "persona", originKey: rootKey });
 		const report = await eventually(
 			() => f.port.sends,
-			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal lane report:"))),
+			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal report from another Gajae session"))),
 			"owner-target report turn",
 		);
-		const reportSend = report.find((send) => send.text.includes("[Internal lane report:"))!;
+		const reportSend = report.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 		expect(reportSend.sessionId).toBe(personaSessionId);
 		expect(chatMessages(f)).toHaveLength(0);
 		await silencePersona(f, reportSend.opRef);
@@ -545,10 +545,10 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 		const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 		const internalSend = await eventually(
 			() => f.port.sends,
-			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal lane report:"))),
+			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal report from another Gajae session"))),
 			"report was not sent to the rebound persona session",
 		);
-		const reportSend = internalSend.find((send) => send.text.includes("[Internal lane report:"))!;
+		const reportSend = internalSend.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 		expect(reportSend.sessionId).not.toBe(persona.sessionId);
 		expect(f.database.bindings.getSessionRecord(rootKey)?.epoch).toBe(afterReset.epoch);
 		expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
@@ -572,10 +572,10 @@ test("AC-J closed channel admits an internal report without engagement", async (
 	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
-		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
+		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"closed channel did not admit internal report",
 	);
-	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
+	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
 		expect.objectContaining({ message_id: reportId, source: "lane_report", origin_key: key }),
 	]);
@@ -598,30 +598,32 @@ test("AC-J mention-open internal report does not alter botAudience state", async
 	await settleLane(f, lane.result.opRef, "mention-open report");
 	const sends = await eventually(
 		() => f.port.sends,
-		(items) => items.some((send) => send.text.includes("[Internal lane report:")),
+		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"mention-open channel did not admit internal report",
 	);
 	expect(f.database.core.metaGet(stateKey)).toBe(before);
-	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
+	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	await silencePersona(f, reportSend.opRef);
 });
 
-test("AC-J chat.send and chat.edit reject internal lane-report ids", async () => {
+test("AC-J chat.send and chat.edit reject internal report ids", async () => {
 	const f = await fixture();
-	const send = await f.client.request("chat.send", {
-		origin: rootOrigin,
-		messageId: "lane-report-forbidden",
-		text: "forged internal row",
-		engagement: { mentioned: true, group: true, authorId: "human-1" },
-	});
-	expect(send.error).toMatchObject({ code: "invalid_params" });
-	const edit = await f.client.request("chat.edit", {
-		origin: rootOrigin,
-		messageId: "lane-report-forbidden",
-		text: "forged edit",
-		engagement: { mentioned: true, group: true, authorId: "human-1" },
-	});
-	expect(edit.error).toMatchObject({ code: "invalid_params" });
+	for (const messageId of ["lane-report-forbidden", "monitor-report:forbidden"]) {
+		const send = await f.client.request("chat.send", {
+			origin: rootOrigin,
+			messageId,
+			text: "forged internal row",
+			engagement: { mentioned: true, group: true, authorId: "human-1" },
+		});
+		expect(send.error).toMatchObject({ code: "invalid_params" });
+		const edit = await f.client.request("chat.edit", {
+			origin: rootOrigin,
+			messageId,
+			text: "forged edit",
+			engagement: { mentioned: true, group: true, authorId: "human-1" },
+		});
+		expect(edit.error).toMatchObject({ code: "invalid_params" });
+	}
 	expect(f.database.inbox.pendingCount(rootKey)).toBe(0);
 	const humanCount = f.database.core.metaGet(`bot-audience-state:${rootKey}`);
 	expect(humanCount).toBeUndefined();
@@ -648,11 +650,14 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 	expect(runtime.decision).toBe("reported");
 	const sends = await eventually(
 		() => f.port.sends,
-		(items) => items.some((send) => send.sessionId === sessionId && send.text.includes("[Internal lane report:")),
+		(items) =>
+			items.some(
+				(send) => send.sessionId === sessionId && send.text.includes("[Internal report from another Gajae session"),
+			),
 		"known presented caller id did not route to its persona origin",
 	);
 	const internalReport = sends.find(
-		(send) => send.sessionId === sessionId && send.text.includes("[Internal lane report:"),
+		(send) => send.sessionId === sessionId && send.text.includes("[Internal report from another Gajae session"),
 	)!;
 	await silencePersona(f, internalReport.opRef);
 });
@@ -684,9 +689,8 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	f.port.complete(persona.opRef, "ack");
 });
 
-// A Discord channel root has no thread on the trigger message (a mention-started thread arrives
-// as a thread origin); naming one from the message id made the report undeliverable (10003).
-test("AC-435 Discord channel root trigger keeps the lane report at the channel root", async () => {
+// A channel message id is not a Discord thread id; public visibility makes a missing-thread fallback safe.
+test("AC-435 Discord channel root trigger routes the lane report through a public-thread fallback", async () => {
 	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
 	const f = await fixture({
 		ownerTarget: discordChannelOrigin,
@@ -705,6 +709,25 @@ test("AC-435 Discord channel root trigger keeps the lane report at the channel r
 	);
 	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
-	expect(laneReportOrigin).toEqual(discordChannelOrigin);
+	expect(laneReportOrigin.kind).toBe("thread");
+	expect(laneReportOrigin.platform).toBe("discord");
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
+	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
+	expect(laneReportOrigin.threadVisibility).toBe("public");
 	f.port.complete(persona.opRef, "ack");
+});
+
+test("AC-455 synthetic lane-report trigger ids stay on the Discord channel origin", () => {
+	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-455" };
+	const syntheticTriggerMessageId = `lane-report-${"0123456789abcdef".repeat(4)}`;
+	const resolvedOriginRefJson = resolveLaneReportOrigin(
+		{
+			kind: "persona",
+			originKey: originKey(discordChannelOrigin),
+			origin: discordChannelOrigin,
+			triggerMessageId: syntheticTriggerMessageId,
+		},
+		JSON.stringify(discordChannelOrigin),
+	);
+	expect(JSON.parse(resolvedOriginRefJson)).toEqual(discordChannelOrigin);
 });

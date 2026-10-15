@@ -19,6 +19,24 @@ test("Slack files use MIME kind, preferred name/url, and readable sizes", () => 
 	for (const size of [-1, Number.NaN, Number.POSITIVE_INFINITY]) expect(describeSlackFile({ size })).toBe("[file]");
 });
 
+test("Slack files name their file id so same-named attachments stay distinct", () => {
+	const a = describeSlackFile({ id: "F0C8P71RK54", name: "image.png", mimetype: "image/png", size: 2048 });
+	const b = describeSlackFile({ id: "F0C8PPGAV7G", name: "image.png", mimetype: "image/png", size: 2048 });
+	expect(a).toBe("[image · image.png · id F0C8P71RK54 · 2 KB]");
+	expect(b).toBe("[image · image.png · id F0C8PPGAV7G · 2 KB]");
+	// Only a well-formed Slack file id is rendered: it sits inside the message text.
+	for (const id of [
+		"",
+		"U0C8P71RK54",
+		"F0c8p71",
+		"F0C8P71RK54] [image",
+		"F0C8P71RK54\n",
+		"F0C8P71RK54/../../secret",
+		"F1",
+	])
+		expect(describeSlackFile({ id, name: "image.png" })).toBe("[file · image.png]");
+});
+
 test("Slack inbound bodies retain captions, cap file rendering, and distinguish empty messages", () => {
 	expect(describeInboundBody({})).toBe("");
 	expect(describeInboundBody({ text: " untouched " })).toBe(" untouched ");

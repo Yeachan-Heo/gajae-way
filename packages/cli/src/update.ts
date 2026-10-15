@@ -20,6 +20,7 @@ import { launchRestartStack } from "./restart-stack";
 import {
 	type InstallServicesOptions,
 	installServices,
+	removeStaleServices,
 	type ServicePlatform,
 	serviceSpecs,
 	systemdUnitName,
@@ -39,8 +40,6 @@ export const UPDATE_USAGE = "usage: gajaeway update [--check] [--force] [--bin-d
 
 export const DEFAULT_RELEASE_REPO = "Yeachan-Heo/gajae-way";
 const RELEASE_REPO_OVERRIDE_ENV = "GAJAEWAY_UPDATE_REPO";
-/** The release manifest carrying the gjc pin; installed beside the binaries. */
-const PIN_MANIFEST = "package.json";
 /** A fork can point updates at its own releases; the declared upstream stays the default. */
 export function releaseRepo(env: NodeJS.ProcessEnv = process.env): string {
 	const override = env[RELEASE_REPO_OVERRIDE_ENV]?.trim();
@@ -214,7 +213,10 @@ export type ReleaseFetcher = (repo: string) => Promise<ReleaseInfo>;
 export type AssetDownloader = (asset: ReleaseAsset) => Promise<Uint8Array>;
 export type TarballExtractor = (tarball: Uint8Array, intoDir: string) => Promise<void>;
 export type RestartQueuer = (home: string, binDir: string, trigger: "update") => Promise<RestartQueueReceipt>;
-export type UpdateCommandRunner = (command: readonly string[]) => Promise<number>;
+export interface UpdateCommandOptions {
+	readonly allowFailure?: boolean;
+}
+export type UpdateCommandRunner = (command: readonly string[], options?: UpdateCommandOptions) => Promise<number>;
 
 type UpdateServiceOptions = Pick<
 	InstallServicesOptions,
@@ -262,10 +264,10 @@ async function readPinnedGjcVersion(path: string): Promise<string> {
 	return version;
 }
 
-async function defaultUpdateCommandRunner(command: readonly string[]): Promise<number> {
+async function defaultUpdateCommandRunner(command: readonly string[], options?: UpdateCommandOptions): Promise<number> {
 	const child = Bun.spawn([...command], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
 	const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
-	if (exitCode !== 0) {
+	if (exitCode !== 0 && !options?.allowFailure) {
 		const detail = stderr.trim();
 		throw new Error(`${command.join(" ")} exited with status ${exitCode}${detail.length === 0 ? "" : `: ${detail}`}`);
 	}
@@ -281,7 +283,22 @@ async function installUpdatedServices(options: {
 }): Promise<boolean> {
 	const { home, binDir, platform, noRestart, deps } = options;
 	const brokerProvisioned = await exists(homeLayout(home).brokerProvisionManifest);
-	const env = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env), GAJAEWAY_HOME: home };
+	const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
+	const execute = async (command: readonly string[]): Promise<void> => {
+		const exitCode = await run(command);
+		if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
+	};
+	if (!noRestart) {
+		await removeStaleServices({
+			binDir,
+			platform,
+			env,
+			reloadSystemd: false,
+			...deps.serviceOptions,
+			run,
+		});
+	}
 	await installServices({
 		binDir,
 		platform,
@@ -291,15 +308,11 @@ async function installUpdatedServices(options: {
 		...deps.serviceOptions,
 	});
 	if (platform === "linux") {
-		const run = deps.serviceRunner ?? defaultUpdateCommandRunner;
-		const execute = async (command: readonly string[]): Promise<void> => {
-			const exitCode = await run(command);
-			if (exitCode !== 0) throw new Error(`${command.join(" ")} exited with status ${exitCode}`);
-		};
 		await execute(["systemctl", "--user", "daemon-reload"]);
 		if (!noRestart) {
 			const enableUnits: string[] = [];
 			for (const spec of serviceSpecs()) {
+				if (!(await exists(join(binDir, spec.binary)))) continue;
 				if (spec.id === "broker" && !brokerProvisioned) continue;
 				if (
 					spec.id.startsWith("adapter-") &&
@@ -362,7 +375,7 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 				throw new Error(`release tarball is missing core binaries: ${missingCore.join(", ")}`);
 			await assertStagedBinariesUsable(staged, toInstall);
 
-			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, PIN_MANIFEST));
+			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, "package.json"));
 			await installPinnedGjc({
 				home: options.home,
 				version: gjcVersion,
@@ -372,20 +385,22 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, "").slice(0, 15);
 			const backupDir = join(binDir, `backup-${current}-${stamp}Z`);
 			await mkdir(backupDir, { recursive: false });
-			// The compiled gateway and broker host read the gjc pin from the package.json
-			// beside them; a stale one makes the new binaries refuse the gjc just installed.
-			const replaced = [...toInstall, PIN_MANIFEST];
-			for (const name of replaced) {
+			for (const name of toInstall) {
 				const target = join(binDir, name);
 				if (await exists(target)) await copyFile(target, join(backupDir, name));
 			}
-			for (const name of replaced) {
+			const packagePath = join(binDir, "package.json");
+			if (await exists(packagePath)) await copyFile(packagePath, join(backupDir, "package.json"));
+			for (const name of toInstall) {
 				const stagedPath = join(staged.dir, name);
 				const tempPath = join(binDir, `.update-${name}`);
 				await copyFile(stagedPath, tempPath);
-				await chmod(tempPath, name === PIN_MANIFEST ? 0o644 : 0o755);
+				await chmod(tempPath, 0o755);
 				await rename(tempPath, join(binDir, name));
 			}
+			const packageTempPath = join(binDir, ".update-package.json");
+			await copyFile(join(staged.dir, "package.json"), packageTempPath);
+			await rename(packageTempPath, packagePath);
 			await writeFile(releaseMarkerPath(binDir), `${latest}\n`, "utf8");
 			const brokerNotEnabled = await installUpdatedServices({
 				home: options.home,

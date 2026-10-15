@@ -68,9 +68,12 @@ test("connectSocketWithBackoff retries until a late Unix socket appears", async 
 		expect(retries.map(({ attempt }) => attempt)).toEqual(retries.map((_, index) => index + 1));
 	} finally {
 		await client.close();
-		if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
-		const index = servers.indexOf(server!);
-		if (index >= 0) servers.splice(index, 1);
+		const started = server;
+		if (started) {
+			await new Promise<void>((resolve) => started.close(() => resolve()));
+			const index = servers.indexOf(started);
+			if (index >= 0) servers.splice(index, 1);
+		}
 	}
 });
 
@@ -114,4 +117,26 @@ test("connectSocketWithBackoff rejects with the last error when its deadline exp
 	} finally {
 		connectSocket.mockRestore();
 	}
+});
+
+test("connectSocketWithBackoff aborts promptly while waiting between attempts", async () => {
+	const { path } = await temporarySocket();
+	const controller = new AbortController();
+	let retry!: () => void;
+	const retrying = new Promise<void>((resolve) => {
+		retry = resolve;
+	});
+	let attempts = 0;
+	const connecting = GajaewayClient.connectSocketWithBackoff(path, {
+		initialMs: 10_000,
+		signal: controller.signal,
+		onRetry: () => {
+			attempts++;
+			retry();
+		},
+	});
+	await retrying;
+	controller.abort();
+	await expect(connecting).rejects.toThrow("client connection aborted");
+	expect(attempts).toBe(1);
 });

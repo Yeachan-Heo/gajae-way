@@ -2,12 +2,15 @@ import { statfsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
 	type AgentDiskView,
+	CATCH_ALL_EVENT_ORIGIN,
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
 	LOOPBACK_ORIGIN,
+	monitorSessionOrigin,
 	type OpsCycleResult,
 	type OpsSloResult,
+	originKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { type BrokerAgentDrift, readBrokerAgentDrift } from "../broker-agent/drift";
@@ -158,11 +161,24 @@ export interface RuntimeCycleSources {
 	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
 	 */
 	readonly settledWorkOrigins: ReadonlySet<string>;
+	/**
+	 * When the newest broker authority cutover committed; null when none ran.
+	 * A cutover unbinds every origin (`gjc_session_id = ''`) and quarantines
+	 * every inbound row, lane job and monitor event it finds.
+	 */
+	readonly latestCutoverAt: string | null;
+	/**
+	 * Origins with durable work admitted since the newest cutover: inbound rows,
+	 * lane jobs and monitor events outside quarantine. A failed first bind leaves
+	 * the session row untouched, so this is the evidence that an origin was asked
+	 * to rebind. Empty when no cutover ran.
+	 */
+	readonly addressedSinceCutover: ReadonlySet<string>;
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
 	readonly gjcVersion: string | undefined;
-	/** Newest settled monitor events that ended `failed_no_retry` before any success. */
+	/** Newest settled monitor events that ended `failed_no_retry` or `contract_unmet` before any success. */
 	readonly monitorTerminalStreak: number;
 	/** True while the shared broker's incarnation keeps changing (die/respawn churn). */
 	readonly brokerRespawnChurn: boolean;
@@ -234,6 +250,7 @@ export class RuntimeCycleProjector {
 		const inboundMap = new Map(inbound.map((r) => [r.state, r.n]));
 		const unknownInbound = inbound.map((r) => r.state).filter((state) => !KNOWN_INBOUND_STATES.has(state));
 		const unknownDeliveries = deliveries.map((r) => r.state).filter((state) => !KNOWN_DELIVERY_STATES.has(state));
+		const latestCutoverAt = this.#database.bindings.latestBrokerCutoverAt();
 		return {
 			sessionRows: sessions,
 			inboundCounts: inboundMap,
@@ -263,6 +280,8 @@ export class RuntimeCycleProjector {
 					.filter((row) => SETTLED_JOB_STATES.has(row.state))
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
+			latestCutoverAt,
+			addressedSinceCutover: this.#addressedSinceCutover(latestCutoverAt),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
 			gjcVersion: this.#gjcVersion(),
 			monitorTerminalStreak: this.#database.monitors.consecutiveTerminalFailures(),
@@ -275,11 +294,42 @@ export class RuntimeCycleProjector {
 			slo: evaluateSlo(this.#database.core, DEFAULT_SLO_DAYS, new Date(nowMs)),
 		};
 	}
+
+	#addressedSinceCutover(latestCutoverAt: string | null): Set<string> {
+		const origins = new Set<string>();
+		if (latestCutoverAt === null) return origins;
+		for (const key of this.#database.inbox.unquarantinedOrigins()) origins.add(key);
+		// laneJobRows() already leaves quarantined jobs out.
+		for (const row of this.#database.work.laneJobRows())
+			origins.add(`${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`);
+		// Same session-origin choice as monitor dispatch: a declared type gets its
+		// own session, anything else the monitor's catch-all. A deleted monitor's
+		// declarations are unknown, so both candidates count.
+		for (const row of this.#database.monitors.unquarantinedEventTypes()) {
+			const declared = parseDeclaredEventTypes(row.event_types_json);
+			if (declared === undefined || declared.includes(row.event_type))
+				origins.add(originKey(monitorSessionOrigin(row.monitor_id, row.event_type)));
+			if (declared === undefined || !declared.includes(row.event_type))
+				origins.add(originKey(monitorSessionOrigin(row.monitor_id, CATCH_ALL_EVENT_ORIGIN.conversationId)));
+		}
+		return origins;
+	}
+}
+
+function parseDeclaredEventTypes(json: string | null): string[] | undefined {
+	if (json === null) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(json);
+		return Array.isArray(parsed) && parsed.every((type) => typeof type === "string") ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Pure projection over already-snapshotted sources — independently unit-testable. */
 export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: string): OpsCycleResult {
 	const gates = new Set<CycleGateReason>();
+	const cutoverMs = sources.latestCutoverAt === null ? Number.NaN : Date.parse(sources.latestCutoverAt);
 
 	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
 		const origin = parseOriginRef(row.origin_ref_json);
@@ -292,7 +342,15 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			row.origin_key.startsWith(WORK_LANE_PREFIX) &&
 			row.gjc_session_id === "" &&
 			sources.settledWorkOrigins.has(row.origin_key);
-		if ((row.gjc_session_id === "" && !retiredLane) || row.epoch < 0) gates.add("stale_session_identity");
+		// A cutover unbinds every origin at once. An origin with no work admitted
+		// and no epoch change since then is quarantined history, not a rebind in
+		// progress. Admission (inbound, lane job, monitor event) is the evidence:
+		// a failed first bind never touches the session row itself.
+		const lastActivityMs = Date.parse(row.last_activity_at ?? row.created_at);
+		const cutoverRetired =
+			row.gjc_session_id === "" && lastActivityMs <= cutoverMs && !sources.addressedSinceCutover.has(row.origin_key);
+		if ((row.gjc_session_id === "" && !retiredLane && !cutoverRetired) || row.epoch < 0)
+			gates.add("stale_session_identity");
 		return {
 			originKey: row.origin_key,
 			origin,

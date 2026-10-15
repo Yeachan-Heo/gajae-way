@@ -42,6 +42,16 @@ export function assertAgentDb(path: string): void {
 	}
 }
 
+export function readAuthCredentialData(path: string): string[] {
+	const database = new Database(path, { readonly: true });
+	try {
+		const rows = database.query("SELECT data FROM auth_credentials").all() as Array<{ data: unknown }>;
+		return rows.flatMap((row) => (typeof row.data === "string" ? [row.data] : []));
+	} finally {
+		database.close();
+	}
+}
+
 export function credentialFingerprint(path: string): string {
 	const database = new Database(path, { readonly: true });
 	try {
