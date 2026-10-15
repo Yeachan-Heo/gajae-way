@@ -657,7 +657,7 @@ describe("runUpdate", () => {
 					args: { check: false, force: false, noRestart: true },
 					home: "/tmp/gajaeway-home",
 					deps: {
-						fetchLatestRelease: async () => release("v0.3.0", [DARWIN_ASSET]),
+						fetchLatestRelease: async () => release("v99.0.0", [DARWIN_ASSET]),
 						downloadAsset: noBytes,
 						extractTarball: extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` }))),
 						platform: "darwin",
