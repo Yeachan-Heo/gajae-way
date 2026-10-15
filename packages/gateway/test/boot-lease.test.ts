@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLease, homeLayout, leaseHeld } from "@gajae-gateway/home";
@@ -81,7 +81,9 @@ test("boot restores the outbox projection from the journal before starting recov
 	const home = await temporaryHome();
 	const path = join(home, "gateway.db");
 	const database = await Store.open(path);
-	const agentDir = homeLayout(home).brokerAgentDir;
+	const configuredAgentDir = homeLayout(home).brokerAgentDir;
+	await mkdir(configuredAgentDir, { recursive: true, mode: 0o700 });
+	const agentDir = await realpath(configuredAgentDir);
 	const authority = { canonicalAgentDir: agentDir, identity: `gjc:${agentDir}` };
 	database.transaction((tx) => database.bindings.initializeAuthority(tx, authority, false));
 	database.transaction((tx) =>
