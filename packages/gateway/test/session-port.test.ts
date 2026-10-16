@@ -976,7 +976,7 @@ test("broker SessionPort preserves a structured client-ref conflict emitted with
 	});
 });
 
-test("broker SessionPort retries a terminal-uncertain lifecycle create with the same idempotency key", async () => {
+test("broker SessionPort does not retry a terminal-uncertain lifecycle create", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -986,13 +986,12 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
 		createKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
-		if (createCalls++ === 0)
-			return {
-				exitCode: 1,
-				stdout: JSON.stringify({ ok: false, error: { code: "terminal_uncertain", message: "startup pending" } }),
-				stderr: "",
-			};
-		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-after-retry" } }), stderr: "" };
+		createCalls++;
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({ ok: false, error: { code: "terminal_uncertain", message: "startup pending" } }),
+			stderr: "",
+		};
 	};
 	const port = new BrokerSessionPort({
 		authority,
@@ -1004,15 +1003,17 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 		},
 	});
 	await expect(
-		port.bind({ originKey: "loopback/loopback/retry", epoch: 0, repo: join(home, "workspace") }),
-	).resolves.toMatchObject({
-		sessionId: "sdk-after-retry",
-	});
-	expect(createCalls).toBe(2);
-	expect(createKeys).toHaveLength(2);
+		port.bind({
+			originKey: "loopback/loopback/retry",
+			epoch: 0,
+			repo: join(home, "workspace"),
+			epochRecovery: false,
+		}),
+	).rejects.toMatchObject({ details: { code: "terminal_uncertain" } });
+	expect(createCalls).toBe(1);
+	expect(createKeys).toHaveLength(1);
 	expect(createKeys[0]).toMatch(/^gw-bind-[0-9a-f-]{36}$/);
-	expect(createKeys[1]).toBe(createKeys[0]);
-	expect(sleeps).toEqual([1_000]);
+	expect(sleeps).toEqual([]);
 });
 
 test("bind rebinds a persisted live-false session instead of handing a dead monitor endpoint to request", async () => {
