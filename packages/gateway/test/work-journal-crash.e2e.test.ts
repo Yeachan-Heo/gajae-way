@@ -112,18 +112,38 @@ for (const point of BOUNDARIES) {
 		await f.barrier(point);
 		await f.kill();
 
-		const crashed = await assertReplayRebuildsLive(f);
+		const path = join(f.home, "gateway.db");
+		const crashed = await projections(path);
 		expect(crashed.attempts).toHaveLength(1);
 		expect(crashed.attempts[0]?.settled_at === null).toBe(point !== "settle-commit");
 		expect(crashed.deliveries).toHaveLength(point === "settle-commit" ? 1 : 0);
+		const raw = new Database(path);
+		try {
+			raw.exec("DELETE FROM work_attempt_runtime; DELETE FROM lane_jobs; DELETE FROM deliveries;");
+		} finally {
+			raw.close();
+		}
+		expect(await projections(path)).toEqual({ attempts: [], laneJobs: [], deliveries: [] });
+
+		// Stop at the replay boundary so recovery cannot change the committed state being compared.
+		await f.start("journal-replayed");
+		expect(await projections(path)).toEqual(crashed);
+		await f.kill();
 
 		// The restarted gateway runs on the replayed projections and must finish exactly as the live path does.
 		if (point === "prepared") await f.control(sessionId, { live: "dead" });
 		await f.start();
+		const noticeClient = await f.connect();
 		const after = await settled(f);
 		expect(after.jobs[0].attempts).toHaveLength(1);
 		expect(after.jobs[0].attempts[0].endState).toBe(point === "prepared" ? "terminal_uncertain" : "completed");
 		expect(after.deliveries).toHaveLength(1);
+		const notices = await eventually(
+			() => noticeClient.frames.filter((frame) => frame.event === "chat.message"),
+			(frames) => frames.some((frame) => frame.payload?.deliveryId === after.runtimes[0]?.deliveryId),
+			"one journal-backed delivery",
+		);
+		expect(notices.filter((frame) => frame.payload?.deliveryId === after.runtimes[0]?.deliveryId)).toHaveLength(1);
 		await f.kill();
 		const final = await assertReplayRebuildsLive(f);
 		expect(final.attempts[0]?.settled_at).not.toBeNull();
@@ -150,7 +170,7 @@ test("attempt, lane-job and delivery transitions are journaled through a held la
 	const attempt = journalTypes(path, "attempt", opRef);
 	expect(attempt[0]).toBe("attempt_started");
 	expect(attempt).toContain("attempt_accepted");
-	expect(attempt.at(-1)).toMatch(/^attempt_(settled|reconciled)$/);
+	expect(attempt.at(-1)).toBe("attempt_settled");
 	const job = journalTypes(path, "lane_job", held.runtimes[0].jobId);
 	expect(job[0]).toBe("lane_job_running");
 	expect(job.at(-1)).toBe("lane_job_awaiting_operator");

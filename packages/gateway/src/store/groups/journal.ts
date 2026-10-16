@@ -21,7 +21,6 @@ export type WorkJournalEventType =
 	| "attempt_terminal"
 	| "attempt_updated"
 	| "attempt_settled"
-	| "attempt_reconciled"
 	| `lane_job_${LaneJobState}`
 	| "delivery_queued"
 	| "delivery_inflight"
