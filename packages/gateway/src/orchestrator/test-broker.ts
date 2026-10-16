@@ -1,5 +1,5 @@
 import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
-import { type GlobalGjcClientDependencies, readPinnedGjcVersion, type SpawnFn } from "./broker";
+import { readPinnedGjcVersion, type SpawnFn } from "./broker";
 
 type StubOperation = {
 	readonly sessionId: string;
@@ -30,11 +30,16 @@ type Relay = {
  * `agent_start`, `event/message_end` and `agent_end` frames, stamped with the
  * turn's commandId/turnId — exactly what `gjc sdk serve --stdio` forwards.
  */
-export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, "agentDir"> {
+export function testOnlyBrokerDependencies(options: { reply?: (prompt: string) => string } = {}) {
 	const sessions = new Map<string, string>();
 	const repositories = new Map<string, string>();
 	const operations = new Map<string, StubOperation>();
 	const relays = new Set<Relay>();
+	const reverseReplies = new Map<string, (frame: Record<string, unknown>) => void>();
+	const jobs = new Map<string, number>();
+	const jobsUnavailable = new Set<string>();
+	const activeRuns = new Set<string>();
+	const submitted: Array<{ sessionId: string; text: string }> = [];
 	let connections = 0;
 	const emit = (relay: Relay, frame: Record<string, unknown>) => {
 		try {
@@ -43,11 +48,19 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 			/* relay closed */
 		}
 	};
+	const broadcast = (sessionId: string, frame: Record<string, unknown>) => {
+		for (const relay of relays) if (relay.sessionId === sessionId && relay.helloReceived) emit(relay, frame);
+	};
+	const lifecycle = (sessionId: string, frame: Record<string, unknown>, owner?: Relay) => {
+		if (owner) emit(owner, frame);
+		else broadcast(sessionId, frame);
+		broadcast(sessionId, { type: "event", kind: frame.type, payload: frame, generation: 1, seq: 1 });
+	};
 	const runTurn = (relay: Relay, operation: StubOperation) => {
 		const correlation = { commandId: operation.commandId, turnId: operation.turnId };
 		setTimeout(() => {
-			emit(relay, { type: "agent_start", sessionId: operation.sessionId, ...correlation });
-			operation.reply = stubReply(operation.text);
+			lifecycle(operation.sessionId, { type: "agent_start", sessionId: operation.sessionId, ...correlation }, relay);
+			operation.reply = options.reply?.(operation.text) ?? stubReply(operation.text);
 			emit(relay, {
 				type: "event",
 				kind: "message_end",
@@ -66,12 +79,16 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 			});
 			operation.terminalAt = Date.now();
 			operation.state = "terminal_ok";
-			emit(relay, {
-				type: "agent_end",
-				sessionId: operation.sessionId,
-				...correlation,
-				outcome: { reason: "end_turn" },
-			});
+			lifecycle(
+				operation.sessionId,
+				{
+					type: "agent_end",
+					sessionId: operation.sessionId,
+					...correlation,
+					outcome: { reason: "end_turn" },
+				},
+				relay,
+			);
 		}, 50);
 	};
 	const statusOf = (opRef: string | undefined, sessionId: string | undefined) => {
@@ -108,6 +125,11 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 			return;
 		}
 		const id = typeof frame.id === "string" ? frame.id : "";
+		if (frame.type === "reverse_response") {
+			reverseReplies.get(id)?.(frame);
+			reverseReplies.delete(id);
+			return;
+		}
 		if (frame.type === "control_request") {
 			const input = (frame.input ?? {}) as { text?: unknown; clientRef?: unknown };
 			if (frame.operation === "turn.prompt") {
@@ -126,6 +148,7 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 					state: "in_flight",
 				};
 				operations.set(opRef, operation);
+				submitted.push({ sessionId: relay.sessionId, text: input.text });
 				emit(relay, {
 					type: "control_response",
 					id,
@@ -135,6 +158,7 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 				runTurn(relay, operation);
 				return;
 			}
+			if (frame.operation === "turn.steer") submitted.push({ sessionId: relay.sessionId, text: String(input.text) });
 			if (frame.operation === "turn.steer")
 				return emit(relay, {
 					type: "control_response",
@@ -238,6 +262,29 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 				stderr: "",
 			};
 		}
+		if (args.includes("runtime.jobs.list")) {
+			const sessionId = args[args.indexOf("query") + 1] ?? "";
+			if (jobsUnavailable.has(sessionId)) return failure("unavailable");
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					page: {
+						items: [
+							{
+								running: Array.from({ length: jobs.get(sessionId) ?? 0 }, (_, index) => ({
+									id: `job-${index}`,
+									type: "task",
+									label: "async task",
+								})),
+							},
+						],
+						complete: true,
+					},
+				}),
+				stderr: "",
+			};
+		}
 		if (args.includes("model.set")) return success({ changed: true });
 		if (args.includes("session.close")) return success({ closed: true });
 		if (args.includes("session.resume")) return success({ resumed: true });
@@ -245,11 +292,78 @@ export function testOnlyBrokerDependencies(): Omit<GlobalGjcClientDependencies, 
 			const sessionId = args[3];
 			const repo = sessionId ? repositories.get(sessionId) : undefined;
 			if (!repo) return failure("session_unavailable");
-			return success({ session: { sessionId, live: true, deleted: false, locator: { repo } } });
+			return success({
+				session: {
+					sessionId,
+					live: true,
+					deleted: false,
+					locator: { repo },
+					activity: { state: activeRuns.has(sessionId!) ? "working" : "idle", at: Date.now() },
+				},
+			});
 		}
 		return failure("stub_unsupported");
 	};
 	return {
+		submitted,
+		replayTurnFrames: (sessionId: string, text: string) => {
+			const operation = [...operations.values()].find(
+				(item) => item.sessionId === sessionId && item.state === "terminal_ok",
+			);
+			if (!operation) throw new Error("no finished turn to replay");
+			const correlation = { commandId: operation.commandId, turnId: operation.turnId };
+			broadcast(sessionId, {
+				type: "event",
+				kind: "message_end",
+				...correlation,
+				payload: { event: { message: { role: "assistant", content: [{ type: "text", text }] } } },
+			});
+			broadcast(sessionId, { type: "agent_end", sessionId, ...correlation });
+		},
+		requestReverse: (sessionId: string, method: string): Promise<Record<string, unknown>> => {
+			const relay = [...relays].find((item) => item.sessionId === sessionId && item.helloReceived);
+			if (!relay) throw new Error("no relay for reverse request");
+			const id = crypto.randomUUID();
+			const response = new Promise<Record<string, unknown>>((resolve) => reverseReplies.set(id, resolve));
+			emit(relay, {
+				type: "reverse_request",
+				id,
+				connectionId: relay.connectionId,
+				capability: method === "permission.request" ? "permission" : "ui",
+				leaseId: `lease-${id}`,
+				payload: { method, payload: {} },
+			});
+			return response;
+		},
+		startAgentRun: (sessionId: string) => {
+			activeRuns.add(sessionId);
+			lifecycle(sessionId, { type: "agent_start", sessionId });
+		},
+		setRunningJobs: (sessionId: string, count: number) => {
+			jobs.set(sessionId, count);
+		},
+		setJobsUnavailable: (sessionId: string, unavailable: boolean) => {
+			if (unavailable) jobsUnavailable.add(sessionId);
+			else jobsUnavailable.delete(sessionId);
+		},
+		endAgentRun: (
+			sessionId: string,
+			options?: { positionedOnly?: boolean; correlation?: { commandId: string; turnId: string }; failed?: boolean },
+		) => {
+			if (!options?.correlation) activeRuns.delete(sessionId);
+			const frame = { type: options?.failed ? "agent_failed" : "agent_end", sessionId, ...options?.correlation };
+			if (options?.positionedOnly)
+				broadcast(sessionId, { type: "event", kind: frame.type, payload: frame, generation: 1, seq: 1 });
+			else lifecycle(sessionId, frame);
+		},
+		loseRelays: (sessionId: string) => {
+			for (const relay of [...relays])
+				if (relay.sessionId === sessionId) {
+					relays.delete(relay);
+					relay.controller.close();
+				}
+		},
+		relayCount: (sessionId: string) => [...relays].filter((relay) => relay.sessionId === sessionId).length,
 		command,
 		spawn: spawn as unknown as SpawnFn,
 		healthProbe: async () => true,

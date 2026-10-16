@@ -3068,7 +3068,9 @@ async function createInboundTurnLifecycle(
 			options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest),
 		);
 	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
-	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
+	const internalTriggerText = () =>
+		row.message_id.startsWith("agent-run/") ? userText : laneReportTriggerText(userText);
+	let turnText = laneReport ? internalTriggerText() : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
 	if (nonLoopback) {
@@ -3123,7 +3125,7 @@ async function createInboundTurnLifecycle(
 					? `${droppedNote}\n`
 					: ""
 		}`;
-		turnText = `${header}${laneReport ? laneReportTriggerText(userText) : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
+		turnText = `${header}${laneReport ? internalTriggerText() : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
 	}
 
 	const bootstrap = bootstrapPending
