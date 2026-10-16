@@ -380,7 +380,7 @@ test("a relay that ends mid-turn reports the loss, fails pending requests, and r
 	relays[0]!.end();
 	await expect(pending).rejects.toBeInstanceOf(RelayClosedError);
 	await Bun.sleep(10);
-	expect(lost).toEqual([{ sessionId: "s1", brokerGeneration: 3 }]);
+	expect(lost).toEqual([{ sessionId: "s1", brokerGeneration: 3, opRef: "op-1" }]);
 	expect(relays).toHaveLength(2);
 	expect(sleeps.length).toBeGreaterThan(0);
 	// The reopened relay is usable for commands again.
@@ -474,6 +474,167 @@ test("decodeStreamLine: notifications frames are not turn content; thinking bloc
 	expect(idle).toMatchObject({ kind: "activity", idle: true });
 });
 
+test("relay loss retains the receipt turn identity when a successor starts before callback admission", async () => {
+	const relay = new FakeRelay();
+	let received = () => {};
+	let release = () => {};
+	const started = new Promise<void>((resolve) => {
+		received = resolve;
+	});
+	const resume = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const events: Array<{ opRef?: string }> = [];
+	const tail = new TailRunner({ repo: "/tmp", stream: () => relay, sleep: async () => resume });
+	const handle = await tail.attach({
+		sessionId: "receipt",
+		brokerGeneration: 1,
+		repo: "/tmp",
+		onRelayLost: async (input) => {
+			received();
+			await resume;
+			events.push(input);
+		},
+	});
+	handle.beginTurn("settled-turn");
+	handle.setObserving(true);
+	relay.end();
+	await started;
+	handle.beginTurn("successor-turn");
+	release();
+	await Bun.sleep(10);
+	expect(events[0]?.opRef).toBe("settled-turn");
+	await handle.close();
+});
+
+test("queued turn frames retain their receipt opRef across reuse and old correlations cannot be adopted", async () => {
+	const relay = new FakeRelay();
+	const frames: TailFrame[] = [];
+	let release = () => {};
+	let entered = () => {};
+	const started = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const resume = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const handle = await runner(() => relay).attach({
+		sessionId: "reused",
+		brokerGeneration: 1,
+		repo: "/tmp",
+		onFrame: async (frame) => {
+			frames.push(frame);
+			if (frames.length === 1) {
+				entered();
+				await resume;
+			}
+		},
+	});
+	const correlationA = { commandId: "command-a", turnId: "turn-a" };
+	const end = (correlation: Record<string, string>) => ({ type: "agent_end", ...correlation });
+	handle.beginTurn("a", correlationA);
+	relay.host({ type: "agent_start", ...correlationA });
+	await started;
+	relay.host(end(correlationA));
+	await Bun.sleep(5);
+	handle.beginTurn("b");
+	// B has no receipt yet: a late A end must not establish B's correlation.
+	relay.host(end(correlationA));
+	relay.host(end({ commandId: "command-b", turnId: "turn-b" }));
+	release();
+	await Bun.sleep(10);
+	expect(frames.map((frame) => [frame.rawKind, frame.receiptOpRef, frame.turnId])).toEqual([
+		["agent_start", "a", "turn-a"],
+		["agent_end", "b", "turn-b"],
+	]);
+	await handle.close();
+});
+
+test("providers are registered after a reused turn's transport reopens", async () => {
+	const relays: FakeRelay[] = [];
+	const tail = runner(() => {
+		const relay = new FakeRelay(`providers-${relays.length}`);
+		relays.push(relay);
+		return relay;
+	});
+	const handle = await tail.attach({ sessionId: "providers", brokerGeneration: 1, repo: "/tmp" });
+	handle.beginTurn("first");
+	expect(relays[0]!.written.filter((frame) => frame.type === "register_provider")).toHaveLength(2);
+	handle.beginTurn("second");
+	relays[0]!.end();
+	await Bun.sleep(10);
+	expect(relays).toHaveLength(2);
+	expect(relays[1]!.written.filter((frame) => frame.type === "register_provider")).toHaveLength(2);
+	await handle.close();
+});
+
+test("evictability and release wakeups do not overbook a slot with multiple waiting callers", async () => {
+	const relays: FakeRelay[] = [];
+	let peak = 0;
+	const tail = new TailRunner({
+		repo: "/tmp",
+		maxTailProcesses: 1,
+		sleep: async () => {},
+		stream: () => {
+			const relay = new FakeRelay(`slot-${relays.length}`);
+			relays.push(relay);
+			peak = Math.max(peak, relays.filter((item) => !item.closed).length);
+			return relay;
+		},
+	});
+	const first = await tail.attach({ sessionId: "first", brokerGeneration: 1, repo: "/tmp" });
+	first.setTurnRunning(true);
+	const second = tail.attach({ sessionId: "second", brokerGeneration: 1, repo: "/tmp" });
+	const third = tail.attach({ sessionId: "third", brokerGeneration: 1, repo: "/tmp" });
+	await Bun.sleep(10);
+	expect(relays).toHaveLength(1);
+	first.setObserving(true);
+	first.setTurnRunning(false);
+	const admitted = await Promise.race([second, third]);
+	expect(peak).toBe(1);
+	expect(tail.activeCount).toBe(1);
+	await admitted.close();
+	const results = await Promise.allSettled([second, third]);
+	expect(peak).toBe(1);
+	expect(tail.activeCount).toBe(1);
+	for (const result of results) if (result.status === "fulfilled") await result.value.close();
+	expect(tail.activeCount).toBe(0);
+});
+
+test("an observer remains capacity-evictable while an autonomous run is active", async () => {
+	const relays: FakeRelay[] = [];
+	const lifecycle: Array<[string, boolean]> = [];
+	const tail = new TailRunner({
+		repo: "/tmp",
+		maxTailProcesses: 1,
+		sleep: async () => {},
+		stream: () => {
+			const relay = new FakeRelay(`observer-${relays.length}`);
+			relays.push(relay);
+			return relay;
+		},
+	});
+	let handle: Awaited<ReturnType<typeof tail.attach>>;
+	handle = await tail.attach({
+		sessionId: "observed",
+		brokerGeneration: 1,
+		repo: "/tmp",
+		onObserverLifecycle: (kind, correlated) => {
+			lifecycle.push([kind, correlated]);
+		},
+	});
+	handle.setObserving(true);
+	const start = { type: "agent_start", sessionId: "observed" };
+	relays[0]!.host(start);
+	relays[0]!.host({ type: "event", kind: "agent_start", payload: start });
+	await Bun.sleep(10);
+	expect((handle as unknown as { readonly running: boolean }).running).toBe(false);
+	expect(lifecycle).toEqual([["agent_start", false]]);
+	const successor = await tail.attach({ sessionId: "other", brokerGeneration: 1, repo: "/tmp", priority: "retired" });
+	expect(relays[0]!.closed).toBe(true);
+	await successor.close();
+});
+
 test("a relay that dies six times in a row is declared dead: the handle closes and reports onRelayDead once", async () => {
 	const relays: FakeRelay[] = [];
 	const dead: unknown[] = [];
@@ -499,7 +660,7 @@ test("a relay that dies six times in a row is declared dead: the handle closes a
 		relays.at(-1)!.end();
 		await Bun.sleep(5);
 	}
-	expect(dead).toEqual([{ sessionId: "s1", brokerGeneration: 2 }]);
+	expect(dead).toEqual([{ sessionId: "s1", brokerGeneration: 2, opRef: "op-1" }]);
 	expect(lost.length).toBeGreaterThanOrEqual(1);
 	expect(relays.length).toBeLessThanOrEqual(7);
 	await expect(handle.query("turn.result", {})).rejects.toBeInstanceOf(RelayClosedError);

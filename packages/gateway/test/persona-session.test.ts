@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { isSilenceToken } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import {
+	AGENT_RUN_GRACE_MS,
+	AGENT_RUN_MAX_MS,
 	freshTurnAttempt,
 	PERSONA_COMPACTION_TOKENS,
 	PERSONA_PREAMBLE_REFRESH_SENDS,
@@ -121,6 +123,10 @@ async function harness(
 		onSloEvent?: (code: "persona_bind_failed", at: number) => void;
 		onBindFailure?: (input: { originKey: string; detail: string; at: number }) => void;
 		onSessionReady?: (input: { originKey: string; at: number }) => void;
+		maxLiveHosts?: number;
+		hostIdleRetireMs?: number;
+		setTimeout?: (work: () => void, delayMs: number) => unknown;
+		clearTimeout?: (timer: unknown) => void;
 		now?: () => number;
 	} = {},
 ) {
@@ -1452,6 +1458,7 @@ for (const proof of [
 		const logs: string[] = [];
 		await harness(port, {}, (line) => logs.push(line));
 		const stored = await establishStoredSession(port, `attach-${proof.name.replaceAll(" ", "-")}`);
+		for (const tail of port.tailsOf(stored.sessionId)) await tail.close();
 		port.storedSessionId = stored.sessionId;
 		const recoveryCalls = trackRecoveryCalls();
 		enqueue(`retry-${proof.name.replaceAll(" ", "-")}`, "one delivery");
@@ -1500,6 +1507,7 @@ for (const behavior of ["no_probe", "live", "unknown", "failed_probe", "attach_a
 		const logs: string[] = [];
 		await harness(port, {}, (line) => logs.push(line));
 		const stored = await establishStoredSession(port, `unproven-${behavior}`);
+		for (const tail of port.tailsOf(stored.sessionId)) await tail.close();
 		port.storedSessionId = stored.sessionId;
 		if (behavior === "no_probe") Object.defineProperty(port, "liveness", { value: undefined });
 		enqueue(`unproven-retry-${behavior}`, "do not replay");
@@ -3296,6 +3304,7 @@ async function idleClosedHarness() {
 	await eventually(() => terminal.length === 1, "first turn did not finish");
 	// Thirty idle minutes later the host is gone.
 	port.closed.add(first.sessionId);
+	for (const tail of port.tailsOf(first.sessionId)) await tail.close();
 	return { port, logs, terminal, sessionId: first.sessionId };
 }
 
@@ -4018,4 +4027,456 @@ test("messages arriving while the actor compacts wait for the compacted send ins
 	);
 	expect(port.sends[0]).toMatchObject({ text: "lands after compaction", systemPreamble: PERSONA });
 	expect(port.compactedAfterSends).toEqual([0]);
+});
+
+test("status-settled predecessor frames cannot affect its reused relay's delayed successor", async () => {
+	const port = new ScriptedSessionPort();
+	const terminal: string[] = [];
+	await harness(port, {
+		terminal: (text) => {
+			terminal.push(text);
+		},
+	});
+	enqueue("status-predecessor", "first question");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	const tail = port.tailsOf(first.sessionId)[0]!;
+	const emit = tail.emit.bind(tail);
+	// The status/result path proves A terminal while its content/terminal never
+	// arrives. Keep the same live relay so the successor truly reuses it.
+	tail.emit = () => {};
+	port.complete(first.opRef, "first status answer");
+	await manager!.tick(KEY);
+	await eventually(() => manager!.state(KEY) === "idle", "status predecessor did not settle");
+	tail.emit = emit;
+	let entered = () => {};
+	let release = () => {};
+	const started = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const resume = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	Object.defineProperty(port, "contextUsage", {
+		value: async () => {
+			entered();
+			await resume;
+			return undefined;
+		},
+	});
+	enqueue("status-successor", "second question");
+	const dispatch = manager!.notifyInbound(KEY);
+	await started;
+	port.emitAssistant(first.sessionId, "late first answer", "old-event", first.opRef);
+	port.completeWithoutAnswerFrame(first.opRef, "first status answer");
+	release();
+	await dispatch;
+	await Bun.sleep(10);
+	const second = port.sends[1]!;
+	expect(port.tailsOf(first.sessionId)[0]).toBe(tail);
+	expect(database!.inbox.turnRow(second.opRef)!.turn_state).toBe("accepted");
+	expect(terminal).toHaveLength(1);
+	port.complete(second.opRef, "second answer");
+	await eventually(() => manager!.state(KEY) === "idle", "successor did not finish");
+	expect(terminal).toEqual(["first status answer", "second answer"]);
+});
+
+async function agentObserverFixture() {
+	let now = 10_000;
+	const logs: string[] = [];
+	const noticeTimers = new Set<() => void>();
+	const port = new ScriptedSessionPort();
+	await harness(port, {}, (line) => logs.push(line), {
+		now: () => now,
+		maxLiveHosts: 1,
+		hostIdleRetireMs: AGENT_RUN_MAX_MS + 1,
+		setTimeout: (work, delay) => {
+			if (delay === 3_000) {
+				noticeTimers.add(work);
+				return work;
+			}
+			return setTimeout(work, delay);
+		},
+		clearTimeout: (timer) => {
+			if (typeof timer === "function") noticeTimers.delete(timer as () => void);
+			else clearTimeout(timer as ReturnType<typeof setTimeout>);
+		},
+	});
+	enqueue("observer-seed", "start background work");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	port.complete(send.opRef, "working");
+	await eventually(() => manager!.state(KEY) === "idle", "seed did not settle");
+	port.setActivity(send.sessionId, "idle", now);
+	database!.transaction((tx) => database!.bindings.touch(tx, KEY, JSON.stringify(ORIGIN)));
+	const end = () => {
+		const tail = port.tailsOf(send.sessionId)[0]!;
+		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+		tail.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, idle: true, steerEcho: false });
+	};
+	return {
+		port,
+		send,
+		logs,
+		end,
+		noticeTimers,
+		advance: (ms: number) => {
+			now += ms;
+		},
+		sweep: async () => await manager!.sweepIdleHosts(now),
+		fireNotice: () => {
+			const work = [...noticeTimers];
+			noticeTimers.clear();
+			for (const run of work) run();
+		},
+	};
+}
+
+for (const outcome of ["terminated", "already_gone"] as const)
+	test(`confirmed stalled-host exit (${outcome}) closes an active observer before unavailable post-stop probes`, async () => {
+		const f = await agentObserverFixture();
+		const active = manager!;
+		enqueue("joined-turn", "continue the work");
+		await active.notifyInbound(KEY);
+		const joined = f.port.sends[1]!;
+		const tail = f.port.tailsOf(joined.sessionId)[0]!;
+		expect(joined.sessionId).toBe(f.send.sessionId);
+		f.end();
+		await eventually(() => f.noticeTimers.size === 1, "notice debounce was not armed");
+		const queuedDebounce = [...f.noticeTimers][0]!;
+		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+		await active.reconcile(KEY);
+		f.port.setActivity(joined.sessionId, "tool", 10_000);
+		f.port.emitStall(joined.sessionId);
+		await active.reconcile(KEY);
+		f.advance(STALLED_TURN_TERMINAL_TIMEOUT_MS);
+		let exited = false;
+		let releases = 0;
+		const hostFreed = active.hostFreed.bind(active);
+		active.hostFreed = () => {
+			expect(
+				f.logs.some((line) => line.includes("agent_run_observer_closed") && line.includes("reason=host_terminated")),
+			).toBe(true);
+			releases++;
+			hostFreed();
+		};
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (exited) throw new Error("post-stop status unavailable");
+			return await status(input);
+		};
+		f.port.terminateHost = async (input) => {
+			expect(await input.shouldTerminate?.()).toBe(true);
+			exited = true;
+			// Receipt occurs inside the cutoff mailbox entry; its lifecycle callback
+			// runs later, after confirmed-exit cleanup and the failed status read.
+			tail.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, idle: true, steerEcho: false });
+			f.port.hostJobs.set(joined.sessionId, new Error("post-stop jobs unavailable"));
+			f.port.liveness = async () => {
+				throw new Error("post-stop liveness unavailable");
+			};
+			return outcome === "terminated" ? { outcome, pid: 40_001 } : { outcome };
+		};
+		let attaches = 0;
+		const attach = f.port.attachTail.bind(f.port);
+		f.port.attachTail = async (input) => {
+			attaches++;
+			return await attach(input);
+		};
+		await active.tick(KEY);
+		await active.reconcile(KEY);
+		expect(exited).toBe(true);
+		expect(f.logs.some((line) => line.startsWith("stalled_turn_post_stop_status_unavailable "))).toBe(true);
+		expect(database!.inbox.turnRow(joined.opRef)?.turn_state).toBe("accepted");
+		expect(releases).toBe(1);
+		expect(f.noticeTimers.size).toBe(0);
+		queuedDebounce();
+		await active.reconcile(KEY);
+		await tail.close();
+		await f.sweep();
+		expect(attaches).toBe(0);
+		expect(f.port.tailsOf(joined.sessionId)).toHaveLength(0);
+		expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(0);
+		expect(database!.inbox.hasPendingAgentRunNotice(KEY)).toBe(false);
+		expect(f.port.sends).toHaveLength(2);
+		expect(f.port.steers).toHaveLength(0);
+		expect(releases).toBe(1);
+	});
+
+for (const guard of ["notice", "sweep"] as const)
+	test(`${guard} rejects an observer on a terminating host with unavailable probes`, async () => {
+		const f = await agentObserverFixture();
+		const active = manager!;
+		enqueue("terminating-joined-turn", "continue working");
+		await active.notifyInbound(KEY);
+		const joined = f.port.sends[1]!;
+		const tail = f.port.tailsOf(joined.sessionId)[0]!;
+		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+		await active.reconcile(KEY);
+		f.port.setActivity(joined.sessionId, "tool", 10_000);
+		f.port.emitStall(joined.sessionId);
+		await active.reconcile(KEY);
+		f.advance(STALLED_TURN_TERMINAL_TIMEOUT_MS);
+		let stopping = false;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (stopping) throw new Error("shutdown status unavailable");
+			return await status(input);
+		};
+		f.port.terminateHost = async (input) => {
+			expect(await input.shouldTerminate?.()).toBe(true);
+			stopping = true;
+			tail.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, idle: true, steerEcho: false });
+			f.port.hostJobs.set(joined.sessionId, new Error("shutdown jobs unavailable"));
+			f.port.liveness = async () => {
+				throw new Error("shutdown liveness unavailable");
+			};
+			return { outcome: "terminating", pid: 40_001 };
+		};
+		await active.tick(KEY);
+		await active.reconcile(KEY);
+		expect(f.noticeTimers.size).toBe(1);
+		let attaches = 0;
+		const attach = f.port.attachTail.bind(f.port);
+		f.port.attachTail = async (input) => {
+			attaches++;
+			return await attach(input);
+		};
+		if (guard === "notice") {
+			f.fireNotice();
+			await active.reconcile(KEY);
+		} else await tail.close();
+		await f.sweep();
+		expect(
+			f.logs.some((line) => line.includes("agent_run_observer_closed") && line.includes("reason=host_terminated")),
+		).toBe(true);
+		expect(attaches).toBe(0);
+		expect(f.noticeTimers.size).toBe(0);
+		expect(database!.inbox.hasPendingAgentRunNotice(KEY)).toBe(false);
+		expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
+		expect(active.liveHostCount()).toBe(1);
+		expect(f.port.sends).toHaveLength(2);
+	});
+
+test("every settled turn retains its relay through grace even without running jobs", async () => {
+	const f = await agentObserverFixture();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.advance(AGENT_RUN_GRACE_MS - 1);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.advance(1);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(0);
+	expect(
+		f.logs.some((line) => line.includes("agent_run_observer_closed") && line.includes("reason=grace_expired")),
+	).toBe(true);
+});
+
+test("observer with background jobs protects an otherwise idle host against capacity retirement", async () => {
+	const f = await agentObserverFixture();
+	f.port.hostJobs.set(f.send.sessionId, [{ id: "async-job", type: "task", label: "background work" }]);
+	const other = "loopback/loopback/other-persona";
+	database!.transaction((tx) =>
+		database!.inbox.enqueue(tx, {
+			messageId: "other-host",
+			originKey: other,
+			originRefJson: JSON.stringify({ ...ORIGIN, conversationId: "other-persona" }),
+			body: "new work",
+		}),
+	);
+	await manager!.notifyInbound(other);
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	expect(f.logs.some((line) => line.startsWith("persona_host_retired "))).toBe(false);
+});
+
+test("pending notice decision prevents grace retirement until its debounce finishes", async () => {
+	const f = await agentObserverFixture();
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "autonomous end did not schedule notice");
+	f.advance(AGENT_RUN_GRACE_MS);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.fireNotice();
+	await eventually(() => f.port.sends.length === 2, "notice did not dispatch");
+	expect(f.port.sends[1]!.text).toContain("[Gateway notice]");
+});
+
+test("running jobs and unavailable reports extend grace only up to the six-hour cap", async () => {
+	const f = await agentObserverFixture();
+	f.port.hostJobs.set(f.send.sessionId, [{ id: "async", type: "task", label: "background work" }]);
+	f.advance(AGENT_RUN_GRACE_MS * 2);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.port.hostJobs.set(f.send.sessionId, new Error("jobs unavailable"));
+	f.advance(AGENT_RUN_GRACE_MS * 2);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.advance(AGENT_RUN_MAX_MS);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(0);
+});
+
+test("capacity-evicted observer warns and sweep reattaches within grace", async () => {
+	const f = await agentObserverFixture();
+	await f.port.tailsOf(f.send.sessionId)[0]!.close();
+	expect(f.logs.some((line) => line.startsWith("agent_run_observer_lost "))).toBe(true);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	expect(f.logs.some((line) => line.includes("agent_run_observer_open") && line.includes("reason=reattach"))).toBe(
+		true,
+	);
+});
+
+test("an autonomous run starting with no jobs retains observation past grace and ends in one notice", async () => {
+	const f = await agentObserverFixture();
+	f.port
+		.tailsOf(f.send.sessionId)[0]!
+		.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+	// Drain the tail's serialized callback before evaluating expiry; even a stale
+	// idle liveness report must not override an observed unfinished autonomous run.
+	await Bun.sleep(10);
+	f.advance(AGENT_RUN_GRACE_MS * 2);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	expect(f.logs.some((line) => line.startsWith("agent_run_observer_closed "))).toBe(false);
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "no completion notice timer");
+	f.fireNotice();
+	await eventually(() => f.port.sends.length === 2, "no gateway notice turn");
+	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(1);
+});
+
+test("an active autonomous observer lost across its terminal infers completion from idle liveness", async () => {
+	const f = await agentObserverFixture();
+	const tail = f.port.tailsOf(f.send.sessionId)[0]!;
+	tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+	await Bun.sleep(10);
+	await tail.close();
+	f.port.setActivity(f.send.sessionId, "idle");
+	await f.sweep();
+	expect(f.noticeTimers.size).toBe(1);
+	f.fireNotice();
+	await eventually(() => f.port.sends.length === 2, "lost terminal did not produce a notice");
+	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(1);
+});
+
+test("a start missed during observer loss is inferred from working liveness without a gateway owner", async () => {
+	const f = await agentObserverFixture();
+	await f.port.tailsOf(f.send.sessionId)[0]!.close();
+	f.port.setActivity(f.send.sessionId, "working");
+	await f.sweep();
+	const recovered = f.port.tailsOf(f.send.sessionId)[0]!;
+	expect(recovered.running).toBe(false);
+	f.port.setActivity(f.send.sessionId, "idle");
+	recovered.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, idle: true, steerEcho: false });
+	await eventually(() => f.noticeTimers.size === 1, "inferred start did not attribute the end");
+	f.fireNotice();
+	await eventually(() => f.port.sends.length === 2, "inferred run produced no notice");
+	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(1);
+});
+
+test("notice enqueue refusal retains its batch for retry", async () => {
+	const f = await agentObserverFixture();
+	const enqueue = database!.inbox.enqueue.bind(database!.inbox);
+	database!.inbox.enqueue = () => false;
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
+	f.fireNotice();
+	await eventually(() => f.logs.some((line) => line.includes("reason=notice_failed")), "refusal was not reported");
+	expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
+	database!.inbox.enqueue = enqueue;
+	await f.sweep();
+	await eventually(() => f.port.sends.length === 2, "failed notice was not retried");
+	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(1);
+});
+
+test("persistent notice enqueue refusal cannot retain observer or retirement guards past the hard cap", async () => {
+	const f = await agentObserverFixture();
+	f.port.liveness = async () => {
+		throw new Error("liveness temporarily unavailable");
+	};
+	const enqueueNotice = database!.inbox.enqueue.bind(database!.inbox);
+	database!.inbox.enqueue = () => false;
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
+	f.fireNotice();
+	await eventually(
+		() => f.logs.some((line) => line.includes("reason=notice_failed")),
+		"timer refusal was not reported",
+	);
+	f.advance(AGENT_RUN_GRACE_MS);
+	await f.sweep();
+	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_failed "))).toHaveLength(1);
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.advance(AGENT_RUN_MAX_MS);
+	await f.sweep();
+	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_failed "))).toHaveLength(2);
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(0);
+	expect(f.noticeTimers.size).toBe(0);
+	expect(
+		f.logs.some((line) => line.startsWith("agent_run_observer_closed ") && line.includes("reason=grace_expired")),
+	).toBe(true);
+	database!.inbox.enqueue = enqueueNotice;
+	// A completed but undeliverable notice must no longer hold host admission.
+	database!.transaction((tx) =>
+		database!.inbox.enqueue(tx, {
+			messageId: "after-refusal",
+			originKey: "loopback/loopback/after-refusal",
+			originRefJson: JSON.stringify({ ...ORIGIN, conversationId: "after-refusal" }),
+			body: "new origin",
+		}),
+	);
+	await manager!.notifyInbound("loopback/loopback/after-refusal");
+	expect(f.port.sends).toHaveLength(2);
+	expect(f.port.closes.some((close) => close.sessionId === f.send.sessionId)).toBe(true);
+});
+
+test("working or unavailable liveness extends observation without running jobs", async () => {
+	const f = await agentObserverFixture();
+	f.port.setActivity(f.send.sessionId, "working");
+	f.advance(AGENT_RUN_GRACE_MS * 2);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.port.liveness = async () => {
+		throw new Error("liveness unavailable");
+	};
+	f.advance(AGENT_RUN_GRACE_MS * 2);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
+	f.advance(AGENT_RUN_MAX_MS);
+	await f.sweep();
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(0);
+});
+
+test("reset cancels a pending notice and closes the observer", async () => {
+	const f = await agentObserverFixture();
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	expect(f.noticeTimers.size).toBe(0);
+	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(0);
+	expect(f.logs.some((line) => line.includes("agent_run_observer_closed") && line.includes("reason=reset"))).toBe(true);
+});
+
+test("external epoch rotation fences the observer before it can enqueue a notice", async () => {
+	const f = await agentObserverFixture();
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
+	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, KEY));
+	f.fireNotice();
+	await eventually(() => f.port.tailsOf(f.send.sessionId).length === 0, "rotated observer did not close");
+	expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
+});
+
+test("a notice during a gateway turn steers its gateway framing without lane-report wording", async () => {
+	const f = await agentObserverFixture();
+	enqueue("platform-successor", "current user question");
+	await manager!.notifyInbound(KEY);
+	f.end();
+	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
+	f.fireNotice();
+	await eventually(() => f.port.steers.length === 1, "notice was not steered");
+	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
+	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
 });

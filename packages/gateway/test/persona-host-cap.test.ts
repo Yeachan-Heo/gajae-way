@@ -385,6 +385,8 @@ test("a terminal result does not make a signaled host reusable before its proces
 		"terminal result did not settle",
 	);
 	expect(signalSent).toBe(true);
+	expect(h.logs.some((line) => line.startsWith("agent_run_observer_open "))).toBe(false);
+	expect(h.port.tailsOf(first.sessionId)).toHaveLength(0);
 	expect(h.manager.liveHostCount()).toBe(1);
 	expect(h.manager.admissionHold(origin("b").key)).toBe("host_capacity");
 	expect(h.sent("b1")).toBeUndefined();
@@ -394,6 +396,30 @@ test("a terminal result does not make a signaled host reusable before its proces
 	expect(h.port.closes.map((entry) => entry.sessionId)).toContain(first.sessionId);
 	expect(h.manager.liveHostCount()).toBe(1);
 });
+for (const protection of ["jobs", "active_run", "pending_notice"] as const)
+	test(`host capacity never evicts an observed session with ${protection}`, async () => {
+		const h = await harness({ maxLiveHosts: 1 });
+		await h.send("a", "a1");
+		await h.complete("a", "a1");
+		const sessionId = h.sessionOf("a1");
+		if (protection === "jobs") h.port.hostJobs.set(sessionId, [{ id: "background", type: "task", label: "running" }]);
+		if (protection === "active_run" || protection === "pending_notice") {
+			const kind = protection === "active_run" ? "agent_start" : "agent_end";
+			if (protection === "pending_notice")
+				h.port
+					.tailsOf(sessionId)[0]!
+					.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+			h.port
+				.tailsOf(sessionId)[0]!
+				.emit({ kind, rawKind: kind, payload: {}, idle: kind === "agent_end", steerEcho: false });
+			await Bun.sleep(10);
+		}
+		await h.send("b", "b1");
+		expect(h.sent("b1")).toBeUndefined();
+		expect(h.port.closes).toHaveLength(0);
+		expect(h.port.tailsOf(sessionId)).toHaveLength(1);
+		expect(h.manager.admissionHold(origin("b").key)).toBe("host_capacity");
+	});
 
 test("idle hosts past the retire window are ended by the sweep and busy ones are left alone", async () => {
 	let clock = 1_000_000;
@@ -435,6 +461,15 @@ test("an idle host remains unavailable until asynchronous termination is confirm
 	await eventually(() => h.sent("b1") !== undefined, "capacity did not free after host exit confirmation", 5_000);
 	expect(terminationCalls).toBeGreaterThanOrEqual(2);
 	expect(h.port.closes.map((entry) => entry.sessionId)).toContain(sessionA);
+	expect(
+		h.logs.some(
+			(line) =>
+				line.startsWith("agent_run_observer_closed ") && line.includes(`session=${sessionA} reason=host_terminated`),
+		),
+	).toBe(true);
+	await h.manager.sweepIdleHosts();
+	expect(h.port.tailsOf(sessionA)).toHaveLength(0);
+	expect(h.logs.some((line) => line.includes(`session=${sessionA} reason=reattach`))).toBe(false);
 	expect(h.manager.liveHostCount()).toBe(1);
 });
 

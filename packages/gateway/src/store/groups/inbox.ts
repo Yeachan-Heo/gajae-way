@@ -358,6 +358,15 @@ export class InboxGroup {
 		return row ?? undefined;
 	}
 
+	hasPendingAgentRunNotice(originKey: string): boolean {
+		return (
+			this.#db
+				.prepare(`SELECT 1 FROM inbound_messages WHERE origin_key = ? AND source = 'lane_report'
+			AND message_id LIKE 'agent-run/%' AND state = 'pending' AND turn_state IS NULL AND ${REPLAYABLE_INBOUND} LIMIT 1`)
+				.get(originKey) !== null
+		);
+	}
+
 	bindTurn(
 		tx: WriteTx,
 		input: {
