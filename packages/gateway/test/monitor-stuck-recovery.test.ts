@@ -4,11 +4,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
-import type { CliRunner } from "@gajae-gateway/subsession";
+import type { CliRunner, StatusReport } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { BrokerSessionPort, LastAssistantUnreadableError, sessionRequestStep } from "../src/orchestrator/session-port";
+import {
+	BrokerSessionPort,
+	LastAssistantUnreadableError,
+	SessionTerminalError,
+	sessionRequestStep,
+} from "../src/orchestrator/session-port";
 import { RelayClosedError, RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
 import { type MonitorEventStage, Store } from "../src/store";
 import { MONITOR_EVENT_MAX_OPEN_AGE_MS } from "../src/store/groups/monitors";
@@ -391,4 +396,65 @@ test("a relay hello failure is positive pre-send evidence and arms a session rol
 	const eventId = await propagator.submitAwaitable(monitor.monitorId, "test.tick", {});
 	expect(db.monitors.failure(eventId)?.code).toBe("session_host_unavailable");
 	expect(propagator.sessionSafetyState(sessionOriginKey).pendingRoll).toBe("session_host_unavailable");
+});
+
+/**
+ * The terminal submission failure a session wedged on a prior agent run reports:
+ * the runtime took the prompt, no run ever started, and the cause is the agent
+ * runtime itself. Measured live (memory.canonicalize, every slot from
+ * 2026-10-13T21:30Z): `Timed out waiting for prior agent run to finish before
+ * prompting.`
+ */
+function wedgedSubmissionReport(outcome: Record<string, string> = {}): StatusReport {
+	return {
+		operationRef: "gw-p-wedged-submission",
+		status: {
+			status: "failed",
+			commandId: "command-wedged-submission",
+			turnId: "turn-wedged-submission",
+			terminalAt: Date.now(),
+			error: { code: "internal", message: "Prompt submission failed." },
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "Prompt submission failed.",
+				phase: "submission",
+				category: "agent_runtime",
+				provenance: "agent_failed",
+				providerCode: "internal",
+				...outcome,
+			},
+		},
+		summaryCompleted: true,
+	};
+}
+
+test("a wedged prompt submission is positive pre-send evidence and arms a session roll", async () => {
+	const { db, monitor, propagator, sessionPort, sessionOriginKey } = await harness();
+	sessionPort.request = async () => {
+		throw new SessionTerminalError(wedgedSubmissionReport());
+	};
+	const eventId = await propagator.submitAwaitable(monitor.monitorId, "test.tick", {});
+	expect(db.monitors.failure(eventId)?.code).toBe("session_submission_wedged");
+	expect(propagator.sessionSafetyState(sessionOriginKey).pendingRoll).toBe("session_submission_wedged");
+});
+
+test("a post-start agent failure stays on its session and never rolls", async () => {
+	const { db, monitor, propagator, sessionPort, sessionOriginKey } = await harness();
+	sessionPort.request = async () => {
+		throw new SessionTerminalError(wedgedSubmissionReport({ phase: "post_start" }));
+	};
+	const eventId = await propagator.submitAwaitable(monitor.monitorId, "test.tick", {});
+	expect(db.monitors.failure(eventId)?.code).toBe("authoring_turn_failed");
+	expect(propagator.sessionSafetyState(sessionOriginKey).pendingRoll).toBeUndefined();
+});
+
+test("a cancelled prompt submission never rolls the session", async () => {
+	const { db, monitor, propagator, sessionPort, sessionOriginKey } = await harness();
+	sessionPort.request = async () => {
+		throw new SessionTerminalError(wedgedSubmissionReport({ providerCode: "aborted" }));
+	};
+	const eventId = await propagator.submitAwaitable(monitor.monitorId, "test.tick", {});
+	expect(db.monitors.failure(eventId)?.code).toBe("authoring_turn_failed");
+	expect(propagator.sessionSafetyState(sessionOriginKey).pendingRoll).toBeUndefined();
 });

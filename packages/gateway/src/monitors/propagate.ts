@@ -99,6 +99,11 @@ type DispatchFailureCode =
 	// row names the session whose host may have outlived the gateway.
 	| "gateway_shutdown"
 	| "session_host_unavailable"
+	// The runtime accepted the prompt but no agent run ever started
+	// (`phase=submission` with an agent-runtime cause). Nothing was sent and no
+	// side effect happened, so the event replays cleanly — on the fresh session
+	// the armed roll binds.
+	| "session_submission_wedged"
 	| "authoring_result_unreadable"
 	| "broker_authority_refused"
 	| "event_type_invalid"
@@ -115,6 +120,7 @@ const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode
 	"session_busy",
 	"gateway_shutdown",
 	"session_host_unavailable",
+	"session_submission_wedged",
 ]);
 
 /**
@@ -1528,6 +1534,26 @@ export class MonitorPropagator {
 			}
 			return;
 		}
+		if (isWedgedSubmissionError(error)) {
+			// Positive pre-start evidence: the runtime took the prompt but no run ever
+			// began, and the rate-limiting cause is the session itself (a prior run or
+			// its pre-prompt compaction still holding the agent), so every later prompt
+			// fails identically. Before this the shape fell through to the executor
+			// branch below — a counter with no remedy — and one wedged session lost
+			// every slot forever: memory.canonicalize, 9 consecutive slots from
+			// 2026-10-13T21:30Z, `Timed out waiting for prior agent run to finish
+			// before prompting.` (the persona path already resets this shape: see
+			// `isWedgedSubmission` in orchestrator/persona-session.ts).
+			state.busyFailures = 0;
+			if (currentEpoch && !state.pendingRoll) {
+				state.pendingRoll = "session_submission_wedged";
+				state.stalledSessionId = sessionId;
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_submission_wedged session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
 		// Any other outcome means the runtime accepted a prompt: not stalled.
 		state.busyFailures = 0;
 		if (failureClass === "executor") {
@@ -1625,7 +1651,8 @@ export class MonitorPropagator {
 		// bumpEpoch is the existing rotation primitive: epoch + 1 and turn_count 0.
 		// The next broker-backed SessionPort bind mints a fresh session and
 		// idempotency key for this monitor origin.
-		const stalledSessionId = reason === "session_busy_stalled" ? state.stalledSessionId : undefined;
+		const stalledSessionId =
+			reason === "session_busy_stalled" || reason === "session_submission_wedged" ? state.stalledSessionId : undefined;
 		state.stalledSessionId = undefined;
 		this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson));
 		// A stalled session is still holding its wedged turn; nothing will prompt
@@ -1788,6 +1815,7 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	const step = phase === "request" ? sessionRequestStep(error) : undefined;
 	if (error instanceof LastAssistantUnreadableError || step === "last_assistant") return "authoring_result_unreadable";
 	if (isSessionHostUnavailable(error)) return "session_host_unavailable";
+	if (isWedgedSubmissionError(error)) return "session_submission_wedged";
 	if (error instanceof BrokerAuthorityError) return "broker_authority_refused";
 	if (error instanceof SessionTerminalError || error instanceof SessionRequestTimeoutError)
 		return "authoring_turn_failed";
@@ -1837,6 +1865,28 @@ function hasSdkPromptTerminalFailure(error: unknown): boolean {
 		return ["cause", "details", "error", "detail"].some((key) => visit(fields[key], depth + 1, seen));
 	};
 	return visit(error, 0, new Set());
+}
+
+/**
+ * A terminal failure at the submission phase whose cause is the agent runtime
+ * itself: the runtime took the prompt but never got it into an agent
+ * (`phase=submission`, category `agent_runtime`, provenance `agent_failed`).
+ * Mirrors `isWedgedSubmission` in orchestrator/persona-session.ts, whose comment
+ * records the measured shape: `Timed out waiting for prior agent run to finish
+ * before prompting.` repeats on every later prompt to that session.
+ *
+ * Like a relay hello failure, this is positive pre-send evidence (nothing
+ * started, nothing ran), so it is the one class of turn failure that justifies
+ * rolling the session. Provider, transport and cancellation failures stay on
+ * their session.
+ */
+function isWedgedSubmissionError(error: unknown): boolean {
+	if (!(error instanceof SessionTerminalError)) return false;
+	const status = error.status.status;
+	const outcome = status.outcome;
+	if (outcome?.phase !== "submission" || outcome.provenance !== "agent_failed" || outcome.category !== "agent_runtime")
+		return false;
+	return ![status.error?.code, outcome.code, outcome.providerCode].includes("aborted");
 }
 
 /** Only positive evidence that the prompt was not sent can justify rolling a session. */

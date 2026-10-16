@@ -299,7 +299,12 @@ export type SessionRollReason =
 	| "context_failures_native_compaction_skipped"
 	| "protocol_failures_off_contract"
 	| "session_busy_stalled"
-	| "session_host_unavailable";
+	| "session_host_unavailable"
+	// The runtime accepted the prompt but no agent run ever started
+	// (`phase=submission`): a session wedged on a prior run fails every later
+	// prompt identically, so it earns the same one-shot roll as an unavailable
+	// host. See `isWedgedSubmissionError` in propagate.ts.
+	| "session_submission_wedged";
 
 const ROLL_REASON_BY_STATUS: Partial<Record<NativeCompactionStatus, SessionRollReason>> = {
 	unavailable: "context_failures_native_compaction_unavailable",

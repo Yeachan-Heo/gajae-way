@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
-import { GjcCliError } from "@gajae-gateway/subsession";
+import { GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import {
 	buildMonitorCompactionDigest,
@@ -22,6 +22,7 @@ import {
 } from "../src/monitors/compaction";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
+import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
@@ -44,6 +45,36 @@ function stubPort(status: NativeCompactionStatus): CompactionPort & { calls: str
 			calls.push(sessionId);
 			return { status };
 		},
+	};
+}
+
+/**
+ * The terminal submission failure a session wedged on a prior agent run answers
+ * with: the runtime took the prompt, no run ever started, and the cause is the
+ * agent runtime itself (measured live: `Timed out waiting for prior agent run
+ * to finish before prompting.` — memory.canonicalize, every slot from
+ * 2026-10-13T21:30Z).
+ */
+function wedgedSubmissionReport(): StatusReport {
+	return {
+		operationRef: "gw-p-wedged-submission",
+		status: {
+			status: "failed",
+			commandId: "command-wedged-submission",
+			turnId: "turn-wedged-submission",
+			terminalAt: Date.now(),
+			error: { code: "internal", message: "Prompt submission failed." },
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "Prompt submission failed.",
+				phase: "submission",
+				category: "agent_runtime",
+				provenance: "agent_failed",
+				providerCode: "internal",
+			},
+		},
+		summaryCompleted: true,
 	};
 }
 
@@ -75,6 +106,13 @@ async function harness(
 		 * turn never starts, so it is not recorded in `turns`.
 		 */
 		busy?: (sessionId: string) => boolean;
+		/**
+		 * When true for a session, the runtime takes the prompt but never starts an
+		 * agent run: the exact terminal submission failure a wedged session answers
+		 * with (`Timed out waiting for prior agent run to finish before prompting.`).
+		 * Nothing was sent, so it is not recorded in `turns` either.
+		 */
+		wedgedSubmission?: (sessionId: string) => boolean;
 		/** Propagator clock; reconcile reclaims a `failed` slot only after its retry backoff (#179). */
 		now?: () => number;
 	} = {},
@@ -96,6 +134,7 @@ async function harness(
 	sessionPort.request = async (input) => {
 		if (options.busy?.(input.sessionId))
 			throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", { code: "busy" });
+		if (options.wedgedSubmission?.(input.sessionId)) throw new SessionTerminalError(wedgedSubmissionReport());
 		return request(input);
 	};
 	const pipeline = new MonitorPropagator({
@@ -866,6 +905,57 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 		// The stranded slot is replayed into the live session too, once its
 		// retry backoff has elapsed (#179: the second retry waits 10 minutes).
 		clock += 10 * 60_000 + 1;
+		await pipeline.reconcile();
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
+			"authored_no_delivery",
+		);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a wedged prompt submission rolls the session so the next slot lands on a live session", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-wedged-"));
+	try {
+		// The live shape: the epoch-0 session takes every prompt and answers with a
+		// terminal submission failure (a prior run or its pre-prompt compaction
+		// still holds the agent); a fresh session answers normally.
+		const { database, registry, pipeline, turns, sessionPort } = await harness(directory, {
+			wedgedSubmission: (sessionId) => sessionId === "event-session-e0",
+		});
+		const monitor = registry.add({
+			name: "canonicalize",
+			trigger: { kind: "cron", schedule: "30 */6 * * *" },
+			eventTypes: ["memory.canonicalize"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "memory.canonicalize"));
+		const first = await pipeline.submitAwaitable(monitor.monitorId, "memory.canonicalize", { slot: 0 });
+		expect(database.monitors.failure(first)?.code).toBe("session_submission_wedged");
+		let state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.pendingRoll).toBe("session_submission_wedged");
+		// Nothing was sent to the agent, so the failure is not executor noise and
+		// nothing else moved — and the roll itself waits for the dispatch boundary.
+		expect(state.executorFailures).toBe(0);
+		expect(state.contextFailures).toBe(0);
+		expect(turns).toHaveLength(0);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		// The next slot rolls at the dispatch boundary, binds a fresh session and
+		// delivers, instead of aiming at the wedged session again.
+		const next = await pipeline.submitAwaitable(monitor.monitorId, "memory.canonicalize", { slot: 1 });
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.lastRoll).toBe("session_submission_wedged");
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === next)?.stage).toBe(
+			"authored_no_delivery",
+		);
+		expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e1"]);
+		// The wedged session's host is ended so it stops occupying the runtime.
+		await Bun.sleep(0);
+		expect(sessionPort.closes.map((entry) => entry.sessionId)).toEqual(["event-session-e0"]);
+		// The stranded slot replays into the live session: nothing was sent, so the
+		// #179 retry backoff must not apply to this code.
 		await pipeline.reconcile();
 		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
 			"authored_no_delivery",
