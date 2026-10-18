@@ -11,7 +11,7 @@ import {
 } from "../src/ops/process-reaper";
 import { GJC_ATTACH_ONLY_ENV } from "../src/orchestrator/broker";
 
-const GJC = "/home/user/.gajaeway/gjc/0.18.11/bin/gjc";
+const GJC = "/home/user/.gajaeway/gjc/0.18.12/bin/gjc";
 const GJC_PREFIX = "/home/user/.gajaeway/gjc";
 const AGENT_DIR = "/home/user/.gajaeway/broker/agent";
 const SELF_PID = 1000;
@@ -165,7 +165,7 @@ test("classifier accepts the source-run gateway as a live parent", () => {
 });
 
 test("classifier accepts only exact current and previously pinned executable identities", () => {
-	const currentExecutable = `${GJC_PREFIX}/0.18.11/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
+	const currentExecutable = `${GJC_PREFIX}/0.18.12/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
 	const previousExecutable = `${GJC_PREFIX}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
 	const table = [
 		worker(2201, 2, { executable: previousExecutable }),
@@ -183,14 +183,14 @@ test("classifier accepts only exact current and previously pinned executable ide
 test("reaper recognizes a previous GJC entrypoint after its version directory was pruned", async () => {
 	const home = await temporaryHome("gajaeway-reaper-old-pin-");
 	const prefix = join(home, "gjc");
-	const currentPackageBin = join(prefix, "0.18.11", "node_modules", "@gajae-code", "coding-agent", "bin");
-	const currentExecutable = join(prefix, "0.18.11", "bin", "gjc");
+	const currentPackageBin = join(prefix, "0.18.12", "node_modules", "@gajae-code", "coding-agent", "bin");
+	const currentExecutable = join(prefix, "0.18.12", "bin", "gjc");
 	const oldProcessExecutable = join(prefix, "0.18.9", "node_modules", "@gajae-code", "coding-agent", "bin", "gjc.js");
 	const agentDir = join(home, "agent");
 	const calls: Array<{ pid: number; signal: string }> = [];
 	try {
 		await mkdir(currentPackageBin, { recursive: true });
-		await mkdir(join(prefix, "0.18.11", "bin"), { recursive: true });
+		await mkdir(join(prefix, "0.18.12", "bin"), { recursive: true });
 		await writeFile(join(currentPackageBin, "gjc.js"), "");
 		await symlink("../node_modules/@gajae-code/coding-agent/bin/gjc.js", currentExecutable);
 		const currentProcessExecutable = await realpath(currentExecutable);
@@ -218,7 +218,7 @@ test("reaper recognizes a previous GJC entrypoint after its version directory wa
 test("Unix ps parser preserves exact agent directories, including paths with spaces", () => {
 	const spacedAgentDir = "/home/user/gajae way/agent";
 	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
-	const spacedCurrentGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
+	const spacedCurrentGjc = `${spacedPrefix}/0.18.12/bin/gjc`;
 	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
 	const attachOnlyEnv = `${GJC_ATTACH_ONLY_ENV}=0`;
 	const output = [
@@ -260,7 +260,7 @@ test("Unix ps parser preserves exact agent directories, including paths with spa
 test("Unix ps parser preserves spaced gateway and Bun launcher paths", () => {
 	const spacedAgentDir = "/home/user/gajae way/agent";
 	const spacedPrefix = "/home/user/gajae way/.gajaeway/gjc";
-	const spacedGjc = `${spacedPrefix}/0.18.11/bin/gjc`;
+	const spacedGjc = `${spacedPrefix}/0.18.12/bin/gjc`;
 	const spacedPreviousGjc = `${spacedPrefix}/0.18.9/node_modules/@gajae-code/coding-agent/bin/gjc.js`;
 	const spacedBun = "/home/user/gajae way/.bun/bin/bun";
 	const spacedSource = "/home/user/gajae way/packages/gateway/src/main.ts";
@@ -334,7 +334,7 @@ test("Linux proc reader parses comm with spaces and parentheses and selects a sy
 	const home = await temporaryHome("gajaeway-procroot-");
 	const procRoot = join(home, "proc");
 	const brokerAgentDir = join(home, "broker", "agent");
-	const gjcExecutable = join(home, "gjc", "0.18.11", "bin", "gjc");
+	const gjcExecutable = join(home, "gjc", "0.18.12", "bin", "gjc");
 	const calls: Array<{ pid: number; signal: string }> = [];
 	const writeProc = async (
 		pid: number,
@@ -387,7 +387,7 @@ test("reaper confirms Linux worker exit through procfs", async () => {
 	const home = await temporaryHome("gajaeway-reaper-proc-exit-");
 	const procRoot = join(home, "proc");
 	const brokerAgentDir = join(home, "broker", "agent");
-	const gjcExecutable = join(home, "gjc", "0.18.11", "bin", "gjc");
+	const gjcExecutable = join(home, "gjc", "0.18.12", "bin", "gjc");
 	const workerPid = 4551;
 	const signals: string[] = [];
 	try {
