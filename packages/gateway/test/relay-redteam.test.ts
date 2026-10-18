@@ -122,7 +122,6 @@ async function broker(host: Host, extra: Partial<ConstructorParameters<typeof Br
 		database: db,
 		authority,
 		tailRunner: tail,
-		instanceId: "redteam",
 		cli: async () => {
 			throw new Error("unexpected CLI");
 		},

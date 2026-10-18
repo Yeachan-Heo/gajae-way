@@ -16,11 +16,11 @@ import { runRestore } from "./ops/restore";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 
 /**
- * Hard ceiling on an ordered stop. Below the 30s `TimeoutStopSec` the service
+ * Hard ceiling on an ordered stop. Below the 40s gateway `TimeoutStopSec` the service
  * files ship with, so a stop that cannot settle still exits under its own
  * name instead of being SIGKILLed with nothing in the journal (#225).
  */
-const SHUTDOWN_DEADLINE_MS = 25_000;
+const SHUTDOWN_DEADLINE_MS = 35_000;
 
 const [command, ...args] = process.argv.slice(2);
 if (command === "config" && args[0] === "check") {
@@ -135,7 +135,7 @@ if (command === "config" && args[0] === "check") {
 		};
 		if (!booted) return exit();
 		// An ordered stop that wedges must not keep the dead gateway resident.
-		setTimeout(exit, 30_000);
+		setTimeout(exit, SHUTDOWN_DEADLINE_MS);
 		void booted.stop("broker unreachable").then(exit, exit);
 	};
 	try {

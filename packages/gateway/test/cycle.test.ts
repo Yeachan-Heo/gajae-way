@@ -40,6 +40,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		memoryIntents: new Map(),
 		memoryGitIndexLock: null,
 		monitorStages: new Map(),
+		monitorFailures: [],
 		monitorAuthoringLost: [],
 		memoryClosing: false,
 		instanceId: "test-instance",
@@ -614,5 +615,51 @@ describe("runtime cycle projection", () => {
 		);
 		expect(result.sessions).toHaveLength(1);
 		expect(result.sessions[0].originKey).toBe(boundSession.origin_key);
+	});
+
+	test("runtime-cycle diagnostics include only the five newest monitor failures", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-monitor-failures-"));
+		const database = await Store.open(join(directory, "gateway.db"));
+		try {
+			for (let index = 0; index < 6; index++) {
+				const eventId = `failure-${index}`;
+				database.transaction((tx) => {
+					database.monitors.eventCreate(tx, {
+						eventId,
+						monitorId: "monitor-1",
+						eventType: "memory.audit",
+						payloadJson: "{}",
+						firedAt: new Date(index).toISOString(),
+					});
+					database.monitors.eventUpdate(tx, eventId, "failed");
+					database.monitors.failureRecord(
+						tx,
+						eventId,
+						"internal_error",
+						index === 5
+							? "delivery failed: https://api.example/private-token; inspect /opt/app/credentials with spaces.json"
+							: '{"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
+					);
+				});
+			}
+			const result = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+			expect(result.monitorFailures.map((failure) => failure.eventId)).toEqual([
+				"failure-5",
+				"failure-4",
+				"failure-3",
+				"failure-2",
+				"failure-1",
+			]);
+			expect(result.monitorFailures[0]).toMatchObject({
+				code: "internal_error",
+				detail: "delivery failed: [url] inspect [path]",
+				stage: "failed",
+			});
+			expect(result.monitorFailures[0]?.detail).not.toContain("api.example");
+			expect(result.monitorFailures[0]?.detail).not.toContain("/opt/app");
+		} finally {
+			database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 });

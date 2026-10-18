@@ -205,6 +205,27 @@ describe("document shape", () => {
 	});
 });
 
+describe("status bar", () => {
+	test("renders degraded readiness as a status chip", async () => {
+		const snapshot = await state();
+		const document = await renderIndex(
+			{
+				...snapshot,
+				status: {
+					...snapshot.status,
+					tone: "danger",
+					state: "degraded",
+					fields: { ...snapshot.status.fields, readiness: "3 turn failures" },
+					tones: { ...snapshot.status.tones, readiness: "danger" },
+				},
+			},
+			DEFAULT_ALLOWLIST,
+		);
+		const statusBar = document.slice(document.indexOf('<header class="bar"'), document.indexOf("</header>"));
+		expect(statusBar).toContain('<span class="chip" data-field="readiness" data-tone="danger">3 turn failures</span>');
+	});
+});
+
 describe("stream health", () => {
 	test("inline handlers distinguish gateway loss and wait for a recovery snapshot", async () => {
 		const snapshot = await state();

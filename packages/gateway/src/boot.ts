@@ -10,10 +10,11 @@ import { assertNoRestoreJournal } from "./offline";
 import { reapLeftoverWorkers } from "./ops/process-reaper";
 import { SloRecorder } from "./ops/slo";
 import {
-	GjcCliUnavailableError,
+	type BrokerWaitOptions,
 	GlobalGjcClient,
 	type GlobalGjcClientDependencies,
 	readPinnedGjcVersion,
+	waitForBroker,
 } from "./orchestrator/broker";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
@@ -34,18 +35,6 @@ export interface BootGatewayOptions {
 	readonly brokerWait?: BrokerWaitOptions;
 }
 
-export interface BrokerWaitOptions {
-	readonly initialMs?: number;
-	readonly maxMs?: number;
-	/** Total time boot keeps retrying before the failure is fatal. */
-	readonly deadlineMs?: number;
-	readonly sleep?: (ms: number) => Promise<void>;
-	readonly now?: () => number;
-	readonly log?: (line: string) => void;
-}
-
-export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
-
 /**
  * The persona workspace, created if missing and resolved through any symlink.
  *
@@ -64,40 +53,6 @@ export async function resolvePersonaWorkspace(home: string): Promise<string> {
 	const workspaceDir = join(home, "workspace");
 	await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
 	return await realpath(workspaceDir);
-}
-
-/**
- * Runs one broker boot step, waiting out a broker that is not up yet.
- *
- * After a host reboot the shared broker needs minutes to clear a stale lock and
- * come back; a gateway that exits 1 on the first failed probe spins its service
- * manager's fixed-delay restart loop until then (#182: 9 exits in 5 minutes,
- * 131 in 72). Only {@link GjcCliUnavailableError} is waited on — a wrong gjc
- * version or a rejected argv will not heal and still fails immediately. Every
- * retry logs one line naming the cause, and the wait is bounded so a broker that
- * never returns still ends in a supervised exit.
- */
-export async function waitForBroker<T>(
-	step: string,
-	run: () => Promise<T>,
-	options: BrokerWaitOptions = {},
-): Promise<T> {
-	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-	const now = options.now ?? Date.now;
-	const log = options.log ?? console.error;
-	const maxMs = options.maxMs ?? BROKER_WAIT_DEFAULTS.maxMs;
-	const deadline = now() + (options.deadlineMs ?? BROKER_WAIT_DEFAULTS.deadlineMs);
-	let wait = options.initialMs ?? BROKER_WAIT_DEFAULTS.initialMs;
-	for (let attempt = 1; ; attempt++) {
-		try {
-			return await run();
-		} catch (error) {
-			if (!(error instanceof GjcCliUnavailableError) || now() + wait > deadline) throw error;
-			log(`gateway_boot_waiting_for_broker step=${step} attempt=${attempt} retry_in_ms=${wait} ${diagnostic(error)}`);
-			await sleep(wait);
-			wait = Math.min(wait * 2, maxMs);
-		}
-	}
 }
 
 export interface BootedGateway extends GatewayServer {
@@ -222,7 +177,6 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			const sessionPort = new BrokerSessionPort({
 				database,
 				cli: broker.cli,
-				instanceId: database.instanceId,
 				tailRunner,
 				authority,
 			});

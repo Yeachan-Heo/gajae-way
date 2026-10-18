@@ -114,7 +114,6 @@ export async function createOwnedSessionFixture(
 		database,
 		authority,
 		cli: run,
-		instanceId: "creation-fixture",
 		tailRunner: new TailRunner({ stream: noRelay, repo: binding.repo }),
 	});
 	return await port.bind(binding);
@@ -221,17 +220,34 @@ export class ScriptedSessionPort implements SessionPort {
 
 	/** Background jobs each scripted host reports as running; an Error makes the read fail. */
 	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
+	/** Injects tail activity while a caller is awaiting the running-job probe. */
+	beforeRunningJobs?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
+	/** Injects operation changes while a caller is awaiting host inspection. */
+	beforeTerminateHost?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
 
 	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
+		await this.beforeRunningJobs?.(input);
 		const jobs = this.hostJobs.get(input.sessionId) ?? [];
 		if (jobs instanceof Error) throw jobs;
 		return jobs;
 	}
 
 	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */
-	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
+	async terminateHost(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean | Promise<boolean>;
+	}): Promise<TerminateHostOutcome> {
+		await this.beforeTerminateHost?.({ sessionId: input.sessionId, repo: input.repo });
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state || state.live === false) return { outcome: "already_gone" };
+		if (input.shouldTerminate) {
+			try {
+				if (!(await input.shouldTerminate())) return { outcome: "refused", reason: "termination_guard_rejected" };
+			} catch (error) {
+				return { outcome: "refused", reason: `termination_guard_failed:${String(error)}` };
+			}
+		}
 		await this.close(input);
 		return { outcome: "terminated", pid: 40_000 + this.closes.length };
 	}
@@ -970,6 +986,8 @@ export class ScriptedTailHandle implements TailHandle {
 	#flush: Promise<void> = Promise.resolve();
 	#opRef: string | undefined;
 	#correlation: TurnCorrelation = {};
+	readonly #previousCommandIds = new Set<string>();
+	readonly #previousTurnIds = new Set<string>();
 	#running = false;
 	#closed = false;
 
@@ -1002,6 +1020,10 @@ export class ScriptedTailHandle implements TailHandle {
 
 	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
 		if (this.#closed) return;
+		if (this.#opRef !== opRef) {
+			if (this.#correlation.commandId) this.#previousCommandIds.add(this.#correlation.commandId);
+			if (this.#correlation.turnId) this.#previousTurnIds.add(this.#correlation.turnId);
+		}
 		this.#opRef = opRef;
 		this.#correlation = { ...correlation };
 	}
@@ -1015,12 +1037,24 @@ export class ScriptedTailHandle implements TailHandle {
 		this.#running = running;
 	}
 
+	setObserving(_observing: boolean): void {}
+
 	emit(frame: TailFrame): void {
 		if (this.#closed) return;
+		frame = { ...frame, receiptOpRef: this.#opRef };
+		const kind = frame.kind;
+		if (kind === "agent_start" || kind === "agent_end" || kind === "agent_failed") {
+			void this.#input.onObserverLifecycle?.(kind, frame.commandId !== undefined || frame.turnId !== undefined);
+		}
 		if (frame.commandId !== undefined || frame.turnId !== undefined) {
 			if (this.#opRef === undefined) return;
 			const known = this.#correlation;
 			if (known.commandId === undefined && known.turnId === undefined) {
+				if (
+					(frame.commandId && this.#previousCommandIds.has(frame.commandId)) ||
+					(frame.turnId && this.#previousTurnIds.has(frame.turnId))
+				)
+					return;
 				this.#correlation = {
 					...(frame.commandId ? { commandId: frame.commandId } : {}),
 					...(frame.turnId ? { turnId: frame.turnId } : {}),
@@ -1036,7 +1070,7 @@ export class ScriptedTailHandle implements TailHandle {
 				return;
 		} else if (!frame.idle) return;
 		this.#flush = this.#flush.then(async () => {
-			if (this.#closed) return;
+			if (this.#closed || frame.receiptOpRef !== this.#opRef) return;
 			await this.#input.onFrame?.(frame);
 		});
 		this.#flush.catch(() => {});
@@ -1060,7 +1094,19 @@ export class ScriptedTailHandle implements TailHandle {
 	/** Simulates the relay process dying under a running turn. */
 	lose(): void {
 		if (this.#closed) return;
-		void this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+		void this.#input.onRelayLost?.({
+			sessionId: this.sessionId,
+			brokerGeneration: this.brokerGeneration,
+			opRef: this.#opRef,
+		});
+	}
+
+	/** Capture a transport notification now, then admit its callback later. */
+	captureDeathNotice(): () => void {
+		const input = { sessionId: this.sessionId, brokerGeneration: this.brokerGeneration, opRef: this.#opRef };
+		return () => {
+			void this.#input.onRelayDead?.(input);
+		};
 	}
 
 	/**
@@ -1071,7 +1117,11 @@ export class ScriptedTailHandle implements TailHandle {
 	 */
 	die(): void {
 		void this.close();
-		void this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+		void this.#input.onRelayDead?.({
+			sessionId: this.sessionId,
+			brokerGeneration: this.brokerGeneration,
+			opRef: this.#opRef,
+		});
 	}
 
 	async sendReverseResponse(_input: {
@@ -1089,6 +1139,7 @@ export class ScriptedTailHandle implements TailHandle {
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#remove();
+		this.#input.onClosed?.();
 	}
 }
 

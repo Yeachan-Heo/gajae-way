@@ -199,7 +199,7 @@ function statusBar(snapshot: ConsoleSnapshot, ctx: Ctx): string {
 	const chip = (name: string) => cell(row, name, "chip", ctx);
 	return `<header class="bar" id="statusbar" data-tone="${escapeHtml(row.tone)}" data-state="${escapeHtml(row.state ?? "")}">
 <p class="bar__chips">
-${chip("alive")}${chip("sessions")}${chip("working")}${chip("attention")}${chip("delivery")}${chip("profile")}
+${chip("alive")}${chip("sessions")}${chip("working")}${chip("attention")}${chip("delivery")}${chip("readiness")}${chip("profile")}
 </p>
 <p class="bar__stream" id="stream-state" data-tone="ok">${escapeHtml(row.fields.stream ?? "")}</p>
 </header>`;

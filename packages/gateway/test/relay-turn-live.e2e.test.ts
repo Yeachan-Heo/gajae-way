@@ -61,7 +61,6 @@ liveTest(
 			const port = new BrokerSessionPort({
 				database,
 				authority,
-				instanceId: database.instanceId,
 				cli: async (args, options) => {
 					cliCalls.push([...args]);
 					return await broker.cli(args, options);

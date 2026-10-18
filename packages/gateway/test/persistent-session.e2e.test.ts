@@ -166,7 +166,6 @@ liveTest(
 			port = new BrokerSessionPort({
 				database,
 				cli: broker.cli,
-				instanceId: database.instanceId,
 				authority: brokerAuthority,
 				tailRunner: new TailRunner({
 					stream: (id) => broker.openStream(id),

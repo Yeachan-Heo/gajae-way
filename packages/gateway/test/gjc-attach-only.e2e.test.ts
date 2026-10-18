@@ -963,7 +963,6 @@ sessionFlowTest(
 					authority,
 					database,
 					cli: client.cli,
-					instanceId: database.instanceId,
 					tailRunner,
 				});
 				const originKey = `work/task/gjc-e2e-${randomUUID()}`;

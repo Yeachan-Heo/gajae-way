@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 36;
+export const LATEST_SCHEMA_VERSION = 37;
 
 export interface MigrationHost {
 	readonly database: {
@@ -799,6 +799,33 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(36, new Date().toISOString());
+		});
+	}
+	if (current < 37) {
+		// Issue #568: broker mutation journal. A row is written as `pending` in its
+		// own transaction BEFORE the broker call and resolved after it, so a crash
+		// between the two leaves an intent that the retry replays under the same
+		// broker-side reference instead of minting a second operation.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE IF NOT EXISTS broker_operations (
+					authority_key TEXT NOT NULL,
+					operation TEXT NOT NULL CHECK(operation IN ('session.create','turn.prompt','session.close')),
+					scope TEXT NOT NULL,
+					operation_ref TEXT NOT NULL,
+					request_json TEXT NOT NULL,
+					state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+					result_json TEXT,
+					created_at TEXT NOT NULL,
+					completed_at TEXT,
+					PRIMARY KEY(authority_key, operation, scope),
+					CHECK((state = 'complete' AND result_json IS NOT NULL AND completed_at IS NOT NULL) OR (state = 'pending' AND result_json IS NULL AND completed_at IS NULL))
+				);
+				CREATE INDEX IF NOT EXISTS broker_operations_completed ON broker_operations(state, completed_at);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(37, new Date().toISOString());
 		});
 	}
 }

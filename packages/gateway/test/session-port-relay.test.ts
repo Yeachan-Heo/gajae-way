@@ -60,7 +60,7 @@ async function fixture(options: {
 				: options.relayReply(request),
 	);
 	const tailRunner = new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 20 });
-	const port = new BrokerSessionPort({ database, authority, cli: run, instanceId: "relay-1", tailRunner });
+	const port = new BrokerSessionPort({ database, authority, cli: run, tailRunner });
 	const handle = await port.attachTail({ sessionId: "sdk-1", brokerGeneration: 0, repo });
 	return { port, repo, relay, handle, cli };
 }

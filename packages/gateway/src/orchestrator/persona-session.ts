@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
 import {
 	assertControlAllowed,
@@ -51,6 +51,10 @@ import {
 } from "./tail-runner";
 
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
+/** Graceful shutdown gives accepted persona turns time to finish before their relays close. */
+const PERSONA_SHUTDOWN_DRAIN_MS = 15_000;
+/** Maximum silence after a tail stall before a still-nonterminal operation is cut off. */
+export const STALLED_TURN_TERMINAL_TIMEOUT_MS = 10 * 60_000;
 /**
  * How many times a turn may replace its session after the Router disowns it.
  * Each attempt binds a NEW session (bootstrapped with the last 24h of channel
@@ -70,6 +74,7 @@ const STATUS_TERMINAL_GRACE_MS = 250;
 /** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
 const STATUS_RECHECK_MIN_MS = 250;
 const STATUS_RECHECK_MAX_MS = 5_000;
+const HOST_TERMINATION_RECHECK_MS = 1_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
  * slack: the host stamps rows and the gateway stamps dispatched_at on two
@@ -273,6 +278,10 @@ const AGENT_ERROR_RETRY_MAX_MS = 10_000;
 
 export type PersonaActorState = "idle" | "turn-running";
 
+export type PersonaRestartDrainOutcome = "drained" | "timed_out" | "stopped";
+export const PERSONA_RESTART_DRAIN_WAIT_MS = 120_000;
+export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
+
 /**
  * Server-owned chat behavior attached to one durable persona turn. The actor
  * owns session/recovery ordering; this lifecycle owns only presentation,
@@ -364,6 +373,8 @@ export interface PersonaTerminalInput extends PersonaTurnIdentity {
 export interface PersonaFailureInput extends PersonaTurnIdentity {
 	readonly error: Error;
 	readonly status?: StatusReport;
+	/** The gateway must show the cutoff notice even when an earlier interim was delivered. */
+	readonly forceFailureNotice?: boolean;
 	/**
 	 * The answer this turn wrote before it failed, read from the transcript
 	 * because no relay showed it (#210). A written reply must not die with the
@@ -384,6 +395,26 @@ export interface PersonaBindHoldInput {
 	readonly notice: string;
 	readonly verdict: BrokerLivenessVerdict | undefined;
 }
+
+export const AGENT_RUN_GRACE_MS = 120_000;
+export const AGENT_RUN_MAX_MS = 6 * 60 * 60_000;
+const AGENT_RUN_NOTICE_DELAY_MS = 3_000;
+const AGENT_RUN_NOTICE =
+	"[Gateway notice] The runtime started one or more runs on its own (background job / subagent results) since your last reply that reached this conversation. Text you wrote in those runs was NOT delivered, except replies you gave to user messages. If anything the user should see is still undelivered, send it now in full; otherwise reply [SILENT].";
+
+type AgentRunObserver = {
+	readonly sessionId: string;
+	readonly epoch: number;
+	readonly generation: number;
+	settledAt: number;
+	until: number;
+	tail?: TailHandle;
+	firstEndAt?: number;
+	batchId?: string;
+	active?: boolean;
+	lost?: boolean;
+	noticeTimer?: unknown;
+};
 
 export interface PersonaSessionManagerOptions {
 	readonly database: Store;
@@ -440,6 +471,27 @@ export interface PersonaSessionManagerOptions {
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
 	/** Records a failed persona bind in the durable SLO journal. */
 	readonly onSloEvent?: (code: "persona_bind_failed", at: number) => void;
+	/** Readiness observers receive bind outcomes separately from the durable SLO event stream. */
+	readonly onBindFailure?: (input: {
+		readonly originKey: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
+	/** Reports a session failure before an inbound turn is accepted. */
+	readonly onSessionCreateFailure?: (input: {
+		readonly originKey: string;
+		readonly code: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
+	/** Reports failures applying model or service-tier settings before a turn is sent. */
+	readonly onPreSendFailure?: (input: {
+		readonly originKey: string;
+		readonly detail: string;
+		readonly at: number;
+	}) => void;
+	/** Reports a session as ready after it accepts an inbound turn. */
+	readonly onSessionReady?: (input: { readonly originKey: string; readonly at: number }) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
@@ -490,10 +542,20 @@ export class PersonaSessionManager {
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
+	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
+	readonly #onSessionCreateFailure: PersonaSessionManagerOptions["onSessionCreateFailure"];
+	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
+	readonly #onSessionReady: PersonaSessionManagerOptions["onSessionReady"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
+	/** Host slots claimed by bind attempts that have not yet become live actors. */
+	readonly #hostAdmissionReservations = new Map<OriginActor, "free" | "replacement">();
+	/** At most one reserved admission may concurrently retire an idle host to make room. */
+	#hostReplacementAdmissionOwner: OriginActor | undefined;
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
+	#draining = false;
+	#restartDrainId: string | undefined;
 	#stopped = false;
 
 	constructor(options: PersonaSessionManagerOptions) {
@@ -528,11 +590,15 @@ export class PersonaSessionManager {
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
+		this.#onBindFailure = options.onBindFailure;
+		this.#onSessionCreateFailure = options.onSessionCreateFailure;
+		this.#onPreSendFailure = options.onPreSendFailure;
+		this.#onSessionReady = options.onSessionReady;
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
 	notifyInbound(originKey: string): Promise<void> {
-		if (this.#stopped) return Promise.resolve();
+		if (this.#stopped || this.#draining) return Promise.resolve();
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).admit());
 	}
 
@@ -541,7 +607,7 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).admissionHold();
 	}
 
-	/** Running-server stall heartbeat: threshold check only, never an abort. */
+	/** Running-server heartbeat for tail-stall detection and bounded status reconciliation. */
 	checkStalls(): void {
 		if (this.#stopped) return;
 		this.#port.checkStalls(this.#now());
@@ -549,6 +615,18 @@ export class PersonaSessionManager {
 
 	get stopped(): boolean {
 		return this.#stopped;
+	}
+
+	get draining(): boolean {
+		return this.#draining;
+	}
+
+	get restartDrainActive(): boolean {
+		return this.#restartDrainId !== undefined;
+	}
+
+	get restartDrainId(): string | undefined {
+		return this.#restartDrainId;
 	}
 
 	get onReverseRequest(): PersonaSessionManagerOptions["onReverseRequest"] {
@@ -599,16 +677,42 @@ export class PersonaSessionManager {
 	 * cannot afford.
 	 */
 	async admitHost(requester: OriginActor): Promise<HostAdmission> {
+		const reservation = this.#hostAdmissionReservations.get(requester);
+		if (reservation === "free") return { admitted: true };
 		const live = [...this.#actors.values()].filter((actor) => actor !== requester && actor.hostLive);
-		if (live.length < this.#maxLiveHosts) return { admitted: true };
+		const otherReservations = this.#hostAdmissionReservations.size - (this.#hostReplacementAdmissionOwner ? 1 : 0);
+		if (reservation === undefined && live.length + otherReservations < this.#maxLiveHosts) {
+			this.#hostAdmissionReservations.set(requester, "free");
+			return { admitted: true };
+		}
+		if (this.#hostReplacementAdmissionOwner !== undefined && this.#hostReplacementAdmissionOwner !== requester)
+			return { admitted: false, live: live.length };
 		const idle = live.filter((actor) => actor.hostIdle).sort((a, b) => a.hostLastActiveAt - b.hostLastActiveAt);
+		if (reservation === undefined && idle.length > 0) {
+			this.#hostAdmissionReservations.set(requester, "replacement");
+			this.#hostReplacementAdmissionOwner = requester;
+		}
+		if (this.#hostReplacementAdmissionOwner !== requester) return { admitted: false, live: live.length };
 		for (const candidate of idle) {
 			// Retirement runs on the candidate's own mailbox so it cannot race a
-			// turn that is being dispatched there at the same moment.
-			const retired = await candidate.enqueue(async () => await candidate.retireIdleHost("host_capacity"));
-			if (retired) return { admitted: true };
+			// turn that is being dispatched there at the same moment. The waiter
+			// already owns the freed slot, so do not wake a second actor here.
+			const retired = await candidate.enqueue(async () => await candidate.retireIdleHost("host_capacity", false));
+			if (retired) {
+				this.#hostReplacementAdmissionOwner = undefined;
+				this.#hostAdmissionReservations.set(requester, "free");
+				return { admitted: true };
+			}
 		}
+		this.releaseHostAdmission(requester, false);
 		return { admitted: false, live: live.length };
+	}
+
+	/** A reserved bind either became a live host or failed before binding. */
+	releaseHostAdmission(actor: OriginActor, wakeWaiter = true): void {
+		if (!this.#hostAdmissionReservations.delete(actor)) return;
+		if (this.#hostReplacementAdmissionOwner === actor) this.#hostReplacementAdmissionOwner = undefined;
+		if (wakeWaiter) this.hostFreed();
 	}
 
 	/** A host slot opened: wake the longest-waiting capacity hold, if any. */
@@ -620,12 +724,24 @@ export class PersonaSessionManager {
 			if (oldest === undefined || actor.hostHeldSince < (oldest.hostHeldSince ?? Number.POSITIVE_INFINITY))
 				oldest = actor;
 		}
-		oldest?.releaseHostHold();
+		if (!oldest || this.#hostAdmissionReservations.has(oldest)) return;
+		const reserved = this.#hostAdmissionReservations.size - (this.#hostReplacementAdmissionOwner ? 1 : 0);
+		const reservation =
+			this.liveHostCount() + reserved < this.#maxLiveHosts
+				? "free"
+				: this.#hostReplacementAdmissionOwner === undefined
+					? "replacement"
+					: undefined;
+		if (!reservation) return;
+		this.#hostAdmissionReservations.set(oldest, reservation);
+		if (reservation === "replacement") this.#hostReplacementAdmissionOwner = oldest;
+		if (!oldest.releaseHostHold()) this.releaseHostAdmission(oldest, false);
 	}
 
 	/** Ends hosts that have sat idle past `hostIdleRetireMs`; returns how many were ended. */
 	async sweepIdleHosts(now = this.#now()): Promise<number> {
 		if (this.#stopped) return 0;
+		for (const actor of this.#actors.values()) await actor.enqueue(async () => await actor.sweepObserver(now));
 		const stale = [...this.#actors.values()].filter(
 			(actor) => actor.hostIdle && now - actor.hostLastActiveAt >= this.#hostIdleRetireMs,
 		);
@@ -663,12 +779,23 @@ export class PersonaSessionManager {
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
+			...this.#database.bindings
+				.sessionIdentityRows()
+				.filter(
+					(row) =>
+						row.gjc_session_id &&
+						row.origin_ref_json &&
+						!row.origin_key.startsWith("work/") &&
+						!row.origin_key.startsWith("monitor/"),
+				)
+				.map((row) => row.origin_key),
 		]);
 		return Promise.all(
 			[...origins].map((originKey) =>
 				this.#actor(originKey).enqueue(async () => {
 					await this.#actor(originKey).recover();
 					await this.#actor(originKey).reconcile();
+					await this.#actor(originKey).recoverObserver();
 					// Pending rows outside a turn (released before the restart, or
 					// arrived while down) are dispatched now; nothing is expired.
 					await this.#actor(originKey).admit();
@@ -699,13 +826,19 @@ export class PersonaSessionManager {
 		await Promise.all([...this.#actors.values()].map((actor) => actor.stop()));
 	}
 
+	/** Block new persona triggers and steers before shutdown starts stopping their producers. */
+	beginDrain(): void {
+		if (!this.#stopped) this.#draining = true;
+	}
+
 	/**
-	 * Reconcile accepted work for a bounded shutdown window; an unresolved SDK
-	 * operation stays durable for the next broker generation rather than blocking
-	 * shutdown forever or being aborted.
+	 * Stop admitting persona work and reconcile accepted turns for a bounded
+	 * shutdown window. Unsettled operations stay durable rather than being
+	 * aborted or replayed with potentially duplicated side effects.
 	 */
-	async drain(timeoutMs = 5_000): Promise<void> {
+	async drain(timeoutMs = PERSONA_SHUTDOWN_DRAIN_MS): Promise<void> {
 		if (this.#stopped) return;
+		this.beginDrain();
 		const deadline = this.#now() + Math.max(0, timeoutMs);
 		for (;;) {
 			const unresolved = await Promise.all(
@@ -722,8 +855,113 @@ export class PersonaSessionManager {
 		}
 	}
 
-	recordBindFailure(): void {
-		this.#onSloEvent?.("persona_bind_failed", this.#now());
+	/** Pause new dispatches and wait a bounded interval for accepted turns to deliver. */
+	async drainForRestart(
+		restartId: string,
+		waitMs = PERSONA_RESTART_DRAIN_WAIT_MS,
+	): Promise<PersonaRestartDrainOutcome> {
+		if (!/^[A-Za-z0-9_-]{1,128}$/.test(restartId)) throw new Error("invalid restart id");
+		if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > PERSONA_RESTART_DRAIN_MAX_WAIT_MS)
+			throw new Error("restart drain wait must be an integer within the allowed range");
+		if (this.#stopped) return "stopped";
+		if (this.#restartDrainId !== undefined && this.#restartDrainId !== restartId)
+			throw new Error(`restart drain already owned by ${this.#restartDrainId}`);
+		this.#restartDrainId = restartId;
+		const deadline = Date.now() + waitMs;
+		this.#log(`persona_restart_drain_started id=${restartId} waitMs=${waitMs}`);
+		for (;;) {
+			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
+			const actors = [...this.#actors.values()];
+			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timedOut = Symbol("restart drain timed out");
+			let unsettled: (boolean | undefined)[] | typeof timedOut;
+			try {
+				unsettled = await Promise.race([
+					checks,
+					new Promise<typeof timedOut>((resolve) => {
+						const remainingMs = Math.max(0, deadline - Date.now());
+						timer = setTimeout(() => resolve(timedOut), remainingMs);
+					}),
+				]);
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
+			if (unsettled === timedOut) {
+				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				return "timed_out";
+			}
+			if (!unsettled.some(Boolean)) {
+				this.#log(`persona_restart_drain_ready id=${restartId}`);
+				return "drained";
+			}
+			if (Date.now() >= deadline) {
+				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				return "timed_out";
+			}
+			await Bun.sleep(10);
+		}
+	}
+
+	/** Resume pending admissions if the detached restart supervisor fails before restarting the gateway. */
+	async cancelRestartDrain(restartId: string): Promise<boolean> {
+		if (this.#restartDrainId !== restartId) return false;
+		this.#restartDrainId = undefined;
+		this.#log(`persona_restart_drain_cancelled id=${restartId}`);
+		for (const actor of this.#actors.values())
+			void actor
+				.enqueue(async () => await actor.admit())
+				.catch((error: unknown) =>
+					this.#log(`persona restart resume failed origin=${actor.originKey}: ${safeDiagnostic(error)}`, "error"),
+				);
+		return true;
+	}
+
+	/** Transfer a failed supervisor's dispatch hold to an accepted owner restart. */
+	transferRestartDrain(restartId: string, nextRestartId: string): boolean {
+		if (!/^[A-Za-z0-9_-]{1,128}$/.test(nextRestartId)) throw new Error("invalid restart id");
+		if (this.#restartDrainId !== restartId) return false;
+		this.#restartDrainId = nextRestartId;
+		this.#log(`persona_restart_drain_transferred from=${restartId} to=${nextRestartId}`);
+		return true;
+	}
+
+	recordBindFailure(originKey: string, detail: string): void {
+		const at = this.#now();
+		try {
+			this.#onSloEvent?.("persona_bind_failed", at);
+		} finally {
+			try {
+				this.#onBindFailure?.({ originKey, detail, at });
+			} catch (error) {
+				this.#log(`persona bind readiness observer failed: ${safeDiagnostic(error)}`, "error");
+			}
+		}
+	}
+
+	recordSessionReady(originKey: string): void {
+		try {
+			this.#onSessionReady?.({ originKey, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
+	}
+
+	recordSessionCreateFailure(originKey: string, code: string, detail: string): void {
+		try {
+			this.#onSessionCreateFailure?.({ originKey, code, detail, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona session-create readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
+	}
+
+	recordPreSendFailure(originKey: string, detail: string): void {
+		try {
+			this.#onPreSendFailure?.({ originKey, detail, at: this.#now() });
+		} catch (error) {
+			this.#log(`persona pre-send readiness observer failed: ${safeDiagnostic(error)}`, "error");
+		}
 	}
 
 	#actor(originKey: string): OriginActor {
@@ -860,6 +1098,18 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusTerminalHolds: number;
 	/** Status rechecks scheduled for a turn whose end no relay will announce (backoff ordinal). */
 	statusRechecks: number;
+	/** A live tail stalled; keep reconciling status until it emits another frame or reaches terminal state. */
+	statusRecheckAfterStall: boolean;
+	/** First live-tail stall timestamp; only a nonterminal operation can expire against this deadline. */
+	stallStartedAtMs?: number;
+	/** Tail activity version captured when the current stall began. */
+	stallActivityVersion?: number;
+	/** A refused/unavailable host termination has already been logged for this stall. */
+	stallTerminationWarningLogged?: boolean;
+	/** The host was stopped by the terminal-event cutoff; retry durable failure closure if needed. */
+	stallHostTerminated?: boolean;
+	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
+	stallHostTerminating?: boolean;
 	/** A stalled retired hold already attempted its one allowed host termination. */
 	retiredHostTerminationAttempted?: boolean;
 	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
@@ -891,7 +1141,10 @@ class OriginActor {
 	/** A dispatch retry timer is armed; admissions wait for it instead of re-binding at once. */
 	#dispatchRetry: unknown;
 	readonly #retired = new Map<string, BoundTurn>();
+	#observer: AgentRunObserver | undefined;
 	readonly #retiredReattachTimers = new Map<string, unknown>();
+	/** Updated before the frame's actor-mailbox callback so cutoff guards see concurrent activity. */
+	readonly #tailActivityVersions = new WeakMap<TailHandle, { version: number }>();
 	readonly #graceTimers = new Set<unknown>();
 	readonly #appliedModel = new Map<string, string>();
 	readonly #appliedServiceTier = new Map<string, GjcServiceTier>();
@@ -905,6 +1158,8 @@ class OriginActor {
 	#recoveryScanned = false;
 	/** The session whose host this origin counts as holding; cleared when that host is ended. */
 	#hostSessionId: string | undefined;
+	/** A signalled host remains counted but cannot be reused until its process exits. */
+	#hostTerminatingSessionId: string | undefined;
 	#hostLastActiveAt = 0;
 	/** Set while the oldest pending trigger waits for a host slot. */
 	#hostHeldSince: number | undefined;
@@ -919,8 +1174,9 @@ class OriginActor {
 	/** Active turns count; idle session IDs count only while the broker can manage them. */
 	get hostLive(): boolean {
 		return (
-			this.#current !== undefined ||
+			(this.#current !== undefined && !this.#current.stallHostTerminated) ||
 			this.#retired.size > 0 ||
+			this.#hostTerminatingSessionId !== undefined ||
 			(this.#manager.brokerAvailable && this.#hostSessionId !== undefined)
 		);
 	}
@@ -930,9 +1186,12 @@ class OriginActor {
 		return (
 			this.#manager.brokerAvailable &&
 			this.#hostSessionId !== undefined &&
+			this.#hostTerminatingSessionId === undefined &&
 			this.#state === "idle" &&
 			this.#current === undefined &&
 			this.#retired.size === 0 &&
+			!this.#observer?.active &&
+			this.#observer?.firstEndAt === undefined &&
 			!this.#stopped
 		);
 	}
@@ -948,6 +1207,7 @@ class OriginActor {
 	#touchHost(sessionId?: string): void {
 		if (sessionId !== undefined) this.#hostSessionId = sessionId;
 		this.#hostLastActiveAt = this.#manager.now();
+		if (this.hostLive) this.#manager.releaseHostAdmission(this);
 	}
 
 	/**
@@ -956,7 +1216,7 @@ class OriginActor {
 	 * `session.resume` branch, so conversation history survives. A host with
 	 * background jobs is left alone; ending it would lose them.
 	 */
-	async retireIdleHost(reason: HostRetireReason): Promise<boolean> {
+	async retireIdleHost(reason: HostRetireReason, wakeWaiter = true): Promise<boolean> {
 		if (!this.hostIdle || this.#manager.stopped) return false;
 		const sessionId = this.#hostSessionId;
 		if (sessionId === undefined) return false;
@@ -993,15 +1253,26 @@ class OriginActor {
 			}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}`,
 			ended ? "info" : "warn",
 		);
-		if (!ended) return false;
+		if (!ended) {
+			if (result.outcome === "terminating") {
+				this.#hostTerminatingSessionId = sessionId;
+				this.#manager.log(
+					`persona_host_terminating origin=${this.originKey} session=${sessionId} reason=${reason} pid=${result.pid}`,
+					"warn",
+				);
+				this.#scheduleHostTerminationRecheck(sessionId);
+			}
+			return false;
+		}
+		await this.#closeObserver("host_terminated");
 		this.#hostSessionId = undefined;
-		this.#manager.hostFreed();
+		if (wakeWaiter) this.#manager.hostFreed();
 		return true;
 	}
 
 	/** A slot opened while this origin's trigger was held: dispatch now instead of at the next retry tick. */
-	releaseHostHold(): void {
-		if (this.#hostHeldSince === undefined || this.#stopped || this.#manager.stopped) return;
+	releaseHostHold(): boolean {
+		if (this.#hostHeldSince === undefined || this.#stopped || this.#manager.stopped) return false;
 		this.#hostHeldSince = undefined;
 		if (this.#dispatchRetry) {
 			this.#manager.cancel(this.#dispatchRetry);
@@ -1009,6 +1280,7 @@ class OriginActor {
 			this.#dispatchRetry = undefined;
 		}
 		void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+		return true;
 	}
 
 	async #holdForHostCapacity(trigger: InboundMessageRow, epoch: number, live: number): Promise<void> {
@@ -1042,6 +1314,10 @@ class OriginActor {
 		return this.#state;
 	}
 
+	hasUnsettledTurns(): boolean {
+		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	}
+
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
 		if (this.#stopped || this.#manager.stopped) return Promise.resolve(undefined);
 		const task = this.#queue.then(() => {
@@ -1062,6 +1338,7 @@ class OriginActor {
 	 * origin sends it as the next turn. No window, no coalescing.
 	 */
 	async admit(): Promise<void> {
+		if (this.#manager.draining || this.#manager.restartDrainActive) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -1080,6 +1357,7 @@ class OriginActor {
 	}
 
 	async reset(originRefJson: string, floorAt: string): Promise<void> {
+		await this.#closeObserver("reset");
 		const previous = this.#current;
 		// The binding being rotated away from. Read before bumpEpoch clears it: if
 		// no turn is in flight nothing will ever reconcile this session, so its host
@@ -1098,6 +1376,7 @@ class OriginActor {
 		await this.#manager.discardInbound(discarded);
 		if (previous) {
 			previous.retired = true;
+			this.#clearStallReconciliation(previous);
 			previous.tail?.setTurnRunning(false);
 			await previous.tail?.close();
 			previous.detached = true;
@@ -1470,6 +1749,8 @@ class OriginActor {
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
+			statusRecheckAfterStall: false,
+			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 		};
@@ -1571,6 +1852,7 @@ class OriginActor {
 	}
 
 	async onBrokerGeneration(generation: number): Promise<void> {
+		await this.#closeObserver("broker_generation");
 		this.#recoveryScanned = false;
 		for (const bound of [this.#current, ...this.#retired.values()]) {
 			if (!bound || bound.brokerGeneration === generation) continue;
@@ -1587,9 +1869,11 @@ class OriginActor {
 
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		this.#manager.releaseHostAdmission(this, false);
 		// Stop is called outside the mailbox: wait for admitted work, never enqueue
 		// a shutdown task that would await its own queue entry.
 		await this.#queue;
+		await this.#closeObserver("shutdown");
 		for (const timer of this.#retiredReattachTimers.values()) this.#manager.cancel(timer);
 		this.#retiredReattachTimers.clear();
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
@@ -1626,7 +1910,14 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (
+			this.#manager.draining ||
+			this.#manager.restartDrainActive ||
+			this.#state !== "idle" ||
+			this.#current ||
+			this.#dispatchRetry
+		)
+			return;
 		if (this.#modelRefusalPaused) {
 			const pending = this.#manager.database.inbox.pendingOldest(this.originKey);
 			if (pending) {
@@ -1648,6 +1939,10 @@ class OriginActor {
 			trigger.message_id,
 		);
 		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, turnAttempt);
+		if (this.#hostTerminatingSessionId !== undefined) {
+			await this.#holdForHostCapacity(trigger, epoch, this.#manager.liveHostCount());
+			return;
+		}
 		if (!this.hostLive) {
 			const admission = await this.#manager.admitHost(this);
 			if (!admission.admitted) {
@@ -1665,18 +1960,28 @@ class OriginActor {
 			this.#hostHeldSince = undefined;
 			this.#touchHost(binding.sessionId);
 		} catch (error) {
-			await this.#noteBindFailure(trigger, epoch, error);
+			try {
+				await this.#noteBindFailure(trigger, epoch, error);
+			} finally {
+				this.#manager.releaseHostAdmission(this);
+			}
 			return;
 		}
-		const bound = this.#manager.database.transaction((tx) =>
-			this.#manager.database.inbox.bindTurn(tx, {
-				messageId: trigger.message_id,
-				originKey: this.originKey,
-				epoch,
-				opRef,
-				sessionId: binding.sessionId,
-			}),
-		);
+		let bound: InboundMessageRow;
+		try {
+			bound = this.#manager.database.transaction((tx) =>
+				this.#manager.database.inbox.bindTurn(tx, {
+					messageId: trigger.message_id,
+					originKey: this.originKey,
+					epoch,
+					opRef,
+					sessionId: binding.sessionId,
+				}),
+			);
+		} catch (error) {
+			this.#manager.releaseHostAdmission(this);
+			throw error;
+		}
 		const turn: InboundTurn = {
 			originKey: this.originKey,
 			epoch,
@@ -1685,13 +1990,19 @@ class OriginActor {
 			sessionId: binding.sessionId,
 			triggerMessageId: trigger.message_id,
 		};
-		const lifecycle = await this.#manager.startTurn({
-			originKey: this.originKey,
-			epoch,
-			sessionId: binding.sessionId,
-			turn,
-			trigger: bound,
-		});
+		let lifecycle: PersonaTurnLifecycle;
+		try {
+			lifecycle = await this.#manager.startTurn({
+				originKey: this.originKey,
+				epoch,
+				sessionId: binding.sessionId,
+				turn,
+				trigger: bound,
+			});
+		} catch (error) {
+			this.#manager.releaseHostAdmission(this);
+			throw error;
+		}
 		let tail: TailHandle;
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
@@ -1707,7 +2018,11 @@ class OriginActor {
 			// No send was attempted. A broker disown code or positive liveness
 			// proof can therefore release this row without replaying accepted work.
 			// A generic failure alone is not authority to replace the session.
-			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) throw error;
+			this.#manager.recordSessionCreateFailure(this.originKey, "session_attach_failed", safeDiagnostic(error));
+			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) {
+				this.#manager.releaseHostAdmission(this);
+				throw error;
+			}
 			const nextEpoch = this.#manager.database.transaction((tx) => {
 				retryInboundTurn(this.#manager.database, tx, opRef);
 				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
@@ -1720,15 +2035,23 @@ class OriginActor {
 			);
 			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
 			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
-			else
+			else {
 				this.#scheduleDispatchRetry(
 					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
 				);
+				this.#manager.releaseHostAdmission(this);
+			}
 			return;
 		}
 		// Before the turn starts: the stall clock is not running yet and the
 		// actor queue holds every steer and later send until the context is ready.
-		const context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
+		let context: PreparedContext;
+		try {
+			context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
+		} catch (error) {
+			this.#manager.releaseHostAdmission(this);
+			throw error;
+		}
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,
@@ -1748,6 +2071,8 @@ class OriginActor {
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
+			statusRecheckAfterStall: false,
+			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			agentErrorRetryScheduled: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
@@ -1755,6 +2080,7 @@ class OriginActor {
 		tail.beginTurn(opRef);
 		this.#current = current;
 		this.#state = "turn-running";
+		this.#manager.releaseHostAdmission(this);
 		tail.setTurnRunning(true);
 		// Session state, rather than a per-send selector, is authoritative for
 		// persona turns. Model selection happens BEFORE send; if it fails, no
@@ -1807,6 +2133,7 @@ class OriginActor {
 			await this.#notifyReleased(current);
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
+			this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
 			this.#manager.log(
 				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 				"error",
@@ -1832,6 +2159,7 @@ class OriginActor {
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
+			this.#manager.recordSessionReady(this.originKey);
 			if (preamble.next) this.#personaPreamble.set(binding.sessionId, preamble.next);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
@@ -1871,6 +2199,7 @@ class OriginActor {
 			// not land. A session_not_found returned after port.send is ambiguous:
 			// the broker may have accepted the operation before the CLI failed.
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
+				this.#manager.recordSessionCreateFailure(this.originKey, "session_send_disowned", safeDiagnostic(error));
 				await tail.close();
 				const nextEpoch = this.#manager.database.transaction((tx) => {
 					retryInboundTurn(this.#manager.database, tx, opRef);
@@ -2085,7 +2414,7 @@ class OriginActor {
 			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${attempts} detail=${detail}`,
 			"error",
 		);
-		this.#manager.recordBindFailure();
+		this.#manager.recordBindFailure(this.originKey, detail);
 		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 			this.#manager.log(
 				`persona_send_unrecoverable origin=${this.originKey} message=${trigger.message_id} attempts=${attempts} reason=bind_failed`,
@@ -2247,6 +2576,8 @@ class OriginActor {
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
 		if (
+			this.#manager.draining ||
+			this.#manager.restartDrainActive ||
 			this.#modelRefusalPaused ||
 			!current ||
 			current.retired ||
@@ -2437,32 +2768,311 @@ class OriginActor {
 		return binding;
 	}
 
-	async #attachTail(sessionId: string, epoch: number, retired: boolean): Promise<TailHandle> {
+	async recoverObserver(): Promise<void> {
+		if (this.#observer || this.#current) return;
+		const binding = this.#manager.database.bindings.getSessionRecord(this.originKey);
+		if (!binding?.sessionId || !this.#manager.port.liveness) return;
+		try {
+			const live = await this.#manager.port.liveness({ sessionId: binding.sessionId, repo: this.#manager.repo });
+			if (live.live !== true || live.disowned) return;
+			let jobs = false;
+			try {
+				jobs =
+					(await this.#manager.port.runningJobs?.({ sessionId: binding.sessionId, repo: this.#manager.repo }))
+						?.length !== 0;
+			} catch {
+				jobs = true;
+			}
+			const active = live.activity?.state !== undefined && live.activity.state !== "idle";
+			if (!jobs && !active) return;
+			this.#armObserver(binding.sessionId, binding.epoch, undefined, "recover");
+			if (active) this.#observer!.active = true;
+			await this.sweepObserver(this.#manager.now());
+		} catch (error) {
+			this.#manager.log(
+				`agent_run_observer_lost origin=${this.originKey} session=${binding.sessionId} reason=recover detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+		}
+	}
+
+	#armObserver(sessionId: string, epoch: number, tail: TailHandle | undefined, reason: string): void {
+		const now = this.#manager.now();
+		if (this.#observer?.sessionId === sessionId && this.#observer.epoch === epoch) {
+			this.#observer.settledAt = now;
+			this.#observer.until = now + AGENT_RUN_GRACE_MS;
+			this.#observer.tail ??= tail;
+		} else
+			this.#observer = {
+				sessionId,
+				epoch,
+				generation: this.#manager.brokerGeneration,
+				tail,
+				settledAt: now,
+				until: now + AGENT_RUN_GRACE_MS,
+			};
+		this.#observer.tail?.setObserving(true);
+		this.#touchHost(sessionId);
+		this.#manager.log(`agent_run_observer_open origin=${this.originKey} session=${sessionId} reason=${reason}`);
+	}
+
+	async #closeObserver(reason: string): Promise<void> {
+		const observer = this.#observer;
+		if (!observer) return;
+		this.#observer = undefined;
+		if (observer.noticeTimer !== undefined) this.#manager.cancel(observer.noticeTimer);
+		observer.tail?.setObserving(false);
+		if (this.#current?.tail !== observer.tail) await observer.tail?.close();
+		this.#manager.log(
+			`agent_run_observer_closed origin=${this.originKey} session=${observer.sessionId} reason=${reason}`,
+		);
+	}
+
+	#observerLost(reason: string, closed: boolean): void {
+		const observer = this.#observer;
+		if (!observer) return;
+		observer.lost = true;
+		this.#manager.log(
+			`agent_run_observer_lost origin=${this.originKey} session=${observer.sessionId} reason=${reason}`,
+			"warn",
+		);
+		if (closed) observer.tail = undefined;
+	}
+
+	#observerLifecycle(kind: "agent_start" | "agent_end" | "agent_failed", correlated = false): void {
+		const observer = this.#observer;
+		if (!observer) return;
+		if (kind === "agent_start") {
+			if (!correlated) {
+				observer.active = true;
+				observer.tail?.setObserving(true);
+			}
+			return;
+		}
+		if (!observer.active) {
+			if (!correlated)
+				this.#manager.log(`agent_run_unattributed_end origin=${this.originKey} session=${observer.sessionId}`);
+			return;
+		}
+		observer.active = false;
+		observer.lost = false;
+		observer.tail?.setObserving(true);
+		observer.firstEndAt ??= this.#manager.now();
+		observer.batchId ??= randomUUID();
+		this.#manager.log(`agent_run_autonomous_end origin=${this.originKey} session=${observer.sessionId}`);
+		if (observer.noticeTimer !== undefined) this.#manager.cancel(observer.noticeTimer);
+		observer.noticeTimer = this.#manager.schedule(() => {
+			observer.noticeTimer = undefined;
+			void this.enqueue(async () => {
+				if (this.#observer === observer) await this.#noticeAgentRun(observer);
+			}).catch((error: unknown) =>
+				this.#manager.log(
+					`agent_run_observer_lost origin=${this.originKey} session=${observer.sessionId} reason=notice_failed detail=${safeDiagnostic(error)}`,
+					"warn",
+				),
+			);
+		}, AGENT_RUN_NOTICE_DELAY_MS);
+	}
+
+	async #noticeAgentRun(observer: AgentRunObserver): Promise<void> {
+		if (this.#hostStopping(observer.sessionId)) {
+			await this.#closeObserver("host_terminated");
+			return;
+		}
+		if (observer.firstEndAt === undefined || observer.active) return;
+		const binding = this.#manager.database.bindings.getSessionRecord(this.originKey);
+		if (binding?.sessionId !== observer.sessionId || binding.epoch !== observer.epoch) {
+			await this.#closeObserver("binding_changed");
+			return;
+		}
+		try {
+			const jobs = await this.#manager.port.runningJobs?.({ sessionId: observer.sessionId, repo: this.#manager.repo });
+			if (jobs?.length) {
+				this.#manager.log(
+					`agent_run_notice_deferred origin=${this.originKey} session=${observer.sessionId} jobs=${jobs.length}`,
+				);
+				return;
+			}
+		} catch {
+			/* An unavailable job report must not indefinitely suppress the notice. */
+		}
+		const origin = this.#manager.database.bindings.getOriginByKey(this.originKey);
+		if (!origin) throw new Error("agent run notice has no bound origin");
+		const messageId = `agent-run/${observer.sessionId}/${observer.batchId}`;
+		const coalesced = this.#manager.database.transaction((tx) => {
+			if (this.#manager.database.inbox.hasPendingAgentRunNotice(this.originKey)) return true;
+			const enqueued = this.#manager.database.inbox.enqueue(tx, {
+				messageId,
+				originKey: this.originKey,
+				originRefJson: JSON.stringify(origin),
+				body: AGENT_RUN_NOTICE,
+				source: "lane_report",
+				receivedAt: new Date(this.#manager.now()).toISOString(),
+			});
+			if (!enqueued) throw new Error("agent run notice was not enqueued");
+			return false;
+		});
+		observer.firstEndAt = undefined;
+		observer.batchId = undefined;
+		this.#manager.log(
+			`agent_run_notice_${coalesced ? "coalesced" : "enqueued"} origin=${this.originKey} session=${observer.sessionId}${coalesced ? "" : ` messageId=${messageId}`}`,
+		);
+		// Queue admission after this mailbox transition, like work-lane reports.
+		void this.#manager.notifyInbound(this.originKey).catch(() => {});
+	}
+
+	async sweepObserver(now: number): Promise<void> {
+		const observer = this.#observer;
+		if (!observer) return;
+		if (this.#hostStopping(observer.sessionId)) {
+			await this.#closeObserver("host_terminated");
+			return;
+		}
+		const binding = this.#manager.database.bindings.getSessionRecord(this.originKey);
+		if (
+			binding?.sessionId !== observer.sessionId ||
+			binding.epoch !== observer.epoch ||
+			observer.generation !== this.#manager.brokerGeneration
+		) {
+			await this.#closeObserver("binding_changed");
+			return;
+		}
+		let running = true;
+		try {
+			running =
+				!this.#manager.port.runningJobs ||
+				(await this.#manager.port.runningJobs({ sessionId: observer.sessionId, repo: this.#manager.repo })).length > 0;
+		} catch {
+			/* Keep observing an unavailable job report, bounded by the hard cap. */
+		}
+		let active = true;
+		try {
+			const live = await this.#manager.port.liveness?.({ sessionId: observer.sessionId, repo: this.#manager.repo });
+			if (live?.live === false || live?.disowned) {
+				await this.#closeObserver("host_terminated");
+				return;
+			}
+			active = live?.activity?.state !== "idle";
+			if ((!observer.tail || observer.lost) && active && live?.activity && !this.#current) {
+				// A start can fall in the disconnect gap. A working host with no
+				// gateway owner is sufficient to infer autonomous work in progress.
+				observer.active = true;
+				observer.tail?.setObserving(true);
+			}
+			if ((!observer.tail || observer.lost) && observer.active && !active && !this.#current)
+				this.#observerLifecycle("agent_end");
+		} catch {
+			/* Liveness unavailable: retain observation until the hard cap. */
+		}
+		if (running || active || observer.active)
+			observer.until = Math.min(now + AGENT_RUN_GRACE_MS, observer.settledAt + AGENT_RUN_MAX_MS);
+		if (observer.firstEndAt !== undefined && observer.noticeTimer === undefined) {
+			try {
+				await this.#noticeAgentRun(observer);
+			} catch (error) {
+				this.#manager.log(
+					`agent_run_notice_failed origin=${this.originKey} session=${observer.sessionId} detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+			}
+		}
+		if (now >= observer.until && (observer.noticeTimer === undefined || now >= observer.settledAt + AGENT_RUN_MAX_MS)) {
+			await this.#closeObserver("grace_expired");
+			return;
+		}
+		if (!observer.tail) {
+			try {
+				observer.tail = await this.#attachTail(observer.sessionId, observer.epoch, false, true);
+				observer.tail.setObserving(true);
+				this.#manager.log(
+					`agent_run_observer_open origin=${this.originKey} session=${observer.sessionId} reason=reattach`,
+				);
+			} catch (error) {
+				this.#manager.log(
+					`agent_run_observer_lost origin=${this.originKey} session=${observer.sessionId} reason=attach detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+			}
+		}
+	}
+
+	#hostStopping(sessionId: string): boolean {
+		return (
+			this.#hostTerminatingSessionId === sessionId ||
+			(this.#current?.sessionId === sessionId &&
+				(this.#current.stallHostTerminated === true || this.#current.stallHostTerminating === true))
+		);
+	}
+
+	async #attachTail(sessionId: string, epoch: number, retired: boolean, observing = false): Promise<TailHandle> {
+		if (this.#observer && (this.#observer.sessionId !== sessionId || this.#observer.epoch !== epoch))
+			await this.#closeObserver("binding_changed");
+		// Reuse without awaiting another slot inside the origin mailbox.
+		// Transport callbacks carry the turn identity captured at receipt.
+		if (!retired && !observing && this.#observer?.tail) return this.#observer.tail;
 		const generation = this.#manager.brokerGeneration;
 		// Callbacks are fenced by the handle they came from: a late callback from
 		// a handle this turn no longer holds (or a previous turn's handle on the
 		// same session) must never act on the current binding.
 		let self: TailHandle | undefined;
+		const activity = { version: 0 };
 		const owns = (bound: BoundTurn | undefined): bound is BoundTurn => bound !== undefined && bound.tail === self;
 		const handle = await this.#manager.port.attachTail({
 			sessionId,
 			brokerGeneration: generation,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
-			priority: retired ? "retired" : "current",
+			priority: retired || observing ? "retired" : "current",
+			onObserverLifecycle: retired
+				? undefined
+				: async (kind, correlated) => {
+						const observer = this.#observer;
+						// A gateway-owned boundary before observation was armed carries no
+						// autonomous state and needs only the ordinary turn callback.
+						if (!observer && correlated) return;
+						await this.enqueue(async () => {
+							if (
+								(observer && this.#observer === observer) ||
+								(!observer &&
+									this.#observer?.sessionId === sessionId &&
+									this.#observer.epoch === epoch &&
+									this.#observer.generation === generation)
+							)
+								this.#observerLifecycle(kind, correlated);
+							else
+								this.#manager.log(
+									`agent_run_observer_lost origin=${this.originKey} session=${sessionId} reason=lifecycle_discarded kind=${kind}`,
+									"warn",
+								);
+						});
+					},
+			onClosed: () => {
+				if (self && this.#observer?.tail === self) this.#observerLost("evicted", true);
+			},
 			// Awaited on purpose: the handle delivers frames in order, each one's
 			// side effects (ledger, delivery, terminal) before the next. The handle
 			// never calls back from inside a mailbox turn, so re-entrancy is safe.
 			onFrame: async (frame) => {
+				if (
+					!frame.idle ||
+					frame.assistantText !== undefined ||
+					frame.payload.toolCallStarted === true ||
+					frame.rawKind === "agent_end" ||
+					frame.rawKind === "agent_failed"
+				)
+					activity.version += 1;
 				await this.enqueue(async () => {
 					const bound = this.#findBound(sessionId, epoch, generation);
-					if (bound && (!owns(bound) || bound.detached)) return;
+					if (bound && (!owns(bound) || bound.detached || frame.receiptOpRef !== bound.turn.opRef)) return;
 					await this.#onTailFrame(sessionId, epoch, generation, retired, frame);
 				});
 			},
-			onRelayLost: () => {
+			onRelayLost: ({ opRef }) => {
 				void this.enqueue(async () => {
-					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					const bound = this.#findBound(sessionId, epoch, generation);
+					if (bound && bound.turn.opRef !== opRef) return;
+					if (self && this.#observer?.tail === self) this.#observerLost("transport", false);
+					if (!owns(bound) || bound.turn.opRef !== opRef) return;
 					await this.#onRelayLost(sessionId, epoch, generation, retired, false);
 				}).catch((error: unknown) =>
 					this.#manager.log(
@@ -2471,9 +3081,12 @@ class OriginActor {
 					),
 				);
 			},
-			onRelayDead: () => {
+			onRelayDead: ({ opRef }) => {
 				void this.enqueue(async () => {
-					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					const bound = this.#findBound(sessionId, epoch, generation);
+					if (bound && bound.turn.opRef !== opRef) return;
+					if (self && this.#observer?.tail === self) this.#observerLost("dead", true);
+					if (!owns(bound) || bound.turn.opRef !== opRef) return;
 					await this.#onRelayLost(sessionId, epoch, generation, retired, true);
 				}).catch((error: unknown) =>
 					this.#manager.log(
@@ -2490,7 +3103,7 @@ class OriginActor {
 			},
 			onReverseRequest: async (input) => {
 				await this.enqueue(async () => {
-					if (!owns(this.#findBound(sessionId, epoch, generation))) return;
+					if (!owns(this.#findBound(sessionId, epoch, generation)) && this.#observer?.tail !== self) return;
 					await this.#onReverseRequest(sessionId, epoch, generation, retired, input, self!);
 				}).catch((error: unknown) =>
 					this.#manager.log(
@@ -2502,6 +3115,7 @@ class OriginActor {
 			onDiagnostic: (line, level) => this.#manager.log(line, level),
 		});
 		self = handle;
+		this.#tailActivityVersions.set(handle, activity);
 		return handle;
 	}
 
@@ -2737,6 +3351,163 @@ class OriginActor {
 		return true;
 	}
 
+	/** Stops a current operation only after its live tail stayed silent and status remained nonterminal past the hard bound. */
+	async #terminateStalledTurn(bound: BoundTurn): Promise<boolean> {
+		if (!this.#stillTracked(bound) || this.#current !== bound || bound.retired || !bound.statusRecheckAfterStall)
+			return false;
+		const tail = bound.tail;
+		const activityVersion = bound.stallActivityVersion;
+		const canTerminate = () =>
+			this.#stillTracked(bound) &&
+			this.#current === bound &&
+			!bound.retired &&
+			bound.statusRecheckAfterStall &&
+			tail !== undefined &&
+			bound.tail === tail &&
+			activityVersion !== undefined &&
+			this.#tailActivityVersions.get(tail)?.version === activityVersion;
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
+		const port = this.#manager.port;
+		if (!port.terminateHost) {
+			if (!bound.stallTerminationWarningLogged) {
+				this.#manager.log(
+					`stalled_turn_cutoff_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} reason=host_termination_unsupported`,
+					"error",
+				);
+				bound.stallTerminationWarningLogged = true;
+			}
+			return false;
+		}
+		let jobs: string | undefined;
+		if (port.runningJobs) {
+			try {
+				const running = await port.runningJobs({ sessionId: bound.sessionId, repo: this.#manager.repo });
+				if (running.length > 0)
+					jobs = `count=${running.length} jobs=${JSON.stringify(running.map((job) => `${job.type}:${job.id}:${job.label}`))}`;
+			} catch (error) {
+				jobs = `count=unknown detail=${safeDiagnostic(error)}`;
+			}
+		}
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
+		const authorizeTermination = async () => {
+			if (!canTerminate()) return false;
+			try {
+				const latest = await this.#statusOf(bound);
+				return canTerminate() && latest.status.status !== "unknown" && !isTerminalStatus(latest.status.status);
+			} catch {
+				// An unreadable final status is not proof that the accepted operation is gone.
+				return false;
+			}
+		};
+		let result: TerminateHostOutcome;
+		try {
+			result = await port.terminateHost({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				shouldTerminate: authorizeTermination,
+			});
+		} catch (error) {
+			if (!bound.stallTerminationWarningLogged) {
+				this.#manager.log(
+					`stalled_turn_cutoff_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+					"error",
+				);
+				bound.stallTerminationWarningLogged = true;
+			}
+			return false;
+		}
+		if (result.outcome === "terminating") {
+			bound.stallHostTerminating = true;
+			if (this.#hostTerminatingSessionId !== bound.sessionId) {
+				this.#hostTerminatingSessionId = bound.sessionId;
+				this.#manager.log(
+					`stalled_turn_host_terminating origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} pid=${result.pid}`,
+					"warn",
+				);
+			}
+			this.#scheduleHostTerminationRecheck(bound.sessionId);
+			let latest: StatusReport;
+			try {
+				latest = await this.#statusOf(bound);
+			} catch (error) {
+				if (!this.#stopped && !this.#manager.stopped) {
+					this.#manager.log(
+						`stalled_turn_shutdown_status_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+						"warn",
+					);
+					this.#scheduleStatusRecheck(bound);
+				}
+				return false;
+			}
+			if (isTerminalStatus(latest.status.status)) {
+				await this.#reconcileBound(bound, latest);
+				return true;
+			}
+			this.#scheduleStatusRecheck(bound);
+			return false;
+		}
+		if (result.outcome === "refused" && result.reason === "termination_guard_rejected") {
+			if (!canTerminate()) this.#clearStallReconciliation(bound);
+			return false;
+		}
+		if (result.outcome !== "terminated" && result.outcome !== "already_gone") {
+			if (!bound.stallTerminationWarningLogged) {
+				this.#manager.log(
+					`stalled_turn_cutoff_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} outcome=${result.outcome}`,
+					"error",
+				);
+				bound.stallTerminationWarningLogged = true;
+			}
+			return false;
+		}
+		const firstHostTermination = !bound.stallHostTerminated;
+		bound.stallHostTerminated = true;
+		if (this.#observer?.sessionId === bound.sessionId) await this.#closeObserver("host_terminated");
+		if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
+		if (firstHostTermination) {
+			this.#manager.hostFreed();
+			this.#manager.log(
+				`stalled_turn_host_terminated origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} outcome=${result.outcome}`,
+				"warn",
+			);
+		}
+		if (firstHostTermination && jobs && result.outcome === "terminated")
+			this.#manager.log(
+				`stalled_turn_jobs_lost origin=${this.originKey} opRef=${bound.turn.opRef} session=${bound.sessionId} ${jobs}`,
+				"warn",
+			);
+		let latest: StatusReport;
+		try {
+			latest = await this.#statusOf(bound);
+		} catch (error) {
+			if (!this.#stopped && !this.#manager.stopped) {
+				this.#manager.log(
+					`stalled_turn_post_stop_status_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+				this.#scheduleStatusRecheck(bound);
+			}
+			return false;
+		}
+		if (isTerminalStatus(latest.status.status)) {
+			await this.#reconcileBound(bound, latest);
+			return true;
+		}
+		if (!canTerminate()) return false;
+		this.#manager.log(
+			`stalled_turn_cutoff origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} elapsedMs=${this.#manager.now() - (bound.stallStartedAtMs ?? this.#manager.now())} outcome=${result.outcome} status=${latest.status.status}`,
+			"warn",
+		);
+		await this.#closeAcceptedOnDeadSession(bound, "stalled_no_terminal_event");
+		return true;
+	}
+
 	/**
 	 * The relay that owned the running turn died. Whatever the host streamed
 	 * while it was down is gone (content is best-effort by host contract), so
@@ -2817,6 +3588,14 @@ class OriginActor {
 		if ((bound.retired || retired) && !bound.answerWanted) {
 			if (frame.assistantText) this.#recordStaleOutput(bound);
 		} else {
+			// Tail activity after a stall resumes the ordinary live path. If it goes
+			// quiet again, the tail will raise another stall and restart status checks.
+			if (
+				!bound.stallHostTerminated &&
+				!bound.stallHostTerminating &&
+				(!frame.idle || frame.rawKind === "agent_end" || frame.rawKind === "agent_failed")
+			)
+				this.#clearStallReconciliation(bound);
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
 				bound.hadToolActivity = true;
@@ -2870,11 +3649,32 @@ class OriginActor {
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
 		// If turn is in recovery_hold and not already retired, retire it so pending inbound
 		// can start a fresh trigger turn in the next epoch.
-		const inRecoveryHold = !bound.retired && !retired && this.#holdSweeps.has(bound.turn.opRef);
+		const inRecoveryHold =
+			!bound.retired && !retired && !bound.statusRecheckAfterStall && this.#holdSweeps.has(bound.turn.opRef);
 		if (inRecoveryHold) {
 			bound.retired = true;
 		}
-		if (!bound.retired && !retired) await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
+		if (!bound.retired && !retired) {
+			bound.statusRecheckAfterStall = true;
+			bound.stallStartedAtMs ??= this.#manager.now();
+			bound.stallActivityVersion ??= bound.tail ? this.#tailActivityVersions.get(bound.tail)?.version : undefined;
+			try {
+				await bound.lifecycle.onStall?.({ ...bound, elapsedMs });
+			} catch (error) {
+				this.#manager.log(
+					`persona_stall_hook_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+					"error",
+				);
+			}
+		}
+		if (!bound.retired && !retired && this.#current === bound) {
+			// A live tail stall is not proof that the accepted operation failed: the
+			// host may still finish it. Reconcile status now, and keep polling while
+			// the same silent tail reports it in flight. If that never happens, the
+			// operation is cut off only after STALLED_TURN_TERMINAL_TIMEOUT_MS; a
+			// resumed tail or terminal status takes the ordinary path instead.
+			await this.#reconcileBound(bound);
+		}
 		if (retired || bound.retired) {
 			this.#flushStaleOutput(bound, "stall");
 			const tail = bound.tail;
@@ -2922,7 +3722,7 @@ class OriginActor {
 		tail: TailHandle,
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
-		if (!bound || !this.#manager.onReverseRequest) {
+		if (!bound || bound.tail !== tail || !this.#manager.onReverseRequest) {
 			// Nobody will ever answer this request; tell gjc now instead of leaving its tool call waiting.
 			await tail
 				.sendReverseResponse({
@@ -2975,12 +3775,12 @@ class OriginActor {
 		}
 	}
 
-	async #reconcileBound(bound: BoundTurn): Promise<void> {
+	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
 		let report: StatusReport;
 		try {
-			report = await this.#statusOf(bound);
+			report = knownReport ?? (await this.#statusOf(bound));
 		} catch (error) {
 			if (this.#stopped || this.#manager.stopped) return;
 			// The broker disowning the id (session_unavailable) with the session
@@ -3006,7 +3806,10 @@ class OriginActor {
 					return;
 				}
 				if (state === "accepted" && dead) {
-					await this.#closeAcceptedOnDeadSession(bound, "session_gone");
+					await this.#closeAcceptedOnDeadSession(
+						bound,
+						bound.stallHostTerminated ? "stalled_no_terminal_event" : "session_gone",
+					);
 					return;
 				}
 				// Live and idle long past any work: the status endpoint will never
@@ -3019,7 +3822,7 @@ class OriginActor {
 			);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
-			if (bound.tailEvidenceUnavailable) this.#scheduleStatusRecheck(bound);
+			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
 		if (this.#stopped || this.#manager.stopped) return;
@@ -3027,6 +3830,10 @@ class OriginActor {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
+			if (state === "accepted" && bound.stallHostTerminated) {
+				await this.#closeAcceptedOnDeadSession(bound, "stalled_no_terminal_event");
+				return;
+			}
 			// This is the live counterpart of startup's operator_hold recovery.
 			// A BOUND turn has no broker acknowledgement. When the live session
 			// reports no such operation and its prompt queue remains empty across
@@ -3065,6 +3872,7 @@ class OriginActor {
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
 				"warn",
 			);
+			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);
@@ -3074,20 +3882,27 @@ class OriginActor {
 			// Reported running while the host has idled past the bound: the run
 			// ended without settling its operation and never will.
 			if (await this.#releaseWedgedTurn(bound, `status_${report.status.status}`)) return;
+			if (
+				bound.statusRecheckAfterStall &&
+				bound.stallStartedAtMs !== undefined &&
+				this.#manager.now() - bound.stallStartedAtMs >= STALLED_TURN_TERMINAL_TIMEOUT_MS &&
+				(await this.#terminateStalledTurn(bound))
+			)
+				return;
 			if (bound.detached && !bound.tailEvidenceUnavailable) {
 				// A turn the user still wants answered is re-attached like the
 				// current one; only a discarded (`/new`) hold is deferred.
 				if (bound.retired && !bound.answerWanted) this.#scheduleRetiredReattach(bound);
 				else await this.#reattachCurrentTail(bound);
-			} else if (bound.tailEvidenceUnavailable) {
-				// No relay will ever announce this turn's end (adopted after a
-				// restart, relay lost, or retired by /new): status is the only
-				// terminal signal, so poll it at a bounded cadence rather than
-				// waiting for the 60 s recovery sweep.
+			} else if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) {
+				// A lost relay, recovered turn, or live tail stall may not deliver its
+				// terminal frame. Poll status at a bounded cadence instead of waiting
+				// for the 60 s recovery sweep; a resumed live tail clears the stall flag.
 				this.#scheduleStatusRecheck(bound);
 			}
 			return;
 		}
+		this.#cancelStatusRecheck(bound);
 		if (!bound.tailTerminalObserved && !bound.tailEvidenceUnavailable && bound.statusTerminalHolds < 1) {
 			// Status is decidable-terminal but the tail has not shown its terminal
 			// frame yet. Tail stays the live authority: hold ONCE and give the
@@ -3186,6 +4001,7 @@ class OriginActor {
 							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
 							"warn",
 						);
+						if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 						return;
 					}
 					if (!this.#stillTracked(bound)) return;
@@ -3446,12 +4262,30 @@ class OriginActor {
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
+		if (this.#observer && this.#observer.epoch !== this.#epoch()) await this.#closeObserver("epoch_changed");
+		if (this.#observer?.sessionId === bound.sessionId && (bound.stallHostTerminated || bound.stallHostTerminating))
+			await this.#closeObserver("host_terminated");
 		this.#wedgeProbeAt.delete(bound.turn.opRef);
+		this.#clearStallReconciliation(bound);
+		this.#cancelStatusRecheck(bound);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "terminal");
 		this.#clearRetiredReattach(bound);
+		const observing =
+			!bound.retired &&
+			this.#current === bound &&
+			bound.epoch === this.#epoch() &&
+			!bound.stallHostTerminated &&
+			!bound.stallHostTerminating;
+		if (observing)
+			this.#armObserver(
+				bound.sessionId,
+				bound.epoch,
+				!bound.detached && bound.brokerGeneration === this.#manager.brokerGeneration ? bound.tail : undefined,
+				"settled",
+			);
 		try {
-			await bound.tail?.close();
+			if (!observing) await bound.tail?.close();
 		} catch (error) {
 			if (!resetApplied) throw error;
 			this.#manager.log(`failed_turn_tail_close_failed origin=${this.originKey} opRef=${bound.turn.opRef}`, "error");
@@ -3465,9 +4299,11 @@ class OriginActor {
 		if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
-			this.#touchHost(bound.sessionId);
+			if (bound.stallHostTerminated) {
+				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
+			} else if (!bound.stallHostTerminating) this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (this.hostIdle) this.#manager.hostFreed();
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -3519,6 +4355,8 @@ class OriginActor {
 	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
 		this.#wedgeProbeAt.delete(bound.turn.opRef);
+		this.#clearStallReconciliation(bound);
+		this.#cancelStatusRecheck(bound);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
@@ -3570,6 +4408,11 @@ class OriginActor {
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);
+		const stalledCutoff = reason === "stalled_no_terminal_event";
+		if (!stalledCutoff) {
+			this.#clearStallReconciliation(bound);
+			this.#cancelStatusRecheck(bound);
+		}
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "session_gone");
 		await bound.tail?.close();
@@ -3577,14 +4420,21 @@ class OriginActor {
 		// The notice is persisted BEFORE the trigger closes. If persisting it
 		// throws, the trigger stays open and the next sweep retries the same
 		// deterministic notice: a closed turn never silently loses it.
-		if (!discarded && !answered)
-			await bound.lifecycle.onFailure?.({
-				...bound,
-				error: new GjcRuntimeError(
-					"session_unavailable: the session running this turn was lost before it finished; the request was not resent",
-					{ code: "session_unavailable", message: "the session running this turn was lost before it finished" },
-				),
-			});
+		if (!discarded && !answered) {
+			const message = stalledCutoff
+				? "the session running this turn produced no terminal event before the stall deadline; the request was not resent"
+				: "the session running this turn was lost before it finished";
+			try {
+				await bound.lifecycle.onFailure?.({
+					...bound,
+					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
+					...(stalledCutoff ? { forceFailureNotice: true } : {}),
+				});
+			} catch (error) {
+				if (stalledCutoff) this.#scheduleStatusRecheck(bound);
+				throw error;
+			}
+		}
 		// Completion and the rotation away from the dead binding commit together, so
 		// a crash between them cannot leave the next message aimed at the dead session.
 		// Only the CURRENT turn of the CURRENT epoch rotates: a retired turn or a
@@ -3593,15 +4443,21 @@ class OriginActor {
 			!bound.retired &&
 			this.#current === bound &&
 			database.bindings.getSessionRecord(this.originKey)?.epoch === bound.epoch;
-		const completed = database.transaction((tx) => {
-			const changed = database.inbox.turnComplete(
-				tx,
-				bound.turn.opRef,
-				discarded ? "retired" : (answered?.unlinkedReason ?? "turn_failed"),
-			);
-			if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);
-			return changed;
-		});
+		let completed: number;
+		try {
+			completed = database.transaction((tx) => {
+				const changed = database.inbox.turnComplete(
+					tx,
+					bound.turn.opRef,
+					discarded ? "retired" : (answered?.unlinkedReason ?? "turn_failed"),
+				);
+				if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);
+				return changed;
+			});
+		} catch (error) {
+			if (stalledCutoff) this.#scheduleStatusRecheck(bound);
+			throw error;
+		}
 		for (const held of database.inbox.steersHeld(bound.turn.opRef))
 			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
 		this.#manager.log(
@@ -3619,15 +4475,19 @@ class OriginActor {
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
 		this.#wedgeProbeAt.delete(bound.turn.opRef);
+		this.#clearStallReconciliation(bound);
+		this.#cancelStatusRecheck(bound);
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
-			this.#touchHost(bound.sessionId);
+			if (bound.stallHostTerminated) {
+				if (this.#hostSessionId === bound.sessionId) this.#hostSessionId = undefined;
+			} else if (!bound.stallHostTerminating) this.#touchHost(bound.sessionId);
 			await this.#dispatchNext();
-			if (this.hostIdle) this.#manager.hostFreed();
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && this.hostIdle) this.#manager.hostFreed();
 		}
 	}
 
@@ -3713,7 +4573,76 @@ class OriginActor {
 		}
 	}
 
-	/** Bounded status poll for a turn no relay will ever announce the end of; one timer per turn, backing off. */
+	#clearStallReconciliation(bound: BoundTurn): void {
+		if (!bound.statusRecheckAfterStall) return;
+		bound.statusRecheckAfterStall = false;
+		bound.stallStartedAtMs = undefined;
+		bound.stallActivityVersion = undefined;
+		bound.stallTerminationWarningLogged = false;
+		// Unknown-status sweeps are also the legacy recovery-hold signal checked
+		// by the next stall. Resumed activity invalidates that hold as well.
+		this.#holdSweeps.delete(bound.turn.opRef);
+		if (!bound.tailEvidenceUnavailable) this.#cancelStatusRecheck(bound);
+	}
+
+	#cancelStatusRecheck(bound: BoundTurn): void {
+		const key = `status:${retiredKey(bound)}`;
+		const timer = this.#retiredReattachTimers.get(key);
+		if (timer !== undefined) this.#manager.cancel(timer);
+		this.#retiredReattachTimers.delete(key);
+	}
+
+	#scheduleHostTerminationRecheck(sessionId: string): void {
+		const key = `host-termination:${sessionId}`;
+		if (this.#retiredReattachTimers.has(key)) return;
+		const timer = this.#manager.schedule(() => {
+			this.#retiredReattachTimers.delete(key);
+			if (this.#stopped || this.#manager.stopped) return;
+			void this.enqueue(async () => await this.#reconcileTerminatingHost(sessionId)).catch((error: unknown) =>
+				this.#manager.log(
+					`persona_host_termination_recheck_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`,
+					"warn",
+				),
+			);
+		}, HOST_TERMINATION_RECHECK_MS);
+		this.#retiredReattachTimers.set(key, timer);
+	}
+
+	async #reconcileTerminatingHost(sessionId: string): Promise<void> {
+		if (this.#hostTerminatingSessionId !== sessionId) return;
+		const port = this.#manager.port;
+		if (!port.terminateHost) {
+			this.#scheduleHostTerminationRecheck(sessionId);
+			return;
+		}
+		let result: TerminateHostOutcome;
+		try {
+			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
+		} catch {
+			this.#scheduleHostTerminationRecheck(sessionId);
+			return;
+		}
+		if (result.outcome !== "terminated" && result.outcome !== "already_gone") {
+			this.#scheduleHostTerminationRecheck(sessionId);
+			return;
+		}
+		if (this.#observer?.sessionId === sessionId) await this.#closeObserver("host_terminated");
+		this.#hostTerminatingSessionId = undefined;
+		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
+		const bound = this.#current?.sessionId === sessionId ? this.#current : undefined;
+		if (bound) {
+			bound.stallHostTerminating = false;
+			bound.stallHostTerminated = true;
+		}
+		this.#manager.log(
+			`${bound ? "stalled_turn_host_exit_confirmed" : "persona_host_exit_confirmed"} origin=${this.originKey} session=${sessionId} outcome=${result.outcome}`,
+			"warn",
+		);
+		this.#manager.hostFreed();
+		if (bound) await this.#reconcileBound(bound);
+	}
+
+	/** Bounded status poll for a lost or stalled tail; one timer per turn, backing off. */
 	#scheduleStatusRecheck(bound: BoundTurn): void {
 		const key = `status:${retiredKey(bound)}`;
 		if (this.#retiredReattachTimers.has(key)) return;
@@ -4117,6 +5046,7 @@ export function steerDirectedAtPersona(row: InboundMessageRow): boolean {
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {
+	if (row.source === "lane_report" && row.message_id.startsWith("agent-run/")) return row.body;
 	if (row.source === "lane_report")
 		return `[Internal report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n${row.body}`;
 	return renderSteer(lifecycle?.renderSteer?.(row) ?? row.body, steerDirectedAtPersona(row));

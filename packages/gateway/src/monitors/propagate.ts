@@ -15,6 +15,7 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
+import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
@@ -68,11 +69,7 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 };
 
-/**
- * Stable, public-safe dispatch failure codes. The raw error message is NEVER
- * persisted or logged — it can carry secrets (tokens, URLs, file paths); the
- * structured code plus the dispatch phase is what the operator gets.
- */
+/** Stable, public-safe dispatch failure codes. */
 type DispatchFailureCode =
 	| "session_bind_failed"
 	| "authoring_turn_failed"
@@ -102,6 +99,11 @@ type DispatchFailureCode =
 	// row names the session whose host may have outlived the gateway.
 	| "gateway_shutdown"
 	| "session_host_unavailable"
+	// The runtime accepted the prompt but no agent run ever started
+	// (`phase=submission` with an agent-runtime cause). Nothing was sent and no
+	// side effect happened, so the event replays cleanly — on the fresh session
+	// the armed roll binds.
+	| "session_submission_wedged"
 	| "authoring_result_unreadable"
 	| "broker_authority_refused"
 	| "event_type_invalid"
@@ -118,12 +120,14 @@ const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode
 	"session_busy",
 	"gateway_shutdown",
 	"session_host_unavailable",
+	"session_submission_wedged",
 ]);
 
 /**
  * How long shutdown waits for in-flight authoring turns before marking them
- * interrupted. Together with the persona drain (5s) and connection settle (5s)
- * this keeps an ordered stop inside a 30s `TimeoutStopSec` (#225).
+ * interrupted. The monitor and persona drains run concurrently; together with
+ * the 5s connection settle this keeps an ordered stop inside a 40s
+ * `TimeoutStopSec` (#225).
  */
 export const MONITOR_SHUTDOWN_DRAIN_MS = 10_000;
 
@@ -229,6 +233,15 @@ export class MonitorPropagator {
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
 	readonly #notifyInbound: ((originKey: string) => Promise<void>) | undefined;
+	readonly #onReadinessFailure:
+		| ((input: {
+				readonly code: string;
+				readonly detail: string;
+				readonly originKey: string;
+				readonly at: number;
+		  }) => void)
+		| undefined;
+	readonly #onReadinessSuccess: ((input: { readonly originKey: string; readonly at: number }) => void) | undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -273,6 +286,15 @@ export class MonitorPropagator {
 		deliver?: (payload: ChatMessagePayload) => void;
 		/** Wakes the persona actor after a durable monitor report is enqueued. */
 		notifyInbound?: (originKey: string) => Promise<void>;
+		/** Reports a monitor dispatch failure to process-local functional readiness. */
+		onReadinessFailure?: (input: {
+			readonly code: string;
+			readonly detail: string;
+			readonly originKey: string;
+			readonly at: number;
+		}) => void;
+		/** Reports successful monitor dispatches that require no adapter delivery. */
+		onReadinessSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
@@ -315,6 +337,8 @@ export class MonitorPropagator {
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
 		this.#notifyInbound = options.notifyInbound;
+		this.#onReadinessFailure = options.onReadinessFailure;
+		this.#onReadinessSuccess = options.onReadinessSuccess;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -808,6 +832,7 @@ export class MonitorPropagator {
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
 			if (resumeTurn) return;
+			let transitionedFailure = false;
 			for (const row of rows) {
 				const failed = this.#database.transaction((tx) =>
 					this.#database.monitors.eventTerminalFail(
@@ -817,8 +842,18 @@ export class MonitorPropagator {
 						"dispatch setup failed (monitor_invalid)",
 					),
 				);
-				if (failed) this.#emitStage(row, "failed_no_retry");
+				if (failed) {
+					transitionedFailure = true;
+					this.#emitStage(row, "failed_no_retry");
+				}
 			}
+			if (transitionedFailure)
+				this.#recordReadinessFailure({
+					code: "monitor_invalid",
+					detail: "monitor dispatch failed during setup",
+					originKey: monitorReadinessOriginKey(rows[0]?.monitor_id ?? "unknown"),
+					at: this.#now(),
+				});
 			console.error(
 				`monitor dispatch rejected missing or invalid monitor: events ${rows.map((row) => row.event_id).join(",")}`,
 			);
@@ -877,7 +912,8 @@ export class MonitorPropagator {
 			sessionOrigin = monitorOriginForEvent(monitor, claimedEventType);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
-			this.#database.transaction((tx) => {
+			const transitionedFailure = this.#database.transaction((tx) => {
+				let transitioned = false;
 				for (const row of claimed) {
 					const failed = this.#database.monitors.eventFencedFail(
 						tx,
@@ -889,10 +925,21 @@ export class MonitorPropagator {
 						now(),
 						true,
 					);
-					if (failed) this.#emitStage(row, "failed_no_retry");
+					if (failed) {
+						transitioned = true;
+						this.#emitStage(row, "failed_no_retry");
+					}
 				}
 				for (const row of leased) this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId);
+				return transitioned;
 			});
+			if (transitionedFailure)
+				this.#recordReadinessFailure({
+					code: "event_type_invalid",
+					detail: "monitor dispatch failed during event setup",
+					originKey: monitorReadinessOriginKey(monitor.monitorId),
+					at: now(),
+				});
 			console.error(
 				`monitor dispatch rejected invalid event type: events ${claimed.map((row) => row.event_id).join(",")}`,
 			);
@@ -939,6 +986,16 @@ export class MonitorPropagator {
 			let protocolResponseByteLength: number | undefined;
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
+			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			const flushReadinessFailure = () => {
+				if (!readinessFailure) return;
+				this.#recordReadinessFailure({
+					...readinessFailure,
+					originKey: sessionOriginKey,
+					at: this.#now(),
+				});
+				readinessFailure = undefined;
+			};
 			try {
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
@@ -1165,13 +1222,18 @@ export class MonitorPropagator {
 				// instead of pretending a delivery is still pending (issue #29 defect 3).
 				const target = monitor.channelTarget ?? this.#ownerTarget;
 				if (!target) {
+					let noDeliveryRecorded = false;
 					for (const row of fenced) {
 						if (this.#database.monitors.authoredOutput(row.event_id) === undefined) continue;
 						const updated = this.#database.transaction((tx) =>
 							this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "authored_no_delivery", batchId),
 						);
-						if (updated) this.#emitStage(row, "authored_no_delivery");
+						if (updated) {
+							noDeliveryRecorded = true;
+							this.#emitStage(row, "authored_no_delivery");
+						}
 					}
+					if (noDeliveryRecorded) this.#recordReadinessSuccess(sessionOriginKey);
 					return;
 				}
 				// Fenced delivery admission: the ledger insert is conditional on every
@@ -1197,11 +1259,13 @@ export class MonitorPropagator {
 					)
 					.filter((entry) => isSilentOutput(entry.note));
 				// Mark all silent notes as authored_no_delivery
+				let noDeliveryRecorded = false;
 				for (const entry of silentEntries) {
 					if (this.#database.monitors.authoredOutput(entry.eventId) === undefined) continue;
-					this.#database.transaction((tx) =>
+					const updated = this.#database.transaction((tx) =>
 						this.#database.monitors.eventFencedUpdate(tx, entry.eventId, leaseId, "authored_no_delivery", batchId),
 					);
+					if (updated) noDeliveryRecorded = true;
 				}
 				const validDeliveryEntries: typeof nonSilentEntries = [];
 				for (const entry of nonSilentEntries) {
@@ -1222,7 +1286,13 @@ export class MonitorPropagator {
 							this.#now(),
 						),
 					);
-					if (updated && eventRow) this.#emitStage(eventRow, "contract_unmet");
+					if (updated) {
+						readinessFailure ??= {
+							code: "authored_echo_suspected",
+							detail: "monitor authoring result echoed its contract",
+						};
+						if (eventRow) this.#emitStage(eventRow, "contract_unmet");
+					}
 				}
 				// Deliver only non-silent notes that contain information beyond the contract.
 				const deliveryText = validDeliveryEntries.map((entry) => entry.note).join("\n");
@@ -1263,7 +1333,7 @@ export class MonitorPropagator {
 					// until the next adapter reconnect flushed redeliveries (live finding:
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
-				}
+				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
@@ -1282,6 +1352,7 @@ export class MonitorPropagator {
 							}
 						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
+				let transitionedFailure = false;
 				this.#database.transaction((tx) => {
 					for (const row of leased) {
 						const failed = this.#database.monitors.eventFencedFail(
@@ -1295,9 +1366,14 @@ export class MonitorPropagator {
 							false,
 							protocolFailure,
 						);
-						if (failed) this.#emitStage(row, "failed");
+						if (failed) {
+							transitionedFailure = true;
+							this.#emitStage(row, "failed");
+						}
 					}
 				});
+				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
+				flushReadinessFailure();
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
@@ -1311,6 +1387,7 @@ export class MonitorPropagator {
 					monitor,
 				});
 			} finally {
+				flushReadinessFailure();
 				stopHeartbeat();
 				for (const row of claimed) this.#claims.delete(row.event_id);
 				// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -1457,6 +1534,26 @@ export class MonitorPropagator {
 			}
 			return;
 		}
+		if (isWedgedSubmissionError(error)) {
+			// Positive pre-start evidence: the runtime took the prompt but no run ever
+			// began, and the rate-limiting cause is the session itself (a prior run or
+			// its pre-prompt compaction still holding the agent), so every later prompt
+			// fails identically. Before this the shape fell through to the executor
+			// branch below — a counter with no remedy — and one wedged session lost
+			// every slot forever: memory.canonicalize, 9 consecutive slots from
+			// 2026-10-13T21:30Z, `Timed out waiting for prior agent run to finish
+			// before prompting.` (the persona path already resets this shape: see
+			// `isWedgedSubmission` in orchestrator/persona-session.ts).
+			state.busyFailures = 0;
+			if (currentEpoch && !state.pendingRoll) {
+				state.pendingRoll = "session_submission_wedged";
+				state.stalledSessionId = sessionId;
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_submission_wedged session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
 		// Any other outcome means the runtime accepted a prompt: not stalled.
 		state.busyFailures = 0;
 		if (failureClass === "executor") {
@@ -1554,7 +1651,8 @@ export class MonitorPropagator {
 		// bumpEpoch is the existing rotation primitive: epoch + 1 and turn_count 0.
 		// The next broker-backed SessionPort bind mints a fresh session and
 		// idempotency key for this monitor origin.
-		const stalledSessionId = reason === "session_busy_stalled" ? state.stalledSessionId : undefined;
+		const stalledSessionId =
+			reason === "session_busy_stalled" || reason === "session_submission_wedged" ? state.stalledSessionId : undefined;
 		state.stalledSessionId = undefined;
 		this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson));
 		// A stalled session is still holding its wedged turn; nothing will prompt
@@ -1648,6 +1746,25 @@ export class MonitorPropagator {
 		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
 	}
+	#recordReadinessSuccess(originKey: string): void {
+		try {
+			this.#onReadinessSuccess?.({ originKey, at: this.#now() });
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
+	}
+	#recordReadinessFailure(input: {
+		readonly code: string;
+		readonly detail: string;
+		readonly originKey: string;
+		readonly at: number;
+	}): void {
+		try {
+			this.#onReadinessFailure?.(input);
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
+	}
 	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
 		if (isSilentOutput(note)) return false;
 		if (!monitor.channelTarget && !this.#ownerTarget) return true;
@@ -1698,6 +1815,7 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	const step = phase === "request" ? sessionRequestStep(error) : undefined;
 	if (error instanceof LastAssistantUnreadableError || step === "last_assistant") return "authoring_result_unreadable";
 	if (isSessionHostUnavailable(error)) return "session_host_unavailable";
+	if (isWedgedSubmissionError(error)) return "session_submission_wedged";
 	if (error instanceof BrokerAuthorityError) return "broker_authority_refused";
 	if (error instanceof SessionTerminalError || error instanceof SessionRequestTimeoutError)
 		return "authoring_turn_failed";
@@ -1717,6 +1835,11 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	// The session port waited for the runtime to go idle and it never did.
 	// Nothing was sent, so the event replays cleanly on the next reconcile.
 	if (isSessionBusy(error)) return "session_busy";
+	// Some SDK prompt-terminal failures arrive wrapped in an ordinary Error,
+	// losing the top-level GjcCliError class while preserving the terminal code
+	// in `cause`. Keep these on the authoring-failure path instead of collapsing
+	// them into an opaque internal_error.
+	if (phase === "request" && hasSdkPromptTerminalFailure(error)) return "authoring_turn_failed";
 	// A structured SDK refusal is classified by the phase it interrupted: the
 	// sanitized message no longer carries the verb name, and "internal_error"
 	// hid every configure/request refusal (live: 169 rows in one day, all
@@ -1731,6 +1854,39 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
 	if (step !== undefined) return "authoring_turn_failed";
 	return "internal_error";
+}
+
+function hasSdkPromptTerminalFailure(error: unknown): boolean {
+	const visit = (value: unknown, depth: number, seen: Set<object>): boolean => {
+		if (depth > 4 || value === null || typeof value !== "object" || seen.has(value)) return false;
+		seen.add(value);
+		const fields = value as Record<string, unknown>;
+		if (fields.code === "sdk_prompt_terminal_failed") return true;
+		return ["cause", "details", "error", "detail"].some((key) => visit(fields[key], depth + 1, seen));
+	};
+	return visit(error, 0, new Set());
+}
+
+/**
+ * A terminal failure at the submission phase whose cause is the agent runtime
+ * itself: the runtime took the prompt but never got it into an agent
+ * (`phase=submission`, category `agent_runtime`, provenance `agent_failed`).
+ * Mirrors `isWedgedSubmission` in orchestrator/persona-session.ts, whose comment
+ * records the measured shape: `Timed out waiting for prior agent run to finish
+ * before prompting.` repeats on every later prompt to that session.
+ *
+ * Like a relay hello failure, this is positive pre-send evidence (nothing
+ * started, nothing ran), so it is the one class of turn failure that justifies
+ * rolling the session. Provider, transport and cancellation failures stay on
+ * their session.
+ */
+function isWedgedSubmissionError(error: unknown): boolean {
+	if (!(error instanceof SessionTerminalError)) return false;
+	const status = error.status.status;
+	const outcome = status.outcome;
+	if (outcome?.phase !== "submission" || outcome.provenance !== "agent_failed" || outcome.category !== "agent_runtime")
+		return false;
+	return ![status.error?.code, outcome.code, outcome.providerCode].includes("aborted");
 }
 
 /** Only positive evidence that the prompt was not sent can justify rolling a session. */
@@ -1837,7 +1993,11 @@ function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): Origi
 	);
 }
 
-/** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */
+function monitorReadinessOriginKey(monitorId: string): string {
+	return originKey(monitorSessionOrigin(monitorId, CATCH_ALL_EVENT_ORIGIN.conversationId));
+}
+
+/** Extract a bounded, sanitized lower-level diagnosis without persisting raw error payloads. */
 function failureDetail(error: unknown): string {
 	const object = (value: unknown): Record<string, unknown> =>
 		value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -1907,11 +2067,47 @@ function failureDetail(error: unknown): string {
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
 	// Codes and classifiers the SDK itself produced (envelope error code, terminal
-	// error code, outcome classifiers) are bounded machine tokens: a lowercase
-	// token crosses the boundary, free text never does. Arbitrary `code` fields on
-	// foreign errors stay on the explicit allowlist.
+	// error code, outcome classifiers) are bounded machine tokens. Top-level
+	// `code` fields on foreign errors stay on the explicit allowlist; nested cause
+	// codes and their redacted, length-bounded message are surfaced separately.
 	const sdkToken = (value: unknown): string | undefined =>
 		typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : undefined;
+	const nestedCauses = (value: unknown): Record<string, unknown>[] => {
+		const found: Record<string, unknown>[] = [];
+		const seen = new Set<object>();
+		const visit = (candidate: unknown, depth: number, inCause: boolean): void => {
+			if (depth > 4 || candidate === null || typeof candidate !== "object" || seen.has(candidate)) return;
+			seen.add(candidate);
+			const fields = object(candidate);
+			if (inCause) found.push(fields);
+			for (const key of ["details", "error", "detail", "status", "outcome", "cause"])
+				visit(fields[key], depth + 1, inCause || key === "cause");
+		};
+		visit(value, 0, false);
+		return found;
+	};
+	const causes = nestedCauses(error);
+	const safeCode = (value: unknown): string | undefined => {
+		const token = sdkToken(value);
+		return token !== undefined && sanitizeDiagnostic(token) === token ? token : undefined;
+	};
+	const causeCode = causes
+		.slice()
+		.reverse()
+		.map((fields) => safeCode(fields.code))
+		.find((candidate) => candidate !== undefined);
+	const safeMessage = (value: unknown): string | undefined => {
+		if (typeof value !== "string") return undefined;
+		const cleaned = sanitizeDiagnosticDetail(value, 128);
+		if (!cleaned || cleaned === causeCode) return undefined;
+		return cleaned;
+	};
+	const message = causes
+		.slice()
+		.reverse()
+		.flatMap((fields) => [fields.runtimeMessage, fields.message, fields.reason])
+		.map(safeMessage)
+		.find((candidate) => candidate !== undefined);
 	const outcomeBody = object(terminal.outcome);
 	// #178: a GjcCliError carries the SDK envelope code in `details`, and a
 	// terminal status carries it in `error.code` or `outcome.code`. Those are the
@@ -1940,12 +2136,12 @@ function failureDetail(error: unknown): string {
 	const lastStatus = sdkToken(object(object(fields.lastStatus).status).status);
 	const signal = fields.signal;
 	const status = terminal.status;
-	const message = error instanceof Error ? error.message : "";
-	const cause = /Database has closed|closed database/i.test(message)
+	const outerMessage = error instanceof Error ? error.message : "";
+	const cause = /Database has closed|closed database/i.test(outerMessage)
 		? "database_closed"
-		: /SQLITE_BUSY|database is locked/i.test(message)
+		: /SQLITE_BUSY|database is locked/i.test(outerMessage)
 			? "database_busy"
-			: /timed out|timeout/i.test(message)
+			: /timed out|timeout/i.test(outerMessage)
 				? "timeout"
 				: undefined;
 	const frameNames = ["withTransaction", "#dispatchBatch", "monitorEventFencedFail", "request", "bind"];
@@ -1972,5 +2168,7 @@ function failureDetail(error: unknown): string {
 		...(lastStatus ? { lastStatus } : {}),
 		...(cause ? { cause } : {}),
 		...(frame ? { frame } : {}),
+		...(causeCode && causeCode !== code ? { causeCode } : {}),
+		...(message ? { message } : {}),
 	});
 }

@@ -39,6 +39,16 @@ export interface MonitorFailureRow {
 	readonly response_entry_count: number | null;
 }
 
+export interface RecentMonitorFailureRow {
+	readonly event_id: string;
+	readonly monitor_id: string;
+	readonly event_type: string;
+	readonly stage: string;
+	readonly code: string;
+	readonly detail: string;
+	readonly failed_at: string;
+}
+
 export interface MonitorFailureOptions {
 	readonly protocolFailure?: Pick<MonitorProtocolFailureRecord, "reason" | "responseByteLength" | "responseEntryCount">;
 }
@@ -867,6 +877,19 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				)
 				.get(eventId) as MonitorFailureRow | null) ?? undefined
 		);
+	}
+
+	recentFailures(limit: number): RecentMonitorFailureRow[] {
+		if (!Number.isSafeInteger(limit) || limit < 0 || limit > 100)
+			throw new Error("monitor failure limit must be 0..100");
+		return this.#db
+			.prepare(
+				`SELECT monitor_events.event_id, monitor_events.monitor_id, monitor_events.event_type, monitor_events.stage, monitor_failures.code, monitor_failures.detail, monitor_failures.failed_at
+FROM monitor_failures JOIN monitor_events ON monitor_events.event_id = monitor_failures.event_id
+WHERE ${REPLAYABLE_MONITOR}
+ORDER BY monitor_failures.rowid DESC LIMIT ?`,
+			)
+			.all(limit) as RecentMonitorFailureRow[];
 	}
 
 	failureRecord(tx: WriteTx, eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {

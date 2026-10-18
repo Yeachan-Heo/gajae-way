@@ -255,6 +255,7 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 		await eventually(() => port.sends.length === 1, "first send missing");
 		const first = required(port.sends[0], "first send missing");
 		const firstRelay = port.tailsOf(first.sessionId)[0];
+		const lateDeath = firstRelay!.captureDeathNotice();
 		port.complete(first.opRef, "first answer");
 		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not settle");
 
@@ -263,9 +264,9 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 		await eventually(() => port.sends.length === 2, "second send missing");
 		const second = required(port.sends[1], "second send missing");
 		expect(second.sessionId).toBe(first.sessionId);
-		// The old handle's late death notice must be ignored: it is not the
-		// current turn's handle even though session/epoch/generation all match.
-		firstRelay?.die();
+		// The same connection can be reused; the notice still carries the turn
+		// identity from when transport failure was received, before the successor.
+		lateDeath();
 		await Bun.sleep(20);
 		expect(target.logs.filter((line) => line.includes("reason=relay_dead"))).toEqual([]);
 		// The live turn still streams and completes over its own relay.

@@ -30,6 +30,63 @@ test("delivery ledger expires only after the fifth definitive failure", async ()
 	}
 });
 
+test("restart barriers can seed every retained unresolved terminal delivery", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await Store.open(join(directory, "gateway.db"));
+		let epoch = 0;
+		const add = (deliveryId: string) => {
+			const opRef = `op-${deliveryId}`;
+			const messageId = `message-${deliveryId}`;
+			const turnId = `turn-${deliveryId}`;
+			database.transaction((tx) => {
+				database.inbox.enqueue(tx, {
+					messageId,
+					originKey: "discord/channel/c",
+					originRefJson: "{}",
+					body: "test",
+				});
+				database.inbox.bindTurn(tx, {
+					messageId,
+					originKey: "discord/channel/c",
+					epoch: epoch++,
+					opRef,
+					sessionId: `session-${deliveryId}`,
+				});
+				database.inbox.turnAccept(tx, opRef);
+				database.inbox.claimTerminal(tx, opRef, 0, deliveryId);
+				database.inbox.turnComplete(tx, opRef);
+				database.outbox.create(tx, {
+					deliveryId,
+					turnId,
+					originKey: "discord/channel/c",
+					payloadJson: JSON.stringify({ final: false }),
+				});
+			});
+		};
+		add("terminal-pending");
+		add("terminal-inflight");
+		add("terminal-ambiguous");
+		add("terminal-confirmed");
+		add("terminal-expired");
+		database.transaction((tx) => database.outbox.markInflight(tx, "terminal-inflight"));
+		database.transaction((tx) => {
+			database.outbox.markInflight(tx, "terminal-ambiguous");
+			database.outbox.fail(tx, "terminal-ambiguous", true, "socket hang up");
+			database.outbox.confirm(tx, "terminal-confirmed");
+			for (let attempt = 0; attempt < 5; attempt++) database.outbox.fail(tx, "terminal-expired");
+		});
+		expect(database.outbox.unsettledTerminalDeliveryIds().sort()).toEqual([
+			"terminal-ambiguous",
+			"terminal-inflight",
+			"terminal-pending",
+		]);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("a failed attempt records an allowlisted last_error and the scheduled next_retry_at", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {

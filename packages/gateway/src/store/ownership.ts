@@ -12,6 +12,7 @@ export const TABLE_OWNER = {
 	broker_retired_sessions: "bindings",
 	broker_quarantine: "bindings",
 	broker_cutovers: "bindings",
+	broker_operations: "bindings",
 	deliveries: "outbox",
 	inbound_messages: "inbox",
 	cross_session_watches: "inbox",

@@ -55,6 +55,7 @@ import {
 	workAttemptReportId,
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
+import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import {
 	type LaneForceRetireReason,
@@ -103,6 +104,7 @@ const AWAITING_CHECKS_RETRY_LIMIT = 2;
 const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
 /** Bound concurrent GitHub/remote probes so one slow lane does not serialize recovery. */
 const AWAITING_CHECKS_POLL_CONCURRENCY = 16;
+
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -158,10 +160,11 @@ export interface CheckStatusSnapshot {
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the PR head and its checks for `branch`: null when no matching PR exists,
-	 * undefined when the lookup failed or timed out. Must not throw.
+	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied. Returns null only when an
+	 * unqualified lookup proves no match exists; returns undefined when lookup failed, timed out, or results are incomplete or ambiguous.
+	 * Must not throw.
 	 */
-	getCheckStatus(branch: string, cwd: string): Promise<CheckStatusSnapshot | null | undefined>;
+	getCheckStatus(headSha: string, cwd: string, prNumber?: number): Promise<CheckStatusSnapshot | null | undefined>;
 }
 
 export interface WorkLaneManagerOptions {
@@ -185,7 +188,15 @@ export interface WorkLaneManagerOptions {
 	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
 	readonly checkStatusClient?: CheckStatusClient;
+	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
+	readonly brokerWait?: BrokerWaitOptions;
 }
+/**
+ * A lane bind issued while the supervisor restarts the broker waits for it to
+ * answer again instead of failing `work lane bind failed`. Two minutes covers a
+ * supervised restart with backoff; a broker still down after that is an outage.
+ */
+export const WORK_BIND_BROKER_WAIT = { initialMs: 500, maxMs: 5_000, deadlineMs: 2 * 60_000 } as const;
 interface WorkInput {
 	name: string;
 	text: string;
@@ -488,7 +499,15 @@ export class WorkLaneManager {
 		if (!attempt || attempt.opRef !== opRef) return false;
 		const runtime = this.#db.work.workAttemptGet(opRef);
 		if (!runtime) return false;
-		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
+		if (runtime.settledAt !== null) {
+			if (attempt.endedAt !== runtime.settledAt) return false;
+			if (record.state === "awaiting_checks")
+				this.#putJob(
+					name,
+					settleAwaitingChecks(record, endedAt, { kind: "ended", reason: "lane force-retired before checks settled" }),
+				);
+			return true;
+		}
 		if (attempt.endedAt !== undefined) return false;
 
 		const recordedTerminal = runtime.terminal;
@@ -878,35 +897,59 @@ export class WorkLaneManager {
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
 		}
-		const worktreePath = job.lane.worktreePath;
+		const initialJob = job;
+		if (!initialJob) throw new Error("work lane record was not initialized");
+		const worktreePath = initialJob.lane.worktreePath;
 		input = { ...input, cwd: worktreePath };
+		let bindAttemptStarted = false;
+		let worktreePersisted = false;
 		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 		try {
-			binding = await this.#port.runExclusive("work/admission", async () => {
-				this.#live();
-				this.#options.lanes.assertAdmission(input.name);
-				try {
-					return await this.#port.bind({
-						originKey: sessionKey,
-						epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-						repo: worktreePath,
-						codingRegister: true,
-						...(input.model ? { model: input.model } : {}),
-					});
-				} catch (error) {
-					const cause = workBindFailureCause(error);
-					console.error(
-						`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${worktreePath} cause=${cause} error=${workBindFailureMessage(error)}`,
-					);
-					throw new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
-						reasonCode: "bind_failed",
-						cause,
-						name: input.name,
-					});
-				}
+			// Each try re-takes the admission lock and re-checks capacity, so a
+			// lane waiting out a broker restart does not hold other lanes' admission.
+			// Only an unavailable broker is retried; every other bind failure is final.
+			const bindFailed = (error: unknown): ProtocolError => {
+				const cause = workBindFailureCause(error);
+				console.error(
+					`work_bind_failed name=${input.name} origin=${sessionKey} cwd=${worktreePath} cause=${cause} error=${workBindFailureMessage(error)}`,
+				);
+				return new ProtocolError("verb_failed", `work lane bind failed (cause: ${cause})`, {
+					reasonCode: "bind_failed",
+					cause,
+					name: input.name,
+				});
+			};
+			binding = await waitForBroker(
+				`work.bind:${input.name}`,
+				() =>
+					this.#port.runExclusive("work/admission", async () => {
+						this.#live();
+						this.#options.lanes.assertAdmission(input.name);
+						if (createdWorktree && !worktreePersisted) {
+							this.#putJob(input.name, initialJob);
+							worktreePersisted = true;
+						}
+						bindAttemptStarted = true;
+						try {
+							return await this.#port.bind({
+								originKey: sessionKey,
+								epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+								repo: worktreePath,
+								codingRegister: true,
+								...(input.model ? { model: input.model } : {}),
+							});
+						} catch (error) {
+							throw isBrokerUnavailable(error) ? error : bindFailed(error);
+						}
+					}),
+				{ ...WORK_BIND_BROKER_WAIT, ...this.#options.brokerWait },
+			).catch((error: unknown) => {
+				throw isBrokerUnavailable(error) ? bindFailed(error) : error;
 			});
 		} catch (error) {
-			if (createdWorktree) {
+			if (createdWorktree && bindAttemptStarted) {
+				console.error(`worktree_creation_retained name=${input.name} reason=session_bind_may_reference_worktree`);
+			} else if (createdWorktree) {
 				try {
 					await discardCreatedWorktree(input.name, createdWorktree);
 				} catch (cleanupError) {
@@ -933,7 +976,7 @@ export class WorkLaneManager {
 			context.wakeReportId ?? null,
 			notice?.hash ?? null,
 		);
-		job = appendAttempt(job, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
+		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 		this.#prepareAttempt(runtime, job);
 
 		const observer = this.#register(runtime);
@@ -1556,6 +1599,14 @@ export class WorkLaneManager {
 				) {
 					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
 				}
+				if (
+					job.state === "awaiting_checks" &&
+					checks?.status === "green" &&
+					(job.awaitingChecks?.prNumber === null || job.awaitingChecks?.prNumber === checks.prNumber) &&
+					(checks.prState === "open" || checks.merged === true) &&
+					checks.headSha === facts?.headSha
+				)
+					job = settleAwaitingChecks(job, at, { kind: "passed" });
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
@@ -1704,7 +1755,13 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const facts = await collectRepoFacts(observed.lane.worktreePath, client, true, true);
+		const facts = await collectRepoFacts(
+			observed.lane.worktreePath,
+			client,
+			true,
+			cycle.headSha,
+			cycle.prNumber ?? undefined,
+		);
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
 			let job = this.#job(name);
@@ -2592,9 +2649,7 @@ function workBindFailureCause(error: unknown): WorkBindFailureCause {
 		/\bwas created but never became live\b/.test(message)
 	)
 		return "timeout";
-	// BrokerSessionPort's SDK sanitizer can drop GjcCliUnavailableError.code while
-	// retaining this stable prefix on the plain Error it returns.
-	if (/^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(message)) return "broker_unavailable";
+	if (isBrokerUnavailable(error)) return "broker_unavailable";
 	if (error instanceof BrokerAuthorityError) {
 		if (error.code === "unowned_session") return "cwd_rejected";
 		if (error.code === "authority_mismatch" || error.code === "cutover_required") return "epoch_conflict";
@@ -2900,6 +2955,9 @@ function checksOutcome(
 			kind: "ended",
 			reason: `head_moved from=${cycle.headSha.slice(0, 12)} to=${facts.remoteHeadSha.slice(0, 12)}`,
 		};
+	const headIsPublished =
+		(facts?.pushed === true && facts.remoteHeadSha === cycle.headSha) ||
+		(checks?.headSha === cycle.headSha && (cycle.prNumber === null || checks.prNumber === cycle.prNumber));
 	if (cycle.prNumber === null) {
 		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
 		if (checks?.prState === "closed") {
@@ -2911,7 +2969,7 @@ function checksOutcome(
 			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
 		}
 		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-		if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+		if (!headIsPublished) {
 			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 			return { kind: "wait" };
@@ -2939,7 +2997,7 @@ function checksOutcome(
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	}
 	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-	if (facts?.pushed !== true || facts.remoteHeadSha !== cycle.headSha) {
+	if (!headIsPublished) {
 		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 		return { kind: "wait" };
@@ -3004,7 +3062,8 @@ async function collectRepoFacts(
 	worktreePath: string,
 	checkClient?: CheckStatusClient,
 	includePushStatus = true,
-	checkWhenUnpushed = false,
+	checkHeadSha?: string,
+	checkPrNumber?: number,
 ): Promise<
 	| {
 			headSha?: string;
@@ -3041,11 +3100,6 @@ async function collectRepoFacts(
 				.filter((line) => line.trim()).length,
 			branch: branchName,
 		};
-		const checksBeforeRemoteProbe =
-			checkWhenUnpushed && branchName && branchName !== "HEAD" && checkClient
-				? await checkClient.getCheckStatus(branchName, worktreePath)
-				: undefined;
-
 		// Bare clones do not create remote-tracking refs, so verify every configured push URL directly.
 		if (includePushStatus && branchName && branchName !== "HEAD") {
 			const pushUrlsResult = Bun.spawnSync(
@@ -3074,10 +3128,11 @@ async function collectRepoFacts(
 
 			// Query even when the source ref is absent: GitHub retains merged PRs after branch deletion.
 			if (checkClient) {
-				const checkStatus =
-					checksBeforeRemoteProbe !== undefined
-						? checksBeforeRemoteProbe
-						: await checkClient.getCheckStatus(branchName, worktreePath);
+				const checkStatus = await checkClient.getCheckStatus(
+					checkHeadSha ?? result.remoteHeadSha ?? headSha,
+					worktreePath,
+					checkPrNumber,
+				);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
 		}

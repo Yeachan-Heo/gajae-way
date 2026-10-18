@@ -85,7 +85,6 @@ test("gjc 0.18 endpoint_stale on inspect retires the saved session instead of re
 		database,
 		authority,
 		cli: run,
-		instanceId: "stale-inspect",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});

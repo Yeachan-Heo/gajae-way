@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,7 +49,6 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 		database,
 		authority,
 		cli: run,
-		instanceId: "create-epoch",
 		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace") }),
 		sleep: async () => {},
 	});
@@ -163,7 +161,6 @@ test("generic and malformed create failures do not mint a new idempotency key or
 		database,
 		authority,
 		cli: run,
-		instanceId: "create-generic",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	try {
@@ -210,7 +207,6 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 		},
 	];
 	const epoch = 7;
-	const instanceId = "create-thrown";
 	const repo = join(home, "workspace");
 	let activeError: Error = failures[0]!.error;
 	const idempotencyKeys: string[] = [];
@@ -223,23 +219,21 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 		database,
 		authority,
 		cli: run,
-		instanceId,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	try {
 		for (const failure of failures) {
 			activeError = failure.error;
 			idempotencyKeys.length = 0;
-			const expectedKey = `gw-bind-${createHash("sha256")
-				.update(`${instanceId}|${failure.originKey}|${epoch}|${repo}`)
-				.digest("hex")
-				.slice(0, 32)}`;
 			for (let attempt = 0; attempt < 2; attempt++) {
 				const error = await port.bind({ originKey: failure.originKey, epoch, repo }).catch((caught: unknown) => caught);
 				expect(error).toBeInstanceOf(Error);
 				expect(error).toMatchObject({ name: "Error", message: failure.error.message });
 			}
-			expect(idempotencyKeys).toEqual([expectedKey, expectedKey]);
+			// The first attempt's intent is still pending, so the retry replays its key.
+			expect(idempotencyKeys).toHaveLength(2);
+			expect(idempotencyKeys[0]).toMatch(/^gw-bind-[0-9a-f-]{36}$/);
+			expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]!);
 			expect(database.bindings.getSessionRecord(failure.originKey)).toBeUndefined();
 			expect(database.core.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
 		}
@@ -287,12 +281,13 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 	);
 	const repo = join(home, "workspace");
 	const originKey = "discord/channel/stuck";
-	const poisonedKey = `gw-bind-${createHash("sha256").update(`public-uncertain|${originKey}|0|${repo}`).digest("hex").slice(0, 32)}`;
+	let poisonedKey: string | undefined;
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
 		if (args.includes("session.create")) {
 			const key = args[args.indexOf("--idempotency-key") + 1]!;
 			idempotencyKeys.push(key);
+			poisonedKey ??= key;
 			if (key === poisonedKey) return publicUndecidableCreate(key);
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }), stderr: "" };
 		}
@@ -308,15 +303,14 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 		database,
 		authority,
 		cli: run,
-		instanceId: "public-uncertain",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});
 	try {
 		const binding = await port.bind({ originKey, epoch: 0, repo });
 		expect(idempotencyKeys).toHaveLength(2);
-		expect(idempotencyKeys[0]).toBe(poisonedKey);
-		expect(idempotencyKeys[1]).not.toBe(poisonedKey);
+		expect(idempotencyKeys[0]).toBe(poisonedKey!);
+		expect(idempotencyKeys[1]).not.toBe(poisonedKey!);
 		expect(binding).toMatchObject({ sessionId: "fresh-session", epoch: 1 });
 		expect(database.bindings.getSessionRecord(originKey)).toMatchObject({ epoch: 1, sessionId: "fresh-session" });
 	} finally {
@@ -343,7 +337,6 @@ test("gjc 0.18 operation_failed naming a different key is not proof about the se
 		database,
 		authority,
 		cli: run,
-		instanceId: "foreign-ref",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	try {

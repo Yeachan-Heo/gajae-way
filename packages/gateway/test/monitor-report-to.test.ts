@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
+import { FunctionalReadiness } from "../src/functional-readiness";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -13,10 +14,10 @@ import { attachTestBrokerOwnership, sessionPortFromResponder, sessionPortFromScr
 
 const target: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
 
-function eventsFromPrompt(text: string): Array<{ eventId: string; eventType: string }> {
+function eventsFromPrompt(text: string): Array<{ eventId: string; eventType: string; payload?: unknown }> {
 	const match = text.match(/\[.*\]$/s);
 	if (!match) throw new Error("prompt has no event array");
-	return JSON.parse(match[0]) as Array<{ eventId: string; eventType: string }>;
+	return JSON.parse(match[0]) as Array<{ eventId: string; eventType: string; payload?: unknown }>;
 }
 
 async function openTestStore() {
@@ -191,6 +192,7 @@ test("reportTo omits silent and contract-only notes rejected by the delivery pat
 			reportTo: target,
 		});
 		const notifications: string[] = [];
+		const readiness = new FunctionalReadiness();
 		const sessionPort = sessionPortFromScript({
 			bind: async () => ({ sessionId: "monitor-session" }),
 			respond: async (_sessionId, text) =>
@@ -211,14 +213,24 @@ test("reportTo omits silent and contract-only notes rejected by the delivery pat
 			notifyInbound: async (key) => {
 				notifications.push(key);
 			},
+			onReadinessFailure: ({ code, detail, originKey, at }) =>
+				readiness.recordFailure({ category: "monitor_delivery", code, detail, origin: originKey, at }),
 		});
 
 		const silentEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.silent", {});
 		expect(database.monitors.eventGet(silentEventId)?.stage).toBe("authored_no_delivery");
 		expect(database.inbox.pendingByOrigin()).toEqual([]);
-		const echoEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.echo", {});
-		expect(database.monitors.eventGet(echoEventId)?.stage).toBe("contract_unmet");
-		expect(database.monitors.failure(echoEventId)?.code).toBe("authored_echo_suspected");
+		for (let index = 0; index < 3; index++) {
+			const echoEventId = await propagator.submitAwaitable(monitor.monitorId, "deploy.echo", { index });
+			expect(database.monitors.eventGet(echoEventId)?.stage).toBe("contract_unmet");
+			expect(database.monitors.failure(echoEventId)?.code).toBe("authored_echo_suspected");
+		}
+		expect(readiness.snapshot().ready).toBe(false);
+		expect(readiness.snapshot().failure).toMatchObject({
+			category: "monitor_delivery",
+			code: "authored_echo_suspected",
+			consecutiveFailures: 3,
+		});
 		expect(database.inbox.pendingByOrigin()).toEqual([]);
 
 		const recoveryEventId = crypto.randomUUID();
@@ -237,6 +249,73 @@ test("reportTo omits silent and contract-only notes rejected by the delivery pat
 		expect(database.monitors.eventGet(recoveryEventId)?.stage).toBe("authored_no_delivery");
 		expect(database.inbox.pendingByOrigin()).toEqual([]);
 		expect(notifications).toEqual([]);
+	} finally {
+		await propagator?.drain();
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("mixed silent and contract-echo batches preserve monitor readiness failure streaks", async () => {
+	const { home, database } = await openTestStore();
+	let propagator: MonitorPropagator | undefined;
+	try {
+		const registry = new MonitorRegistry(database);
+		const instruction = "Inspect deploys and report only verified changes.";
+		const monitor = registry.add({
+			name: "mixed-outcomes",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["deploy.changed"],
+			burstPolicy: "coalesce",
+			instruction,
+			channelTarget: { origin: target },
+		});
+		const readiness = new FunctionalReadiness();
+		const sessionPort = sessionPortFromScript({
+			bind: async () => ({ sessionId: "monitor-session" }),
+			respond: async (_sessionId, text) =>
+				JSON.stringify(
+					eventsFromPrompt(text).map(({ eventId, payload }) => ({
+						eventId,
+						note: (payload as { readonly kind?: string } | undefined)?.kind === "silent" ? "[SILENT]" : instruction,
+					})),
+				),
+		});
+		propagator = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			notifyInbound: async () => {},
+			onReadinessFailure: ({ code, detail, originKey, at }) =>
+				readiness.recordFailure({ category: "monitor_delivery", code, detail, origin: originKey, at }),
+			onReadinessSuccess: () => readiness.recordSuccess("monitor_delivery"),
+		});
+
+		for (let index = 0; index < 3; index++) {
+			const silentEventId = propagator.submit(monitor.monitorId, "deploy.changed", { kind: "silent", index });
+			const echoEventId = propagator.submit(monitor.monitorId, "deploy.changed", { kind: "echo", index });
+			for (let attempt = 0; attempt < 400; attempt++) {
+				if (
+					database.monitors.eventGet(silentEventId)?.stage === "authored_no_delivery" &&
+					database.monitors.eventGet(echoEventId)?.stage === "contract_unmet"
+				) {
+					break;
+				}
+				await Bun.sleep(5);
+			}
+			expect(database.monitors.eventGet(silentEventId)?.stage).toBe("authored_no_delivery");
+			expect(database.monitors.eventGet(echoEventId)?.stage).toBe("contract_unmet");
+		}
+
+		expect(readiness.snapshot().ready).toBe(false);
+		expect(readiness.snapshot().failure).toMatchObject({
+			category: "monitor_delivery",
+			code: "authored_echo_suspected",
+			consecutiveFailures: 3,
+		});
 	} finally {
 		await propagator?.drain();
 		database.close();

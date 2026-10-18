@@ -14,7 +14,7 @@ export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = ["0.1", "1.0"];
 
 /** Capability identifiers advertised at negotiation. Grows additively per phase. */
 export const CAPABILITIES = [
-	/** Core gateway lifecycle verbs: gateway.status, gateway.shutdown. */
+	/** Core gateway lifecycle verbs: status, shutdown, and a persona-turn restart drain. */
 	"gateway.core",
 	/** Loopback chat verbs: chat.send + chat.* events (P0). */
 	"chat.loopback",

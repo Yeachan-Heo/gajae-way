@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, STALLED_TURN_TERMINAL_TIMEOUT_MS } from "../src/orchestrator/persona-session";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -47,7 +47,7 @@ async function connect(path: string) {
 	return { send: (value: unknown) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
 }
 
-async function startGateway(port: ScriptedSessionPort) {
+async function startGateway(port: ScriptedSessionPort, personaNow?: () => number) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-idem-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -61,7 +61,13 @@ async function startGateway(port: ScriptedSessionPort) {
 	};
 	database = await Store.open(config.dbPath);
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
-	const runtime = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
+	const runtime = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		onStop: () => database?.close(),
+		...(personaNow ? { personaNow } : {}),
+	});
 	server = runtime;
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -644,5 +650,122 @@ test("a foreign turn's answer cannot replace the current turn's result-only term
 		expect(terminals).toHaveLength(2);
 	} finally {
 		await manager.stop();
+	}
+});
+
+test("a stalled turn reconciles terminal status after duplicate mid-work speech and releases queued lane reports", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const { client } = await startGateway(port);
+	const db = database;
+	if (!db) throw new Error("gateway database was not opened");
+	try {
+		sendChannelMessage(client, "stall", "start the work");
+		await eventually(() => port.sends.length === 1, "initial persona turn was not sent");
+		const send = port.sends.at(0);
+		if (!send) throw new Error("initial persona send disappeared");
+
+		// The first update is delivered; the duplicate is suppressed by the gateway's
+		// real interim gate. Neither update is a terminal frame.
+		port.emitAssistant(send.sessionId, "Starting the work now", "work-update-1", send.opRef);
+		port.emitAssistant(send.sessionId, "Starting the work now", "work-update-2", send.opRef);
+		await eventually(() => messages(client).length === 1, "first mid-work update was not delivered");
+		expect(messages(client).map((frame) => frame.payload.text)).toEqual(["Starting the work now"]);
+
+		// Model the real failure shape: the operation is terminal, but the owner's
+		// relay never delivers agent_end. A lane completion report waits in the same
+		// origin's durable inbox until status reconciliation closes this turn.
+		expect(
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, {
+					messageId: "lane-completion-report",
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body: "lane complete",
+					source: "lane_report",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
+		).toBe(true);
+		const readsBeforeStall = port.statusReads.length;
+		port.emitStall(send.sessionId);
+		await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not initiate status reconciliation");
+		expect(db.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+		const readsAfterStall = port.statusReads.length;
+		// Status initially confirms the operation is still running. Once its terminal
+		// result appears, the stall-triggered bounded recheck must discover it without
+		// another tail frame or the 60-second recovery sweep.
+		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "The work is complete.");
+
+		await eventually(
+			() => port.statusReads.length > readsAfterStall && db.inbox.turnRow(send.opRef)?.turn_state === "done",
+			"stall status recheck did not reconcile the terminal operation",
+		);
+		await eventually(
+			() => port.sends.length === 2,
+			"queued lane report remained blocked after terminal reconciliation",
+		);
+		expect(messages(client).map((frame) => frame.payload.text)).toEqual([
+			"Starting the work now",
+			"The work is complete.",
+		]);
+		const laneSend = port.sends.at(1);
+		if (!laneSend) throw new Error("lane report send disappeared");
+		expect(laneSend.text).toContain("lane complete");
+		port.complete(laneSend.opRef, "lane report received");
+		await eventually(() => db.inbox.pendingCount("discord/channel/chan-1") === 0, "lane report did not settle");
+	} finally {
+		client.close();
+	}
+});
+
+test("a genuinely in-flight stalled turn sends one cutoff notice and releases the lane report", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const clock = { now: Date.now() };
+	const { client } = await startGateway(port, () => clock.now);
+	const db = database;
+	if (!db) throw new Error("gateway database was not opened");
+	try {
+		sendChannelMessage(client, "stall-cutoff", "start the lane and report when done");
+		await eventually(() => port.sends.length === 1, "persona turn was not sent");
+		const send = port.sends.at(0);
+		if (!send) throw new Error("persona send disappeared");
+		port.emitAssistant(send.sessionId, "The lane is running", "lane-running", send.opRef);
+		port.emitAssistant(send.sessionId, "The lane is running", "lane-running-duplicate", send.opRef);
+		await eventually(() => messages(client).length === 1, "mid-work update was not delivered");
+		expect(messages(client).map((frame) => frame.payload.text)).toEqual(["The lane is running"]);
+
+		expect(
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, {
+					messageId: "stalled-lane-report",
+					originKey: "discord/channel/chan-1",
+					originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+					body: "lane complete",
+					source: "lane_report",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
+		).toBe(true);
+		port.setActivity(send.sessionId, "tool", clock.now);
+		const readsBeforeStall = port.statusReads.length;
+		port.emitStall(send.sessionId);
+		await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not inspect operation status");
+		expect(db.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+
+		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+		await eventually(() => db.inbox.turnRow(send.opRef)?.turn_state === "done", "stalled turn did not close");
+		await eventually(() => port.sends.length === 2, "queued lane report was not dispatched");
+		const replies = messages(client).map((frame) => frame.payload.text as string);
+		expect(replies).toHaveLength(2);
+		expect(replies[1]).toContain("[turn failed] This message was not answered.");
+		expect(replies.filter((text) => text.startsWith("[turn failed]"))).toHaveLength(1);
+		const laneSend = port.sends.at(1);
+		if (!laneSend) throw new Error("lane report send disappeared");
+		expect(laneSend.text).toContain("lane complete");
+		expect(port.closes.map((close) => close.sessionId)).toEqual([send.sessionId]);
+		port.complete(laneSend.opRef, "lane report received");
+		await eventually(() => db.inbox.pendingCount("discord/channel/chan-1") === 0, "lane report did not settle");
+	} finally {
+		client.close();
 	}
 });

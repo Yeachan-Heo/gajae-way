@@ -434,9 +434,11 @@ export class LaneGovernor {
 				};
 			}
 			// Session is confirmed dead or disowned; the attempt owner closes the
-			// history and runtime row together before we retire the binding.
+			// history and runtime row together before we retire the binding. A
+			// completed attempt may also own an unresolved checks cycle that must end
+			// when its lane is force-retired.
 			const lastAttempt = record?.attempts.at(-1);
-			if (lastAttempt && !lastAttempt.endedAt) {
+			if (lastAttempt && (!lastAttempt.endedAt || record?.state === "awaiting_checks")) {
 				const reason: LaneForceRetireReason = liveness.disowned ? "session_disowned" : "session_dead";
 				const endedAt = new Date(this.#now()).toISOString();
 				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, reason, endedAt)) {

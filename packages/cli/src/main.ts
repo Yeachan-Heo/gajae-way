@@ -45,6 +45,7 @@ import {
 	launchRestartStack,
 	type RunRestartOptions,
 	readRestartReceipt,
+	recoverRestartStack,
 	renderRestartReceipt,
 	runRestartStack,
 } from "./restart-stack";
@@ -86,7 +87,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -97,7 +98,7 @@ export function usageFor(command: string | undefined): string | undefined {
 }
 
 export function parseArgs(args: string[]): { command?: string; rest: string[]; socket: string } {
-	let socket = socketPath();
+	let socket = process.env.GAJAEWAY_SOCKET_PATH ?? socketPath();
 	const rest: string[] = [];
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === "--socket") socket = args[++i] ?? socket;
@@ -316,6 +317,8 @@ function waitForMonitorStage(client: GajaewayClient, eventId: string, timeoutSec
  */
 const OPS_CYCLE_PAGING_UNSUPPORTED =
 	"ops.cycle paging is unsupported by the running gateway; restart the gateway after updating it";
+const OPS_CYCLE_MONITOR_FAILURES_UNSUPPORTED =
+	"ops.cycle monitor failure diagnostics are unsupported by the running gateway; restart the gateway after updating it";
 
 function hasCyclePagingMetadata(cycle: OpsCycleResult): boolean {
 	return (
@@ -326,8 +329,13 @@ function hasCyclePagingMetadata(cycle: OpsCycleResult): boolean {
 	);
 }
 
+function requireCycleMonitorFailureDiagnostics(cycle: OpsCycleResult): void {
+	if (!Array.isArray(cycle.monitorFailures)) throw new Error(OPS_CYCLE_MONITOR_FAILURES_UNSUPPORTED);
+}
+
 export function renderCycle(cycle: OpsCycleResult): string[] {
 	if (!hasCyclePagingMetadata(cycle)) throw new Error(OPS_CYCLE_PAGING_UNSUPPORTED);
+	requireCycleMonitorFailureDiagnostics(cycle);
 	const lines: string[] = [];
 	lines.push(`phase: ${cycle.phase}`);
 	if (cycle.gates.length > 0) lines.push(`gates: ${cycle.gates.join(", ")}`);
@@ -374,6 +382,14 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(
 		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,
 	);
+	if (cycle.monitorFailures.length === 0) lines.push("monitor failures: none");
+	else {
+		lines.push(`monitor failures (newest ${cycle.monitorFailures.length}):`);
+		for (const failure of cycle.monitorFailures)
+			lines.push(
+				`  ${failure.failedAt} ${failure.code} event=${failure.eventId} monitor=${failure.monitorId} type=${failure.eventType} stage=${failure.stage} detail=${failure.detail}`,
+			);
+	}
 	if (cycle.monitorAuthoringLost.length > 0)
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
@@ -405,6 +421,7 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
+
 export function renderSlo(result: OpsSloResult): string[] {
 	const message = result.ok
 		? `SLO ok: ${result.days.length} consecutive UTC days`
@@ -430,7 +447,7 @@ export function sloExitCode(result: OpsSloResult): number {
 }
 
 const OPS_USAGE =
-	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status]";
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status|--recover --confirm-service-manager-settled]";
 
 const OPS_CYCLE_USAGE = "usage: gajaeway ops cycle [--limit N] [--offset N] [--json]";
 
@@ -755,7 +772,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					// has to come back, so it must not need the gateway to answer first.
 					// It also runs detached: restarting the gateway kills a persona turn that
 					// invoked it, which must not end the sequence half-applied (issue #54).
-					const usage = "usage: gajaeway ops restart-stack [--status]";
+					const usage = "usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
 					const home = gatewayHome();
 					const flag = parsed.rest[1];
 					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
@@ -763,6 +780,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							...options.restartStack?.run,
 							home,
 							id: parsed.rest[2],
+							gatewaySocketPath: parsed.socket,
 						});
 						for (const line of renderRestartReceipt(receipt)) console.log(line);
 						if (receipt.state !== "ok") process.exitCode = 1;
@@ -773,8 +791,24 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						for (const line of renderRestartReceipt(receipt, state)) console.log(line);
 						// Only a completed, verified sequence exits 0; queued or running is not yet success.
 						if (state !== "ok") process.exitCode = 1;
+					} else if (
+						flag === "--recover" &&
+						parsed.rest.length === 3 &&
+						parsed.rest[2] === "--confirm-service-manager-settled"
+					) {
+						const receipt = await recoverRestartStack({
+							home,
+							gatewaySocketPath: parsed.socket,
+							confirmServiceManagerSettled: true,
+						});
+						for (const line of renderRestartReceipt(receipt)) console.log(line);
+						process.exitCode = 1;
 					} else if (parsed.rest.length === 1) {
-						const { receipt, supervisorPid } = await launchRestartStack({ ...options.restartStack?.launch, home });
+						const { receipt, supervisorPid } = await launchRestartStack({
+							...options.restartStack?.launch,
+							home,
+							gatewaySocketPath: parsed.socket,
+						});
 						console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
 						console.log("read the outcome with: gajaeway ops restart-stack --status");
 					} else throw new Error(usage);
@@ -805,6 +839,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					else if (cycle) {
 						const result = await client.opsCycle(cycle.params);
 						if (!hasCyclePagingMetadata(result)) throw new Error(OPS_CYCLE_PAGING_UNSUPPORTED);
+						requireCycleMonitorFailureDiagnostics(result);
 						if (cycle.json) console.log(JSON.stringify(result));
 						else for (const line of renderCycle(result)) console.log(line);
 						// Fail-closed: a gated/degraded cycle exits non-zero even though the
@@ -1146,6 +1181,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const result = await runUpdate({
 					args: update,
 					home: gatewayHome(),
+					gatewaySocketPath: parsed.socket,
 					...(options.update === undefined ? {} : { deps: options.update }),
 				});
 				for (const line of renderUpdate(result)) console.log(line);

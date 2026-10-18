@@ -375,6 +375,15 @@ export class OutboxGroup {
 			.all(conversationId, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
 	}
 
+	unsettledTerminalDeliveryIds(): string[] {
+		const rows = this.#db
+			.prepare(
+				"SELECT DISTINCT d.delivery_id FROM inbound_messages i JOIN json_each(i.terminal_delivery_id) terminal JOIN deliveries d ON d.delivery_id = terminal.value WHERE i.turn_role = 'trigger' AND i.turn_state = 'done' AND d.state IN ('pending','inflight','failed_ambiguous') ORDER BY d.created_at, d.delivery_id",
+			)
+			.all() as Array<{ delivery_id: string }>;
+		return rows.map((row) => row.delivery_id);
+	}
+
 	terminalForTurns(turnIds: readonly string[]): Array<{ delivery_id: string; turn_id: string; state: string }> {
 		const ids = [...new Set(turnIds)];
 		if (ids.length === 0) return [];

@@ -26,7 +26,7 @@ import {
 	type UpdateDeps,
 } from "../src/update";
 
-const PINNED_GJC = "0.18.11";
+const PINNED_GJC = "0.18.12";
 
 async function homeWithConfig(): Promise<string> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-update-home-"));
@@ -296,7 +296,7 @@ describe("runUpdate", () => {
 		}
 	});
 
-	test("a macOS update unloads and removes a stale LaunchAgent when its binary is absent", async () => {
+	test("a macOS update defers stale LaunchAgent cleanup to the drained restart stack", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
 		const home = await homeWithConfig();
 		const agentsDir = join(home, "agents");
@@ -316,23 +316,17 @@ describe("runUpdate", () => {
 					serviceOptions: serviceOptions(home),
 					serviceRunner: async (command) => {
 						serviceCommands.push([...command]);
-						return command[1] === "print" && command[2].endsWith("dev.gajaeway.adapter-slack") ? 113 : 0;
+						return 0;
 					},
 					queueRestart: async () => ({ receiptId: "r-1", supervisorPid: 42 }),
 					platform: "darwin",
 					arch: "arm64",
 				},
 			});
-			const serviceTarget = `gui/${process.getuid?.() ?? 0}/dev.gajaeway.admin`;
-			const unloadedTarget = `gui/${process.getuid?.() ?? 0}/dev.gajaeway.adapter-slack`;
 			expect(result.restartQueued).toBe("r-1");
-			expect(serviceCommands).toEqual([
-				["launchctl", "print", unloadedTarget],
-				["launchctl", "print", serviceTarget],
-				["launchctl", "bootout", serviceTarget],
-			]);
+			expect(serviceCommands).toEqual([]);
 			const remaining = await readdir(agentsDir);
-			for (const plist of stalePlists) expect(remaining).not.toContain(plist);
+			for (const plist of stalePlists) expect(remaining).toContain(plist);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 			await rm(home, { recursive: true, force: true });
@@ -434,7 +428,7 @@ describe("runUpdate", () => {
 		}
 	});
 
-	test("a Linux update disables and removes a stale unit when its binary is absent", async () => {
+	test("a Linux update defers stale unit cleanup to the drained restart stack", async () => {
 		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
 		const home = await homeWithConfig();
 		const unitDir = join(home, "units");
@@ -462,11 +456,10 @@ describe("runUpdate", () => {
 			});
 			expect(result.restartQueued).toBe("r-1");
 			expect(serviceCommands).toEqual([
-				["systemctl", "--user", "disable", "--now", "gajaeway-admin.service"],
 				["systemctl", "--user", "daemon-reload"],
 				["systemctl", "--user", "enable", "gajaeway-gateway.service"],
 			]);
-			expect(await readdir(unitDir)).not.toContain("gajaeway-admin.service");
+			expect(await readdir(unitDir)).toContain("gajaeway-admin.service");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 			await rm(home, { recursive: true, force: true });

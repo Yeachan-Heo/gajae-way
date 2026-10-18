@@ -802,4 +802,148 @@ export class BindingsGroup {
 			)
 			.run(tx, brokerAuthorityKey(authority), sessionId, cursor, new Date().toISOString());
 	}
+
+	/**
+	 * Records the intent of one broker mutation before it is issued, or returns the
+	 * row a previous attempt left. A `pending` row means an earlier call may or may
+	 * not have reached the broker (crash, restart, torn transport): the caller
+	 * replays it under the SAME `operationRef`. A `complete` row carries the
+	 * original result and the broker is not called again.
+	 */
+	beginBrokerOperation(
+		tx: WriteTx,
+		authority: BrokerAuthority,
+		input: {
+			readonly operation: BrokerOperationKind;
+			readonly scope: string;
+			readonly operationRef: string;
+			readonly requestJson: string;
+		},
+	): BrokerOperationRecord {
+		this.assertAuthority(authority);
+		const key = brokerAuthorityKey(authority);
+		const existing = this.#db
+			.prepare(
+				"SELECT operation, scope, operation_ref, request_json, state, result_json FROM broker_operations WHERE authority_key = ? AND operation = ? AND scope = ?",
+			)
+			.getWithWrite(tx, key, input.operation, input.scope) as BrokerOperationRow | null;
+		if (existing) return brokerOperationRecord(existing);
+		this.#db
+			.prepare(
+				"INSERT INTO broker_operations(authority_key, operation, scope, operation_ref, request_json, state, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+			)
+			.run(tx, key, input.operation, input.scope, input.operationRef, input.requestJson, new Date().toISOString());
+		return { ...input, state: "pending", resumed: false };
+	}
+
+	/** Stores the broker's answer for a pending operation; a retry of the same operation then returns it. */
+	completeBrokerOperation(
+		tx: WriteTx,
+		authority: BrokerAuthority,
+		operation: BrokerOperationKind,
+		scope: string,
+		operationRef: string,
+		resultJson: string,
+	): void {
+		this.assertAuthority(authority);
+		const changed = this.#db
+			.prepare(
+				"UPDATE broker_operations SET state = 'complete', result_json = ?, completed_at = ? WHERE authority_key = ? AND operation = ? AND scope = ? AND operation_ref = ? AND state = 'pending'",
+			)
+			.run(
+				tx,
+				resultJson,
+				new Date().toISOString(),
+				brokerAuthorityKey(authority),
+				operation,
+				scope,
+				operationRef,
+			).changes;
+		if (changed !== 1) throw new Error(`broker operation ${operation} ${operationRef} is not pending`);
+	}
+
+	/**
+	 * Drops an operation row: the broker definitively refused it (nothing applied),
+	 * or the caller recorded the outcome in its own durable state in this same
+	 * transaction and the intent must not be served to any later attempt.
+	 */
+	releaseBrokerOperation(
+		tx: WriteTx,
+		authority: BrokerAuthority,
+		operation: BrokerOperationKind,
+		scope: string,
+		operationRef: string,
+	): void {
+		this.assertAuthority(authority);
+		this.#db
+			.prepare(
+				"DELETE FROM broker_operations WHERE authority_key = ? AND operation = ? AND scope = ? AND operation_ref = ?",
+			)
+			.run(tx, brokerAuthorityKey(authority), operation, scope, operationRef);
+	}
+
+	/**
+	 * Bounds the journal: completed operations older than `completedBefore` and
+	 * old pending close intents. Pending creates and prompts are never age-pruned:
+	 * a create may have applied before its binding was recorded, and an unknown
+	 * prompt status never authorizes resending its non-idempotent clientRef.
+	 */
+	pruneBrokerOperations(
+		tx: WriteTx,
+		cutoff: { readonly completedBefore: string; readonly pendingBefore: string },
+	): number {
+		return this.#db
+			.prepare(
+				"DELETE FROM broker_operations WHERE (state = 'complete' AND completed_at < ?) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)",
+			)
+			.run(tx, cutoff.completedBefore, cutoff.pendingBefore).changes;
+	}
+
+	brokerOperation(
+		authority: BrokerAuthority,
+		operation: BrokerOperationKind,
+		scope: string,
+	): BrokerOperationRecord | undefined {
+		const row = this.#db
+			.prepare(
+				"SELECT operation, scope, operation_ref, request_json, state, result_json FROM broker_operations WHERE authority_key = ? AND operation = ? AND scope = ?",
+			)
+			.get(brokerAuthorityKey(authority), operation, scope) as BrokerOperationRow | null;
+		return row ? brokerOperationRecord(row) : undefined;
+	}
+}
+
+export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close";
+
+export interface BrokerOperationRecord {
+	readonly operation: BrokerOperationKind;
+	readonly scope: string;
+	/** The broker-side dedup reference: `--idempotency-key` for global ops, `clientRef` for prompts. */
+	readonly operationRef: string;
+	readonly requestJson: string;
+	readonly state: "pending" | "complete";
+	readonly resultJson?: string;
+	/** True when an earlier attempt left this row, false when this call recorded the intent. */
+	readonly resumed: boolean;
+}
+
+interface BrokerOperationRow {
+	operation: BrokerOperationKind;
+	scope: string;
+	operation_ref: string;
+	request_json: string;
+	state: "pending" | "complete";
+	result_json: string | null;
+}
+
+function brokerOperationRecord(row: BrokerOperationRow): BrokerOperationRecord {
+	return {
+		operation: row.operation,
+		scope: row.scope,
+		operationRef: row.operation_ref,
+		requestJson: row.request_json,
+		state: row.state,
+		...(row.result_json !== null ? { resultJson: row.result_json } : {}),
+		resumed: true,
+	};
 }

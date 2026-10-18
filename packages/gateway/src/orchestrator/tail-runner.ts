@@ -64,6 +64,8 @@ const MIRRORED_EVENT_KINDS: ReadonlySet<string> = new Set([
 export interface TailFrame {
 	readonly kind: TailEventKind;
 	readonly rawKind: string;
+	/** Gateway turn identity captured before asynchronous delivery. */
+	readonly receiptOpRef?: string;
 	/** Host correlation, present on every frame the host attributes to a turn. */
 	readonly commandId?: string;
 	readonly turnId?: string;
@@ -90,6 +92,12 @@ export interface TailAttachInput {
 	readonly originKey?: string;
 	/** Current tails may wait for capacity; parked retired holds must not consume it. */
 	priority?: "current" | "retired";
+	/** Lifecycle-only notification; no content stream capabilities required. */
+	onObserverLifecycle?: (
+		kind: "agent_start" | "agent_end" | "agent_failed",
+		correlated: boolean,
+	) => void | Promise<void>;
+	onClosed?: () => void;
 	onFrame?: (frame: TailFrame) => void | Promise<void>;
 	onReverseRequest?: (input: {
 		id: string;
@@ -100,9 +108,9 @@ export interface TailAttachInput {
 	}) => void | Promise<void>;
 	onStall?: (input: { sessionId: string; brokerGeneration: number; elapsedMs: number }) => void | Promise<void>;
 	/** The relay died mid-turn; frames emitted while it was down are lost (best-effort content). It reopens. */
-	onRelayLost?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
+	onRelayLost?: (input: { sessionId: string; brokerGeneration: number; opRef?: string }) => void | Promise<void>;
 	/** The relay could not be kept open (repeated immediate deaths); the handle is closed and will not reopen. */
-	onRelayDead?: (input: { sessionId: string; brokerGeneration: number }) => void | Promise<void>;
+	onRelayDead?: (input: { sessionId: string; brokerGeneration: number; opRef?: string }) => void | Promise<void>;
 	onDiagnostic?: (line: string, level?: LogLevel) => void;
 }
 
@@ -143,6 +151,8 @@ export interface TailHandle {
 	 * correlation are dropped; uncorrelated frames were never turn content.
 	 */
 	beginTurn(opRef: string, correlation?: TurnCorrelation): void;
+	/** Observers resist TTL reaping but remain capacity-evictable. */
+	setObserving(observing: boolean): void;
 	/** Adds host correlation learned after beginTurn (from the accept receipt or agent_start). */
 	correlate(opRef: string, correlation: TurnCorrelation): void;
 	setTurnRunning(running: boolean): void;
@@ -246,6 +256,7 @@ export class TailRunner {
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #handles = new Set<ManagedTailHandle>();
 	readonly #waiters: Array<() => void> = [];
+	#reservedSlots = 0;
 	#lastSaturationAlertAt: number | undefined;
 
 	constructor(options: TailRunnerOptions) {
@@ -300,6 +311,7 @@ export class TailRunner {
 	async attach(input: TailAttachInput): Promise<TailHandle> {
 		await this.#acquireSlot(input.priority ?? "current");
 		const handle = new ManagedTailHandle(this, { ...input, repo: input.repo || this.#repo });
+		this.#reservedSlots--;
 		this.#handles.add(handle);
 		handle.start();
 		try {
@@ -340,7 +352,7 @@ export class TailRunner {
 
 	async #acquireSlot(priority: "current" | "retired"): Promise<void> {
 		await this.reapIdle();
-		while (this.#handles.size >= this.#maxTailProcesses) {
+		while (this.#handles.size + this.#reservedSlots >= this.#maxTailProcesses) {
 			const evictable = [...this.#handles]
 				.filter((handle) => !handle.running)
 				.sort(
@@ -354,6 +366,13 @@ export class TailRunner {
 			if (priority === "retired") throw new TailCapacityError();
 			await new Promise<void>((resolve) => this.#waiters.push(resolve));
 		}
+		// Reserve before yielding back to attach: eviction's release can wake a
+		// second waiter before the first caller has installed its new handle.
+		this.#reservedSlots++;
+	}
+
+	notifyEvictable(): void {
+		this.#waiters.shift()?.();
 	}
 
 	release(handle: ManagedTailHandle): void {
@@ -388,6 +407,8 @@ class ManagedTailHandle implements TailHandle {
 	#ready = false;
 	#closed = false;
 	#running = false;
+	#observing = false;
+	#lastObserverLifecycle?: { key: string; positioned: boolean };
 	#lastEventAt: number;
 	#idleSince: number | undefined;
 	#stallReported = false;
@@ -397,12 +418,15 @@ class ManagedTailHandle implements TailHandle {
 	#helloResolve: (() => void) | undefined;
 	#refusal: RelayRefusedError | undefined;
 	#reopenFailures = 0;
+	#lostOpRef?: string;
 	#requestSeq = 0;
 	readonly #pending = new Map<string, PendingRequest>();
 	/** Ordered delivery: a later frame's side effects wait on the earlier one's. */
 	#deliveries: Promise<void> = Promise.resolve();
 	#opRef: string | undefined;
 	#correlation: TurnCorrelation = {};
+	readonly #previousCommandIds = new Set<string>();
+	readonly #previousTurnIds = new Set<string>();
 	#droppedForeign = 0;
 	#streamWithRegisteredProviders: TailStream | undefined;
 	/** Map of capability -> leaseId for active provider leases */
@@ -435,7 +459,11 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	get idleSince(): number | undefined {
-		return this.#idleSince;
+		return this.#observing ? undefined : this.#idleSince;
+	}
+
+	setObserving(observing: boolean): void {
+		this.#observing = observing;
 	}
 
 	start(): void {
@@ -443,6 +471,10 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
+		if (this.#opRef !== opRef) {
+			if (this.#correlation.commandId) this.#previousCommandIds.add(this.#correlation.commandId);
+			if (this.#correlation.turnId) this.#previousTurnIds.add(this.#correlation.turnId);
+		}
 		this.#opRef = opRef;
 		this.#correlation = { ...correlation };
 		this.#droppedForeign = 0;
@@ -464,12 +496,14 @@ class ManagedTailHandle implements TailHandle {
 
 	setTurnRunning(running: boolean): void {
 		if (this.#closed) return;
+		const wasRunning = this.#running;
 		this.#running = running;
 		this.#stallReported = false;
 		// A stall is silence DURING a turn: the clock starts at the turn start.
 		this.#lastEventAt = this.#runner.now();
 		if (running) this.#idleSince = undefined;
 		else this.#idleSince ??= this.#runner.now();
+		if (wasRunning && !running) this.#runner.notifyEvictable();
 	}
 
 	checkStall(now: number): void {
@@ -603,6 +637,7 @@ class ManagedTailHandle implements TailHandle {
 							this.#receiveLine(line);
 						}
 					} finally {
+						this.#lostOpRef = this.#opRef;
 						streamEnded = true;
 						// The relay ended: whether or not hello arrived, nobody is waiting on it any more.
 						// If stream ended without hello or refusal, this resolves the hello promise and fails immediately.
@@ -619,6 +654,7 @@ class ManagedTailHandle implements TailHandle {
 					if (helloTimedOut) throw new RelayHelloError(elapsedMs, childState);
 					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
 				}
+				if (this.#opRef && this.#streamWithRegisteredProviders !== stream) this.#registerProviders(stream);
 				if (!this.#ready) {
 					this.#ready = true;
 					this.#readyResolve();
@@ -652,9 +688,13 @@ class ManagedTailHandle implements TailHandle {
 			// host streamed while it was down is gone (content is best-effort by
 			// host contract). The actor reconciles through status and the
 			// transcript; this handle only reopens so later commands have a channel.
-			if (this.#running) {
+			if (this.#running || this.#observing) {
 				this.#input.onDiagnostic?.(`tail_relay_lost session=${this.sessionId} opRef=${this.#opRef ?? "-"}`, "warn");
-				await this.#input.onRelayLost?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+				await this.#input.onRelayLost?.({
+					sessionId: this.sessionId,
+					brokerGeneration: this.brokerGeneration,
+					opRef: this.#lostOpRef,
+				});
 			}
 			const sinceOpen = this.#runner.now() - openedAt;
 			this.#reopenFailures = sinceOpen < 5_000 ? this.#reopenFailures + 1 : 0;
@@ -667,7 +707,11 @@ class ManagedTailHandle implements TailHandle {
 		if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
 			this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`, "error");
 			await this.close();
-			await this.#input.onRelayDead?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration });
+			await this.#input.onRelayDead?.({
+				sessionId: this.sessionId,
+				brokerGeneration: this.brokerGeneration,
+				opRef: this.#lostOpRef,
+			});
 			return false;
 		}
 		const backoff = Math.min(30_000, REOPEN_BASE_BACKOFF_MS * 2 ** this.#reopenFailures);
@@ -777,10 +821,35 @@ class ManagedTailHandle implements TailHandle {
 			);
 			return;
 		}
+		if (this.#input.onObserverLifecycle) {
+			const positioned = frame.type === "event";
+			const kind = positioned ? frame.kind : frame.type;
+			const payload = positioned ? recordOf(frame.payload) : frame;
+			if ((kind === "agent_start" || kind === "agent_end" || kind === "agent_failed") && payload) {
+				const commandId = payload.commandId ?? frame.commandId;
+				const turnId = payload.turnId ?? frame.turnId;
+				const correlated = commandId !== undefined || turnId !== undefined;
+				const key = JSON.stringify([kind, commandId, turnId]);
+				const last = this.#lastObserverLifecycle;
+				// The host broadcasts raw + positioned copies of one lifecycle boundary.
+				if (last?.key === key && last.positioned !== positioned) this.#lastObserverLifecycle = undefined;
+				else {
+					this.#lastObserverLifecycle = { key, positioned };
+					// Admit at receipt; the actor captures its observer identity now.
+					void Promise.resolve(this.#input.onObserverLifecycle?.(kind, correlated)).catch((error: unknown) =>
+						this.#input.onDiagnostic?.(
+							`agent_run_observer_lost origin=${this.#input.originKey ?? "-"} session=${this.sessionId} reason=callback_failed detail=${sanitizeDiagnostic(messageOf(error))}`,
+							"warn",
+						),
+					);
+				}
+			}
+		}
 		for (const decoded of decodeStreamFrame(frame)) this.#accept(decoded);
 	}
 
 	#accept(frame: TailFrame): void {
+		frame = { ...frame, receiptOpRef: this.#opRef };
 		if (frame.kind === "unknown" && this.#unknownDiagnostics < UNKNOWN_KIND_DIAGNOSTIC_CAP) {
 			this.#unknownDiagnostics++;
 			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`, "warn");
@@ -803,7 +872,7 @@ class ManagedTailHandle implements TailHandle {
 		this.#stallReported = false;
 		this.#deliveries = this.#deliveries
 			.then(async () => {
-				if (this.#closed) return;
+				if (this.#closed || frame.receiptOpRef !== this.#opRef) return;
 				await this.#input.onFrame?.(frame);
 			})
 			.catch((error: unknown) => {
@@ -824,6 +893,13 @@ class ManagedTailHandle implements TailHandle {
 		if (this.#opRef === undefined) return false;
 		const known = this.#correlation;
 		if (known.commandId === undefined && known.turnId === undefined) {
+			// History prevents provisional adoption, not an authoritative receipt
+			// from naming the current turn. Once known, correlation matching wins.
+			if (
+				(frame.commandId && this.#previousCommandIds.has(frame.commandId)) ||
+				(frame.turnId && this.#previousTurnIds.has(frame.turnId))
+			)
+				return false;
 			this.#correlation = {
 				...(frame.commandId ? { commandId: frame.commandId } : {}),
 				...(frame.turnId ? { turnId: frame.turnId } : {}),
@@ -971,6 +1047,7 @@ class ManagedTailHandle implements TailHandle {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#input.onClosed?.();
 		// Clear heartbeat timer
 		if (this.#heartbeatTimer) {
 			clearInterval(this.#heartbeatTimer);

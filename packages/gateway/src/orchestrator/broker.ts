@@ -132,6 +132,65 @@ export class GjcCliUnavailableError extends Error {
 	}
 }
 
+/**
+ * The broker is down or restarting, as the client reports it. The SDK sanitizer
+ * in front of session operations can rebuild the error as a plain Error, which
+ * keeps this class's stable message prefix.
+ */
+export function isBrokerUnavailable(error: unknown): boolean {
+	if (error instanceof GjcCliUnavailableError) return true;
+	return error instanceof Error && /^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(error.message);
+}
+
+export interface BrokerWaitOptions {
+	readonly initialMs?: number;
+	readonly maxMs?: number;
+	/** Total time the caller keeps retrying before the failure is final. */
+	readonly deadlineMs?: number;
+	readonly sleep?: (ms: number) => Promise<void>;
+	readonly now?: () => number;
+	readonly log?: (line: string) => void;
+}
+
+export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
+
+/**
+ * Runs one broker-dependent step, waiting out a broker that is not up yet.
+ *
+ * After a host reboot the shared broker needs minutes to clear a stale lock and
+ * come back; a gateway that exits 1 on the first failed probe spins its service
+ * manager's fixed-delay restart loop until then (#182: 9 exits in 5 minutes,
+ * 131 in 72), and a `work.start` issued while the supervisor restarts the
+ * broker failed `work lane bind failed` (#568). Only an unavailable broker
+ * ({@link isBrokerUnavailable}) is waited on — a wrong gjc version or a
+ * rejected argv will not heal and still fails immediately. Every retry logs one
+ * line naming the cause, and the wait is bounded so a broker that never returns
+ * still ends in a definite failure.
+ */
+export async function waitForBroker<T>(
+	step: string,
+	run: () => Promise<T>,
+	options: BrokerWaitOptions = {},
+): Promise<T> {
+	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	const now = options.now ?? Date.now;
+	const log = options.log ?? console.error;
+	const maxMs = options.maxMs ?? BROKER_WAIT_DEFAULTS.maxMs;
+	const deadline = now() + (options.deadlineMs ?? BROKER_WAIT_DEFAULTS.deadlineMs);
+	let wait = options.initialMs ?? BROKER_WAIT_DEFAULTS.initialMs;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await run();
+		} catch (error) {
+			if (!isBrokerUnavailable(error) || now() + wait > deadline) throw error;
+			const detail = sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+			log(`gateway_waiting_for_broker step=${step} attempt=${attempt} retry_in_ms=${wait} ${detail}`);
+			await sleep(wait);
+			wait = Math.min(wait * 2, maxMs);
+		}
+	}
+}
+
 /** Boot-only SDK capability check. Periodic health uses an exact, cursor-free socket lookup. */
 export function brokerHealthArgs(): readonly string[] {
 	return ["sdk", "session", "list", "--scope", "all"];

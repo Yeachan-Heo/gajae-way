@@ -278,10 +278,10 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		spec.id === "broker" ? "RestartSec=2s" : "RestartSec=2",
 		...(spec.id === "broker"
 			? // The host propagates `gjc sdk broker run`'s exit code: 143 is its clean SIGTERM stop.
-				["KillMode=control-group", "TimeoutStopSec=30s", "SuccessExitStatus=143"]
+				["KillMode=control-group", "TimeoutStartSec=60s", "TimeoutStopSec=30s", "SuccessExitStatus=143"]
 			: spec.id === "gateway"
-				? ["KillMode=mixed", "TimeoutStopSec=30s"]
-				: []),
+				? ["KillMode=mixed", "TimeoutStartSec=60s", "TimeoutStopSec=40s"]
+				: ["TimeoutStartSec=60s", "TimeoutStopSec=60s"]),
 		"",
 		"[Install]",
 		`WantedBy=${spec.dependsOnGateway ? GATEWAY_UNIT : "default.target"}`,
@@ -358,8 +358,9 @@ export async function removeStaleServices(options: RemoveStaleServicesOptions): 
  * The ordered commands that realign the whole stack.
  *
  * systemd restarts the broker before the gateway; gateway dependencies restart
- * their adapters. launchd has no dependency propagation, so every job is
- * kicked explicitly in the same order.
+ * their adapters. launchd has no dependency propagation, so the adapters are
+ * restarted while the old gateway still holds the admission drain, then the
+ * gateway is restarted last.
  */
 export function restartStackCommands(platform: ServicePlatform, uid?: number): readonly (readonly string[])[] {
 	if (platform === "linux")
@@ -369,17 +370,17 @@ export function restartStackCommands(platform: ServicePlatform, uid?: number): r
 		];
 	if (platform === "darwin") {
 		const target = uid ?? process.getuid?.() ?? 0;
-		return restartOrder().map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
+		return restartOrder(platform).map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
 	}
 	throw new Error(`unsupported service platform: ${platform}`);
 }
 
-/** Broker, gateway, then every job that holds a connection to the gateway. */
-export function restartOrder(): readonly ServiceSpec[] {
-	return [
-		...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
-		...SERVICE_SPECS.filter((spec) => spec.dependsOnGateway),
-	];
+/** Platform-specific order; launchd keeps the draining gateway alive until dependents restart. */
+export function restartOrder(platform: ServicePlatform): readonly ServiceSpec[] {
+	const core = SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway && spec.id !== "gateway");
+	const gateway = SERVICE_SPECS.filter((spec) => spec.id === "gateway");
+	const dependents = SERVICE_SPECS.filter((spec) => spec.dependsOnGateway);
+	return platform === "darwin" ? [...core, ...dependents, ...gateway] : [...core, ...gateway, ...dependents];
 }
 
 function requirePlatform(platform: string): ServicePlatform {

@@ -1,23 +1,35 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	encodeFrame,
 	MAX_FRAME_BYTES,
+	monitorSessionOrigin,
 	OPS_CYCLE_DEFAULT_LIMIT,
 	OPS_CYCLE_MAX_LIMIT,
 	type OpsCycleResult,
 	type OriginRef,
 	originKey,
 } from "@gajae-gateway/protocol";
+import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
+import { MonitorRegistry } from "../src/monitors/registry";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
+import {
+	attachTestBrokerOwnership,
+	createOwnedSessionFixture,
+	initializeTestBrokerAuthority,
+	noRelay,
+	ScriptedSessionPort,
+	sessionPortFromResponder,
+} from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -561,6 +573,212 @@ test("ops.cycle serves a fresh fail-closed snapshot and broker provisioning stat
 		else process.env.HOME = previousHome;
 		if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
 		else process.env.XDG_DATA_HOME = previousXdgDataHome;
+	}
+});
+
+test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-600-"));
+	const config = testConfig(directory);
+	const database = await Store.open(config.dbPath);
+	let databaseClosed = false;
+	const closeDatabase = () => {
+		if (databaseClosed) return;
+		database.close();
+		databaseClosed = true;
+	};
+	const agentDir = join(directory, "agent");
+	const repo = join(directory, "workspace");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const registry = new MonitorRegistry(database);
+	const genericErrorMonitor = registry.add({
+		name: "diagnostic-generic-error",
+		trigger: { kind: "cron", schedule: "0 * * * *" },
+		eventTypes: ["memory.audit"],
+		burstPolicy: "dedupe",
+		enabled: true,
+	});
+	const nestedTerminalMonitor = registry.add({
+		name: "diagnostic-nested-terminal",
+		trigger: { kind: "cron", schedule: "0 * * * *" },
+		eventTypes: ["memory.audit"],
+		burstPolicy: "dedupe",
+		enabled: true,
+	});
+	const turnFailureMonitor = registry.add({
+		name: "diagnostic-turn-failure",
+		trigger: { kind: "cron", schedule: "0 * * * *" },
+		eventTypes: ["memory.audit"],
+		burstPolicy: "dedupe",
+		enabled: true,
+	});
+	const genericErrorEventId = crypto.randomUUID();
+	const nestedTerminalEventId = crypto.randomUUID();
+	const turnFailureEventId = crypto.randomUUID();
+	const eventIds = [genericErrorEventId, nestedTerminalEventId, turnFailureEventId];
+	for (const [monitor, eventId] of [
+		[genericErrorMonitor, genericErrorEventId],
+		[nestedTerminalMonitor, nestedTerminalEventId],
+		[turnFailureMonitor, turnFailureEventId],
+	] as const)
+		database.transaction((tx) =>
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "memory.audit",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			}),
+		);
+	const reboundOriginKey = originKey(monitorSessionOrigin(nestedTerminalMonitor.monitorId, "memory.audit"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-session",
+		originKey: reboundOriginKey,
+		epoch: 0,
+		repo,
+	});
+	let createdSessions = 0;
+	const cli: CliRunner = async (args) => {
+		if (args.includes("inspect") && args.includes("saved-session"))
+			return {
+				exitCode: 1,
+				stdout: JSON.stringify({
+					ok: false,
+					error: { code: "session_unavailable", message: "saved session unavailable" },
+				}),
+				stderr: "",
+			};
+		if (args.includes("session.create")) {
+			createdSessions++;
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessionId: `fresh-session-${createdSessions}` } }),
+				stderr: "",
+			};
+		}
+		if (args.includes("inspect")) {
+			const sessionId = args.at(-1);
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId, live: true, deleted: false, locator: { repo } } },
+				}),
+				stderr: "",
+			};
+		}
+		throw new Error(`unexpected SDK call ${args.join(" ")}`);
+	};
+	const sessionPort = new BrokerSessionPort({
+		database,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	sessionPort.request = async (input) => {
+		if (input.originKey?.includes(genericErrorMonitor.monitorId)) throw new Error("generic request failure");
+		const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
+			code: "sdk_prompt_terminal_failed",
+			reason:
+				"The model is temporarily unavailable; token=ghp_attacker-secret https://secret.example/path;/opt/app/credentials with spaces.json",
+		});
+		if (input.originKey?.includes(nestedTerminalMonitor.monitorId))
+			throw new Error("monitor request failed", { cause });
+		throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", {
+			code: "internal_error",
+			cause: { code: cause.code, message: cause.code, reason: "model_overloaded" },
+		});
+	};
+	const previousHome = process.env.HOME;
+	const previousXdgDataHome = process.env.XDG_DATA_HOME;
+	const reboundLogs: string[] = [];
+	const info = spyOn(console, "info").mockImplementation((line) => reboundLogs.push(String(line)));
+	process.env.HOME = directory;
+	process.env.XDG_DATA_HOME = join(directory, ".local", "share");
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: closeDatabase });
+		for (let i = 0; i < 200 && eventIds.some((id) => !database.monitors.failure(id)); i++) await Bun.sleep(5);
+		const genericError = database.monitors.failure(genericErrorEventId);
+		const nestedTerminal = database.monitors.failure(nestedTerminalEventId);
+		const turnFailure = database.monitors.failure(turnFailureEventId);
+		expect(genericError?.code).toBe("internal_error");
+		expect(nestedTerminal?.code).toBe("authoring_turn_failed");
+		expect(turnFailure?.code).toBe("authoring_turn_failed");
+		expect(reboundLogs.some((line) => line.startsWith(`session_rebound origin=${reboundOriginKey}`))).toBe(true);
+		expect(database.bindings.getSessionRecord(reboundOriginKey)).toMatchObject({
+			epoch: 1,
+			sessionId: expect.stringMatching(/^fresh-session-/),
+		});
+		expect(createdSessions).toBe(3);
+		for (const detail of [genericError?.detail ?? "", nestedTerminal?.detail ?? "", turnFailure?.detail ?? ""]) {
+			expect(detail).not.toContain("ghp_");
+			expect(detail).not.toContain("secret.example");
+			expect(detail).not.toContain("/opt/");
+			expect(detail).not.toContain("C:\\service");
+		}
+		expect(nestedTerminal?.detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
+		expect(nestedTerminal?.detail).toContain("The model is temporarily unavailable");
+		expect(turnFailure?.detail).toContain('"causeCode":"sdk_prompt_terminal_failed"');
+		expect(turnFailure?.detail).toContain('"message":"model_overloaded"');
+
+		const frames: unknown[] = [];
+		const conn = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					for (const line of new TextDecoder().decode(data).split("\n")) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		try {
+			conn.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+			conn.write(`${JSON.stringify({ v: "0.1", type: "request", id: "cycle", verb: "ops.cycle" })}\n`);
+			for (let i = 0; i < 100 && !frames.some((frame) => (frame as { id?: string }).id === "cycle"); i++)
+				await Bun.sleep(5);
+		} finally {
+			conn.end();
+		}
+		const response = frames.find((frame) => (frame as { id?: string }).id === "cycle") as
+			| { result?: OpsCycleResult }
+			| undefined;
+		expect(response?.result?.monitorFailures).toHaveLength(3);
+		const failures = response?.result?.monitorFailures ?? [];
+		expect(failures.find((failure) => failure.eventId === genericErrorEventId)).toMatchObject({
+			monitorId: genericErrorMonitor.monitorId,
+			eventType: "memory.audit",
+			stage: "failed",
+			code: "internal_error",
+		});
+		expect(failures.find((failure) => failure.eventId === nestedTerminalEventId)).toMatchObject({
+			monitorId: nestedTerminalMonitor.monitorId,
+			eventType: "memory.audit",
+			stage: "failed",
+			code: "authoring_turn_failed",
+		});
+		expect(failures.find((failure) => failure.eventId === turnFailureEventId)).toMatchObject({
+			monitorId: turnFailureMonitor.monitorId,
+			eventType: "memory.audit",
+			stage: "failed",
+			code: "authoring_turn_failed",
+		});
+		expect(failures.find((row) => row.eventId === nestedTerminalEventId)?.detail).toContain(
+			'"causeCode":"sdk_prompt_terminal_failed"',
+		);
+		expect(failures.find((row) => row.eventId === nestedTerminalEventId)?.detail).toContain(
+			"The model is temporarily unavailable",
+		);
+		expect(failures.find((row) => row.eventId === turnFailureEventId)?.detail).toContain(
+			'"message":"model_overloaded"',
+		);
+	} finally {
+		info.mockRestore();
+		await server?.stop("issue #600 regression test");
+		server = undefined;
+		closeDatabase();
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+		else process.env.XDG_DATA_HOME = previousXdgDataHome;
+		await rm(directory, { recursive: true, force: true });
 	}
 });
 

@@ -77,7 +77,6 @@ async function broker(
 		authority,
 		database,
 		cli: run,
-		instanceId: "output-test",
 		tailRunner: new TailRunner({
 			stream: relay ? scriptedRelay(relay).spawn : noRelay,
 			repo: input.repo,

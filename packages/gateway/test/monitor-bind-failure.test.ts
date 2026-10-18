@@ -28,6 +28,7 @@ test("bind failure includes operation details in error report", async () => {
 			},
 			runExclusive: async (_, fn) => fn(),
 		};
+		const readinessFailures: Array<{ code: string; detail: string; originKey: string; at: number }> = [];
 
 		const pipeline = new MonitorPropagator({
 			database,
@@ -36,6 +37,7 @@ test("bind failure includes operation details in error report", async () => {
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(database),
 			emit: () => {},
+			onReadinessFailure: (failure) => readinessFailures.push(failure),
 			repo: join(home, "workspace"),
 			model: undefined,
 			serviceTier: undefined,
@@ -54,6 +56,13 @@ test("bind failure includes operation details in error report", async () => {
 		const failure = database.monitors.failure(eventId);
 		expect(failure).toBeDefined();
 		expect(failure?.code).toBe("session_bind_failed");
+		expect(readinessFailures).toHaveLength(1);
+		expect(readinessFailures[0]).toMatchObject({
+			code: "session_bind_failed",
+			detail: "monitor dispatch failed during bind",
+			originKey: `monitor/eventtype/test.bind_fail/parent=${monitor.monitorId}`,
+		});
+		expect(Number.isFinite(readinessFailures[0]?.at)).toBe(true);
 
 		// Verify the detail includes operation information
 		const detail = failure?.detail || "";

@@ -30,6 +30,7 @@ async function harness(
 	respond: SessionPortResponder,
 	options: {
 		ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } };
+		onReadinessSuccess?: (input: { originKey: string; at: number }) => void;
 	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-silent-"));
@@ -51,6 +52,7 @@ async function harness(
 		delivery: new DeliveryService(database),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
+		...(options.onReadinessSuccess ? { onReadinessSuccess: options.onReadinessSuccess } : {}),
 	});
 	propagators.push(propagator);
 	return { propagator, monitor, database, registry };
@@ -66,6 +68,7 @@ const stage = (db: Store, id: string) => db.monitors.eventRows().find((row) => r
 
 describe("isSilentOutput integration (issue #338: propagate.ts must use the closing-marker grammar)", () => {
 	test("note with a reasoning preamble closed by [SILENT] is NOT delivered", async () => {
+		const readinessSuccesses: Array<{ originKey: string; at: number }> = [];
 		const {
 			propagator,
 			monitor,
@@ -75,7 +78,10 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 				JSON.stringify(
 					eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Nothing new since last sweep.\n\n[SILENT]" })),
 				),
-			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
+			{
+				ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } },
+				onReadinessSuccess: (input) => readinessSuccesses.push(input),
+			},
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
 		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
@@ -84,6 +90,28 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 		expect(db!.monitors.authoredOutput(eventId)).toBe("Nothing new since last sweep.\n\n[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
 		expect(db!.outbox.rows()).toHaveLength(0);
+		expect(readinessSuccesses).toHaveLength(1);
+		expect(Number.isFinite(readinessSuccesses[0]?.at)).toBe(true);
+	});
+
+	test("successful dispatch with no delivery target clears monitor readiness", async () => {
+		const readinessSuccesses: Array<{ originKey: string; at: number }> = [];
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async (_id, text) =>
+				JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "completed" }))),
+			{ onReadinessSuccess: (input) => readinessSuccesses.push(input) },
+		);
+		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		for (let attempt = 0; attempt < 100 && stage(db!, eventId) !== "authored_no_delivery"; attempt++)
+			await Bun.sleep(10);
+
+		expect(stage(db!, eventId)).toBe("authored_no_delivery");
+		expect(readinessSuccesses).toHaveLength(1);
+		expect(Number.isFinite(readinessSuccesses[0]?.at)).toBe(true);
 	});
 
 	test("note that merely mentions [SILENT] mid-text IS delivered (a mention is not a directive)", async () => {

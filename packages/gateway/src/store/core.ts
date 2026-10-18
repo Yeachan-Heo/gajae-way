@@ -61,6 +61,7 @@ const AUTHORITY_CENSUS_TABLES = [
 	"broker_retired_sessions",
 	"broker_quarantine",
 	"broker_cutovers",
+	"broker_operations",
 ] as const;
 
 export class StoreCore {

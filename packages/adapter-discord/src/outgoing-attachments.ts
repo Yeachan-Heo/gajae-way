@@ -16,12 +16,28 @@ interface DiscordMediaFileSnapshot {
 	readonly ctimeNs: bigint;
 }
 
-/** Extracts explicit MEDIA:/absolute/path directives from standalone response lines. */
+/** Extracts explicit MEDIA:/absolute/path directives from standalone response lines outside fenced code. */
 export function parseDiscordMedia(text: string): ParsedDiscordMedia {
 	const lines = text.split(/\r?\n/);
 	const paths: string[] = [];
 	const content: string[] = [];
+	let fence: { character: string; length: number } | undefined;
 	for (const line of lines) {
+		const fenceLine = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+		const delimiter = fenceLine?.[1];
+		const suffix = fenceLine?.[2] ?? "";
+		if (fence) {
+			if (delimiter?.charAt(0) === fence.character && delimiter.length >= fence.length && /^[ \t]*$/.test(suffix))
+				fence = undefined;
+			content.push(line);
+			continue;
+		}
+		// A backtick in a backtick fence's info string makes it ordinary prose.
+		if (delimiter && (delimiter.charAt(0) !== "`" || !suffix.includes("`"))) {
+			fence = { character: delimiter.charAt(0), length: delimiter.length };
+			content.push(line);
+			continue;
+		}
 		if (!line.startsWith("MEDIA:")) {
 			content.push(line);
 			continue;

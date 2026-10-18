@@ -55,20 +55,23 @@ test("a linux install writes one bound systemd user unit per service", async () 
 				expect(unit).toContain("RestartSec=2s");
 				expect(unit).toContain("KillMode=control-group");
 				expect(unit).toContain("SuccessExitStatus=143\n");
+				expect(unit).toContain("TimeoutStartSec=60s");
 				expect(unit).toContain("TimeoutStopSec=30s");
 			} else if (spec.id === "gateway") {
 				expect(unit).toContain(`Wants=${BROKER_UNIT}`);
 				expect(unit).toContain(`After=${BROKER_UNIT}`);
 				expect(unit).not.toContain("Requires=");
 				expect(unit).toContain("KillMode=mixed");
-				expect(unit).toContain("TimeoutStopSec=30s");
+				expect(unit).toContain("TimeoutStartSec=60s");
+				expect(unit).toContain("TimeoutStopSec=40s");
 			} else {
 				expect(unit).toContain(`BindsTo=${GATEWAY_UNIT}`);
 				expect(unit).toContain(`After=${GATEWAY_UNIT}`);
 				expect(unit).toContain(`PartOf=${GATEWAY_UNIT}`);
 				expect(unit).toContain(`WantedBy=${GATEWAY_UNIT}`);
 				expect(unit).not.toContain("KillMode=process");
-				expect(unit).not.toContain("TimeoutStopSec=");
+				expect(unit).toContain("TimeoutStartSec=60s");
+				expect(unit).toContain("TimeoutStopSec=60s");
 			}
 		}
 	} finally {
@@ -176,10 +179,13 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 
 	const darwin = restartStackCommands("darwin", 501);
 	expect(darwin[0]).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.broker"]);
-	expect(darwin[1]).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.gateway"]);
+	expect(darwin.at(-1)).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.gateway"]);
 	expect(darwin).toHaveLength(serviceSpecs().length);
-	for (const spec of serviceSpecs().filter((candidate) => candidate.dependsOnGateway))
+	const gatewayIndex = darwin.findIndex((command) => command[3] === "gui/501/dev.gajaeway.gateway");
+	for (const spec of serviceSpecs().filter((candidate) => candidate.dependsOnGateway)) {
 		expect(darwin).toContainEqual(["launchctl", "kickstart", "-k", `gui/501/${spec.label}`]);
+		expect(darwin.findIndex((command) => command[3] === `gui/501/${spec.label}`)).toBeLessThan(gatewayIndex);
+	}
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
 });

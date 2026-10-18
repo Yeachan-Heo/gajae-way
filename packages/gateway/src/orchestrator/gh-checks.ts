@@ -13,6 +13,7 @@ interface RollupEntry {
 }
 
 const FAILED_LOG_TAIL_LIMIT_BYTES = 3_200;
+const PR_LOOKUP_LIMIT = 100;
 
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const SUCCESS_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
@@ -52,21 +53,22 @@ export function classifyCheckRollup(
 }
 
 /** Production client: bounded async PR/check lookups; failed GitHub Actions logs are a best-effort red-check tail. */
-export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
+export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): CheckStatusClient {
 	return {
-		async getCheckStatus(branch, cwd) {
+		async getCheckStatus(headSha, cwd, preferredPrNumber) {
 			try {
+				if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
 				const child = Bun.spawn(
 					[
-						"gh",
+						executable,
 						"pr",
 						"list",
-						"--head",
-						branch,
 						"--state",
 						"all",
+						"--search",
+						headSha,
 						"--limit",
-						"1",
+						`${PR_LOOKUP_LIMIT}`,
 						"--json",
 						"number,headRefOid,state,mergedAt,statusCheckRollup",
 					],
@@ -81,10 +83,26 @@ export function ghCheckStatusClient(timeoutMs = 5_000): CheckStatusClient {
 					mergedAt?: string | null;
 					statusCheckRollup?: RollupEntry[] | null;
 				}>;
-				const pr = prs[0];
+				if (prs.length >= PR_LOOKUP_LIMIT) return undefined;
+				const matchingPrs = prs.filter((candidate) => candidate.headRefOid === headSha);
+				if (matchingPrs.length === 0) return preferredPrNumber === undefined ? null : undefined;
+				const preferredPr =
+					preferredPrNumber === undefined
+						? undefined
+						: matchingPrs.find((candidate) => candidate.number === preferredPrNumber);
+				if (preferredPrNumber !== undefined && !preferredPr) return undefined;
+				const openMatches = preferredPr
+					? []
+					: matchingPrs.filter((candidate) => candidate.state.toUpperCase() === "OPEN");
+				// The checks cycle persists a PR number, so do not bind it to an arbitrary open match.
+				if (openMatches.length > 1) return undefined;
+				// A SHA can be shared across PRs; the active PR must outrank stale closed matches.
+				const pr =
+					preferredPr ??
+					openMatches[0] ??
+					matchingPrs.find((candidate) => Boolean(candidate.mergedAt)) ??
+					matchingPrs[0];
 				if (!pr) return null;
-				const headSha = pr.headRefOid;
-				if (!headSha) return undefined;
 				const rollup = pr.statusCheckRollup ?? [];
 				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);
 				const withPrState: CheckStatusSnapshot = {

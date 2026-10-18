@@ -330,11 +330,13 @@ function statusRow(
 	const engagementLabel = !engagement
 		? "bot audience counter not reported"
 		: `${formatCount(engagement.botAudienceDeclines)} addressed bot declines · ${formatCount(engagement.botAudienceRateLimited)} rate limited`;
+	const readiness = status?.readiness;
+	const readinessLabel = !readiness ? "not reported" : readiness.ready ? "ready" : (readiness.reason ?? "degraded");
 
 	return {
 		key: "status",
-		tone: status ? (danger ? "danger" : "ok") : "danger",
-		state: status ? "alive" : "unreachable",
+		tone: status ? (readiness?.ready === false || danger ? "danger" : "ok") : "danger",
+		state: status ? (readiness?.ready === false ? "degraded" : "alive") : "unreachable",
 		fields: {
 			alive: status
 				? startedAt
@@ -347,6 +349,7 @@ function statusRow(
 			delivery: deliveryLabel,
 			context: contextLabel,
 			botAudience: engagementLabel,
+			readiness: readinessLabel,
 			profile: status ? `profile ${status.profileVersion}` : (statusError ?? "no answer from the socket"),
 			stream: `data ${formatClockSeconds(now)}`,
 		},
@@ -360,6 +363,7 @@ function statusRow(
 				: engagement.botAudienceDeclines === 0 && engagement.botAudienceRateLimited === 0
 					? "ok"
 					: "warn",
+			readiness: !readiness ? "muted" : readiness.ready ? "ok" : "danger",
 			working: working === 0 ? "muted" : "active",
 		},
 	};

@@ -441,6 +441,28 @@ export function sanitizeDiagnostic(text: string): string {
 	return redactSecrets(stripControl(text, true)).trim();
 }
 
+/**
+ * Sanitizes bounded diagnostic details that cross a runtime API boundary.
+ * URLs and absolute paths are not credentials, but they can expose tokens,
+ * hostnames, or local filesystem layout and therefore must not be returned
+ * verbatim from persisted failure rows.
+ */
+export function sanitizeDiagnosticDetail(text: string, maxLength: number): string {
+	if (!Number.isSafeInteger(maxLength) || maxLength < 0)
+		throw new Error("diagnostic detail limit must be a non-negative integer");
+	const withoutUrls = sanitizeDiagnostic(text).replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/gi, "[url]");
+	// An unquoted path may contain spaces, so redact the whole message suffix
+	// after its first absolute-path marker instead of guessing where it ends.
+	const absolutePath = /(^|[^A-Za-z0-9._-])(?:\/{1,2}|[A-Za-z]:\\|\\\\)[^/\s"'<>\\]/.exec(withoutUrls);
+	const pathStart = absolutePath ? absolutePath.index + (absolutePath[1]?.length ?? 0) : -1;
+	const withoutPaths = pathStart < 0 ? withoutUrls : `${withoutUrls.slice(0, pathStart).trimEnd()} [path]`;
+	const cleaned = withoutPaths
+		.replace(/[\r\n\t]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return Array.from(cleaned).slice(0, maxLength).join("");
+}
+
 /** Bounded tail builder that sanitizes complete lines and redacts multiline credential arrays. */
 export class StreamingDiagnosticTail {
 	readonly #maxBytes: number;

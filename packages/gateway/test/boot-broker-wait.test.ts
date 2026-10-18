@@ -3,8 +3,8 @@ import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
-import { bootGateway, resolvePersonaWorkspace, waitForBroker } from "../src/boot";
-import { GjcCliUnavailableError, readPinnedGjcVersion } from "../src/orchestrator/broker";
+import { bootGateway, resolvePersonaWorkspace } from "../src/boot";
+import { GjcCliUnavailableError, readPinnedGjcVersion, waitForBroker } from "../src/orchestrator/broker";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -54,7 +54,7 @@ test("boot waits out a shared broker that is still recovering instead of exiting
 	try {
 		expect(sleeps).toEqual([1_000, 2_000, 4_000]);
 		expect(lines).toHaveLength(3);
-		expect(lines[0]).toStartWith("gateway_boot_waiting_for_broker step=preflight attempt=1 retry_in_ms=1000 ");
+		expect(lines[0]).toStartWith("gateway_waiting_for_broker step=preflight attempt=1 retry_in_ms=1000 ");
 		expect(lines[0]).toContain("broker_unavailable");
 	} finally {
 		await server.stop("test shutdown");

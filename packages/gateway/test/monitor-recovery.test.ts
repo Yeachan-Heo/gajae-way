@@ -419,6 +419,7 @@ describe("monitor crash-boundary state machine", () => {
 			burstPolicy: "serialize",
 		});
 		let turns = 0;
+		const readinessFailures: Array<{ code: string; detail: string; originKey: string; at: number }> = [];
 		const propagator = new MonitorPropagator({
 			database: db,
 			registry,
@@ -429,6 +430,7 @@ describe("monitor crash-boundary state machine", () => {
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(db),
 			emit: () => {},
+			onReadinessFailure: (failure) => readinessFailures.push(failure),
 		});
 		propagators.push(propagator);
 		const eventId = crypto.randomUUID();
@@ -446,6 +448,11 @@ describe("monitor crash-boundary state machine", () => {
 		expect(db.monitors.failure(eventId)).toMatchObject({
 			code: "event_type_invalid",
 			detail: "dispatch setup failed (event_type_invalid)",
+		});
+		expect(readinessFailures).toHaveLength(1);
+		expect(readinessFailures[0]).toMatchObject({
+			code: "event_type_invalid",
+			detail: "monitor dispatch failed during event setup",
 		});
 		expect(turns).toBe(0);
 		await propagator.reconcile();
@@ -478,6 +485,7 @@ describe("monitor crash-boundary state machine", () => {
 		const registry = new MonitorRegistry(db);
 		expect(registry.list().map((record) => record.monitorId)).toEqual([valid.monitorId]);
 		const eventId = crypto.randomUUID();
+		const readinessFailures: Array<{ code: string; detail: string; originKey: string; at: number }> = [];
 		createEvent(db, {
 			eventId,
 			monitorId: invalidId,
@@ -496,6 +504,7 @@ describe("monitor crash-boundary state machine", () => {
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(db),
 			emit: () => {},
+			onReadinessFailure: (failure) => readinessFailures.push(failure),
 		});
 		propagators.push(propagator);
 
@@ -506,9 +515,15 @@ describe("monitor crash-boundary state machine", () => {
 			code: "monitor_invalid",
 			detail: "dispatch setup failed (monitor_invalid)",
 		});
+		expect(readinessFailures).toHaveLength(1);
+		expect(readinessFailures[0]).toMatchObject({
+			code: "monitor_invalid",
+			detail: "monitor dispatch failed during setup",
+		});
 		expect(turns).toBe(0);
 		await propagator.reconcile();
 		expect(db.monitors.eventRows().filter((row) => row.event_id === eventId)).toHaveLength(1);
+		expect(readinessFailures).toHaveLength(1);
 		expect(turns).toBe(0);
 	});
 

@@ -49,6 +49,47 @@ describe("status bar", () => {
 		expect(state.status.tone).toBe("ok");
 	});
 
+	test("functional readiness reason is visible and degrades the status row", async () => {
+		const reason = "monitor_delivery: authoring_turn_failed (3 consecutive failures within 5m)";
+		const state = await snapshot({
+			"gateway.status": {
+				...STATUS,
+				readiness: {
+					ready: false,
+					state: "degraded",
+					windowMs: 5 * 60_000,
+					failureThreshold: 3,
+					reason,
+					failure: {
+						category: "monitor_delivery",
+						code: "authoring_turn_failed",
+						detail: "monitor dispatch failed during request",
+						at: "2026-08-27T14:02:31.000Z",
+						origin: "monitor/eventtype/review.due/parent=monitor-1",
+						consecutiveFailures: 3,
+					},
+				},
+			},
+		});
+		expect(state.status).toMatchObject({
+			tone: "danger",
+			state: "degraded",
+			fields: { readiness: reason },
+			tones: { readiness: "danger" },
+		});
+	});
+
+	test("missing readiness is shown as unreported without changing process liveness", async () => {
+		const { readiness: _readiness, ...legacyStatus } = STATUS;
+		const state = await snapshot({ "gateway.status": legacyStatus });
+		expect(state.status).toMatchObject({
+			tone: "ok",
+			state: "alive",
+			fields: { readiness: "not reported" },
+			tones: { readiness: "muted" },
+		});
+	});
+
 	test("carries no diagnostics: pid and schemaVersion are not glance-level facts", async () => {
 		const state = await snapshot();
 		const rendered = Object.values(state.status.fields).join(" ");

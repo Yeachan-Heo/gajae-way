@@ -79,7 +79,6 @@ async function brokerPortFixture(cli: CliRunner, instanceId = "session-port-rebi
 		authority,
 		database,
 		cli,
-		instanceId,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});
@@ -101,6 +100,71 @@ function createSuccess(sessionId: string) {
 		stderr: "",
 	};
 }
+
+test("an unknown startup model fails without poisoning create keys and can be corrected", async () => {
+	let createCalls = 0;
+	const createKeys: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			createCalls++;
+			const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+			createKeys.push(key);
+			const input = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { modelId?: string };
+			if (input.modelId === "missing/provider" && createCalls % 2 === 0)
+				return {
+					exitCode: 1,
+					stdout: "",
+					stderr: '[Uncaught Exception] Error: Model "missing/provider" not found',
+				};
+			if (input.modelId === "missing/provider")
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: false,
+						error: {
+							code: "operation_failed",
+							message: 'Model "missing/provider" not found',
+							outcomeCertainty: "unknown",
+							references: [{ kind: "idempotencyKey", value: key }],
+						},
+					}),
+					stderr: "",
+				};
+			return createSuccess("corrected-model-session");
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { repo: "/tmp/workspace" } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const originKey = "discord/dm/unknown-startup-model";
+
+	for (let attempt = 0; attempt < MAX_POISONED_CREATE_ROTATIONS + 1; attempt++) {
+		await expect(port.bind({ originKey, epoch: 0, repo, model: "missing/provider" })).rejects.toMatchObject({
+			details: { code: "model_not_found", message: 'Model "missing/provider" not found' },
+		});
+	}
+	expect(createCalls).toBe(MAX_POISONED_CREATE_ROTATIONS + 1);
+	expect(new Set(createKeys).size).toBe(createKeys.length);
+	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBeUndefined();
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBeUndefined();
+
+	await expect(port.bind({ originKey, epoch: 0, repo, model: "provider/valid-model" })).resolves.toMatchObject({
+		sessionId: "corrected-model-session",
+		epoch: 0,
+	});
+	expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(0);
+	expect(database.core.metaGet(`create_rotation:${originKey}`)).toBe("0");
+});
 
 test("poisoned create failures stop rotating epochs at the durable per-origin cap", async () => {
 	let createCalls = 0;
@@ -194,7 +258,6 @@ test("poisoned-create rotation counts survive replacement SessionPort instances"
 		authority: fixture.database.inspectBrokerAuthority().authority!,
 		database: fixture.database,
 		cli: run,
-		instanceId: "session-port-rebind-after-restart",
 		tailRunner: new TailRunner({ stream: noRelay, repo: fixture.repo }),
 		sleep: async () => {},
 	});
@@ -392,7 +455,6 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner,
 	});
 	port.setStallTimeoutMs(5_000);
@@ -482,7 +544,6 @@ test("model thinking suffix is applied on create and explicit model changes", as
 		authority,
 		database,
 		cli: run,
-		instanceId: "thinking-test",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	const binding = await port.bind({
@@ -547,7 +608,6 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: noRelay, repo: "/tmp/repo" }),
 	});
 	await port.bind({ originKey: "discord/channel/c", epoch: 2, repo: "/tmp/repo" });
@@ -592,7 +652,6 @@ test("broker SessionPort rebinds a saved binding on an explicit session_unavaila
 		authority,
 		database,
 		cli: run,
-		instanceId: "public-error",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	await expect(port.bind({ originKey: "public-session-gone", epoch: 0, repo })).resolves.toMatchObject({
@@ -629,7 +688,6 @@ test("generic inspect errors preserve saved authority and do not trigger a repla
 		authority,
 		database,
 		cli: run,
-		instanceId: "generic-error",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	await expect(port.bind({ originKey: "generic-inspect-error", epoch: 0, repo })).resolves.toMatchObject({
@@ -660,7 +718,6 @@ test("structured nonzero session failures survive normalization at the global li
 			calls.push([...args]);
 			return { exitCode: 1, stdout: JSON.stringify(publicFailure), stderr: "" };
 		},
-		instanceId: "envelope-error",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	await createOwnedSessionFixture(database, authority, {
@@ -723,7 +780,6 @@ async function resumeHarness(options: {
 		authority,
 		database: db,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	await createOwnedSessionFixture(db, authority, {
@@ -865,7 +921,6 @@ test("가8: broker SessionPort resumes a gjc >= 0.16 session whose locator has o
 		authority,
 		database: database!,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	await createOwnedSessionFixture(database!, authority, {
@@ -905,7 +960,6 @@ test("broker SessionPort preserves a structured client-ref conflict emitted with
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") }),
 	});
 	await createOwnedSessionFixture(database, authority, {
@@ -944,7 +998,6 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace") }),
 		sleep: async (milliseconds) => {
 			sleeps.push(milliseconds);
@@ -957,7 +1010,7 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	});
 	expect(createCalls).toBe(2);
 	expect(createKeys).toHaveLength(2);
-	expect(createKeys[0]).toMatch(/^gw-bind-[a-f0-9]{32}$/);
+	expect(createKeys[0]).toMatch(/^gw-bind-[0-9a-f-]{36}$/);
 	expect(createKeys[1]).toBe(createKeys[0]);
 	expect(sleeps).toEqual([1_000]);
 });
@@ -1004,7 +1057,6 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 			authority,
 			database,
 			cli,
-			instanceId: "i",
 			tailRunner: new TailRunner({ stream: noRelay, repo }),
 		});
 		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
@@ -1043,7 +1095,7 @@ test("a recovered answer is the full body, never the 500-character summary", asy
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const tailRunner = new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
-	const port = new BrokerSessionPort({ database, authority, cli: run, instanceId: "instance-body", tailRunner });
+	const port = new BrokerSessionPort({ database, authority, cli: run, tailRunner });
 	try {
 		await createOwnedSessionFixture(database, authority, {
 			sessionId: "11111111-2222-3333-4444-555555555555",
@@ -1102,7 +1154,6 @@ test("fetchAssistantSince follows transcript continuation pages and returns the 
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-pages",
 		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 	});
 	try {
@@ -1139,7 +1190,6 @@ test("fetchAssistantSince with preferSpoken skips a trailing silent row for the 
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-spoken",
 		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 	});
 	const row = (offsetMs: number, body: string) => ({
@@ -1193,7 +1243,6 @@ test("liveness carries the host's activity {state, at} from session inspect, and
 		database: database!,
 		authority,
 		cli: run,
-		instanceId: "activity",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	const target = { sessionId: "owned", repo };
@@ -1236,7 +1285,6 @@ test("close uses the global lifecycle route: the per-session control route prohi
 		authority,
 		database,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: noRelay, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 	});
 	await createOwnedSessionFixture(database, authority, {
@@ -1250,7 +1298,7 @@ test("close uses the global lifecycle route: the per-session control route prohi
 	const args = calls[0]!;
 	expect(args.slice(0, 4)).toEqual(["sdk", "session", "raw", "global"]);
 	expect(args).toContain("session.close");
-	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-instance-1-sdk-1-\d+$/);
+	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-[0-9a-f-]{36}$/);
 	expect(JSON.parse(args[args.indexOf("--json-input") + 1]!)).toEqual({ sessionId: "sdk-1" });
 });
 
@@ -1270,7 +1318,6 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 		database,
 		authority,
 		cli: run,
-		instanceId: "ownership",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	for (const target of [
@@ -1319,7 +1366,6 @@ test("legacy private bindings cannot initialize a global port or be resumed and 
 				database: database!,
 				authority,
 				cli: run,
-				instanceId: "legacy",
 				tailRunner: new TailRunner({ stream: noRelay, repo: home }),
 			}),
 	).toThrow(BrokerAuthorityError);
@@ -1351,7 +1397,6 @@ test("bind rejects an unowned persisted ID before inspect and without epoch rota
 		database,
 		authority,
 		cli: run,
-		instanceId: "binding",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	try {
@@ -1397,7 +1442,6 @@ test("historical owned bindings remain readable after epoch retirement but fail 
 		database,
 		authority,
 		cli: run,
-		instanceId: "history",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	expect((await port.fetchLastAssistant({ sessionId: "retired-owned", repo })).text).toBe("historical answer");
@@ -1439,7 +1483,6 @@ test("authority failures propagate through recovery catches without rebind or re
 		database,
 		authority,
 		cli: run,
-		instanceId: "failure",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	const target = { sessionId: "owned", repo };
@@ -1581,7 +1624,6 @@ for (const fixture of [
 			database,
 			authority,
 			cli: run,
-			instanceId: "instance-1",
 			tailRunner: new TailRunner({ stream: relay.spawn, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
 		});
 		let failure: unknown;
@@ -1613,7 +1655,6 @@ test("a relay that dies before the steer reply is ambiguity, never a definitive 
 		cli: async () => {
 			throw new Error("steer must not spawn a CLI");
 		},
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: relay.spawn, repo: join(home, "workspace"), requestTimeoutMs: 50 }),
 	});
 	const attempt = port.steer({ sessionId: "sdk-1", repo: "/tmp/repo", text: "input", clientRef: "expected-ref" });
@@ -1646,7 +1687,6 @@ test("send distinguishes an explicit model refusal from a transport error with t
 		cli: async () => {
 			throw new Error("unexpected CLI command");
 		},
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: refusalRelay.spawn, repo }),
 	});
 	const refusal = await port
@@ -1690,7 +1730,6 @@ for (const fixture of [
 		const port = new BrokerSessionPort({
 			database,
 			authority,
-			instanceId: "fixture",
 			cli: async () => {
 				throw new Error("unexpected CLI call");
 			},
@@ -1733,7 +1772,6 @@ test("send waits out a `busy` refusal and resends under the same op-ref once the
 		database,
 		authority,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
 		now: () => clock,
 		sleep: async (ms) => {
@@ -1772,7 +1810,6 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 		database,
 		authority,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
 		now: () => clock,
 		sleep: async (ms) => {
@@ -1832,7 +1869,6 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 		database,
 		authority,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 200 }),
 	});
 	const result = await port.request({ sessionId: "sdk-1", repo, text: "go", opRef: "gw-torn-1", pollMs: 0 });
@@ -1883,7 +1919,6 @@ for (const progressing of [true, false]) {
 			database,
 			authority,
 			cli: run,
-			instanceId: "instance-1",
 			tailRunner: new TailRunner({ stream: relay.spawn, repo, now: () => clock }),
 			now: () => clock,
 			sleep: async (ms) => {
@@ -1960,7 +1995,6 @@ test("contextUsage reads context.get usage from the relay's query page", async (
 		database: database!,
 		authority,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
 	});
 	const tail = await port.attachTail({ sessionId: "sdk-1", brokerGeneration: 0, repo });
@@ -1997,7 +2031,6 @@ test("runCompaction waits minutes for gjc to finish compacting and maps its rece
 		database: database!,
 		authority,
 		cli: run,
-		instanceId: "instance-1",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	const target = { sessionId: "sdk-1", repo, originKey: "compact" };

@@ -60,12 +60,22 @@ function makeManager(port: ScriptedSessionPort, logs: string[], terminal: string
 }
 
 function enqueue(messageId: string, body: string, receivedAt = new Date().toISOString()): void {
+	enqueueOrigin(KEY, JSON.stringify(ORIGIN), messageId, body, receivedAt);
+}
+
+function enqueueOrigin(
+	originKey: string,
+	originRefJson: string,
+	messageId: string,
+	body: string,
+	receivedAt = new Date().toISOString(),
+): void {
 	expect(
 		database?.transaction((tx) =>
 			database?.inbox.enqueue(tx, {
 				messageId,
-				originKey: KEY,
-				originRefJson: JSON.stringify(ORIGIN),
+				originKey,
+				originRefJson,
 				body,
 				receivedAt,
 			}),
@@ -114,6 +124,136 @@ test("restart observes an accepted nonterminal turn on the same live session wit
 		"observed turn did not reach terminal completion",
 	);
 	expect(terminal).toEqual(["transcript survived restart"]);
+});
+
+test("bounded shutdown keeps an accepted turn alive past the old cutoff and defers new input until restart", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	manager = makeManager(port, logs, terminal);
+	enqueue("m-drain", "finish before gateway stops");
+	await manager.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "initial turn did not reach an accepted send");
+	const first = port.sends[0];
+	if (!first) throw new Error("accepted send disappeared during shutdown test");
+
+	let drainFinished = false;
+	manager.beginDrain();
+	const draining = manager.drain().then(() => {
+		drainFinished = true;
+	});
+	enqueue("m-during-drain", "dispatch after restart");
+	await manager.notifyInbound(KEY);
+
+	// Exceed the old five-second shutdown window while the accepted operation is still running.
+	await Bun.sleep(5_100);
+	expect(drainFinished).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(database.inbox.pendingOldest(KEY)).toMatchObject({
+		message_id: "m-during-drain",
+		turn_role: null,
+		turn_state: null,
+	});
+	port.complete(first.opRef, "answer completed during shutdown");
+	await draining;
+	await eventually(
+		() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+		"shutdown drain did not settle the accepted turn",
+	);
+	expect(terminal).toEqual(["answer completed during shutdown"]);
+
+	await manager.stop();
+	manager = makeManager(port, logs, terminal);
+	await manager.recover();
+	await eventually(() => port.sends.length === 2, "queued input was not resumed after restart");
+	const second = port.sends[1];
+	if (!second) throw new Error("queued send disappeared during restart test");
+	expect(second.text).toBe("dispatch after restart");
+	port.complete(second.opRef, "queued answer");
+	await eventually(() => terminal.length === 2, "queued input did not finish after restart");
+	expect(terminal).toEqual(["answer completed during shutdown", "queued answer"]);
+	expect(port.sends.filter((send) => send.opRef === first.opRef)).toHaveLength(1);
+}, 15_000);
+
+test("restart drain waits for all active turns and holds new persona dispatches", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-drain-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: ({ originKey, epoch }) => `${originKey}-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	manager = makeManager(port, logs, terminal);
+	const otherOrigin = { ...ORIGIN, conversationId: "other" };
+	const otherKey = "loopback/loopback/other";
+	const queuedOrigin = { ...ORIGIN, conversationId: "queued" };
+	const queuedKey = "loopback/loopback/queued";
+
+	enqueue("active-1", "first active turn");
+	enqueueOrigin(otherKey, JSON.stringify(otherOrigin), "active-2", "second active turn");
+	await Promise.all([manager.notifyInbound(KEY), manager.notifyInbound(otherKey)]);
+	await eventually(() => port.sends.length === 2, "both active turns did not start");
+	const [firstSend, secondSend] = port.sends;
+	if (!firstSend || !secondSend) throw new Error("both active sends were not recorded");
+
+	const draining = manager.drainForRestart("restart-602");
+	enqueueOrigin(queuedKey, JSON.stringify(queuedOrigin), "queued-1", "held until restart");
+	await manager.notifyInbound(queuedKey);
+	await Bun.sleep(20);
+	expect(port.sends).toHaveLength(2);
+	expect(await Promise.race([draining.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
+
+	port.complete(firstSend.opRef, "first delivered");
+	await eventually(() => database?.inbox.turnRow(firstSend.opRef)?.turn_state === "done", "first turn did not deliver");
+	expect(terminal).toContain("first delivered");
+	expect(await Promise.race([draining.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
+
+	port.complete(secondSend.opRef, "second delivered");
+	await expect(draining).resolves.toBe("drained");
+	await eventually(() => terminal.length === 2, "restart drain completed before all answers were delivered");
+	expect(terminal).toEqual(expect.arrayContaining(["first delivered", "second delivered"]));
+	expect(port.sends).toHaveLength(2);
+	expect(database.inbox.pendingOldest(queuedKey)?.message_id).toBe("queued-1");
+
+	await expect(manager.cancelRestartDrain("restart-602")).resolves.toBe(true);
+	await eventually(() => port.sends.length === 3, "cancelled restart drain did not resume pending dispatch");
+});
+
+test("restart drain reaches its deadline and keeps new dispatches held for durable recovery", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-drain-timeout-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: ({ originKey, epoch }) => `${originKey}-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	const currentManager = makeManager(port, []);
+	manager = currentManager;
+	enqueue("active-timeout", "provider did not finish");
+	await currentManager.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "accepted turn did not start before drain timeout");
+
+	await expect(currentManager.drainForRestart("restart-timeout", 20)).resolves.toBe("timed_out");
+	expect(currentManager.restartDrainActive).toBe(true);
+	enqueue("queued-after-timeout", "resume after restart");
+	await currentManager.notifyInbound(KEY);
+	expect(port.sends).toHaveLength(1);
+	expect(database.inbox.pendingOldest(KEY)?.message_id).toBe("queued-after-timeout");
+});
+
+test("a transferred restart drain rejects assertions from the prior supervisor", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-transfer-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort({ onBind: ({ originKey, epoch }) => `${originKey}-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	manager = makeManager(port, []);
+	await expect(manager.drainForRestart("stack-supervisor")).resolves.toBe("drained");
+	expect(manager.transferRestartDrain("stack-supervisor", "owner-restart")).toBe(true);
+	await expect(manager.drainForRestart("stack-supervisor", 0)).rejects.toThrow(
+		"restart drain already owned by owner-restart",
+	);
+	expect(manager.restartDrainId).toBe("owner-restart");
+	await expect(manager.drainForRestart("owner-restart", 0)).resolves.toBe("drained");
+	await expect(manager.cancelRestartDrain("owner-restart")).resolves.toBe(true);
 });
 
 test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {

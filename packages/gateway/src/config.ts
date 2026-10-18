@@ -93,7 +93,7 @@ export interface GatewayConfigFile {
 	readonly serviceTier?: GjcServiceTier;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
-	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
+	/** Tail silence threshold in milliseconds; a separate fixed deadline governs terminal cutoffs. */
 	readonly stallTimeoutMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
@@ -649,7 +649,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	if (input.turnTimeoutMs !== undefined) {
 		throw new ConfigError(
 			"config_invalid",
-			"turnTimeoutMs was removed with persistent SDK sessions; use stallTimeoutMs for tail-stall alerts (it never kills a running turn)",
+			"turnTimeoutMs was removed with persistent SDK sessions; use stallTimeoutMs for tail-silence detection (the terminal cutoff uses a separate fixed deadline)",
 		);
 	}
 	const model = parseModel(input.model);

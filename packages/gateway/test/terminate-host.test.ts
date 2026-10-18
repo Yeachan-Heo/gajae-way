@@ -14,7 +14,7 @@ import { noRelay } from "./session-port.fake";
  * to be a `sdk session-host-internal`. A real child process stands in for the
  * host so the SIGTERM path is exercised for real, not mocked.
  */
-async function harness(pidFor: (sessionId: string) => number | undefined, live = true) {
+async function harness(pidFor: (sessionId: string) => number | undefined, live = true, inspectErrorCode?: string) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-terminate-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
@@ -25,6 +25,12 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 		if (args.includes("inspect")) {
 			const sessionId = args[args.indexOf("inspect") + 1]!;
 			const pid = pidFor(sessionId);
+			if (inspectErrorCode)
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ ok: false, error: { code: inspectErrorCode, message: "inspect unavailable" } }),
+					stderr: "",
+				};
 			if (pid === undefined)
 				return {
 					exitCode: 1,
@@ -44,13 +50,12 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 		database,
 		authority,
 		cli: run,
-		instanceId: "terminate",
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});
 	// The port refuses any session it does not own (#assertOwned): register the
 	// ids these tests will name, exactly as bind() would have.
-	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5"]) {
+	for (const sessionId of ["s-1", "s-2", "s-3", "s-4", "s-5", "s-6", "s-7", "s-8"]) {
 		const owned = database.transaction((tx) =>
 			database.bindings.recordOwnedBinding(tx, {
 				authority,
@@ -77,8 +82,13 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
  * SIGTERM. A shell no-op loop carries the tag in its own argv, so
  * `ps -o command=` shows it (`sleep` rejects extra arguments and exits at once).
  */
-function fakeHost(argvTag: string) {
-	return Bun.spawn(["sh", "-c", "while :; do sleep 1; done", argvTag], { stdout: "ignore", stderr: "ignore" });
+function fakeHost(argvTag: string, ignoreTerm = false, delayedTerm = false) {
+	const loop = delayedTerm
+		? "trap 'sleep 2; exit 0' TERM; while :; do sleep 1; done"
+		: ignoreTerm
+			? "trap '' TERM; while :; do sleep 1; done"
+			: "while :; do sleep 1; done";
+	return Bun.spawn(["sh", "-c", loop, argvTag], { stdout: "ignore", stderr: "ignore" });
 }
 
 test("a live session host reported by the broker is SIGTERMed and exits", async () => {
@@ -88,6 +98,76 @@ test("a live session host reported by the broker is SIGTERMed and exits", async 
 		const outcome = await h.port.terminateHost({ sessionId: "s-1", repo: h.repo });
 		expect(outcome).toEqual({ outcome: "terminated", pid: child.pid });
 		expect(await child.exited).not.toBe(0); // signalled, not a clean exit
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
+test("a session host that ignores SIGTERM is escalated and confirmed exited", async () => {
+	const child = fakeHost("sdk session-host-internal", true);
+	const h = await harness(() => child.pid);
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo })).toEqual({
+			outcome: "terminated",
+			pid: child.pid,
+		});
+		expect(await child.exited).not.toBe(0);
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
+test("a signaled host stays tracked when escalation is canceled until its process exits", async () => {
+	const child = fakeHost("sdk session-host-internal", false, true);
+	const h = await harness(() => child.pid);
+	let guardCalls = 0;
+	try {
+		expect(
+			await h.port.terminateHost({
+				sessionId: "s-1",
+				repo: h.repo,
+				shouldTerminate: () => ++guardCalls === 1,
+			}),
+		).toEqual({ outcome: "terminating", pid: child.pid });
+		expect(guardCalls).toBe(2);
+		expect(await Promise.race([child.exited.then(() => "exited"), Bun.sleep(100).then(() => "alive")])).toBe("alive");
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "terminating",
+			pid: child.pid,
+		});
+		expect(guardCalls).toBe(2);
+		expect(await child.exited).toBe(0);
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "already_gone",
+		});
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
+test("a signaled host is force-retired after a canceled escalation outlives its grace", async () => {
+	const child = fakeHost("sdk session-host-internal", true);
+	const h = await harness(() => child.pid);
+	let guardCalls = 0;
+	try {
+		expect(
+			await h.port.terminateHost({
+				sessionId: "s-1",
+				repo: h.repo,
+				shouldTerminate: () => ++guardCalls === 1,
+			}),
+		).toEqual({ outcome: "terminating", pid: child.pid });
+		expect(guardCalls).toBe(2);
+		await Bun.sleep(1_100);
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo, shouldTerminate: () => false })).toEqual({
+			outcome: "terminated",
+			pid: child.pid,
+		});
+		expect(guardCalls).toBe(2);
+		expect(await child.exited).not.toBe(0);
 	} finally {
 		child.kill();
 		await h.close();
@@ -111,10 +191,13 @@ test("a pid that is not a session host is never signalled - broker, daemon, or a
 	}
 });
 
-test("a session the broker no longer knows, or reports not live, is already gone", async () => {
+test("broker absence alone does not prove a session host process is gone", async () => {
 	const gone = await harness(() => undefined);
 	try {
-		expect(await gone.port.terminateHost({ sessionId: "s-3", repo: gone.repo })).toEqual({ outcome: "already_gone" });
+		expect(await gone.port.terminateHost({ sessionId: "s-3", repo: gone.repo })).toEqual({
+			outcome: "refused",
+			reason: "inspect_failed:session_gone_without_process_identity",
+		});
 	} finally {
 		await gone.close();
 	}
@@ -122,12 +205,43 @@ test("a session the broker no longer knows, or reports not live, is already gone
 	const notLive = await harness(() => child.pid, false);
 	try {
 		expect(await notLive.port.terminateHost({ sessionId: "s-4", repo: notLive.repo })).toEqual({
-			outcome: "already_gone",
+			outcome: "refused",
+			reason: "session_not_live_but_process_live",
 		});
 		expect(child.killed).toBe(false);
 	} finally {
 		child.kill();
 		await notLive.close();
+	}
+});
+
+test("a transient inspect envelope refuses termination without killing the live host", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const h = await harness(() => child.pid, true, "broker_unavailable");
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-6", repo: h.repo })).toEqual({
+			outcome: "refused",
+			reason: "inspect_failed:broker_unavailable",
+		});
+		expect(child.killed).toBe(false);
+	} finally {
+		child.kill();
+		await h.close();
+	}
+});
+
+test("a rejected final termination guard leaves the session host running", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const h = await harness(() => child.pid);
+	try {
+		expect(await h.port.terminateHost({ sessionId: "s-7", repo: h.repo, shouldTerminate: async () => false })).toEqual({
+			outcome: "refused",
+			reason: "termination_guard_rejected",
+		});
+		expect(child.killed).toBe(false);
+	} finally {
+		child.kill();
+		await h.close();
 	}
 });
 
@@ -139,6 +253,30 @@ test("a pid that already exited is already gone, not an error", async () => {
 	const h = await harness(() => pid);
 	try {
 		expect(await h.port.terminateHost({ sessionId: "s-5", repo: h.repo })).toEqual({ outcome: "already_gone" });
+	} finally {
+		await h.close();
+	}
+});
+
+test("an already-dead host is reported gone without invoking the signal guard", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const pid = child.pid;
+	child.kill();
+	await child.exited;
+	const h = await harness(() => pid);
+	try {
+		let guardCalls = 0;
+		expect(
+			await h.port.terminateHost({
+				sessionId: "s-8",
+				repo: h.repo,
+				shouldTerminate: () => {
+					guardCalls++;
+					return false;
+				},
+			}),
+		).toEqual({ outcome: "already_gone" });
+		expect(guardCalls).toBe(0);
 	} finally {
 		await h.close();
 	}

@@ -24,12 +24,34 @@ export type DeliveryErrorCode =
 	| "invalid_request"
 	| "other";
 
+export type FunctionalReadinessCategory = "session_create" | "turn" | "delivery" | "monitor_delivery";
+
+export interface FunctionalReadinessFailure {
+	readonly category: FunctionalReadinessCategory;
+	readonly code: string;
+	readonly detail: string;
+	readonly at: string;
+	readonly origin?: string;
+	readonly consecutiveFailures: number;
+}
+
+export interface GatewayReadinessResult {
+	readonly ready: boolean;
+	readonly state: "ready" | "degraded";
+	readonly windowMs: number;
+	readonly failureThreshold: number;
+	readonly reason: string | null;
+	readonly failure: FunctionalReadinessFailure | null;
+}
+
 export interface GatewayStatusResult {
 	readonly profileVersion: string;
 	readonly capabilities: readonly string[];
 	readonly pid: number;
 	readonly startedAt: string;
 	readonly schemaVersion: number;
+	/** Functional health when reported; older gateways may omit this additive field. */
+	readonly readiness?: GatewayReadinessResult;
 	/** Session census (grows in later phases). */
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
@@ -1027,6 +1049,17 @@ export interface OpsSloResult {
 	readonly ok: boolean;
 }
 
+/** Bounded, sanitized diagnosis for a recent monitor dispatch failure. */
+export interface MonitorFailureDiagnostic {
+	readonly eventId: string;
+	readonly monitorId: string;
+	readonly eventType: string;
+	readonly stage: string;
+	readonly failedAt: string;
+	readonly code: string;
+	readonly detail: string;
+}
+
 export interface OpsSloParams {
 	readonly days?: number;
 }
@@ -1074,6 +1107,8 @@ export interface OpsCycleResult {
 	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
+	/** Most recent monitor dispatch failure records, including their sanitized cause details. */
+	readonly monitorFailures: readonly MonitorFailureDiagnostic[];
 	/**
 	 * Event types whose most recent terminal events (last 24h) exhausted retries
 	 * with no authored output: `consecutive` lost slots, newest at `lastFiredAt`.
@@ -1149,6 +1184,14 @@ export interface OpsDeliveriesResult {
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
+	"gateway.restart.prepare": {
+		params: { readonly restartId: string; readonly waitMs?: number };
+		result: { readonly ready: true; readonly drained: boolean };
+	};
+	"gateway.restart.cancel": {
+		params: { readonly restartId: string };
+		result: { readonly cancelled: boolean; readonly transferred?: boolean };
+	};
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
@@ -1217,12 +1260,15 @@ export interface EventCatalogV01 {
 	"chat.message": ChatMessagePayload;
 	"chat.progress": ChatProgressPayload;
 	"gateway.stopping": { readonly reason: string };
+	"gateway.restart.superseded": { readonly restartId: string; readonly ownerRestartId: string };
 	"monitor.event": MonitorEventRecord;
 }
 
 export const VERBS_V01 = [
 	"gateway.status",
 	"gateway.shutdown",
+	"gateway.restart.prepare",
+	"gateway.restart.cancel",
 	"chat.send",
 	"chat.edit",
 	"delivery.confirm",
@@ -1259,7 +1305,13 @@ export const VERBS_V01 = [
 	"ops.slo",
 	"ops.cycle",
 ] as const;
-export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
+export const EVENTS_V01 = [
+	"chat.message",
+	"chat.progress",
+	"gateway.restart.superseded",
+	"gateway.stopping",
+	"monitor.event",
+] as const;
 
 export type VerbName = keyof VerbCatalogV01;
 export type EventName = keyof EventCatalogV01;

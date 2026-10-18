@@ -174,7 +174,6 @@ test("poisoned create-key rotation stops at exactly three rotations and rethrows
 		database,
 		authority,
 		cli: run,
-		instanceId: "broker-wedge-rotation",
 		tailRunner: new TailRunner({ stream: noRelay, repo: REPO }),
 		sleep: async () => {},
 	});
@@ -233,7 +232,6 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 		database,
 		authority,
 		cli: run,
-		instanceId: "broker-wedge-reset",
 		tailRunner: new TailRunner({ stream: noRelay, repo: REPO }),
 		sleep: async () => {},
 	});
