@@ -16,15 +16,22 @@ const { writeSync } = require("node:fs");
 self.onmessage = ({ data }) => {
 	const beat = new Int32Array(data.buffer);
 	let seen = Atomics.load(beat, 0);
-	let seenAt = Date.now();
+	let checkedAt = Date.now();
+	let stalledMs = 0;
 	setInterval(() => {
+		// Count only time this worker was itself awake: a suspended process (host
+		// sleep, SIGSTOP) pauses both threads, and the wall-clock gap on resume is
+		// not the main thread's fault.
+		const now = Date.now();
+		stalledMs += Math.min(Math.max(0, now - checkedAt), 2 * data.checkMs);
+		checkedAt = now;
 		const current = Atomics.load(beat, 0);
 		if (current !== seen) {
 			seen = current;
-			seenAt = Date.now();
+			stalledMs = 0;
 			return;
 		}
-		if (Date.now() - seenAt < data.stallMs) return;
+		if (stalledMs < data.stallMs) return;
 		try {
 			writeSync(2, data.line);
 		} catch {}

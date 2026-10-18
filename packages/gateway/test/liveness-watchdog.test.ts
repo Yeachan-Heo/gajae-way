@@ -4,7 +4,7 @@ import { join } from "node:path";
 const watchdogModule = join(import.meta.dir, "../src/liveness-watchdog.ts");
 
 /** Runs a child that installs the watchdog and then executes `body`. */
-async function runChild(body: string) {
+async function runChild(body: string, whileRunning?: (child: Bun.Subprocess) => Promise<void>) {
 	const script = `
 		const { installLivenessWatchdog } = await import(${JSON.stringify(watchdogModule)});
 		installLivenessWatchdog({ stallMs: 400, beatMs: 50 });
@@ -16,6 +16,7 @@ async function runChild(body: string) {
 		child.exited,
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
+		whileRunning?.(child),
 	]);
 	clearTimeout(deadline);
 	return { exitCode, signalCode: child.signalCode, stdout, stderr };
@@ -50,6 +51,32 @@ test("a serviced event loop is never killed and the watchdog does not hold the p
 			}
 		}, 50);
 	`);
+	expect(result.signalCode).toBeNull();
+	expect(result.exitCode).toBe(0);
+	expect(result.stdout).toContain("done");
+	expect(result.stderr).not.toContain("event_loop_stalled");
+});
+
+test("a whole-process suspension longer than the deadline is not a stall", async () => {
+	// SIGSTOP pauses the worker and the main thread alike, as host sleep does;
+	// the wall-clock gap seen on resume must not read as a wedged main thread.
+	const result = await runChild(
+		`
+		let ticks = 0;
+		const timer = setInterval(() => {
+			if (++ticks === 40) {
+				clearInterval(timer);
+				console.log("done");
+			}
+		}, 50);
+	`,
+		async (child) => {
+			await Bun.sleep(400);
+			child.kill("SIGSTOP");
+			await Bun.sleep(1_500);
+			child.kill("SIGCONT");
+		},
+	);
 	expect(result.signalCode).toBeNull();
 	expect(result.exitCode).toBe(0);
 	expect(result.stdout).toContain("done");
