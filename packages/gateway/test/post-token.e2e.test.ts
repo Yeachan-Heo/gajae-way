@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { OriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { deterministicPostDeliveryId } from "../src/orchestrator/tail-runner";
-import { type GatewayServer, resolvePostTarget, startUnixServer } from "../src/server/server";
+import { type GatewayServer, replyTargetConversation, resolvePostTarget, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
@@ -130,6 +130,64 @@ test("resolvePostTarget accepts only configured channels of the current platform
 		["", "invalid_origin_key"],
 	] as const)
 		expect(resolvePostTarget(raw, here, config)).toEqual({ ok: false, reason });
+});
+
+test("resolvePostTarget reads every spelling models use for a configured channel", () => {
+	const here: OriginRef = { platform: "discord", kind: "channel", conversationId: "chan-1" };
+	const report: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
+	const config: GatewayConfig = { ...({ channels } as GatewayConfig), handoffTargets: { 업무보고: report } };
+	for (const raw of ["discord:report-room", "<#report-room>", "<#report-room|업무보고>", "report-room", "업무보고"])
+		expect(resolvePostTarget(raw, here, config)).toMatchObject({ ok: true, key: REPORT });
+	expect(resolvePostTarget("chan-1", here, config)).toEqual({ ok: false, reason: "current_conversation" });
+	expect(resolvePostTarget("unlisted", here, config)).toEqual({ ok: false, reason: "unconfigured_channel" });
+	expect(resolvePostTarget("slack:C9", here, config)).toEqual({ ok: false, reason: "other_platform" });
+});
+
+test("[REPLY:] names a conversation only when it is one; a message id still threads here", () => {
+	const here: OriginRef = { platform: "discord", kind: "channel", conversationId: "chan-1" };
+	const config = { channels } as GatewayConfig;
+	expect(replyTargetConversation(REPORT, here, config)).toMatchObject({ ok: true, key: REPORT });
+	expect(replyTargetConversation("discord:report-room", here, config)).toMatchObject({ ok: true, key: REPORT });
+	expect(replyTargetConversation("report-room", here, config)).toMatchObject({ ok: true, key: REPORT });
+	expect(replyTargetConversation("chan-1", here, config)).toEqual({ ok: false, reason: "current_conversation" });
+	// An explicit spelling of a room the persona may not post in is refused, not misread as a message id.
+	expect(replyTargetConversation("discord:unlisted", here, config)).toEqual({
+		ok: false,
+		reason: "unconfigured_channel",
+	});
+	for (const messageId of ["1544704223634260038", "msg-42", "C1:9.0", "1726543210.123456"])
+		expect(replyTargetConversation(messageId, here, config)).toBeUndefined();
+});
+
+test("[SEND:]/[POST:] blocks anywhere in a reply post once each; the text around them stays here", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const client = await startGateway(port);
+	const send = await startTurn(port, client, "b1");
+	port.complete(
+		send.opRef,
+		"배포 끝났습니다 [SEND:discord:report-room] 완료: 배포 [SENDDONE] 확인 부탁\n[POST:<#report-room>]\n두 번째 보고\n[POSTDONE]",
+	);
+	await eventually(() => rows(REPORT).length === 2, "both posts were not sent");
+	await eventually(() => database!.inbox.nonterminalTurns(HERE).length === 0, "turn never settled");
+	await Bun.sleep(50);
+	expect(rows(REPORT).map((row) => JSON.parse(row.payload_json).text)).toEqual(["완료: 배포", "두 번째 보고"]);
+	expect(rows(HERE).map((row) => JSON.parse(row.payload_json).text)).toEqual(["배포 끝났습니다", "확인 부탁"]);
+	expect(messages(client).some((frame) => /\[(SEND|POST)/.test(frame.payload.text))).toBe(false);
+});
+
+test("[REPLY:<channel>] posts there; [REPLY:<message id>] in the same reply threads here", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const client = await startGateway(port);
+	const send = await startTurn(port, client, "c1");
+	port.complete(send.opRef, "[REPLY:discord:report-room] 보고 올립니다\n[BREAK]\n[REPLY:m-c1] 여기 답");
+	await eventually(() => messages(client).length === 2, "both parts were not delivered");
+	const delivered = messages(client).map((frame) => [
+		frame.payload.origin.conversationId,
+		frame.payload.text,
+		frame.payload.replyToMessageId,
+	]);
+	expect(delivered).toContainEqual(["report-room", "보고 올립니다", undefined]);
+	expect(delivered).toContainEqual(["chan-1", "여기 답", "m-c1"]);
 });
 
 test("a [POST:] part goes to the configured target once, recorded there as the persona's own words", async () => {
