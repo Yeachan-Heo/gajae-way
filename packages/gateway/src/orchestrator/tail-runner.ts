@@ -934,17 +934,9 @@ class ManagedTailHandle implements TailHandle {
 				definitions: { methods: ["request"] },
 			}),
 		);
-		// Register for 'ui' capability with select and confirm methods
-		const uiId = `gw-ui-${this.brokerGeneration}-${this.sessionId}`;
-		stream.write(
-			JSON.stringify({
-				type: "register_provider",
-				id: uiId,
-				connectionId: this.#connectionId,
-				capability: "ui",
-				definitions: { methods: ["select", "confirm"] },
-			}),
-		);
+		// Do not advertise `ui`: GJC treats any UI provider registration as support
+		// for `ui.elicit`, which this gateway does not handle. Selector asks use the
+		// permission provider when the transport supports interactive panels.
 		// Start heartbeat timer to keep leases alive
 		this.#startHeartbeat();
 	}
