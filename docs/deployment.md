@@ -460,6 +460,8 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 
 Outbound `MEDIA:/absolute/path` attachments are disabled unless `mediaDirectories` is configured. Relative entries resolve from the directory containing `adapter-discord.json`; uploads are accepted only when the file's resolved real path remains inside one of those directories. Keep this allowlist limited to files that may be exposed in Discord.
 
+Only standalone `MEDIA:` lines outside fenced code request uploads. Examples inside backtick or tilde code fences remain ordinary reply text.
+
 `engagement` selects how messages become turns: `open` admits them without addressing, `mention-open` requires a real mention or native reply to this bot, and `closed` requires both addressing and owner/allowlist authorization. `audience` independently restricts authors to `all`, `human-only`, or `bot-only`; `closed` ignores it. Omitting `audience` keeps the safe `human-only` default (humans follow the mode; bots stay on the closed gate).
 
 Bot-authored turns admitted by a widened audience are unlimited in sequence by default. Set `botAudience.maxConsecutiveTurns` globally, or `channels.<key>.botAudienceMaxConsecutiveTurns`, to require a human message after N consecutive bot turns. The runaway guard is the rolling-minute rate limit `botAudience.maxTurnsPerWindow` (per-channel override `botAudienceMaxTurnsPerWindow`), default 30 bot admissions per conversation per minute; it is not reset by a human message. Both declines are logged with the origin's current counts and counted in `gateway.status` (`engagement.botAudienceDeclines`, `engagement.botAudienceRateLimited`).

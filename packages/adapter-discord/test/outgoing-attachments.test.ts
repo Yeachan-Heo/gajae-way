@@ -17,6 +17,45 @@ test("extracts standalone MEDIA lines and preserves ordinary text", () => {
 	});
 });
 
+// Purpose: keep documented upload syntax literal instead of reading example paths from disk.
+// Expected: fenced MEDIA examples, including empty directives, are returned unchanged without upload requests.
+test.each(["```", "~~~"])("preserves MEDIA examples inside %s code fences", (fence) => {
+	const text = ["Use this syntax:", `${fence}text`, "MEDIA:/tmp/example.png", "MEDIA:", fence].join("\n");
+	expect(parseDiscordMedia(text)).toEqual({ text, paths: [] });
+	const crlf = text.replace(/\n/g, "\r\n");
+	expect(parseDiscordMedia(crlf)).toEqual({ text: crlf, paths: [] });
+});
+
+// Purpose: distinguish an actual closing fence from shorter runs, other markers, or a language-tagged run.
+// Expected: examples stay literal until the matching closer, and a real directive after it still becomes an upload.
+test.each([
+	{ opener: "````markdown", inner: ["```", "~~~", "````text"], closer: "`````" },
+	{ opener: "~~~text", inner: ["```", "~~", "~~~text"], closer: "~~~~" },
+	{ opener: "   ```text", inner: ["```text"], closer: " ``` \t" },
+])("resumes MEDIA extraction after the matching $opener fence", ({ opener, inner, closer }) => {
+	const example = [opener, ...inner, "MEDIA:/tmp/example.png", closer].join("\n");
+	expect(parseDiscordMedia(`${example}\nMEDIA:/tmp/render.png`)).toEqual({
+		text: example.trim(),
+		paths: ["/tmp/render.png"],
+	});
+});
+
+// Purpose: fence-like prose must not suppress a subsequent explicit upload request.
+// Expected: inline, short, over-indented, and invalid-info markers leave the real directive actionable.
+test.each(["Inline ```", "``", "    ```", "```text`example"])("extracts MEDIA after non-fence text %s", (line) => {
+	expect(parseDiscordMedia(`${line}\nMEDIA:/tmp/render.png`)).toEqual({
+		text: line.trim(),
+		paths: ["/tmp/render.png"],
+	});
+});
+
+// Purpose: unfinished code examples must not trigger a file read or count toward the upload limit.
+// Expected: the open block is preserved even with more than ten literal MEDIA lines.
+test("preserves an unclosed fenced MEDIA example", () => {
+	const text = ["```text", ...Array.from({ length: 11 }, (_, index) => `MEDIA:/tmp/example-${index}`)].join("\n");
+	expect(parseDiscordMedia(text)).toEqual({ text, paths: [] });
+});
+
 // Purpose: reject malformed directives and batches Discord cannot accept.
 // Expected: empty paths and more than ten files are rejected; both boundaries are required for completion.
 test("rejects empty MEDIA paths and more than ten files", () => {
