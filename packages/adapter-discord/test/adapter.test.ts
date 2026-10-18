@@ -243,6 +243,59 @@ test("uploads an explicit MEDIA path as a Discord attachment", async () => {
 	}
 });
 
+// Purpose: let the persona explain MEDIA syntax without attempting to upload its illustrative path.
+// Expected: the complete code example is posted as text and confirmed with uploads disabled.
+test("delivers a fenced MEDIA example as text with uploads disabled", async () => {
+	const text = ["Use this syntax:", "```text", "MEDIA:/not/a/real/example.png", "```"].join("\n");
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery(text));
+	expect(sent).toEqual([text]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+// Purpose: an illustrative MEDIA path must not prevent a real rendered image from reaching Discord.
+// Expected: only the actual PNG is attached, the example remains in the caption, and the delivery confirms.
+test("uploads a PNG after a fenced MEDIA example", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-example-"));
+	try {
+		const filePath = join(home, "render.png");
+		const bytes = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5XcAAAAASUVORK5CYII=",
+			"base64",
+		);
+		await writeFile(filePath, bytes);
+		const example = ["Example:", "```text", "MEDIA:/not/a/real/example.png", "```"].join("\n");
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`${example}\nMEDIA:${filePath}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(1);
+		const upload = sent[0] as { content: string; files: Array<{ name: string; attachment: Buffer }> };
+		expect(upload.content).toBe(example);
+		expect(upload.files).toHaveLength(1);
+		expect(upload.files[0]?.name).toBe("render.png");
+		expect(upload.files[0]?.attachment).toEqual(bytes);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 // Purpose: verify a file-only reply still reaches Discord when removing MEDIA leaves no caption.
 // Expected: one empty-content upload is sent and the delivery confirms; both are required for completion.
 test("sends a MEDIA attachment without an empty text-only message", async () => {
