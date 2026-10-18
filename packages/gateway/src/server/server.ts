@@ -106,13 +106,12 @@ import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachme
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
-	extractHandoffAtBlockStart,
+	extractRoutingBlocks,
 	extractWakeLines,
 	extractWatchLines,
 	type HandoffProvenance,
 	type HandoffReply,
 	handoffMessageId,
-	parseHandoffReply,
 	parseWatchTtl,
 	readHandoffProvenance,
 	renderHandoffFailure,
@@ -124,7 +123,6 @@ import {
 	renderWatchFailure,
 	renderWatchRegistered,
 	resolveHandoffTarget,
-	sanitizeHandoffTokens,
 	WATCH_REASON_MAX_LENGTH,
 	type WakeLine,
 	type WatchLine,
@@ -2859,6 +2857,24 @@ async function createInboundTurnLifecycle(
 		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
 	};
 	/**
+	 * Every handoff block of one final answer. Spellings that resolve to the same
+	 * conversation are one hop: the source message may enqueue one row there, so
+	 * their notes travel together instead of the later ones being dropped.
+	 */
+	const handOffAll = async (handoffs: readonly HandoffReply[]) => {
+		const merged = new Map<string, HandoffReply>();
+		for (const handoff of handoffs) {
+			const resolved = resolveHandoffTarget(handoff.target, runtime.config);
+			const id = resolved.ok ? resolved.originKey : `unresolved:${handoff.target}`;
+			const prior = merged.get(id);
+			merged.set(
+				id,
+				prior ? { target: prior.target, note: [prior.note, handoff.note].filter(Boolean).join("\n\n") } : handoff,
+			);
+		}
+		for (const handoff of merged.values()) await handOff(handoff);
+	};
+	/**
 	 * A `[WAKE:<origin>] <summary>` line (#442): the target conversation's session
 	 * gets one durable internal turn carrying the summary as information only, over
 	 * the handoff relay (same hop chain and limit). This conversation keeps its
@@ -3044,44 +3060,21 @@ async function createInboundTurnLifecycle(
 	};
 	const deliverTurnText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
-		let messageToProcess = rawMessage;
-		let handoffAfterDelivery: HandoffReply | undefined;
-
-		// Check if message STARTS with a handoff token
-		const handoffAtStart = parseHandoffReply(rawMessage);
-		if (handoffAtStart) {
-			// The work itself never posts here; only the final answer hands off.
-			if (source === "terminal") await handOff(handoffAtStart);
+		// Routing blocks may sit anywhere and repeat. Handoff blocks never post
+		// here and leave only with the final answer, after this conversation's own
+		// parts; post blocks come back as ordinary [POST:] parts.
+		const routed = extractRoutingBlocks(rawMessage);
+		const handoffsAfterDelivery = source === "terminal" ? routed.handoffs : [];
+		let message = routed.text;
+		if (!message) {
+			await handOffAll(handoffsAfterDelivery);
 			return;
 		}
-
-		// A token can open a later [BREAK]-delimited block. Deliver earlier blocks
-		// first, then hand off; tokens on ordinary lines remain non-directive text.
-		const blockHandoff = extractHandoffAtBlockStart(rawMessage);
-		if (blockHandoff) {
-			// Process only the text before the token
-			messageToProcess = blockHandoff.textBefore;
-			// Save handoff to trigger after delivery
-			if (source === "terminal") {
-				handoffAfterDelivery = blockHandoff.handoff;
-			}
-		}
-		const sanitized = sanitizeHandoffTokens(messageToProcess);
-		let message = sanitized.text;
-		const reportInvalidHandoff = () => {
-			if (source === "terminal" && sanitized.strippedToken) {
-				deliverTerminalLine(
-					"A handoff token was removed because it did not form a valid reply-block directive; no handoff was sent.",
-					deliveredParts.length,
-				);
-			}
-		};
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
 			message = reactionReply.body;
 			if (!message) {
-				reportInvalidHandoff();
-				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				await handOffAll(handoffsAfterDelivery);
 				return;
 			}
 		} else if (reactionReply) {
@@ -3156,8 +3149,7 @@ async function createInboundTurnLifecycle(
 			}
 			message = reactionReply.body;
 			if (!message) {
-				reportInvalidHandoff();
-				if (handoffAfterDelivery) await handOff(handoffAfterDelivery);
+				await handOffAll(handoffsAfterDelivery);
 				return;
 			}
 		}
@@ -3211,22 +3203,25 @@ async function createInboundTurnLifecycle(
 		const planned: PlannedPart[] = [];
 		for (const rawPart of parts) {
 			if (planned.length >= maxTurnParts) break;
-			// Cross-room post: a part opening with [POST:<origin key>] goes to that
-			// configured channel instead of this conversation. A refused target keeps
-			// the part here (token stripped) so its content is never lost.
+			// Cross-room post: a part opening with [POST:<target>] (block-form posts
+			// and [SEND:] arrive here as such parts) goes to that configured channel
+			// instead of this conversation. A refused target keeps the part here
+			// (token stripped) so its content is never lost.
 			let part = rawPart;
 			let post: PlannedPart["post"];
+			const refused = (target: string, reason: string) => {
+				if (reason === "current_conversation" || postRefusalsLogged.has(rawPart)) return;
+				postRefusalsLogged.add(rawPart);
+				console.error(
+					`gateway post target refused origin=${key} target=${JSON.stringify(sanitizeDiagnostic(target).slice(0, 160))} reason=${reason}; delivering the part here`,
+				);
+			};
 			const postMatch = rawPart.match(POST_TOKEN);
 			if (postMatch) {
 				part = rawPart.slice(postMatch[0].length);
 				const resolved = resolvePostTarget(postMatch[1] ?? "", origin, runtime.config);
 				if (resolved.ok) post = { origin: resolved.target, key: resolved.key };
-				else if (resolved.reason !== "current_conversation" && !postRefusalsLogged.has(rawPart)) {
-					postRefusalsLogged.add(rawPart);
-					console.error(
-						`gateway post target refused origin=${key} target=${JSON.stringify(sanitizeDiagnostic(postMatch[1] ?? "").slice(0, 160))} reason=${resolved.reason}; delivering the part here`,
-					);
-				}
+				else refused(postMatch[1] ?? "", resolved.reason);
 			}
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
 			// answer a specific message; mentions are plain <@author id> in the text.
@@ -3236,11 +3231,22 @@ async function createInboundTurnLifecycle(
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
+			let replyTarget = replyMatch?.[1];
+			if (!post && replyTarget) {
+				// [REPLY:<channel>] is a post; as a message id it would land here while
+				// the persona believes it spoke in that channel.
+				const conversation = replyTargetConversation(replyTarget, origin, runtime.config);
+				if (conversation) {
+					if (conversation.ok) post = { origin: conversation.target, key: conversation.key };
+					else refused(replyTarget, conversation.reason);
+					replyTarget = undefined;
+				}
+			}
 			if (post) {
 				planned.push({ body, post });
 				continue;
 			}
-			const replyTo = replyMatch?.[1] || inboundThreadRoot;
+			const replyTo = replyTarget || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		const local = planned.filter((step) => step.post === undefined);
@@ -3310,10 +3316,7 @@ async function createInboundTurnLifecycle(
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
 		if (fileReply) await deliverFiles(fileReply.paths, planned.at(-1)?.replyTo ?? inboundThreadRoot);
-		if (handoffAfterDelivery) {
-			await handOff(handoffAfterDelivery);
-		}
-		reportInvalidHandoff();
+		await handOffAll(handoffsAfterDelivery);
 	};
 	/**
 	 * Sends one [POST:] part to its target conversation through the ordinary
@@ -3969,19 +3972,45 @@ export type PostTargetResolution =
 				| "unconfigured_channel";
 	  };
 
+const PLATFORM_CHANNEL = /^([a-z]+):([A-Za-z0-9_-]+)$/;
+const CHANNEL_MENTION = /^<#([A-Za-z0-9_-]+)(?:\|[^>]*)?>$/;
+const BARE_CHANNEL_ID = /^[A-Za-z0-9_-]+$/;
+
 /**
- * Where a [POST:] part may go: a canonical origin key (the protocol parser,
- * nothing looser) naming a `channel` on the current platform that the gateway
- * configuration lists. DMs, threads, other platforms and unlisted rooms are
- * refused so a persona cannot write into a conversation nobody configured.
+ * The conversation a [POST:] / [SEND:] / [REPLY:] target spells, or undefined
+ * when it spells none. Models write every form, so all are read: a canonical
+ * origin key, a `handoffTargets` alias, `<platform>:<channel id>`, a channel
+ * mention `<#id>`, or a bare channel id on this platform (`bare`: the one form
+ * a platform message id can also take).
  */
-export function resolvePostTarget(raw: string, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
-	let target: OriginRef;
-	try {
-		target = parseOriginKey(raw.trim());
-	} catch {
-		return { ok: false, reason: "invalid_origin_key" };
-	}
+function spelledConversation(
+	raw: string,
+	origin: OriginRef,
+	config: Pick<GatewayConfig, "handoffTargets">,
+): { readonly target: OriginRef; readonly bare: boolean } | undefined {
+	const spelled = raw.trim();
+	const parse = (key: string) => {
+		try {
+			return parseOriginKey(key);
+		} catch {
+			return undefined;
+		}
+	};
+	const canonical = parse(spelled);
+	if (canonical) return { target: canonical, bare: false };
+	const aliased = config.handoffTargets?.[spelled];
+	if (aliased) return { target: aliased, bare: false };
+	const prefixed = spelled.match(PLATFORM_CHANNEL);
+	const prefixedTarget = prefixed ? parse(`${prefixed[1]}/channel/${prefixed[2]}`) : undefined;
+	if (prefixedTarget) return { target: prefixedTarget, bare: false };
+	const mention = spelled.match(CHANNEL_MENTION);
+	const mentionTarget = mention ? parse(`${origin.platform}/channel/${mention[1]}`) : undefined;
+	if (mentionTarget) return { target: mentionTarget, bare: false };
+	const bareTarget = BARE_CHANNEL_ID.test(spelled) ? parse(`${origin.platform}/channel/${spelled}`) : undefined;
+	return bareTarget ? { target: bareTarget, bare: true } : undefined;
+}
+
+function resolveSpelledPost(target: OriginRef, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
 	const key = originKey(target);
 	if (key === originKey(origin)) return { ok: false, reason: "current_conversation" };
 	if (target.platform !== origin.platform || !isChatPlatform(target.platform))
@@ -3989,6 +4018,36 @@ export function resolvePostTarget(raw: string, origin: OriginRef, config: Gatewa
 	if (target.kind !== "channel") return { ok: false, reason: "not_a_channel" };
 	if (!resolveChannelPolicy(target, config)) return { ok: false, reason: "unconfigured_channel" };
 	return { ok: true, target, key };
+}
+
+/**
+ * Where a [POST:] part may go: a `channel` on the current platform that the
+ * gateway configuration lists, however its target is spelled. DMs, threads,
+ * other platforms and unlisted rooms are refused so a persona cannot write
+ * into a conversation nobody configured.
+ */
+export function resolvePostTarget(raw: string, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
+	const spelled = spelledConversation(raw, origin, config);
+	return spelled ? resolveSpelledPost(spelled.target, origin, config) : { ok: false, reason: "invalid_origin_key" };
+}
+
+/**
+ * Models write `[REPLY:<channel>]` meaning "say this in that channel". A reply
+ * target that spells a conversation is read as a post target; undefined means
+ * it is a message id and threads here as before. A bare id counts as a
+ * conversation only when it IS one this reply could name (a configured channel
+ * or this one) - otherwise it is a message id like any other.
+ */
+export function replyTargetConversation(
+	raw: string,
+	origin: OriginRef,
+	config: GatewayConfig,
+): PostTargetResolution | undefined {
+	const spelled = spelledConversation(raw, origin, config);
+	if (!spelled) return undefined;
+	const resolved = resolveSpelledPost(spelled.target, origin, config);
+	if (spelled.bare && !resolved.ok && resolved.reason !== "current_conversation") return undefined;
+	return resolved;
 }
 
 /**
@@ -4023,13 +4082,13 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// thread (live, slack DM, 2026-09-17).
 		...(isChatPlatform(origin.platform)
 			? [
-					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
-					`Posting to another room: start a reply part with [POST:<origin key>] (for example [POST:${origin.platform}/channel/<channel id>]) to send that part to another channel instead of this conversation; the token never appears in the delivered text. Only ${origin.platform} channels configured in the gateway are allowed - never a DM or a thread, never another platform - and a refused target is posted here with the token removed. A post is sent once, when your answer is final, and a reply-threading token in the same part is ignored. In Discord and Slack text, a channel link is <#channel id>.`,
+					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root. To say something in another channel, use a post block (below), not a reply token.",
+					`Posting to another room: wrap what that channel should read as [POST:<origin key>] the text to post [POSTDONE] (for example [POST:${origin.platform}/channel/<channel id>] ... [POSTDONE]); [SEND:<target>] ... [SENDDONE] means the same. Blocks may sit anywhere in a reply and one reply may carry several; text outside them is delivered here as usual, and the tokens never appear in the delivered text. The target may also be written as a configured handoff alias, ${origin.platform}:<channel id>, or <#channel id>. Only ${origin.platform} channels configured in the gateway are allowed - never a DM or a thread, never another platform - and a refused target is posted here with the token removed. A post is sent once, when your answer is final, and a reply-threading token inside it is ignored. In Discord and Slack text, a channel link is <#channel id>.`,
 				]
 			: []),
 		...(isChatPlatform(origin.platform)
 			? [
-					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
+					"Handoffs: when work belongs to another conversation, wrap it in your final reply as [HANDOFF:<target>] what that conversation's session needs to know and do [HANDOFFDONE] (<target> is a configured handoff alias or an origin such as discord:<channel id>). Blocks may sit anywhere in the reply and one reply may hand off to several conversations; text outside the blocks is answered here as usual, and each target gets a pointer here. That session answers there. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
 					"Waking another conversation: when another conversation's session should KNOW something but the work stays here, put a line [WAKE:<target>] <one-line summary> (a configured handoff alias or an origin such as discord:<channel id>) at the start of a line in your final reply. That line is removed from what this conversation sees, the rest of your reply is delivered here as usual, and the target session gets an internal turn carrying the summary as information only - it grants that session no permission and is not an instruction. Wakes use the handoff chain: they stop after 2 hops, a target already in the chain is refused, and a refused or unknown target is reported here.",
 					"Watching another conversation: when you need to wait for its next human message, put [WATCH:<target>] <ttl> <short reason> on a line in your final reply (for example [WATCH:discord/dm/peer=<id>] 30m waiting for the Harbor credential). Targets use a configured handoff alias or a canonical chat origin key; TTL is 1m-7d and the reason is 1-240 characters. The watch is one-shot and expires automatically. On a matching human message, this conversation gets an internal information-only turn with the sender, origin, reason and queue status; the original message, attachments and secrets are not copied. The source session handles the message independently, and this watch grants no permission. Only one active watch per target is allowed; the 2-hop limit and loop checks still apply.",
 				]
