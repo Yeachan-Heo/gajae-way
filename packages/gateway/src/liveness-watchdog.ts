@@ -9,29 +9,35 @@ export interface LivenessWatchdogOptions {
 	readonly beatMs?: number;
 }
 
+interface WatchdogState {
+	seenBeat: number;
+	checkedAt: number;
+	stalledMs: number;
+}
+
+/** Advances the worker's awake-time budget using a supplied clock sample. */
+export function advanceWatchdogState(state: WatchdogState, currentBeat: number, now: number, checkMs: number): void {
+	state.stalledMs += Math.min(Math.max(0, now - state.checkedAt), 2 * checkMs);
+	state.checkedAt = now;
+	if (currentBeat !== state.seenBeat) {
+		state.seenBeat = currentBeat;
+		state.stalledMs = 0;
+	}
+}
+
 // Inline source keeps the watchdog working in a `bun build --compile` binary,
-// which embeds no separate worker entrypoint.
+// which embeds no separate worker entrypoint. Serialize the state transition so
+// the worker and deterministic clock test exercise the same implementation.
 const WORKER_SOURCE = `
 const { writeSync } = require("node:fs");
+const advanceWatchdogState = (${advanceWatchdogState.toString()});
 self.onmessage = ({ data }) => {
 	const beat = new Int32Array(data.buffer);
-	let seen = Atomics.load(beat, 0);
-	let checkedAt = Date.now();
-	let stalledMs = 0;
+	const state = { seenBeat: Atomics.load(beat, 0), checkedAt: Date.now(), stalledMs: 0 };
 	setInterval(() => {
-		// Count only time this worker was itself awake: a suspended process (host
-		// sleep, SIGSTOP) pauses both threads, and the wall-clock gap on resume is
-		// not the main thread's fault.
 		const now = Date.now();
-		stalledMs += Math.min(Math.max(0, now - checkedAt), 2 * data.checkMs);
-		checkedAt = now;
-		const current = Atomics.load(beat, 0);
-		if (current !== seen) {
-			seen = current;
-			stalledMs = 0;
-			return;
-		}
-		if (stalledMs < data.stallMs) return;
+		advanceWatchdogState(state, Atomics.load(beat, 0), now, data.checkMs);
+		if (state.stalledMs < data.stallMs) return;
 		try {
 			writeSync(2, data.line);
 		} catch {}

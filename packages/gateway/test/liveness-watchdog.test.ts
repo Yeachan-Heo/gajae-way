@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
+import { advanceWatchdogState } from "../src/liveness-watchdog";
 
 const watchdogModule = join(import.meta.dir, "../src/liveness-watchdog.ts");
 
@@ -57,28 +58,24 @@ test("a serviced event loop is never killed and the watchdog does not hold the p
 	expect(result.stderr).not.toContain("event_loop_stalled");
 });
 
-test("a whole-process suspension longer than the deadline is not a stall", async () => {
-	// SIGSTOP pauses the worker and the main thread alike, as host sleep does;
-	// the wall-clock gap seen on resume must not read as a wedged main thread.
-	const result = await runChild(
-		`
-		let ticks = 0;
-		const timer = setInterval(() => {
-			if (++ticks === 40) {
-				clearInterval(timer);
-				console.log("done");
-			}
-		}, 50);
-	`,
-		async (child) => {
-			await Bun.sleep(400);
-			child.kill("SIGSTOP");
-			await Bun.sleep(1_500);
-			child.kill("SIGCONT");
-		},
-	);
-	expect(result.signalCode).toBeNull();
-	expect(result.exitCode).toBe(0);
-	expect(result.stdout).toContain("done");
-	expect(result.stderr).not.toContain("event_loop_stalled");
+test("a whole-process suspension longer than the deadline is not a stall", () => {
+	const stallMs = 400;
+	const checkMs = 50;
+	const state = { seenBeat: 0, checkedAt: 0, stalledMs: 0 };
+
+	// The worker gets the first check after resume, before the main-thread beat
+	// timer. Its injected clock sees a 1.5s wall-clock gap, but only awake time
+	// counts toward the 400ms deadline.
+	advanceWatchdogState(state, 0, 1_500, checkMs);
+	expect(state.stalledMs).toBe(2 * checkMs);
+	expect(state.stalledMs).toBeLessThan(stallMs);
+
+	// Once the main thread services its timer, the next worker check resets the
+	// budget. A genuinely wedged main thread still accumulates the full deadline.
+	advanceWatchdogState(state, 1, 1_550, checkMs);
+	expect(state.stalledMs).toBe(0);
+	for (let now = 1_600; now <= 1_950; now += checkMs) {
+		advanceWatchdogState(state, 1, now, checkMs);
+	}
+	expect(state.stalledMs).toBe(stallMs);
 });
