@@ -659,18 +659,21 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 
 test("simultaneous cap admission and same-name resume refuse without overlapping sends", async () => {
 	const f = await fixture();
-	const results = await Promise.allSettled([started(f, "a"), started(f, "b"), started(f, "c")]);
+	const names = ["a", "b", "c"] as const;
+	const results = await Promise.allSettled(names.map((name) => started(f, name)));
 	expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
 	const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
 	expect(rejected.reason).toMatchObject({ code: "lane_capacity", detail: { active: 2, maxLanes: 2 } });
+	// Repo facts are read asynchronously before admission, so which two win is not fixed.
+	const admitted = names[results.findIndex((r) => r.status === "fulfilled")]!;
 	for (const resume of [false, true])
-		await expect(f.manager.start({ name: "a", text: "again", cwd: f.directory, resume })).rejects.toMatchObject({
+		await expect(f.manager.start({ name: admitted, text: "again", cwd: f.directory, resume })).rejects.toMatchObject({
 			code: "invalid_params",
 			detail: { reasonCode: "attempt_open" },
 		});
 	expect(f.port.binds).toHaveLength(2);
 	expect(f.port.sends).toHaveLength(2);
-	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: false });
+	expect(await f.lanes.retire(admitted, "operator")).toMatchObject({ retired: false });
 	expect(await f.lanes.sweep(Date.now() + 1e9)).toBe(0);
 });
 
@@ -1624,22 +1627,26 @@ test("remote clones are asynchronous, preserve repo_clone_failed, and clean up m
 test("#615: a lane start whose git never returns does not wedge other requests", async () => {
 	const hang = await hangingStatusRepo();
 	cleanups.push(hang.cleanup);
-	const f = await fixture({ gitCommandTimeoutMs: 400 });
+	const f = await fixture({ gitCommandTimeoutMs: 2_000 });
 	let ticks = 0;
-	const timer = setInterval(() => ticks++, 10);
+	const timer = setInterval(() => ticks++, 5);
+	const stuck = f.manager.start({ name: "stuck-facts", text: "work", cwd: hang.repo });
 	try {
-		const stuck = f.manager.start({ name: "stuck-facts", text: "work", cwd: hang.repo });
 		const pid = await hookPid(hang.pidFile);
-		// While that lane's git is stuck, an unrelated lane is admitted, bound and sent.
+		// While that lane's git is stuck, an unrelated lane is admitted, bound and sent,
+		// and timers keep firing.
 		const other = await f.manager.start({ name: "other", text: "work", cwd: f.directory });
 		expect(other.started).toBe(true);
+		const before = ticks;
+		await Bun.sleep(50);
+		expect(ticks).toBeGreaterThan(before);
 		expect(pidAlive(pid)).toBe(true);
-		expect(ticks).toBeGreaterThan(0);
 		// Repo facts are optional at start: the deadline drops them and the lane proceeds.
 		expect(await stuck).toMatchObject({ started: true });
 		expect(await untilGone(pid)).toBe(true);
 	} finally {
 		clearInterval(timer);
+		await stuck.catch(() => undefined);
 	}
 });
 
