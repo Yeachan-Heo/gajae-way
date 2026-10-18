@@ -64,10 +64,14 @@ describe("permission panels", () => {
 	});
 
 	test.each([
-		["non-Slack origin", { origin: { platform: "discord", kind: "channel", conversationId: "D1" } as OriginRef }],
-		["unknown origin", { origin: undefined }],
-		["no trigger author", { triggerAuthorId: undefined }],
-	])("%s is declined without posting a panel", async (_name, overrides) => {
+		[
+			"non-Slack origin",
+			{ origin: { platform: "discord", kind: "channel", conversationId: "D1" } as OriginRef },
+			"panels not available for discord",
+		],
+		["unknown origin", { origin: undefined }, "session origin not found"],
+		["no trigger author", { triggerAuthorId: undefined }, "no trigger author to answer the panel"],
+	])("%s is declined without posting a panel", async (_name, overrides, message) => {
 		const h = harness();
 		await h.open(overrides);
 		expect(h.delivered).toEqual([]);
@@ -76,7 +80,7 @@ describe("permission panels", () => {
 				id: "rev-1",
 				connectionId: "conn-1",
 				leaseId: "lease-1",
-				error: { code: "unavailable", message: expect.any(String) },
+				error: { code: "unavailable", message },
 			},
 		]);
 		expect(h.panels.size).toBe(0);

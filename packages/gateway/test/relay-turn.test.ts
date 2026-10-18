@@ -6,8 +6,10 @@ import {
 	RelayRefusedError,
 	RelayRequestTimeoutError,
 	type TailFrame,
+	type TailHandle,
 	TailRunner,
 } from "../src/orchestrator/tail-runner";
+import { PermissionPanels } from "../src/server/permission-panels";
 
 /**
  * A scripted `gjc sdk serve --stdio` host: answers hello with a connectionId,
@@ -116,6 +118,61 @@ test("attach exchanges hello and stamps every request with the host's connection
 	expect(await pending).toEqual({ ok: true, result: { status: "in_flight" } });
 	await handle.close();
 	expect(relay.closed).toBe(true);
+});
+
+test("a fake GJC ui.elicit request is not advertised and gets an explicit stale-request refusal", async () => {
+	const relay = new FakeRelay();
+	const panels = new PermissionPanels({ deliver: () => {} });
+	let handled!: () => void;
+	const requestHandled = new Promise<void>((resolve) => {
+		handled = resolve;
+	});
+	let handle!: TailHandle;
+	handle = await runner(() => relay).attach({
+		sessionId: "ask-ui",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onReverseRequest: async (request) => {
+			await panels.open({
+				origin: { platform: "discord", kind: "dm", conversationId: "discord-dm" },
+				triggerAuthorId: "discord-user",
+				tail: handle,
+				request,
+			});
+			handled();
+		},
+	});
+	handle.beginTurn("ask-ui");
+	expect(relay.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+		{ capability: "permission", definitions: { methods: ["request"] } },
+	]);
+	relay.host({
+		type: "reverse_request",
+		id: "ask-1",
+		connectionId: "connection:1",
+		leaseId: "lease-ui",
+		capability: "ui",
+		payload: {
+			method: "ui.elicit",
+			payload: {
+				mode: "form",
+				message: "Choose one",
+				requestedSchema: {
+					type: "object",
+					properties: { value: { type: "string", oneOf: [{ const: "option:0", title: "First" }] } },
+					required: ["value"],
+				},
+			},
+		},
+	});
+	await requestHandled;
+	expect(relay.lastRequest("reverse_response")).toMatchObject({
+		type: "reverse_response",
+		id: "ask-1",
+		ok: false,
+		error: { code: "unavailable", message: "ui.elicit not available" },
+	});
+	await handle.close();
 });
 
 test("control responses resolve by id; a refused control carries its error code", async () => {
@@ -559,12 +616,16 @@ test("providers are registered after a reused turn's transport reopens", async (
 	});
 	const handle = await tail.attach({ sessionId: "providers", brokerGeneration: 1, repo: "/tmp" });
 	handle.beginTurn("first");
-	expect(relays[0]!.written.filter((frame) => frame.type === "register_provider")).toHaveLength(2);
+	expect(relays[0]!.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+		{ capability: "permission", definitions: { methods: ["request"] } },
+	]);
 	handle.beginTurn("second");
 	relays[0]!.end();
 	await Bun.sleep(10);
 	expect(relays).toHaveLength(2);
-	expect(relays[1]!.written.filter((frame) => frame.type === "register_provider")).toHaveLength(2);
+	expect(relays[1]!.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+		{ capability: "permission", definitions: { methods: ["request"] } },
+	]);
 	await handle.close();
 });
 
