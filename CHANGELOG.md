@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.2] - 2026-10-18
+
+### Features
+- **gateway**: Block-form `HANDOFF`/`SEND` routing tokens anywhere in a reply, many per turn; `SEND`/`REPLY:<channel>` post cross-room (#614)
+- **gateway**: Report functional readiness (#608)
+- **gateway**: Intent-first broker operation journal and broker readiness wait for `work.start` (#568, #570)
+
+### Fixes
+- **gateway**: Pin GJC 0.18.12 (#617)
+- **gateway**: Re-prompt the persona after runs the runtime started on its own (#612)
+- **gateway**: Roll a monitor session after a wedged prompt submission (#611)
+- **gateway**: Terminalize stalled persona turns (#596, #599)
+- **gateway**: Drain persona turns before shutdown (#601, #605)
+- **gateway**: Recover invalid model creates and drain restarts (#602, #607)
+- **gateway**: Diagnose monitor dispatch failures (#600, #606)
+- **gateway**: Fix work lane checks lookup and retirement (#595, #598)
+- **broker**: Measure the watchdog window in awake time, not wall time (#610)
+- **discord**: Keep fenced `MEDIA` examples as text (#613)
+- **slack**: Preserve mrkdwn link syntax (#593, #594)
+
 ## [0.3.1] - 2026-10-15
 
 ### Fixes
