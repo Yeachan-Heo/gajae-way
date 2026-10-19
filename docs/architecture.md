@@ -54,6 +54,7 @@ SQLite records one active private broker authority and immutable gateway-created
 | `broker_operations` | `bindings` | `store/groups/bindings.ts` |
 | `deliveries` | `outbox` | `store/groups/outbox.ts` |
 | `inbound_messages` | `inbox` | `store/groups/inbox.ts` |
+| `thread_mutes` | `inbox` | `store/groups/inbox.ts` |
 | `cross_session_watches` | `inbox` | `store/groups/inbox.ts` |
 | `conversation_context` | `inbox` | `store/groups/inbox.ts` |
 | `conversation_context_state` | `inbox` | `store/groups/inbox.ts` |
