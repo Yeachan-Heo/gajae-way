@@ -136,7 +136,7 @@ docker compose run --rm -it setup gajaeway setup
 docker compose run --rm --no-deps -T setup gajaeway setup --status
 ```
 
-It is not a ready-to-chat deployment: it has no broker service, private pinned-GJC installation, or broker-agent provisioning step. The image's `/usr/local/bin/gjc` and `GJC_EXECUTABLE` setting do not replace the private executable required by the runtime. Model credentials must also be provisioned. Adapter services are profile-gated (`discord`, `slack`, `telegram`); setup writes their configuration but does not activate Compose profiles, so plain `docker compose up` starts no adapters. Use the local procedure above unless you supply the missing container orchestration.
+It is not a ready-to-chat deployment: it has no broker service, private pinned-GJC installation, or broker-agent provisioning step. The image's `/usr/local/bin/gjc` does not replace the private executable required by the runtime. Model credentials must also be provisioned. Adapter services are profile-gated (`discord`, `slack`, `telegram`); setup writes their configuration but does not activate Compose profiles, so plain `docker compose up` starts no adapters. Use the local procedure above unless you supply the missing container orchestration.
 
 ## Getting a Discord Bot Token
 
