@@ -445,6 +445,7 @@ test("#632: command prose is not evidence, while root files and keyed issue ids 
 		),
 	).toBe(true);
 	expect(isAuthoredEchoSuspected(instruction, `${instruction} I did not run \`make test\`.`)).toBe(true);
+	expect(isAuthoredEchoSuspected(instruction, "I did not inspect https://example.com/checks/42.")).toBe(true);
 });
 
 test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric results remain deliverable", () => {
@@ -465,6 +466,16 @@ test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric resu
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make test: passed.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make: passed.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran pytest: passed.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran git commit -m "fix": passed.`)).toBe(
+		false,
+	);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran ./scripts/check: passed.`)).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			longerInstruction,
+			`${longerInstruction} Ran pytest: 12 tests passed. Did not run integration tests.`,
+		),
+	).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth: 17.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Latency was 450.`)).toBe(false);

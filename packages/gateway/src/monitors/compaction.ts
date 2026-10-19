@@ -584,7 +584,7 @@ function structuredPayloadCountMarkers(payload: unknown, seen = new WeakSet<obje
 function authoredCommandMarkers(text: string): string[] {
 	const marker: string[] = [];
 	for (const [, executable, argumentsText] of text.matchAll(
-		/\b(?:ran|run|executed|execute|invoked|invoke|called)\s+([A-Za-z0-9_.+-]+)(?:\s+([A-Za-z0-9_./=+-]+(?:\s+[A-Za-z0-9_./=+-]+)*))?(?=\s*[:.;,!?\n]|$)/gi,
+		/\b(?:ran|run|executed|execute|invoked|invoke|called)\s+([A-Za-z0-9_./+-]+)(?:\s+((?:"[^"\n]*"|'[^'\n]*'|[A-Za-z0-9_./=+-]+)(?:\s+(?:"[^"\n]*"|'[^'\n]*'|[A-Za-z0-9_./=+-]+))*))?(?=\s*[:.;,!?\n]|$)/gi,
 	)) {
 		if (executable && !NON_COMMAND_START_WORDS.has(executable.toLowerCase()))
 			marker.push(argumentsText ? `${executable} ${argumentsText}` : executable);
@@ -626,6 +626,14 @@ function authoredEvidenceMarkers(text: string): string[] {
 		...(text.match(/`[^`\n]+`/g) ?? []),
 	];
 	return markers.map((marker) => marker.toLowerCase().replace(/[),.;!?}\]"'`]+$/g, ""));
+}
+
+function hasNovelAuthoredEvidence(note: string, contractEvidence: Set<string>): boolean {
+	const clauses = note.split(/[.!?;]\s+|\s+\b(?:but|however|although|yet)\b\s+/i);
+	return clauses.some((clause) => {
+		if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(clause))) return false;
+		return authoredEvidenceMarkers(clause).some((marker) => !contractEvidence.has(marker));
+	});
 }
 
 function authoredEchoTokens(text: string): string[] {
@@ -677,12 +685,12 @@ export function isAuthoredEchoSuspected(
 	);
 	if (contractContent.size === 0 || noteContent.size === 0) return false;
 
-	if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(note))) return true;
 	const contractEvidence = new Set([
 		...authoredEvidenceMarkers(evidenceContract),
 		...(evidenceContract.match(/\b\d+(?:,\d{3})*(?:\.\d+)?%?\b/g) ?? []),
 	]);
-	if (authoredEvidenceMarkers(note).some((marker) => !contractEvidence.has(marker))) return false;
+	if (hasNovelAuthoredEvidence(note, contractEvidence)) return false;
+	if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(note))) return true;
 
 	const novelTokens = [...noteContent].filter((token) => !contractContent.has(token));
 	const novelMetaWords = novelTokens.filter((token) => META_ECHO_WORDS.has(token)).length;
