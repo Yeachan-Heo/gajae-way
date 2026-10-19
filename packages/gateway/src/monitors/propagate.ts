@@ -1730,8 +1730,8 @@ export class MonitorPropagator {
 		return digest;
 	}
 	/**
-	 * Newest authored notes for one monitor, newest first, bounded by the digest
-	 * budget. Silent markers and contract restatements are skipped: the no-target
+	 * Newest authored notes for one monitor, newest first; the digest builder
+	 * applies the note cap. Silent markers and contract restatements are skipped: the no-target
 	 * path never classifies echoes, and an echo in the digest is exactly the
 	 * example a fresh session would copy (#369).
 	 */
@@ -1743,7 +1743,6 @@ export class MonitorPropagator {
 		)) {
 			if (isSilentOutput(row.note) || this.#isContractEcho(monitor, row.event_type, row.note)) continue;
 			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note: row.note });
-			if (notes.length === MONITOR_DIGEST_MAX_NOTES) break;
 		}
 		return notes;
 	}

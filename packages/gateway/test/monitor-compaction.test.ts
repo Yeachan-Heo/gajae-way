@@ -615,11 +615,11 @@ test("a monitor with no instruction has no task segment, and rolls with a digest
 	}
 });
 
-test("a rolled digest skips notes that only restated the instruction (#369)", async () => {
+test("a rolled digest skips silent notes and instruction echoes, and fills its budget from older real notes (#369)", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-digest-echo-"));
 	try {
 		const instruction = "Publish the blog draft and verify the live page.";
-		let mode: "real" | "echo" | "empty" = "real";
+		let mode: "real" | "echo" | "silent" | "empty" = "real";
 		const { database, registry, pipeline, turns } = await harness(directory, {
 			contextFailureRollThreshold: 1,
 			compaction: stubPort("unavailable"),
@@ -627,8 +627,9 @@ test("a rolled digest skips notes that only restated the instruction (#369)", as
 				if (mode === "empty") return "";
 				if (mode === "real") return echoNotes(prompt);
 				const payload = prompt.slice(prompt.indexOf("entry per event: ") + "entry per event: ".length);
+				const note = mode === "echo" ? instruction : "[SILENT]";
 				return JSON.stringify(
-					(JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => ({ eventId, note: instruction })),
+					(JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => ({ eventId, note })),
 				);
 			},
 		});
@@ -639,19 +640,32 @@ test("a rolled digest skips notes that only restated the instruction (#369)", as
 			burstPolicy: "serialize",
 			instruction,
 		});
-		const realId = await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 0 });
+		// One more legitimate note than the digest holds, oldest first.
+		const realIds: string[] = [];
+		for (let tick = 0; tick <= MONITOR_DIGEST_MAX_NOTES; tick += 1)
+			realIds.push(await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick }));
+		mode = "silent";
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 100 });
+		// More echoes than digest slots, all newer than every legitimate note.
 		mode = "echo";
-		const echoId = await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 1 });
-		// No delivery target: the echo settles as an ordinary undelivered note.
-		expect(database.monitors.authoredOutput(echoId)).toBe(instruction);
+		const echoIds: string[] = [];
+		for (let tick = 0; tick <= MONITOR_DIGEST_MAX_NOTES; tick += 1)
+			echoIds.push(await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 200 + tick }));
+		// No delivery target: an echo settles as an ordinary undelivered note.
+		for (const echoId of echoIds) expect(database.monitors.authoredOutput(echoId)).toBe(instruction);
 		mode = "empty";
-		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 2 });
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 300 });
 		mode = "real";
-		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 3 });
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 301 });
 		const rolled = turns.at(-1)?.prompt ?? "";
 		expect(rolled).toContain("Context compaction");
-		expect(rolled).toContain(`blog.tick: note for ${realId}`);
 		expect(rolled).not.toContain(`blog.tick: ${instruction}`);
+		expect(rolled).not.toContain("[SILENT]");
+		// The echoes do not consume the budget: the newest legitimate notes fill it,
+		// and the cap still holds.
+		const kept = realIds.filter((id) => rolled.includes(`blog.tick: note for ${id}`));
+		expect(kept).toEqual(realIds.slice(1));
+		expect(kept).toHaveLength(MONITOR_DIGEST_MAX_NOTES);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
