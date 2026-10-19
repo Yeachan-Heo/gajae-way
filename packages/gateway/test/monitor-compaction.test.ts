@@ -20,7 +20,7 @@ import {
 	type NativeCompactionStatus,
 	unavailableCompactionPort,
 } from "../src/monitors/compaction";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
@@ -358,9 +358,11 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		const healthyIds: string[] = [];
 		for (let tick = 0; tick < 3; tick += 1)
 			healthyIds.push(await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick }));
-		// Pre-failure prompts keep the exact original shape.
+		// Pre-failure prompts carry no digest.
 		for (const turn of turns) {
-			expect(turn.prompt.startsWith(`Author monitor events. ${instruction} Respond ONLY with a JSON array`)).toBe(true);
+			expect(
+				turn.prompt.startsWith(`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n${MONITOR_AUTHORING_REPORT_RULE}\n`),
+			).toBe(true);
 			expect(turn.prompt).not.toContain("Context compaction");
 		}
 		empty = true;
@@ -577,7 +579,7 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 	}
 });
 
-test("a monitor with no instruction is unchanged, and rolls with a digest that omits the instruction line", async () => {
+test("a monitor with no instruction has no task segment, and rolls with a digest that omits the instruction line", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-noinstr-"));
 	try {
 		let empty = false;
@@ -593,9 +595,12 @@ test("a monitor with no instruction is unchanged, and rolls with a digest that o
 			burstPolicy: "serialize",
 		});
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 0 });
-		// Unchanged prompt shape for an instruction-less monitor: no guidance, no
-		// digest, no leading blank.
-		expect(turns[0]!.prompt.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		// No task segment and no digest for an instruction-less monitor.
+		expect(
+			turns[0]!.prompt.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		empty = true;
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 1 });
 		empty = false;
@@ -603,7 +608,50 @@ test("a monitor with no instruction is unchanged, and rolls with a digest that o
 		const rolled = turns.at(-1)!;
 		expect(rolled.prompt).toContain("Context compaction");
 		expect(rolled.prompt).not.toContain("Standing instruction");
-		expect(rolled.prompt.startsWith("Author monitor events.\nContext compaction")).toBe(true);
+		expect(rolled.prompt.startsWith(`${MONITOR_AUTHORING_HEADER}\nContext compaction`)).toBe(true);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a rolled digest skips notes that only restated the instruction (#369)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-digest-echo-"));
+	try {
+		const instruction = "Publish the blog draft and verify the live page.";
+		let mode: "real" | "echo" | "empty" = "real";
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			contextFailureRollThreshold: 1,
+			compaction: stubPort("unavailable"),
+			respond: (prompt) => {
+				if (mode === "empty") return "";
+				if (mode === "real") return echoNotes(prompt);
+				const payload = prompt.slice(prompt.indexOf("entry per event: ") + "entry per event: ".length);
+				return JSON.stringify(
+					(JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => ({ eventId, note: instruction })),
+				);
+			},
+		});
+		const monitor = registry.add({
+			name: "blog",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["blog.tick"],
+			burstPolicy: "serialize",
+			instruction,
+		});
+		const realId = await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 0 });
+		mode = "echo";
+		const echoId = await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 1 });
+		// No delivery target: the echo settles as an ordinary undelivered note.
+		expect(database.monitors.authoredOutput(echoId)).toBe(instruction);
+		mode = "empty";
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 2 });
+		mode = "real";
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 3 });
+		const rolled = turns.at(-1)?.prompt ?? "";
+		expect(rolled).toContain("Context compaction");
+		expect(rolled).toContain(`blog.tick: note for ${realId}`);
+		expect(rolled).not.toContain(`blog.tick: ${instruction}`);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

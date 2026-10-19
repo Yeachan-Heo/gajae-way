@@ -273,3 +273,15 @@ test("authored-note digest returns newest notes that actually have output", asyn
 		expect(database.monitors.recentAuthoredNotes("m1", 1).map((r) => r.note)).toEqual(["third"]);
 	});
 });
+
+test("authored-note digest never returns contract_unmet echoes (#369)", async () => {
+	await withDb((database) => {
+		seedEvent(database, "real", "delivered", null, "2026-10-01T00:00:01.000Z");
+		seedEvent(database, "echo", "contract_unmet", null, "2026-10-01T00:00:02.000Z");
+		database.transaction((tx) => {
+			database.monitors.authoredOutputCreate(tx, "real", "published r-1");
+			database.monitors.authoredOutputCreate(tx, "echo", "Publish the draft.");
+		});
+		expect(database.monitors.recentAuthoredNotes("m1", 5).map((r) => r.note)).toEqual(["published r-1"]);
+	});
+});

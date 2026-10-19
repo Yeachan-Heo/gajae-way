@@ -6,7 +6,7 @@ import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
 import { FunctionalReadiness } from "../src/functional-readiness";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import { MONITOR_AUTHORING_HEADER, MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -344,7 +344,7 @@ test("the runtime routes a monitor report into the target conversation's persona
 		const sessionPort = sessionPortFromResponder({
 			bind: (key, epoch) => `${key}-session-${epoch}`,
 			respond: async (_sessionId, text) => {
-				if (text.startsWith("Author monitor events."))
+				if (text.startsWith(MONITOR_AUTHORING_HEADER))
 					return JSON.stringify(
 						eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "Completed by monitor." })),
 					);
