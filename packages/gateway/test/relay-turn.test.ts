@@ -120,6 +120,75 @@ test("attach exchanges hello and stamps every request with the host's connection
 	expect(relay.closed).toBe(true);
 });
 
+test("session observer content is activity only, without adoption or delivery-backlog timestamps", async () => {
+	const relay = new FakeRelay();
+	const frames: TailFrame[] = [];
+	let activity = 0;
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const handle = await runner(() => relay).attach({
+		sessionId: "session-observer",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onSessionActivity: () => {
+			activity++;
+		},
+		onFrame: async (frame) => {
+			frames.push(frame);
+			await blocked;
+		},
+	});
+	try {
+		expect(relay.written[0]?.capabilities).toEqual(["tool_activity_v2", "turn_stream", "session_host_observer_v1"]);
+		relay.host({ type: "event", kind: "tool_execution_end", payload: {} });
+		await Bun.sleep(0);
+		expect(activity).toBe(0); // No selected operation yet.
+		handle.beginTurn("op", CORRELATION);
+		relay.host(messageEnd("assistant", "owned"));
+		await Bun.sleep(0);
+		expect(frames).toHaveLength(1);
+		for (const kind of [
+			"message_update",
+			"message_end",
+			"tool_execution_start",
+			"tool_execution_update",
+			"tool_execution_end",
+		])
+			relay.host({ type: "event", kind, payload: {} });
+		await Bun.sleep(0);
+		expect(activity).toBe(5); // Ingress, even with the owned consumer blocked.
+		expect(frames).toHaveLength(1); // No observer content or synthesized IDs.
+		for (const frame of [
+			{ type: "hello", connectionId: relay.connectionId },
+			{ type: "activity", state: "active", at: Date.now() },
+			{ type: "tool_activity", state: "running" },
+			{ type: "event", kind: "unknown_future_kind", payload: {} },
+			{ type: "agent_start" },
+			{ type: "agent_end" },
+			messageEnd("assistant", "foreign", { commandId: "foreign", turnId: "foreign" }),
+		])
+			relay.host(frame);
+		await Bun.sleep(0);
+		expect(activity).toBe(5);
+		release();
+		await Bun.sleep(0);
+		// Uncorrelated idle remains an actor hint, never a correlated receipt.
+		expect(frames.map((frame) => [frame.kind, frame.commandId])).toEqual([
+			["message_end", CORRELATION.commandId],
+			["agent_end", undefined],
+		]);
+		await handle.close();
+		relay.host({ type: "event", kind: "tool_execution_end", payload: {} });
+		await Bun.sleep(0);
+		expect(activity).toBe(5);
+	} finally {
+		release();
+		await handle.close();
+	}
+});
+
 test("a fake GJC ui.elicit request is not advertised and gets an explicit stale-request refusal", async () => {
 	const relay = new FakeRelay();
 	const panels = new PermissionPanels({ deliver: () => {} });
