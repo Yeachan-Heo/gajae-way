@@ -532,13 +532,12 @@ export function isAuthoredEchoSuspected(
 	eventContext?: AuthoredEchoEventContext,
 ): boolean {
 	if (!note) return false;
-	const contractParts = [
-		contractText,
-		eventContext?.eventType,
-		eventContext?.payload === undefined ? undefined : eventPayloadDateTokens(eventContext.payload),
-	].filter((part): part is string => Boolean(part));
-	if (contractParts.length === 0) return false;
-	const fullContract = contractParts.join("\n");
+	// Score instruction and event type independently so either can expose a short echo.
+	const contractSources = [contractText, eventContext?.eventType].filter((part): part is string => Boolean(part));
+	if (contractSources.length === 0) return false;
+	const payloadDateTokens = eventContext?.payload === undefined ? "" : eventPayloadDateTokens(eventContext.payload);
+	const fullContract = [...contractSources, payloadDateTokens].filter(Boolean).join("\n");
+	// Event identity, timing and the full payload can explain copied markers, but must not inflate task coverage.
 	const evidenceContract = [
 		fullContract,
 		eventContext?.eventId,
@@ -547,23 +546,32 @@ export function isAuthoredEchoSuspected(
 	]
 		.filter((part): part is string => Boolean(part))
 		.join("\n");
-	const contractContent = new Set(
-		authoredEchoTokens(fullContract).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token)),
+	const contractContentSources = contractSources.map(
+		(source) => new Set(authoredEchoTokens(source).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token))),
 	);
-	const noteContent = new Set(authoredEchoTokens(note).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token)));
+	const contractContent = new Set(contractContentSources.flatMap((source) => [...source]));
+	// Remove event-owned date/time tokens from both coverage and novelty scoring.
+	const payloadDateContent = new Set(authoredEchoTokens(payloadDateTokens));
+	const noteContent = new Set(
+		authoredEchoTokens(note).filter(
+			(token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token) && !payloadDateContent.has(token),
+		),
+	);
 	if (contractContent.size === 0 || noteContent.size === 0) return false;
 
 	const contractEvidence = new Set(authoredEvidenceMarkers(evidenceContract));
 	if (authoredEvidenceMarkers(note).some((marker) => !contractEvidence.has(marker))) return false;
 	if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(note))) return true;
 
-	const sharedTokens = [...noteContent].filter((token) => contractContent.has(token)).length;
 	const novelTokens = [...noteContent].filter((token) => !contractContent.has(token));
 	const novelMetaWords = novelTokens.filter((token) => META_ECHO_WORDS.has(token)).length;
 	const novelContentRatio = (novelTokens.length - novelMetaWords) / noteContent.size;
+	const hasCoveredContractSource = contractContentSources.some((source) => {
+		if (source.size === 0) return false;
+		const sharedTokens = [...noteContent].filter((token) => source.has(token)).length;
+		return sharedTokens / source.size >= MIN_CONTRACT_COVERAGE;
+	});
 	return (
-		sharedTokens / contractContent.size >= MIN_CONTRACT_COVERAGE &&
-		novelMetaWords <= MAX_NOVEL_META_WORDS &&
-		novelContentRatio <= MAX_NOVEL_CONTENT_RATIO
+		hasCoveredContractSource && novelMetaWords <= MAX_NOVEL_META_WORDS && novelContentRatio <= MAX_NOVEL_CONTENT_RATIO
 	);
 }

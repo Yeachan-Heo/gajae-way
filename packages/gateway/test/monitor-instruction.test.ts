@@ -389,6 +389,24 @@ test("#632: seven paraphrased daily notes are detected against the stored instru
 	}
 });
 
+test("#632: event types and timestamps cannot dilute a short instruction echo", () => {
+	const context = {
+		eventType: "backup.daily",
+		eventId: "4afac2c1-bf4b-44e8-9db4-58c453764a8b",
+		payload: { at: "2026-10-18T11:00:00.000Z" },
+		firedAt: "2026-10-18T11:00:00.000Z",
+	};
+	expect(isAuthoredEchoSuspected("Check backups.", "backup daily 2026-10-18T11:00Z", context)).toBe(true);
+	expect(isAuthoredEchoSuspected("Check backups.", "Check backups.", context)).toBe(true);
+	expect(
+		isAuthoredEchoSuspected(
+			"Inspect release logs.",
+			"This note only describes the event. It does not confirm that the review ran.",
+			{ eventType: "deployment.audit" },
+		),
+	).toBe(true);
+});
+
 test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric results remain deliverable", () => {
 	const reports = [
 		"Ran bun test packages/gateway/test/monitor-instruction.test.ts: 12 tests passed and 0 failed.",
