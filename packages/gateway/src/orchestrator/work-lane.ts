@@ -680,14 +680,24 @@ export class WorkLaneManager {
 		let triggerMessageId: string | undefined;
 		if (callerOrigin && callerLane === undefined) {
 			try {
-				const origin = parseOriginKey(callerOrigin);
+				const activeTurn = this.#db.inbox.nonterminalTurns(callerOrigin)[0];
+				let origin = parseOriginKey(callerOrigin);
+				if (origin.platform === "discord" && origin.kind === "thread") {
+					// Keys omit visibility. Preserve Discord's admitted metadata without
+					// changing Slack's intentional channel-to-thread delivery projection.
+					const activeRow = activeTurn ? this.#db.inbox.turnRow(activeTurn.opRef) : undefined;
+					const storedOrigin = activeRow
+						? JSON.parse(activeRow.origin_ref_json)
+						: this.#db.bindings.getOriginByKey(callerOrigin);
+					if (storedOrigin) {
+						const admitted = validateOriginRef(storedOrigin as unknown as OriginRef);
+						if (originKey(admitted) !== callerOrigin) throw new Error("bound origin does not match caller session");
+						origin = admitted;
+					}
+				}
 				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) {
 					callerPersona = origin;
-					// Capture trigger message ID from the current nonterminal turn for threading
-					const nonterminalTurns = this.#db.inbox.nonterminalTurns(callerOrigin);
-					if (nonterminalTurns.length > 0) {
-						triggerMessageId = nonterminalTurns[0]?.triggerMessageId;
-					}
+					triggerMessageId = activeTurn?.triggerMessageId;
 				}
 			} catch {
 				/* Unknown and non-persona origins fall back to ownerTarget for starts. */

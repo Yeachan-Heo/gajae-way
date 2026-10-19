@@ -73,7 +73,7 @@ export type WorkParent =
 			readonly kind: "persona";
 			readonly originKey: string;
 			readonly origin: OriginRef;
-			/** Trigger message ID for threading lane reports (channel root origins only). */
+			/** Trigger message ID for threading Slack lane reports (channel root origins only). */
 			readonly triggerMessageId?: string;
 	  }
 	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
@@ -445,25 +445,20 @@ function laneReportRoot(row: LaneReportRow): WorkReportRoot | null {
 	return root;
 }
 
-/** Resolve Slack or Discord channel roots to trigger threads when their platform semantics permit it. */
+/** Resolve Slack channel roots to trigger threads; Discord reports keep their admitted origin. */
 export function resolveLaneReportOrigin(parent: WorkParent | null, admissionOriginRefJson: string): string {
 	if (parent?.kind !== "persona" || !parent.triggerMessageId) return admissionOriginRefJson;
 	// Synthetic lane report ids are internal row ids, not platform messages or thread ids.
 	if (/^lane-report-[0-9a-f]{64}$/.test(parent.triggerMessageId)) return admissionOriginRefJson;
 	try {
 		const origin = JSON.parse(admissionOriginRefJson) as OriginRef;
-		if (origin.kind !== "channel") return admissionOriginRefJson;
-		if (origin.platform === "slack") {
-			if (!parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) return admissionOriginRefJson;
-		} else if (origin.platform !== "discord") {
-			return admissionOriginRefJson;
-		}
+		if (origin.kind !== "channel" || origin.platform !== "slack") return admissionOriginRefJson;
+		if (!parent.triggerMessageId.startsWith(`${origin.conversationId}:`)) return admissionOriginRefJson;
 		const threadOrigin: OriginRef = {
 			platform: origin.platform,
 			kind: "thread",
 			conversationId: parent.triggerMessageId,
 			parentId: origin.conversationId,
-			...(origin.platform === "discord" ? { threadVisibility: "public" as const } : {}),
 		};
 		validateOriginRef(threadOrigin);
 		return JSON.stringify(threadOrigin);
