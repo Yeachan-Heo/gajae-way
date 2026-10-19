@@ -677,9 +677,12 @@ export function isAuthoredEchoSuspected(
 	);
 	if (contractContent.size === 0 || noteContent.size === 0) return false;
 
-	const contractEvidence = new Set(authoredEvidenceMarkers(evidenceContract));
-	if (authoredEvidenceMarkers(note).some((marker) => !contractEvidence.has(marker))) return false;
 	if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(note))) return true;
+	const contractEvidence = new Set([
+		...authoredEvidenceMarkers(evidenceContract),
+		...(evidenceContract.match(/\b\d+(?:,\d{3})*(?:\.\d+)?%?\b/g) ?? []),
+	]);
+	if (authoredEvidenceMarkers(note).some((marker) => !contractEvidence.has(marker))) return false;
 
 	const novelTokens = [...noteContent].filter((token) => !contractContent.has(token));
 	const novelMetaWords = novelTokens.filter((token) => META_ECHO_WORDS.has(token)).length;

@@ -444,6 +444,7 @@ test("#632: command prose is not evidence, while root files and keyed issue ids 
 			{ eventType: "deployment.daily" },
 		),
 	).toBe(true);
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} I did not run \`make test\`.`)).toBe(true);
 });
 
 test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric results remain deliverable", () => {
@@ -467,6 +468,12 @@ test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric resu
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth: 17.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Latency was 450.`)).toBe(false);
+	const numberedInstruction = `${longerInstruction} Check queue depth 17.`;
+	expect(isAuthoredEchoSuspected(numberedInstruction, `${numberedInstruction} Queue depth is 17.`)).toBe(true);
+	const differentNumberInstruction = `${longerInstruction} Check queue depth 16.`;
+	expect(isAuthoredEchoSuspected(differentNumberInstruction, `${differentNumberInstruction} Queue depth is 17.`)).toBe(
+		false,
+	);
 	expect(
 		isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`, {
 			eventType: "report.daily",
