@@ -3216,6 +3216,18 @@ test("#481 check rollup: latest named checks must all be terminal before settlin
 			{ ...run("lint", "COMPLETED", "FAILURE"), startedAt: "2026-10-18T12:01:00Z" },
 		]),
 	).toEqual({ prNumber: 11, headSha, status: "red", failingChecks: ["lint"] });
+	expect(
+		classifyCheckRollup(13, headSha, [
+			{
+				...run("ci", "COMPLETED", "FAILURE"),
+				checkSuite: { app: { id: "app-1" }, workflowRun: { workflow: { id: "workflow-1" } } },
+			},
+			{
+				...run("ci", "COMPLETED", "SUCCESS"),
+				checkSuite: { app: { id: "app-1" }, workflowRun: { workflow: { id: "workflow-2" } } },
+			},
+		]),
+	).toEqual({ prNumber: 13, headSha, status: "red", failingChecks: ["ci"] });
 	const sameNamedCheckRunAndStatus = [
 		{
 			...run("ci", "COMPLETED", "FAILURE"),
@@ -3297,14 +3309,37 @@ test("#481 check rollup: latest named checks must all be terminal before settlin
 async function writeGhCheckStub(
 	ghPath: string,
 	associated: readonly object[],
-	details: object,
+	details: {
+		readonly number: number;
+		readonly headRefOid: string;
+		readonly state?: string;
+		readonly mergedAt?: string | null;
+		readonly statusCheckRollup?: readonly object[];
+		readonly hasNextPage?: boolean;
+	},
 	argsPath = `${ghPath}.args`,
 	branchCandidates: readonly object[] = [],
 ): Promise<void> {
 	const script = [
 		"#!/bin/sh",
-		`printf '%s\\n' "$*" >> ${JSON.stringify(argsPath)}`,
-		`if [ "$1" = api ] && [ "$2" != "repos/{owner}/{repo}/pulls" ]; then printf '%s' ${JSON.stringify(JSON.stringify(associated))}; elif [ "$1" = api ]; then printf '%s' ${JSON.stringify(JSON.stringify(branchCandidates))}; else printf '%s' ${JSON.stringify(JSON.stringify(details))}; fi`,
+		`if [ "$1" = api ] && [ "$2" = graphql ]; then printf 'api graphql\\n' >> ${JSON.stringify(argsPath)}; printf '%s' ${JSON.stringify(
+			JSON.stringify({
+				data: {
+					repository: {
+						pullRequest: {
+							...details,
+							state: details.state ?? "OPEN",
+							statusCheckRollup: {
+								contexts: {
+									nodes: details.statusCheckRollup ?? [],
+									pageInfo: { hasNextPage: details.hasNextPage ?? false },
+								},
+							},
+						},
+					},
+				},
+			}),
+		)}; elif [ "$1" = api ]; then printf '%s\\n' "$*" >> ${JSON.stringify(argsPath)}; if [ "$2" = "repos/{owner}/{repo}/pulls" ]; then printf '%s' ${JSON.stringify(JSON.stringify(branchCandidates))}; else printf '%s' ${JSON.stringify(JSON.stringify(associated))}; fi; fi`,
 		"",
 	].join("\n");
 	await writeFile(ghPath, script);
@@ -3356,9 +3391,27 @@ test("#628 resolves an exact pushed head even when its PR uses a different branc
 		[
 			`api repos/{owner}/{repo}/commits/${headSha}/pulls -X GET -F per_page=100`,
 			"api repos/{owner}/{repo}/pulls -X GET -F head={owner}:work/67772d69737375652d363235 -F state=all -F per_page=100",
-			"pr view 626 --json number,headRefOid,state,mergedAt,statusCheckRollup",
+			"api graphql",
 		].sort(),
 	);
+});
+
+test("#628 re-queries the persisted PR directly after a head-branch PR closes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const argsPath = join(directory, "args.txt");
+	const headSha = "e".repeat(40);
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[],
+		{ number: 631, headRefOid: headSha, state: "CLOSED", mergedAt: null, statusCheckRollup: [] },
+		argsPath,
+	);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, 631, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 631, headSha, prState: "closed", merged: false });
+	expect((await readFile(argsPath, "utf8")).trim().split("\n")).toEqual(["api graphql"]);
 });
 
 test("#595 GH check lookup keeps the lane branch as a SHA-checked PR candidate", async () => {

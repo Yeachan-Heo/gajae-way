@@ -12,6 +12,10 @@ interface RollupEntry {
 	readonly detailsUrl?: string;
 	readonly startedAt?: string;
 	readonly createdAt?: string;
+	readonly checkSuite?: {
+		readonly app?: { readonly id?: string | null } | null;
+		readonly workflowRun?: { readonly workflow?: { readonly id?: string | null } | null } | null;
+	} | null;
 }
 
 interface AssociatedPullRequest {
@@ -28,6 +32,35 @@ const PR_LOOKUP_LIMIT = 100;
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const SUCCESS_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
+
+const PR_CHECK_QUERY = `
+query ($owner: String!, $repo: String!, $number: Int!) {
+	repository(owner: $owner, name: $repo) {
+		pullRequest(number: $number) {
+			number
+			headRefOid
+			state
+			mergedAt
+			statusCheckRollup {
+				contexts(first: 100) {
+					nodes {
+						__typename
+						... on CheckRun {
+							name
+						status
+							conclusion
+							startedAt
+							detailsUrl
+							checkSuite { app { id } workflowRun { workflow { id } } }
+						}
+						... on StatusContext { context state createdAt targetUrl }
+					}
+					pageInfo { hasNextPage }
+				}
+			}
+		}
+	}
+}`;
 
 interface PullRequestLookup {
 	readonly results: readonly unknown[] | undefined;
@@ -71,9 +104,8 @@ export function classifyCheckRollup(
 function latestCheckEntries(rollup: readonly RollupEntry[]): RollupEntry[] {
 	const latest = new Map<string, RollupEntry>();
 	for (const [index, entry] of rollup.entries()) {
-		const source = isStatusContext(entry) ? "status" : "check-run";
 		const name = entry.name ?? entry.context ?? `unknown:${index}`;
-		const key = `${source}:${name}`;
+		const key = checkIdentity(entry, name);
 		const previous = latest.get(key);
 		if (!previous || isLaterCheck(entry, previous)) latest.set(key, entry);
 	}
@@ -82,6 +114,13 @@ function latestCheckEntries(rollup: readonly RollupEntry[]): RollupEntry[] {
 
 function isStatusContext(entry: RollupEntry): boolean {
 	return entry.__typename === "StatusContext" || (entry.state !== undefined && entry.status === undefined);
+}
+
+function checkIdentity(entry: RollupEntry, name: string): string {
+	if (isStatusContext(entry)) return `status:${name}`;
+	const appId = entry.checkSuite?.app?.id ?? "unknown-app";
+	const workflowId = entry.checkSuite?.workflowRun?.workflow?.id ?? "unknown-workflow";
+	return `check-run:${appId}:${workflowId}:${name}`;
 }
 
 function isLaterCheck(candidate: RollupEntry, previous: RollupEntry): boolean {
@@ -98,6 +137,8 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 		async getCheckStatus(headSha, cwd, preferredPrNumber, branchName) {
 			try {
 				if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
+				if (preferredPrNumber !== undefined)
+					return await pullRequestCheckStatus(executable, cwd, timeoutMs, preferredPrNumber);
 				const [byHeadSha, byBranch] = await Promise.all([
 					queryPullRequests(executable, cwd, timeoutMs, [
 						"api",
@@ -130,55 +171,82 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 					if (candidate.head?.sha === headSha) candidates.set(candidate.number, candidate);
 				const matchingPrs = [...candidates.values()];
 				if (matchingPrs.length === 0) {
-					if (
-						preferredPrNumber !== undefined ||
-						byHeadSha.results === undefined ||
-						(branchName !== undefined && byBranch?.results === undefined)
-					)
+					if (byHeadSha.results === undefined || (branchName !== undefined && byBranch?.results === undefined))
 						return undefined;
 					return null;
 				}
-				const preferredPr =
-					preferredPrNumber === undefined
-						? undefined
-						: matchingPrs.find((candidate) => candidate.number === preferredPrNumber);
-				if (preferredPrNumber !== undefined && !preferredPr) return undefined;
-				const pr = preferredPr ?? selectAssociatedPullRequest(matchingPrs, branchName);
+				const pr = selectAssociatedPullRequest(matchingPrs, branchName);
 				if (!pr) return null;
-				const details = Bun.spawn(
-					[executable, "pr", "view", `${pr.number}`, "--json", "number,headRefOid,state,mergedAt,statusCheckRollup"],
-					{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
-				);
-				const [detailsText, detailsExitCode] = await Promise.all([new Response(details.stdout).text(), details.exited]);
-				if (detailsExitCode !== 0) return undefined;
-				const current = JSON.parse(detailsText) as {
-					number: number;
-					headRefOid: string;
-					state: string;
-					mergedAt?: string | null;
-					statusCheckRollup?: RollupEntry[] | null;
-				};
-				if (current.number !== pr.number || !/^[0-9a-f]{40}$/.test(current.headRefOid)) return undefined;
-				const rollup = current.statusCheckRollup ?? [];
-				const snapshot = classifyCheckRollup(pr.number, current.headRefOid, rollup);
-				const withPrState: CheckStatusSnapshot = {
-					...snapshot,
-					prState: current.state.toUpperCase() === "OPEN" ? "open" : "closed",
-					merged: Boolean(current.mergedAt),
-				};
-				if (snapshot.status !== "red") return withPrState;
-				const targets = failedCheckLogTargets(rollup).slice(0, 3);
-				const tails = await Promise.all(
-					targets.map((target) => readFailedLogTail(target, cwd, Math.min(timeoutMs, 2_000))),
-				);
-				const joinedTail = tails.filter(Boolean).join("\n---\n");
-				const failureLogTail = utf8Suffix(joinedTail, FAILED_LOG_TAIL_LIMIT_BYTES);
-				return failureLogTail ? { ...withPrState, failureLogTail } : withPrState;
+				return await pullRequestCheckStatus(executable, cwd, timeoutMs, pr.number);
 			} catch {
 				return undefined;
 			}
 		},
 	};
+}
+
+async function pullRequestCheckStatus(
+	executable: string,
+	cwd: string,
+	timeoutMs: number,
+	prNumber: number,
+): Promise<CheckStatusSnapshot | undefined> {
+	try {
+		const child = Bun.spawn(
+			[
+				executable,
+				"api",
+				"graphql",
+				"-F",
+				"owner={owner}",
+				"-F",
+				"repo={repo}",
+				"-F",
+				`number=${prNumber}`,
+				"-f",
+				`query=${PR_CHECK_QUERY}`,
+			],
+			{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
+		);
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		if (exitCode !== 0) return undefined;
+		const result = JSON.parse(stdout) as {
+			data?: {
+				repository?: {
+					pullRequest?: {
+						number: number;
+						headRefOid: string;
+						state: string;
+						mergedAt?: string | null;
+						statusCheckRollup?: {
+							contexts?: { nodes?: RollupEntry[]; pageInfo?: { hasNextPage?: boolean } } | null;
+						} | null;
+					} | null;
+				};
+			};
+		};
+		const current = result.data?.repository?.pullRequest;
+		if (!current || current.number !== prNumber || !/^[0-9a-f]{40}$/.test(current.headRefOid)) return undefined;
+		const contexts = current.statusCheckRollup?.contexts;
+		if (contexts?.pageInfo?.hasNextPage) return undefined;
+		const rollup = contexts?.nodes ?? [];
+		const snapshot = classifyCheckRollup(prNumber, current.headRefOid, rollup);
+		const withPrState: CheckStatusSnapshot = {
+			...snapshot,
+			prState: current.state.toUpperCase() === "OPEN" ? "open" : "closed",
+			merged: Boolean(current.mergedAt),
+		};
+		if (snapshot.status !== "red") return withPrState;
+		const targets = failedCheckLogTargets(rollup).slice(0, 3);
+		const tails = await Promise.all(
+			targets.map((target) => readFailedLogTail(target, cwd, Math.min(timeoutMs, 2_000))),
+		);
+		const joinedTail = tails.filter(Boolean).join("\n---\n");
+		const failureLogTail = utf8Suffix(joinedTail, FAILED_LOG_TAIL_LIMIT_BYTES);
+		return failureLogTail ? { ...withPrState, failureLogTail } : withPrState;
+	} catch {
+		return undefined;
+	}
 }
 
 function selectAssociatedPullRequest(
