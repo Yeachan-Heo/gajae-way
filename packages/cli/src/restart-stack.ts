@@ -1041,6 +1041,8 @@ export interface LaunchRestartOptions {
 	readonly uid?: number;
 	/** Installed service binary directory used for lease verification. */
 	readonly binDir?: string;
+	/** LaunchAgents directory on darwin. */
+	readonly launchAgentsDir?: string;
 	/** Argv that re-enters the CLI; `--run <id>` is appended. */
 	readonly worker?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
@@ -1083,6 +1085,7 @@ export async function launchRestartStack(
 			GAJAEWAY_HOME: options.home,
 			...(options.gatewaySocketPath === undefined ? {} : { GAJAEWAY_SOCKET_PATH: options.gatewaySocketPath }),
 			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
+			...(options.launchAgentsDir === undefined ? {} : { GAJAEWAY_LAUNCH_AGENTS_DIR: options.launchAgentsDir }),
 		},
 	};
 	let child: Bun.Subprocess;
