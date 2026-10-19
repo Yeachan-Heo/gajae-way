@@ -65,6 +65,38 @@ test("migrates a migration-001 database to the latest schema", async () => {
 	}
 });
 
+test("migration 38 is idempotent when a partially upgraded database already has thread mutes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v38-idempotent-"));
+	const path = join(directory, "gateway.db");
+	const threadKey = "discord/thread/thread-1/parent=channel-1";
+	try {
+		const initial = await Store.open(path);
+		initial.transaction((tx) => initial.inbox.muteThread(tx, threadKey));
+		initial.close();
+
+		const partial = new Database(path);
+		partial.exec("DELETE FROM schema_migrations WHERE version = 38");
+		partial.close();
+
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(38);
+		expect(upgraded.inbox.isThreadMuted(threadKey)).toBe(true);
+		const verified = new Database(path, { readonly: true });
+		expect(
+			verified.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 38").get()?.n,
+		).toBe(1);
+		verified.close();
+		upgraded.close();
+
+		const reopened = await Store.open(path);
+		expect(reopened.schemaVersion).toBe(38);
+		expect(reopened.inbox.isThreadMuted(threadKey)).toBe(true);
+		reopened.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("upgrades a deployed lane-jobs schema 10 database to combined schema 12 without losing jobs", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v10-"));
 	const path = join(directory, "gateway.db");

@@ -143,22 +143,19 @@ export class InboxGroup {
 
 	isThreadMuted(threadOriginKey: string): boolean {
 		return (
-			this.#db
-				.prepare("SELECT 1 AS n FROM thread_mutes WHERE thread_origin_key = ? LIMIT 1")
-				.get(threadOriginKey) !== null
+			this.#db.prepare("SELECT 1 AS n FROM thread_mutes WHERE thread_origin_key = ? LIMIT 1").get(threadOriginKey) !==
+			null
 		);
 	}
 
 	muteThread(tx: WriteTx, threadOriginKey: string): void {
-		const stmt = this.#db.prepare(
-			"INSERT OR IGNORE INTO thread_mutes (thread_origin_key, muted_at) VALUES (?, ?)",
-		);
-		tx.execute(stmt, threadOriginKey, new Date().toISOString());
+		const stmt = this.#db.prepare("INSERT OR IGNORE INTO thread_mutes (thread_origin_key, muted_at) VALUES (?, ?)");
+		stmt.run(tx, threadOriginKey, new Date().toISOString());
 	}
 
 	unmuteThread(tx: WriteTx, threadOriginKey: string): void {
 		const stmt = this.#db.prepare("DELETE FROM thread_mutes WHERE thread_origin_key = ?");
-		tx.execute(stmt, threadOriginKey);
+		stmt.run(tx, threadOriginKey);
 	}
 
 	stateCounts(): Array<{ state: string; n: number }> {

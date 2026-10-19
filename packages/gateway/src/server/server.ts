@@ -14,8 +14,8 @@ import {
 	type HelloPayload,
 	isChatPlatform,
 	isPlatformMessageId,
-	isSilentOutput,
 	isShutupToken,
+	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
@@ -58,6 +58,7 @@ import {
 	resolveChannelPolicy,
 	suppressMutedThreadFollowUp,
 	threadFollowUpEngaged,
+	threadMuteAddressed,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import { FunctionalReadiness } from "../functional-readiness";
@@ -2666,7 +2667,14 @@ async function sendChat(
 		params.engagement as never,
 		options.database.inbox,
 	);
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUpForEngagement);
+	const mutedThread = origin.kind === "thread" && options.database.inbox.isThreadMuted(key);
+	const engagementDecision = decideEngagement(
+		origin,
+		params.engagement as never,
+		runtime.config,
+		threadFollowUpForEngagement,
+		mutedThread,
+	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as
@@ -2715,6 +2723,8 @@ async function sendChat(
 		);
 	}
 	if (!engaged) {
+		if (mutedThread && !threadMuteAddressed(params.engagement as never))
+			console.info(`gateway engagement-muted skip origin=${key} message=${inboundMessageId ?? "unidentified"}`);
 		connection.write({
 			v: PROFILE_VERSION,
 			type: "response",
@@ -2878,6 +2888,9 @@ async function sendChat(
 		});
 		return;
 	}
+	if (mutedThread && threadMuteAddressed(params.engagement as never)) {
+		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, key));
+	}
 	for (const intentId of admission.memoryIntentIds) runtime.memory.enqueueExistingId(intentId);
 	for (const watchOriginKey of admission.watchWakeOrigins)
 		void runtime.personaSessions
@@ -2981,7 +2994,14 @@ async function editChat(
 		params.engagement as never,
 		options.database.inbox,
 	);
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUpForEngagement);
+	const mutedThread = origin.kind === "thread" && options.database.inbox.isThreadMuted(key);
+	const engagementDecision = decideEngagement(
+		origin,
+		params.engagement as never,
+		runtime.config,
+		threadFollowUpForEngagement,
+		mutedThread,
+	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as { mentioned?: boolean } | undefined;
@@ -2998,6 +3018,8 @@ async function editChat(
 			);
 	}
 	if (!engagementDecision.engaged || botAudienceGuardSpent) {
+		if (mutedThread && !threadMuteAddressed(params.engagement as never))
+			console.info(`gateway engagement-muted skip origin=${key} message=${params.messageId}`);
 		declined();
 		return;
 	}
@@ -3020,6 +3042,9 @@ async function editChat(
 		// The same edit event delivered twice: acknowledged once, dispatched once.
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
 		return;
+	}
+	if (mutedThread && threadMuteAddressed(params.engagement as never)) {
+		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, key));
 	}
 	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
@@ -3615,7 +3640,7 @@ async function createInboundTurnLifecycle(
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilentOutput(part))
+			.filter((part) => part.length > 0 && !isSilentOutput(part) && !isShutupToken(part))
 			.slice(0, 5);
 		// A persona that decided not to speak often says so instead of emitting
 		// the token (#260). On gated traffic, such a part is dropped like one.
@@ -3964,13 +3989,6 @@ async function createInboundTurnLifecycle(
 					`user: ${clipByCodePoints(userText, 500)}\nassistant: ${clipByCodePoints(replyText, 500)}`,
 				);
 			});
-			// Issue #625: unmute the thread if it's muted and we're engaging with a mentioned
-			// or replied-to message (we only reach here if engagement decision was positive)
-			if (origin.kind === "thread" && nonLoopback && options.database.inbox.isThreadMuted(key)) {
-				options.database.transaction((tx) => {
-					options.database.inbox.unmuteThread(tx, key);
-				});
-			}
 			// Issue #625: mute the thread if the response is [SHUTUP]
 			if (isShutupToken(text) && origin.kind === "thread" && nonLoopback) {
 				options.database.transaction((tx) => {

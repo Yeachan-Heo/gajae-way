@@ -234,6 +234,7 @@ export function decideEngagement(
 	 * only owner/allowlist authors, and audience rules still decide bots.
 	 */
 	threadFollowUp = false,
+	mutedThread = false,
 ): EngagementDecision {
 	// An adapter that already knows the room moved past this message records it
 	// and asks for nothing more. Checked before every other gate, loopback
@@ -241,6 +242,8 @@ export function decideEngagement(
 	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
+	if (origin.kind === "thread" && mutedThread && !threadMuteAddressed(engagement))
+		return { engaged: false, botAudienceAdmission: false };
 	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };
 	const policy = resolveChannelPolicy(origin, config);
 	return evaluateChannelEngagement({
@@ -251,16 +254,17 @@ export function decideEngagement(
 	});
 }
 
+/** A channel's open policy is not an explicit mention that may unmute a thread. */
+export function threadMuteAddressed(engagement: EngagementContext | undefined): boolean {
+	return engagement?.explicitMention === true || engagement?.replyTo?.fromSelf === true;
+}
+
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */
 export interface ThreadEngagementStore {
 	originTriggeredTurn(originKey: string): boolean;
 	messageJoinedTurn(originKey: string, messageId: string): boolean;
 	/** Check if the thread is muted (follow-ups are suppressed unless mentioned/replied-to). */
 	isThreadMuted(threadOriginKey: string): boolean;
-	/** Mute a thread, suppressing LLM turns for unmentioned follow-ups. */
-	muteThread(threadOriginKey: string): void;
-	/** Unmute a thread, allowing LLM turns for follow-ups again. */
-	unmuteThread(threadOriginKey: string): void;
 }
 
 /**
@@ -312,8 +316,7 @@ export function suppressMutedThreadFollowUp(
 	if (!threadFollowUp) return false;
 	if (!store.isThreadMuted(threadOriginKey)) return true;
 	// Thread is muted; only engage if mentioned or replied-to
-	const hasReplyToSelf = (engagement as { replyTo?: { fromSelf?: boolean } } | undefined)?.replyTo?.fromSelf === true;
-	return engagement?.mentioned === true || hasReplyToSelf;
+	return threadMuteAddressed(engagement);
 }
 
 /**

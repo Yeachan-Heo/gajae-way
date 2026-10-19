@@ -45,6 +45,7 @@ const AUTHORITY_CENSUS_TABLES = [
 	"monitor_events",
 	"authored_outputs",
 	"inbound_messages",
+	"thread_mutes",
 	"cross_session_watches",
 	"conversation_context",
 	"lane_jobs",

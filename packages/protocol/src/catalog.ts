@@ -136,8 +136,10 @@ export interface ReplyContext {
 
 /** Inbound engagement metadata supplied by adapters for group-capable origins. */
 export interface EngagementContext {
-	/** True when the agent account was explicitly mentioned/addressed. */
+	/** True when channel-policy admission considers the message addressed; open channels may set this for all messages. */
 	readonly mentioned: boolean;
+	/** True only for a literal @mention; unlike `mentioned`, this excludes open-channel admission and replies. */
+	readonly explicitMention?: boolean;
 	/**
 	 * The message must be recorded but must never open a turn. Set by an adapter
 	 * that backfills a message it knows the room has already moved past - e.g. a
@@ -1393,8 +1395,12 @@ export function isSilentOutput(text: string): boolean {
 export const SHUTUP_TOKENS = ["[SHUTUP]", "SHUTUP"] as const;
 
 export function isShutupToken(text: string): boolean {
-	const normalized = unbracket(text.trim()).toUpperCase();
-	return (SHUTUP_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
+	const firstLine = text.split(/\r?\n/, 1)[0]?.trim() ?? "";
+	const compactLine = firstLine.replace(/\s/g, "");
+	if (!compactLine) return false;
+	const controls = firstLine.match(/\[[^[\]\n]*\]|SHUTUP/gi);
+	if (!controls || controls.join("").replace(/\s/g, "") !== compactLine) return false;
+	return controls.some((control) => unbracket(control).toUpperCase() === "SHUTUP");
 }
 
 function unbracket(text: string): string {

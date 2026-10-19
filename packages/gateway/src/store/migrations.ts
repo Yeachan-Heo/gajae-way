@@ -823,10 +823,10 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 				);
 				CREATE INDEX IF NOT EXISTS broker_operations_completed ON broker_operations(state, completed_at);
 			`);
-		host.database
-			.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-			.run(37, new Date().toISOString());
-	});
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(37, new Date().toISOString());
+		});
 	}
 	if (current < 38) {
 		// Issue #625: thread muting. When a bot replies with [SHUTUP], the thread
