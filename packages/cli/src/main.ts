@@ -781,6 +781,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							home,
 							id: parsed.rest[2],
 							gatewaySocketPath: parsed.socket,
+							...(process.env.GAJAEWAY_LAUNCH_AGENTS_DIR === undefined
+								? {}
+								: { launchAgentsDir: process.env.GAJAEWAY_LAUNCH_AGENTS_DIR }),
 						});
 						for (const line of renderRestartReceipt(receipt)) console.log(line);
 						if (receipt.state !== "ok") process.exitCode = 1;
