@@ -1163,7 +1163,8 @@ export class MonitorPropagator {
 					);
 					const safety = this.#safetyState(sessionOriginKey);
 					safety.turns = turns;
-					safety.priorRunBusyFailures = 0;
+					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch)
+						safety.priorRunBusyFailures = 0;
 				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
@@ -1516,14 +1517,17 @@ export class MonitorPropagator {
 	 * THE ONE monitor-session failure classifier and native-compaction request
 	 * point (issue #68).
 	 *
-	 * Only a context-class failure of the CURRENT session's own fresh work can
-	 * feed the streak. Everything else is recorded and dropped:
-	 * - executor-class (aside worker timeout, orphaned external run, tool
-	 *   failure, lock skip) and protocol-class (malformed or off-contract
-	 *   answer) are not evidence about context size at all. The executor
-	 *   sub-kind is named for the operator (`lastExecutorReason`), and the
-	 *   orphaned case is counted separately because its remedy is reclaiming an
-	 *   external daemon job, not touching this session.
+	 * It keeps independent evidence separate:
+	 * - only context-class failures of the CURRENT session's own fresh work feed
+	 *   the context streak and can request native compaction;
+	 * - `session_busy` and the exact prior-run-busy terminal failure use bounded
+	 *   stuck-session streaks, while positive host/submission evidence can arm a
+	 *   roll directly. None of these is context evidence;
+	 * - other executor-class failures (aside worker timeout, orphaned external
+	 *   run, tool failure, lock skip) and protocol-class failures are recorded
+	 *   without a context roll. The executor sub-kind is named for the operator
+	 *   (`lastExecutorReason`), and orphaned work is counted separately because
+	 *   its remedy is reclaiming an external daemon job, not touching this session.
 	 * - a replayed batch (reconcile revived it) carries an old payload and may
 	 *   have failed against a session that is already gone.
 	 * - a bound epoch that is no longer current means the failure belongs to a
