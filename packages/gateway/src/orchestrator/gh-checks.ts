@@ -45,15 +45,11 @@ export function classifyCheckRollup(
 	rollup: readonly RollupEntry[],
 ): CheckStatusSnapshot {
 	if (!/^[0-9a-f]{40}$/.test(headSha)) throw new Error("PR head SHA is invalid");
-	const latest = new Map<string, RollupEntry>();
-	for (const entry of rollup) {
-		const label = entry.name ?? entry.context ?? "unknown";
-		const previous = latest.get(label);
-		if (!previous || isLaterCheck(entry, previous)) latest.set(label, entry);
-	}
+	const latest = latestCheckEntries(rollup);
 	const failingChecks: string[] = [];
-	let pending = latest.size === 0;
-	for (const [label, entry] of latest) {
+	let pending = latest.length === 0;
+	for (const entry of latest) {
+		const label = entry.name ?? entry.context ?? "unknown";
 		if (entry.__typename === "StatusContext" || (entry.state !== undefined && entry.status === undefined)) {
 			const state = entry.state?.toUpperCase() ?? "PENDING";
 			if (FAILED_STATES.has(state)) failingChecks.push(label);
@@ -70,6 +66,16 @@ export function classifyCheckRollup(
 	}
 	const status = pending ? "pending" : failingChecks.length > 0 ? "red" : "green";
 	return { prNumber, headSha, status, failingChecks: status === "red" ? [...new Set(failingChecks)] : [] };
+}
+
+function latestCheckEntries(rollup: readonly RollupEntry[]): RollupEntry[] {
+	const latest = new Map<string, RollupEntry>();
+	for (const [index, entry] of rollup.entries()) {
+		const label = entry.name ?? entry.context ?? `unknown:${index}`;
+		const previous = latest.get(label);
+		if (!previous || isLaterCheck(entry, previous)) latest.set(label, entry);
+	}
+	return [...latest.values()];
 }
 
 function isLaterCheck(candidate: RollupEntry, previous: RollupEntry): boolean {
@@ -216,7 +222,7 @@ async function queryPullRequests(
 
 export function failedCheckLogTargets(rollup: readonly RollupEntry[]): Array<{ runId: string; jobId?: string }> {
 	const targets = new Map<string, { runId: string; jobId?: string }>();
-	for (const entry of rollup) {
+	for (const entry of latestCheckEntries(rollup)) {
 		if (entry.status?.toUpperCase() !== "COMPLETED" || !FAILED_CONCLUSIONS.has(entry.conclusion?.toUpperCase() ?? ""))
 			continue;
 		if (!entry.detailsUrl) continue;

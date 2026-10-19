@@ -3216,6 +3216,30 @@ test("#481 check rollup: latest named checks must all be terminal before settlin
 			{ ...run("lint", "COMPLETED", "FAILURE"), startedAt: "2026-10-18T12:01:00Z" },
 		]),
 	).toEqual({ prNumber: 11, headSha, status: "red", failingChecks: ["lint"] });
+	expect(
+		failedCheckLogTargets([
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:00:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/100",
+			},
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:01:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/101",
+			},
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:02:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/102",
+			},
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:03:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/103",
+			},
+		]),
+	).toEqual([{ runId: "103" }]);
 	expect(classifyCheckRollup(2, headSha, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe(
 		"pending",
 	);
