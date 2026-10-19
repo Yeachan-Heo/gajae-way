@@ -427,6 +427,9 @@ test("#632: copied payload values and URLs are not novel evidence", () => {
 			payload: { url: "https://example.com/incident/42" },
 		}),
 	).toBe(false);
+	const countContext = { eventType: "deployment.daily", payload: { failures: 3 } };
+	expect(isAuthoredEchoSuspected("Check deployment.", "Check deployment. Found 3 failures.", countContext)).toBe(true);
+	expect(isAuthoredEchoSuspected("Check deployment.", "Check deployment. Found 4 failures.", countContext)).toBe(false);
 });
 
 test("#632: command prose is not evidence, while root files and keyed issue ids are", () => {
@@ -459,6 +462,8 @@ test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric resu
 	const longerInstruction =
 		"Review the last 24 hours of runtime activity and report blockers, failures, latency, deploy status, error rates, public-safe evidence, and existing issues before proposing changes.";
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make test: passed.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make: passed.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran pytest: passed.`)).toBe(false);
 });
 
 test("#180: mention targets are validated as platform ids", async () => {

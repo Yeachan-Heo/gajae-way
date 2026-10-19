@@ -517,29 +517,105 @@ function serializeEchoPayload(payload: unknown): string {
 	}
 }
 
+const PAYLOAD_COUNT_LABELS = new Map([
+	["test", "tests"],
+	["tests", "tests"],
+	["issue", "issues"],
+	["issues", "issues"],
+	["pr", "prs"],
+	["prs", "prs"],
+	["pull request", "pull requests"],
+	["pull requests", "pull requests"],
+	["file", "files"],
+	["files", "files"],
+	["error", "errors"],
+	["errors", "errors"],
+	["failure", "failures"],
+	["failures", "failures"],
+	["warning", "warnings"],
+	["warnings", "warnings"],
+	["blocker", "blockers"],
+	["blockers", "blockers"],
+	["commit", "commits"],
+	["commits", "commits"],
+	["change", "changes"],
+	["changes", "changes"],
+	["update", "updates"],
+	["updates", "updates"],
+	["result", "results"],
+	["results", "results"],
+	["passed", "passed"],
+	["passing", "passing"],
+	["failed", "failed"],
+	["found", "found"],
+	["millisecond", "ms"],
+	["milliseconds", "ms"],
+	["ms", "ms"],
+	["second", "seconds"],
+	["seconds", "seconds"],
+	["minute", "minutes"],
+	["minutes", "minutes"],
+]);
+
+function structuredPayloadCountMarkers(payload: unknown, seen = new WeakSet<object>()): string[] {
+	if (payload === null || typeof payload !== "object") return [];
+	if (seen.has(payload)) return [];
+	seen.add(payload);
+	if (Array.isArray(payload)) return payload.flatMap((value) => structuredPayloadCountMarkers(value, seen));
+
+	const markers: string[] = [];
+	for (const [key, value] of Object.entries(payload)) {
+		if (typeof value === "number" && Number.isFinite(value)) {
+			const label = key
+				.replace(/([a-z])([A-Z])/g, "$1 $2")
+				.replace(/[_-]+/g, " ")
+				.replace(/\s*(?:count|total)$/i, "")
+				.trim()
+				.toLowerCase();
+			const normalizedLabel = PAYLOAD_COUNT_LABELS.get(label);
+			if (normalizedLabel) markers.push(`${value} ${normalizedLabel}`);
+		}
+		markers.push(...structuredPayloadCountMarkers(value, seen));
+	}
+	return markers;
+}
+
 /** Detect generic command invocations without accepting descriptive task prose as commands. */
 function authoredCommandMarkers(text: string): string[] {
 	const marker: string[] = [];
 	for (const [, executable, argumentsText] of text.matchAll(
-		/\b(?:ran|run|executed|execute|invoked|invoke|called)\s+([A-Za-z0-9_.+-]+)\s+([A-Za-z0-9_./:=+-]+(?:\s+[A-Za-z0-9_./:=+-]+)*)/gi,
+		/\b(?:ran|run|executed|execute|invoked|invoke|called)\s+([A-Za-z0-9_.+-]+)(?:\s+([A-Za-z0-9_./=+-]+(?:\s+[A-Za-z0-9_./=+-]+)*))?(?=\s*[:.;,!?\n]|$)/gi,
 	)) {
-		if (executable && argumentsText && !NON_COMMAND_START_WORDS.has(executable.toLowerCase()))
-			marker.push(`${executable} ${argumentsText}`);
+		if (executable && !NON_COMMAND_START_WORDS.has(executable.toLowerCase()))
+			marker.push(argumentsText ? `${executable} ${argumentsText}` : executable);
 	}
 	return marker;
 }
 
 function authoredEvidenceMarkers(text: string): string[] {
+	const quantifiedResults =
+		text.match(
+			/\b\d+(?:,\d{3})*(?:\.\d+)?%?\s*(?:tests?|issues?|prs?|pull\s+requests?|files?|errors?|failures?|warnings?|blockers?|commits?|changes?|updates?|results?|passed|passing|failed|found|ms|seconds?|minutes?)\b/gi,
+		) ?? [];
+	const quantifiedValues = new Set(
+		quantifiedResults
+			.map((marker) => marker.match(/^\d+(?:,\d{3})*(?:\.\d+)?/)?.[0])
+			.filter((value): value is string => value !== undefined),
+	);
+	const standaloneResultMarkers = (
+		text.match(/\b(?:passed|passing|failed|found|changed|updated|blocked|resolved|reopened)\s+\d+\b/gi) ?? []
+	).filter((marker) => {
+		const value = marker.match(/\d+/)?.[0];
+		return value === undefined || !quantifiedValues.has(value);
+	});
 	const markers = [
 		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
 		...(text.match(/#\d+/g) ?? []),
 		...(text.match(/\b[0-9a-f]{7,40}\b/gi) ?? []),
 		...(text.match(/\b(?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),
 		...(text.match(/\b[A-Z][A-Z0-9]*-\d+\b/gi) ?? []),
-		...(text.match(
-			/\b\d+(?:,\d{3})*(?:\.\d+)?%?\s*(?:tests?|issues?|prs?|pull\s+requests?|files?|errors?|failures?|warnings?|blockers?|commits?|changes?|updates?|results?|passed|passing|failed|found|ms|seconds?|minutes?)\b/gi,
-		) ?? []),
-		...(text.match(/\b(?:passed|passing|failed|found|changed|updated|blocked|resolved|reopened)\s+\d+\b/gi) ?? []),
+		...quantifiedResults,
+		...standaloneResultMarkers,
 		...authoredCommandMarkers(text),
 		...(text.match(/`[^`\n]+`/g) ?? []),
 	];
@@ -565,9 +641,17 @@ export function isAuthoredEchoSuspected(
 	const contractSources = [contractText, eventContext?.eventType].filter((part): part is string => Boolean(part));
 	if (contractSources.length === 0) return false;
 	const payloadText = eventContext?.payload === undefined ? undefined : serializeEchoPayload(eventContext.payload);
+	const payloadCountMarkers =
+		eventContext?.payload === undefined ? [] : structuredPayloadCountMarkers(eventContext.payload);
 	const fullContract = contractSources.join("\n");
 	// Event identity, timing and payload can explain copied markers, but must not inflate task coverage.
-	const evidenceContract = [fullContract, eventContext?.eventId, eventContext?.firedAt, payloadText]
+	const evidenceContract = [
+		fullContract,
+		eventContext?.eventId,
+		eventContext?.firedAt,
+		payloadText,
+		...payloadCountMarkers,
+	]
 		.filter((part): part is string => Boolean(part))
 		.join("\n");
 	const contractContentSources = contractSources.map(
@@ -575,7 +659,9 @@ export function isAuthoredEchoSuspected(
 	);
 	const contractContent = new Set(contractContentSources.flatMap((source) => [...source]));
 	// Event metadata is contract context, but it must not dilute task coverage or create novelty.
-	const eventMetadataText = [eventContext?.eventId, eventContext?.firedAt, payloadText].filter(Boolean).join("\n");
+	const eventMetadataText = [eventContext?.eventId, eventContext?.firedAt, payloadText, ...payloadCountMarkers]
+		.filter(Boolean)
+		.join("\n");
 	const eventMetadataContent = new Set(authoredEchoTokens(eventMetadataText));
 	const noteContent = new Set(
 		authoredEchoTokens(note).filter(
