@@ -429,6 +429,20 @@ test("#632: copied payload values and URLs are not novel evidence", () => {
 	).toBe(false);
 });
 
+test("#632: command prose is not evidence, while root files and keyed issue ids are", () => {
+	const instruction =
+		"Review the last 24 hours of runtime activity and report blockers, failures, latency, deploy status, error rates, public-safe evidence, and existing issues before proposing changes.";
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} Changed README.md.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} Opened OPS-123.`)).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			"Review deployment daily.",
+			"This note only describes the task and does not confirm work: running deployment review.",
+			{ eventType: "deployment.daily" },
+		),
+	).toBe(true);
+});
+
 test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric results remain deliverable", () => {
 	const reports = [
 		"Ran bun test packages/gateway/test/monitor-instruction.test.ts: 12 tests passed and 0 failed.",

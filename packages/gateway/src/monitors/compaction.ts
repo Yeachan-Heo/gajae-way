@@ -479,13 +479,21 @@ const NON_COMMAND_START_WORDS = new Set([
 	...META_ECHO_WORDS,
 	"activity",
 	"daily",
+	"deploy",
+	"deployment",
+	"deployments",
 	"failure",
 	"failures",
+	"final",
 	"friction",
+	"initial",
 	"latency",
 	"operation",
+	"previous",
+	"recent",
 	"report",
 	"runtime",
+	"scheduled",
 	"system",
 ]);
 
@@ -509,10 +517,11 @@ function serializeEchoPayload(payload: unknown): string {
 	}
 }
 
+/** Detect generic command invocations without accepting descriptive task prose as commands. */
 function authoredCommandMarkers(text: string): string[] {
 	const marker: string[] = [];
 	for (const [, executable, argumentsText] of text.matchAll(
-		/\b(?:ran|run|running|executed|execute|executing|invoked|invoke|called|calling)\s+([A-Za-z0-9_.+-]+)\s+([A-Za-z0-9_./:=+-]+(?:\s+[A-Za-z0-9_./:=+-]+)*)/gi,
+		/\b(?:ran|run|executed|execute|invoked|invoke|called)\s+([A-Za-z0-9_.+-]+)\s+([A-Za-z0-9_./:=+-]+(?:\s+[A-Za-z0-9_./:=+-]+)*)/gi,
 	)) {
 		if (executable && argumentsText && !NON_COMMAND_START_WORDS.has(executable.toLowerCase()))
 			marker.push(`${executable} ${argumentsText}`);
@@ -525,7 +534,8 @@ function authoredEvidenceMarkers(text: string): string[] {
 		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
 		...(text.match(/#\d+/g) ?? []),
 		...(text.match(/\b[0-9a-f]{7,40}\b/gi) ?? []),
-		...(text.match(/\b(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),
+		...(text.match(/\b(?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),
+		...(text.match(/\b[A-Z][A-Z0-9]*-\d+\b/gi) ?? []),
 		...(text.match(
 			/\b\d+(?:,\d{3})*(?:\.\d+)?%?\s*(?:tests?|issues?|prs?|pull\s+requests?|files?|errors?|failures?|warnings?|blockers?|commits?|changes?|updates?|results?|passed|passing|failed|found|ms|seconds?|minutes?)\b/gi,
 		) ?? []),
