@@ -50,7 +50,7 @@ export function classifyCheckRollup(
 	let pending = latest.length === 0;
 	for (const entry of latest) {
 		const label = entry.name ?? entry.context ?? "unknown";
-		if (entry.__typename === "StatusContext" || (entry.state !== undefined && entry.status === undefined)) {
+		if (isStatusContext(entry)) {
 			const state = entry.state?.toUpperCase() ?? "PENDING";
 			if (FAILED_STATES.has(state)) failingChecks.push(label);
 			else if (state !== "SUCCESS") pending = true;
@@ -71,11 +71,17 @@ export function classifyCheckRollup(
 function latestCheckEntries(rollup: readonly RollupEntry[]): RollupEntry[] {
 	const latest = new Map<string, RollupEntry>();
 	for (const [index, entry] of rollup.entries()) {
-		const label = entry.name ?? entry.context ?? `unknown:${index}`;
-		const previous = latest.get(label);
-		if (!previous || isLaterCheck(entry, previous)) latest.set(label, entry);
+		const source = isStatusContext(entry) ? "status" : "check-run";
+		const name = entry.name ?? entry.context ?? `unknown:${index}`;
+		const key = `${source}:${name}`;
+		const previous = latest.get(key);
+		if (!previous || isLaterCheck(entry, previous)) latest.set(key, entry);
 	}
 	return [...latest.values()];
+}
+
+function isStatusContext(entry: RollupEntry): boolean {
+	return entry.__typename === "StatusContext" || (entry.state !== undefined && entry.status === undefined);
 }
 
 function isLaterCheck(candidate: RollupEntry, previous: RollupEntry): boolean {
