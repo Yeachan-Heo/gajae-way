@@ -689,8 +689,8 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	f.port.complete(persona.opRef, "ack");
 });
 
-// A channel message id is not a Discord thread id; public visibility makes a missing-thread fallback safe.
-test("AC-435 Discord channel root trigger routes the lane report through a public-thread fallback", async () => {
+// A Discord channel message id does not prove that a thread exists.
+test("AC-435 Discord channel root trigger keeps the lane report at the channel root", async () => {
 	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
 	const f = await fixture({
 		ownerTarget: discordChannelOrigin,
@@ -709,11 +709,7 @@ test("AC-435 Discord channel root trigger routes the lane report through a publi
 	);
 	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
-	expect(laneReportOrigin.kind).toBe("thread");
-	expect(laneReportOrigin.platform).toBe("discord");
-	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
-	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
-	expect(laneReportOrigin.threadVisibility).toBe("public");
+	expect(laneReportOrigin).toEqual(discordChannelOrigin);
 	f.port.complete(persona.opRef, "ack");
 });
 
@@ -730,4 +726,59 @@ test("AC-455 synthetic lane-report trigger ids stay on the Discord channel origi
 		JSON.stringify(discordChannelOrigin),
 	);
 	expect(JSON.parse(resolvedOriginRefJson)).toEqual(discordChannelOrigin);
+});
+
+test("Discord channel report wakes an idle persona and posts its reply at the channel root", async () => {
+	const f = await fixture({ channels: { "parent-channel": { engagement: "open", audience: "all" } } });
+	const persona = await startPersonaTurn(f, rootOrigin, "ordinary-channel-message");
+	const lane = await startLane(f, "idle-channel-worker", persona.sessionId);
+	await silencePersona(f, persona.opRef);
+	await settleLane(f, lane.result.opRef, "channel result");
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+	const sends = await eventually(
+		() => f.port.sends,
+		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
+		"idle persona report send",
+	);
+	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
+	const reportRow = f.database.inbox.turnRows(reportSend.opRef).find((row) => row.message_id === reportId)!;
+	expect(JSON.parse(reportRow.origin_ref_json)).toEqual(rootOrigin);
+	f.port.complete(reportSend.opRef, "channel ack");
+	await eventually(
+		() => chatMessages(f),
+		(items) => items.length === 1,
+		"channel reply post",
+	);
+	expect(chatMessages(f)[0]?.payload.origin).toEqual(rootOrigin);
+	expect(chatMessages(f)[0]?.payload.text).toBe("channel ack");
+});
+
+for (const visibility of ["public", "private", undefined] as const) {
+	test(`Discord ${visibility ?? "unknown"} thread report preserves its admitted origin`, () => {
+		const origin: OriginRef = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: "real-thread",
+			parentId: "parent-channel",
+			...(visibility ? { threadVisibility: visibility } : {}),
+		};
+		const json = JSON.stringify(origin);
+		expect(
+			resolveLaneReportOrigin(
+				{ kind: "persona", originKey: originKey(origin), origin, triggerMessageId: "thread-message" },
+				json,
+			),
+		).toBe(json);
+	});
+}
+
+test("Slack channel report rejects a trigger message from a different channel", () => {
+	const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
+	const json = JSON.stringify(origin);
+	expect(
+		resolveLaneReportOrigin(
+			{ kind: "persona", originKey: originKey(origin), origin, triggerMessageId: "C2:1700000000.000001" },
+			json,
+		),
+	).toBe(json);
 });
