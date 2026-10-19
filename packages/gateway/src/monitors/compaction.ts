@@ -394,69 +394,176 @@ const NON_SUBSTANTIVE_ECHO_WORDS = new Set([
 	"and",
 	"as",
 	"at",
+	"before",
+	"but",
 	"by",
+	"can",
 	"do",
+	"does",
 	"for",
 	"from",
 	"here",
 	"in",
 	"is",
 	"it",
+	"no",
+	"not",
 	"of",
 	"on",
 	"or",
+	"only",
 	"please",
 	"should",
 	"task",
 	"the",
+	"that",
 	"this",
 	"to",
+	"was",
+	"were",
 	"what",
 	"we",
 	"will",
 	"with",
 	"your",
 	"run",
+	"event",
 ]);
 
-/** Detect likely contract restatements without treating copied prompt numbers as evidence of work. */
-export function isAuthoredEchoSuspected(contractText: string | undefined, note: string): boolean {
-	if (!contractText || !note) return false;
+const META_ECHO_WORDS = new Set([
+	"check",
+	"checked",
+	"confirm",
+	"confirms",
+	"confirmed",
+	"describe",
+	"describes",
+	"described",
+	"find",
+	"finds",
+	"found",
+	"happened",
+	"inspect",
+	"inspected",
+	"look",
+	"mention",
+	"mentioned",
+	"note",
+	"noted",
+	"review",
+	"reviewed",
+	"run",
+	"ran",
+	"say",
+	"says",
+	"schedule",
+	"scheduled",
+	"state",
+	"states",
+	"summarize",
+	"summarized",
+	"target",
+	"verify",
+	"verified",
+]);
 
-	const tokenize = (text: string): string[] => text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-	const contractTokens = tokenize(contractText);
-	const noteTokens = tokenize(note);
-	if (contractTokens.length === 0 || noteTokens.length === 0) return false;
+const NO_WORK_DISCLAIMER_PATTERNS = [
+	/\b(?:do|does|did|has|have|had|is|are|was|were)\s+not\s+(?:confirm|verify|check|run|execute|inspect|review|report|show)\b/i,
+	/\bnot\s+(?:confirmed|verified|checked|run|executed|inspected|reviewed|completed|done)\b/i,
+	/\b(?:only|merely)\s+(?:describe|describes|summarize|summarizes|summarise|summarises|repeat|repeats|restate|restates|state|states|report|reports|note|notes)\b/i,
+	/\b(?:nothing|no\s+work|no\s+review|no\s+checks?|no\s+commands?|no\s+results?)\s+(?:(?:has|have|was|were)\s+)?(?:been\s+)?(?:done|checked|run|executed|performed)\b/i,
+];
 
-	// Token overlap alone can discard a finding appended to a copied instruction.
-	// Require broad contract coverage and no novel content words before suppressing.
-	const contractContent = contractTokens.filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token));
-	const noteContent = noteTokens.filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token));
-	if (contractContent.length === 0 || noteContent.length === 0) return false;
-	const remainingContractTokens = new Map<string, number>();
-	for (const token of contractContent)
-		remainingContractTokens.set(token, (remainingContractTokens.get(token) ?? 0) + 1);
-	for (const token of noteContent) {
-		const remaining = remainingContractTokens.get(token) ?? 0;
-		if (remaining === 0) return false;
-		remainingContractTokens.set(token, remaining - 1);
+const MAX_NOVEL_META_WORDS = 5;
+const MAX_NOVEL_CONTENT_RATIO = 0.2;
+const MIN_CONTRACT_COVERAGE = 0.7;
+
+export interface AuthoredEchoEventContext {
+	readonly eventType?: string;
+	readonly eventId?: string;
+	readonly payload?: unknown;
+	readonly firedAt?: string;
+}
+
+function serializeEchoPayload(payload: unknown): string {
+	if (typeof payload === "string") return payload;
+	try {
+		return JSON.stringify(payload) ?? "";
+	} catch {
+		return String(payload);
 	}
-	const contractSet = new Set(contractContent);
-	const noteSet = new Set(noteContent);
-	const sharedTokens = [...noteSet].filter((token) => contractSet.has(token)).length;
-	if (sharedTokens / contractSet.size < 0.7) return false;
+}
 
-	const evidenceMarkers = (text: string): string[] =>
-		(text.match(/(?:https?:\/\/|www\.)[^\s<>()]+|#\d+|\b[A-Z]+-\d+\b|\b\d+\b|```|`[^`]+`/gi) ?? []).map((marker) =>
-			marker.toLowerCase().replace(/[),.;!?]+$/g, ""),
-		);
-	const remainingContractEvidence = new Map<string, number>();
-	for (const marker of evidenceMarkers(contractText))
-		remainingContractEvidence.set(marker, (remainingContractEvidence.get(marker) ?? 0) + 1);
-	for (const marker of evidenceMarkers(note)) {
-		const remaining = remainingContractEvidence.get(marker) ?? 0;
-		if (remaining === 0) return false;
-		remainingContractEvidence.set(marker, remaining - 1);
-	}
-	return true;
+function authoredEvidenceMarkers(text: string): string[] {
+	const markers = [
+		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()]+/gi) ?? []),
+		...(text.match(/#\d+/g) ?? []),
+		...(text.match(/\b[0-9a-f]{7,40}\b/gi) ?? []),
+		...(text.match(/\b(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),
+		...(text.match(
+			/\b\d+(?:,\d{3})*(?:\.\d+)?%?\s*(?:tests?|issues?|prs?|pull\s+requests?|files?|errors?|failures?|warnings?|blockers?|commits?|changes?|updates?|results?|passed|passing|failed|found|ms|seconds?|minutes?)\b/gi,
+		) ?? []),
+		...(text.match(/\b(?:passed|passing|failed|found|changed|updated|blocked|resolved|reopened)\s+\d+\b/gi) ?? []),
+		...(text.match(
+			/\b(?:bun|npm|pnpm|yarn|git|gh|cargo|pytest|python3?|node)\s+(?:test|run|exec|check|status|diff|show|log|pr|issue|ci|install|typecheck|lint)\b[^\n]*/gi,
+		) ?? []),
+		...(text.match(/`[^`\n]+`/g) ?? []),
+	];
+	return markers.map((marker) => marker.toLowerCase().replace(/[),.;!?]+$/g, ""));
+}
+
+function authoredEchoTokens(text: string): string[] {
+	const normalizedTimestamps = text.replace(
+		/\b(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?Z?\b/gi,
+		"$1 $2 $3 $4 $5",
+	);
+	return normalizedTimestamps.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function eventPayloadDateTokens(payload: unknown): string {
+	const serialized = serializeEchoPayload(payload);
+	return (serialized.match(/\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z?)?\b/gi) ?? []).join("\n");
+}
+
+/** Detect contract-only notes while allowing paraphrase words and real, novel work evidence. */
+export function isAuthoredEchoSuspected(
+	contractText: string | undefined,
+	note: string,
+	eventContext?: AuthoredEchoEventContext,
+): boolean {
+	if (!note) return false;
+	const contractParts = [
+		contractText,
+		eventContext?.eventType,
+		eventContext?.payload === undefined ? undefined : eventPayloadDateTokens(eventContext.payload),
+	].filter((part): part is string => Boolean(part));
+	if (contractParts.length === 0) return false;
+	const fullContract = contractParts.join("\n");
+	const evidenceContract = [
+		fullContract,
+		eventContext?.eventId,
+		eventContext?.firedAt,
+		eventContext?.payload === undefined ? undefined : serializeEchoPayload(eventContext.payload),
+	]
+		.filter((part): part is string => Boolean(part))
+		.join("\n");
+	const contractContent = new Set(
+		authoredEchoTokens(fullContract).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token)),
+	);
+	const noteContent = new Set(authoredEchoTokens(note).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token)));
+	if (contractContent.size === 0 || noteContent.size === 0) return false;
+
+	const contractEvidence = new Set(authoredEvidenceMarkers(evidenceContract));
+	if (authoredEvidenceMarkers(note).some((marker) => !contractEvidence.has(marker))) return false;
+	if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(note))) return true;
+
+	const sharedTokens = [...noteContent].filter((token) => contractContent.has(token)).length;
+	const novelTokens = [...noteContent].filter((token) => !contractContent.has(token));
+	const novelMetaWords = novelTokens.filter((token) => META_ECHO_WORDS.has(token)).length;
+	const novelContentRatio = (novelTokens.length - novelMetaWords) / noteContent.size;
+	return (
+		sharedTokens / contractContent.size >= MIN_CONTRACT_COVERAGE &&
+		novelMetaWords <= MAX_NOVEL_META_WORDS &&
+		novelContentRatio <= MAX_NOVEL_CONTENT_RATIO
+	);
 }

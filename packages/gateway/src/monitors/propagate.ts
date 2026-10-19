@@ -1218,9 +1218,7 @@ export class MonitorPropagator {
 						const row = this.#database.monitors.eventGet(entry.eventId);
 						if (!row) continue;
 						const intentId = `monitor-event-intent:${entry.eventId}`;
-						const reportable = Boolean(
-							monitor.reportTo && this.#isReportableResult(monitor, row.event_type, entry.note),
-						);
+						const reportable = Boolean(monitor.reportTo && this.#isReportableResult(monitor, row, entry.note));
 						const authoredOk = this.#database.transaction((tx) => {
 							const authored = this.#database.monitors.authorFenced(
 								tx,
@@ -1313,7 +1311,7 @@ export class MonitorPropagator {
 				const validDeliveryEntries: typeof nonSilentEntries = [];
 				for (const entry of nonSilentEntries) {
 					const eventRow = fenced.find((row) => row.event_id === entry.eventId);
-					const isEcho = this.#isContractEcho(monitor, eventRow?.event_type, entry.note);
+					const isEcho = eventRow ? this.#isContractEcho(monitor, eventRow, entry.note) : false;
 					if (!isEcho) {
 						validDeliveryEntries.push(entry);
 						continue;
@@ -1741,7 +1739,7 @@ export class MonitorPropagator {
 			monitor.monitorId,
 			MONITOR_DIGEST_MAX_NOTES * DIGEST_NOTE_SCAN_FACTOR,
 		)) {
-			if (isSilentOutput(row.note) || this.#isContractEcho(monitor, row.event_type, row.note)) continue;
+			if (isSilentOutput(row.note) || this.#isContractEcho(monitor, row, row.note)) continue;
 			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note: row.note });
 		}
 		return notes;
@@ -1768,12 +1766,12 @@ export class MonitorPropagator {
 		eventId: string,
 		note: string,
 		noDelivery = false,
-		row?: { event_id: string; monitor_id: string; event_type: string; fired_at: string },
+		row?: Pick<MonitorEventDbRow, "event_id" | "monitor_id" | "event_type" | "payload_json" | "fired_at">,
 	): void {
 		const eventRow = row ?? this.#database.monitors.eventGet(eventId);
 		if (!eventRow) return;
 		const monitor = this.#registry.get(eventRow.monitor_id);
-		const reportable = Boolean(monitor?.reportTo && this.#isReportableResult(monitor, eventRow.event_type, note));
+		const reportable = Boolean(monitor?.reportTo && this.#isReportableResult(monitor, eventRow, note));
 		const intentId = `monitor-event-intent:${eventId}`;
 		const authored = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
@@ -1818,13 +1816,26 @@ export class MonitorPropagator {
 			console.error("monitor readiness observer failed");
 		}
 	}
-	#isReportableResult(monitor: MonitorRecord, eventType: string, note: string): boolean {
+	#isReportableResult(
+		monitor: MonitorRecord,
+		event: Pick<MonitorEventDbRow, "event_id" | "event_type" | "payload_json" | "fired_at">,
+		note: string,
+	): boolean {
 		if (isSilentOutput(note)) return false;
 		if (!monitor.channelTarget && !this.#ownerTarget) return true;
-		return !this.#isContractEcho(monitor, eventType, note);
+		return !this.#isContractEcho(monitor, event, note);
 	}
-	#isContractEcho(monitor: MonitorRecord, eventType: string | undefined, note: string): boolean {
-		return isAuthoredEchoSuspected(monitor.instruction, note) || isAuthoredEchoSuspected(eventType, note);
+	#isContractEcho(
+		monitor: MonitorRecord,
+		event: Pick<MonitorEventDbRow, "event_id" | "event_type" | "payload_json" | "fired_at">,
+		note: string,
+	): boolean {
+		return isAuthoredEchoSuspected(monitor.instruction, note, {
+			eventId: event.event_id,
+			eventType: event.event_type,
+			payload: event.payload_json,
+			firedAt: event.fired_at,
+		});
 	}
 	#enqueueMonitorReport(
 		tx: WriteTx,
