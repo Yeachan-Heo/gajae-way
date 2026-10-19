@@ -1447,17 +1447,18 @@ test("#621 regression: restart-stack-worker fixture fails if GAJAEWAY_LAUNCH_AGE
 	// on a macOS host. The fixture must be run with GAJAEWAY_LAUNCH_AGENTS_DIR set.
 	const { home, cleanup } = await tempHome();
 	try {
+		const env: NodeJS.ProcessEnv = {
+			...process.env,
+			GAJAEWAY_HOME: home,
+			FIXTURE_CALLER_PGID: String(process.pid),
+		};
+		delete env.GAJAEWAY_LAUNCH_AGENTS_DIR;
 		const worker = Bun.spawn(
 			[process.execPath, join(import.meta.dir, "fixtures/restart-stack-worker.ts"), "ops", "restart-stack"],
 			{
 				stdout: "pipe",
 				stderr: "pipe",
-				env: {
-					...process.env,
-					GAJAEWAY_HOME: home,
-					FIXTURE_CALLER_PGID: String(process.pid),
-					// Deliberately omit GAJAEWAY_LAUNCH_AGENTS_DIR to test the guard
-				},
+				env,
 			},
 		);
 		const exitCode = await worker.exited;
