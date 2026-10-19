@@ -242,7 +242,8 @@ export function decideEngagement(
 	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
-	if (mutedThread && !threadMuteAddressed(engagement, origin)) return { engaged: false, botAudienceAdmission: false };
+	if (mutedThread && !threadMuteAddressed(engagement, origin, config))
+		return { engaged: false, botAudienceAdmission: false };
 	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };
 	const policy = resolveChannelPolicy(origin, config);
 	return evaluateChannelEngagement({
@@ -274,16 +275,25 @@ export function threadMuteKey(
 /**
  * Whether a message in a muted thread addresses the persona and so unmutes it.
  * A channel's open policy is not an explicit mention. An adapter that predates
- * `explicitMention` only reports `mentioned`, which is honoured so its mentions
- * still unmute. A Slack thread kept on the channel session is rooted at the
- * persona's own message, so every reply in it carries `replyTo.fromSelf`: that
- * is thread membership, not a reply, and only a mention unmutes it.
+ * `explicitMention` reports a mention only as `mentioned`, which is honoured
+ * except in an `open` channel, where such an adapter sets `mentioned` on every
+ * message and it says nothing about addressing. A Slack thread kept on the
+ * channel session is rooted at the persona's own message, so every reply in it
+ * carries `replyTo.fromSelf`: that is thread membership, not a reply, and only
+ * a mention unmutes it.
  */
 export function threadMuteAddressed(
 	engagement: EngagementContext | undefined,
-	origin: Pick<OriginRef, "kind">,
+	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
+	config: GatewayConfig,
 ): boolean {
-	if ((engagement?.explicitMention ?? engagement?.mentioned) === true) return true;
+	if (engagement?.explicitMention === true) return true;
+	if (
+		engagement?.explicitMention === undefined &&
+		engagement?.mentioned === true &&
+		resolveChannelPolicy(origin, config)?.engagement !== "open"
+	)
+		return true;
 	return origin.kind === "thread" && engagement?.replyTo?.fromSelf === true;
 }
 
@@ -291,8 +301,6 @@ export function threadMuteAddressed(
 export interface ThreadEngagementStore {
 	originTriggeredTurn(originKey: string): boolean;
 	messageJoinedTurn(originKey: string, messageId: string): boolean;
-	/** Check if the thread is muted (follow-ups are suppressed unless mentioned/replied-to). */
-	isThreadMuted(threadOriginKey: string): boolean;
 }
 
 /**
@@ -329,22 +337,6 @@ export function threadFollowUpEngaged(
 		conversationId: origin.parentId,
 	});
 	return store.messageJoinedTurn(parentKey, origin.conversationId);
-}
-
-/**
- * Suppress threadFollowUp engagement if the thread is muted, unless the message
- * is explicitly mentioned or replied to the bot (which unmutes).
- */
-export function suppressMutedThreadFollowUp(
-	threadFollowUp: boolean,
-	threadOriginKey: string,
-	engagement: EngagementContext | undefined,
-	store: ThreadEngagementStore,
-): boolean {
-	if (!threadFollowUp) return false;
-	if (!store.isThreadMuted(threadOriginKey)) return true;
-	// Thread is muted; only engage if mentioned or replied-to
-	return threadMuteAddressed(engagement, { kind: "thread" });
 }
 
 /**

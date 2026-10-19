@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { GatewayConfig } from "../src/config";
-import { decideEngagement, suppressMutedThreadFollowUp, threadFollowUpEngaged } from "../src/engagement/policy";
+import { decideEngagement, threadFollowUpEngaged, threadMuteKey } from "../src/engagement/policy";
 
 const OWNER = "U-owner";
 const THREAD = {
@@ -60,20 +60,12 @@ test("audience rules still decide bots in a followed-up thread", () => {
 const THREAD_KEY = "slack/thread/C1:1700000000.000100/parent=C1";
 
 function store(
-	options: {
-		triggeredOrigins?: readonly string[];
-		triggeredMessages?: readonly [string, string][];
-		mutedThreads?: Set<string>;
-	} = {},
+	options: { triggeredOrigins?: readonly string[]; triggeredMessages?: readonly [string, string][] } = {},
 ) {
-	const muted = options.mutedThreads ?? new Set<string>();
 	return {
 		originTriggeredTurn: (key: string) => (options.triggeredOrigins ?? []).includes(key),
 		messageJoinedTurn: (key: string, messageId: string) =>
 			(options.triggeredMessages ?? []).some(([k, m]) => k === key && m === messageId),
-		isThreadMuted: (threadOriginKey: string) => muted.has(threadOriginKey),
-		muteThread: (threadOriginKey: string) => muted.add(threadOriginKey),
-		unmuteThread: (threadOriginKey: string) => muted.delete(threadOriginKey),
 	};
 }
 
@@ -109,59 +101,70 @@ test("defaulting the parameter keeps every existing caller mention-gated", () =>
 
 test("a muted thread suppresses follow-ups without mention or reply-to (issue #625)", () => {
 	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
-	const muted = store({
-		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
-		mutedThreads: new Set([THREAD_KEY]),
-	});
-	// Without mention or reply, the muted thread is not engaged
-	const noMentionNoReply = { mentioned: false, group: true, authorId: "U-stranger" };
-	const followUpCheck = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
-	const followUpAfterMuteCheck = suppressMutedThreadFollowUp(followUpCheck, THREAD_KEY, noMentionNoReply, muted);
-	const engagement = decideEngagement(THREAD, noMentionNoReply, mentionOpen, followUpAfterMuteCheck);
-	expect(engagement.engaged).toBe(false);
+	const followUp = threadFollowUpEngaged(
+		THREAD,
+		THREAD_KEY,
+		store({ triggeredMessages: [["slack/channel/C1", THREAD.conversationId]] }),
+	);
+	expect(followUp).toBe(true);
+	const noMentionNoReply = { mentioned: false, explicitMention: false, group: true, authorId: "U-stranger" };
+	expect(decideEngagement(THREAD, noMentionNoReply, mentionOpen, followUp, true).engaged).toBe(false);
+	expect(decideEngagement(THREAD, noMentionNoReply, mentionOpen, followUp, false).engaged).toBe(true);
 });
 
 test("mute overrides open-channel admission unless there is a real mention or reply", () => {
 	const open = config({ channels: { "slack:C1": { engagement: "open", audience: "all" } } });
-	const muted = store({ mutedThreads: new Set([THREAD_KEY]) });
 	const openChannelFollowUp = { mentioned: true, explicitMention: false, group: true, authorId: OWNER };
-	const followUp = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
-	const suppressedFollowUp = suppressMutedThreadFollowUp(followUp, THREAD_KEY, openChannelFollowUp, muted);
-	expect(decideEngagement(THREAD, openChannelFollowUp, open, suppressedFollowUp, true).engaged).toBe(false);
+	expect(decideEngagement(THREAD, openChannelFollowUp, open, true, true).engaged).toBe(false);
 	const explicitMention = { ...openChannelFollowUp, explicitMention: true };
-	const mentionedFollowUp = suppressMutedThreadFollowUp(followUp, THREAD_KEY, explicitMention, muted);
-	expect(decideEngagement(THREAD, explicitMention, open, mentionedFollowUp, true).engaged).toBe(true);
+	expect(decideEngagement(THREAD, explicitMention, open, true, true).engaged).toBe(true);
 });
 
 test("a muted thread engages with explicit mention (issue #625)", () => {
 	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
-	const muted = store({
-		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
-		mutedThreads: new Set([THREAD_KEY]),
-	});
-	// With mention, engagement should be allowed even if muted
 	const withMention = { mentioned: true, explicitMention: true, group: true, authorId: "U-stranger" };
-	const followUpCheck = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
-	const followUpAfterMuteCheck = suppressMutedThreadFollowUp(followUpCheck, THREAD_KEY, withMention, muted);
-	const engagement = decideEngagement(THREAD, withMention, mentionOpen, followUpAfterMuteCheck);
-	expect(engagement.engaged).toBe(true);
+	expect(decideEngagement(THREAD, withMention, mentionOpen, true, true).engaged).toBe(true);
 });
 
 test("a muted thread engages with reply-to (issue #625)", () => {
 	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
-	const muted = store({
-		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
-		mutedThreads: new Set([THREAD_KEY]),
-	});
-	// With reply-to bot, engagement should be allowed even if muted
 	const withReplyToBot = {
 		mentioned: false,
+		explicitMention: false,
 		group: true,
 		authorId: "U-stranger",
-		replyTo: { fromSelf: true },
+		replyTo: { messageId: "C1:1700000000.000200", fromSelf: true },
 	};
-	const followUpCheck = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
-	const followUpAfterMuteCheck = suppressMutedThreadFollowUp(followUpCheck, THREAD_KEY, withReplyToBot as never, muted);
-	const engagement = decideEngagement(THREAD, withReplyToBot as never, mentionOpen, followUpAfterMuteCheck);
-	expect(engagement.engaged).toBe(true);
+	expect(decideEngagement(THREAD, withReplyToBot, mentionOpen, true, true).engaged).toBe(true);
+});
+
+test("a legacy adapter mention unmutes except where an open channel marks every message mentioned", () => {
+	const legacyMention = { mentioned: true, group: true, authorId: OWNER };
+	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	expect(decideEngagement(THREAD, legacyMention, mentionOpen, true, true).engaged).toBe(true);
+	const open = config({ channels: { "slack:C1": { engagement: "open", audience: "all" } } });
+	expect(decideEngagement(THREAD, legacyMention, open, true, true).engaged).toBe(false);
+	// No policy entry is a closed channel: `mentioned` is still a real mention there.
+	expect(decideEngagement(THREAD, legacyMention, config(), true, true).engaged).toBe(true);
+});
+
+test("a Slack thread kept on the channel session mutes under its own thread key", () => {
+	const botRootReply = {
+		mentioned: true,
+		explicitMention: false,
+		group: true,
+		authorId: OWNER,
+		replyTo: { messageId: THREAD.conversationId, fromSelf: true },
+	};
+	expect(threadMuteKey(CHANNEL, "slack/channel/C1", botRootReply)).toBe(THREAD_KEY);
+	expect(threadMuteKey(THREAD, THREAD_KEY, undefined)).toBe(THREAD_KEY);
+	expect(threadMuteKey(CHANNEL, "slack/channel/C1", { ...botRootReply, replyTo: undefined })).toBeUndefined();
+	const discordChannel = { platform: "discord" as const, kind: "channel" as const, conversationId: "C1" };
+	expect(threadMuteKey(discordChannel, "discord/channel/C1", botRootReply)).toBeUndefined();
+	// Every reply in that thread is fromSelf, so only a mention admits it while muted.
+	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	expect(decideEngagement(CHANNEL, botRootReply, mentionOpen, false, true).engaged).toBe(false);
+	expect(decideEngagement(CHANNEL, { ...botRootReply, explicitMention: true }, mentionOpen, false, true).engaged).toBe(
+		true,
+	);
 });

@@ -56,7 +56,6 @@ import {
 	decideEngagement,
 	resolveBotAudienceLimits,
 	resolveChannelPolicy,
-	suppressMutedThreadFollowUp,
 	threadFollowUpEngaged,
 	threadMuteAddressed,
 	threadMuteKey,
@@ -2661,15 +2660,11 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	// Check if the thread is muted and suppress follow-up unless mentioned or replied-to
-	const threadFollowUpForEngagement = suppressMutedThreadFollowUp(
-		threadFollowUp,
-		key,
-		params.engagement as never,
-		options.database.inbox,
-	);
+	// A muted thread (#625) admits only a message that addresses the persona, which also unmutes it.
 	const muteKey = threadMuteKey(origin, key, params.engagement as never);
 	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
+	const muteAddressed = mutedThread && threadMuteAddressed(params.engagement as never, origin, runtime.config);
+	const threadFollowUpForEngagement = threadFollowUp && (!mutedThread || muteAddressed);
 	const engagementDecision = decideEngagement(
 		origin,
 		params.engagement as never,
@@ -2725,7 +2720,7 @@ async function sendChat(
 		);
 	}
 	if (!engaged) {
-		if (mutedThread && !threadMuteAddressed(params.engagement as never, origin))
+		if (mutedThread && !muteAddressed)
 			console.info(`gateway engagement-muted skip origin=${key} message=${inboundMessageId ?? "unidentified"}`);
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2890,7 +2885,7 @@ async function sendChat(
 		});
 		return;
 	}
-	if (muteKey !== undefined && mutedThread && threadMuteAddressed(params.engagement as never, origin)) {
+	if (muteKey !== undefined && muteAddressed) {
 		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, muteKey));
 	}
 	for (const intentId of admission.memoryIntentIds) runtime.memory.enqueueExistingId(intentId);
@@ -2989,15 +2984,11 @@ async function editChat(
 		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
 	);
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
-	// Check if the thread is muted and suppress follow-up unless mentioned or replied-to
-	const threadFollowUpForEngagement = suppressMutedThreadFollowUp(
-		threadFollowUp,
-		key,
-		params.engagement as never,
-		options.database.inbox,
-	);
+	// A muted thread (#625) admits only a message that addresses the persona, which also unmutes it.
 	const muteKey = threadMuteKey(origin, key, params.engagement as never);
 	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
+	const muteAddressed = mutedThread && threadMuteAddressed(params.engagement as never, origin, runtime.config);
+	const threadFollowUpForEngagement = threadFollowUp && (!mutedThread || muteAddressed);
 	const engagementDecision = decideEngagement(
 		origin,
 		params.engagement as never,
@@ -3021,7 +3012,7 @@ async function editChat(
 			);
 	}
 	if (!engagementDecision.engaged || botAudienceGuardSpent) {
-		if (mutedThread && !threadMuteAddressed(params.engagement as never, origin))
+		if (mutedThread && !muteAddressed)
 			console.info(`gateway engagement-muted skip origin=${key} message=${params.messageId}`);
 		declined();
 		return;
@@ -3046,7 +3037,7 @@ async function editChat(
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
 		return;
 	}
-	if (muteKey !== undefined && mutedThread && threadMuteAddressed(params.engagement as never, origin)) {
+	if (muteKey !== undefined && muteAddressed) {
 		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, muteKey));
 	}
 	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
@@ -4532,6 +4523,14 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(origin.kind === "thread"
 			? [
 					"To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
+				]
+			: []),
+		// Slack keeps a thread rooted at the persona's own message on the channel
+		// session (adapter-slack decideInbound), so the thread notice above never
+		// reaches it.
+		...(origin.platform === "slack" && origin.kind === "channel"
+			? [
+					"Replies in a Slack thread under one of your own messages arrive in this channel session. To mute such a thread so it stops sending you messages unless you are explicitly mentioned there, answer a message from that thread with exactly [SHUTUP] and nothing else. This mutes only that thread, persists across restarts, and a mention in the thread unmutes it.",
 				]
 			: []),
 		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord
