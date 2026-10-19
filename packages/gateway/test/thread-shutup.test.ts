@@ -14,6 +14,15 @@ const OTHER_THREAD = { ...THREAD, conversationId: "other-root" } as const;
 const CHANNEL = { platform: "discord", kind: "channel", conversationId: "channel" } as const;
 const OWNER_DM = { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: "owner" } as const;
 const OWNER = "owner";
+const SLACK_CHANNEL = { platform: "slack", kind: "channel", conversationId: "C0SHUTUP" } as const;
+/** Root of a Slack thread started on the persona's own message; replies stay on the channel session. */
+const SLACK_BOT_ROOT = "C0SHUTUP:1700000000.000100";
+const SLACK_BOT_THREAD_KEY = originKey({
+	platform: "slack",
+	kind: "thread",
+	conversationId: SLACK_BOT_ROOT,
+	parentId: SLACK_CHANNEL.conversationId,
+});
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -68,7 +77,10 @@ function config(home: string, engagement: "open" | "mention-open"): GatewayConfi
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "discord:channel": { engagement, audience: "all" } },
+		channels: {
+			"discord:channel": { engagement, audience: "all" },
+			"slack:C0SHUTUP": { engagement, audience: "all" },
+		},
 		dmPolicy: "open",
 		ownerTarget: { origin: OWNER_DM },
 	};
@@ -142,10 +154,10 @@ async function fixture(
 async function send(
 	client: Client,
 	id: string,
-	origin: typeof THREAD | typeof OTHER_THREAD | typeof CHANNEL | typeof OWNER_DM,
+	origin: typeof THREAD | typeof OTHER_THREAD | typeof CHANNEL | typeof OWNER_DM | typeof SLACK_CHANNEL,
 	engagement: {
 		mentioned: boolean;
-		explicitMention: boolean;
+		explicitMention?: boolean;
 		group: boolean;
 		authorId: string;
 		authorIsBot?: boolean;
@@ -259,8 +271,50 @@ test("SHUTUP composes with reaction control tokens without leaking its marker", 
 	}
 });
 
+test("SHUTUP mutes a Slack thread that is carried by its channel session", async () => {
+	const f = await fixture("open");
+	// Every reply under the persona's own Slack message carries replyTo.fromSelf and
+	// stays on the channel origin (adapter-slack decideInbound).
+	const botThreadReply = {
+		mentioned: true,
+		explicitMention: false,
+		group: true,
+		authorId: OWNER,
+		replyTo: { messageId: SLACK_BOT_ROOT, fromSelf: true },
+	};
+	try {
+		await send(f.client, "slack-mute-trigger", SLACK_CHANNEL, botThreadReply);
+		await waitForTurn(f, 1);
+		await waitUntil(() => f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY));
+		expect(f.database.inbox.isThreadMuted(originKey(SLACK_CHANNEL))).toBe(false);
+
+		expect((await send(f.client, "slack-muted-reply", SLACK_CHANNEL, botThreadReply)).result.engaged).toBe(false);
+		expect(f.turns).toHaveLength(1);
+		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(true);
+
+		// The channel itself and other bot-rooted threads in it stay engaged.
+		const channelRoot = { mentioned: true, explicitMention: false, group: true, authorId: OWNER };
+		expect((await send(f.client, "slack-channel-root", SLACK_CHANNEL, channelRoot)).result.engaged).toBe(true);
+		await waitForTurn(f, 2);
+		const otherThread = { ...botThreadReply, replyTo: { messageId: "C0SHUTUP:1700000000.000200", fromSelf: true } };
+		expect((await send(f.client, "slack-other-thread", SLACK_CHANNEL, otherThread)).result.engaged).toBe(true);
+		await waitForTurn(f, 3);
+
+		// A literal mention inside the muted thread unmutes it.
+		const mention = { ...botThreadReply, explicitMention: true };
+		expect((await send(f.client, "slack-unmute", SLACK_CHANNEL, mention)).result.engaged).toBe(true);
+		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(false);
+		await waitForTurn(f, 4);
+		expect((await send(f.client, "slack-after-unmute", SLACK_CHANNEL, botThreadReply)).result.engaged).toBe(true);
+	} finally {
+		f.client.close();
+	}
+});
+
 for (const [label, addressed] of [
 	["explicit mention", threadMention],
+	// An adapter that predates explicitMention reports a literal mention only as `mentioned`.
+	["legacy mention without explicitMention", { mentioned: true, group: true, authorId: OWNER }],
 	[
 		"reply to persona",
 		{

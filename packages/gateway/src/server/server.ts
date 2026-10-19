@@ -59,6 +59,7 @@ import {
 	suppressMutedThreadFollowUp,
 	threadFollowUpEngaged,
 	threadMuteAddressed,
+	threadMuteKey,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import { FunctionalReadiness } from "../functional-readiness";
@@ -2667,7 +2668,8 @@ async function sendChat(
 		params.engagement as never,
 		options.database.inbox,
 	);
-	const mutedThread = origin.kind === "thread" && options.database.inbox.isThreadMuted(key);
+	const muteKey = threadMuteKey(origin, key, params.engagement as never);
+	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
 	const engagementDecision = decideEngagement(
 		origin,
 		params.engagement as never,
@@ -2723,7 +2725,7 @@ async function sendChat(
 		);
 	}
 	if (!engaged) {
-		if (mutedThread && !threadMuteAddressed(params.engagement as never))
+		if (mutedThread && !threadMuteAddressed(params.engagement as never, origin))
 			console.info(`gateway engagement-muted skip origin=${key} message=${inboundMessageId ?? "unidentified"}`);
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2888,8 +2890,8 @@ async function sendChat(
 		});
 		return;
 	}
-	if (mutedThread && threadMuteAddressed(params.engagement as never)) {
-		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, key));
+	if (muteKey !== undefined && mutedThread && threadMuteAddressed(params.engagement as never, origin)) {
+		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, muteKey));
 	}
 	for (const intentId of admission.memoryIntentIds) runtime.memory.enqueueExistingId(intentId);
 	for (const watchOriginKey of admission.watchWakeOrigins)
@@ -2994,7 +2996,8 @@ async function editChat(
 		params.engagement as never,
 		options.database.inbox,
 	);
-	const mutedThread = origin.kind === "thread" && options.database.inbox.isThreadMuted(key);
+	const muteKey = threadMuteKey(origin, key, params.engagement as never);
+	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
 	const engagementDecision = decideEngagement(
 		origin,
 		params.engagement as never,
@@ -3018,7 +3021,7 @@ async function editChat(
 			);
 	}
 	if (!engagementDecision.engaged || botAudienceGuardSpent) {
-		if (mutedThread && !threadMuteAddressed(params.engagement as never))
+		if (mutedThread && !threadMuteAddressed(params.engagement as never, origin))
 			console.info(`gateway engagement-muted skip origin=${key} message=${params.messageId}`);
 		declined();
 		return;
@@ -3043,8 +3046,8 @@ async function editChat(
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
 		return;
 	}
-	if (mutedThread && threadMuteAddressed(params.engagement as never)) {
-		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, key));
+	if (muteKey !== undefined && mutedThread && threadMuteAddressed(params.engagement as never, origin)) {
+		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, muteKey));
 	}
 	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
@@ -3990,9 +3993,10 @@ async function createInboundTurnLifecycle(
 				);
 			});
 			// Issue #625: mute the thread if the response is [SHUTUP]
-			if (isShutupToken(text) && origin.kind === "thread" && nonLoopback) {
+			const muteKey = nonLoopback ? threadMuteKey(origin, key, engagement as never) : undefined;
+			if (muteKey !== undefined && isShutupToken(text)) {
 				options.database.transaction((tx) => {
-					options.database.inbox.muteThread(tx, key);
+					options.database.inbox.muteThread(tx, muteKey);
 				});
 			}
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;

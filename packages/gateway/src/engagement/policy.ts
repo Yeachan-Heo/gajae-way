@@ -242,8 +242,7 @@ export function decideEngagement(
 	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
-	if (origin.kind === "thread" && mutedThread && !threadMuteAddressed(engagement))
-		return { engaged: false, botAudienceAdmission: false };
+	if (mutedThread && !threadMuteAddressed(engagement, origin)) return { engaged: false, botAudienceAdmission: false };
 	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };
 	const policy = resolveChannelPolicy(origin, config);
 	return evaluateChannelEngagement({
@@ -254,9 +253,38 @@ export function decideEngagement(
 	});
 }
 
-/** A channel's open policy is not an explicit mention that may unmute a thread. */
-export function threadMuteAddressed(engagement: EngagementContext | undefined): boolean {
-	return engagement?.explicitMention === true || engagement?.replyTo?.fromSelf === true;
+/**
+ * The durable mute key of the visible thread a message belongs to, or undefined
+ * when the message is not in a thread. A Slack reply under the persona's own
+ * message keeps the channel session (adapter-slack `decideInbound`), so its
+ * thread is named by `replyTo.messageId` (`channel:thread_ts`), which is exactly
+ * the conversation id a thread origin for that root carries.
+ */
+export function threadMuteKey(
+	origin: Pick<OriginRef, "platform" | "kind" | "conversationId">,
+	key: string,
+	engagement: EngagementContext | undefined,
+): string | undefined {
+	if (origin.kind === "thread") return key;
+	const root = engagement?.replyTo?.messageId;
+	if (origin.platform !== "slack" || origin.kind !== "channel" || !root) return undefined;
+	return originKey({ platform: "slack", kind: "thread", conversationId: root, parentId: origin.conversationId });
+}
+
+/**
+ * Whether a message in a muted thread addresses the persona and so unmutes it.
+ * A channel's open policy is not an explicit mention. An adapter that predates
+ * `explicitMention` only reports `mentioned`, which is honoured so its mentions
+ * still unmute. A Slack thread kept on the channel session is rooted at the
+ * persona's own message, so every reply in it carries `replyTo.fromSelf`: that
+ * is thread membership, not a reply, and only a mention unmutes it.
+ */
+export function threadMuteAddressed(
+	engagement: EngagementContext | undefined,
+	origin: Pick<OriginRef, "kind">,
+): boolean {
+	if ((engagement?.explicitMention ?? engagement?.mentioned) === true) return true;
+	return origin.kind === "thread" && engagement?.replyTo?.fromSelf === true;
 }
 
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */
@@ -316,7 +344,7 @@ export function suppressMutedThreadFollowUp(
 	if (!threadFollowUp) return false;
 	if (!store.isThreadMuted(threadOriginKey)) return true;
 	// Thread is muted; only engage if mentioned or replied-to
-	return threadMuteAddressed(engagement);
+	return threadMuteAddressed(engagement, { kind: "thread" });
 }
 
 /**
