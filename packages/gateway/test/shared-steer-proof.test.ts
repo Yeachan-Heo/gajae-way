@@ -8,6 +8,7 @@ const original: Extract<WorkerOutputResult, { status: "proven" }> = {
 	status: "proven",
 	text: "original answer",
 	observedAtMs: 200,
+	terminal: { status: "terminal_ok", clientRef: "original-op", terminalAt: 100, receiptState: "present" },
 	provenance: {
 		source: "turn.result",
 		fullness: "original",

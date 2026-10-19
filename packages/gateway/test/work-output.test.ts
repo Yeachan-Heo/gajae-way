@@ -123,6 +123,15 @@ test("worker output uses the actual operation-owned single-page query and preser
 		status: "proven",
 		text,
 		observedAtMs: floor + 2_000,
+		terminal: {
+			status: "terminal_ok",
+			clientRef: input.opRef,
+			commandId: "command-1",
+			turnId: "turn-1",
+			startedAt: floor,
+			terminalAt: floor + 1_000,
+			receiptState: "present",
+		},
 		provenance: {
 			source: "turn.result",
 			fullness: "original",

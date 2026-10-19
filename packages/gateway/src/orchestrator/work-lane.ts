@@ -41,6 +41,7 @@ import { BrokerAuthorityError, type Store } from "../store";
 import {
 	type LaneReportRow,
 	resolveLaneReportOrigin,
+	terminalEvidence,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -67,7 +68,7 @@ import {
 	workSessionKey,
 } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
-import { isSessionUnavailable, type SessionPort } from "./session-port";
+import { isSessionUnavailable, type SessionLiveness, type SessionPort } from "./session-port";
 import { isRelayTransportFailure, type TailHandle } from "./tail-runner";
 
 const owners = new WeakSet<Store>();
@@ -140,6 +141,10 @@ interface Observer {
 	turnEndObservedAt?: string;
 	/** First of an unbroken run of host-gone verdicts; any other observation resets it. */
 	goneSince?: number;
+	/** First positive live=false inspect while terminal/missing status remains readable. */
+	receiptDeadSince?: number;
+	/** Monotonic even when multiple execution frames share the same clock tick. */
+	activityVersion?: number;
 }
 interface Waiter {
 	readonly owner: object;
@@ -1306,11 +1311,21 @@ export class WorkLaneManager {
 			return;
 		observer.attaching = (async () => {
 			const runtime = observer.runtime;
+			const invalidateActivity = () => {
+				observer.activityVersion = (observer.activityVersion ?? 0) + 1;
+				observer.receiptDeadSince = undefined;
+			};
 			const tail = await this.#port.attachTail({
 				sessionId: runtime.sessionId,
 				brokerGeneration: observer.generation,
 				repo: runtime.cwd,
 				originKey: runtime.sessionKey,
+				onTurnActivity: invalidateActivity,
+				onRelayLost: invalidateActivity,
+				onRelayDead: () => {
+					invalidateActivity();
+					if (this.#writeCurrent(observer)) this.#readopt(observer, "reconciliation_unavailable");
+				},
 				onFrame: (frame) => {
 					if (!this.#writeCurrent(observer)) return;
 					if (
@@ -1381,6 +1396,89 @@ export class WorkLaneManager {
 			return false;
 		}
 	}
+	/**
+	 * Lifecycle delivery is not guaranteed across disconnects/restarts. A live
+	 * host can independently prove execution ended, but a request deadline, an
+	 * idle broker activity label, or an unavailable probe cannot (#564).
+	 */
+	async #observeIdleTurnEnd(
+		observer: Observer,
+		runtime: WorkAttemptRuntime,
+		status: PromptStatusBody,
+	): Promise<boolean | undefined> {
+		if (
+			status.clientRef !== runtime.opRef ||
+			(!status.commandId && !status.turnId) ||
+			!(status.startedAt !== undefined && status.startedAt >= Date.parse(runtime.startedAt)) ||
+			!(status.terminalAt !== undefined && status.terminalAt >= status.startedAt)
+		)
+			return false;
+		if (!this.#port.turnRunning) return undefined;
+		const activityVersion = observer.activityVersion;
+		const tail = observer.attaching ? undefined : observer.tail;
+		const connectionEpoch = tail?.connectionEpoch;
+		if (tail && connectionEpoch !== undefined)
+			tail.correlate(runtime.opRef, { commandId: status.commandId, turnId: status.turnId });
+		const running = await this.#port.turnRunning({
+			sessionId: runtime.sessionId,
+			repo: runtime.cwd,
+			...(tail && connectionEpoch !== undefined ? { relay: tail } : {}),
+		});
+		if (!this.#writeCurrent(observer) || observer.activityVersion !== activityVersion || running === true) return false;
+		if (running === undefined) return undefined;
+		// A CLI idle snapshot cannot prove end across an unobserved attachment gap.
+		if (!tail || connectionEpoch === undefined || observer.tail !== tail || observer.attaching) return false;
+		// Revalidate the same operation after the live snapshot. A late receipt,
+		// changed identity, or unknown status is handled by a fresh normal tick.
+		const current = await this.#query(runtime, tail);
+		if (
+			!this.#writeCurrent(observer) ||
+			observer.activityVersion !== activityVersion ||
+			observer.tail !== tail ||
+			observer.attaching !== undefined ||
+			tail.connectionEpoch !== connectionEpoch ||
+			JSON.stringify(current) !== JSON.stringify(status)
+		)
+			return false;
+		return true;
+	}
+	/** A cached failed request can outlive its host without ever emitting lifecycle end. */
+	async #missingReceiptHostDead(
+		observer: Observer,
+		runtime: WorkAttemptRuntime,
+		status: PromptStatusBody,
+	): Promise<boolean> {
+		const activityVersion = observer.activityVersion;
+		let live: SessionLiveness | undefined;
+		try {
+			live = await this.#port.liveness?.({ sessionId: runtime.sessionId, repo: runtime.cwd });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+		}
+		if (!this.#writeCurrent(observer)) return false;
+		if (observer.activityVersion !== activityVersion || live?.live !== false || live.disowned) {
+			observer.receiptDeadSince = undefined;
+			return false;
+		}
+		observer.receiptDeadSince ??= this.#now();
+		if (this.#now() - observer.receiptDeadSince < (this.#options.hostLostGraceMs ?? HOST_LOST_GRACE_MS)) return false;
+		let current: PromptStatusBody;
+		try {
+			current = await this.#query(runtime, observer.tail);
+		} catch (error) {
+			observer.receiptDeadSince = undefined;
+			throw error;
+		}
+		if (
+			!this.#writeCurrent(observer) ||
+			observer.activityVersion !== activityVersion ||
+			JSON.stringify(current) !== JSON.stringify(status)
+		) {
+			observer.receiptDeadSince = undefined;
+			return false;
+		}
+		return true;
+	}
 	async #tick(observer: Observer): Promise<void> {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
@@ -1396,6 +1494,7 @@ export class WorkLaneManager {
 				status = await this.#query(runtime, observer.tail);
 				observer.goneSince = undefined;
 			} catch (error) {
+				observer.receiptDeadSince = undefined;
 				if (!(await this.#hostGone(runtime, error))) {
 					observer.goneSince = undefined;
 					throw error;
@@ -1406,17 +1505,50 @@ export class WorkLaneManager {
 				if (this.#now() - observer.goneSince < (this.#options.hostLostGraceMs ?? HOST_LOST_GRACE_MS)) return;
 			}
 			if (!this.#writeCurrent(observer)) return;
-			if (status?.status === "unknown") return;
+			if (status?.status === "unknown") {
+				observer.receiptDeadSince = undefined;
+				return;
+			}
 			if (!status) console.error(`work_host_lost opRef=${runtime.opRef} session=${runtime.sessionId} source=observer`);
-			const terminal = status
+			let terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
 			if (
 				terminal?.reasonCode === "terminal_missing_receipt" &&
 				runtime.turnEndObservedAt === undefined &&
 				observer.turnEndObservedAt === undefined
-			)
-				return;
+			) {
+				const activityVersion = observer.activityVersion;
+				const proofTail = observer.tail;
+				const proofConnectionEpoch = proofTail?.connectionEpoch;
+				const idle = await this.#observeIdleTurnEnd(observer, runtime, status!).catch((error: unknown) => {
+					if (error instanceof BrokerAuthorityError) throw error;
+					return undefined;
+				});
+				if (idle !== undefined) observer.receiptDeadSince = undefined;
+				if (idle === false) return;
+				if (idle === undefined) {
+					if (!(await this.#missingReceiptHostDead(observer, runtime, status!))) return;
+					terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
+				}
+				if (observer.activityVersion !== activityVersion) {
+					observer.receiptDeadSince = undefined;
+					return;
+				}
+				if (idle === true) {
+					if (
+						!proofTail ||
+						observer.tail !== proofTail ||
+						observer.attaching ||
+						proofConnectionEpoch === undefined ||
+						proofTail.connectionEpoch !== proofConnectionEpoch
+					)
+						return;
+					observer.turnEndObservedAt ??= this.#at();
+					observer.tail?.setTurnRunning(false);
+				}
+			} else observer.receiptDeadSince = undefined;
+			if (!this.#writeCurrent(observer)) return;
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			runtime =
 				this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -1492,7 +1624,19 @@ export class WorkLaneManager {
 					// (#248): re-derive the end state from the reconciled receipt.
 					const reconciled =
 						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
-							? terminalEvidence({ ...terminal.status, receiptState: "present" }, terminal.observedAt)
+							? terminalEvidence(
+									safeStatus({
+										...terminal.status,
+										...result.terminal,
+										// Preserve an existing outcome only for the same terminal
+										// status; a deadline failure is superseded, not completion proof.
+										outcome:
+											result.terminal.outcome ??
+											(terminal.status.status === result.terminal.status ? terminal.status.outcome : undefined),
+										error: result.terminal.error,
+									}),
+									terminal.observedAt,
+								)
 							: undefined;
 					const updated = this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(reconciled ? { terminal: reconciled } : {}),
@@ -2332,6 +2476,13 @@ export class WorkLaneManager {
 					this.#schedule(observer, 0);
 					continue;
 				}
+				// Restart/generation recovery must use the same execution proof and
+				// continuous-death grace as a live observer, never one inspect verdict.
+				if (terminalStillRunning && this.#binding(runtime) && this.#writeCurrent(observer)) {
+					this.#attach(observer);
+					this.#schedule(observer, 0);
+					continue;
+				}
 				let live: { live: boolean | undefined; disowned: boolean } = { live: undefined, disowned: false };
 				try {
 					live = (await this.#port.liveness?.({ sessionId: runtime.sessionId, repo: runtime.cwd })) ?? live;
@@ -2340,11 +2491,6 @@ export class WorkLaneManager {
 				}
 				if (!this.#current(observer)) continue;
 				if (live.live === true && !live.disowned && this.#binding(runtime)) {
-					this.#attach(observer);
-					this.#schedule(observer, 0);
-					continue;
-				}
-				if (terminalStillRunning && live.live === undefined && !live.disowned && this.#binding(runtime)) {
 					this.#attach(observer);
 					this.#schedule(observer, 0);
 					continue;
@@ -2792,24 +2938,6 @@ function provesAcceptance(status: PromptStatusBody): boolean {
 	);
 }
 
-function terminalEvidence(status: PromptStatusBody, observedAt: string): WorkAttemptTerminalEvidence | undefined {
-	if (status.status !== "terminal_ok" && status.status !== "failed") return undefined;
-	const reasonCode =
-		status.receiptState === "missing"
-			? "terminal_missing_receipt"
-			: status.receiptState === "unknown"
-				? "terminal_uncertain"
-				: status.status === "failed"
-					? status.error?.code === "prompt_deadline_exceeded"
-						? "prompt_deadline_exceeded"
-						: "sdk_failed"
-					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
-						? "end_turn"
-						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
-							? status.outcome!.reason!
-							: "stopped_incomplete";
-	return { kind: "broker", observedAt, reasonCode, status };
-}
 /** Bound the leading excerpt without splitting a Unicode scalar. */
 export function utf8Prefix(text: string, maxBytes = 2048): string {
 	let bytes = 0;

@@ -34,7 +34,7 @@ import {
 	type SessionBindInput,
 	type WorkerOutputResult,
 } from "../src/orchestrator/session-port";
-import { RelayClosedError, TailRunner } from "../src/orchestrator/tail-runner";
+import { RelayClosedError, type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
 import {
 	assertOutsideServiceDirectory,
 	type CheckStatusClient,
@@ -54,6 +54,7 @@ import {
 	initializeTestBrokerAuthority,
 	noRelay,
 	ScriptedSessionPort,
+	scriptedRelay,
 } from "./session-port.fake";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -1778,6 +1779,887 @@ test("#562 a missing receipt stays open during turn activity and recovery until 
 	expect(outputReads).toBe(3);
 	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 });
+
+test("an idle runtime reconciles a missing receipt after lost lifecycle, including restart", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	let running: boolean | undefined = true;
+	let probeFails = false;
+	let probes = 0;
+	Object.assign(f.port, {
+		turnRunning: async () => {
+			probes++;
+			if (probeFails) throw new Error("transient probe failure");
+			return running;
+		},
+	});
+	let reads = 0;
+	const result = await started(f, "a", origin);
+	const invocationAt = now;
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "failed",
+			commandId: "command-1",
+			turnId: "turn-1",
+			clientRef: input.opRef,
+			startedAt: invocationAt,
+			terminalAt: invocationAt + 1,
+			receiptState: "missing",
+			error: { code: "prompt_deadline_exceeded" },
+		},
+		summaryCompleted: true,
+	});
+	f.port.fetchWorkerOutput = async (input) => {
+		reads++;
+		return parseWorkerOutputResponse(
+			input,
+			{
+				exitCode: 0,
+				stderr: "",
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: input.opRef,
+						...input.terminalIdentity,
+						status: "failed",
+						startedAt: invocationAt,
+						terminalAt: invocationAt + 1,
+						receiptState: "missing",
+						error: { code: "prompt_deadline_exceeded" },
+					},
+				}),
+			},
+			now,
+		);
+	};
+	await until(() => probes > 0);
+	expect(reads).toBe(0);
+	expect(f.notices).toEqual([]);
+	// A deadline failure is not execution-end evidence. Neither an unknown nor
+	// a failed runtime probe may release the #564 live-turn safety gate.
+	running = undefined;
+	const prior = probes;
+	await until(() => probes > prior);
+	probeFails = true;
+	await f.restart();
+	await until(() => probes > prior + 1);
+	expect(reads).toBe(0);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	probeFails = false;
+	running = false;
+	await until(() => reads === 1);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		turnEndObservedAt: expect.any(String),
+		terminal: { reasonCode: "terminal_missing_receipt" },
+		settledAt: null,
+	});
+	// The positive execution-end observation survives a gateway restart.
+	await f.restart();
+	now += 1000;
+	await until(() => reads === 2);
+	now += 5000;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(reads).toBe(3);
+	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
+	expect(f.notices.map((notice) => notice.text)).toEqual([
+		`[lane a] attempt_ended: terminal_missing_receipt: final_response_missing opRef=${result.opRef}`,
+	]);
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+});
+
+test("a cached missing receipt reconciles positive host death, not live or transient probes", async () => {
+	let now = Date.now();
+	let generation = 0;
+	const f = await fixture({ now: () => now, hostLostGraceMs: 100, brokerGeneration: () => generation });
+	const result = await started(f, "a", origin);
+	const invocationAt = now;
+	let running: boolean | undefined = true;
+	let probes = 0;
+	Object.assign(f.port, {
+		turnRunning: async () => {
+			probes++;
+			return running;
+		},
+	});
+	let live: boolean | undefined = false;
+	let disowned = false;
+	let probeFails = false;
+	let inspections = 0;
+	f.port.liveness = async () => {
+		inspections++;
+		if (probeFails) throw new Error("inspect transport unavailable");
+		return { live, disowned };
+	};
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "failed",
+			clientRef: input.opRef,
+			commandId: "command-1",
+			turnId: "turn-1",
+			startedAt: invocationAt,
+			terminalAt: invocationAt + 1,
+			receiptState: "missing",
+			error: { code: "prompt_deadline_exceeded" },
+		},
+		summaryCompleted: true,
+	});
+	await until(() => probes >= 2);
+	const lastActivity = f.db.bindings
+		.workLaneRows()
+		.find((row) => row.gjc_session_id === result.sessionId)?.last_activity_at;
+	now += 24 * 60 * 60 * 1000;
+	await until(() => probes >= 3);
+	expect(f.db.bindings.workLaneRows().find((row) => row.gjc_session_id === result.sessionId)?.last_activity_at).toBe(
+		lastActivity,
+	);
+	await f.restart();
+	await until(() => probes >= 4);
+	generation++;
+	await f.manager.onBrokerGeneration();
+	await until(() => probes >= 5);
+	expect(inspections).toBe(0); // Live execution outranks a contradictory broker label.
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.notices).toEqual([]);
+	running = undefined;
+	await until(() => inspections >= 1);
+	now += 99;
+	await until(() => inspections >= 2);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	let beforeRestart = inspections;
+	await f.restart();
+	await until(() => inspections > beforeRestart);
+	now += 1; // A restart cannot inherit the previous observer's partial grace.
+	beforeRestart = inspections;
+	await until(() => inspections > beforeRestart);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	// Each indeterminate/disowned/failed probe breaks the positive-death grace.
+	for (const uncertain of ["disowned", "unknown", "transport"] as const) {
+		disowned = uncertain === "disowned";
+		live = uncertain === "unknown" ? undefined : false;
+		probeFails = uncertain === "transport";
+		const prior = inspections;
+		now += 1000;
+		await f.restart();
+		await until(() => inspections > prior);
+		expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	}
+	disowned = false;
+	live = false;
+	probeFails = false;
+	let prior = inspections;
+	await until(() => inspections > prior);
+	now += 99;
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	now += 1;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toMatchObject({ kind: "local", reasonCode: "session_dead" });
+	expect(f.port.workerOutputReads).toEqual([]);
+	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] attempt_ended: session_dead: output_unavailable"]);
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("execution frames interrupt death grace during inspect and terminal revalidation", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
+	const result = await started(f, "a", origin);
+	const invocationAt = now;
+	Object.assign(f.port, { turnRunning: async () => undefined });
+	let inspections = 0;
+	let heldInspect: ReturnType<typeof deferred<void>> | undefined;
+	let justInspected = false;
+	let injectStatus = false;
+	f.port.liveness = async () => {
+		inspections++;
+		const held = heldInspect;
+		if (held) await held.promise;
+		justInspected = true;
+		return { live: false, disowned: false };
+	};
+	f.port.status = async (input) => {
+		if (injectStatus && justInspected) {
+			injectStatus = false;
+			f.port.emitTool(result.sessionId, { toolName: "bash" });
+		}
+		justInspected = false;
+		return {
+			operationRef: input.opRef,
+			status: {
+				status: "failed",
+				receiptState: "missing",
+				clientRef: input.opRef,
+				commandId: `command-${input.opRef}`,
+				turnId: `turn-${input.opRef}`,
+				startedAt: invocationAt,
+				terminalAt: invocationAt + 1,
+				error: { code: "prompt_deadline_exceeded" },
+			},
+			summaryCompleted: true,
+		};
+	};
+	await until(() => inspections >= 1);
+	for (let i = 0; i < 3; i++) {
+		const prior = inspections;
+		now += 200;
+		f.port.emitTool(result.sessionId, { toolName: "bash" });
+		await until(() => inspections > prior);
+		expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	}
+	const held = deferred<void>();
+	heldInspect = held;
+	let prior = inspections;
+	now += 100;
+	await until(() => inspections > prior);
+	f.port.emitTool(result.sessionId, { toolName: "bash" });
+	heldInspect = undefined;
+	held.resolve();
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	justInspected = false;
+	injectStatus = true;
+	now += 100;
+	await until(() => !injectStatus);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	prior = inspections;
+	await until(() => inspections > prior);
+	now += 99;
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	now += 1;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
+	expect(f.notices).toHaveLength(1);
+});
+
+for (const stage of ["context", "status"] as const) {
+	test(`execution during an awaited ${stage} probe invalidates idle proof`, async () => {
+		const f = await fixture();
+		const result = await started(f, "a", origin);
+		const invocationAt = Date.now();
+		const release = deferred<void>();
+		let entered = false;
+		let probes = 0;
+		let contextRead = false;
+		Object.assign(f.port, {
+			turnRunning: async () => {
+				probes++;
+				if (probes > 1) return true;
+				contextRead = true;
+				if (stage === "context") {
+					entered = true;
+					await release.promise;
+				}
+				return false;
+			},
+		});
+		f.port.status = async (input) => {
+			if (stage === "status" && contextRead && !entered) {
+				entered = true;
+				await release.promise;
+			}
+			return {
+				operationRef: input.opRef,
+				status: {
+					status: "failed",
+					receiptState: "missing",
+					clientRef: input.opRef,
+					commandId: `command-${input.opRef}`,
+					turnId: `turn-${input.opRef}`,
+					startedAt: invocationAt,
+					terminalAt: invocationAt + 1,
+				},
+				summaryCompleted: true,
+			};
+		};
+		await until(() => entered);
+		f.port.emitTool(result.sessionId, { toolName: "bash" });
+		release.resolve();
+		await until(() => probes > 1);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+		expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+		expect(f.port.workerOutputReads).toEqual([]);
+		expect(f.notices).toEqual([]);
+	});
+}
+
+for (const evidence of ["idle", "dead"] as const) {
+	test(`real tail ingress invalidates ${evidence} proof behind an idle delivery backlog`, async () => {
+		const f = await fixture({ hostLostGraceMs: 0 });
+		const releaseFrames = deferred<void>();
+		const releaseStatus = deferred<void>();
+		let terminal = false;
+		let terminalAt = 0;
+		let rechecking = false;
+		let recheckReturned = false;
+		let queries = 0;
+		let backlogEntered = false;
+		let toolDelivered = false;
+		let ingress = 0;
+		let executionProbes = 0;
+		let running: boolean | undefined = evidence === "idle" ? false : undefined;
+		const relay = scriptedRelay(async () => {
+			if (terminal && ++queries === 2) {
+				rechecking = true;
+				await releaseStatus.promise;
+			}
+			return { ok: true, result: {} };
+		});
+		const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+		let attached: TailHandle | undefined;
+		f.port.attachTail = async (input) => {
+			const tail = await runner.attach({
+				...input,
+				onTurnActivity: () => {
+					ingress++;
+					input.onTurnActivity?.();
+				},
+				onFrame: async (frame) => {
+					if (frame.kind === "activity" && frame.idle) {
+						backlogEntered = true;
+						await releaseFrames.promise;
+					}
+					if (frame.kind === "tool_execution_start") toolDelivered = true;
+					await input.onFrame?.(frame);
+				},
+			});
+			attached = tail;
+			return tail;
+		};
+		Object.assign(f.port, {
+			turnRunning: async () => {
+				executionProbes++;
+				return running;
+			},
+		});
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			const report = await status(input);
+			if (!terminal) return report;
+			if (input.relay) {
+				await (input.relay as TailHandle).query("turn.result", { kind: "prompt", clientRef: input.opRef });
+				if (queries >= 2) recheckReturned = true;
+			}
+			return {
+				...report,
+				status: {
+					...report.status,
+					status: "failed",
+					receiptState: "missing",
+					clientRef: input.opRef,
+					terminalAt,
+					error: { code: "prompt_deadline_exceeded" },
+				},
+				summaryCompleted: true,
+			};
+		};
+		try {
+			const result = await started(f, "a", origin);
+			await until(() => attached !== undefined);
+			relay.streams[0]!.host({ type: "activity", state: "idle" });
+			await until(() => backlogEntered);
+			attached!.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
+			f.port.liveness = async () => ({ live: false, disowned: false });
+			terminalAt = Date.now();
+			terminal = true;
+			await until(() => rechecking);
+			expect(executionProbes).toBe(1);
+			relay.streams[0]!.host({ type: "activity", state: "active" });
+			relay.streams[0]!.host({
+				type: "event",
+				kind: "tool_execution_start",
+				commandId: "foreign-command",
+				turnId: "foreign-turn",
+				payload: { toolName: "bash" },
+			});
+			relay.streams[0]!.host({
+				type: "event",
+				kind: "tool_execution_start",
+				commandId: `command-${result.opRef}`,
+				turnId: `turn-${result.opRef}`,
+				payload: { toolName: "bash" },
+			});
+			expect(toolDelivered).toBe(false);
+			running = true;
+			releaseStatus.resolve();
+			await until(() => recheckReturned);
+			await Bun.sleep(20);
+			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+			expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+			expect(f.port.workerOutputReads).toEqual([]);
+			expect(f.notices).toEqual([]);
+			expect(toolDelivered).toBe(false);
+			expect(ingress).toBe(1);
+		} finally {
+			releaseStatus.resolve();
+			releaseFrames.resolve();
+		}
+	});
+}
+
+test("recovery cannot use CLI idle snapshots before a real correlated observer is ready", async () => {
+	const f = await fixture();
+	const result = await started(f, "a", origin);
+	const invocationAt = Date.now();
+	const releaseAttachment = deferred<void>();
+	const releaseContext = deferred<void>();
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+	let attached: TailHandle | undefined;
+	let ingress = 0;
+	f.port.attachTail = async (input) => {
+		const tail = await runner.attach({
+			...input,
+			onTurnActivity: () => {
+				ingress++;
+				input.onTurnActivity?.();
+			},
+		});
+		attached = tail;
+		await releaseAttachment.promise;
+		return tail;
+	};
+	let probes = 0;
+	let contextResolved = false;
+	let readyProbe = false;
+	Object.assign(f.port, {
+		turnRunning: async (input: { relay?: TailHandle }) => {
+			probes++;
+			if (input.relay) readyProbe = true;
+			if (probes === 1) {
+				await releaseContext.promise;
+				contextResolved = true;
+				return false;
+			}
+			return true;
+		},
+	});
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "failed",
+			receiptState: "missing",
+			clientRef: input.opRef,
+			commandId: `command-${input.opRef}`,
+			turnId: `turn-${input.opRef}`,
+			startedAt: invocationAt,
+			terminalAt: invocationAt + 1,
+			error: { code: "prompt_deadline_exceeded" },
+		},
+		summaryCompleted: true,
+	});
+	try {
+		await f.restart();
+		await until(() => attached !== undefined && probes > 0);
+		relay.streams[0]!.host({
+			type: "event",
+			kind: "tool_execution_start",
+			commandId: `command-${result.opRef}`,
+			turnId: `turn-${result.opRef}`,
+			payload: { toolName: "bash" },
+		});
+		// This response proves the preceding frame reached the real reader. The
+		// frame has no selected operation yet, so it cannot advance the epoch.
+		await attached!.query("context.get", {});
+		expect(ingress).toBe(0);
+		releaseContext.resolve();
+		await until(() => contextResolved);
+		await Bun.sleep(20);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+		expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+		expect(f.port.workerOutputReads).toEqual([]);
+		expect(f.notices).toEqual([]);
+		releaseAttachment.resolve();
+		await until(() => readyProbe);
+		expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	} finally {
+		releaseContext.resolve();
+		releaseAttachment.resolve();
+	}
+});
+
+test("a real relay transport gap invalidates a pending idle snapshot", async () => {
+	const f = await fixture();
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	const runner = new TailRunner({ stream: relay.spawn, repo: f.directory, sleep: async () => {} });
+	f.port.attachTail = (input) => runner.attach(input);
+	const result = await started(f, "a", origin);
+	const invocationAt = Date.now();
+	const releaseContext = deferred<void>();
+	let probes = 0;
+	Object.assign(f.port, {
+		turnRunning: async () => {
+			probes++;
+			if (probes === 1) {
+				await releaseContext.promise;
+				return false;
+			}
+			return true;
+		},
+	});
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "failed",
+			receiptState: "missing",
+			clientRef: input.opRef,
+			commandId: `command-${input.opRef}`,
+			turnId: `turn-${input.opRef}`,
+			startedAt: invocationAt,
+			terminalAt: invocationAt + 1,
+		},
+		summaryCompleted: true,
+	});
+	try {
+		await until(() => probes > 0 && relay.streams.length > 0);
+		relay.streams[0]!.close();
+		await until(() => relay.streams.length > 1);
+		releaseContext.resolve();
+		await until(() => probes > 1);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+		expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+		expect(f.port.workerOutputReads).toEqual([]);
+		expect(f.notices).toEqual([]);
+	} finally {
+		releaseContext.resolve();
+	}
+});
+
+test("a dead activity observer is readopted without replay before idle reconciliation", async () => {
+	const f = await fixture();
+	const result = await started(f, "a", origin);
+	const invocationAt = Date.now();
+	let running = true;
+	Object.assign(f.port, { turnRunning: async () => running });
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "failed",
+			receiptState: "missing",
+			clientRef: input.opRef,
+			commandId: `command-${input.opRef}`,
+			turnId: `turn-${input.opRef}`,
+			startedAt: invocationAt,
+			terminalAt: invocationAt + 1,
+		},
+		summaryCompleted: true,
+	});
+	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	await until(() => f.port.tailsOf(result.sessionId).some((tail) => tail.running));
+	const old = f.port.tailsOf(result.sessionId)[0]!;
+	old.die();
+	await until(() => f.port.tailsOf(result.sessionId).some((tail) => tail !== old && tail.running));
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	running = false;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+	expect(f.notices).toHaveLength(1);
+});
+
+test("real failed inspect envelopes cannot establish missing-receipt host death", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
+	const result = await started(f, "a", origin);
+	const invocationAt = now;
+	const database = await Store.open(join(f.directory, "probe.db"));
+	cleanups.push(async () => database.close());
+	const authority = initializeTestBrokerAuthority(database, join(f.directory, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: result.sessionId,
+		originKey: workSessionKey("a"),
+		epoch: 0,
+		repo: f.directory,
+	});
+	let exitCode = 1;
+	let ok: boolean | undefined = true;
+	let inspections = 0;
+	const probe = new BrokerSessionPort({
+		database,
+		authority,
+		cli: async () => {
+			inspections++;
+			return {
+				exitCode,
+				stderr: "",
+				stdout: JSON.stringify({
+					ok,
+					result: { session: { sessionId: result.sessionId, live: false } },
+				}),
+			};
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo: f.directory }),
+	});
+	f.port.liveness = probe.liveness.bind(probe);
+	Object.assign(f.port, { turnRunning: async () => undefined });
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "failed",
+			receiptState: "missing",
+			clientRef: input.opRef,
+			commandId: "command-1",
+			turnId: "turn-1",
+			startedAt: invocationAt,
+			terminalAt: invocationAt + 1,
+			error: { code: "prompt_deadline_exceeded" },
+		},
+		summaryCompleted: true,
+	});
+	await until(() => inspections >= 1);
+	now += 1000;
+	await until(() => inspections >= 2);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	exitCode = 0;
+	ok = undefined;
+	let prior = inspections;
+	await until(() => inspections > prior);
+	now += 1000;
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	ok = true;
+	prior = inspections;
+	await until(() => inspections > prior);
+	now += 99;
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	now += 1;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
+	expect(f.notices).toHaveLength(1);
+});
+
+test("an idle snapshot cannot terminalize an unstarted or uncorrelated missing receipt", async () => {
+	const f = await fixture();
+	let probes = 0;
+	Object.assign(f.port, {
+		turnRunning: async () => {
+			probes++;
+			return false;
+		},
+	});
+	const result = await started(f, "a", origin);
+	let statusReads = 0;
+	let startedAt: number | undefined;
+	let clientRef: string | undefined = result.opRef;
+	f.port.status = async (input) => {
+		statusReads++;
+		return {
+			operationRef: input.opRef,
+			status: {
+				status: "failed",
+				receiptState: "missing",
+				clientRef,
+				commandId: "command-1",
+				turnId: "turn-1",
+				startedAt,
+				terminalAt: Date.now(),
+			},
+			summaryCompleted: true,
+		};
+	};
+	await until(() => statusReads >= 2);
+	expect(probes).toBe(0);
+	startedAt = Date.now() - 1;
+	clientRef = undefined;
+	const prior = statusReads;
+	await until(() => statusReads > prior + 1);
+	expect(probes).toBe(0);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+	expect(f.port.workerOutputReads).toEqual([]);
+	expect(f.notices).toEqual([]);
+});
+
+for (const recheck of ["unknown", "in_flight", "wrong_identity", "transport_error"] as const) {
+	test(`idle missing-receipt reconciliation stays open on ${recheck} revalidation`, async () => {
+		const f = await fixture();
+		let probed = false;
+		let rechecks = 0;
+		Object.assign(f.port, {
+			turnRunning: async () => {
+				probed = true;
+				return false;
+			},
+		});
+		const result = await started(f, "a", origin);
+		const at = Date.now();
+		f.port.status = async (input) => {
+			if (probed) {
+				rechecks++;
+				if (recheck === "transport_error") throw new Error("probe disconnected");
+				return {
+					operationRef: recheck === "wrong_identity" ? "other-op" : input.opRef,
+					status: { status: recheck === "in_flight" ? "in_flight" : "unknown" },
+					summaryCompleted: false,
+				};
+			}
+			return {
+				operationRef: input.opRef,
+				status: {
+					status: "failed",
+					receiptState: "missing",
+					clientRef: input.opRef,
+					commandId: "command-1",
+					turnId: "turn-1",
+					startedAt: at,
+					terminalAt: at,
+					error: { code: "prompt_deadline_exceeded" },
+				},
+				summaryCompleted: true,
+			};
+		};
+		await until(() => rechecks >= 2);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+		expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+		expect(f.port.workerOutputReads).toEqual([]);
+		expect(f.notices).toEqual([]);
+	});
+}
+
+test("a late receipt during idle reconciliation is re-read and reported exactly once", async () => {
+	const f = await fixture();
+	const result = await started(f, "a", origin);
+	const at = Date.now();
+	let receipt = false;
+	Object.assign(f.port, {
+		turnRunning: async () => {
+			receipt = true;
+			return false;
+		},
+	});
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: receipt ? "terminal_ok" : "failed",
+			receiptState: receipt ? "present" : "missing",
+			clientRef: input.opRef,
+			commandId: "command-1",
+			turnId: "turn-1",
+			startedAt: at,
+			terminalAt: at,
+			...(receipt ? { outcome: { reason: "end_turn" } } : { error: { code: "prompt_deadline_exceeded" } }),
+		},
+		summaryCompleted: true,
+	});
+	f.port.fetchWorkerOutput = async (input) =>
+		parseWorkerOutputResponse(
+			input,
+			{
+				exitCode: 0,
+				stderr: "",
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: input.opRef,
+						...input.terminalIdentity,
+						status: "terminal_ok",
+						startedAt: at,
+						terminalAt: at,
+						receiptState: "present",
+						content: { version: 1, type: "text", text: "done", byteLength: 4, truncated: false },
+					},
+				}),
+			},
+			at,
+		);
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.job().attempts[0]?.endState).toBe("completed");
+	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] completed: done"]);
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+for (const receiptReason of ["end_turn", undefined] as const) {
+	test(`a receipt after idle reconciliation and restart uses its actual outcome (${receiptReason ?? "unknown"})`, async () => {
+		let now = Date.now();
+		const f = await fixture({ now: () => now });
+		Object.assign(f.port, { turnRunning: async () => false });
+		const result = await started(f, "a", origin);
+		const invocationAt = now;
+		let receipt = false;
+		let reads = 0;
+		f.port.status = async (input) => ({
+			operationRef: input.opRef,
+			status: {
+				status: "failed",
+				clientRef: input.opRef,
+				commandId: "command-1",
+				turnId: "turn-1",
+				startedAt: invocationAt,
+				terminalAt: invocationAt + 1,
+				receiptState: "missing",
+				error: { code: "prompt_deadline_exceeded" },
+			},
+			summaryCompleted: true,
+		});
+		f.port.fetchWorkerOutput = async (input) => {
+			reads++;
+			return parseWorkerOutputResponse(
+				input,
+				{
+					exitCode: 0,
+					stderr: "",
+					stdout: JSON.stringify({
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: input.opRef,
+							...input.terminalIdentity,
+							status: receipt ? "terminal_ok" : "failed",
+							startedAt: invocationAt,
+							terminalAt: invocationAt + 1,
+							receiptState: receipt ? "present" : "missing",
+							...(receipt
+								? {
+										...(receiptReason ? { outcome: { reason: receiptReason } } : {}),
+										content: { version: 1, type: "text", text: "done", byteLength: 4, truncated: false },
+									}
+								: { error: { code: "prompt_deadline_exceeded" } }),
+						},
+					}),
+				},
+				now,
+			);
+		};
+		await until(() => reads === 1);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+			terminal: { reasonCode: "terminal_missing_receipt" },
+			settledAt: null,
+		});
+		await f.restart();
+		receipt = true;
+		now += 1000;
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+		expect(reads).toBe(2);
+		expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toMatchObject({
+			reasonCode: receiptReason ?? "stopped_incomplete",
+			status: { status: "terminal_ok", receiptState: "present" },
+		});
+		expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.status?.error).toBeUndefined();
+		expect(f.job().attempts[0]?.endState).toBe(receiptReason ? "completed" : "attempt_ended");
+		expect(f.notices.map((notice) => notice.text)).toEqual([
+			receiptReason ? "[lane a] completed: done" : "[lane a] attempt_ended: stopped_incomplete: done",
+		]);
+		await f.restart();
+		expect(f.notices).toHaveLength(1);
+		expect(f.port.sends).toHaveLength(1);
+	});
+}
 
 test("a receipt still missing after the output budget stays held with a non-loss diagnostic (#248)", async () => {
 	let now = Date.now();
