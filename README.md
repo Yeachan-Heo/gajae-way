@@ -29,7 +29,7 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 
 ## Why this exists
 
-- **One presence, many rooms — never one blur.** Every conversation is a validated origin (`platform/kind/conversationId`) with its own session and epoch. Your DM is not your team channel. `/new` rebinds *that* conversation and leaves the others untouched.
+- **One presence, many rooms — never one blur.** Every conversation is a validated origin (`platform/kind/conversationId`) with its own session and epoch. Your DM is not your team channel. `/new` rebinds *that* conversation and leaves the others untouched. This separates conversation context, not tenants: the persona shares its workspace, memory, and host permissions across rooms.
 - **Memory you can read with `cat`.** Turns and monitor output land in `$GAJAEWAY_HOME/memory` as Markdown across a small set of canonical axes. It is your filesystem, your git history, your grep — not a vector blob you have to trust.
 - **It acts without being asked.** Cron and event monitors give the persona its own turns, so it can canonicalize memory on a schedule or audit itself each morning while you sleep.
 - **Delivery is ledgered, not hoped for.** Replies get a durable record before they go out. After a crash, a send whose outcome was uncertain is reissued and *visibly labeled a duplicate* instead of quietly pretending nothing happened.
@@ -40,11 +40,11 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 ## What it feels like
 
 - Send a DM that your `dmPolicy` accepts (`owner-only`, `allowlist`, or `open`) and talk normally. Your bot responds in that conversation's own ongoing context.
-- In a group, it stays out of the way until you mention it. You can explicitly open a configured channel for normal conversation.
+- In a group, it normally waits for a mention or a native reply to the bot. You can explicitly open a configured channel for normal conversation; author and audience policies still apply.
 - Send `/new` when you want a fresh start in that conversation. It confirms that a fresh session has started.
-- When the gateway accepts a DM or an addressed group turn (a real mention or native reply), Discord and Slack both show a reaction-gradient presence — phase markers, an advancing clock, and an effort digit (tool calls, falling back to output tokens) reacted directly onto the message it is answering; Discord also shows the platform's native typing indicator, and Slack also drives Slack's native assistant status line (`<app> <status>`, via `assistant.threads.setStatus`) under the reply thread. Slack additionally promotes messages in an adapter-configured `open` channel to addressed; Discord does not treat `open`-channel messages as addressed without a real mention. The reaction-gradient markers themselves are never a posted or edited message. Presence stays up through mid-work messages while the turn keeps working and comes off only when the turn ends. In a channel it merely overhears, nothing is shown until it actually replies.
+- Discord shows reaction-gradient presence for gateway-engaged turns, including unmentioned turns in open channels, plus the platform's native typing indicator. Discord's `statusReactions` can select `static` or `off`. Slack shows reaction-gradient presence for accepted DMs and addressed group turns (including messages in an adapter-configured `open` channel), plus a native assistant status line (`<app> <status>`, via `assistant.threads.setStatus`) under the reply thread. The gradient uses phase markers, an advancing clock, and an effort digit (tool calls, falling back to output tokens) reacted directly onto the message it is answering — never a posted or edited status message. Presence stays up through mid-work messages while the turn keeps working, with stale-presence cleanup if progress stops.
 - Replies are protected by a durable delivery record. After a crash, a send whose outcome was uncertain may be reissued; when it was, it is visibly labeled as a duplicate rather than silently pretending it was not.
-- Discord replies can attach local files when the response contains a standalone `MEDIA:/absolute/path/to/file` line. The adapter removes the directive from the visible text and sends the file natively with its caption; uploads are limited to 10 files and 25 MiB total per message.
+- Discord replies can attach local files when the response contains a standalone `MEDIA:/absolute/path/to/file` line outside a code fence. Uploads are disabled unless `mediaDirectories` is configured in `$GAJAEWAY_HOME/adapter-discord.json`; files must resolve inside those directories. The adapter removes the directive from the visible text and sends the file natively with its caption; uploads are limited to 10 files and 25 MiB total per message.
 - Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
 
 ## Packages
@@ -60,43 +60,83 @@ The Bun workspace under `packages/` is divided by responsibility:
 | `@gajae-gateway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
 | `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery. |
 | `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn and file delivery, reactions, reaction-gradient working presence, opt-in live replies, and missed-message recovery. |
+| `@gajae-gateway/admin` | Local operator web console. |
+| `@gajae-gateway/home` | Shared home layout and process ownership leases. |
+| `@gajae-gateway/log` | Shared structured logging. |
+| `@gajae-gateway/subsession` | GJC session boundary. |
+| `@gajae-gateway/conformance` | Protocol conformance checks for CI/tests. |
 
-`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable as standalone packages — see [Publishing packages](#publishing-packages) below for the release workflow. The gateway, adapters, admin console, and `@gajae-gateway/subsession` stay private application code and ship only as the compiled binaries below; `@gajae-gateway/conformance` is a private, unshipped CI/test-only package.
+`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable as standalone packages — see [Publishing packages](#publishing-packages) below for the release workflow. The remaining packages are private: runtime code is bundled into the six application binaries; `@gajae-gateway/conformance` is CI/test-only, not a standalone binary.
 
 For how memory, monitors, and the gateway work end to end, see [the documentation](docs/).
 
 ## Quick Start
 
-**Option 1: Docker Compose (recommended for first-time users)**
+**Local installation from source**
+
+Requirements: Bun ≥1.4.0 and an authenticated GJC source profile at `~/.gjc/agent` (credentials and model configuration). The runtime uses the exact GJC version pinned in [`packages/gateway/package.json`](packages/gateway/package.json), currently 0.18.12, installed privately under `$GAJAEWAY_HOME/gjc`; a `gjc` on your PATH is not sufficient.
 
 ```sh
 # Clone and enter the repository
 git clone https://github.com/Yeachan-Heo/gajae-way.git
 cd gajae-way
 
-# Run interactive setup (choose your platform: Discord, Slack, or Telegram)
-docker compose run --rm -it setup gajaeway setup
-
-# Start the gateway and adapters
-docker compose up
-```
-
-Then send your bot a DM on Discord/Slack/Telegram and start chatting.
-
-**Option 2: Local installation with build**
-
-Requirements: Bun ≥1.4.0, `gjc` ≥0.16.0 on your PATH.
-
-```sh
 # Build the binaries
 bun install
 bun run build
 
-# Run one-command setup and start
-GAJAEWAY_HOME=~/.gajaeway ./dist/gajaeway up
+export GAJAEWAY_HOME="$HOME/.gajaeway"
+
+# Bootstrap the private, pinned GJC using the source checkout's installer
+bun -e 'import { installPinnedGjc } from "./packages/cli/src/gjc-install.ts"; const { gjc } = await Bun.file("packages/gateway/package.json").json(); await installPinnedGjc({ home: process.env.GAJAEWAY_HOME!, version: gjc.version });'
+
+# Validate platform credentials and write configuration (does not start services)
+./dist/gajaeway setup
+
+# Snapshot the authenticated source profile into the private broker agent directory
+# Run this before starting the broker; --from DIR selects a different source profile
+./dist/gajaeway setup --broker-agent
+
+# Validate configuration before starting processes
+./dist/gajaeway-gateway config check
 ```
 
-The `up` command will prompt you for credentials, then report next steps. For production deployment, see [Deployment Guide](docs/deployment.md).
+Setup asks which adapters to configure and for your platform user ID(s). The default `dmPolicy` is `allowlist`: without any owner/allowlist IDs, all DMs are declined. Discord setup can infer the application owner; Slack and Telegram users should supply their own IDs. Complete each platform's app installation and permissions before chatting.
+
+Start the broker, gateway, and each configured adapter in separate terminals, in that order. Set the same `GAJAEWAY_HOME` in every terminal and run from the checkout:
+
+```sh
+# Terminal 1: keep the broker running
+export GAJAEWAY_HOME="$HOME/.gajaeway"
+./dist/gajaeway-gateway broker
+
+# Terminal 2: keep the gateway running
+export GAJAEWAY_HOME="$HOME/.gajaeway"
+./dist/gajaeway-gateway daemon
+
+# Terminal 3: choose the adapter you configured (or use another terminal for each)
+export GAJAEWAY_HOME="$HOME/.gajaeway"
+./dist/gajaeway-discord    # alternatives: ./dist/gajaeway-slack or ./dist/gajaeway-telegram
+
+# Another terminal: inspect readiness, then test a DM from an allowed user
+export GAJAEWAY_HOME="$HOME/.gajaeway"
+./dist/gajaeway status
+./dist/gajaeway ops cycle --json
+```
+
+There is no dispatchable `gajaeway up` command. For persistent deployment, `gajaeway services install --bin-dir DIR` writes launchd/systemd definitions; installation does not load or start them. Use an absolute binary directory and follow the service-manager instructions in the [Deployment Guide](docs/deployment.md).
+
+**Docker Compose: setup helper, not a complete runtime stack**
+
+The checked-in Compose file can build the image and run platform credential setup:
+
+```sh
+docker compose build setup
+docker compose run --rm -it setup gajaeway setup
+docker compose run --rm --no-deps -T setup gajaeway setup --status
+```
+
+It is not a ready-to-chat deployment: it has no broker service, private pinned-GJC installation, or broker-agent provisioning step. The image's `/usr/local/bin/gjc` and `GJC_EXECUTABLE` setting do not replace the private executable required by the runtime. Model credentials must also be provisioned. Adapter services are profile-gated (`discord`, `slack`, `telegram`); setup writes their configuration but does not activate Compose profiles, so plain `docker compose up` starts no adapters. Use the local procedure above unless you supply the missing container orchestration.
 
 ## Getting a Discord Bot Token
 
@@ -137,7 +177,7 @@ Production hosts run the compiled binaries, not this source checkout.
 
 ### Publishing packages
 
-`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable under the `@gajae-gateway` scope. Each has its own `build` step that bundles `src/` into a single Node-ESM-resolvable `dist/*.js` with Bun, then emits `.d.ts` declarations with `tsc` (`emitDeclarationOnly`), and a `prepublishOnly` script so a publish always ships current compiled output. The published tarball includes both `dist/` (resolved by `main`/`types`/the default export condition for non-Bun consumers) and `src/` (resolved by the `bun` export condition, so an installed Bun consumer imports source directly instead of the compiled build). `@gajae-gateway/protocol` has zero runtime dependencies. Packing must go through Bun, not plain npm: `npm pack --dry-run` only lists a package's contents and does **not** rewrite dependencies — plain `npm pack`/`npm publish` of a package directory leave `workspace:*` in the packed manifest, which a real npm consumer cannot resolve. `bun pm pack` rewrites each published package's `workspace:*` dependency on `@gajae-gateway/protocol`/`@gajae-gateway/sdk` to the exact version being packed, producing a registry-valid manifest — verified by packing with `bun pm pack`, `npm install`-ing the tarballs into a scratch project, and running a real `node --input-type=module -e "import('@gajae-gateway/sdk')"` against the installed package (transcript: [`artifacts/ultragoal-npm-clean-install-verification.txt`](artifacts/ultragoal-npm-clean-install-verification.txt)).
+`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable under the `@gajae-gateway` scope. Each has its own `build` step that bundles `src/` into a single ESM `dist/*.js` with Bun, then emits `.d.ts` declarations with `tsc` (`emitDeclarationOnly`), and a `prepublishOnly` script that builds before publishing a package directory. Protocol and SDK target Node; the CLI targets Bun and requires Bun at runtime. The published tarball includes both `dist/` (resolved by `main` and the default export condition) and `src/` (resolved by the `bun` and `types` conditions; the `types` field also points to source, not the generated declarations). `@gajae-gateway/protocol` has zero runtime dependencies. Packing must go through Bun, not plain npm: `npm pack --dry-run` only lists a package's contents and does **not** rewrite dependencies — plain `npm pack`/`npm publish` of a package directory leave `workspace:*` in the packed manifest, which a real npm consumer cannot resolve. `bun pm pack` rewrites each published package's `workspace:*` dependency on `@gajae-gateway/protocol`/`@gajae-gateway/sdk` to the exact version being packed, producing a registry-valid manifest — verified by packing with `bun pm pack`, `npm install`-ing the tarballs into a scratch project, and running a real `node --input-type=module -e "import('@gajae-gateway/sdk')"` against the installed package (transcript: [`artifacts/ultragoal-npm-clean-install-verification.txt`](artifacts/ultragoal-npm-clean-install-verification.txt)).
 
 `scripts/release-packages.ts` runs the whole release in the required dependency order (`protocol` → `sdk` → `cli`, since `sdk` and `cli` depend on the versions published before them):
 
@@ -150,9 +190,9 @@ Inspect `dist-packed/*.tgz` from a dry run before ever running `release:publish`
 
 ### CI/CD
 
-[`build.yml`](.github/workflows/build.yml) runs on every push and pull request: Biome, `tsc --noEmit`, `bun test packages/`, and the frozen-corpus benchmark gate, each across macOS arm64, Linux x64, and Linux arm64.
+[`build.yml`](.github/workflows/build.yml) runs on every push and pull request: Biome, `tsc --noEmit`, `bun test packages/`, and the frozen-corpus benchmark gate, each across macOS arm64, Linux x64, and Linux arm64. A separate Linux x64 job validates Compose, builds its setup image, and exercises `setup --status`; it does not test a live broker-backed chat deployment.
 
-[`release.yml`](.github/workflows/release.yml) runs on a `v*.*.*` tag push (or manually via `workflow_dispatch`, with an optional `npm_tag` input for a non-`latest` dist-tag). It re-runs the full `verify` matrix first, then only on green: publishes `@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` to npm in dependency order via `bun run release:publish`, builds and archives the six standalone binaries for each platform, and creates a GitHub release with the archives attached and auto-generated notes. Publishing uses npm trusted publishing (OIDC), not a token: each of the three packages has a GitHub Actions trusted publisher on npmjs.com for repository `Yeachan-Heo/gajae-way` and workflow `release.yml`, the job holds `id-token: write`, and npm >= 11.5.1 exchanges the job's OIDC token for a short-lived publish credential and attaches provenance. No `NPM_TOKEN` secret is used. Publishing works only from GitHub-hosted runners and only from `release.yml`; renaming the workflow file requires updating the trusted publisher on all three packages.
+[`release.yml`](.github/workflows/release.yml) runs on a `v*.*.*` tag push (or manually via `workflow_dispatch`, with an optional `npm_tag` input for a non-`latest` dist-tag). Its `verify` matrix runs Biome, `tsc --noEmit`, and package tests on the same three platforms, but omits the build workflow's benchmark and Docker checks. Only on green does it publish `@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` to npm in dependency order via `bun run release:publish`, build and archive the six standalone binaries for each platform, and create a GitHub release with the archives attached and auto-generated notes. The publish job uses npm trusted publishing (OIDC), not a token: it grants `id-token: write` and installs current npm on Node 24. Each package must have a matching GitHub Actions trusted publisher configured on npmjs.com for repository `Yeachan-Heo/gajae-way` and workflow `release.yml`; that registry-side configuration is not established by this repository. npm >= 11.5.1 can exchange the job's OIDC token for a short-lived publish credential and attach provenance. No `NPM_TOKEN` secret is used. This workflow uses GitHub-hosted runners; renaming the workflow file requires updating the trusted publisher on all three packages.
 
 ## License
 
