@@ -442,6 +442,9 @@ test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric resu
 	for (const note of reports) {
 		expect(isAuthoredEchoSuspected(RUNTIME_FEEDBACK_INSTRUCTION, note, context)).toBe(false);
 	}
+	const longerInstruction =
+		"Review the last 24 hours of runtime activity and report blockers, failures, latency, deploy status, error rates, public-safe evidence, and existing issues before proposing changes.";
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make test: passed.`)).toBe(false);
 });
 
 test("#180: mention targets are validated as platform ids", async () => {

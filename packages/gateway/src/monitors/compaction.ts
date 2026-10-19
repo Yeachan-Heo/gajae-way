@@ -474,6 +474,21 @@ const NO_WORK_DISCLAIMER_PATTERNS = [
 	/\b(?:nothing|no\s+work|no\s+review|no\s+checks?|no\s+commands?|no\s+results?)\s+(?:(?:has|have|was|were)\s+)?(?:been\s+)?(?:done|checked|run|executed|performed)\b/i,
 ];
 
+const NON_COMMAND_START_WORDS = new Set([
+	...NON_SUBSTANTIVE_ECHO_WORDS,
+	...META_ECHO_WORDS,
+	"activity",
+	"daily",
+	"failure",
+	"failures",
+	"friction",
+	"latency",
+	"operation",
+	"report",
+	"runtime",
+	"system",
+]);
+
 const MAX_NOVEL_META_WORDS = 5;
 const MAX_NOVEL_CONTENT_RATIO = 0.2;
 const MIN_CONTRACT_COVERAGE = 0.7;
@@ -494,6 +509,17 @@ function serializeEchoPayload(payload: unknown): string {
 	}
 }
 
+function authoredCommandMarkers(text: string): string[] {
+	const marker: string[] = [];
+	for (const [, executable, argumentsText] of text.matchAll(
+		/\b(?:ran|run|running|executed|execute|executing|invoked|invoke|called|calling)\s+([A-Za-z0-9_.+-]+)\s+([A-Za-z0-9_./:=+-]+(?:\s+[A-Za-z0-9_./:=+-]+)*)/gi,
+	)) {
+		if (executable && argumentsText && !NON_COMMAND_START_WORDS.has(executable.toLowerCase()))
+			marker.push(`${executable} ${argumentsText}`);
+	}
+	return marker;
+}
+
 function authoredEvidenceMarkers(text: string): string[] {
 	const markers = [
 		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
@@ -504,9 +530,7 @@ function authoredEvidenceMarkers(text: string): string[] {
 			/\b\d+(?:,\d{3})*(?:\.\d+)?%?\s*(?:tests?|issues?|prs?|pull\s+requests?|files?|errors?|failures?|warnings?|blockers?|commits?|changes?|updates?|results?|passed|passing|failed|found|ms|seconds?|minutes?)\b/gi,
 		) ?? []),
 		...(text.match(/\b(?:passed|passing|failed|found|changed|updated|blocked|resolved|reopened)\s+\d+\b/gi) ?? []),
-		...(text.match(
-			/\b(?:bun|npm|pnpm|yarn|git|gh|cargo|pytest|python3?|node)\s+(?:test|run|exec|check|status|diff|show|log|pr|issue|ci|install|typecheck|lint)\b[^\n]*/gi,
-		) ?? []),
+		...authoredCommandMarkers(text),
 		...(text.match(/`[^`\n]+`/g) ?? []),
 	];
 	return markers.map((marker) => marker.toLowerCase().replace(/[),.;!?}\]"'`]+$/g, ""));
