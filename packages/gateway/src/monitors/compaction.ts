@@ -608,6 +608,10 @@ function authoredEvidenceMarkers(text: string): string[] {
 		const value = marker.match(/\d+/)?.[0];
 		return value === undefined || !quantifiedValues.has(value);
 	});
+	const scalarResultMarkers = [
+		...text.matchAll(/\b(?:is|are|was|were|reached|equals?)\s+(\d+(?:,\d{3})*(?:\.\d+)?%?)\b/gi),
+		...text.matchAll(/["'][\w.-]+["']\s*:\s*(\d+(?:,\d{3})*(?:\.\d+)?%?)\b/g),
+	].flatMap(([, value]) => (value ? [value] : []));
 	const markers = [
 		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
 		...(text.match(/#\d+/g) ?? []),
@@ -616,6 +620,7 @@ function authoredEvidenceMarkers(text: string): string[] {
 		...(text.match(/\b[A-Z][A-Z0-9]*-\d+\b/gi) ?? []),
 		...quantifiedResults,
 		...standaloneResultMarkers,
+		...scalarResultMarkers,
 		...authoredCommandMarkers(text),
 		...(text.match(/`[^`\n]+`/g) ?? []),
 	];
