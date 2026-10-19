@@ -8,10 +8,12 @@ import { runRestartStack } from "../../src/restart-stack";
 import { serviceSpecs } from "../../src/services";
 
 const home = process.env.GAJAEWAY_HOME;
+const launchAgentsDir = process.env.GAJAEWAY_LAUNCH_AGENTS_DIR;
 const callerGroup = Number(process.env.FIXTURE_CALLER_PGID);
 const id = process.argv[process.argv.indexOf("--run") + 1];
 if (!home || !id || !Number.isInteger(callerGroup))
 	throw new Error("fixture needs GAJAEWAY_HOME, caller pgid, --run id");
+if (!launchAgentsDir) throw new Error("fixture needs GAJAEWAY_LAUNCH_AGENTS_DIR to prevent touching real system files");
 
 const leases = new Map<LeaseName, Lease>();
 let adminPid = process.pid + 1;
@@ -21,6 +23,7 @@ await runRestartStack({
 	platform: "darwin",
 	uid: 501,
 	binDir: process.execPath.slice(0, process.execPath.lastIndexOf("/")),
+	launchAgentsDir,
 	pollMs: 10,
 	runner: async (command) => {
 		const label = command.at(-1)?.split("/").at(-1) ?? "";

@@ -1442,6 +1442,35 @@ test("an uninstalled service is skipped and does not abort the remaining stack",
 	}
 });
 
+test("#621 regression: restart-stack-worker fixture fails if GAJAEWAY_LAUNCH_AGENTS_DIR is not set", async () => {
+	// This prevents the fixture from accidentally touching the real ~/Library/LaunchAgents
+	// on a macOS host. The fixture must be run with GAJAEWAY_LAUNCH_AGENTS_DIR set.
+	const { home, cleanup } = await tempHome();
+	try {
+		const env: NodeJS.ProcessEnv = {
+			...process.env,
+			GAJAEWAY_HOME: home,
+			FIXTURE_CALLER_PGID: String(process.pid),
+		};
+		delete env.GAJAEWAY_LAUNCH_AGENTS_DIR;
+		const worker = Bun.spawn(
+			[process.execPath, join(import.meta.dir, "fixtures/restart-stack-worker.ts"), "ops", "restart-stack"],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
+		const exitCode = await worker.exited;
+		const stderr = await new Response(worker.stderr).text();
+		expect(exitCode).not.toBe(0);
+		expect(stderr).toContain("GAJAEWAY_LAUNCH_AGENTS_DIR");
+		expect(stderr).toContain("prevent touching real system files");
+	} finally {
+		await cleanup();
+	}
+});
+
 test("supervisorArgv escapes the gateway cgroup on systemd without bootout", () => {
 	const worker = ["/opt/bin/gajaeway", "ops", "restart-stack", "--run", "r1"];
 	expect(supervisorArgv("darwin", worker, "/h", "r1")).toEqual(worker);
