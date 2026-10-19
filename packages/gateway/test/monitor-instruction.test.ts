@@ -5,7 +5,12 @@ import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { isAuthoredEchoSuspected } from "../src/monitors/compaction";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import {
+	buildMonitorAuthoringPrompt,
+	MONITOR_AUTHORING_HEADER,
+	MONITOR_AUTHORING_REPORT_RULE,
+	MonitorPropagator,
+} from "../src/monitors/propagate";
 import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors/registry";
 import { Store } from "../src/store";
 
@@ -41,6 +46,23 @@ async function harness(directory: string) {
 	return { database, registry, pipeline, prompts };
 }
 
+test("the authoring prompt orders execution before the report, with literal wording (#369)", () => {
+	const events = [{ eventId: "e-1", eventType: "deploy.blocked", payload: { release: "r-1" } }];
+	const prompt = buildMonitorAuthoringPrompt({ guidance: "Pull the deploy queue.", events });
+	const lines = prompt.split("\n");
+	// Literal phrases, not the exported constants: the wording is the fix.
+	expect(lines[0]).toContain("Do the work");
+	expect(lines[0]).toContain("using your tools, before you reply");
+	expect(lines[1]).toBe("Task: Pull the deploy queue.");
+	expect(lines[2]).toContain("Report only after the work is done");
+	expect(lines[2]).toContain("restates the task instead of reporting results is rejected");
+	expect(lines[3]).toBe(
+		`Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(events)}`,
+	);
+	expect(lines).toHaveLength(4);
+	expect(prompt).not.toContain("Author monitor events");
+});
+
 test("a monitor's instruction reaches the authoring prompt and survives a store round-trip", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-instruction-"));
 	try {
@@ -61,9 +83,13 @@ test("a monitor's instruction reaches the authoring prompt and survives a store 
 		expect(prompts).toHaveLength(1);
 		const prompt = prompts[0]!;
 		expect(prompt).toContain(instruction);
-		// The instruction lands in the guidance slot, directly after the header and
-		// before the JSON-array response contract — which is unchanged.
-		expect(prompt.startsWith(`Author monitor events. ${instruction} Respond ONLY with a JSON array`)).toBe(true);
+		// The instruction is the task to execute, directly after the execute-first
+		// header and before the report rule and JSON-array response contract (#369).
+		expect(
+			prompt.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		expect(prompt).toContain('{"eventId","note"}');
 		database.close();
 	} finally {
@@ -71,7 +97,7 @@ test("a monitor's instruction reaches the authoring prompt and survives a store 
 	}
 });
 
-test("a monitor without an instruction keeps the exact pre-existing prompt shape", async () => {
+test("a monitor without an instruction gets no task segment", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-no-instruction-"));
 	try {
 		const { database, registry, pipeline, prompts } = await harness(directory);
@@ -87,8 +113,12 @@ test("a monitor without an instruction keeps the exact pre-existing prompt shape
 		await Bun.sleep(250);
 		expect(prompts).toHaveLength(1);
 		// No instruction and no maintenance guidance for this event type: no
-		// guidance segment at all.
-		expect(prompts[0]!.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		// task segment at all.
+		expect(
+			prompts[0]!.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -216,7 +246,7 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 		});
 		pipeline.submit(monitorId, "gajaeway.runtime-feedback.daily", { at: "2026-09-07T11:00:00.000Z" });
 		await Bun.sleep(250);
-		expect(prompts[0]!.startsWith(`Author monitor events. ${instruction} Respond ONLY`)).toBe(true);
+		expect(prompts[0]!.startsWith(`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n`)).toBe(true);
 		expect(delivered).toHaveLength(1);
 		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
 		// The mention comes from the typed field, not from the author remembering it.

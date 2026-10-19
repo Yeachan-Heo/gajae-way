@@ -824,10 +824,11 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.map((row) => (row as { batch_id: string }).batch_id);
 	}
 
+	/** Authored notes for the session-roll digest; `contract_unmet` echoes never seed a fresh session (#369). */
 	recentAuthoredNotes(monitorId: string, limit: number): Array<{ event_type: string; fired_at: string; note: string }> {
 		return this.#db
 			.prepare(
-				`SELECT monitor_events.event_type AS event_type, monitor_events.fired_at AS fired_at, authored_outputs.output_text AS note FROM monitor_events JOIN authored_outputs ON authored_outputs.event_id = monitor_events.event_id WHERE monitor_events.monitor_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY monitor_events.fired_at DESC, monitor_events.rowid DESC LIMIT ?`,
+				`SELECT monitor_events.event_type AS event_type, monitor_events.fired_at AS fired_at, authored_outputs.output_text AS note FROM monitor_events JOIN authored_outputs ON authored_outputs.event_id = monitor_events.event_id WHERE monitor_events.monitor_id = ? AND monitor_events.stage <> 'contract_unmet' AND ${REPLAYABLE_MONITOR} ORDER BY monitor_events.fired_at DESC, monitor_events.rowid DESC LIMIT ?`,
 			)
 			.all(monitorId, limit) as Array<{ event_type: string; fired_at: string; note: string }>;
 	}

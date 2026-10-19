@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MONITOR_PROCEDURE_MAX_BYTES } from "../src/monitors/procedure";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -151,7 +151,11 @@ test("a monitor without procedure files keeps the pre-existing prompt and record
 			burstPolicy: "serialize",
 		});
 		await pipeline.submitAwaitable(monitor.monitorId, "p", {});
-		expect(prompts[0]!.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		expect(
+			prompts[0]!.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		expect(database.monitors.eventRows(monitor.monitorId)[0]?.procedure_json).toBeNull();
 		database.close();
 	} finally {

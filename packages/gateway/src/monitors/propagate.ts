@@ -59,6 +59,9 @@ import {
 import { readMonitorProcedure } from "./procedure";
 import type { MonitorRegistry } from "./registry";
 
+/** Candidate notes read per digest slot, so skipped echo/silent notes do not starve the digest. */
+const DIGEST_NOTE_SCAN_FACTOR = 4;
+
 export const MONITOR_REPORT_MESSAGE_ID_PREFIX = "monitor-report:";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -68,6 +71,37 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 	"memory.audit":
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 };
+
+/** First line of every monitor authoring prompt: execute before reporting. */
+export const MONITOR_AUTHORING_HEADER =
+	"Monitor events fired. Do the work they call for now, using your tools, before you reply.";
+/** The report rule that precedes the JSON response contract. */
+export const MONITOR_AUTHORING_REPORT_RULE =
+	"Report only after the work is done. Each note states what you actually did and found: commands run, files changed, commits, links, results. A note that restates the task instead of reporting results is rejected and not delivered.";
+
+/**
+ * The authoring turn prompt. Execution comes first and the JSON report last:
+ * when the response format led ("Author monitor events ... Respond ONLY with
+ * JSON"), sessions answered the format without doing the work and restated
+ * the instruction as the note (#369). The event array stays the final
+ * segment of the prompt.
+ */
+export function buildMonitorAuthoringPrompt(input: {
+	readonly guidance?: string;
+	readonly procedure?: string;
+	readonly digest?: string;
+	readonly events: readonly { readonly eventId: string; readonly eventType: string; readonly payload: unknown }[];
+}): string {
+	const lines = [MONITOR_AUTHORING_HEADER];
+	if (input.guidance) lines.push(`Task: ${input.guidance}`);
+	if (input.procedure) lines.push(input.procedure);
+	if (input.digest) lines.push(input.digest);
+	lines.push(
+		MONITOR_AUTHORING_REPORT_RULE,
+		`Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(input.events)}`,
+	);
+	return lines.join("\n");
+}
 
 /** Stable, public-safe dispatch failure codes. */
 type DispatchFailureCode =
@@ -1074,7 +1108,16 @@ export class MonitorPropagator {
 							this.#database.monitors.eventFencedSetProcedure(tx, row.event_id, leaseId, versionsJson, now());
 					});
 				}
-				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${procedure.prompt ? `\n${procedure.prompt}\n` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+				const prompt = buildMonitorAuthoringPrompt({
+					guidance,
+					procedure: procedure.prompt,
+					digest,
+					events: claimed.map((row) => ({
+						eventId: row.event_id,
+						eventType: row.event_type,
+						payload: JSON.parse(row.payload_json),
+					})),
+				});
 				// #187: a request-phase failure does not mean the prompt was refused —
 				// the turn it started may still be running. Reuse its op-ref on retry.
 				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
@@ -1646,7 +1689,7 @@ export class MonitorPropagator {
 		const digest = buildMonitorCompactionDigest({
 			monitorName: monitor.name,
 			instruction: monitor.instruction,
-			notes: this.#recentAuthoredNotes(monitor.monitorId),
+			notes: this.#recentAuthoredNotes(monitor),
 		});
 		// bumpEpoch is the existing rotation primitive: epoch + 1 and turn_count 0.
 		// The next broker-backed SessionPort bind mints a fresh session and
@@ -1686,11 +1729,21 @@ export class MonitorPropagator {
 		);
 		return digest;
 	}
-	/** Newest authored notes for one monitor, newest first, bounded by the digest budget. */
-	#recentAuthoredNotes(monitorId: string): MonitorDigestNote[] {
+	/**
+	 * Newest authored notes for one monitor, newest first; the digest builder
+	 * applies the note cap. Silent markers and contract restatements are skipped: the no-target
+	 * path never classifies echoes, and an echo in the digest is exactly the
+	 * example a fresh session would copy (#369).
+	 */
+	#recentAuthoredNotes(monitor: MonitorRecord): MonitorDigestNote[] {
 		const notes: MonitorDigestNote[] = [];
-		for (const row of this.#database.monitors.recentAuthoredNotes(monitorId, MONITOR_DIGEST_MAX_NOTES))
+		for (const row of this.#database.monitors.recentAuthoredNotes(
+			monitor.monitorId,
+			MONITOR_DIGEST_MAX_NOTES * DIGEST_NOTE_SCAN_FACTOR,
+		)) {
+			if (isSilentOutput(row.note) || this.#isContractEcho(monitor, row.event_type, row.note)) continue;
 			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note: row.note });
+		}
 		return notes;
 	}
 	/**
