@@ -465,9 +465,16 @@ test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric resu
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make: passed.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran pytest: passed.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth: 17.`)).toBe(false);
 	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Latency was 450.`)).toBe(false);
 	expect(
 		isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`, {
+			eventType: "report.daily",
+			payload: { depth: 17 },
+		}),
+	).toBe(true);
+	expect(
+		isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth: 17.`, {
 			eventType: "report.daily",
 			payload: { depth: 17 },
 		}),
