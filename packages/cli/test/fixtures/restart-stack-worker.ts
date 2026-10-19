@@ -13,8 +13,7 @@ const callerGroup = Number(process.env.FIXTURE_CALLER_PGID);
 const id = process.argv[process.argv.indexOf("--run") + 1];
 if (!home || !id || !Number.isInteger(callerGroup))
 	throw new Error("fixture needs GAJAEWAY_HOME, caller pgid, --run id");
-if (!launchAgentsDir)
-	throw new Error("fixture needs GAJAEWAY_LAUNCH_AGENTS_DIR to prevent touching real system files");
+if (!launchAgentsDir) throw new Error("fixture needs GAJAEWAY_LAUNCH_AGENTS_DIR to prevent touching real system files");
 
 const leases = new Map<LeaseName, Lease>();
 let adminPid = process.pid + 1;
