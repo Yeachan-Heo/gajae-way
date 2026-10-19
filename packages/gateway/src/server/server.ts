@@ -2814,6 +2814,9 @@ async function sendChat(
 					? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
 					: undefined,
 			});
+			// The unmute commits with the addressed message it answers, so a crash can
+			// never leave an accepted unmute action behind a still-muted thread.
+			if (accepted && muteKey !== undefined && muteAddressed) options.database.inbox.unmuteThread(tx, muteKey);
 			if (!accepted || !nonLoopback || authorIsBot)
 				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
 
@@ -2884,9 +2887,6 @@ async function sendChat(
 			result: { turnId: null, engaged: true },
 		});
 		return;
-	}
-	if (muteKey !== undefined && muteAddressed) {
-		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, muteKey));
 	}
 	for (const intentId of admission.memoryIntentIds) runtime.memory.enqueueExistingId(intentId);
 	for (const watchOriginKey of admission.watchWakeOrigins)
@@ -3021,24 +3021,23 @@ async function editChat(
 	const turnId = crypto.randomUUID();
 	const { messageId: editedId, text: edit } = params;
 	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.transaction((tx) =>
-			options.database.inbox.enqueue(tx, {
+		options.database.transaction((tx) => {
+			const enqueued = options.database.inbox.enqueue(tx, {
 				messageId,
 				originKey: key,
 				originRefJson: JSON.stringify(origin),
 				body: renderMessageEdit(editedId, edit),
 				engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
 				...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
-			}),
-		),
+			});
+			if (enqueued && muteKey !== undefined && muteAddressed) options.database.inbox.unmuteThread(tx, muteKey);
+			return enqueued;
+		}),
 	);
 	if (!accepted) {
 		// The same edit event delivered twice: acknowledged once, dispatched once.
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
 		return;
-	}
-	if (muteKey !== undefined && muteAddressed) {
-		options.database.transaction((tx) => options.database.inbox.unmuteThread(tx, muteKey));
 	}
 	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
@@ -3956,7 +3955,13 @@ async function createInboundTurnLifecycle(
 			: nonLoopback
 				? (editedMessageId(steered.message_id) ?? steered.message_id)
 				: undefined;
+	// A Slack channel session carries several bot-rooted threads, so [SHUTUP]
+	// mutes the thread of the latest chat message this turn took in, not the
+	// trigger's: the persona answers the newest message a steer brought in.
+	let muteEngagement: EngagementContext | undefined = engagement as EngagementContext | undefined;
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
+		if (steered.source !== "lane_report" && steered.engagement_json)
+			muteEngagement = JSON.parse(steered.engagement_json) as EngagementContext;
 		runtime.inbound.delete(steered.message_id);
 		acknowledgeSteer(runtime, steered, turnId);
 	};
@@ -3984,7 +3989,7 @@ async function createInboundTurnLifecycle(
 				);
 			});
 			// Issue #625: mute the thread if the response is [SHUTUP]
-			const muteKey = nonLoopback ? threadMuteKey(origin, key, engagement as never) : undefined;
+			const muteKey = nonLoopback ? threadMuteKey(origin, key, muteEngagement) : undefined;
 			if (muteKey !== undefined && isShutupToken(text)) {
 				options.database.transaction((tx) => {
 					options.database.inbox.muteThread(tx, muteKey);

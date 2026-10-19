@@ -115,6 +115,7 @@ async function start(
 async function fixture(
 	engagement: "open" | "mention-open",
 	firstReply = "[SHUTUP]\nthis control response must not be delivered",
+	firstTurnGate?: Promise<void>,
 ) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-thread-shutup-"));
 	const gatewayConfig = config(directory, engagement);
@@ -124,6 +125,7 @@ async function fixture(
 		bind: async (key, epoch) => `session-${key}-${epoch}`,
 		respond: async (_session, text) => {
 			turns.push(text);
+			if (turns.length === 1) await firstTurnGate;
 			return turns.length === 1 ? firstReply : `normal reply ${turns.length}`;
 		},
 	});
@@ -306,6 +308,75 @@ test("SHUTUP mutes a Slack thread that is carried by its channel session", async
 		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(false);
 		await waitForTurn(f, 4);
 		expect((await send(f.client, "slack-after-unmute", SLACK_CHANNEL, botThreadReply)).result.engaged).toBe(true);
+	} finally {
+		f.client.close();
+	}
+});
+
+test("SHUTUP mutes the Slack thread of the message steered into the turn, not the trigger's", async () => {
+	let finish!: () => void;
+	const running = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const f = await fixture("open", "[SHUTUP]", running);
+	const threadB = "C0SHUTUP:1700000000.000300";
+	const threadBKey = originKey({ platform: "slack", kind: "thread", conversationId: threadB, parentId: "C0SHUTUP" });
+	try {
+		const channelRoot = { mentioned: true, explicitMention: true, group: true, authorId: OWNER };
+		await send(f.client, "slack-root-trigger", SLACK_CHANNEL, channelRoot);
+		await waitUntil(() => f.turns.length === 1);
+		const threadBReply = {
+			mentioned: true,
+			explicitMention: false,
+			group: true,
+			authorId: OWNER,
+			replyTo: { messageId: threadB, fromSelf: true },
+		};
+		expect((await send(f.client, "slack-thread-b-steer", SLACK_CHANNEL, threadBReply)).result.engaged).toBe(true);
+		await waitUntil(() => f.port.steers.length === 1);
+		finish();
+		await waitForTurn(f, 1);
+		await waitUntil(() => f.database.inbox.isThreadMuted(threadBKey));
+		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(false);
+		expect((await send(f.client, "slack-thread-b-muted", SLACK_CHANNEL, threadBReply)).result.engaged).toBe(false);
+	} finally {
+		finish();
+		f.client.close();
+	}
+});
+
+test("an unmute commits atomically with the addressed message that carries it", async () => {
+	const f = await fixture("mention-open");
+	try {
+		await send(f.client, "atomic-trigger", THREAD, threadMention);
+		await waitForTurn(f, 1);
+		await waitUntil(() => f.database.inbox.isThreadMuted(originKey(THREAD)));
+		const unmute = spyOn(f.database.inbox, "unmuteThread").mockImplementation(() => {
+			throw new Error("crash between admission and unmute");
+		});
+		const error = spyOn(console, "error").mockImplementation(() => {});
+		try {
+			f.client.send({
+				v: "0.1",
+				type: "request",
+				id: "atomic-unmute-crash",
+				verb: "chat.send",
+				params: { origin: THREAD, text: "atomic-unmute", messageId: "atomic-unmute", engagement: threadMention },
+			});
+			await waitUntil(() =>
+				f.client.frames.some((frame) => frame.type === "error" && frame.id === "atomic-unmute-crash"),
+			);
+		} finally {
+			unmute.mockRestore();
+			error.mockRestore();
+		}
+		// Nothing of the failed admission is durable, so the replayed message is admitted and unmutes.
+		expect(f.database.inbox.isThreadMuted(originKey(THREAD))).toBe(true);
+		const replay = await send(f.client, "atomic-unmute", THREAD, threadMention);
+		expect(replay.result).toMatchObject({ engaged: true });
+		expect(replay.result.turnId).not.toBeNull();
+		expect(f.database.inbox.isThreadMuted(originKey(THREAD))).toBe(false);
+		await waitForTurn(f, 2);
 	} finally {
 		f.client.close();
 	}
