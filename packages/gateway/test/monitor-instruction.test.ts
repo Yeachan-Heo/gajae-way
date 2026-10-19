@@ -5,7 +5,12 @@ import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { isAuthoredEchoSuspected } from "../src/monitors/compaction";
-import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropagator } from "../src/monitors/propagate";
+import {
+	buildMonitorAuthoringPrompt,
+	MONITOR_AUTHORING_HEADER,
+	MONITOR_AUTHORING_REPORT_RULE,
+	MonitorPropagator,
+} from "../src/monitors/propagate";
 import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors/registry";
 import { Store } from "../src/store";
 
@@ -40,6 +45,23 @@ async function harness(directory: string) {
 	});
 	return { database, registry, pipeline, prompts };
 }
+
+test("the authoring prompt orders execution before the report, with literal wording (#369)", () => {
+	const events = [{ eventId: "e-1", eventType: "deploy.blocked", payload: { release: "r-1" } }];
+	const prompt = buildMonitorAuthoringPrompt({ guidance: "Pull the deploy queue.", events });
+	const lines = prompt.split("\n");
+	// Literal phrases, not the exported constants: the wording is the fix.
+	expect(lines[0]).toContain("Do the work");
+	expect(lines[0]).toContain("using your tools, before you reply");
+	expect(lines[1]).toBe("Task: Pull the deploy queue.");
+	expect(lines[2]).toContain("Report only after the work is done");
+	expect(lines[2]).toContain("restates the task instead of reporting results is rejected");
+	expect(lines[3]).toBe(
+		`Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(events)}`,
+	);
+	expect(lines).toHaveLength(4);
+	expect(prompt).not.toContain("Author monitor events");
+});
 
 test("a monitor's instruction reaches the authoring prompt and survives a store round-trip", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-instruction-"));
