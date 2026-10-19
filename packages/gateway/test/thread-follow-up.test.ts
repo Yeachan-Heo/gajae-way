@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { GatewayConfig } from "../src/config";
-import { decideEngagement, threadFollowUpEngaged } from "../src/engagement/policy";
+import { decideEngagement, suppressMutedThreadFollowUp, threadFollowUpEngaged } from "../src/engagement/policy";
 
 const OWNER = "U-owner";
 const THREAD = {
@@ -60,12 +60,20 @@ test("audience rules still decide bots in a followed-up thread", () => {
 const THREAD_KEY = "slack/thread/C1:1700000000.000100/parent=C1";
 
 function store(
-	options: { triggeredOrigins?: readonly string[]; triggeredMessages?: readonly [string, string][] } = {},
+	options: {
+		triggeredOrigins?: readonly string[];
+		triggeredMessages?: readonly [string, string][];
+		mutedThreads?: Set<string>;
+	} = {},
 ) {
+	const muted = options.mutedThreads ?? new Set<string>();
 	return {
 		originTriggeredTurn: (key: string) => (options.triggeredOrigins ?? []).includes(key),
 		messageJoinedTurn: (key: string, messageId: string) =>
 			(options.triggeredMessages ?? []).some(([k, m]) => k === key && m === messageId),
+		isThreadMuted: (threadOriginKey: string) => muted.has(threadOriginKey),
+		muteThread: (threadOriginKey: string) => muted.add(threadOriginKey),
+		unmuteThread: (threadOriginKey: string) => muted.delete(threadOriginKey),
 	};
 }
 
@@ -97,4 +105,51 @@ test("defaulting the parameter keeps every existing caller mention-gated", () =>
 	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
 	expect(decideEngagement(THREAD, speaker("U-stranger"), mentionOpen).engaged).toBe(false);
 	expect(decideEngagement(THREAD, speaker("U-stranger", true), mentionOpen).engaged).toBe(true);
+});
+
+test("a muted thread suppresses follow-ups without mention or reply-to (issue #625)", () => {
+	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	const muted = store({
+		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
+		mutedThreads: new Set([THREAD_KEY]),
+	});
+	// Without mention or reply, the muted thread is not engaged
+	const noMentionNoReply = { mentioned: false, group: true, authorId: "U-stranger" };
+	const followUpCheck = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
+	const followUpAfterMuteCheck = suppressMutedThreadFollowUp(followUpCheck, THREAD_KEY, noMentionNoReply, muted);
+	const engagement = decideEngagement(THREAD, noMentionNoReply, mentionOpen, followUpAfterMuteCheck);
+	expect(engagement.engaged).toBe(false);
+});
+
+test("a muted thread engages with explicit mention (issue #625)", () => {
+	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	const muted = store({
+		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
+		mutedThreads: new Set([THREAD_KEY]),
+	});
+	// With mention, engagement should be allowed even if muted
+	const withMention = { mentioned: true, group: true, authorId: "U-stranger" };
+	const followUpCheck = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
+	const followUpAfterMuteCheck = suppressMutedThreadFollowUp(followUpCheck, THREAD_KEY, withMention, muted);
+	const engagement = decideEngagement(THREAD, withMention, mentionOpen, followUpAfterMuteCheck);
+	expect(engagement.engaged).toBe(true);
+});
+
+test("a muted thread engages with reply-to (issue #625)", () => {
+	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	const muted = store({
+		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
+		mutedThreads: new Set([THREAD_KEY]),
+	});
+	// With reply-to bot, engagement should be allowed even if muted
+	const withReplyToBot = {
+		mentioned: false,
+		group: true,
+		authorId: "U-stranger",
+		replyTo: { fromSelf: true },
+	};
+	const followUpCheck = threadFollowUpEngaged(THREAD, THREAD_KEY, muted);
+	const followUpAfterMuteCheck = suppressMutedThreadFollowUp(followUpCheck, THREAD_KEY, withReplyToBot as never, muted);
+	const engagement = decideEngagement(THREAD, withReplyToBot as never, mentionOpen, followUpAfterMuteCheck);
+	expect(engagement.engaged).toBe(true);
 });

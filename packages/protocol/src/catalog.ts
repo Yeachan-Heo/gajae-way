@@ -1384,6 +1384,19 @@ export function isSilentOutput(text: string): boolean {
 	return isSilenceToken(text) || containsSilenceToken(text);
 }
 
+/**
+ * Thread mute token (issue #625): when a turn's final reply contains this,
+ * the thread is muted for this bot, suppressing LLM turns for unmentioned follow-ups
+ * until the next mention or reply to the bot. The token must be alone in the final
+ * reply to trigger muting (like [SILENT]).
+ */
+export const SHUTUP_TOKENS = ["[SHUTUP]", "SHUTUP"] as const;
+
+export function isShutupToken(text: string): boolean {
+	const normalized = unbracket(text.trim()).toUpperCase();
+	return (SHUTUP_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
+}
+
 function unbracket(text: string): string {
 	return text.startsWith("[") && text.endsWith("]") && text.length > 2 ? text.slice(1, -1).trim() : text;
 }

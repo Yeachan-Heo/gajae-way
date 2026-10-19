@@ -255,6 +255,12 @@ export function decideEngagement(
 export interface ThreadEngagementStore {
 	originTriggeredTurn(originKey: string): boolean;
 	messageJoinedTurn(originKey: string, messageId: string): boolean;
+	/** Check if the thread is muted (follow-ups are suppressed unless mentioned/replied-to). */
+	isThreadMuted(threadOriginKey: string): boolean;
+	/** Mute a thread, suppressing LLM turns for unmentioned follow-ups. */
+	muteThread(threadOriginKey: string): void;
+	/** Unmute a thread, allowing LLM turns for follow-ups again. */
+	unmuteThread(threadOriginKey: string): void;
 }
 
 /**
@@ -291,6 +297,23 @@ export function threadFollowUpEngaged(
 		conversationId: origin.parentId,
 	});
 	return store.messageJoinedTurn(parentKey, origin.conversationId);
+}
+
+/**
+ * Suppress threadFollowUp engagement if the thread is muted, unless the message
+ * is explicitly mentioned or replied to the bot (which unmutes).
+ */
+export function suppressMutedThreadFollowUp(
+	threadFollowUp: boolean,
+	threadOriginKey: string,
+	engagement: EngagementContext | undefined,
+	store: ThreadEngagementStore,
+): boolean {
+	if (!threadFollowUp) return false;
+	if (!store.isThreadMuted(threadOriginKey)) return true;
+	// Thread is muted; only engage if mentioned or replied-to
+	const hasReplyToSelf = (engagement as { replyTo?: { fromSelf?: boolean } } | undefined)?.replyTo?.fromSelf === true;
+	return engagement?.mentioned === true || hasReplyToSelf;
 }
 
 /**

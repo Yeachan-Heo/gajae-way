@@ -15,6 +15,7 @@ import {
 	isChatPlatform,
 	isPlatformMessageId,
 	isSilentOutput,
+	isShutupToken,
 	LOOPBACK_ORIGIN,
 	type MonitorEventOperatorResult,
 	type MonitorEventRecord,
@@ -55,6 +56,7 @@ import {
 	decideEngagement,
 	resolveBotAudienceLimits,
 	resolveChannelPolicy,
+	suppressMutedThreadFollowUp,
 	threadFollowUpEngaged,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
@@ -2657,7 +2659,14 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
+	// Check if the thread is muted and suppress follow-up unless mentioned or replied-to
+	const threadFollowUpForEngagement = suppressMutedThreadFollowUp(
+		threadFollowUp,
+		key,
+		params.engagement as never,
+		options.database.inbox,
+	);
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUpForEngagement);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as
@@ -2677,7 +2686,7 @@ async function sendChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUpForEngagement);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.warn(
@@ -2965,7 +2974,14 @@ async function editChat(
 		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
 	);
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
+	// Check if the thread is muted and suppress follow-up unless mentioned or replied-to
+	const threadFollowUpForEngagement = suppressMutedThreadFollowUp(
+		threadFollowUp,
+		key,
+		params.engagement as never,
+		options.database.inbox,
+	);
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUpForEngagement);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as { mentioned?: boolean } | undefined;
@@ -2974,7 +2990,7 @@ async function editChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUpForEngagement);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.warn(
@@ -3948,6 +3964,19 @@ async function createInboundTurnLifecycle(
 					`user: ${clipByCodePoints(userText, 500)}\nassistant: ${clipByCodePoints(replyText, 500)}`,
 				);
 			});
+			// Issue #625: unmute the thread if it's muted and we're engaging with a mentioned
+			// or replied-to message (we only reach here if engagement decision was positive)
+			if (origin.kind === "thread" && nonLoopback && options.database.inbox.isThreadMuted(key)) {
+				options.database.transaction((tx) => {
+					options.database.inbox.unmuteThread(tx, key);
+				});
+			}
+			// Issue #625: mute the thread if the response is [SHUTUP]
+			if (isShutupToken(text) && origin.kind === "thread" && nonLoopback) {
+				options.database.transaction((tx) => {
+					options.database.inbox.muteThread(tx, key);
+				});
+			}
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
 			// Recovered from the transcript after it already reached the room under
 			// another turn: recorded above, never posted a second time.
@@ -4476,6 +4505,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
 					"To stay quiet on a message that is not for you, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded.",
+				]
+			: []),
+		...(origin.kind === "thread"
+			? [
+					"To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
 				]
 			: []),
 		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord
