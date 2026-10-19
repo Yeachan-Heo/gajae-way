@@ -50,6 +50,7 @@ import {
 	MONITOR_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
+	MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD,
 	MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD,
 	type MonitorDigestNote,
 	type NativeCompactionStatus,
@@ -133,10 +134,9 @@ type DispatchFailureCode =
 	// row names the session whose host may have outlived the gateway.
 	| "gateway_shutdown"
 	| "session_host_unavailable"
-	// The runtime accepted the prompt but no agent run ever started
-	// (`phase=submission` with an agent-runtime cause). Nothing was sent and no
-	// side effect happened, so the event replays cleanly — on the fresh session
-	// the armed roll binds.
+	// The runtime accepted the prompt but no agent run ever started (`phase=submission`
+	// with an agent-runtime cause), or gjc returned its exact prior-run-busy terminal
+	// failure. Nothing was sent and the event replays cleanly on the fresh session.
 	| "session_submission_wedged"
 	| "authoring_result_unreadable"
 	| "broker_authority_refused"
@@ -146,9 +146,10 @@ type DispatchFailureCode =
 
 /**
  * Failures that say nothing about the dispatch path, so the #179 retry backoff
- * does not apply: `session_busy` sent nothing (and the #263 roll moves the next
- * attempt to a fresh session), `gateway_shutdown` was this process's own stop
- * (#225: the next boot re-dispatches at once). Both still consume the budget.
+ * does not apply: `session_busy` and the classified prior-run-busy terminal
+ * failure sent nothing (and the roll moves the next attempt to a fresh session),
+ * while `gateway_shutdown` was this process's own stop (#225: the next boot
+ * re-dispatches at once). All still consume the dispatch budget.
  */
 const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode>([
 	"session_busy",
@@ -249,6 +250,8 @@ export interface MonitorSessionSafetyState {
 	 * session that never finished a turn has no row yet.
 	 */
 	stalledSessionId: string | undefined;
+	/** Consecutive exact `sdk_prompt_terminal_failed` prior-run-busy failures in this epoch. */
+	priorRunBusyFailures: number;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
@@ -1158,7 +1161,9 @@ export class MonitorPropagator {
 					const turns = this.#database.transaction((tx) =>
 						this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
 					);
-					this.#safetyState(sessionOriginKey).turns = turns;
+					const safety = this.#safetyState(sessionOriginKey);
+					safety.turns = turns;
+					safety.priorRunBusyFailures = 0;
 				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
@@ -1499,6 +1504,7 @@ export class MonitorPropagator {
 			lastProtocolReason: undefined,
 			busyFailures: 0,
 			stalledSessionId: undefined,
+			priorRunBusyFailures: 0,
 			nativeCompaction: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
@@ -1543,6 +1549,8 @@ export class MonitorPropagator {
 			boundEpoch !== undefined &&
 			boundEpoch === (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0);
 		const liveBinding = !replayed && currentEpoch;
+		const priorRunBusyFailure = isPriorRunBusyTerminalFailure(error);
+		if (currentEpoch && !priorRunBusyFailure) state.priorRunBusyFailures = 0;
 		if (isSessionBusy(error)) {
 			// A busy refusal is not evidence about context or contract: the prompt
 			// was never accepted. It IS evidence that the session is wedged on a turn
@@ -1563,6 +1571,27 @@ export class MonitorPropagator {
 				state.stalledSessionId = sessionId;
 				console.error(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_busy_stalled busy_failures=${state.busyFailures}/${MONITOR_BUSY_FAILURE_ROLL_THRESHOLD} session=${sessionId ?? "none"} turns=${state.turns}`,
+				);
+			}
+			return;
+		}
+		if (priorRunBusyFailure) {
+			// Count only failures on the current epoch. A stale session's terminal
+			// result must not roll (or contribute to the streak of) its successor.
+			if (!currentEpoch) return;
+			state.busyFailures = 0;
+			state.priorRunBusyFailures = Math.min(
+				MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD,
+				state.priorRunBusyFailures + 1,
+			);
+			console.error(
+				`monitor prior run still busy for ${sessionOriginKey} (monitor ${monitor.monitorId}): prior_run_busy_failures=${state.priorRunBusyFailures}/${MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD} replayed=${replayed} context_failures=${state.contextFailures} (unchanged)`,
+			);
+			if (!state.pendingRoll && state.priorRunBusyFailures >= MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD) {
+				state.pendingRoll = "session_prior_run_busy_stalled";
+				state.stalledSessionId = sessionId;
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_prior_run_busy_stalled prior_run_busy_failures=${state.priorRunBusyFailures}/${MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD} session=${sessionId ?? "none"} turns=${state.turns}`,
 				);
 			}
 			return;
@@ -1695,7 +1724,11 @@ export class MonitorPropagator {
 		// The next broker-backed SessionPort bind mints a fresh session and
 		// idempotency key for this monitor origin.
 		const stalledSessionId =
-			reason === "session_busy_stalled" || reason === "session_submission_wedged" ? state.stalledSessionId : undefined;
+			reason === "session_busy_stalled" ||
+			reason === "session_prior_run_busy_stalled" ||
+			reason === "session_submission_wedged"
+				? state.stalledSessionId
+				: undefined;
 		state.stalledSessionId = undefined;
 		this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson));
 		// A stalled session is still holding its wedged turn; nothing will prompt
@@ -1723,6 +1756,7 @@ export class MonitorPropagator {
 		state.orphanedExecutorFailures = 0;
 		state.protocolFailures = 0;
 		state.busyFailures = 0;
+		state.priorRunBusyFailures = 0;
 		state.turns = 0;
 		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
@@ -1868,7 +1902,7 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	const step = phase === "request" ? sessionRequestStep(error) : undefined;
 	if (error instanceof LastAssistantUnreadableError || step === "last_assistant") return "authoring_result_unreadable";
 	if (isSessionHostUnavailable(error)) return "session_host_unavailable";
-	if (isWedgedSubmissionError(error)) return "session_submission_wedged";
+	if (isWedgedSubmissionError(error) || isPriorRunBusyTerminalFailure(error)) return "session_submission_wedged";
 	if (error instanceof BrokerAuthorityError) return "broker_authority_refused";
 	if (error instanceof SessionTerminalError || error instanceof SessionRequestTimeoutError)
 		return "authoring_turn_failed";
@@ -1909,15 +1943,39 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	return "internal_error";
 }
 
-function hasSdkPromptTerminalFailure(error: unknown): boolean {
-	const visit = (value: unknown, depth: number, seen: Set<object>): boolean => {
-		if (depth > 4 || value === null || typeof value !== "object" || seen.has(value)) return false;
+const PRIOR_RUN_BUSY_TERMINAL_REASON = "Timed out waiting for prior agent run to finish before prompting.";
+
+function findSdkPromptTerminalFailure(
+	error: unknown,
+	matches: (fields: Record<string, unknown>) => boolean = () => true,
+): Record<string, unknown> | undefined {
+	const visit = (value: unknown, depth: number, seen: Set<object>): Record<string, unknown> | undefined => {
+		if (depth > 4 || value === null || typeof value !== "object" || seen.has(value)) return undefined;
 		seen.add(value);
 		const fields = value as Record<string, unknown>;
-		if (fields.code === "sdk_prompt_terminal_failed") return true;
-		return ["cause", "details", "error", "detail"].some((key) => visit(fields[key], depth + 1, seen));
+		if (fields.code === "sdk_prompt_terminal_failed" && matches(fields)) return fields;
+		for (const key of ["cause", "details", "error", "detail", "status"]) {
+			const found = visit(fields[key], depth + 1, seen);
+			if (found) return found;
+		}
+		return undefined;
 	};
 	return visit(error, 0, new Set());
+}
+
+function hasSdkPromptTerminalFailure(error: unknown): boolean {
+	return findSdkPromptTerminalFailure(error) !== undefined;
+}
+
+/** Exact gjc terminal reason that means a previous agent run still owns the prompt queue. */
+function isPriorRunBusyTerminalFailure(error: unknown): boolean {
+	return (
+		findSdkPromptTerminalFailure(error, (terminalFailure) =>
+			[terminalFailure.reason, terminalFailure.message].some(
+				(value) => typeof value === "string" && value.includes(PRIOR_RUN_BUSY_TERMINAL_REASON),
+			),
+		) !== undefined
+	);
 }
 
 /**

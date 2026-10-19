@@ -17,11 +17,15 @@ import type { ProtocolFailureReason } from "@gajae-gateway/protocol";
  * which restored the first line of defence.
  *
  * This module is the SECOND line: it detects the case where native compaction
- * silently fails again, and only then rolls the session as a last resort.
+ * silently fails again and rolls as a last resort. Separate bounded checks
+ * handle explicit protocol and stuck-session evidence without requesting
+ * compaction.
  * Invariants:
  * - A healthy monitor is NEVER rolled. Turn count is observational only.
- * - A roll requires consecutive context-class authoring failures AND a native
- *   compaction attempt that did not succeed.
+ * - A context-triggered roll requires consecutive context-class authoring
+ *   failures AND a native-compaction attempt that did not succeed.
+ * - Other rolls require repeated protocol failures or positive stuck-session
+ *   evidence; they never masquerade as context exhaustion.
  * - Nothing here calls an LLM: the digest is pure text assembly.
  */
 
@@ -62,6 +66,13 @@ export const MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD = 3;
  * because a busy refusal was filed as an executor failure with no remedy.
  */
 export const MONITOR_BUSY_FAILURE_ROLL_THRESHOLD = 2;
+
+/**
+ * Consecutive exact prior-run-busy terminal failures before the safety net rolls.
+ * One can be a transient while a previous run settles; the second confirms a
+ * session that keeps refusing every later prompt.
+ */
+export const MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD = 2;
 
 /**
  * Outcome of asking the runtime to compact a session natively.
@@ -299,6 +310,7 @@ export type SessionRollReason =
 	| "context_failures_native_compaction_skipped"
 	| "protocol_failures_off_contract"
 	| "session_busy_stalled"
+	| "session_prior_run_busy_stalled"
 	| "session_host_unavailable"
 	// The runtime accepted the prompt but no agent run ever started
 	// (`phase=submission`): a session wedged on a prior run fails every later
