@@ -1355,10 +1355,11 @@ export class WorkLaneManager {
 			});
 	}
 	/**
-	 * `work jobs` `last=` records when real content was observed for this bound
-	 * session, not a poll/hello/heartbeat or the host's execution timestamp.
-	 * Observer-only content is not attempt ownership or completion evidence.
-	 * Throttled; the write is fenced to the binding and open attempt.
+	 * Advances the persisted `work jobs` `last=` activity checkpoint on real
+	 * content, not polls/hello/heartbeats. Preparation and settlement also write
+	 * their timestamps, so the checkpoint alone proves neither observed content
+	 * nor attempt ownership/completion. These content-driven writes are throttled
+	 * and fenced to the binding and open attempt.
 	 */
 	#touch(observer: Observer): void {
 		const now = this.#now();
