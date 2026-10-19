@@ -114,7 +114,7 @@ async function start(
 
 async function fixture(
 	engagement: "open" | "mention-open",
-	firstReply = "[SHUTUP]\nthis control response must not be delivered",
+	firstReply: string | Error = "[SHUTUP]\nthis control response must not be delivered",
 	firstTurnGate?: Promise<void>,
 ) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-thread-shutup-"));
@@ -126,7 +126,8 @@ async function fixture(
 		respond: async (_session, text) => {
 			turns.push(text);
 			if (turns.length === 1) await firstTurnGate;
-			return turns.length === 1 ? firstReply : `normal reply ${turns.length}`;
+			if (turns.length === 1 && firstReply instanceof Error) throw firstReply;
+			return turns.length === 1 ? (firstReply as string) : `normal reply ${turns.length}`;
 		},
 	});
 	const originalBind = port.bind.bind(port);
@@ -341,6 +342,24 @@ test("SHUTUP mutes the Slack thread of the message steered into the turn, not th
 		expect((await send(f.client, "slack-thread-b-muted", SLACK_CHANNEL, threadBReply)).result.engaged).toBe(false);
 	} finally {
 		finish();
+		f.client.close();
+	}
+});
+
+test("a [SHUTUP] answer recovered from a failed turn still mutes the thread", async () => {
+	const f = await fixture("mention-open", new Error("Agent run failed after execution started."));
+	f.port.fetchAssistantSince = async () => ({ text: "[SHUTUP]", pages: 1, complete: true });
+	const error = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		await send(f.client, "recovered-trigger", THREAD, threadMention);
+		await waitUntil(() => f.database.inbox.isThreadMuted(originKey(THREAD)));
+		const followUp = { mentioned: false, explicitMention: false, group: true, authorId: OWNER };
+		expect((await send(f.client, "recovered-follow-up", THREAD, followUp)).result.engaged).toBe(false);
+		expect(
+			f.client.frames.some((frame) => frame.event === "chat.message" && String(frame.payload.text).includes("SHUTUP")),
+		).toBe(false);
+	} finally {
+		error.mockRestore();
 		f.client.close();
 	}
 });

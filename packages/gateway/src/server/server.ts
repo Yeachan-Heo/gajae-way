@@ -3959,6 +3959,12 @@ async function createInboundTurnLifecycle(
 	// mutes the thread of the latest chat message this turn took in, not the
 	// trigger's: the persona answers the newest message a steer brought in.
 	let muteEngagement: EngagementContext | undefined = engagement as EngagementContext | undefined;
+	/** Issue #625: an answer of [SHUTUP] mutes the thread it answered, however that answer reached the gateway. */
+	const applyShutup = (answer: string) => {
+		const muteKey = nonLoopback ? threadMuteKey(origin, key, muteEngagement) : undefined;
+		if (muteKey !== undefined && isShutupToken(answer))
+			options.database.transaction((tx) => options.database.inbox.muteThread(tx, muteKey));
+	};
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		if (steered.source !== "lane_report" && steered.engagement_json)
 			muteEngagement = JSON.parse(steered.engagement_json) as EngagementContext;
@@ -3988,13 +3994,7 @@ async function createInboundTurnLifecycle(
 					`user: ${clipByCodePoints(userText, 500)}\nassistant: ${clipByCodePoints(replyText, 500)}`,
 				);
 			});
-			// Issue #625: mute the thread if the response is [SHUTUP]
-			const muteKey = nonLoopback ? threadMuteKey(origin, key, muteEngagement) : undefined;
-			if (muteKey !== undefined && isShutupToken(text)) {
-				options.database.transaction((tx) => {
-					options.database.inbox.muteThread(tx, muteKey);
-				});
-			}
+			applyShutup(text);
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
 			// Recovered from the transcript after it already reached the room under
 			// another turn: recorded above, never posted a second time.
@@ -4101,6 +4101,7 @@ async function createInboundTurnLifecycle(
 			// The turn wrote its answer before it failed (#210): deliver it through
 			// the ordinary terminal slot. It then counts as a visible reply, and the
 			// failure stays in the operator log instead of replacing the answer.
+			if (recoveredText) applyShutup(recoveredText);
 			if (nonLoopback && recoveredText && !assistantDeliveryStarted)
 				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
