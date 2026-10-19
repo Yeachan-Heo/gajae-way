@@ -407,6 +407,28 @@ test("#632: event types and timestamps cannot dilute a short instruction echo", 
 	).toBe(true);
 });
 
+test("#632: copied payload values and URLs are not novel evidence", () => {
+	const shared = { eventType: "deployment.daily" };
+	expect(
+		isAuthoredEchoSuspected("Check deployment.", "Check deployment for release r-1.", {
+			...shared,
+			payload: { release: "r-1" },
+		}),
+	).toBe(true);
+	expect(
+		isAuthoredEchoSuspected("Check deployment.", "Check deployment https://example.com/incident/42", {
+			...shared,
+			payload: { url: "https://example.com/incident/42" },
+		}),
+	).toBe(true);
+	expect(
+		isAuthoredEchoSuspected("Check deployment.", "Check deployment https://example.com/incident/43", {
+			...shared,
+			payload: { url: "https://example.com/incident/42" },
+		}),
+	).toBe(false);
+});
+
 test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric results remain deliverable", () => {
 	const reports = [
 		"Ran bun test packages/gateway/test/monitor-instruction.test.ts: 12 tests passed and 0 failed.",

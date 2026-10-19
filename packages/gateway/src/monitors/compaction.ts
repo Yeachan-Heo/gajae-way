@@ -496,7 +496,7 @@ function serializeEchoPayload(payload: unknown): string {
 
 function authoredEvidenceMarkers(text: string): string[] {
 	const markers = [
-		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()]+/gi) ?? []),
+		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
 		...(text.match(/#\d+/g) ?? []),
 		...(text.match(/\b[0-9a-f]{7,40}\b/gi) ?? []),
 		...(text.match(/\b(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),
@@ -509,7 +509,7 @@ function authoredEvidenceMarkers(text: string): string[] {
 		) ?? []),
 		...(text.match(/`[^`\n]+`/g) ?? []),
 	];
-	return markers.map((marker) => marker.toLowerCase().replace(/[),.;!?]+$/g, ""));
+	return markers.map((marker) => marker.toLowerCase().replace(/[),.;!?}\]"'`]+$/g, ""));
 }
 
 function authoredEchoTokens(text: string): string[] {
@@ -518,11 +518,6 @@ function authoredEchoTokens(text: string): string[] {
 		"$1 $2 $3 $4 $5",
 	);
 	return normalizedTimestamps.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-}
-
-function eventPayloadDateTokens(payload: unknown): string {
-	const serialized = serializeEchoPayload(payload);
-	return (serialized.match(/\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z?)?\b/gi) ?? []).join("\n");
 }
 
 /** Detect contract-only notes while allowing paraphrase words and real, novel work evidence. */
@@ -535,26 +530,23 @@ export function isAuthoredEchoSuspected(
 	// Score instruction and event type independently so either can expose a short echo.
 	const contractSources = [contractText, eventContext?.eventType].filter((part): part is string => Boolean(part));
 	if (contractSources.length === 0) return false;
-	const payloadDateTokens = eventContext?.payload === undefined ? "" : eventPayloadDateTokens(eventContext.payload);
-	const fullContract = [...contractSources, payloadDateTokens].filter(Boolean).join("\n");
-	// Event identity, timing and the full payload can explain copied markers, but must not inflate task coverage.
-	const evidenceContract = [
-		fullContract,
-		eventContext?.eventId,
-		eventContext?.firedAt,
-		eventContext?.payload === undefined ? undefined : serializeEchoPayload(eventContext.payload),
-	]
+	const payloadText = eventContext?.payload === undefined ? undefined : serializeEchoPayload(eventContext.payload);
+	const fullContract = contractSources.join("\n");
+	// Event identity, timing and payload can explain copied markers, but must not inflate task coverage.
+	const evidenceContract = [fullContract, eventContext?.eventId, eventContext?.firedAt, payloadText]
 		.filter((part): part is string => Boolean(part))
 		.join("\n");
 	const contractContentSources = contractSources.map(
 		(source) => new Set(authoredEchoTokens(source).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token))),
 	);
 	const contractContent = new Set(contractContentSources.flatMap((source) => [...source]));
-	// Remove event-owned date/time tokens from both coverage and novelty scoring.
-	const payloadDateContent = new Set(authoredEchoTokens(payloadDateTokens));
+	// Event metadata is contract context, but it must not dilute task coverage or create novelty.
+	const eventMetadataText = [eventContext?.eventId, eventContext?.firedAt, payloadText].filter(Boolean).join("\n");
+	const eventMetadataContent = new Set(authoredEchoTokens(eventMetadataText));
 	const noteContent = new Set(
 		authoredEchoTokens(note).filter(
-			(token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token) && !payloadDateContent.has(token),
+			(token) =>
+				!NON_SUBSTANTIVE_ECHO_WORDS.has(token) && (!eventMetadataContent.has(token) || contractContent.has(token)),
 		),
 	);
 	if (contractContent.size === 0 || noteContent.size === 0) return false;
