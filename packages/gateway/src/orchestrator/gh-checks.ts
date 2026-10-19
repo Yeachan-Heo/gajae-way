@@ -1,7 +1,7 @@
 import { StreamingDiagnosticTail } from "./rebind";
 import type { CheckStatusClient, CheckStatusSnapshot } from "./work-lane";
 
-/** One entry of `gh pr list --json statusCheckRollup`: a CheckRun or a commit StatusContext. */
+/** One entry of `gh pr view --json statusCheckRollup`: a CheckRun or a commit StatusContext. */
 interface RollupEntry {
 	readonly __typename?: string;
 	readonly name?: string;
@@ -10,6 +10,16 @@ interface RollupEntry {
 	readonly conclusion?: string;
 	readonly state?: string;
 	readonly detailsUrl?: string;
+	readonly startedAt?: string;
+	readonly createdAt?: string;
+}
+
+interface AssociatedPullRequest {
+	readonly number: number;
+	readonly state: string;
+	readonly merged_at?: string | null;
+	readonly updated_at?: string;
+	readonly head: { readonly ref: string; readonly sha: string };
 }
 
 const FAILED_LOG_TAIL_LIMIT_BYTES = 3_200;
@@ -19,10 +29,15 @@ const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION
 const SUCCESS_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
 
+interface PullRequestLookup {
+	readonly results: readonly unknown[] | undefined;
+	readonly fullPage: boolean;
+}
+
 /**
- * Collapse a PR status-check rollup into one snapshot. Any failed entry makes it red;
- * otherwise any entry without a final verdict keeps it pending; an empty rollup is pending
- * because CI has not registered yet.
+ * Collapse a PR status-check rollup into one snapshot. Only the latest check
+ * with each name is considered; an unfinished latest check keeps the rollup
+ * pending, and any terminal failure makes it red. An empty rollup is pending.
  */
 export function classifyCheckRollup(
 	prNumber: number,
@@ -30,10 +45,15 @@ export function classifyCheckRollup(
 	rollup: readonly RollupEntry[],
 ): CheckStatusSnapshot {
 	if (!/^[0-9a-f]{40}$/.test(headSha)) throw new Error("PR head SHA is invalid");
-	const failingChecks: string[] = [];
-	let pending = rollup.length === 0;
+	const latest = new Map<string, RollupEntry>();
 	for (const entry of rollup) {
 		const label = entry.name ?? entry.context ?? "unknown";
+		const previous = latest.get(label);
+		if (!previous || isLaterCheck(entry, previous)) latest.set(label, entry);
+	}
+	const failingChecks: string[] = [];
+	let pending = latest.size === 0;
+	for (const [label, entry] of latest) {
 		if (entry.__typename === "StatusContext" || (entry.state !== undefined && entry.status === undefined)) {
 			const state = entry.state?.toUpperCase() ?? "PENDING";
 			if (FAILED_STATES.has(state)) failingChecks.push(label);
@@ -48,67 +68,91 @@ export function classifyCheckRollup(
 		if (FAILED_CONCLUSIONS.has(conclusion)) failingChecks.push(label);
 		else if (!SUCCESS_CONCLUSIONS.has(conclusion)) pending = true;
 	}
-	const status = failingChecks.length > 0 ? "red" : pending ? "pending" : "green";
-	return { prNumber, headSha, status, failingChecks: [...new Set(failingChecks)] };
+	const status = pending ? "pending" : failingChecks.length > 0 ? "red" : "green";
+	return { prNumber, headSha, status, failingChecks: status === "red" ? [...new Set(failingChecks)] : [] };
+}
+
+function isLaterCheck(candidate: RollupEntry, previous: RollupEntry): boolean {
+	const candidateTime = Date.parse(candidate.startedAt ?? candidate.createdAt ?? "");
+	const previousTime = Date.parse(previous.startedAt ?? previous.createdAt ?? "");
+	if (Number.isFinite(candidateTime) && Number.isFinite(previousTime)) return candidateTime >= previousTime;
+	// GitHub's rollup is newest-last when timestamps are not available.
+	return true;
 }
 
 /** Production client: bounded async PR/check lookups; failed GitHub Actions logs are a best-effort red-check tail. */
 export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): CheckStatusClient {
 	return {
-		async getCheckStatus(headSha, cwd, preferredPrNumber) {
+		async getCheckStatus(headSha, cwd, preferredPrNumber, branchName) {
 			try {
 				if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
-				const child = Bun.spawn(
-					[
-						executable,
-						"pr",
-						"list",
-						"--state",
-						"all",
-						"--search",
-						headSha,
-						"--limit",
-						`${PR_LOOKUP_LIMIT}`,
-						"--json",
-						"number,headRefOid,state,mergedAt,statusCheckRollup",
-					],
-					{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
-				);
-				const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-				if (exitCode !== 0) return undefined;
-				const prs = JSON.parse(stdout) as Array<{
-					number: number;
-					headRefOid: string;
-					state: string;
-					mergedAt?: string | null;
-					statusCheckRollup?: RollupEntry[] | null;
-				}>;
-				if (prs.length >= PR_LOOKUP_LIMIT) return undefined;
-				const matchingPrs = prs.filter((candidate) => candidate.headRefOid === headSha);
-				if (matchingPrs.length === 0) return preferredPrNumber === undefined ? null : undefined;
+				const [byHeadSha, byBranch] = await Promise.all([
+					queryPullRequests(executable, cwd, timeoutMs, [
+						"api",
+						`repos/{owner}/{repo}/commits/${headSha}/pulls`,
+						"-X",
+						"GET",
+						"-F",
+						`per_page=${PR_LOOKUP_LIMIT}`,
+					]),
+					branchName === undefined
+						? Promise.resolve(undefined)
+						: queryPullRequests(executable, cwd, timeoutMs, [
+								"api",
+								"repos/{owner}/{repo}/pulls",
+								"-X",
+								"GET",
+								"-F",
+								`head={owner}:${branchName}`,
+								"-F",
+								"state=all",
+								"-F",
+								`per_page=${PR_LOOKUP_LIMIT}`,
+							]),
+				]);
+				if (byHeadSha.fullPage || byBranch?.fullPage) return undefined;
+				const candidates = new Map<number, AssociatedPullRequest>();
+				for (const candidate of (byHeadSha.results as readonly AssociatedPullRequest[] | undefined) ?? [])
+					if (candidate.head?.sha === headSha) candidates.set(candidate.number, candidate);
+				for (const candidate of (byBranch?.results as readonly AssociatedPullRequest[] | undefined) ?? [])
+					if (candidate.head?.sha === headSha) candidates.set(candidate.number, candidate);
+				const matchingPrs = [...candidates.values()];
+				if (matchingPrs.length === 0) {
+					if (
+						preferredPrNumber !== undefined ||
+						byHeadSha.results === undefined ||
+						(branchName !== undefined && byBranch?.results === undefined)
+					)
+						return undefined;
+					return null;
+				}
 				const preferredPr =
 					preferredPrNumber === undefined
 						? undefined
 						: matchingPrs.find((candidate) => candidate.number === preferredPrNumber);
 				if (preferredPrNumber !== undefined && !preferredPr) return undefined;
-				const openMatches = preferredPr
-					? []
-					: matchingPrs.filter((candidate) => candidate.state.toUpperCase() === "OPEN");
-				// The checks cycle persists a PR number, so do not bind it to an arbitrary open match.
-				if (openMatches.length > 1) return undefined;
-				// A SHA can be shared across PRs; the active PR must outrank stale closed matches.
-				const pr =
-					preferredPr ??
-					openMatches[0] ??
-					matchingPrs.find((candidate) => Boolean(candidate.mergedAt)) ??
-					matchingPrs[0];
+				const pr = preferredPr ?? selectAssociatedPullRequest(matchingPrs, branchName);
 				if (!pr) return null;
-				const rollup = pr.statusCheckRollup ?? [];
-				const snapshot = classifyCheckRollup(pr.number, headSha, rollup);
+				const details = Bun.spawn(
+					[executable, "pr", "view", `${pr.number}`, "--json", "number,headRefOid,state,mergedAt,statusCheckRollup"],
+					{ cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
+				);
+				const [detailsText, detailsExitCode] = await Promise.all([new Response(details.stdout).text(), details.exited]);
+				if (detailsExitCode !== 0) return undefined;
+				const current = JSON.parse(detailsText) as {
+					number: number;
+					headRefOid: string;
+					state: string;
+					mergedAt?: string | null;
+					statusCheckRollup?: RollupEntry[] | null;
+				};
+				if (current.number !== pr.number || !/^[0-9a-f]{40}$/.test(current.headRefOid)) return undefined;
+				const rollup = current.statusCheckRollup ?? [];
+				const snapshot = classifyCheckRollup(pr.number, current.headRefOid, rollup);
 				const withPrState: CheckStatusSnapshot = {
 					...snapshot,
-					prState: pr.state.toUpperCase() === "OPEN" ? "open" : "closed",
-					merged: Boolean(pr.mergedAt),
+					prState: current.state.toUpperCase() === "OPEN" ? "open" : "closed",
+					merged: Boolean(current.mergedAt),
 				};
 				if (snapshot.status !== "red") return withPrState;
 				const targets = failedCheckLogTargets(rollup).slice(0, 3);
@@ -123,6 +167,51 @@ export function ghCheckStatusClient(timeoutMs = 5_000, executable = "gh"): Check
 			}
 		},
 	};
+}
+
+function selectAssociatedPullRequest(
+	prs: readonly AssociatedPullRequest[],
+	branchName?: string,
+): AssociatedPullRequest | undefined {
+	return [...prs].sort((left, right) => {
+		const leftOpen = left.state.toUpperCase() === "OPEN";
+		const rightOpen = right.state.toUpperCase() === "OPEN";
+		if (leftOpen !== rightOpen) return leftOpen ? -1 : 1;
+		const leftBranch = branchName !== undefined && left.head.ref === branchName;
+		const rightBranch = branchName !== undefined && right.head.ref === branchName;
+		if (leftBranch !== rightBranch) return leftBranch ? -1 : 1;
+		const leftUpdated = Date.parse(left.updated_at ?? "");
+		const rightUpdated = Date.parse(right.updated_at ?? "");
+		if (Number.isFinite(leftUpdated) && Number.isFinite(rightUpdated) && leftUpdated !== rightUpdated)
+			return rightUpdated - leftUpdated;
+		return left.number - right.number;
+	})[0];
+}
+
+async function queryPullRequests(
+	executable: string,
+	cwd: string,
+	timeoutMs: number,
+	args: readonly string[],
+): Promise<PullRequestLookup> {
+	try {
+		const child = Bun.spawn([executable, ...args], {
+			cwd,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+			timeout: timeoutMs,
+			killSignal: "SIGKILL",
+		});
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		if (exitCode !== 0) return { results: undefined, fullPage: false };
+		const results = JSON.parse(stdout) as unknown;
+		if (!Array.isArray(results)) return { results: undefined, fullPage: false };
+		if (results.length >= PR_LOOKUP_LIMIT) return { results: undefined, fullPage: true };
+		return { results, fullPage: false };
+	} catch {
+		return { results: undefined, fullPage: false };
+	}
 }
 
 export function failedCheckLogTargets(rollup: readonly RollupEntry[]): Array<{ runId: string; jobId?: string }> {

@@ -3193,7 +3193,7 @@ test("#481 settled report of a pushed lane with a red PR names the PR and failin
 	expect(text).toContain("checks=red(lint,test)");
 });
 
-test("#481 check rollup: any failure is red, unfinished is pending, all success is green", () => {
+test("#481 check rollup: latest named checks must all be terminal before settling", () => {
 	const run = (name: string, status: string, conclusion = "") => ({ __typename: "CheckRun", name, status, conclusion });
 	const headSha = "a".repeat(40);
 	expect(
@@ -3202,7 +3202,20 @@ test("#481 check rollup: any failure is red, unfinished is pending, all success 
 			run("lint", "COMPLETED", "FAILURE"),
 			run("test", "IN_PROGRESS"),
 		]),
-	).toEqual({ prNumber: 1, headSha, status: "red", failingChecks: ["lint"] });
+	).toEqual({ prNumber: 1, headSha, status: "pending", failingChecks: [] });
+	expect(
+		classifyCheckRollup(10, headSha, [
+			{ ...run("lint", "COMPLETED", "FAILURE"), startedAt: "2026-10-18T12:00:00Z" },
+			{ ...run("lint", "COMPLETED", "SUCCESS"), startedAt: "2026-10-18T12:01:00Z" },
+			run("test", "COMPLETED", "SUCCESS"),
+		]),
+	).toEqual({ prNumber: 10, headSha, status: "green", failingChecks: [] });
+	expect(
+		classifyCheckRollup(11, headSha, [
+			{ ...run("lint", "COMPLETED", "SUCCESS"), startedAt: "2026-10-18T12:00:00Z" },
+			{ ...run("lint", "COMPLETED", "FAILURE"), startedAt: "2026-10-18T12:01:00Z" },
+		]),
+	).toEqual({ prNumber: 11, headSha, status: "red", failingChecks: ["lint"] });
 	expect(classifyCheckRollup(2, headSha, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe(
 		"pending",
 	);
@@ -3237,148 +3250,193 @@ test("#481 check rollup: any failure is red, unfinished is pending, all success 
 	expect(() => classifyCheckRollup(8, "invalid", [])).toThrow("PR head SHA is invalid");
 });
 
-test("#595 GH check lookup finds the PR whose current head exactly matches the requested SHA", async () => {
+async function writeGhCheckStub(
+	ghPath: string,
+	associated: readonly object[],
+	details: object,
+	argsPath = `${ghPath}.args`,
+	branchCandidates: readonly object[] = [],
+): Promise<void> {
+	const script = [
+		"#!/bin/sh",
+		`printf '%s\\n' "$*" >> ${JSON.stringify(argsPath)}`,
+		`if [ "$1" = api ] && [ "$2" != "repos/{owner}/{repo}/pulls" ]; then printf '%s' ${JSON.stringify(JSON.stringify(associated))}; elif [ "$1" = api ]; then printf '%s' ${JSON.stringify(JSON.stringify(branchCandidates))}; else printf '%s' ${JSON.stringify(JSON.stringify(details))}; fi`,
+		"",
+	].join("\n");
+	await writeFile(ghPath, script);
+	await chmod(ghPath, 0o755);
+}
+
+test("#628 resolves an exact pushed head even when its PR uses a different branch", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const argsPath = join(directory, "args.txt");
 	const headSha = "a".repeat(40);
-	const response = [
-		{
-			number: 571,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: "b".repeat(40),
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
-		{
-			number: 570,
-			state: "MERGED",
-			mergedAt: "2026-10-14T12:00:00Z",
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
-		},
-	];
 	const ghPath = join(directory, "gh");
-	await writeFile(
+	await writeGhCheckStub(
 		ghPath,
-		`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsPath)}\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`,
-	);
-	await chmod(ghPath, 0o755);
-	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
-	const recordedArgs = (await readFile(argsPath, "utf8")).trim().split("\n");
-	expect(snapshot).toMatchObject({
-		prNumber: 570,
-		headSha,
-		status: "green",
-		prState: "closed",
-		merged: true,
-	});
-	expect(recordedArgs).toEqual([
-		"pr",
-		"list",
-		"--state",
-		"all",
-		"--search",
-		headSha,
-		"--limit",
-		"100",
-		"--json",
-		"number,headRefOid,state,mergedAt,statusCheckRollup",
-	]);
-});
-
-test("#595 GH check lookup prefers the open PR when duplicate PR heads match the requested SHA", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
-	cleanups.push(() => rm(directory, { recursive: true, force: true }));
-	const headSha = "c".repeat(40);
-	const response = [
+		[
+			{
+				number: 626,
+				state: "open",
+				merged_at: null,
+				updated_at: "2026-10-19T04:00:00Z",
+				head: { ref: "feature/thread-shutup", sha: headSha },
+			},
+		],
 		{
-			number: 569,
-			state: "CLOSED",
-			mergedAt: null,
+			number: 626,
 			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
-		},
-		{
-			number: 571,
 			state: "OPEN",
 			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+			statusCheckRollup: [{ name: "lint", status: "COMPLETED", conclusion: "FAILURE" }],
 		},
-		{
-			number: 570,
-			state: "CLOSED",
-			mergedAt: "2026-10-14T12:00:00Z",
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
-		},
-	];
-	const ghPath = join(directory, "gh");
-	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
-	await chmod(ghPath, 0o755);
+		argsPath,
+	);
 
-	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
-	expect(snapshot).toMatchObject({
-		prNumber: 571,
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(
 		headSha,
-		status: "pending",
+		directory,
+		undefined,
+		"work/67772d69737375652d363235",
+	);
+	expect(snapshot).toMatchObject({
+		prNumber: 626,
+		headSha,
+		status: "red",
+		failingChecks: ["lint"],
 		prState: "open",
 		merged: false,
 	});
+	expect((await readFile(argsPath, "utf8")).trim().split("\n").sort()).toEqual(
+		[
+			`api repos/{owner}/{repo}/commits/${headSha}/pulls -X GET -F per_page=100`,
+			"api repos/{owner}/{repo}/pulls -X GET -F head={owner}:work/67772d69737375652d363235 -F state=all -F per_page=100",
+			"pr view 626 --json number,headRefOid,state,mergedAt,statusCheckRollup",
+		].sort(),
+	);
 });
 
-test("#595 GH check lookup retries when multiple open PRs share the requested head SHA", async () => {
+test("#595 GH check lookup keeps the lane branch as a SHA-checked PR candidate", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "b".repeat(40);
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[],
+		{
+			number: 630,
+			headRefOid: headSha,
+			state: "OPEN",
+			mergedAt: null,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+		undefined,
+		[
+			{
+				number: 630,
+				head: { ref: "work/lane", sha: headSha },
+				state: "open",
+				merged_at: null,
+				updated_at: "2026-10-19T04:00:00Z",
+			},
+		],
+	);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, undefined, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 630, headSha, status: "pending", prState: "open", merged: false });
+});
+
+test("#595 GH check lookup chooses the lane-branch candidate deterministically for a shared head SHA", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "c".repeat(40);
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[
+			{
+				number: 571,
+				state: "open",
+				updated_at: "2026-10-19T04:02:00Z",
+				head: { ref: "feature/other", sha: headSha },
+			},
+			{
+				number: 572,
+				state: "open",
+				updated_at: "2026-10-19T04:01:00Z",
+				head: { ref: "work/lane", sha: headSha },
+			},
+			{
+				number: 569,
+				state: "closed",
+				merged_at: null,
+				head: { ref: "work/lane", sha: headSha },
+			},
+		],
+		{
+			number: 572,
+			headRefOid: headSha,
+			state: "OPEN",
+			mergedAt: null,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+	);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, undefined, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 572, headSha, status: "pending", prState: "open", merged: false });
+});
+
+test("#595 GH check lookup breaks an exact-head PR tie by newest update then number", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const headSha = "d".repeat(40);
-	const response = [
-		{
-			number: 572,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
-		{
-			number: 573,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
-	];
 	const ghPath = join(directory, "gh");
-	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
-	await chmod(ghPath, 0o755);
+	await writeGhCheckStub(
+		ghPath,
+		[
+			{ number: 580, state: "open", updated_at: "2026-10-19T04:00:00Z", head: { ref: "feature/older", sha: headSha } },
+			{ number: 581, state: "open", updated_at: "2026-10-19T04:02:00Z", head: { ref: "feature/newer", sha: headSha } },
+			{ number: 579, state: "open", updated_at: "2026-10-19T04:02:00Z", head: { ref: "feature/tied", sha: headSha } },
+		],
+		{
+			number: 579,
+			headRefOid: headSha,
+			state: "OPEN",
+			mergedAt: null,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+	);
 
-	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
-	expect(snapshot).toBeUndefined();
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, undefined, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 579, headSha, status: "pending", prState: "open", merged: false });
 });
 
 test("#595 GH check lookup preserves the persisted PR over another open duplicate", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const headSha = "e".repeat(40);
-	const response = [
-		{
-			number: 574,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[
+			{ number: 574, state: "open", head: { ref: "work/lane", sha: headSha } },
+			{
+				number: 575,
+				state: "closed",
+				merged_at: "2026-10-14T12:00:00Z",
+				head: { ref: "feature/closed", sha: headSha },
+			},
+		],
 		{
 			number: 575,
+			headRefOid: headSha,
 			state: "CLOSED",
 			mergedAt: "2026-10-14T12:00:00Z",
-			headRefOid: headSha,
 			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
 		},
-	];
-	const ghPath = join(directory, "gh");
-	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
-	await chmod(ghPath, 0o755);
+	);
 
 	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, 575);
 	expect(snapshot).toMatchObject({
@@ -3399,15 +3457,14 @@ test("#595 GH check lookup treats a full result page as ambiguous, with or witho
 	const prResults = (count: number, includeExactHead = false) =>
 		Array.from({ length: count }, (_, index) => ({
 			number: index + 1,
-			state: "CLOSED",
-			mergedAt: null,
-			headRefOid: includeExactHead && index === 0 ? headSha : (index + 1).toString(16).padStart(40, "0"),
-			statusCheckRollup: [],
+			state: "closed",
+			head: {
+				ref: `old/${index + 1}`,
+				sha: includeExactHead && index === 0 ? headSha : (index + 1).toString(16).padStart(40, "0"),
+			},
 		}));
 	const lookup = async (count: number, includeExactHead = false) => {
-		const response = JSON.stringify(prResults(count, includeExactHead));
-		await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(response)}\n`);
-		await chmod(ghPath, 0o755);
+		await writeGhCheckStub(ghPath, prResults(count, includeExactHead), { number: 1, headRefOid: headSha });
 		return client.getCheckStatus(headSha, directory);
 	};
 
@@ -3560,18 +3617,25 @@ test("#595 an exact PR head settles checks when its ref is not the worktree's lo
 	expect(f.job().awaitingChecks).toBeUndefined();
 });
 
-test("#595 an unresolved PR lookup settles the checks cycle instead of waiting for its timeout", async () => {
+test("#628 a successful no-PR lookup waits for the existing timeout, then permits resume", async () => {
+	let now = Date.parse("2026-10-19T00:00:00.000Z");
 	const checks = scriptedChecks(undefined);
-	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const f = await fixture({ now: () => now, checkStatusClient: checks.client, ownerTarget: () => origin });
 	const { head } = await awaitingLane(f, "fix/review-without-pr");
 	expect(f.job().awaitingChecks).toMatchObject({ prNumber: null, headSha: head });
 	checks.set(null);
+	await pollTimes(f, 2);
+	expect(f.job().state).toBe("awaiting_checks");
+	now += 3_600_000 - 1;
+	await pollTimes(f, 2);
+	expect(f.job().state).toBe("awaiting_checks");
+	now++;
 	await pollUntil(f, () => f.job().state !== "awaiting_checks");
 	expect(f.job().state).toBe("attempt_ended");
 	expect(f.job().awaitingChecks).toBeUndefined();
-	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: pr_not_found");
-	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks")).toContain("pr_not_found");
-	const resumed = await f.manager.start({ name: "a", text: "continue without a PR", cwd: f.directory });
+	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: timeout after 60m");
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks timeout")).toContain("pr=unknown");
+	const resumed = await f.manager.start({ name: "a", text: "continue after no-PR timeout", cwd: f.directory });
 	expect(resumed).toMatchObject({ started: true });
 });
 
@@ -3805,6 +3869,14 @@ test("#481 awaiting_checks: the third red result settles the lane failed with th
 	const report = checksNotice(f, "[lane a] failed");
 	expect(report).toContain("checks=red(unit-test,lint-check)");
 	expect(report).toContain("pr=491");
+	const resumed = await f.manager.start({
+		name: "a",
+		text: "resume after exhausted red checks",
+		cwd: f.job().lane.worktreePath,
+		resume: true,
+	});
+	expect(resumed).toMatchObject({ started: true });
+	expect(f.job().state).toBe("running");
 });
 
 test("#481 awaiting_checks: past one hour on the injected clock the lane settles with a timeout", async () => {
@@ -3828,7 +3900,7 @@ test("#481 awaiting_checks: a closed PR settles the lane with pr_closed", async 
 	const checks = scriptedChecks({ prNumber: 493, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	await awaitingLane(f, "fix/pr-closed");
-	checks.set(null);
+	checks.set({ prNumber: 493, status: "pending", failingChecks: [], prState: "closed", merged: false });
 	await pollUntil(f, () => f.job().state !== "awaiting_checks");
 	const job = f.job();
 	expect(job.state).toBe("attempt_ended");

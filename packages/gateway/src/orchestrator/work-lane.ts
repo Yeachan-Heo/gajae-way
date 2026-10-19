@@ -160,11 +160,18 @@ export interface CheckStatusSnapshot {
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied. Returns null only when an
-	 * unqualified lookup proves no match exists; returns undefined when lookup failed, timed out, or results are incomplete or ambiguous.
+	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied and
+	 * `branchName` when several exact-head PRs are available. Returns null only
+	 * when an unqualified lookup proves no match exists; returns undefined when
+	 * lookup failed, timed out, or results are incomplete.
 	 * Must not throw.
 	 */
-	getCheckStatus(headSha: string, cwd: string, prNumber?: number): Promise<CheckStatusSnapshot | null | undefined>;
+	getCheckStatus(
+		headSha: string,
+		cwd: string,
+		prNumber?: number,
+		branchName?: string,
+	): Promise<CheckStatusSnapshot | null | undefined>;
 }
 
 export interface WorkLaneManagerOptions {
@@ -2959,7 +2966,7 @@ function checksOutcome(
 		(facts?.pushed === true && facts.remoteHeadSha === cycle.headSha) ||
 		(checks?.headSha === cycle.headSha && (cycle.prNumber === null || checks.prNumber === cycle.prNumber));
 	if (cycle.prNumber === null) {
-		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
+		if (checks === null) return checksTimeoutOrWait(cycle, now);
 		if (checks?.prState === "closed") {
 			if (checks.merged)
 				return {
@@ -2968,12 +2975,7 @@ function checksOutcome(
 				};
 			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
 		}
-		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-		if (!headIsPublished) {
-			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
-				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
-			return { kind: "wait" };
-		}
+		if (!headIsPublished) return checksTimeoutOrWait(cycle, now);
 		if (checks?.status === "green") return { kind: "passed" };
 		if (checks?.status === "red")
 			return {
@@ -2981,13 +2983,12 @@ function checksOutcome(
 				failingChecks: checks.failingChecks,
 				...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
 			};
-		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
-			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
-		return { kind: "wait" };
+		return checksTimeoutOrWait(cycle, now);
 	}
-	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
-	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
-		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	// A missing PR result is not proof the checks cycle ended; retain the deadline.
+	if (checks === null || checks === undefined) return checksTimeoutOrWait(cycle, now);
+	// A different number means the recorded PR is no longer the active exact-head match.
+	if (checks.prNumber !== cycle.prNumber) return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	if (checks?.prState === "closed") {
 		if (checks.merged)
 			return {
@@ -2997,11 +2998,7 @@ function checksOutcome(
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	}
 	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-	if (!headIsPublished) {
-		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
-			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
-		return { kind: "wait" };
-	}
+	if (!headIsPublished) return checksTimeoutOrWait(cycle, now);
 	if (checks?.status === "green") return { kind: "passed" };
 	if (checks?.status === "red")
 		return {
@@ -3010,6 +3007,10 @@ function checksOutcome(
 			...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
 		};
 	// Pending, or unavailable (lookup failed): keep waiting until the deadline.
+	return checksTimeoutOrWait(cycle, now);
+}
+
+function checksTimeoutOrWait(cycle: AwaitingChecks, now: number): ChecksOutcome {
 	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 	return { kind: "wait" };
@@ -3073,7 +3074,7 @@ async function collectRepoFacts(
 			pushed?: boolean | null;
 			/** Known branch head shared by every configured push URL. */
 			remoteHeadSha?: string;
-			/** null: no open PR for the branch; absent: not pushed, no client, or the lookup failed. */
+			/** null: no PR has this exact head; absent: not pushed, no client, or the lookup failed. */
 			checkStatus?: CheckStatusSnapshot | null;
 	  }
 	| undefined
@@ -3132,6 +3133,7 @@ async function collectRepoFacts(
 					checkHeadSha ?? result.remoteHeadSha ?? headSha,
 					worktreePath,
 					checkPrNumber,
+					branchName,
 				);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
