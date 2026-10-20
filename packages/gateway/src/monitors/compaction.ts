@@ -406,69 +406,313 @@ const NON_SUBSTANTIVE_ECHO_WORDS = new Set([
 	"and",
 	"as",
 	"at",
+	"before",
+	"but",
 	"by",
+	"can",
 	"do",
+	"does",
 	"for",
 	"from",
 	"here",
 	"in",
 	"is",
 	"it",
+	"no",
+	"not",
 	"of",
 	"on",
 	"or",
+	"only",
 	"please",
 	"should",
 	"task",
 	"the",
+	"that",
 	"this",
 	"to",
+	"was",
+	"were",
 	"what",
 	"we",
 	"will",
 	"with",
 	"your",
 	"run",
+	"event",
 ]);
 
-/** Detect likely contract restatements without treating copied prompt numbers as evidence of work. */
-export function isAuthoredEchoSuspected(contractText: string | undefined, note: string): boolean {
-	if (!contractText || !note) return false;
+const META_ECHO_WORDS = new Set([
+	"check",
+	"checked",
+	"confirm",
+	"confirms",
+	"confirmed",
+	"describe",
+	"describes",
+	"described",
+	"find",
+	"finds",
+	"found",
+	"happened",
+	"inspect",
+	"inspected",
+	"look",
+	"mention",
+	"mentioned",
+	"note",
+	"noted",
+	"review",
+	"reviewed",
+	"run",
+	"ran",
+	"say",
+	"says",
+	"schedule",
+	"scheduled",
+	"state",
+	"states",
+	"summarize",
+	"summarized",
+	"target",
+	"verify",
+	"verified",
+]);
 
-	const tokenize = (text: string): string[] => text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-	const contractTokens = tokenize(contractText);
-	const noteTokens = tokenize(note);
-	if (contractTokens.length === 0 || noteTokens.length === 0) return false;
+const NO_WORK_DISCLAIMER_PATTERNS = [
+	/\b(?:do|does|did|has|have|had|is|are|was|were)\s+not\s+(?:confirm|verify|check|run|execute|inspect|review|report|show)\b/i,
+	/\bnot\s+(?:confirmed|verified|checked|run|executed|inspected|reviewed|completed|done)\b/i,
+	/\b(?:only|merely)\s+(?:describe|describes|summarize|summarizes|summarise|summarises|repeat|repeats|restate|restates|state|states|report|reports|note|notes)\b/i,
+	/\b(?:nothing|no\s+work|no\s+review|no\s+checks?|no\s+commands?|no\s+results?)\s+(?:(?:has|have|was|were)\s+)?(?:been\s+)?(?:done|checked|run|executed|performed)\b/i,
+];
 
-	// Token overlap alone can discard a finding appended to a copied instruction.
-	// Require broad contract coverage and no novel content words before suppressing.
-	const contractContent = contractTokens.filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token));
-	const noteContent = noteTokens.filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token));
-	if (contractContent.length === 0 || noteContent.length === 0) return false;
-	const remainingContractTokens = new Map<string, number>();
-	for (const token of contractContent)
-		remainingContractTokens.set(token, (remainingContractTokens.get(token) ?? 0) + 1);
-	for (const token of noteContent) {
-		const remaining = remainingContractTokens.get(token) ?? 0;
-		if (remaining === 0) return false;
-		remainingContractTokens.set(token, remaining - 1);
+const NON_COMMAND_START_WORDS = new Set([
+	...NON_SUBSTANTIVE_ECHO_WORDS,
+	...META_ECHO_WORDS,
+	"activity",
+	"daily",
+	"deploy",
+	"deployment",
+	"deployments",
+	"failure",
+	"failures",
+	"final",
+	"friction",
+	"initial",
+	"latency",
+	"operation",
+	"previous",
+	"recent",
+	"report",
+	"runtime",
+	"scheduled",
+	"system",
+]);
+
+const MAX_NOVEL_META_WORDS = 5;
+const MAX_NOVEL_CONTENT_RATIO = 0.2;
+const MIN_CONTRACT_COVERAGE = 0.7;
+
+export interface AuthoredEchoEventContext {
+	readonly eventType?: string;
+	readonly eventId?: string;
+	readonly payload?: unknown;
+	readonly firedAt?: string;
+}
+
+function serializeEchoPayload(payload: unknown): string {
+	if (typeof payload === "string") return payload;
+	try {
+		return JSON.stringify(payload) ?? "";
+	} catch {
+		return String(payload);
 	}
-	const contractSet = new Set(contractContent);
-	const noteSet = new Set(noteContent);
-	const sharedTokens = [...noteSet].filter((token) => contractSet.has(token)).length;
-	if (sharedTokens / contractSet.size < 0.7) return false;
+}
 
-	const evidenceMarkers = (text: string): string[] =>
-		(text.match(/(?:https?:\/\/|www\.)[^\s<>()]+|#\d+|\b[A-Z]+-\d+\b|\b\d+\b|```|`[^`]+`/gi) ?? []).map((marker) =>
-			marker.toLowerCase().replace(/[),.;!?]+$/g, ""),
-		);
-	const remainingContractEvidence = new Map<string, number>();
-	for (const marker of evidenceMarkers(contractText))
-		remainingContractEvidence.set(marker, (remainingContractEvidence.get(marker) ?? 0) + 1);
-	for (const marker of evidenceMarkers(note)) {
-		const remaining = remainingContractEvidence.get(marker) ?? 0;
-		if (remaining === 0) return false;
-		remainingContractEvidence.set(marker, remaining - 1);
+const PAYLOAD_COUNT_LABELS = new Map([
+	["test", "tests"],
+	["tests", "tests"],
+	["issue", "issues"],
+	["issues", "issues"],
+	["pr", "prs"],
+	["prs", "prs"],
+	["pull request", "pull requests"],
+	["pull requests", "pull requests"],
+	["file", "files"],
+	["files", "files"],
+	["error", "errors"],
+	["errors", "errors"],
+	["failure", "failures"],
+	["failures", "failures"],
+	["warning", "warnings"],
+	["warnings", "warnings"],
+	["blocker", "blockers"],
+	["blockers", "blockers"],
+	["commit", "commits"],
+	["commits", "commits"],
+	["change", "changes"],
+	["changes", "changes"],
+	["update", "updates"],
+	["updates", "updates"],
+	["result", "results"],
+	["results", "results"],
+	["passed", "passed"],
+	["passing", "passing"],
+	["failed", "failed"],
+	["found", "found"],
+	["millisecond", "ms"],
+	["milliseconds", "ms"],
+	["ms", "ms"],
+	["second", "seconds"],
+	["seconds", "seconds"],
+	["minute", "minutes"],
+	["minutes", "minutes"],
+]);
+
+function structuredPayloadCountMarkers(payload: unknown, seen = new WeakSet<object>()): string[] {
+	if (payload === null || typeof payload !== "object") return [];
+	if (seen.has(payload)) return [];
+	seen.add(payload);
+	if (Array.isArray(payload)) return payload.flatMap((value) => structuredPayloadCountMarkers(value, seen));
+
+	const markers: string[] = [];
+	for (const [key, value] of Object.entries(payload)) {
+		if (typeof value === "number" && Number.isFinite(value)) {
+			const label = key
+				.replace(/([a-z])([A-Z])/g, "$1 $2")
+				.replace(/[_-]+/g, " ")
+				.replace(/\s*(?:count|total)$/i, "")
+				.trim()
+				.toLowerCase();
+			const normalizedLabel = PAYLOAD_COUNT_LABELS.get(label);
+			if (normalizedLabel) markers.push(`${value} ${normalizedLabel}`);
+		}
+		markers.push(...structuredPayloadCountMarkers(value, seen));
 	}
-	return true;
+	return markers;
+}
+
+/** Detect generic command invocations without accepting descriptive task prose as commands. */
+function authoredCommandMarkers(text: string): string[] {
+	const marker: string[] = [];
+	for (const [, executable, argumentsText] of text.matchAll(
+		/\b(?:ran|run|executed|execute|invoked|invoke|called)\s+([A-Za-z0-9_./+-]+)(?:\s+((?:"[^"\n]*"|'[^'\n]*'|[A-Za-z0-9_./=+-]+)(?:\s+(?:"[^"\n]*"|'[^'\n]*'|[A-Za-z0-9_./=+-]+))*))?(?=\s*[:.;,!?\n]|$)/gi,
+	)) {
+		if (executable && !NON_COMMAND_START_WORDS.has(executable.toLowerCase()))
+			marker.push(argumentsText ? `${executable} ${argumentsText}` : executable);
+	}
+	return marker;
+}
+
+function authoredEvidenceMarkers(text: string): string[] {
+	const quantifiedResults =
+		text.match(
+			/\b\d+(?:,\d{3})*(?:\.\d+)?%?\s*(?:tests?|issues?|prs?|pull\s+requests?|files?|errors?|failures?|warnings?|blockers?|commits?|changes?|updates?|results?|passed|passing|failed|found|ms|seconds?|minutes?)\b/gi,
+		) ?? [];
+	const quantifiedValues = new Set(
+		quantifiedResults
+			.map((marker) => marker.match(/^\d+(?:,\d{3})*(?:\.\d+)?/)?.[0])
+			.filter((value): value is string => value !== undefined),
+	);
+	const standaloneResultMarkers = (
+		text.match(/\b(?:passed|passing|failed|found|changed|updated|blocked|resolved|reopened)\s+\d+\b/gi) ?? []
+	).filter((marker) => {
+		const value = marker.match(/\d+/)?.[0];
+		return value === undefined || !quantifiedValues.has(value);
+	});
+	const scalarResultMarkers = [
+		...text.matchAll(/\b(?:is|are|was|were|reached|equals?)\s+(\d+(?:,\d{3})*(?:\.\d+)?%?)\b/gi),
+		...text.matchAll(/["'][\w.-]+["']\s*:\s*(\d+(?:,\d{3})*(?:\.\d+)?%?)\b/g),
+		...text.matchAll(/\b[A-Za-z][\w .-]*\s*[:=]\s*(\d+(?:,\d{3})*(?:\.\d+)?%?)\b/g),
+	].flatMap(([, value]) => (value ? [value] : []));
+	const markers = [
+		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
+		...(text.match(/#\d+/g) ?? []),
+		...(text.match(/\b[0-9a-f]{7,40}\b/gi) ?? []),
+		...(text.match(/\b(?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),
+		...(text.match(/\b[A-Z][A-Z0-9]*-\d+\b/gi) ?? []),
+		...quantifiedResults,
+		...standaloneResultMarkers,
+		...scalarResultMarkers,
+		...authoredCommandMarkers(text),
+		...(text.match(/`[^`\n]+`/g) ?? []),
+	];
+	return markers.map((marker) => marker.toLowerCase().replace(/[),.;!?}\]"'`]+$/g, ""));
+}
+
+function hasNovelAuthoredEvidence(note: string, contractEvidence: Set<string>): boolean {
+	const clauses = note.split(/[.!?;]\s+|\s+\b(?:but|however|although|yet)\b\s+/i);
+	return clauses.some((clause) => {
+		if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(clause))) return false;
+		return authoredEvidenceMarkers(clause).some((marker) => !contractEvidence.has(marker));
+	});
+}
+
+function authoredEchoTokens(text: string): string[] {
+	const normalizedTimestamps = text.replace(
+		/\b(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?Z?\b/gi,
+		"$1 $2 $3 $4 $5",
+	);
+	return normalizedTimestamps.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/** Detect contract-only notes while allowing paraphrase words and real, novel work evidence. */
+export function isAuthoredEchoSuspected(
+	contractText: string | undefined,
+	note: string,
+	eventContext?: AuthoredEchoEventContext,
+): boolean {
+	if (!note) return false;
+	// Score instruction and event type independently so either can expose a short echo.
+	const contractSources = [contractText, eventContext?.eventType].filter((part): part is string => Boolean(part));
+	if (contractSources.length === 0) return false;
+	const payloadText = eventContext?.payload === undefined ? undefined : serializeEchoPayload(eventContext.payload);
+	const payloadCountMarkers =
+		eventContext?.payload === undefined ? [] : structuredPayloadCountMarkers(eventContext.payload);
+	const fullContract = contractSources.join("\n");
+	// Event identity, timing and payload can explain copied markers, but must not inflate task coverage.
+	const evidenceContract = [
+		fullContract,
+		eventContext?.eventId,
+		eventContext?.firedAt,
+		payloadText,
+		...payloadCountMarkers,
+	]
+		.filter((part): part is string => Boolean(part))
+		.join("\n");
+	const contractContentSources = contractSources.map(
+		(source) => new Set(authoredEchoTokens(source).filter((token) => !NON_SUBSTANTIVE_ECHO_WORDS.has(token))),
+	);
+	const contractContent = new Set(contractContentSources.flatMap((source) => [...source]));
+	// Event metadata is contract context, but it must not dilute task coverage or create novelty.
+	const eventMetadataText = [eventContext?.eventId, eventContext?.firedAt, payloadText, ...payloadCountMarkers]
+		.filter(Boolean)
+		.join("\n");
+	const eventMetadataContent = new Set(authoredEchoTokens(eventMetadataText));
+	const noteContent = new Set(
+		authoredEchoTokens(note).filter(
+			(token) =>
+				!NON_SUBSTANTIVE_ECHO_WORDS.has(token) && (!eventMetadataContent.has(token) || contractContent.has(token)),
+		),
+	);
+	if (contractContent.size === 0 || noteContent.size === 0) return false;
+
+	const contractEvidence = new Set([
+		...authoredEvidenceMarkers(evidenceContract),
+		...(evidenceContract.match(/\b\d+(?:,\d{3})*(?:\.\d+)?%?\b/g) ?? []),
+	]);
+	if (hasNovelAuthoredEvidence(note, contractEvidence)) return false;
+	if (NO_WORK_DISCLAIMER_PATTERNS.some((pattern) => pattern.test(note))) return true;
+
+	const novelTokens = [...noteContent].filter((token) => !contractContent.has(token));
+	const novelMetaWords = novelTokens.filter((token) => META_ECHO_WORDS.has(token)).length;
+	const novelContentRatio = (novelTokens.length - novelMetaWords) / noteContent.size;
+	const hasCoveredContractSource = contractContentSources.some((source) => {
+		if (source.size === 0) return false;
+		const sharedTokens = [...noteContent].filter((token) => source.has(token)).length;
+		return sharedTokens / source.size >= MIN_CONTRACT_COVERAGE;
+	});
+	return (
+		hasCoveredContractSource && novelMetaWords <= MAX_NOVEL_META_WORDS && novelContentRatio <= MAX_NOVEL_CONTENT_RATIO
+	);
 }
