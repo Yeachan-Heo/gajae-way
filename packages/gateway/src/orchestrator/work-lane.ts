@@ -1314,6 +1314,7 @@ export class WorkLaneManager {
 			const invalidateActivity = () => {
 				observer.activityVersion = (observer.activityVersion ?? 0) + 1;
 				observer.receiptDeadSince = undefined;
+				observer.goneSince = undefined;
 			};
 			const tail = await this.#port.attachTail({
 				sessionId: runtime.sessionId,
@@ -1502,13 +1503,21 @@ export class WorkLaneManager {
 		// A saved SDK terminal is still incomplete without execution-end proof.
 		// Recovery must refresh it through the same fenced path as a fresh status.
 		if (!runtime.terminal || unresolvedReceipt) {
+			const activityVersion = observer.activityVersion;
 			let status: PromptStatusBody | undefined;
 			try {
 				status = await this.#query(runtime, observer.tail);
 				observer.goneSince = undefined;
 			} catch (error) {
 				observer.receiptDeadSince = undefined;
-				if (!(await this.#hostGone(runtime, error))) {
+				const hostGone = await this.#hostGone(runtime, error);
+				// Both status and inspect must belong to one uninterrupted activity
+				// epoch. A start during either await cannot seed post-start grace.
+				if (!this.#writeCurrent(observer) || observer.activityVersion !== activityVersion) {
+					observer.goneSince = undefined;
+					return;
+				}
+				if (!hostGone) {
 					observer.goneSince = undefined;
 					throw error;
 				}

@@ -3846,6 +3846,150 @@ test("#308 host loss must persist across the grace window before settling", asyn
 	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
 });
 
+test("#308 a native start between probes resets accumulated host-loss grace", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
+	const attach = f.port.attachTail.bind(f.port);
+	let nativeStart: (() => void) | undefined;
+	f.port.attachTail = async (input) => {
+		nativeStart = () => {
+			void input.onObserverLifecycle?.("agent_start", false);
+		};
+		return attach(input);
+	};
+	const result = await started(f, "a", origin);
+	let inspections = 0;
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.liveness = async () => {
+		inspections++;
+		return { live: false, disowned: false };
+	};
+	await until(() => inspections >= 2 && nativeStart !== undefined);
+	now += 99;
+	let prior = inspections;
+	await until(() => inspections > prior);
+	// Invoke receipt-time ingress synchronously between completed probe ticks.
+	nativeStart!();
+	now += 1;
+	prior = inspections;
+	await until(() => inspections > prior || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	now += 99;
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	now += 1;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	expect(f.notices).toHaveLength(1);
+});
+
+for (const stage of ["status", "inspect"] as const) {
+	for (const lifecycle of ["raw", "positioned"] as const) {
+		test(`native ${lifecycle} start during ${stage} restarts saved-receipt host-loss proof`, async () => {
+			let now = Date.now();
+			const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
+			const result = await started(f, "a", origin);
+			await f.manager.stop();
+			const runtime = f.db.work.workAttemptGet(result.opRef)!;
+			const terminal = {
+				kind: "broker" as const,
+				observedAt: new Date(now).toISOString(),
+				reasonCode: "terminal_missing_receipt",
+				status: {
+					status: "failed" as const,
+					clientRef: result.opRef,
+					commandId: `command-${result.opRef}`,
+					turnId: `turn-${result.opRef}`,
+					startedAt: now,
+					terminalAt: now + 1,
+					receiptState: "missing" as const,
+					error: { code: "prompt_deadline_exceeded" },
+				},
+			};
+			f.db.transaction((tx) => f.db.work.workAttemptUpdate(tx, result.opRef, runtime.version, { terminal }));
+			const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+			const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+			f.port.attachTail = (input) => runner.attach(input);
+			Object.assign(f.port, { turnRunning: async () => true });
+			let unavailable = false;
+			let block = false;
+			let entered = false;
+			let holdNextStatus = false;
+			let freshEntered = false;
+			let inspections = 0;
+			const release = deferred<void>();
+			const releaseFresh = deferred<void>();
+			f.port.status = async (input) => {
+				if (!unavailable) return { operationRef: input.opRef, status: terminal.status, summaryCompleted: true };
+				if (holdNextStatus) {
+					freshEntered = true;
+					await releaseFresh.promise;
+				} else if (block && stage === "status") {
+					entered = true;
+					await release.promise;
+				}
+				throw sessionUnavailable();
+			};
+			f.port.liveness = async () => {
+				inspections++;
+				if (block && stage === "inspect") {
+					entered = true;
+					await release.promise;
+				}
+				return { live: false, disowned: false };
+			};
+			f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+			try {
+				await f.restart();
+				await until(() => relay.streams.length > 0);
+				unavailable = true;
+				await until(() => inspections >= 2);
+				block = true;
+				now += 100;
+				await until(() => entered);
+				relay.streams[0]!.host(
+					lifecycle === "raw" ? { type: "agent_start" } : { type: "event", kind: "agent_start", payload: {} },
+				);
+				holdNextStatus = true;
+				release.resolve();
+				await until(() => freshEntered || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+					terminal,
+					settledAt: null,
+					output: { reads: 0 },
+				});
+				expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+				expect(f.notices).toEqual([]);
+				// A pre-start probe must not seed a new grace after the await.
+				// Delay the first fresh status; its completion starts the new window.
+				now += 1000;
+				block = false;
+				holdNextStatus = false;
+				let prior = inspections;
+				releaseFresh.resolve();
+				await until(() => inspections > prior + 1 || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+				now += 99;
+				prior = inspections;
+				await until(() => inspections > prior);
+				expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+				now += 1;
+				await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toEqual(terminal);
+				expect(f.notices).toHaveLength(1);
+				expect(f.port.sends).toHaveLength(1);
+				expect(f.port.resumes).toHaveLength(0);
+			} finally {
+				release.resolve();
+				releaseFresh.resolve();
+			}
+		});
+	}
+}
+
 test("#308 restart recovery classifies a router-disowned open attempt as host_lost", async () => {
 	const f = await fixture();
 	const result = await started(f);
