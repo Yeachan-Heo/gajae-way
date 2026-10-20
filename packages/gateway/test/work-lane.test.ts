@@ -4663,6 +4663,236 @@ test("#595 force-retiring a lane awaiting checks clears the hold and allows resu
 	expect(resumed).toMatchObject({ started: true });
 });
 
+for (const retirement of ["automatic", "force"] as const) {
+	test(`audit: ${retirement} dead-lane retirement reports the ended checks cycle to its parent`, async () => {
+		const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+		const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+		const { head, sessionId } = await awaitingLane(f, `fix/${retirement}-retire-checks-report`);
+		await until(() => f.notices.length === 1);
+		const opRef = f.job().attempts.at(-1)!.opRef;
+		const savedRuntime = f.db.work.workAttemptGet(opRef)!;
+		expect(savedRuntime).toMatchObject({ terminal: { reasonCode: "end_turn" } });
+		expect(savedRuntime.settledAt).not.toBeNull();
+		const originalRow = f.db.outbox.rows()[0]!;
+		expect(originalRow.delivery_id).toBe(savedRuntime.deliveryId);
+		expect(f.notices[0]?.text).toContain("checks=pending");
+		const close = f.port.close.bind(f.port);
+		let admittedBeforeClose = false;
+		f.port.close = async (input) => {
+			expect(f.job().state).toBe("attempt_ended");
+			expect(f.job().awaitingChecks).toBeUndefined();
+			expect(f.db.outbox.rows()).toHaveLength(2);
+			admittedBeforeClose = true;
+			return close(input);
+		};
+		f.port.setSessionState(sessionId, { live: false });
+		if (retirement === "automatic") expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+		else expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true, forced: true });
+		expect(admittedBeforeClose).toBe(true);
+		expect(f.db.work.workAttemptGet(opRef)).toEqual(savedRuntime);
+		const rows = f.db.outbox.rows();
+		expect(rows).toHaveLength(2);
+		expect(rows.find((row) => row.delivery_id === originalRow.delivery_id)).toEqual(originalRow);
+		expect(new Set(rows.map((row) => row.delivery_id)).size).toBe(2);
+		await until(() => f.notices.length === 2);
+		expect(f.notices[1]?.deliveryId).not.toBe(savedRuntime.deliveryId);
+		expect(f.notices[1]?.text).toContain("awaiting_checks lane force-retired before checks settled");
+		expect(f.notices[1]?.text).toContain(`head=${head.slice(0, 12)} pr=598`);
+		expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: false });
+		await f.manager.recover();
+		await f.restart();
+		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+		expect(f.db.outbox.rows()).toEqual(rows);
+		expect(f.notices).toHaveLength(2);
+		expect(f.db.work.workAttemptGet(opRef)).toEqual(savedRuntime);
+	});
+}
+
+test("ended checks retirement admits a distinct report to the bound persona inbox", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const nudges: string[] = [];
+	const f = await fixture({
+		checkStatusClient: checks.client,
+		ownerTarget: () => origin,
+		notifyPersona: (key) => nudges.push(key),
+	});
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
+	const { sessionId } = await awaitingLane(f, "fix/retire-checks-persona");
+	await until(() => nudges.length === 1);
+	const runtime = f.db.work.workAttemptGet(f.job().attempts.at(-1)!.opRef)!;
+	expect(f.db.inbox.pendingOldest(originKey(origin))?.message_id).toBe(runtime.reportId);
+	f.port.setSessionState(sessionId, { live: false });
+	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+	expect(f.db.inbox.pendingCount(originKey(origin))).toBe(2);
+	expect(f.db.inbox.messageExists(runtime.reportId)).toBe(true);
+	await until(() => nudges.length === 2);
+	expect(nudges).toEqual([originKey(origin), originKey(origin)]);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	expect(f.notices).toHaveLength(0);
+	await f.restart();
+	expect(f.db.inbox.pendingCount(originKey(origin))).toBe(2);
+	expect(f.db.work.workAttemptGet(runtime.opRef)).toEqual(runtime);
+});
+
+test("ended checks retirement routes a distinct conclusion through the nested lane parent", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const f = await fixture({ allowNested: () => true, checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/retire-checks-nested", true);
+	const parent = await started(f, "parent", origin);
+	const child = await f.manager.start({
+		name: "child",
+		text: "child work",
+		cwd: f.directory,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child did not start");
+	f.port.complete(child.opRef, "child result");
+	await until(
+		() =>
+			f.job("child").state === "awaiting_checks" && f.db.work.laneReportsByParent("parent")[0]?.state === "consumed",
+	);
+	const runtime = f.db.work.workAttemptGet(child.opRef)!;
+	const first = f.db.work.laneReportsByParent("parent")[0]!;
+	await f.manager.recover();
+	// Recovery is already registered; isolate callback lock ordering from recovery's parent drain.
+	f.lanes.setRecoveryGate(async () => {});
+	f.port.setSessionState(child.sessionId, { live: false });
+	const releaseParent = deferred<void>();
+	let parentLocked = false;
+	const parentLock = f.port.runExclusive(workSessionKey("parent"), async () => {
+		parentLocked = true;
+		await releaseParent.promise;
+	});
+	let retirement: ReturnType<typeof f.lanes.forceRetire> | undefined;
+	try {
+		await until(() => parentLocked);
+		let retired = false;
+		retirement = f.lanes.forceRetire("child").then((result) => {
+			retired = result.retired;
+			return result;
+		});
+		// The synchronous settlement callback must not await the parent's held lock.
+		await until(() => retired);
+		expect(f.job("child").state).toBe("attempt_ended");
+		expect(f.db.work.laneReportsByParent("parent")).toHaveLength(2);
+	} finally {
+		releaseParent.resolve();
+		await parentLock;
+		await retirement;
+		f.lanes.setRecoveryGate(() => f.manager.recover());
+	}
+	await until(() => f.db.work.laneReportsByParent("parent").filter((row) => row.state === "consumed").length === 2);
+	const reports = f.db.work.laneReportsByParent("parent");
+	const conclusion = reports.find((row) => row.report_id !== first.report_id)!;
+	expect(conclusion.child_op_ref).not.toBe(child.opRef);
+	expect(conclusion.body).toContain("lane force-retired before checks settled");
+	expect(conclusion.body).toContain(`head=${head.slice(0, 12)} pr=598`);
+	expect(f.db.work.workAttemptGet(child.opRef)).toEqual(runtime);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	await f.restart();
+	expect(f.db.work.laneReportsByParent("parent")).toEqual(reports);
+});
+
+for (const mode of ["run", "no-target", "silent"] as const) {
+	for (const conclusion of ["forced", "normal"] as const) {
+		test(`ended checks ${conclusion} conclusion preserves ${mode} report suppression`, async () => {
+			const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+			const nudges: string[] = [];
+			const f = await fixture({ checkStatusClient: checks.client, notifyPersona: (key) => nudges.push(key) });
+			await laneRepo(f.directory, `fix/checks-${conclusion}-${mode}`, true);
+			if (mode !== "no-target") f.setOwnerTarget(origin);
+			let run: ReturnType<typeof f.manager.run> | undefined;
+			if (mode === "run") run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
+			else await f.manager.start({ name: "a", text: "work", cwd: f.directory });
+			await until(() => f.port.sends.length === 1);
+			const { opRef, sessionId } = f.port.sends[0]!;
+			f.port.complete(opRef, mode === "silent" ? "[SILENT]" : "done");
+			if (run) await run;
+			await until(() => f.job().state === "awaiting_checks");
+			const runtime = f.db.work.workAttemptGet(opRef)!;
+			if (mode === "silent") expect(runtime.output.knownSilence).not.toBeNull();
+			else expect(runtime.parent).toBeNull();
+			if (conclusion === "forced") {
+				f.port.setSessionState(sessionId, { live: false });
+				expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+			} else {
+				checks.set({ prNumber: 598, status: "green", failingChecks: [] });
+				await pollUntil(f, () => f.job().state === "done");
+			}
+			expect(f.job().awaitingChecks).toBeUndefined();
+			await f.restart();
+			expect(f.db.work.workAttemptGet(opRef)).toEqual(runtime);
+			expect(f.db.outbox.rows()).toHaveLength(0);
+			expect(f.db.inbox.pendingCount(originKey(origin))).toBe(0);
+			expect(f.notices).toHaveLength(0);
+			expect(nudges).toHaveLength(0);
+		});
+	}
+}
+
+test("ended checks retirement requires dead or disowned proof, not unknown liveness", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/retire-checks-unknown");
+	await until(() => f.notices.length === 1);
+	const job = f.job();
+	const binding = f.db.bindings.getSessionRecord(workSessionKey("a"));
+	const runtime = f.db.work.workAttemptGet(job.attempts.at(-1)!.opRef);
+	const rows = f.db.outbox.rows();
+	for (const live of [true, undefined]) {
+		f.port.liveness = async () => ({ live, disowned: false });
+		expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: false });
+		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+	}
+	expect(f.job()).toEqual(job);
+	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))).toEqual(binding);
+	expect(f.db.work.workAttemptGet(runtime!.opRef)).toEqual(runtime);
+	expect(f.db.outbox.rows()).toEqual(rows);
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.closes).toHaveLength(0);
+});
+
+test("ended checks force retirement fences an already in-flight green GitHub poll", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head, sessionId } = await awaitingLane(f, "fix/retire-checks-stale-poll");
+	await until(() => f.notices.length === 1);
+	let entered = false;
+	const release = deferred<void>();
+	checks.client.getCheckStatus = async () => {
+		entered = true;
+		await release.promise;
+		return { prNumber: 598, headSha: head, status: "green", failingChecks: [] };
+	};
+	const poll = f.manager.recover();
+	let retirement: ReturnType<typeof f.lanes.forceRetire> | undefined;
+	try {
+		await until(() => entered);
+		// The poll is explicitly registered above. Do not wait for its held network read again.
+		f.lanes.setRecoveryGate(async () => {});
+		f.port.setSessionState(sessionId, { live: false });
+		let retired = false;
+		retirement = f.lanes.forceRetire("a").then((result) => {
+			retired = result.retired;
+			return result;
+		});
+		await until(() => retired);
+		expect(await retirement).toMatchObject({ retired: true });
+		expect(f.db.outbox.rows()).toHaveLength(2);
+	} finally {
+		release.resolve();
+		await poll;
+		await retirement;
+		f.lanes.setRecoveryGate(() => f.manager.recover());
+	}
+	await until(() => f.notices.length === 2);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(checksNotice(f, "[lane a] checks passed")).toBeUndefined();
+	await f.restart();
+	expect(f.db.outbox.rows()).toHaveLength(2);
+	expect(f.notices).toHaveLength(2);
+});
+
 test("#481 awaiting_checks: the third red result settles the lane failed with the red checks in its report", async () => {
 	const red: CheckStatusAnswer = { prNumber: 491, status: "red", failingChecks: ["unit-test", "lint-check"] };
 	const checks = scriptedChecks({ prNumber: 491, status: "pending", failingChecks: [] });
