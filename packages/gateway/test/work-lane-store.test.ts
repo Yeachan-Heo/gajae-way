@@ -1676,7 +1676,7 @@ describe("work attempt durable transactions", () => {
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(37);
+		expect(migrated.schemaVersion).toBe(38);
 		expect(migrated.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -1745,7 +1745,7 @@ DELETE FROM schema_migrations WHERE version > 34;
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(37);
+		expect(migrated.schemaVersion).toBe(38);
 		expect(migrated.work.laneJobJson(f.record.jobId)).toBe(JSON.stringify(f.record));
 		expect(() =>
 			f.raw.query("UPDATE lane_jobs SET updated_at = ? WHERE job_id = ?").run(END, f.record.jobId),
@@ -1817,7 +1817,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(37);
+		expect(migrated.schemaVersion).toBe(38);
 		expect(migrated.work.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.transaction((tx) => prepareAttempt(migrated, tx, historical, f.record));

@@ -34,7 +34,9 @@ test("a real mention addresses the bot for human and bot authors", () => {
 		{ id: "human-1", bot: false },
 		{ id: "other-bot", bot: true },
 	]) {
-		expect(decideInbound(message({ author, content: "<@self-bot> your turn" }), SELF, CHANNELS)?.mentioned).toBe(true);
+		const engagement = decideInbound(message({ author, content: "<@self-bot> your turn" }), SELF, CHANNELS);
+		expect(engagement?.mentioned).toBe(true);
+		expect(engagement?.explicitMention).toBe(true);
 	}
 });
 
@@ -53,6 +55,7 @@ test("a native reply to our message is addressed, including for a bot author", (
 			CHANNELS,
 		);
 		expect(decision?.mentioned).toBe(true);
+		expect(decision?.explicitMention).toBe(false);
 		expect(decision?.replyTo).toMatchObject({ messageId: "outbound-1", fromSelf: true });
 	}
 });

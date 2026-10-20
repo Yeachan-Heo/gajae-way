@@ -14,6 +14,7 @@ import {
 	type HelloPayload,
 	isChatPlatform,
 	isPlatformMessageId,
+	isShutupToken,
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventOperatorResult,
@@ -56,6 +57,8 @@ import {
 	resolveBotAudienceLimits,
 	resolveChannelPolicy,
 	threadFollowUpEngaged,
+	threadMuteAddressed,
+	threadMuteKey,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import { FunctionalReadiness } from "../functional-readiness";
@@ -2655,7 +2658,18 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
+	// A muted thread (#625) admits only a message that addresses the persona, which also unmutes it.
+	const muteKey = threadMuteKey(origin, key, params.engagement as never);
+	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
+	const muteAddressed = mutedThread && threadMuteAddressed(params.engagement as never, origin, runtime.config);
+	const threadFollowUpForEngagement = threadFollowUp && (!mutedThread || muteAddressed);
+	const engagementDecision = decideEngagement(
+		origin,
+		params.engagement as never,
+		runtime.config,
+		threadFollowUpForEngagement,
+		mutedThread,
+	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as
@@ -2675,7 +2689,7 @@ async function sendChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUpForEngagement);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.warn(
@@ -2704,6 +2718,8 @@ async function sendChat(
 		);
 	}
 	if (!engaged) {
+		if (mutedThread && !muteAddressed)
+			console.info(`gateway engagement-muted skip origin=${key} message=${inboundMessageId ?? "unidentified"}`);
 		connection.write({
 			v: PROFILE_VERSION,
 			type: "response",
@@ -2796,6 +2812,9 @@ async function sendChat(
 					? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
 					: undefined,
 			});
+			// The unmute commits with the addressed message it answers, so a crash can
+			// never leave an accepted unmute action behind a still-muted thread.
+			if (accepted && muteKey !== undefined && muteAddressed) options.database.inbox.unmuteThread(tx, muteKey);
 			if (!accepted || !nonLoopback || authorIsBot)
 				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
 
@@ -2963,7 +2982,18 @@ async function editChat(
 		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
 	);
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
+	// A muted thread (#625) admits only a message that addresses the persona, which also unmutes it.
+	const muteKey = threadMuteKey(origin, key, params.engagement as never);
+	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
+	const muteAddressed = mutedThread && threadMuteAddressed(params.engagement as never, origin, runtime.config);
+	const threadFollowUpForEngagement = threadFollowUp && (!mutedThread || muteAddressed);
+	const engagementDecision = decideEngagement(
+		origin,
+		params.engagement as never,
+		runtime.config,
+		threadFollowUpForEngagement,
+		mutedThread,
+	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engagement = params.engagement as { mentioned?: boolean } | undefined;
@@ -2972,7 +3002,7 @@ async function editChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUpForEngagement);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.warn(
@@ -2980,6 +3010,8 @@ async function editChat(
 			);
 	}
 	if (!engagementDecision.engaged || botAudienceGuardSpent) {
+		if (mutedThread && !muteAddressed)
+			console.info(`gateway engagement-muted skip origin=${key} message=${params.messageId}`);
 		declined();
 		return;
 	}
@@ -2987,16 +3019,18 @@ async function editChat(
 	const turnId = crypto.randomUUID();
 	const { messageId: editedId, text: edit } = params;
 	const accepted = ingestOrReportDrop(key, messageId, true, () =>
-		options.database.transaction((tx) =>
-			options.database.inbox.enqueue(tx, {
+		options.database.transaction((tx) => {
+			const enqueued = options.database.inbox.enqueue(tx, {
 				messageId,
 				originKey: key,
 				originRefJson: JSON.stringify(origin),
 				body: renderMessageEdit(editedId, edit),
 				engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
 				...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
-			}),
-		),
+			});
+			if (enqueued && muteKey !== undefined && muteAddressed) options.database.inbox.unmuteThread(tx, muteKey);
+			return enqueued;
+		}),
 	);
 	if (!accepted) {
 		// The same edit event delivered twice: acknowledged once, dispatched once.
@@ -3591,7 +3625,7 @@ async function createInboundTurnLifecycle(
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilentOutput(part))
+			.filter((part) => part.length > 0 && !isSilentOutput(part) && !isShutupToken(part))
 			.slice(0, 5);
 		// A persona that decided not to speak often says so instead of emitting
 		// the token (#260). On gated traffic, such a part is dropped like one.
@@ -3924,7 +3958,19 @@ async function createInboundTurnLifecycle(
 			: nonLoopback
 				? (editedMessageId(steered.message_id) ?? steered.message_id)
 				: undefined;
+	// A Slack channel session carries several bot-rooted threads, so [SHUTUP]
+	// mutes the thread of the latest chat message this turn took in, not the
+	// trigger's: the persona answers the newest message a steer brought in.
+	let muteEngagement: EngagementContext | undefined = engagement as EngagementContext | undefined;
+	/** Issue #625: an answer of [SHUTUP] mutes the thread it answered, however that answer reached the gateway. */
+	const applyShutup = (answer: string) => {
+		const muteKey = nonLoopback ? threadMuteKey(origin, key, muteEngagement) : undefined;
+		if (muteKey !== undefined && isShutupToken(answer))
+			options.database.transaction((tx) => options.database.inbox.muteThread(tx, muteKey));
+	};
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
+		if (steered.source !== "lane_report" && steered.engagement_json)
+			muteEngagement = JSON.parse(steered.engagement_json) as EngagementContext;
 		runtime.inbound.delete(steered.message_id);
 		acknowledgeSteer(runtime, steered, turnId);
 	};
@@ -3951,6 +3997,7 @@ async function createInboundTurnLifecycle(
 					`user: ${clipByCodePoints(userText, 500)}\nassistant: ${clipByCodePoints(replyText, 500)}`,
 				);
 			});
+			applyShutup(text);
 			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
 			// Recovered from the transcript after it already reached the room under
 			// another turn: recorded above, never posted a second time.
@@ -4057,6 +4104,7 @@ async function createInboundTurnLifecycle(
 			// The turn wrote its answer before it failed (#210): deliver it through
 			// the ordinary terminal slot. It then counts as a visible reply, and the
 			// failure stays in the operator log instead of replacing the answer.
+			if (recoveredText) applyShutup(recoveredText);
 			if (nonLoopback && recoveredText && !assistantDeliveryStarted)
 				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
@@ -4535,6 +4583,19 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
 					"To stay quiet on a message that is not for you, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded.",
+				]
+			: []),
+		...(origin.kind === "thread"
+			? [
+					"To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
+				]
+			: []),
+		// Slack keeps a thread rooted at the persona's own message on the channel
+		// session (adapter-slack decideInbound), so the thread notice above never
+		// reaches it.
+		...(origin.platform === "slack" && origin.kind === "channel"
+			? [
+					"Replies in a Slack thread under one of your own messages arrive in this channel session. To mute such a thread so it stops sending you messages unless you are explicitly mentioned there, answer a message from that thread with exactly [SHUTUP] and nothing else. This mutes only that thread, persists across restarts, and a mention in the thread unmutes it.",
 				]
 			: []),
 		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord

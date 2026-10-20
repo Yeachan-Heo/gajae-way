@@ -138,8 +138,11 @@ export function engagementForMessage(
 				}
 			: undefined;
 	// A reply to our own message addresses us just like an explicit mention.
+	const explicitMention = [...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].some(
+		(match) => match[1] === identity.botUserId,
+	);
 	const mentioned =
-		[...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].some((match) => match[1] === identity.botUserId) ||
+		explicitMention ||
 		replyTo?.fromSelf === true ||
 		(origin.kind !== "dm" && channels?.[origin.parentId ?? origin.conversationId]?.engagement === "open");
 	const authorName = (message.user ? names.userName(message.user) : undefined) ?? message.username;
@@ -147,6 +150,7 @@ export function engagementForMessage(
 	const channelName = origin.kind !== "dm" ? names.channelName(message.channel) : undefined;
 	return {
 		mentioned,
+		explicitMention,
 		group: origin.kind !== "dm",
 		authorId: message.user ?? message.bot_id ?? "",
 		...(message.bot_id || message.subtype === "bot_message" ? { authorIsBot: true } : {}),
