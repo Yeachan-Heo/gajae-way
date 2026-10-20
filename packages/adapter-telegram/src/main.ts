@@ -8,6 +8,7 @@ import {
 	type FileRef,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
+	originKey,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
@@ -433,25 +434,66 @@ async function readOutboundFile(file: FileRef): Promise<Uint8Array> {
 	}
 }
 
+/**
+ * Settles each conversation's deliveries one at a time, in the order the gateway
+ * sent them. One reply can fan out into a text delivery and several file
+ * deliveries; settled concurrently, a small upload overtakes a large one and the
+ * chat shows them out of order. Different conversations still settle in parallel,
+ * and a failed settlement never blocks the deliveries queued behind it.
+ */
+export class TelegramDeliveryOrder {
+	readonly #chains = new Map<string, Promise<void>>();
+
+	constructor(private readonly log: Pick<Console, "error"> = console) {}
+
+	run(key: string, task: () => Promise<void>): void {
+		const previous = this.#chains.get(key) ?? Promise.resolve();
+		const next = previous
+			.then(task)
+			.catch((error: unknown) =>
+				this.log.error(
+					`Telegram delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
+		this.#chains.set(key, next);
+		void next.then(() => {
+			if (this.#chains.get(key) === next) this.#chains.delete(key);
+		});
+	}
+
+	/** Resolves once every queued delivery, including ones queued while waiting, has settled. */
+	async drain(): Promise<void> {
+		while (this.#chains.size > 0) await Promise.all([...this.#chains.values()]);
+	}
+}
+
+/**
+ * The Telegram conversation a delivery lands in: its persisted chat and forum
+ * topic, so origins that share a destination share one order. An origin without
+ * a route fails settlement anyway; it is still ordered by its own key.
+ */
+export function telegramDeliveryKey(state: TelegramAdapterState, origin: OriginRef): string {
+	const route = state.routeFor(origin);
+	return route ? `route:${route.chatId}:${route.messageThreadId ?? ""}` : `origin:${originKey(origin)}`;
+}
+
 export function subscribeTelegramDeliveries(
 	gateway: GatewayClientLike,
 	bot: Pick<TelegramBotApi, "sendMessage" | "setMessageReaction"> &
 		Partial<Pick<TelegramBotApi, "sendPhoto" | "sendDocument">>,
 	state: TelegramAdapterState,
-	log: Pick<Console, "error"> = console,
+	order: TelegramDeliveryOrder = new TelegramDeliveryOrder(),
 ): () => void {
 	return gateway.onChatMessage((message) => {
+		if (message.origin.platform !== "telegram" || !message.deliveryId) return;
 		// A file delivery's text is only the "📎 name" fallback; it must never be
 		// posted as a message when the upload itself is what was asked for.
-		const settled = message.reaction
-			? settleTelegramReaction(gateway, bot, state, message)
-			: message.file
-				? settleTelegramFile(gateway, bot, state, message)
-				: settleTelegramDelivery(gateway, bot, state, message);
-		void settled.catch((error) =>
-			log.error(
-				`Telegram delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+		order.run(telegramDeliveryKey(state, message.origin), () =>
+			message.reaction
+				? settleTelegramReaction(gateway, bot, state, message)
+				: message.file
+					? settleTelegramFile(gateway, bot, state, message)
+					: settleTelegramDelivery(gateway, bot, state, message),
 		);
 	});
 }
@@ -615,6 +657,9 @@ class ReconnectingGateway implements GatewayClientLike {
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
+	// Shared across reconnects so a delivery replayed on a new connection still
+	// waits behind the conversation's in-flight settlement.
+	readonly #deliveryOrder = new TelegramDeliveryOrder();
 	#handlers = new Set<(message: ChatMessagePayload) => void>();
 
 	constructor(
@@ -646,7 +691,7 @@ class ReconnectingGateway implements GatewayClientLike {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeTelegramDeliveries(client, this.bot, this.state);
+			this.#deliveryOff = subscribeTelegramDeliveries(client, this.bot, this.state, this.#deliveryOrder);
 			this.monitor(client);
 		} catch {
 			this.scheduleReconnect();

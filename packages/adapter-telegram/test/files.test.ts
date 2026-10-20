@@ -9,6 +9,9 @@ import {
 	subscribeTelegramDeliveries,
 	TELEGRAM_PHOTO_MAX_BYTES,
 	TelegramBotApi,
+	TelegramDeliveryOrder,
+	type TelegramUpload,
+	type TelegramUploadTarget,
 	telegramPhotoEligible,
 } from "../src/main";
 import { telegramMessageOrigin } from "../src/origin";
@@ -289,6 +292,137 @@ test("the delivery subscription uploads a file delivery and never posts its fall
 	expect(uploads.map((upload) => upload.method)).toEqual(["sendDocument"]);
 	expect(sent).toEqual([]);
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "file-delivery" } }]);
+});
+
+/**
+ * A subscription whose uploads finish when `uploadDelay` says, recording when each
+ * Bot API call starts and ends so tests can see settlement order, not just call order.
+ */
+function orderedSubscription(
+	state: TelegramAdapterState,
+	uploadDelay: (upload: TelegramUpload, target: TelegramUploadTarget) => Promise<void>,
+	request: (verb: string, params: unknown) => Promise<void> = async () => {},
+) {
+	const events: string[] = [];
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const errors: string[] = [];
+	const order = new TelegramDeliveryOrder({ error: (message: string) => void errors.push(message) });
+	let handler: ((message: ChatMessagePayload) => void) | undefined;
+	const upload = async (target: TelegramUploadTarget, file: TelegramUpload): Promise<{ message_id?: number }> => {
+		events.push(`start ${file.name}`);
+		await uploadDelay(file, target);
+		events.push(`end ${file.name}`);
+		return { message_id: 501 };
+	};
+	subscribeTelegramDeliveries(
+		{
+			request: async <T>(verb: string, params?: unknown) => {
+				requests.push({ verb, params });
+				await request(verb, params);
+				return {} as T;
+			},
+			onChatMessage: (given) => {
+				handler = given;
+				return () => {};
+			},
+		},
+		{
+			sendMessage: async (_chatId, text) => {
+				events.push(`start text ${text}`);
+				await Bun.sleep(20);
+				events.push(`end text ${text}`);
+			},
+			setMessageReaction: async () => {},
+			sendPhoto: upload,
+			sendDocument: upload,
+		},
+		state,
+		order,
+	);
+	const deliver = (message: ChatMessagePayload): void => handler?.(message);
+	return { events, requests, errors, order, deliver };
+}
+
+async function stateWithBoth(): Promise<TelegramAdapterState> {
+	const state = await stateWith(DM);
+	await state.rememberOrigin(TOPIC, 99);
+	return state;
+}
+
+test("one conversation's text and files settle in gateway order even when a later upload is faster", async () => {
+	const state = await stateWith(DM);
+	// A is the slow, large upload; B would finish first if both ran at once.
+	const { events, requests, order, deliver } = orderedSubscription(state, (file) =>
+		Bun.sleep(file.name === "a.png" ? 60 : 1),
+	);
+	deliver({
+		turnId: "turn-1",
+		origin: DM,
+		role: "assistant",
+		text: "here are the charts",
+		final: true,
+		deliveryId: "text",
+	});
+	deliver(await fileDelivery(DM, "a.png", PNG, { deliveryId: "a" }));
+	deliver(await fileDelivery(DM, "b.png", PNG, { deliveryId: "b" }));
+	await order.drain();
+	expect(events).toEqual([
+		"start text here are the charts",
+		"end text here are the charts",
+		"start a.png",
+		"end a.png",
+		"start b.png",
+		"end b.png",
+	]);
+	expect(requests).toEqual([
+		{ verb: "delivery.confirm", params: { deliveryId: "text" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "a" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "b" } },
+	]);
+});
+
+test("a stalled upload in one chat does not hold back another chat's deliveries", async () => {
+	const state = await stateWithBoth();
+	let release!: () => void;
+	const stalled = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const { events, requests, order, deliver } = orderedSubscription(state, (_file, target) =>
+		target.chatId === "22" ? stalled : Promise.resolve(),
+	);
+	deliver(await fileDelivery(DM, "dm.png", PNG, { deliveryId: "dm" }));
+	deliver(await fileDelivery(TOPIC, "topic.png", PNG, { deliveryId: "topic" }));
+	for (let attempt = 0; attempt < 40 && requests.length === 0; attempt++) await Bun.sleep(5);
+	expect(events).toEqual(["start dm.png", "start topic.png", "end topic.png"]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "topic" } }]);
+	release();
+	await order.drain();
+	expect(events.at(-1)).toBe("end dm.png");
+	expect(requests.at(-1)).toEqual({ verb: "delivery.confirm", params: { deliveryId: "dm" } });
+});
+
+test("a failed settlement does not block the conversation's next delivery", async () => {
+	const state = await stateWith(DM);
+	const { events, requests, errors, order, deliver } = orderedSubscription(
+		state,
+		async (file) => {
+			if (file.name === "a.png") throw new Error("socket hang up");
+		},
+		// Even the delivery.fail report for A is lost; B must still go out.
+		async (verb, params) => {
+			if (verb === "delivery.fail" && (params as { deliveryId: string }).deliveryId === "a")
+				throw new Error("gateway is not connected");
+		},
+	);
+	deliver(await fileDelivery(DM, "a.png", PNG, { deliveryId: "a" }));
+	deliver(await fileDelivery(DM, "b.png", PNG, { deliveryId: "b" }));
+	await order.drain();
+	expect(events).toEqual(["start a.png", "start b.png", "end b.png"]);
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "a", reason: "socket hang up", ambiguous: true } },
+		{ verb: "delivery.confirm", params: { deliveryId: "b" } },
+	]);
+	expect(errors).toEqual(["Telegram delivery settlement request failed: gateway is not connected"]);
 });
 
 test("photo eligibility follows the content, not the name, and Telegram's photo size limit", () => {
