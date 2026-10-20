@@ -133,6 +133,7 @@ interface Observer {
 	readonly binding: { readonly sessionId: string | null; readonly epoch: number } | undefined;
 	tail?: TailHandle;
 	attaching?: Promise<void>;
+	disposal?: Promise<void>;
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
 	wakeRequested?: boolean;
@@ -268,6 +269,8 @@ export class WorkLaneManager {
 	readonly #db: Store;
 	readonly #port: SessionPort;
 	readonly #observers = new Map<string, Observer>();
+	/** Includes dropped observers no longer reachable through #observers. */
+	readonly #observerDisposals = new Set<Promise<void>>();
 	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
@@ -997,6 +1000,10 @@ export class WorkLaneManager {
 		const observer = this.#register(runtime);
 		this.#attach(observer);
 		await observer.attaching;
+		if (!this.#writeCurrent(observer)) {
+			this.#live();
+			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
+		}
 		let accepted = false;
 		let rejected = false;
 		let source: "receipt" | "status" = "receipt";
@@ -1264,11 +1271,45 @@ export class WorkLaneManager {
 	#dropObserver(observer: Observer, error: unknown): void {
 		const opRef = observer.runtime.opRef;
 		console.error(`work_observer_failed opRef=${JSON.stringify(opRef)} error=${failureReason(error)}`);
+		void this.#disposeObserver(observer);
+		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
+		this.#failures.delete(opRef);
+	}
+	/** Revoke callbacks immediately; dispose relays without waiting on our own tick. */
+	#disposeObserver(observer: Observer): Promise<void> {
+		if (observer.disposal) return observer.disposal;
 		observer.abort.abort();
 		if (observer.timer) clearTimeout(observer.timer);
 		observer.timer = undefined;
-		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
-		this.#failures.delete(opRef);
+		const report = (error: unknown) => {
+			console.error(`work_observer_cleanup_failed opRef=${observer.runtime.opRef} reason=${failureReason(error)}`);
+		};
+		const closeTail = async () => {
+			const tail = observer.tail;
+			observer.tail = undefined;
+			try {
+				await tail?.close();
+			} catch (error) {
+				report(error);
+			}
+		};
+		const disposal = Promise.resolve()
+			.then(async () => {
+				// Closing an acquired handle first also releases a pending ready wait.
+				await closeTail();
+				try {
+					await observer.attaching;
+				} catch (error) {
+					report(error);
+				}
+				// A late attachment is fenced and closes itself; retain cleanup ownership
+				// until that completion, including any handle acquired before revocation.
+				await closeTail();
+			})
+			.finally(() => this.#observerDisposals.delete(disposal));
+		observer.disposal = disposal;
+		this.#observerDisposals.add(disposal);
+		return disposal;
 	}
 	/** Counts the failure and reports it once per distinct reason instead of on every poll. */
 	#failed(observer: Observer, error: unknown): void {
@@ -1713,6 +1754,9 @@ export class WorkLaneManager {
 					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
 				}
 			}
+			// Diagnostics may suspend while shutdown, generation recovery or a
+			// binding change revokes this observer without changing runtime.version.
+			if (!this.#writeCurrent(observer)) return;
 			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
@@ -1881,8 +1925,9 @@ export class WorkLaneManager {
 		}
 		if (this.#current(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt) {
 			observer.tail?.setTurnRunning(false);
-			await observer.tail?.close();
-			observer.tail = undefined;
+			await this.#disposeObserver(observer);
+			if (this.#observers.get(runtime.opRef) === observer) this.#observers.delete(runtime.opRef);
+			this.#failures.delete(runtime.opRef);
 		}
 	}
 	#finishWaiters(opRef: string): void {
@@ -2447,11 +2492,9 @@ export class WorkLaneManager {
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {
-					prior.abort.abort();
-					if (prior.timer) clearTimeout(prior.timer);
-					await prior.attaching;
+					const disposal = this.#disposeObserver(prior);
 					await prior.task;
-					await prior.tail?.close();
+					await disposal;
 				}
 				if (this.#stopped) return;
 				const observer = this.#register(runtime);
@@ -2609,17 +2652,14 @@ export class WorkLaneManager {
 	}
 	async #detachObservers(): Promise<void> {
 		const observers = [...this.#observers.values()];
-		for (const observer of observers) {
-			observer.abort.abort();
-			if (observer.timer) clearTimeout(observer.timer);
-		}
 		await Promise.all(
 			observers.map(async (observer) => {
-				await observer.attaching;
+				const disposal = this.#disposeObserver(observer);
 				await observer.task;
-				await observer.tail?.close();
+				await disposal;
 			}),
 		);
+		while (this.#observerDisposals.size) await Promise.all([...this.#observerDisposals]);
 		this.#observers.clear();
 	}
 

@@ -1293,6 +1293,226 @@ test("a lane row torn under a live observer is logged and dropped, not an unhand
 	expect(rejections).toEqual([]);
 });
 
+function tearObserverLane(f: Awaited<ReturnType<typeof fixture>>, opRef: string) {
+	const torn = closeAttempt({
+		record: f.job(),
+		opRef,
+		endState: "attempt_ended",
+		errorCode: "host_lost",
+		endedAt: new Date(Date.now() + 1000).toISOString(),
+	});
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, { ...torn, laneKey: laneJobIdentity("a").laneKey, json: JSON.stringify(torn) }),
+	);
+}
+
+test("audit: a dropped observer closes its resident relay once and shutdown drains rejected cleanup", async () => {
+	const rejections: unknown[] = [];
+	const onRejection = (reason: unknown) => rejections.push(reason);
+	process.on("unhandledRejection", onRejection);
+	cleanups.push(async () => {
+		process.off("unhandledRejection", onRejection);
+	});
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const f = await fixture();
+	const terminate = spyOn(f.port, "terminateHost");
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+	const attach = f.port.attachTail.bind(f.port);
+	let resident: TailHandle | undefined;
+	f.port.attachTail = async (input) => {
+		if (input.originKey !== workSessionKey("a")) return attach(input);
+		resident = await runner.attach(input);
+		return resident;
+	};
+	const result = await started(f, "a", origin);
+	const healthy = await started(f, "b", origin);
+	if (!resident) throw new Error("resident relay was not acquired");
+	const tail = resident;
+	const releaseClose = deferred<void>();
+	const originalClose = tail.close.bind(tail);
+	const close = spyOn(tail, "close").mockImplementation(async () => {
+		await originalClose();
+		await releaseClose.promise;
+		throw new Error("fixture cleanup rejection");
+	});
+	cleanups.push(async () => {
+		releaseClose.resolve();
+	});
+	try {
+		tearObserverLane(f, result.opRef);
+		await until(() => close.mock.calls.length === 1);
+		expect(relay.streams[0]?.closed).toBe(true);
+		f.port.complete(healthy.opRef, "other lane still served");
+		await until(() => f.db.work.workAttemptGet(healthy.opRef)?.settledAt != null);
+		expect(f.notices).toHaveLength(1);
+		expect(f.notices[0]?.text).toContain("[lane b] completed");
+		let stopped = false;
+		const stopping = f.manager.stop().then(() => {
+			stopped = true;
+		});
+		expect(f.manager.stop()).toBe(f.manager.stop());
+		await Bun.sleep(0);
+		expect(stopped).toBe(false);
+		releaseClose.resolve();
+		await stopping;
+		await Bun.sleep(0);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(errors.mock.calls.some((call) => String(call[0]).includes("work_observer_cleanup_failed"))).toBe(true);
+		expect(rejections).toEqual([]);
+		expect(terminate).not.toHaveBeenCalled();
+		expect(f.port.closes).toEqual([]);
+	} finally {
+		releaseClose.resolve();
+		await originalClose();
+	}
+});
+
+for (const boundary of ["attachment", "ready"] as const) {
+	for (const revoke of ["drop", "shutdown"] as const) {
+		test(`observer ${revoke} drains a pending ${boundary} and closes the acquired tail exactly once`, async () => {
+			const rejections: unknown[] = [];
+			const onRejection = (reason: unknown) => rejections.push(reason);
+			process.on("unhandledRejection", onRejection);
+			cleanups.push(async () => {
+				process.off("unhandledRejection", onRejection);
+			});
+			const errors = spyOn(console, "error").mockImplementation(() => {});
+			cleanups.push(async () => errors.mockRestore());
+			const f = await fixture();
+			const terminate = spyOn(f.port, "terminateHost");
+			const result = await started(f, "a", origin);
+			await f.manager.stop();
+			const before = f.db.work.workAttemptGet(result.opRef)!;
+			const releaseAttachment = deferred<void>();
+			const releaseReady = deferred<void>();
+			const releaseClose = deferred<void>();
+			const attach = f.port.attachTail.bind(f.port);
+			let acquired = false;
+			let closeCalls = 0;
+			f.port.attachTail = async (input) => {
+				if (input.sessionId !== result.sessionId) return attach(input);
+				const tail = await attach(input);
+				if (boundary === "ready") Object.defineProperty(tail, "ready", { value: releaseReady.promise });
+				const close = tail.close.bind(tail);
+				tail.close = async () => {
+					closeCalls++;
+					await close();
+					// A real close releases ready; waiting for ready before close deadlocks.
+					releaseReady.resolve();
+					await releaseClose.promise;
+				};
+				acquired = true;
+				if (boundary === "attachment") await releaseAttachment.promise;
+				return tail;
+			};
+			cleanups.push(async () => {
+				releaseAttachment.resolve();
+				releaseReady.resolve();
+				releaseClose.resolve();
+			});
+			try {
+				await f.restart();
+				await until(() => acquired);
+				if (revoke === "drop") {
+					const healthy = await started(f, "b", origin);
+					tearObserverLane(f, result.opRef);
+					await until(() =>
+						errors.mock.calls.some(
+							(call) => String(call[0]).includes("work_observer_failed") && String(call[0]).includes(result.opRef),
+						),
+					);
+					f.port.complete(healthy.opRef, "healthy during cleanup");
+					await until(() => f.db.work.workAttemptGet(healthy.opRef)?.settledAt != null);
+					expect(f.notices).toHaveLength(1);
+					expect(f.notices[0]?.text).toContain("[lane b] completed");
+				}
+				let stopped = false;
+				const stopping = f.manager.stop().then(() => {
+					stopped = true;
+				});
+				if (boundary === "attachment") {
+					await Bun.sleep(0);
+					expect(stopped).toBe(false);
+					expect(closeCalls).toBe(0);
+					releaseAttachment.resolve();
+				}
+				await until(() => closeCalls === 1);
+				expect(stopped).toBe(false);
+				expect(f.port.tailsOf(result.sessionId)).toEqual([]);
+				releaseClose.resolve();
+				await stopping;
+				await f.manager.stop();
+				await Bun.sleep(0);
+				expect(closeCalls).toBe(1);
+				if (revoke === "shutdown") {
+					expect(f.db.work.workAttemptGet(result.opRef)).toEqual(before);
+					expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+					expect(f.notices).toEqual([]);
+				}
+				expect(rejections).toEqual([]);
+				expect(terminate).not.toHaveBeenCalled();
+				expect(f.port.closes).toEqual([]);
+			} finally {
+				releaseAttachment.resolve();
+				releaseReady.resolve();
+				releaseClose.resolve();
+			}
+		});
+	}
+}
+
+for (const revoke of ["stop", "generation", "binding"] as const) {
+	test(`initial start cannot send after ${revoke} revokes pending relay readiness`, async () => {
+		let generation = 1;
+		const f = await fixture({ brokerGeneration: () => generation });
+		const ready = deferred<void>();
+		const attach = f.port.attachTail.bind(f.port);
+		let acquired: TailHandle | undefined;
+		f.port.attachTail = async (input) => {
+			const tail = await attach(input);
+			if (acquired) return tail;
+			Object.defineProperty(tail, "ready", { value: ready.promise });
+			const close = tail.close.bind(tail);
+			tail.close = async () => {
+				await close();
+				ready.resolve();
+			};
+			acquired = tail;
+			return tail;
+		};
+		const start = f.manager
+			.start({ name: "a", text: "not submitted", cwd: f.directory })
+			.catch((error: unknown) => error);
+		try {
+			await until(() => acquired !== undefined);
+			const before = f.db.work.workAttemptOpen()[0]!;
+			let transition: Promise<void> | undefined;
+			if (revoke === "stop") transition = f.manager.stop();
+			else if (revoke === "generation") {
+				generation++;
+				transition = f.manager.onBrokerGeneration();
+			} else {
+				f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey("a")));
+				ready.resolve();
+			}
+			expect(await start).toBeInstanceOf(ProtocolError);
+			await transition;
+			expect(f.port.sends).toEqual([]);
+			expect(f.port.sendAttempts).toEqual([]);
+			expect(f.db.work.workAttemptGet(before.opRef)).toEqual(before);
+			expect(f.notices).toEqual([]);
+			expect(f.db.outbox.rows()).toEqual([]);
+			expect(f.port.closes).toEqual([]);
+		} finally {
+			ready.resolve();
+			await start;
+			await f.manager.stop();
+		}
+	});
+}
+
 test("saved terminal proof wins over dead liveness and output recovery consumes saved budget", async () => {
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
@@ -1402,6 +1622,83 @@ test("stop releases run before draining a blocked finite output read and preserv
 	expect(f.db.work.workAttemptGet(op)?.output.disposition).toBe("pending");
 	expect(f.notices).toHaveLength(0);
 });
+
+for (const revoke of ["stop", "generation", "binding"] as const) {
+	test(`audit: ${revoke} during transport diagnostics revokes observer settlement and reporting authority`, async () => {
+		let generation = 1;
+		const rejections: unknown[] = [];
+		const onRejection = (reason: unknown) => rejections.push(reason);
+		process.on("unhandledRejection", onRejection);
+		cleanups.push(async () => {
+			process.off("unhandledRejection", onRejection);
+		});
+		const f = await fixture({ brokerGeneration: () => generation });
+		const terminate = spyOn(f.port, "terminateHost");
+		const gate = deferred<{ kind: "transport"; nativeErrorCode: "ECONNRESET" }>();
+		let entered = false;
+		f.port.failedTransportCause = async () => {
+			entered = true;
+			return gate.promise;
+		};
+		cleanups.push(async () => {
+			gate.resolve({ kind: "transport", nativeErrorCode: "ECONNRESET" });
+		});
+		const result = await started(f, "a", origin);
+		f.port.status = async (input) => ({
+			operationRef: input.opRef,
+			status: { status: "failed", receiptState: "missing" },
+			summaryCompleted: true,
+		});
+		f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+		f.port.fail(result.opRef, "fixture failure", { code: "sdk_failed" });
+		await until(() => entered);
+		const before = f.db.work.workAttemptGet(result.opRef)!;
+		const jobBefore = f.db.work.laneJobJson(laneJobIdentity("a").jobId);
+		// Readoption may legitimately settle saved terminal proof. Isolate the old
+		// observer, not the replacement recovery's separate write authority.
+		const recover = spyOn(f.manager, "recover").mockImplementation(async () => {});
+		let stopped = false;
+		let stopping: Promise<void> | undefined;
+		if (revoke === "stop")
+			stopping = f.manager.stop().then(() => {
+				stopped = true;
+			});
+		else if (revoke === "generation") generation++;
+		else f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, result.sessionKey));
+		try {
+			await Bun.sleep(0);
+			if (stopping) expect(stopped).toBe(false);
+			gate.resolve({ kind: "transport", nativeErrorCode: "ECONNRESET" });
+			// Queue behind the settlement lock held across failedTransportCause.
+			await f.port.runExclusive(result.sessionKey, async () => {});
+			if (stopping) await stopping;
+			if (revoke === "binding") await until(() => recover.mock.calls.length > 0);
+			expect(f.db.work.workAttemptGet(result.opRef)).toEqual(before);
+			expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+			expect(f.db.work.laneJobJson(laneJobIdentity("a").jobId)).toBe(jobBefore);
+			expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+			expect(f.notices).toEqual([]);
+			expect(f.db.outbox.rows()).toEqual([]);
+			expect(f.port.steers).toEqual([]);
+			recover.mockRestore();
+			if (revoke === "generation") {
+				// A new generation may recover the same proof, but only after the
+				// revoked observer's immutable-state assertions above have passed.
+				await f.manager.onBrokerGeneration();
+				await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.notices).toHaveLength(1);
+			}
+			await f.manager.stop();
+			await Bun.sleep(0);
+			expect(rejections).toEqual([]);
+			expect(terminate).not.toHaveBeenCalled();
+			expect(f.port.closes).toEqual([]);
+		} finally {
+			gate.resolve({ kind: "transport", nativeErrorCode: "ECONNRESET" });
+			recover.mockRestore();
+		}
+	});
+}
 
 test("invalid shared parameters have no bind/send effects and manager registration is unique", async () => {
 	const f = await fixture();
