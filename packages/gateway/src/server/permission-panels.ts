@@ -74,10 +74,13 @@ export class PermissionPanels {
 					error: { code: "unavailable", message },
 				})
 				.catch(() => {});
+		const reverseMethod = request.payload.method.startsWith(`${request.capability}.`)
+			? request.payload.method
+			: `${request.capability}.${request.payload.method}`;
 		if (request.capability !== "permission" || request.payload.method !== "request")
-			return await decline(`${request.capability}.${request.payload.method} not available`);
+			return await decline(`${reverseMethod} not available`);
 		if (!origin) return await decline("session origin not found");
-		if (origin.platform !== "slack") return await decline("panels not available for this platform");
+		if (origin.platform !== "slack") return await decline(`panels not available for ${origin.platform}`);
 		if (!triggerAuthorId) return await decline("no trigger author to answer the panel");
 		const payload = (request.payload.payload ?? {}) as { toolCall?: unknown; options?: unknown };
 		const options = offeredOptions(payload.options);

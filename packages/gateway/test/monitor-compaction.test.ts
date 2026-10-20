@@ -17,10 +17,11 @@ import {
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
 	MONITOR_DIGEST_MAX_NOTES,
+	MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD,
 	type NativeCompactionStatus,
 	unavailableCompactionPort,
 } from "../src/monitors/compaction";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
@@ -358,9 +359,11 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		const healthyIds: string[] = [];
 		for (let tick = 0; tick < 3; tick += 1)
 			healthyIds.push(await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick }));
-		// Pre-failure prompts keep the exact original shape.
+		// Pre-failure prompts carry no digest.
 		for (const turn of turns) {
-			expect(turn.prompt.startsWith(`Author monitor events. ${instruction} Respond ONLY with a JSON array`)).toBe(true);
+			expect(
+				turn.prompt.startsWith(`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n${MONITOR_AUTHORING_REPORT_RULE}\n`),
+			).toBe(true);
 			expect(turn.prompt).not.toContain("Context compaction");
 		}
 		empty = true;
@@ -577,7 +580,7 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 	}
 });
 
-test("a monitor with no instruction is unchanged, and rolls with a digest that omits the instruction line", async () => {
+test("a monitor with no instruction has no task segment, and rolls with a digest that omits the instruction line", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-noinstr-"));
 	try {
 		let empty = false;
@@ -593,9 +596,12 @@ test("a monitor with no instruction is unchanged, and rolls with a digest that o
 			burstPolicy: "serialize",
 		});
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 0 });
-		// Unchanged prompt shape for an instruction-less monitor: no guidance, no
-		// digest, no leading blank.
-		expect(turns[0]!.prompt.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		// No task segment and no digest for an instruction-less monitor.
+		expect(
+			turns[0]!.prompt.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		empty = true;
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 1 });
 		empty = false;
@@ -603,7 +609,64 @@ test("a monitor with no instruction is unchanged, and rolls with a digest that o
 		const rolled = turns.at(-1)!;
 		expect(rolled.prompt).toContain("Context compaction");
 		expect(rolled.prompt).not.toContain("Standing instruction");
-		expect(rolled.prompt.startsWith("Author monitor events.\nContext compaction")).toBe(true);
+		expect(rolled.prompt.startsWith(`${MONITOR_AUTHORING_HEADER}\nContext compaction`)).toBe(true);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a rolled digest skips silent notes and instruction echoes, and fills its budget from older real notes (#369)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-digest-echo-"));
+	try {
+		const instruction = "Publish the blog draft and verify the live page.";
+		let mode: "real" | "echo" | "silent" | "empty" = "real";
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			contextFailureRollThreshold: 1,
+			compaction: stubPort("unavailable"),
+			respond: (prompt) => {
+				if (mode === "empty") return "";
+				if (mode === "real") return echoNotes(prompt);
+				const payload = prompt.slice(prompt.indexOf("entry per event: ") + "entry per event: ".length);
+				const note = mode === "echo" ? instruction : "[SILENT]";
+				return JSON.stringify(
+					(JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => ({ eventId, note })),
+				);
+			},
+		});
+		const monitor = registry.add({
+			name: "blog",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["blog.tick"],
+			burstPolicy: "serialize",
+			instruction,
+		});
+		// One more legitimate note than the digest holds, oldest first.
+		const realIds: string[] = [];
+		for (let tick = 0; tick <= MONITOR_DIGEST_MAX_NOTES; tick += 1)
+			realIds.push(await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick }));
+		mode = "silent";
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 100 });
+		// More echoes than digest slots, all newer than every legitimate note.
+		mode = "echo";
+		const echoIds: string[] = [];
+		for (let tick = 0; tick <= MONITOR_DIGEST_MAX_NOTES; tick += 1)
+			echoIds.push(await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 200 + tick }));
+		// No delivery target: an echo settles as an ordinary undelivered note.
+		for (const echoId of echoIds) expect(database.monitors.authoredOutput(echoId)).toBe(instruction);
+		mode = "empty";
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 300 });
+		mode = "real";
+		await pipeline.submitAwaitable(monitor.monitorId, "blog.tick", { tick: 301 });
+		const rolled = turns.at(-1)?.prompt ?? "";
+		expect(rolled).toContain("Context compaction");
+		expect(rolled).not.toContain(`blog.tick: ${instruction}`);
+		expect(rolled).not.toContain("[SILENT]");
+		// The echoes do not consume the budget: the newest legitimate notes fill it,
+		// and the cap still holds.
+		const kept = realIds.filter((id) => rolled.includes(`blog.tick: note for ${id}`));
+		expect(kept).toEqual(realIds.slice(1));
+		expect(kept).toHaveLength(MONITOR_DIGEST_MAX_NOTES);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -960,6 +1023,96 @@ test("a wedged prompt submission rolls the session so the next slot lands on a l
 		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
 			"authored_no_delivery",
 		);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("repeated prior-run-busy terminal failures roll within a bounded streak and replay events once", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-prior-run-busy-"));
+	try {
+		const { database, registry, pipeline, turns, sessionPort } = await harness(directory);
+		const monitor = registry.add({
+			name: "prior-run-busy",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["busy.tick"],
+			burstPolicy: "serialize",
+			channelTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } },
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "busy.tick"));
+		const priorRunReason = "Timed out waiting for prior agent run to finish before prompting.";
+		const attempts: Array<{ sessionId: string; eventIds: string[] }> = [];
+		const originalRequest = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			const marker = "entry per event: ";
+			const payload = input.text.slice(input.text.lastIndexOf(marker) + marker.length);
+			const eventIds = (JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => eventId);
+			attempts.push({ sessionId: input.sessionId, eventIds });
+			if (input.sessionId === "event-session-e0") {
+				const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
+					code: "sdk_prompt_terminal_failed",
+					reason: priorRunReason,
+				});
+				throw new Error("monitor prompt terminal failure", { cause });
+			}
+			return originalRequest(input);
+		};
+
+		expect(MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD).toBe(2);
+		const failed: string[] = [];
+		for (let index = 0; index < MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD; index += 1) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "busy.tick", { tick: index });
+			failed.push(eventId);
+			expect(database.monitors.failure(eventId)?.code).toBe("session_submission_wedged");
+			const state = pipeline.sessionSafetyState(sessionKey);
+			expect(state.priorRunBusyFailures).toBe(index + 1);
+			expect(state.pendingRoll).toBe(
+				index + 1 === MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD ? "session_prior_run_busy_stalled" : undefined,
+			);
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		}
+
+		const recovered = await pipeline.submitAwaitable(monitor.monitorId, "busy.tick", { tick: "after-roll" });
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+			lastRoll: "session_prior_run_busy_stalled",
+			priorRunBusyFailures: 0,
+		});
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === recovered)?.stage).toBe(
+			"authored",
+		);
+		await Bun.sleep(0);
+		expect(sessionPort.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
+
+		// The known terminal failure proves nothing was sent, so its rows replay
+		// immediately on the fresh session. Every durable event is authored once.
+		await pipeline.reconcile();
+		for (const eventId of [...failed, recovered]) {
+			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+			expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === eventId)?.stage).toBe(
+				"authored",
+			);
+		}
+		for (const eventId of failed)
+			expect(attempts.filter((attempt) => attempt.eventIds.includes(eventId))).toHaveLength(2);
+		expect(attempts.filter((attempt) => attempt.eventIds.includes(recovered))).toHaveLength(1);
+		expect(attempts.map(({ sessionId }) => sessionId)).toEqual([
+			"event-session-e0",
+			"event-session-e0",
+			"event-session-e1",
+			"event-session-e1",
+			"event-session-e1",
+		]);
+		expect(turns.map(({ sessionId }) => sessionId)).toEqual([
+			"event-session-e1",
+			"event-session-e1",
+			"event-session-e1",
+		]);
+		const deliveries = database.outbox.rows().map((row) => JSON.parse(row.payload_json) as { text: string });
+		for (const eventId of [...failed, recovered])
+			expect(deliveries.filter(({ text }) => text.includes(`note for ${eventId}`))).toHaveLength(1);
+		expect(database.monitors.eventRows(monitor.monitorId)).toHaveLength(failed.length + 1);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

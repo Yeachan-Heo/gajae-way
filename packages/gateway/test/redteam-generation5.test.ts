@@ -539,7 +539,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(37);
+		expect(upgraded.schemaVersion).toBe(38);
 		expect(upgraded.inbox.turnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual([
 			["ride-trigger", "trigger", "bound"],
 			["ride-member", "steer", "bound"],

@@ -48,6 +48,7 @@ async function harness(
 		readonly now?: () => number;
 		readonly respond?: SessionPortResponder;
 		readonly initializeAuthority?: boolean;
+		readonly overlap?: "skip" | "queue";
 	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stuck-"));
@@ -60,7 +61,7 @@ async function harness(
 		trigger: { kind: "cron", schedule: "0 * * * *" },
 		eventTypes: ["test.tick"],
 		burstPolicy: "serialize",
-		overlap: "skip",
+		overlap: options.overlap ?? "skip",
 		enabled: true,
 	});
 	const sessionPort = sessionPortFromScript({
@@ -457,4 +458,40 @@ test("a cancelled prompt submission never rolls the session", async () => {
 	const eventId = await propagator.submitAwaitable(monitor.monitorId, "test.tick", {});
 	expect(db.monitors.failure(eventId)?.code).toBe("authoring_turn_failed");
 	expect(propagator.sessionSafetyState(sessionOriginKey).pendingRoll).toBeUndefined();
+});
+
+test("only consecutive prior-run-busy terminal failures enter the recovery streak", async () => {
+	const { db, monitor, propagator, sessionPort, sessionOriginKey } = await harness({ overlap: "queue" });
+	const outcomes = [
+		{
+			reason: "Timed out waiting for prior agent run to finish before prompting.",
+			code: "session_submission_wedged",
+			streak: 1,
+		},
+		{ reason: "The model is temporarily unavailable.", code: "authoring_turn_failed", streak: 0 },
+		{
+			reason: "Timed out waiting for prior agent run to finish before prompting.",
+			code: "session_submission_wedged",
+			streak: 1,
+		},
+	];
+	let nextOutcome = 0;
+	sessionPort.request = async () => {
+		const outcome = outcomes[nextOutcome++];
+		if (!outcome) throw new Error("unexpected extra request");
+		const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
+			code: "sdk_prompt_terminal_failed",
+			reason: outcome.reason,
+		});
+		throw new Error("monitor prompt terminal failure", { cause });
+	};
+	for (const outcome of outcomes) {
+		const eventId = await propagator.submitAwaitable(monitor.monitorId, "test.tick", {});
+		expect(db.monitors.failure(eventId)?.code).toBe(outcome.code);
+		expect(propagator.sessionSafetyState(sessionOriginKey)).toMatchObject({
+			priorRunBusyFailures: outcome.streak,
+			pendingRoll: undefined,
+		});
+	}
+	expect(db.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0).toBe(0);
 });

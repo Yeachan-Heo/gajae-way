@@ -530,3 +530,68 @@ test("RT14 work start survives observer spawn failure, sends once without relay 
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.workerOutputReads).toHaveLength(1);
 });
+
+test("work session activity survives loss of the submitting relay without claiming turn ownership", async () => {
+	const { db, home } = await database();
+	const gajaewayHome = join(home, "gajaeway");
+	const port = new ScriptedSessionPort({ sessionIdForBind: () => crypto.randomUUID() });
+	attachTestBrokerOwnership(db, port, join(home, "agent"));
+	const hosts: Host[] = [];
+	const tail = new TailRunner({
+		repo: home,
+		sleep: async () => {},
+		stream: () => {
+			const host = new Host(undefined, true, `connection-${hosts.length}`);
+			hosts.push(host);
+			return host;
+		},
+	});
+	port.attachTail = (input) => tail.attach(input);
+	let now = Date.now();
+	const manager = new WorkLaneManager({
+		database: db,
+		port,
+		lanes: new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome, maxLanes: 1 }),
+		gajaewayHome,
+		serviceDirectory: join(home, "service"),
+		pollMs: 5,
+		now: () => now,
+	});
+	cleanups.push(() => manager.stop());
+	const result = await manager.start({ name: "relay-activity", text: "work", cwd: home });
+	if (!result.started) throw new Error("work held");
+	await until(() => hosts.length === 1 && port.sends.length === 1);
+	const correlation = { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` };
+	const activity = () =>
+		db.bindings.workLaneRows().find((row) => row.origin_key === result.sessionKey)!.last_activity_at;
+	// The original submitter receives correlated content and advances activity.
+	now += 2_000;
+	hosts[0]!.host(message("owned", correlation));
+	await until(() => activity() === new Date(now).toISOString());
+	const beforeLoss = activity();
+	hosts[0]!.close();
+	await until(() => hosts.length === 2 && hosts[1]!.written.some((frame) => frame.type === "hello"));
+	// SDK publishContentFrames keeps the old invocation connectionId. A fresh
+	// connection only gets an uncorrelated copy if BOTH observer caps were offered.
+	now += 2_000;
+	const hello = hosts[1]!.written.find((frame) => frame.type === "hello")!;
+	const caps = hello.capabilities as string[];
+	if (caps.includes("turn_stream") && caps.includes("session_host_observer_v1"))
+		hosts[1]!.host({ type: "event", kind: "tool_execution_end", payload: { toolCallId: "after-reopen" } });
+	await until(() => activity() !== beforeLoss);
+	expect(activity()).toBe(new Date(now).toISOString());
+	expect(db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null });
+	expect(db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(port.workerOutputReads).toHaveLength(0);
+	// Observation, hello, and lifecycle broadcasts are not execution progress.
+	const observed = activity();
+	now += 2_000;
+	hosts[1]!.host({ type: "activity", state: "active", at: now });
+	hosts[1]!.host({ type: "agent_end" });
+	hosts[1]!.host(message("foreign", { commandId: "foreign", turnId: "foreign" }));
+	await Bun.sleep(25);
+	expect(activity()).toBe(observed);
+	expect(db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+});

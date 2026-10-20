@@ -19,9 +19,21 @@ import { runtimeErrorOfLine, sanitizeDiagnostic } from "./rebind";
  * is attributed by correlation; the checks that used to reconstruct that from
  * three overlapping snapshot sources (turn floors, ring high-water marks,
  * text-hash dedupe, timestamp fences) do not exist any more.
+ * Work observers additionally negotiate session content for activity-only
+ * observation after reconnect; uncorrelated copies never become turn output.
  */
 
 export const HELLO_CAPABILITIES = ["tool_activity_v2"] as const;
+
+/** A fresh connection is not the original invocation's content recipient. */
+const OBSERVER_CAPABILITIES = ["turn_stream", "session_host_observer_v1"] as const;
+const SESSION_CONTENT_KINDS: ReadonlySet<string> = new Set([
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+]);
 
 /** Frame kinds the actor keys on (host `AgentSessionEvent` names plus lifecycle). */
 export type TailEventKind =
@@ -98,7 +110,15 @@ export interface TailAttachInput {
 		correlated: boolean,
 	) => void | Promise<void>;
 	onClosed?: () => void;
+	/** Synchronous correlation-validated non-idle ingress, before ordered frame delivery. */
+	onTurnActivity?: () => void;
 	onFrame?: (frame: TailFrame) => void | Promise<void>;
+	/**
+	 * Live session content observed without invocation correlation (e.g. after
+	 * reconnect). Observation only: never turn output, receipt, or end proof.
+	 * Called at ingress, not after the turn-frame delivery queue drains.
+	 */
+	onSessionActivity?: () => void;
 	onReverseRequest?: (input: {
 		id: string;
 		connectionId: string;
@@ -132,6 +152,8 @@ export type RelayResponse = {
 export interface TailHandle {
 	readonly sessionId: string;
 	readonly brokerGeneration: number;
+	/** Connected transport incarnation; undefined before hello, during gaps, and after close. */
+	readonly connectionEpoch: number | undefined;
 	/** Resolves once the host hello was exchanged on the relay. */
 	readonly ready: Promise<void>;
 	/** Sends `control_request` and resolves with its `control_response`. */
@@ -148,7 +170,7 @@ export interface TailHandle {
 	}): Promise<void>;
 	/**
 	 * Names the turn whose content this handle delivers. Frames with a different
-	 * correlation are dropped; uncorrelated frames were never turn content.
+	 * correlation are dropped; uncorrelated observer content is not turn evidence.
 	 */
 	beginTurn(opRef: string, correlation?: TurnCorrelation): void;
 	/** Observers resist TTL reaping but remain capacity-evictable. */
@@ -415,6 +437,7 @@ class ManagedTailHandle implements TailHandle {
 	#unknownDiagnostics = 0;
 	#stream: TailStream | undefined;
 	#connectionId: string | undefined;
+	#connectionEpoch = 0;
 	#helloResolve: (() => void) | undefined;
 	#refusal: RelayRefusedError | undefined;
 	#reopenFailures = 0;
@@ -452,6 +475,10 @@ class ManagedTailHandle implements TailHandle {
 
 	get turnRunning(): boolean {
 		return this.#running;
+	}
+
+	get connectionEpoch(): number | undefined {
+		return !this.#closed && this.#stream && this.#connectionId ? this.#connectionEpoch : undefined;
 	}
 
 	get running(): boolean {
@@ -644,7 +671,13 @@ class ManagedTailHandle implements TailHandle {
 						this.#helloResolve?.();
 					}
 				})();
-				stream.write(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [...HELLO_CAPABILITIES] }));
+				stream.write(
+					JSON.stringify({
+						type: "hello",
+						protocolVersion: 3,
+						capabilities: [...HELLO_CAPABILITIES, ...(this.#input.onSessionActivity ? OBSERVER_CAPABILITIES : [])],
+					}),
+				);
 				await hello;
 				clearTimeout(helloTimer);
 				if (this.#refusal) throw this.#refusal;
@@ -773,6 +806,7 @@ class ManagedTailHandle implements TailHandle {
 		if (frame.type === "hello") {
 			if (typeof frame.connectionId === "string" && frame.connectionId.length > 0) {
 				this.#connectionId = frame.connectionId;
+				this.#connectionEpoch++;
 				this.#helloResolve?.();
 			}
 			return;
@@ -855,8 +889,17 @@ class ManagedTailHandle implements TailHandle {
 			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`, "warn");
 		}
 		if (frame.commandId === undefined && frame.turnId === undefined) {
-			// Uncorrelated: lifecycle noise (activity, identity_header, notifications
-			// turn_stream). Only the idle marker matters to the actor.
+			// The SDK sends content to the original submitting connection, or an
+			// uncorrelated copy to explicitly negotiated session observers. Never
+			// invent an attempt correlation for that copy, even on a running handle.
+			if (this.#opRef && SESSION_CONTENT_KINDS.has(frame.rawKind)) {
+				try {
+					this.#input.onSessionActivity?.();
+				} catch {
+					this.#input.onDiagnostic?.(`tail_session_activity_failed session=${this.sessionId}`, "warn");
+				}
+			}
+			// Lifecycle/idle broadcasts retain their existing actor semantics.
 			if (!frame.idle) return;
 		} else if (!this.#matchesTurn(frame)) {
 			if (this.#droppedForeign++ === 0)
@@ -870,6 +913,7 @@ class ManagedTailHandle implements TailHandle {
 		// replies and unrelated notifications say nothing about the turn.
 		this.#lastEventAt = this.#runner.now();
 		this.#stallReported = false;
+		if (!frame.idle) this.#input.onTurnActivity?.();
 		this.#deliveries = this.#deliveries
 			.then(async () => {
 				if (this.#closed || frame.receiptOpRef !== this.#opRef) return;
@@ -934,17 +978,9 @@ class ManagedTailHandle implements TailHandle {
 				definitions: { methods: ["request"] },
 			}),
 		);
-		// Register for 'ui' capability with select and confirm methods
-		const uiId = `gw-ui-${this.brokerGeneration}-${this.sessionId}`;
-		stream.write(
-			JSON.stringify({
-				type: "register_provider",
-				id: uiId,
-				connectionId: this.#connectionId,
-				capability: "ui",
-				definitions: { methods: ["select", "confirm"] },
-			}),
-		);
+		// Do not advertise `ui`: GJC treats any UI provider registration as support
+		// for `ui.elicit`, which this gateway does not handle. Selector asks use the
+		// permission provider when the transport supports interactive panels.
 		// Start heartbeat timer to keep leases alive
 		this.#startHeartbeat();
 	}

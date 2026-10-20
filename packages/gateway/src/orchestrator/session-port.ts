@@ -16,6 +16,8 @@ import {
 	type LastAssistantResult,
 	OpRefError,
 	OpRefRejectedError,
+	type PromptOutcomeBody,
+	type PromptStatusBody,
 	parseEnvelope,
 	parseStatusReport,
 	type SendReceipt,
@@ -116,6 +118,8 @@ export interface SessionPort {
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
+	/** Live execution/queued-turn state from context.get; undefined is not idle proof. */
+	turnRunning?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean | undefined>;
 	/**
 	 * Background jobs (async `task` sub-lanes, async bash) still running inside the
 	 * session host (`runtime.jobs.list`). Ending the host ends them, so a caller
@@ -308,6 +312,8 @@ export type WorkerOutputResult =
 			readonly status: "proven";
 			readonly text: string;
 			readonly observedAtMs: number;
+			/** Correlated turn.result terminal facts, not an inferred success verdict. */
+			readonly terminal: PromptStatusBody;
 			readonly provenance: {
 				readonly source: "turn.result";
 				readonly fullness: "original";
@@ -442,11 +448,9 @@ export interface BrokerSessionPortOptions {
 
 const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
 const DEFAULT_STATUS_POLL_MS = 500;
-const SESSION_CREATE_ATTEMPTS = 5;
 const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
-const SESSION_CREATE_RETRY_MS = 1_000;
 /**
  * How long a completed broker operation answers a retry of the same op ref.
  * Keys are per-attempt, so this bounds the journal's size, not its correctness:
@@ -895,31 +899,25 @@ export class BrokerSessionPort implements SessionPort {
 		idempotencyKey: string,
 		requestJson: string,
 	): Promise<{ readonly sessionId?: unknown }> {
-		let lastFailure: unknown;
-		for (let attempt = 1; attempt <= SESSION_CREATE_ATTEMPTS; attempt++) {
-			try {
-				return parseEnvelope<{ sessionId?: unknown }>(
-					await this.#cli([
-						"sdk",
-						"session",
-						"raw",
-						"global",
-						"--op",
-						"session.create",
-						"--idempotency-key",
-						idempotencyKey,
-						"--json-input",
-						requestJson,
-					]),
+		try {
+			return parseEnvelope<{ sessionId?: unknown }>(
+				await this.#cli([
+					"sdk",
+					"session",
+					"raw",
+					"global",
+					"--op",
 					"session.create",
-				);
-			} catch (error) {
-				lastFailure = error;
-				if (!isTransientCreateFailure(error) || attempt === SESSION_CREATE_ATTEMPTS) throw sanitizeSdkFailure(error);
-				await this.#sleep(SESSION_CREATE_RETRY_MS);
-			}
+					"--idempotency-key",
+					idempotencyKey,
+					"--json-input",
+					requestJson,
+				]),
+				"session.create",
+			);
+		} catch (error) {
+			throw sanitizeSdkFailure(error);
 		}
-		throw sanitizeSdkFailure(lastFailure ?? new Error("session.create did not produce a result"));
 	}
 
 	/**
@@ -964,6 +962,8 @@ export class BrokerSessionPort implements SessionPort {
 				);
 			return { live: undefined, disowned: isSessionGoneCode(envelope.error?.code) };
 		}
+		if (result.exitCode !== 0 || envelope.ok !== true)
+			throw new GjcCliUnavailableError("session inspect did not provide a successful envelope");
 		const session = envelope.result?.session;
 		const live = session?.live;
 		const state = session?.activity?.state;
@@ -1582,6 +1582,37 @@ export class BrokerSessionPort implements SessionPort {
 		return parseRunningJobs(result.stdout);
 	}
 
+	async turnRunning(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean | undefined> {
+		this.#assertOwned(input);
+		const result = await this.#overRelay(
+			input,
+			"context.get",
+			async (sdk) => await sdk("query", "context.get", {}, { timeoutMs: 10_000 }),
+		);
+		if (result.exitCode !== 0) return undefined;
+		const response = JSON.parse(result.stdout) as {
+			ok?: unknown;
+			page?: { items?: unknown[]; complete?: unknown };
+		};
+		if (
+			response.ok !== true ||
+			response.page?.complete !== true ||
+			!Array.isArray(response.page.items) ||
+			response.page.items.length !== 1
+		)
+			return undefined;
+		const snapshot = recordOf(response.page.items[0]);
+		if (snapshot?.isStreaming === true) return true;
+		if (
+			(typeof snapshot?.steeringQueueDepth === "number" && snapshot.steeringQueueDepth > 0) ||
+			(typeof snapshot?.followupQueueDepth === "number" && snapshot.followupQueueDepth > 0)
+		)
+			return true;
+		if (snapshot?.isStreaming === false && snapshot.steeringQueueDepth === 0 && snapshot.followupQueueDepth === 0)
+			return false;
+		return undefined;
+	}
+
 	async contextUsage(input: {
 		sessionId: string;
 		repo: string;
@@ -2095,7 +2126,7 @@ export function parseWorkerOutputResponse(
 	if (result.status === "accepted" || result.status === "in_flight")
 		return { status: "absent", code: "output_pending" };
 	if (
-		result.status !== "terminal_ok" ||
+		(result.status !== "terminal_ok" && !(result.status === "failed" && result.receiptState === "missing")) ||
 		typeof result.terminalAt !== "number" ||
 		!Number.isFinite(result.terminalAt) ||
 		result.terminalAt < input.notBeforeMs
@@ -2109,6 +2140,13 @@ export function parseWorkerOutputResponse(
 			result.startedAt > result.terminalAt)
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
+	// A request deadline can publish a failed/missing result before the live
+	// execution's final receipt arrives. Keep that result inside the same bounded
+	// retrieval budget as terminal_ok/missing, never an assumed final failure.
+	if (result.status === "failed")
+		return result.content === undefined && result.textSummary === undefined
+			? { status: "absent", code: "output_pending" }
+			: { status: "unavailable", code: "invalid_evidence" };
 	const content = workerRecord(result.content);
 	if (!content) {
 		if (result.content !== undefined || result.textSummary !== undefined)
@@ -2135,6 +2173,16 @@ export function parseWorkerOutputResponse(
 		status: "proven",
 		text: content.text,
 		observedAtMs,
+		terminal: {
+			status: "terminal_ok",
+			clientRef: result.clientRef,
+			...(typeof result.commandId === "string" ? { commandId: result.commandId } : {}),
+			...(typeof result.turnId === "string" ? { turnId: result.turnId } : {}),
+			...(typeof result.startedAt === "number" ? { startedAt: result.startedAt } : {}),
+			terminalAt: result.terminalAt,
+			receiptState: "present",
+			...(workerRecord(result.outcome) ? { outcome: result.outcome as PromptOutcomeBody } : {}),
+		},
 		provenance: {
 			source: "turn.result",
 			fullness: "original",
@@ -2460,20 +2508,6 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 function isRefusedOutcome(error: unknown): boolean {
 	if (!(error instanceof GjcCliError)) return false;
 	return recordOf(error.details)?.outcomeCertainty === "not-applied" || isSessionGoneCode(sdkErrorCode(error));
-}
-
-/**
- * Create failures that are safe to retry under the SAME idempotency key: the
- * runtime either has not created the session (spawn_failed) or cannot yet
- * prove what it created (terminal_uncertain, uncertain_after_send). The key
- * guarantees the retry resolves to the same session, never a second one.
- * Measured: five simultaneous cold binds on one agent dir starve gjc's
- * lifecycle launcher and surface all three codes.
- */
-function isTransientCreateFailure(error: unknown): boolean {
-	if (!(error instanceof GjcCliError)) return false;
-	const code = envelopeErrorCode(error.details);
-	return code === "terminal_uncertain" || code === "uncertain_after_send" || code === "spawn_failed";
 }
 
 /**

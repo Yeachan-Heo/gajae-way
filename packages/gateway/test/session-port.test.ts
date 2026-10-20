@@ -976,7 +976,7 @@ test("broker SessionPort preserves a structured client-ref conflict emitted with
 	});
 });
 
-test("broker SessionPort retries a terminal-uncertain lifecycle create with the same idempotency key", async () => {
+test("broker SessionPort does not retry a terminal-uncertain lifecycle create", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -986,13 +986,12 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
 		createKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
-		if (createCalls++ === 0)
-			return {
-				exitCode: 1,
-				stdout: JSON.stringify({ ok: false, error: { code: "terminal_uncertain", message: "startup pending" } }),
-				stderr: "",
-			};
-		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-after-retry" } }), stderr: "" };
+		createCalls++;
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({ ok: false, error: { code: "terminal_uncertain", message: "startup pending" } }),
+			stderr: "",
+		};
 	};
 	const port = new BrokerSessionPort({
 		authority,
@@ -1004,15 +1003,17 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 		},
 	});
 	await expect(
-		port.bind({ originKey: "loopback/loopback/retry", epoch: 0, repo: join(home, "workspace") }),
-	).resolves.toMatchObject({
-		sessionId: "sdk-after-retry",
-	});
-	expect(createCalls).toBe(2);
-	expect(createKeys).toHaveLength(2);
+		port.bind({
+			originKey: "loopback/loopback/retry",
+			epoch: 0,
+			repo: join(home, "workspace"),
+			epochRecovery: false,
+		}),
+	).rejects.toMatchObject({ details: { code: "terminal_uncertain" } });
+	expect(createCalls).toBe(1);
+	expect(createKeys).toHaveLength(1);
 	expect(createKeys[0]).toMatch(/^gw-bind-[0-9a-f-]{36}$/);
-	expect(createKeys[1]).toBe(createKeys[0]);
-	expect(sleeps).toEqual([1_000]);
+	expect(sleeps).toEqual([]);
 });
 
 test("bind rebinds a persisted live-false session instead of handing a dead monitor endpoint to request", async () => {
@@ -1235,9 +1236,11 @@ test("liveness carries the host's activity {state, at} from session inspect, and
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database!, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
 	let session: Record<string, unknown> = {};
+	let exitCode = 0;
+	let ok: boolean | undefined = true;
 	const run: CliRunner = async (args) => {
 		if (!args.includes("inspect")) throw new Error(`unexpected command ${args.join(" ")}`);
-		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { session } }), stderr: "" };
+		return { exitCode, stdout: JSON.stringify({ ok, result: { session } }), stderr: "" };
 	};
 	const port = new BrokerSessionPort({
 		database: database!,
@@ -1256,6 +1259,14 @@ test("liveness carries the host's activity {state, at} from session inspect, and
 	expect(await port.liveness(target)).toEqual({ live: true, disowned: false });
 	session = { live: true };
 	expect(await port.liveness(target)).toEqual({ live: true, disowned: false });
+	session = { live: false };
+	exitCode = 1;
+	expect(await port.liveness(target)).toEqual({ live: undefined, disowned: false });
+	exitCode = 0;
+	ok = undefined;
+	expect(await port.liveness(target)).toEqual({ live: undefined, disowned: false });
+	ok = true;
+	expect(await port.liveness(target)).toEqual({ live: false, disowned: false });
 });
 
 test("close uses the global lifecycle route: the per-session control route prohibits session.close for the daemon CLI", async () => {
@@ -2010,6 +2021,78 @@ test("contextUsage reads context.get usage from the relay's query page", async (
 		expect(await port.contextUsage({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
 		reply = { ok: false, error: { code: "unsupported_query", message: "context.get is unavailable" } };
 		expect(await port.contextUsage({ sessionId: "sdk-1", repo, relay: tail })).toBeUndefined();
+	} finally {
+		await tail.close();
+	}
+});
+
+test("turnRunning requires a complete live idle snapshot with empty queues, over CLI and relay", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, {
+		sessionId: "sdk-1",
+		repo,
+		originKey: "turn-running",
+		epoch: 0,
+	});
+	let reply: Record<string, unknown> = {};
+	let cliReads = 0;
+	let exitCode = 0;
+	const run: CliRunner = async (args, options) => {
+		cliReads++;
+		expect(args).toContain("context.get");
+		expect(options?.timeoutMs).toBe(10_000);
+		return { exitCode, stdout: JSON.stringify(reply), stderr: "" };
+	};
+	const relay = scriptedRelay((request) => {
+		expect(request).toEqual({ type: "query_request", operation: "context.get", input: {} });
+		return reply as ReturnType<Parameters<typeof scriptedRelay>[0]>;
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+	});
+	const tail = await port.attachTail({ sessionId: "sdk-1", brokerGeneration: 0, repo });
+	const idle = { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
+	const cases: Array<[Record<string, unknown>, boolean | undefined]> = [
+		[{ ok: true, page: { items: [idle], complete: true } }, false],
+		[{ ok: true, page: { items: [{ isStreaming: true }], complete: true } }, true],
+		[{ ok: true, page: { items: [{ ...idle, steeringQueueDepth: 1 }], complete: true } }, true],
+		[{ ok: true, page: { items: [{ ...idle, followupQueueDepth: 1 }], complete: true } }, true],
+		...[
+			{ isStreaming: false },
+			{ ...idle, isStreaming: "false" },
+			{ ...idle, steeringQueueDepth: -1 },
+			{ ...idle, followupQueueDepth: "0" },
+		].map((snapshot): [Record<string, unknown>, undefined] => [
+			{ ok: true, page: { items: [snapshot], complete: true } },
+			undefined,
+		]),
+		[{ ok: true, page: { items: [idle], complete: false } }, undefined],
+		[{ ok: true, page: { items: [], complete: true } }, undefined],
+		[{ ok: true, page: { items: [idle, idle], complete: true } }, undefined],
+		[{ ok: false, error: { code: "unsupported_query" } }, undefined],
+		[{ ok: true, result: idle }, undefined],
+	];
+	try {
+		for (const [response, expected] of cases) {
+			reply = response;
+			const before = cliReads;
+			expect(await port.turnRunning({ sessionId: "sdk-1", repo, relay: tail })).toBe(expected);
+			expect(cliReads).toBe(before);
+			expect(await port.turnRunning({ sessionId: "sdk-1", repo })).toBe(expected);
+		}
+		await tail.close();
+		reply = { ok: true, page: { items: [idle], complete: true } };
+		const before = cliReads;
+		expect(await port.turnRunning({ sessionId: "sdk-1", repo, relay: tail })).toBe(false);
+		expect(cliReads).toBe(before + 1);
+		exitCode = 1;
+		expect(await port.turnRunning({ sessionId: "sdk-1", repo })).toBeUndefined();
 	} finally {
 		await tail.close();
 	}

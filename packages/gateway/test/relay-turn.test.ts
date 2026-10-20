@@ -6,8 +6,10 @@ import {
 	RelayRefusedError,
 	RelayRequestTimeoutError,
 	type TailFrame,
+	type TailHandle,
 	TailRunner,
 } from "../src/orchestrator/tail-runner";
+import { PermissionPanels } from "../src/server/permission-panels";
 
 /**
  * A scripted `gjc sdk serve --stdio` host: answers hello with a connectionId,
@@ -116,6 +118,130 @@ test("attach exchanges hello and stamps every request with the host's connection
 	expect(await pending).toEqual({ ok: true, result: { status: "in_flight" } });
 	await handle.close();
 	expect(relay.closed).toBe(true);
+});
+
+test("session observer content is activity only, without adoption or delivery-backlog timestamps", async () => {
+	const relay = new FakeRelay();
+	const frames: TailFrame[] = [];
+	let activity = 0;
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const handle = await runner(() => relay).attach({
+		sessionId: "session-observer",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onSessionActivity: () => {
+			activity++;
+		},
+		onFrame: async (frame) => {
+			frames.push(frame);
+			await blocked;
+		},
+	});
+	try {
+		expect(relay.written[0]?.capabilities).toEqual(["tool_activity_v2", "turn_stream", "session_host_observer_v1"]);
+		relay.host({ type: "event", kind: "tool_execution_end", payload: {} });
+		await Bun.sleep(0);
+		expect(activity).toBe(0); // No selected operation yet.
+		handle.beginTurn("op", CORRELATION);
+		relay.host(messageEnd("assistant", "owned"));
+		await Bun.sleep(0);
+		expect(frames).toHaveLength(1);
+		for (const kind of [
+			"message_update",
+			"message_end",
+			"tool_execution_start",
+			"tool_execution_update",
+			"tool_execution_end",
+		])
+			relay.host({ type: "event", kind, payload: {} });
+		await Bun.sleep(0);
+		expect(activity).toBe(5); // Ingress, even with the owned consumer blocked.
+		expect(frames).toHaveLength(1); // No observer content or synthesized IDs.
+		for (const frame of [
+			{ type: "hello", connectionId: relay.connectionId },
+			{ type: "activity", state: "active", at: Date.now() },
+			{ type: "tool_activity", state: "running" },
+			{ type: "event", kind: "unknown_future_kind", payload: {} },
+			{ type: "agent_start" },
+			{ type: "agent_end" },
+			messageEnd("assistant", "foreign", { commandId: "foreign", turnId: "foreign" }),
+		])
+			relay.host(frame);
+		await Bun.sleep(0);
+		expect(activity).toBe(5);
+		release();
+		await Bun.sleep(0);
+		// Uncorrelated idle remains an actor hint, never a correlated receipt.
+		expect(frames.map((frame) => [frame.kind, frame.commandId])).toEqual([
+			["message_end", CORRELATION.commandId],
+			["agent_end", undefined],
+		]);
+		await handle.close();
+		relay.host({ type: "event", kind: "tool_execution_end", payload: {} });
+		await Bun.sleep(0);
+		expect(activity).toBe(5);
+	} finally {
+		release();
+		await handle.close();
+	}
+});
+
+test("a fake GJC ui.elicit request is not advertised and gets an explicit stale-request refusal", async () => {
+	const relay = new FakeRelay();
+	const panels = new PermissionPanels({ deliver: () => {} });
+	let handled!: () => void;
+	const requestHandled = new Promise<void>((resolve) => {
+		handled = resolve;
+	});
+	let handle!: TailHandle;
+	handle = await runner(() => relay).attach({
+		sessionId: "ask-ui",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onReverseRequest: async (request) => {
+			await panels.open({
+				origin: { platform: "discord", kind: "dm", conversationId: "discord-dm" },
+				triggerAuthorId: "discord-user",
+				tail: handle,
+				request,
+			});
+			handled();
+		},
+	});
+	handle.beginTurn("ask-ui");
+	expect(relay.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+		{ capability: "permission", definitions: { methods: ["request"] } },
+	]);
+	relay.host({
+		type: "reverse_request",
+		id: "ask-1",
+		connectionId: "connection:1",
+		leaseId: "lease-ui",
+		capability: "ui",
+		payload: {
+			method: "ui.elicit",
+			payload: {
+				mode: "form",
+				message: "Choose one",
+				requestedSchema: {
+					type: "object",
+					properties: { value: { type: "string", oneOf: [{ const: "option:0", title: "First" }] } },
+					required: ["value"],
+				},
+			},
+		},
+	});
+	await requestHandled;
+	expect(relay.lastRequest("reverse_response")).toMatchObject({
+		type: "reverse_response",
+		id: "ask-1",
+		ok: false,
+		error: { code: "unavailable", message: "ui.elicit not available" },
+	});
+	await handle.close();
 });
 
 test("control responses resolve by id; a refused control carries its error code", async () => {
@@ -559,12 +685,16 @@ test("providers are registered after a reused turn's transport reopens", async (
 	});
 	const handle = await tail.attach({ sessionId: "providers", brokerGeneration: 1, repo: "/tmp" });
 	handle.beginTurn("first");
-	expect(relays[0]!.written.filter((frame) => frame.type === "register_provider")).toHaveLength(2);
+	expect(relays[0]!.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+		{ capability: "permission", definitions: { methods: ["request"] } },
+	]);
 	handle.beginTurn("second");
 	relays[0]!.end();
 	await Bun.sleep(10);
 	expect(relays).toHaveLength(2);
-	expect(relays[1]!.written.filter((frame) => frame.type === "register_provider")).toHaveLength(2);
+	expect(relays[1]!.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+		{ capability: "permission", definitions: { methods: ["request"] } },
+	]);
 	await handle.close();
 });
 

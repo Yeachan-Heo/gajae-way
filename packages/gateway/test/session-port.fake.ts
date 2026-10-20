@@ -990,6 +990,7 @@ export class ScriptedTailHandle implements TailHandle {
 	readonly #previousTurnIds = new Set<string>();
 	#running = false;
 	#closed = false;
+	#connectionEpoch = 1;
 
 	constructor(input: TailAttachInput, remove: () => void) {
 		this.#input = input;
@@ -1004,6 +1005,10 @@ export class ScriptedTailHandle implements TailHandle {
 
 	get running(): boolean {
 		return this.#running;
+	}
+
+	get connectionEpoch(): number | undefined {
+		return this.#closed ? undefined : this.#connectionEpoch;
 	}
 
 	async control(
@@ -1069,6 +1074,7 @@ export class ScriptedTailHandle implements TailHandle {
 			)
 				return;
 		} else if (!frame.idle) return;
+		if (!frame.idle) this.#input.onTurnActivity?.();
 		this.#flush = this.#flush.then(async () => {
 			if (this.#closed || frame.receiptOpRef !== this.#opRef) return;
 			await this.#input.onFrame?.(frame);
@@ -1094,6 +1100,7 @@ export class ScriptedTailHandle implements TailHandle {
 	/** Simulates the relay process dying under a running turn. */
 	lose(): void {
 		if (this.#closed) return;
+		this.#connectionEpoch++;
 		void this.#input.onRelayLost?.({
 			sessionId: this.sessionId,
 			brokerGeneration: this.brokerGeneration,

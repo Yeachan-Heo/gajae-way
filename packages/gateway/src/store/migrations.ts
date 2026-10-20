@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 37;
+export const LATEST_SCHEMA_VERSION = 38;
 
 export interface MigrationHost {
 	readonly database: {
@@ -826,6 +826,23 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(37, new Date().toISOString());
+		});
+	}
+	if (current < 38) {
+		// Issue #625: thread muting. When a bot replies with [SHUTUP], the thread
+		// is muted, suppressing LLM turns for unmentioned follow-ups until the next
+		// mention or reply to the bot. Persisted across restarts.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE IF NOT EXISTS thread_mutes (
+					thread_origin_key TEXT PRIMARY KEY,
+					muted_at TEXT NOT NULL,
+					CHECK(thread_origin_key LIKE 'slack/thread/%' OR thread_origin_key LIKE 'discord/thread/%')
+				);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(38, new Date().toISOString());
 		});
 	}
 }

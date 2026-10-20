@@ -5,11 +5,60 @@ import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { isAuthoredEchoSuspected } from "../src/monitors/compaction";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import {
+	buildMonitorAuthoringPrompt,
+	MONITOR_AUTHORING_HEADER,
+	MONITOR_AUTHORING_REPORT_RULE,
+	MonitorPropagator,
+} from "../src/monitors/propagate";
 import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors/registry";
 import { Store } from "../src/store";
 
 import { ScriptedSessionPort } from "./session-port.fake";
+
+const RUNTIME_FEEDBACK_INSTRUCTION =
+	"Review the last 24 hours of runtime operation. Report actual friction, failures and latency with public-safe evidence only. Check existing issues before proposing a new one.";
+const RUNTIME_FEEDBACK_EVENT_TYPE = "gajaeway.runtime-feedback.daily";
+
+const CONTRACT_ONLY_DAILY_NOTES = [
+	{
+		date: "2026-10-12",
+		note: `What the run should do: ${RUNTIME_FEEDBACK_INSTRUCTION} This review was scheduled for 2026-10-12T11:00Z.`,
+	},
+	{
+		date: "2026-10-13",
+		note: "The daily runtime-feedback review was scheduled for 2026-10-13T11:00Z to review the last 24 hours of runtime operation and report actual friction, failures and latency with public-safe evidence. It describes the event only and does not confirm the review ran or what it found. Check existing issues before proposing a new one.",
+	},
+	{
+		date: "2026-10-14",
+		note: "The daily runtime feedback review was scheduled for 2026-10-14T11:00Z to look back over the last 24 hours, describe operational friction, failures and delays, and check existing issues before proposing a new one. This note only describes the event and does not confirm that the review ran or what it found.",
+	},
+	{
+		date: "2026-10-15",
+		note: "Today's target is a retrospective of runtime activity for the previous 24 hours: identify friction, failures, and latency, then consider existing issues before raising another. The event was scheduled at 2026-10-15T11:00Z; this only describes the target and does not confirm work.",
+	},
+	{
+		date: "2026-10-16",
+		note: "A daily review was due at 2026-10-16T11:00Z to examine recent runtime operations, capture problems and slowdowns, and consider current issues before proposing a new issue. This note describes the assignment only; it does not confirm that anything ran or what was found.",
+	},
+	{
+		date: "2026-10-17",
+		note: "The scheduled review at 2026-10-17T11:00Z covers the last 24 hours of runtime operation: report actual friction, failures and latency using public-safe evidence; check existing issues before proposing a new one. This note only describes the task; it does not confirm that review ran or what it found.",
+	},
+	{
+		date: "2026-10-18",
+		note: "The daily runtime feedback review was scheduled for 2026-10-18T11:00Z to inspect the last 24 hours of operation, report friction, failures and latency with public-safe evidence, and check existing issues before suggesting another. This note only describes the event. It does not confirm that the review ran or say what it found.",
+	},
+] as const;
+
+function runtimeFeedbackEventContext(date: string) {
+	return {
+		eventType: RUNTIME_FEEDBACK_EVENT_TYPE,
+		eventId: "4afac2c1-bf4b-44e8-9db4-58c453764a8b",
+		payload: { at: `${date}T11:00:00.000Z` },
+		firedAt: `${date}T11:00:00.000Z`,
+	};
+}
 
 /** Real registry + generic SessionPort harness honoring the JSON authoring contract. */
 async function harness(directory: string) {
@@ -41,6 +90,23 @@ async function harness(directory: string) {
 	return { database, registry, pipeline, prompts };
 }
 
+test("the authoring prompt orders execution before the report, with literal wording (#369)", () => {
+	const events = [{ eventId: "e-1", eventType: "deploy.blocked", payload: { release: "r-1" } }];
+	const prompt = buildMonitorAuthoringPrompt({ guidance: "Pull the deploy queue.", events });
+	const lines = prompt.split("\n");
+	// Literal phrases, not the exported constants: the wording is the fix.
+	expect(lines[0]).toContain("Do the work");
+	expect(lines[0]).toContain("using your tools, before you reply");
+	expect(lines[1]).toBe("Task: Pull the deploy queue.");
+	expect(lines[2]).toContain("Report only after the work is done");
+	expect(lines[2]).toContain("restates the task instead of reporting results is rejected");
+	expect(lines[3]).toBe(
+		`Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(events)}`,
+	);
+	expect(lines).toHaveLength(4);
+	expect(prompt).not.toContain("Author monitor events");
+});
+
 test("a monitor's instruction reaches the authoring prompt and survives a store round-trip", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-instruction-"));
 	try {
@@ -61,9 +127,13 @@ test("a monitor's instruction reaches the authoring prompt and survives a store 
 		expect(prompts).toHaveLength(1);
 		const prompt = prompts[0]!;
 		expect(prompt).toContain(instruction);
-		// The instruction lands in the guidance slot, directly after the header and
-		// before the JSON-array response contract — which is unchanged.
-		expect(prompt.startsWith(`Author monitor events. ${instruction} Respond ONLY with a JSON array`)).toBe(true);
+		// The instruction is the task to execute, directly after the execute-first
+		// header and before the report rule and JSON-array response contract (#369).
+		expect(
+			prompt.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		expect(prompt).toContain('{"eventId","note"}');
 		database.close();
 	} finally {
@@ -71,7 +141,7 @@ test("a monitor's instruction reaches the authoring prompt and survives a store 
 	}
 });
 
-test("a monitor without an instruction keeps the exact pre-existing prompt shape", async () => {
+test("a monitor without an instruction gets no task segment", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-no-instruction-"));
 	try {
 		const { database, registry, pipeline, prompts } = await harness(directory);
@@ -87,8 +157,12 @@ test("a monitor without an instruction keeps the exact pre-existing prompt shape
 		await Bun.sleep(250);
 		expect(prompts).toHaveLength(1);
 		// No instruction and no maintenance guidance for this event type: no
-		// guidance segment at all.
-		expect(prompts[0]!.startsWith("Author monitor events. Respond ONLY with a JSON array")).toBe(true);
+		// task segment at all.
+		expect(
+			prompts[0]!.startsWith(
+				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
+			),
+		).toBe(true);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -198,7 +272,7 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 
 		const prompts: string[] = [];
 		const delivered: ChatMessagePayload[] = [];
-		const note = `${instruction} Release blocked.`;
+		const note = `${instruction} Release blocked; issue #632 tracks the blocker.`;
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
@@ -216,7 +290,7 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 		});
 		pipeline.submit(monitorId, "gajaeway.runtime-feedback.daily", { at: "2026-09-07T11:00:00.000Z" });
 		await Bun.sleep(250);
-		expect(prompts[0]!.startsWith(`Author monitor events. ${instruction} Respond ONLY`)).toBe(true);
+		expect(prompts[0]!.startsWith(`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n`)).toBe(true);
 		expect(delivered).toHaveLength(1);
 		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
 		// The mention comes from the typed field, not from the author remembering it.
@@ -227,17 +301,16 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 	}
 });
 
-test("#369: contract-only notes are terminal and never delivered", async () => {
+test("#632: dated contract-only notes are terminal and never delivered", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-contract-echo-"));
 	try {
 		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
-		const instruction =
-			"Review the last 24 hours of runtime operation. Report actual friction, failures and latency with public-safe evidence only.";
+		const instruction = RUNTIME_FEEDBACK_INSTRUCTION;
 		const monitor = registry.add({
 			name: "runtime-feedback",
 			trigger: { kind: "cron", schedule: "*/5 * * * *" },
-			eventTypes: ["gajaeway.runtime-feedback.daily"],
+			eventTypes: [RUNTIME_FEEDBACK_EVENT_TYPE],
 			instruction,
 			channelTarget: {
 				origin: { platform: "discord", kind: "channel", conversationId: "1470204268933022023" },
@@ -245,13 +318,16 @@ test("#369: contract-only notes are terminal and never delivered", async () => {
 			},
 		});
 		const delivered: ChatMessagePayload[] = [];
+		const noteFixture = CONTRACT_ONLY_DAILY_NOTES.find(({ date }) => date === "2026-10-18");
+		if (!noteFixture) throw new Error("10-18 regression note is missing");
+		const note = noteFixture.note;
 		const sessionPort = new ScriptedSessionPort({
 			onSend: (input, scripted) => {
 				const payload = input.text.match(/\[.*\]$/s)?.[0];
 				if (!payload) throw new Error("monitor event payload is missing");
 				const [event] = JSON.parse(payload) as Array<{ eventId: string }>;
 				if (!event) throw new Error("monitor event is missing");
-				scripted.complete(input.opRef, JSON.stringify([{ eventId: event.eventId, note: instruction }]));
+				scripted.complete(input.opRef, JSON.stringify([{ eventId: event.eventId, note }]));
 			},
 		});
 		const pipeline = new MonitorPropagator({
@@ -264,7 +340,9 @@ test("#369: contract-only notes are terminal and never delivered", async () => {
 			deliver: (payload) => delivered.push(payload),
 		});
 
-		pipeline.submit(monitor.monitorId, "gajaeway.runtime-feedback.daily", {});
+		pipeline.submit(monitor.monitorId, RUNTIME_FEEDBACK_EVENT_TYPE, {
+			at: "2026-10-18T11:00:00.000Z",
+		});
 		await Bun.sleep(250);
 
 		expect(delivered).toHaveLength(0);
@@ -289,19 +367,136 @@ test("#369: reused event-tag text and copied numbers are not novel work evidence
 			"Review the last 24 hours of runtime activity and report blockers and failures.",
 			"Review the last 24 hours of runtime activity and report blockers and failures. Release blocked.",
 		),
-	).toBe(false);
+	).toBe(true);
 	expect(
 		isAuthoredEchoSuspected(
 			"Review the last 24 hours of runtime activity and report blockers and failures.",
 			"Review the last 24 hours of runtime activity and report blockers and failures. Blockers remain.",
 		),
-	).toBe(false);
+	).toBe(true);
 	expect(
 		isAuthoredEchoSuspected(
 			"Review the last 24 hours of runtime activity and report blockers and failures.",
 			"Review the last 24 hours.",
 		),
 	).toBe(false);
+});
+
+test("#632: seven paraphrased daily notes are detected against the stored instruction and event contract", () => {
+	// The issue quotes the 10-18 ending verbatim; the other entries represent the reported restatement shapes.
+	for (const { date, note } of CONTRACT_ONLY_DAILY_NOTES) {
+		expect(isAuthoredEchoSuspected(RUNTIME_FEEDBACK_INSTRUCTION, note, runtimeFeedbackEventContext(date))).toBe(true);
+	}
+});
+
+test("#632: event types and timestamps cannot dilute a short instruction echo", () => {
+	const context = {
+		eventType: "backup.daily",
+		eventId: "4afac2c1-bf4b-44e8-9db4-58c453764a8b",
+		payload: { at: "2026-10-18T11:00:00.000Z" },
+		firedAt: "2026-10-18T11:00:00.000Z",
+	};
+	expect(isAuthoredEchoSuspected("Check backups.", "backup daily 2026-10-18T11:00Z", context)).toBe(true);
+	expect(isAuthoredEchoSuspected("Check backups.", "Check backups.", context)).toBe(true);
+	expect(
+		isAuthoredEchoSuspected(
+			"Inspect release logs.",
+			"This note only describes the event. It does not confirm that the review ran.",
+			{ eventType: "deployment.audit" },
+		),
+	).toBe(true);
+});
+
+test("#632: copied payload values and URLs are not novel evidence", () => {
+	const shared = { eventType: "deployment.daily" };
+	expect(
+		isAuthoredEchoSuspected("Check deployment.", "Check deployment for release r-1.", {
+			...shared,
+			payload: { release: "r-1" },
+		}),
+	).toBe(true);
+	expect(
+		isAuthoredEchoSuspected("Check deployment.", "Check deployment https://example.com/incident/42", {
+			...shared,
+			payload: { url: "https://example.com/incident/42" },
+		}),
+	).toBe(true);
+	expect(
+		isAuthoredEchoSuspected("Check deployment.", "Check deployment https://example.com/incident/43", {
+			...shared,
+			payload: { url: "https://example.com/incident/42" },
+		}),
+	).toBe(false);
+	const countContext = { eventType: "deployment.daily", payload: { failures: 3 } };
+	expect(isAuthoredEchoSuspected("Check deployment.", "Check deployment. Found 3 failures.", countContext)).toBe(true);
+	expect(isAuthoredEchoSuspected("Check deployment.", "Check deployment. Found 4 failures.", countContext)).toBe(false);
+});
+
+test("#632: command prose is not evidence, while root files and keyed issue ids are", () => {
+	const instruction =
+		"Review the last 24 hours of runtime activity and report blockers, failures, latency, deploy status, error rates, public-safe evidence, and existing issues before proposing changes.";
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} Changed README.md.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} Opened OPS-123.`)).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			"Review deployment daily.",
+			"This note only describes the task and does not confirm work: running deployment review.",
+			{ eventType: "deployment.daily" },
+		),
+	).toBe(true);
+	expect(isAuthoredEchoSuspected(instruction, `${instruction} I did not run \`make test\`.`)).toBe(true);
+	expect(isAuthoredEchoSuspected(instruction, "I did not inspect https://example.com/checks/42.")).toBe(true);
+});
+
+test("#632: reports with novel commands, PRs, SHAs, URLs, paths, or numeric results remain deliverable", () => {
+	const reports = [
+		"Ran bun test packages/gateway/test/monitor-instruction.test.ts: 12 tests passed and 0 failed.",
+		"Opened PR #640 to add the missing event payload to the contract gate.",
+		"Applied the fix in commit c534283180.",
+		"Review evidence: https://github.com/Yeachan-Heo/gajae-way/pull/632/checks.",
+		"Changed packages/gateway/src/monitors/compaction.ts and verified the new verdict.",
+		"The monitor scan found 3 failures and 0 unresolved warnings.",
+	];
+	const context = runtimeFeedbackEventContext("2026-10-18");
+	for (const note of reports) {
+		expect(isAuthoredEchoSuspected(RUNTIME_FEEDBACK_INSTRUCTION, note, context)).toBe(false);
+	}
+	const longerInstruction =
+		"Review the last 24 hours of runtime activity and report blockers, failures, latency, deploy status, error rates, public-safe evidence, and existing issues before proposing changes.";
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make test: passed.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran make: passed.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran pytest: passed.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran git commit -m "fix": passed.`)).toBe(
+		false,
+	);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Ran ./scripts/check: passed.`)).toBe(false);
+	expect(
+		isAuthoredEchoSuspected(
+			longerInstruction,
+			`${longerInstruction} Ran pytest: 12 tests passed. Did not run integration tests.`,
+		),
+	).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth: 17.`)).toBe(false);
+	expect(isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Latency was 450.`)).toBe(false);
+	const numberedInstruction = `${longerInstruction} Check queue depth 17.`;
+	expect(isAuthoredEchoSuspected(numberedInstruction, `${numberedInstruction} Queue depth is 17.`)).toBe(true);
+	const differentNumberInstruction = `${longerInstruction} Check queue depth 16.`;
+	expect(isAuthoredEchoSuspected(differentNumberInstruction, `${differentNumberInstruction} Queue depth is 17.`)).toBe(
+		false,
+	);
+	expect(
+		isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth is 17.`, {
+			eventType: "report.daily",
+			payload: { depth: 17 },
+		}),
+	).toBe(true);
+	expect(
+		isAuthoredEchoSuspected(longerInstruction, `${longerInstruction} Queue depth: 17.`, {
+			eventType: "report.daily",
+			payload: { depth: 17 },
+		}),
+	).toBe(true);
 });
 
 test("#180: mention targets are validated as platform ids", async () => {

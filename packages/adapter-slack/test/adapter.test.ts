@@ -225,6 +225,7 @@ for (const shape of [
 						receivedAt: "2023-11-14T22:13:20.123Z",
 						engagement: {
 							mentioned: shape.parent_user_id === "UBOT",
+							explicitMention: false,
 							group: !dm,
 							authorId: "U1",
 							authorName: "Alice",
@@ -282,8 +283,13 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 		const message = inbound(extra);
 		expect(engagementForMessage(message, slackMessageOrigin(message), identity, names, undefined).mentioned).toBe(true);
 	}
+	expect(
+		engagementForMessage(inbound({ text: "<@UBOT> hi" }), origin, identity, names, undefined).explicitMention,
+	).toBe(true);
 	expect(engagementForMessage(inbound({ text: "<@UBOT2>" }), origin, identity, names, undefined).mentioned).toBe(false);
-	expect(engagementForMessage(inbound(), origin, identity, names, { C1: { engagement: "open" } }).mentioned).toBe(true);
+	const openChannel = engagementForMessage(inbound(), origin, identity, names, { C1: { engagement: "open" } });
+	expect(openChannel.mentioned).toBe(true);
+	expect(openChannel.explicitMention).toBe(false);
 	expect(
 		engagementForMessage(
 			inbound({ channel: "D1" }),
@@ -301,6 +307,7 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 	);
 	expect(bot?.engagement).toEqual({
 		mentioned: false,
+		explicitMention: false,
 		group: true,
 		authorId: "B2",
 		authorIsBot: true,
@@ -322,6 +329,7 @@ test("Slack thread reply under the bot's own message continues the channel sessi
 	expect(underBot?.origin).toEqual({ platform: "slack", kind: "channel", conversationId: "C1" });
 	expect(underBot?.engagement.replyTo).toEqual({ messageId: "C1:1700000001.000000", authorId: "UBOT", fromSelf: true });
 	expect(underBot?.engagement.mentioned).toBe(true);
+	expect(underBot?.engagement.explicitMention).toBe(false);
 	// Thread a human started on their own message: its own origin and session.
 	const underHuman = decideInbound(
 		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", parent_user_id: "U9", text: "side talk" }),
@@ -380,6 +388,7 @@ test("Slack edits use nested identity, edited timestamp and rendered body equali
 					receivedAt: "2023-11-14T22:13:21.500Z",
 					engagement: {
 						...engagement,
+						explicitMention: false,
 						authorName: "Alice",
 						authorHandle: "alice",
 						channelLabel: "#general",
