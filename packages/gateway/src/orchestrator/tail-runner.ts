@@ -110,6 +110,8 @@ export interface TailAttachInput {
 		correlated: boolean,
 	) => void | Promise<void>;
 	onClosed?: () => void;
+	/** Synchronous correlation-validated non-idle ingress, before ordered frame delivery. */
+	onTurnActivity?: () => void;
 	onFrame?: (frame: TailFrame) => void | Promise<void>;
 	/**
 	 * Live session content observed without invocation correlation (e.g. after
@@ -150,6 +152,8 @@ export type RelayResponse = {
 export interface TailHandle {
 	readonly sessionId: string;
 	readonly brokerGeneration: number;
+	/** Connected transport incarnation; undefined before hello, during gaps, and after close. */
+	readonly connectionEpoch: number | undefined;
 	/** Resolves once the host hello was exchanged on the relay. */
 	readonly ready: Promise<void>;
 	/** Sends `control_request` and resolves with its `control_response`. */
@@ -433,6 +437,7 @@ class ManagedTailHandle implements TailHandle {
 	#unknownDiagnostics = 0;
 	#stream: TailStream | undefined;
 	#connectionId: string | undefined;
+	#connectionEpoch = 0;
 	#helloResolve: (() => void) | undefined;
 	#refusal: RelayRefusedError | undefined;
 	#reopenFailures = 0;
@@ -470,6 +475,10 @@ class ManagedTailHandle implements TailHandle {
 
 	get turnRunning(): boolean {
 		return this.#running;
+	}
+
+	get connectionEpoch(): number | undefined {
+		return !this.#closed && this.#stream && this.#connectionId ? this.#connectionEpoch : undefined;
 	}
 
 	get running(): boolean {
@@ -797,6 +806,7 @@ class ManagedTailHandle implements TailHandle {
 		if (frame.type === "hello") {
 			if (typeof frame.connectionId === "string" && frame.connectionId.length > 0) {
 				this.#connectionId = frame.connectionId;
+				this.#connectionEpoch++;
 				this.#helloResolve?.();
 			}
 			return;
@@ -903,6 +913,7 @@ class ManagedTailHandle implements TailHandle {
 		// replies and unrelated notifications say nothing about the turn.
 		this.#lastEventAt = this.#runner.now();
 		this.#stallReported = false;
+		if (!frame.idle) this.#input.onTurnActivity?.();
 		this.#deliveries = this.#deliveries
 			.then(async () => {
 				if (this.#closed || frame.receiptOpRef !== this.#opRef) return;

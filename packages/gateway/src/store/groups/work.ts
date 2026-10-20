@@ -122,6 +122,29 @@ export interface WorkAttemptTerminalEvidence {
 	readonly status?: PromptStatusBody;
 }
 
+/** The caller must first validate and sanitize the correlated status. */
+export function terminalEvidence(
+	status: PromptStatusBody,
+	observedAt: string,
+): WorkAttemptTerminalEvidence | undefined {
+	if (status.status !== "terminal_ok" && status.status !== "failed") return undefined;
+	const reasonCode =
+		status.receiptState === "missing"
+			? "terminal_missing_receipt"
+			: status.receiptState === "unknown"
+				? "terminal_uncertain"
+				: status.status === "failed"
+					? status.error?.code === "prompt_deadline_exceeded"
+						? "prompt_deadline_exceeded"
+						: "sdk_failed"
+					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
+						? "end_turn"
+						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
+							? status.outcome!.reason!
+							: "stopped_incomplete";
+	return { kind: "broker", observedAt, reasonCode, status };
+}
+
 export interface WorkAttemptRuntime {
 	readonly opRef: string;
 	readonly jobId: string;
@@ -134,7 +157,7 @@ export interface WorkAttemptRuntime {
 	readonly mode: WorkAttemptMode;
 	readonly sendPhase: "prepared" | "accepted" | "uncertain";
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
-	/** Lifecycle proof that the session turn ended; a missing receipt alone is not terminal proof. */
+	/** Turn-end proof from lifecycle or live idle reconciliation; a missing receipt alone is not proof. */
 	readonly turnEndObservedAt?: string;
 	readonly terminal: WorkAttemptTerminalEvidence | null;
 	readonly output: WorkAttemptOutput;
@@ -422,14 +445,23 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRuntime): boolean {
 	const before = current.terminal;
 	const after = next.terminal;
+	const proof = next.output.proof;
 	return (
 		before?.kind === "broker" &&
 		after?.kind === "broker" &&
 		before.observedAt === after.observedAt &&
 		before.status?.receiptState === "missing" &&
-		JSON.stringify({ ...before.status, receiptState: "present" }) === JSON.stringify(after.status) &&
+		after.status?.receiptState === "present" &&
+		after.status.status === "terminal_ok" &&
+		after.reasonCode === terminalEvidence(after.status, after.observedAt)?.reasonCode &&
+		after.status.clientRef === current.opRef &&
+		(before.status.commandId === undefined || before.status.commandId === after.status.commandId) &&
+		(before.status.turnId === undefined || before.status.turnId === after.status.turnId) &&
 		current.output.proof === null &&
-		next.output.proof !== null &&
+		proof !== null &&
+		after.status.commandId === proof.commandId &&
+		after.status.turnId === proof.turnId &&
+		after.status.terminalAt === proof.terminalAt &&
 		(next.output.disposition === "available" || next.output.disposition === "silent")
 	);
 }

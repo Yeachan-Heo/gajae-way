@@ -1321,7 +1321,13 @@ describe("work attempt durable transactions", () => {
 			kind: "broker" as const,
 			observedAt: END,
 			reasonCode: "terminal_missing_receipt",
-			status: { status: "terminal_ok" as const, receiptState: "missing" as const, outcome: { reason: "end_turn" } },
+			status: {
+				status: "terminal_ok" as const,
+				receiptState: "missing" as const,
+				clientRef: f.runtime.opRef,
+				terminalAt: Date.parse(END),
+				outcome: { reason: "end_turn" },
+			},
 		};
 		const present = {
 			...missing,
