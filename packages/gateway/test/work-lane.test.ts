@@ -1780,6 +1780,152 @@ test("#562 a missing receipt stays open during turn activity and recovery until 
 	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 });
 
+for (const endEvidence of ["idle", "dead", "receipt", "cancelled"] as const) {
+	test(`a persisted missing-receipt terminal recovers via ${endEvidence} without ending live execution`, async () => {
+		let now = Date.now();
+		let generation = 0;
+		const f = await fixture({ now: () => now, hostLostGraceMs: 100, brokerGeneration: () => generation });
+		const result = await started(f, "a", origin);
+		await f.manager.stop();
+		const runtime = f.db.work.workAttemptGet(result.opRef)!;
+		const status = {
+			status: "failed" as const,
+			clientRef: result.opRef,
+			commandId: `command-${result.opRef}`,
+			turnId: `turn-${result.opRef}`,
+			startedAt: now,
+			terminalAt: now + 1,
+			receiptState: "missing" as const,
+			error: { code: "prompt_deadline_exceeded" },
+		};
+		f.db.transaction((tx) =>
+			f.db.work.workAttemptUpdate(tx, result.opRef, runtime.version, {
+				terminal: {
+					kind: "broker",
+					observedAt: new Date(now).toISOString(),
+					reasonCode: "terminal_missing_receipt",
+					status,
+				},
+			}),
+		);
+		let running: boolean | undefined = true;
+		let probes = 0;
+		let inspections = 0;
+		let receipt = false;
+		let statusReads = 0;
+		let refresh: "normal" | "foreign" | "unknown" | "in_flight" = "normal";
+		Object.assign(f.port, {
+			turnRunning: async () => {
+				probes++;
+				return running;
+			},
+		});
+		f.port.liveness = async () => {
+			inspections++;
+			return { live: false, disowned: false };
+		};
+		const currentStatus = () =>
+			receipt
+				? {
+						...status,
+						status: "terminal_ok" as const,
+						receiptState: "present" as const,
+						error: undefined,
+						outcome: { reason: endEvidence === "cancelled" ? "cancelled" : "end_turn" },
+					}
+				: status;
+		f.port.status = async (input) => {
+			statusReads++;
+			const current = currentStatus();
+			return {
+				operationRef: input.opRef,
+				status: {
+					...current,
+					...(refresh === "foreign" ? { turnId: "foreign-turn" } : {}),
+					...(refresh === "unknown" ? { receiptState: "unknown" as const } : {}),
+					...(refresh === "in_flight" ? { status: "in_flight" as const } : {}),
+				},
+				summaryCompleted: true,
+			};
+		};
+		f.port.fetchWorkerOutput = async (input) =>
+			receipt
+				? parseWorkerOutputResponse(
+						input,
+						{
+							exitCode: 0,
+							stderr: "",
+							stdout: JSON.stringify({
+								ok: true,
+								result: {
+									kind: "prompt",
+									...currentStatus(),
+									content: { version: 1, type: "text", text: "recovered", byteLength: 9, truncated: false },
+								},
+							}),
+						},
+						now,
+					)
+				: { status: "absent", code: "output_pending" };
+		await f.restart();
+		await until(() => probes > 0);
+		now += 86_400_000;
+		const prior = probes;
+		await until(() => probes > prior);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null, output: { reads: 0 } });
+		expect(f.notices).toEqual([]);
+		expect(inspections).toBe(0);
+		generation++;
+		await f.manager.onBrokerGeneration();
+		if (endEvidence === "dead") {
+			running = undefined;
+			await until(() => inspections > 0);
+			now += 99;
+			const before = inspections;
+			await until(() => inspections > before);
+			expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(0);
+			// A refreshed nonterminal status interrupts continuous-death proof.
+			refresh = "in_flight";
+			const beforeStatus = statusReads;
+			now += 1000;
+			await until(() => statusReads > beforeStatus);
+			refresh = "normal";
+			const beforeReset = inspections;
+			await until(() => inspections > beforeReset);
+			now += 99;
+			const afterReset = inspections;
+			await until(() => inspections > afterReset);
+			expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(0);
+			now += 1;
+		} else if (endEvidence === "idle") running = false;
+		else {
+			receipt = true;
+			for (const blocked of ["foreign", "unknown", "in_flight"] as const) {
+				refresh = blocked;
+				const before = statusReads;
+				await until(() => statusReads > before + 1);
+				expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null, output: { reads: 0 } });
+			}
+			refresh = "normal";
+		}
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.output.reads === 1);
+		if (!receipt) {
+			await f.restart();
+			now += 1000;
+			await until(() => f.db.work.workAttemptGet(result.opRef)?.output.reads === 2);
+			now += 5000;
+		}
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+		expect(f.job().attempts[0]?.endState).toBe(
+			receipt ? (endEvidence === "cancelled" ? "attempt_ended" : "completed") : "terminal_missing_receipt",
+		);
+		await f.restart();
+		expect(f.notices).toHaveLength(1);
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.port.resumes).toHaveLength(0);
+	});
+}
+
 test("an idle runtime reconciles a missing receipt after lost lifecycle, including restart", async () => {
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
@@ -2094,117 +2240,128 @@ for (const stage of ["context", "status"] as const) {
 }
 
 for (const evidence of ["idle", "dead"] as const) {
-	test(`real tail ingress invalidates ${evidence} proof behind an idle delivery backlog`, async () => {
-		const f = await fixture({ hostLostGraceMs: 0 });
-		const releaseFrames = deferred<void>();
-		const releaseStatus = deferred<void>();
-		let terminal = false;
-		let terminalAt = 0;
-		let rechecking = false;
-		let recheckReturned = false;
-		let queries = 0;
-		let backlogEntered = false;
-		let toolDelivered = false;
-		let ingress = 0;
-		let executionProbes = 0;
-		let running: boolean | undefined = evidence === "idle" ? false : undefined;
-		const relay = scriptedRelay(async () => {
-			if (terminal && ++queries === 2) {
-				rechecking = true;
-				await releaseStatus.promise;
-			}
-			return { ok: true, result: {} };
-		});
-		const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
-		let attached: TailHandle | undefined;
-		f.port.attachTail = async (input) => {
-			const tail = await runner.attach({
-				...input,
-				onTurnActivity: () => {
-					ingress++;
-					input.onTurnActivity?.();
-				},
-				onFrame: async (frame) => {
-					if (frame.kind === "activity" && frame.idle) {
-						backlogEntered = true;
-						await releaseFrames.promise;
-					}
-					if (frame.kind === "tool_execution_start") toolDelivered = true;
-					await input.onFrame?.(frame);
-				},
+	for (const ingressKind of ["tool", "agent_start", "positioned_agent_start"] as const) {
+		test(`real tail ${ingressKind} ingress invalidates ${evidence} proof behind an idle delivery backlog`, async () => {
+			const f = await fixture({ hostLostGraceMs: 0 });
+			const releaseFrames = deferred<void>();
+			const releaseStatus = deferred<void>();
+			let terminal = false;
+			let terminalAt = 0;
+			let rechecking = false;
+			let recheckReturned = false;
+			let queries = 0;
+			let backlogEntered = false;
+			let toolDelivered = false;
+			let ingress = 0;
+			let executionProbes = 0;
+			let running: boolean | undefined = evidence === "idle" ? false : undefined;
+			const relay = scriptedRelay(async () => {
+				if (terminal && ++queries === 2) {
+					rechecking = true;
+					await releaseStatus.promise;
+				}
+				return { ok: true, result: {} };
 			});
-			attached = tail;
-			return tail;
-		};
-		Object.assign(f.port, {
-			turnRunning: async () => {
-				executionProbes++;
-				return running;
-			},
-		});
-		const status = f.port.status.bind(f.port);
-		f.port.status = async (input) => {
-			const report = await status(input);
-			if (!terminal) return report;
-			if (input.relay) {
-				await (input.relay as TailHandle).query("turn.result", { kind: "prompt", clientRef: input.opRef });
-				if (queries >= 2) recheckReturned = true;
-			}
-			return {
-				...report,
-				status: {
-					...report.status,
-					status: "failed",
-					receiptState: "missing",
-					clientRef: input.opRef,
-					terminalAt,
-					error: { code: "prompt_deadline_exceeded" },
-				},
-				summaryCompleted: true,
+			const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+			let attached: TailHandle | undefined;
+			f.port.attachTail = async (input) => {
+				const tail = await runner.attach({
+					...input,
+					onTurnActivity: () => {
+						ingress++;
+						input.onTurnActivity?.();
+					},
+					onFrame: async (frame) => {
+						if (frame.kind === "activity" && frame.idle) {
+							backlogEntered = true;
+							await releaseFrames.promise;
+						}
+						if (frame.kind === "tool_execution_start") toolDelivered = true;
+						await input.onFrame?.(frame);
+					},
+				});
+				attached = tail;
+				return tail;
 			};
-		};
-		try {
-			const result = await started(f, "a", origin);
-			await until(() => attached !== undefined);
-			relay.streams[0]!.host({ type: "activity", state: "idle" });
-			await until(() => backlogEntered);
-			attached!.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
-			f.port.liveness = async () => ({ live: false, disowned: false });
-			terminalAt = Date.now();
-			terminal = true;
-			await until(() => rechecking);
-			expect(executionProbes).toBe(1);
-			relay.streams[0]!.host({ type: "activity", state: "active" });
-			relay.streams[0]!.host({
-				type: "event",
-				kind: "tool_execution_start",
-				commandId: "foreign-command",
-				turnId: "foreign-turn",
-				payload: { toolName: "bash" },
+			Object.assign(f.port, {
+				turnRunning: async () => {
+					executionProbes++;
+					return running;
+				},
 			});
-			relay.streams[0]!.host({
-				type: "event",
-				kind: "tool_execution_start",
-				commandId: `command-${result.opRef}`,
-				turnId: `turn-${result.opRef}`,
-				payload: { toolName: "bash" },
-			});
-			expect(toolDelivered).toBe(false);
-			running = true;
-			releaseStatus.resolve();
-			await until(() => recheckReturned);
-			await Bun.sleep(20);
-			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
-			expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
-			expect(f.port.workerOutputReads).toEqual([]);
-			expect(f.notices).toEqual([]);
-			expect(toolDelivered).toBe(false);
-			expect(ingress).toBe(1);
-		} finally {
-			releaseStatus.resolve();
-			releaseFrames.resolve();
-		}
-	});
+			const status = f.port.status.bind(f.port);
+			f.port.status = async (input) => {
+				const report = await status(input);
+				if (!terminal) return report;
+				if (input.relay) {
+					await (input.relay as TailHandle).query("turn.result", { kind: "prompt", clientRef: input.opRef });
+					if (queries >= 2) recheckReturned = true;
+				}
+				return {
+					...report,
+					status: {
+						...report.status,
+						status: "failed",
+						receiptState: "missing",
+						clientRef: input.opRef,
+						terminalAt,
+						error: { code: "prompt_deadline_exceeded" },
+					},
+					summaryCompleted: true,
+				};
+			};
+			try {
+				const result = await started(f, "a", origin);
+				await until(() => attached !== undefined);
+				relay.streams[0]!.host({ type: "activity", state: "idle" });
+				await until(() => backlogEntered);
+				attached!.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
+				f.port.liveness = async () => ({ live: false, disowned: false });
+				terminalAt = Date.now();
+				terminal = true;
+				await until(() => rechecking);
+				expect(executionProbes).toBe(1);
+				relay.streams[0]!.host({ type: "activity", state: "active" });
+				relay.streams[0]!.host({
+					type: "event",
+					kind: "tool_execution_start",
+					commandId: "foreign-command",
+					turnId: "foreign-turn",
+					payload: { toolName: "bash" },
+				});
+				if (ingressKind === "tool") {
+					relay.streams[0]!.host({
+						type: "event",
+						kind: "tool_execution_start",
+						commandId: `command-${result.opRef}`,
+						turnId: `turn-${result.opRef}`,
+						payload: { toolName: "bash" },
+					});
+				} else {
+					// Native execution can restart without an SDK owner, before content.
+					relay.streams[0]!.host(
+						ingressKind === "agent_start"
+							? { type: "agent_start" }
+							: { type: "event", kind: "agent_start", payload: {} },
+					);
+				}
+				expect(toolDelivered).toBe(false);
+				running = true;
+				releaseStatus.resolve();
+				await until(() => recheckReturned);
+				await Bun.sleep(20);
+				expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+				expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+				expect(f.port.workerOutputReads).toEqual([]);
+				expect(f.notices).toEqual([]);
+				expect(toolDelivered).toBe(false);
+				expect(ingress).toBe(ingressKind === "tool" ? 1 : 0);
+			} finally {
+				releaseStatus.resolve();
+				releaseFrames.resolve();
+			}
+		});
+	}
 }
 
 test("recovery cannot use CLI idle snapshots before a real correlated observer is ready", async () => {
