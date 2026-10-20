@@ -57,7 +57,7 @@ test("a failed isolated install leaves the active current link unchanged and rem
 			"registry unavailable",
 		);
 		expect(await readlink(layout.gjcCurrent)).toBe("0.18.8");
-		expect(await readdir(layout.gjcPrefix)).toEqual(["0.18.8", "current"]);
+		expect((await readdir(layout.gjcPrefix)).sort()).toEqual(["0.18.8", "current"]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
