@@ -30,6 +30,7 @@ export type Control = {
 };
 export type Call = { method: string; input: Record<string, unknown> };
 export type Barrier =
+	| "journal-replayed"
 	| "prepared"
 	| "accepted-before-save"
 	| "terminal-before"
@@ -193,6 +194,8 @@ async function serve(home: string, barrier?: Barrier) {
 		throw new Error(`fixture barrier ${point} was not killed within 30 seconds`);
 	};
 	const database = await Store.open(join(home, "gateway.db"));
+	database.replayJournal();
+	hit("journal-replayed");
 	const agentDir = resolve(join(home, "agent"));
 	const authority = { canonicalAgentDir: agentDir, identity: `gjc:${agentDir}` };
 	database.transaction((tx) =>
