@@ -387,6 +387,8 @@ For each enabled adapter, create a configuration file:
 }
 ```
 
+The gateway accepts standalone `MEDIA:<absolute-path>` lines for Telegram replies as well as Slack: the adapter uploads each checked file into the same chat and forum topic as the reply with multipart `sendPhoto` (JPEG/PNG/WebP up to 10 MB) or `sendDocument` (everything else, and any photo Telegram refuses as a photo). The bot needs permission to send photos and documents in the chat.
+
 ### 5. Start the gateway
 
 ```sh

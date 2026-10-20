@@ -1,6 +1,14 @@
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import {
+	type ChatMessagePayload,
+	type EngagementContext,
+	type FileRef,
+	type OriginRef,
+	OUTBOUND_FILE_MAX_BYTES,
+} from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	describeInboundBody,
@@ -18,6 +26,12 @@ import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./r
 import { TelegramAdapterState } from "./state";
 
 const TELEGRAM_MESSAGE_LIMIT = 4_096;
+/**
+ * sendPhoto refuses photos over 10 MB (https://core.telegram.org/bots/api#sendphoto).
+ * Decimal megabytes keep us under the limit whichever unit Telegram means;
+ * anything larger goes out as a document, which Telegram accepts up to 50 MB.
+ */
+export const TELEGRAM_PHOTO_MAX_BYTES = 10_000_000;
 const ATTACHMENT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface GatewayClientLike {
@@ -78,6 +92,19 @@ export class TelegramApiError extends Error {
 	}
 }
 
+/** One local file to upload; `name` is the file name Telegram shows. */
+export interface TelegramUpload {
+	readonly name: string;
+	readonly bytes: Uint8Array;
+}
+
+/** Where a reply lands: the chat, and the forum topic inside it when there is one. */
+export interface TelegramUploadTarget {
+	readonly chatId: string;
+	readonly messageThreadId?: number;
+	readonly caption?: string;
+}
+
 export class TelegramBotApi implements TelegramFileApi {
 	constructor(
 		readonly token: string,
@@ -91,6 +118,52 @@ export class TelegramBotApi implements TelegramFileApi {
 			body: JSON.stringify(parameters),
 			signal,
 		});
+		return this.#result<T>(method, response);
+	}
+
+	/** Posts one photo (JPEG/PNG/WebP, at most {@link TELEGRAM_PHOTO_MAX_BYTES}) into the chat or topic. */
+	sendPhoto(target: TelegramUploadTarget, file: TelegramUpload): Promise<{ readonly message_id?: number }> {
+		return this.#upload("sendPhoto", "photo", target, file);
+	}
+
+	/** Posts any file as a document into the chat or topic. */
+	sendDocument(target: TelegramUploadTarget, file: TelegramUpload): Promise<{ readonly message_id?: number }> {
+		return this.#upload("sendDocument", "document", target, file);
+	}
+
+	/**
+	 * multipart/form-data upload: the bytes and their file name travel in one
+	 * request, so nothing is left half-posted on failure. The request url embeds
+	 * the bot token, and a transport error may echo it, so such errors are rethrown
+	 * with the token removed; they stay plain Errors so the delivery is still
+	 * treated as ambiguous (the upload may have landed).
+	 */
+	async #upload<T>(
+		method: "sendPhoto" | "sendDocument",
+		field: "photo" | "document",
+		target: TelegramUploadTarget,
+		file: TelegramUpload,
+	): Promise<T> {
+		const form = new FormData();
+		form.append("chat_id", target.chatId);
+		if (target.messageThreadId !== undefined) form.append("message_thread_id", String(target.messageThreadId));
+		if (target.caption !== undefined) form.append("caption", target.caption);
+		form.append(field, new Blob([file.bytes as Uint8Array<ArrayBuffer>]), file.name);
+		let response: Response;
+		try {
+			response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
+				method: "POST",
+				body: form,
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const detail = this.token ? message.replaceAll(this.token, "<redacted>") : message;
+			throw new Error(`Telegram ${method} request failed: ${detail}`);
+		}
+		return this.#result<T>(method, response);
+	}
+
+	async #result<T>(method: string, response: Response): Promise<T> {
 		let body: unknown;
 		try {
 			body = await response.json();
@@ -227,16 +300,154 @@ export async function settleTelegramReaction(
 	}
 }
 
+/**
+ * Settles a file delivery (a persona `MEDIA:<path>` line the gateway checked):
+ * upload the file into the same chat and forum topic the text reply goes to,
+ * post nothing else, then confirm or fail the delivery's own ledger entry.
+ *
+ * Photos (see {@link telegramPhotoEligible}) go through sendPhoto so they render
+ * inline; everything else, and any photo Telegram refuses as a photo, goes
+ * through sendDocument. A refused photo posted nothing, so the document retry
+ * cannot duplicate it. A transport failure is never retried here: the upload may
+ * have landed, so it is reported ambiguous and the ledger decides.
+ */
+export async function settleTelegramFile(
+	gateway: Pick<GatewayClientLike, "request">,
+	bot: Partial<Pick<TelegramBotApi, "sendPhoto" | "sendDocument">>,
+	state: TelegramAdapterState,
+	message: ChatMessagePayload,
+): Promise<void> {
+	if (message.origin.platform !== "telegram" || !message.deliveryId || !message.file) return;
+	const deliveryId = message.deliveryId;
+	try {
+		if (!bot.sendPhoto || !bot.sendDocument)
+			throw new TelegramApiError(400, "this Telegram client cannot upload files");
+		const route = state.routeFor(message.origin);
+		if (!route)
+			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
+		const bytes = await readOutboundFile(message.file);
+		const upload: TelegramUpload = { name: message.file.name, bytes };
+		const target: TelegramUploadTarget = {
+			chatId: route.chatId,
+			...(route.messageThreadId === undefined ? {} : { messageThreadId: route.messageThreadId }),
+			...(message.duplicateWarning ? { caption: `[recovered - may be a duplicate] ${message.text}` } : {}),
+		};
+		let sent = false;
+		if (telegramPhotoEligible(bytes)) {
+			try {
+				await bot.sendPhoto(target, upload);
+				sent = true;
+			} catch (error) {
+				if (!telegramRefusedPhoto(error)) throw error;
+			}
+		}
+		if (!sent) await bot.sendDocument(target, upload);
+		await gateway.request("delivery.confirm", { deliveryId });
+	} catch (error) {
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: error instanceof Error ? error.message : String(error),
+			ambiguous: deliveryFailureIsAmbiguous(error),
+		});
+	}
+}
+
+/**
+ * True for bytes sendPhoto can show inline: a JPEG, PNG or WebP (decided by
+ * magic bytes, not the file name, because Telegram decodes the content) within
+ * the photo size limit. GIF is deliberately excluded: sendPhoto keeps only a
+ * still frame, while a GIF sent with sendDocument is shown as an animation.
+ */
+export function telegramPhotoEligible(bytes: Uint8Array): boolean {
+	if (bytes.byteLength > TELEGRAM_PHOTO_MAX_BYTES) return false;
+	const startsWith = (offset: number, signature: readonly number[]) =>
+		signature.every((byte, index) => bytes[offset + index] === byte);
+	return (
+		startsWith(0, [0xff, 0xd8, 0xff]) ||
+		startsWith(0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) ||
+		(startsWith(0, [0x52, 0x49, 0x46, 0x46]) && startsWith(8, [0x57, 0x45, 0x42, 0x50]))
+	);
+}
+
+/**
+ * A 400 whose description names a photo/image processing error
+ * (`PHOTO_INVALID_DIMENSIONS`, `PHOTO_SAVE_FILE_INVALID`, `IMAGE_PROCESS_FAILED`, ...):
+ * Telegram refused these bytes as a photo, not the chat or the request. Other
+ * 400s (chat or topic not found, missing rights) would fail a document too.
+ */
+function telegramRefusedPhoto(error: unknown): boolean {
+	return (
+		error instanceof TelegramApiError &&
+		error.status === 400 &&
+		/\b(?:PHOTO_[A-Z_]+|IMAGE_PROCESS_FAILED)\b/.test(error.message)
+	);
+}
+
+/**
+ * Reads the checked file again at delivery time and refuses it if it is no
+ * longer the file the gateway approved: the open must not follow a symlink, the
+ * descriptor must still resolve to the checked path, and the size must match
+ * exactly. Every refusal is a definitive non-delivery (nothing was posted).
+ */
+async function readOutboundFile(file: FileRef): Promise<Uint8Array> {
+	if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > OUTBOUND_FILE_MAX_BYTES)
+		throw new TelegramApiError(400, `${file.name} has an invalid checked size`);
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	} catch (error) {
+		throw new TelegramApiError(
+			400,
+			`cannot open ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	try {
+		const descriptorPath =
+			process.platform === "linux"
+				? `/proc/self/fd/${handle.fd}`
+				: process.platform === "darwin"
+					? `/dev/fd/${handle.fd}`
+					: undefined;
+		if (!descriptorPath || (await realpath(descriptorPath)) !== file.path)
+			throw new TelegramApiError(400, `${file.name} changed after the gateway checked it`);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.size !== file.size || stat.size > OUTBOUND_FILE_MAX_BYTES)
+			throw new TelegramApiError(400, `${file.name} changed after the gateway checked it`);
+		const bytes = Buffer.allocUnsafe(file.size + 1);
+		let length = 0;
+		while (length < bytes.length) {
+			const read = await handle.read(bytes, length, bytes.length - length, null);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		if (length !== file.size) throw new TelegramApiError(400, `${file.name} changed while the adapter read it`);
+		return bytes.subarray(0, length);
+	} catch (error) {
+		if (error instanceof TelegramApiError) throw error;
+		throw new TelegramApiError(
+			400,
+			`cannot read ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		await handle.close().catch(() => {});
+	}
+}
+
 export function subscribeTelegramDeliveries(
 	gateway: GatewayClientLike,
-	bot: Pick<TelegramBotApi, "sendMessage" | "setMessageReaction">,
+	bot: Pick<TelegramBotApi, "sendMessage" | "setMessageReaction"> &
+		Partial<Pick<TelegramBotApi, "sendPhoto" | "sendDocument">>,
 	state: TelegramAdapterState,
 	log: Pick<Console, "error"> = console,
 ): () => void {
 	return gateway.onChatMessage((message) => {
+		// A file delivery's text is only the "📎 name" fallback; it must never be
+		// posted as a message when the upload itself is what was asked for.
 		const settled = message.reaction
 			? settleTelegramReaction(gateway, bot, state, message)
-			: settleTelegramDelivery(gateway, bot, state, message);
+			: message.file
+				? settleTelegramFile(gateway, bot, state, message)
+				: settleTelegramDelivery(gateway, bot, state, message);
 		void settled.catch((error) =>
 			log.error(
 				`Telegram delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
