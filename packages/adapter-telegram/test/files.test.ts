@@ -392,8 +392,11 @@ test("a stalled upload in one chat does not hold back another chat's deliveries"
 	);
 	deliver(await fileDelivery(DM, "dm.png", PNG, { deliveryId: "dm" }));
 	deliver(await fileDelivery(TOPIC, "topic.png", PNG, { deliveryId: "topic" }));
-	for (let attempt = 0; attempt < 40 && requests.length === 0; attempt++) await Bun.sleep(5);
-	expect(events).toEqual(["start dm.png", "start topic.png", "end topic.png"]);
+	// The two chats settle in parallel, so which upload starts first depends on file
+	// I/O timing; only "the topic settles while the DM upload is stalled" is ordered.
+	for (let attempt = 0; attempt < 40 && (requests.length === 0 || !events.includes("start dm.png")); attempt++)
+		await Bun.sleep(5);
+	expect([...events].sort()).toEqual(["end topic.png", "start dm.png", "start topic.png"]);
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "topic" } }]);
 	release();
 	await order.drain();

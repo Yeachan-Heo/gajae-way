@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -48,6 +48,16 @@ export type Barrier =
 
 function json<T>(path: string, fallback: T): T {
 	return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as T) : fallback;
+}
+
+/**
+ * Files that the other process polls through json() must never be observable
+ * half-written: a freshly created file is visible empty before its bytes land,
+ * and JSON.parse then fails with "Unexpected EOF". Rename publishes it whole.
+ */
+function writeJsonAtomic(path: string, value: unknown): void {
+	writeFileSync(`${path}.tmp`, JSON.stringify(value));
+	renameSync(`${path}.tmp`, path);
 }
 
 /** Only fixture files supply broker authority; rehydration never invokes send or bind. */
@@ -185,7 +195,7 @@ async function serve(home: string, barrier?: Barrier) {
 	const hit = (point: Barrier) => {
 		const armed = json<{ readonly point?: Barrier | null }>(join(home, "barrier-arm.json"), {}).point;
 		if (barrier !== point && armed !== point) return;
-		writeFileSync(join(home, "barrier-hit.json"), JSON.stringify({ point, pid: process.pid }));
+		writeJsonAtomic(join(home, "barrier-hit.json"), { point, pid: process.pid });
 		if (armed === point) writeFileSync(join(home, "barrier-arm.json"), JSON.stringify({ point: null }));
 		// A synchronous fixture-only barrier can stop inside a real SQLite transaction.
 		// The parent SIGKILLs precisely this child; no production fault flag exists.
@@ -455,7 +465,7 @@ export class WorkFixture {
 		await rm(this.home, { recursive: true, force: true });
 	}
 	async armBarrier(point: Barrier): Promise<void> {
-		await Bun.write(join(this.home, "barrier-arm.json"), JSON.stringify({ point }));
+		writeJsonAtomic(join(this.home, "barrier-arm.json"), { point });
 		await rm(join(this.home, "barrier-hit.json"), { force: true });
 	}
 	async persistAcceptedSend(opRef: string): Promise<void> {
