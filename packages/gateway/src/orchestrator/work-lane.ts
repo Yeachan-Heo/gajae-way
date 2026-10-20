@@ -1326,6 +1326,12 @@ export class WorkLaneManager {
 					invalidateActivity();
 					if (this.#writeCurrent(observer)) this.#readopt(observer, "reconciliation_unavailable");
 				},
+				// Observed session content after reconnect is execution evidence too:
+				// it must invalidate a pending idle/host-dead proof, not only touch last=.
+				onSessionActivity: () => {
+					invalidateActivity();
+					if (this.#writeCurrent(observer)) this.#touch(observer);
+				},
 				onFrame: (frame) => {
 					if (!this.#writeCurrent(observer)) return;
 					if (
@@ -1343,7 +1349,7 @@ export class WorkLaneManager {
 						observer.tail?.setTurnRunning(true);
 					}
 					this.#schedule(observer, 0);
-					this.#touch(observer);
+					if (frame.commandId !== undefined || frame.turnId !== undefined) this.#touch(observer);
 				},
 			});
 			if (!this.#writeCurrent(observer)) {
@@ -1367,9 +1373,11 @@ export class WorkLaneManager {
 			});
 	}
 	/**
-	 * Streamed turn frames are the attempt's activity: `work jobs` `last=` must
-	 * show when the worker last did something, not when the attempt started, so
-	 * a stalled lane is visible. Throttled; the write is fenced to the binding.
+	 * Advances the persisted `work jobs` `last=` activity checkpoint on real
+	 * content, not polls/hello/heartbeats. Preparation and settlement also write
+	 * their timestamps, so the checkpoint alone proves neither observed content
+	 * nor attempt ownership/completion. These content-driven writes are throttled
+	 * and fenced to the binding and open attempt.
 	 */
 	#touch(observer: Observer): void {
 		const now = this.#now();
