@@ -1305,6 +1305,7 @@ export class WorkLaneManager {
 			const invalidateActivity = () => {
 				observer.activityVersion = (observer.activityVersion ?? 0) + 1;
 				observer.receiptDeadSince = undefined;
+				observer.goneSince = undefined;
 			};
 			const tail = await this.#port.attachTail({
 				sessionId: runtime.sessionId,
@@ -1312,6 +1313,11 @@ export class WorkLaneManager {
 				repo: runtime.cwd,
 				originKey: runtime.sessionKey,
 				onTurnActivity: invalidateActivity,
+				onObserverLifecycle: (kind) => {
+					// A native run can start without SDK correlation or content. It
+					// invalidates end proof, but cannot supply an attempt's receipt.
+					if (kind === "agent_start") invalidateActivity();
+				},
 				onRelayLost: invalidateActivity,
 				onRelayDead: () => {
 					invalidateActivity();
@@ -1482,19 +1488,27 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		if (
-			!runtime.terminal ||
-			(runtime.terminal.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined)
-		)
-			this.#attach(observer);
-		if (!runtime.terminal) {
+		const unresolvedReceipt =
+			runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+		if (!runtime.terminal || unresolvedReceipt) this.#attach(observer);
+		// A saved SDK terminal is still incomplete without execution-end proof.
+		// Recovery must refresh it through the same fenced path as a fresh status.
+		if (!runtime.terminal || unresolvedReceipt) {
+			const activityVersion = observer.activityVersion;
 			let status: PromptStatusBody | undefined;
 			try {
 				status = await this.#query(runtime, observer.tail);
 				observer.goneSince = undefined;
 			} catch (error) {
 				observer.receiptDeadSince = undefined;
-				if (!(await this.#hostGone(runtime, error))) {
+				const hostGone = await this.#hostGone(runtime, error);
+				// Both status and inspect must belong to one uninterrupted activity
+				// epoch. A start during either await cannot seed post-start grace.
+				if (!this.#writeCurrent(observer) || observer.activityVersion !== activityVersion) {
+					observer.goneSince = undefined;
+					return;
+				}
+				if (!hostGone) {
 					observer.goneSince = undefined;
 					throw error;
 				}
@@ -1512,6 +1526,22 @@ export class WorkLaneManager {
 			let terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			if (unresolvedReceipt && !terminal) {
+				observer.receiptDeadSince = undefined;
+				return;
+			}
+			if (
+				unresolvedReceipt &&
+				status &&
+				(status.clientRef !== runtime.opRef ||
+					(["commandId", "turnId"] as const).some(
+						(key) => runtime.terminal?.status?.[key] !== undefined && runtime.terminal.status[key] !== status[key],
+					) ||
+					(terminal?.reasonCode !== "terminal_missing_receipt" && status.receiptState !== "present"))
+			) {
+				observer.receiptDeadSince = undefined;
+				return;
+			}
 			if (
 				terminal?.reasonCode === "terminal_missing_receipt" &&
 				runtime.turnEndObservedAt === undefined &&
@@ -1548,6 +1578,11 @@ export class WorkLaneManager {
 				}
 			} else observer.receiptDeadSince = undefined;
 			if (!this.#writeCurrent(observer)) return;
+			// Keep saved terminal evidence immutable until output proves a late
+			// receipt. A refreshed terminal receipt or confirmed host death can
+			// release retrieval, but cannot rewrite the original outcome by itself.
+			if (unresolvedReceipt && terminal?.reasonCode !== "terminal_missing_receipt")
+				observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			runtime =
 				this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -1558,7 +1593,7 @@ export class WorkLaneManager {
 							}
 						: {}),
 					...(turnEndObservedAt && runtime.turnEndObservedAt === undefined ? { turnEndObservedAt } : {}),
-					...(terminal ? { terminal } : {}),
+					...(terminal && !runtime.terminal ? { terminal } : {}),
 				}) ?? runtime;
 			if (!runtime.terminal) return;
 		}
