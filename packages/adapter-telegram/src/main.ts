@@ -33,6 +33,16 @@ const TELEGRAM_MESSAGE_LIMIT = 4_096;
  * anything larger goes out as a document, which Telegram accepts up to 50 MB.
  */
 export const TELEGRAM_PHOTO_MAX_BYTES = 10_000_000;
+/**
+ * Deliveries settle one at a time per chat, so a Bot API request that never
+ * answers would hold back every later reply to that chat. Each request is
+ * abandoned after this long; the delivery then fails as ambiguous.
+ */
+export const TELEGRAM_REQUEST_TIMEOUT_MS = 30_000;
+/** Uploads carry up to 50 MB, so they get longer than a JSON call. */
+export const TELEGRAM_UPLOAD_TIMEOUT_MS = 120_000;
+/** getUpdates long-polls for this long before answering with no updates. */
+const TELEGRAM_POLL_SECONDS = 30;
 const ATTACHMENT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface GatewayClientLike {
@@ -106,18 +116,36 @@ export interface TelegramUploadTarget {
 	readonly caption?: string;
 }
 
+export interface TelegramBotApiTimeouts {
+	readonly requestMs: number;
+	readonly uploadMs: number;
+}
+
 export class TelegramBotApi implements TelegramFileApi {
 	constructor(
 		readonly token: string,
 		readonly fetcher: FetchLike = fetch,
+		readonly timeouts: TelegramBotApiTimeouts = {
+			requestMs: TELEGRAM_REQUEST_TIMEOUT_MS,
+			uploadMs: TELEGRAM_UPLOAD_TIMEOUT_MS,
+		},
 	) {}
 
-	async call<T>(method: string, parameters: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
+	/**
+	 * The timeout covers the whole exchange, response body included, and is
+	 * combined with any caller signal.
+	 */
+	async call<T>(
+		method: string,
+		parameters: Record<string, unknown> = {},
+		signal?: AbortSignal,
+		timeoutMs: number = this.timeouts.requestMs,
+	): Promise<T> {
 		const response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(parameters),
-			signal,
+			signal: withTimeout(timeoutMs, signal),
 		});
 		return this.#result<T>(method, response);
 	}
@@ -155,6 +183,7 @@ export class TelegramBotApi implements TelegramFileApi {
 			response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
 				method: "POST",
 				body: form,
+				signal: withTimeout(this.timeouts.uploadMs),
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -183,11 +212,17 @@ export class TelegramBotApi implements TelegramFileApi {
 		// `allowed_updates` REPLACES Telegram's default set, so "message" has to be
 		// listed explicitly to keep the existing text path working while opting into
 		// "message_reaction" (which is never in the default set).
-		return this.call("getUpdates", {
-			timeout: 30,
-			allowed_updates: ["message", "message_reaction"],
-			...(offset === undefined ? {} : { offset }),
-		});
+		return this.call(
+			"getUpdates",
+			{
+				timeout: TELEGRAM_POLL_SECONDS,
+				allowed_updates: ["message", "message_reaction"],
+				...(offset === undefined ? {} : { offset }),
+			},
+			undefined,
+			// The long poll legitimately holds the request open for its whole window.
+			TELEGRAM_POLL_SECONDS * 1_000 + this.timeouts.requestMs,
+		);
 	}
 
 	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
@@ -218,6 +253,11 @@ export class TelegramBotApi implements TelegramFileApi {
 	downloadFile(filePath: string, signal: AbortSignal): Promise<Response> {
 		return this.fetcher(`https://api.telegram.org/file/bot${this.token}/${filePath}`, { signal });
 	}
+}
+
+function withTimeout(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(timeoutMs);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 export function chunkTelegramMessage(text: string): string[] {

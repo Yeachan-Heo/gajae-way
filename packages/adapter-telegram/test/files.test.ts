@@ -425,6 +425,56 @@ test("a failed settlement does not block the conversation's next delivery", asyn
 	expect(errors).toEqual(["Telegram delivery settlement request failed: gateway is not connected"]);
 });
 
+test("a Bot API request that never answers times out instead of holding back the chat's next delivery", async () => {
+	const state = await stateWith(DM);
+	const calls: Array<{ method: string; signalled: boolean }> = [];
+	// The real Bot API client over a transport whose sendMessage never answers
+	// unless its request is aborted.
+	const bot = new TelegramBotApi(
+		TOKEN,
+		(input, init) => {
+			const method = String(input).split("/").at(-1) ?? "";
+			calls.push({ method, signalled: init?.signal instanceof AbortSignal });
+			if (method !== "sendMessage") return Promise.resolve(okMessage());
+			return new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+			});
+		},
+		{ requestMs: 20, uploadMs: 1_000 },
+	);
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const order = new TelegramDeliveryOrder();
+	let handler: ((message: ChatMessagePayload) => void) | undefined;
+	subscribeTelegramDeliveries(
+		{
+			request: async <T>(verb: string, params?: unknown) => {
+				requests.push({ verb, params });
+				return {} as T;
+			},
+			onChatMessage: (given) => {
+				handler = given;
+				return () => {};
+			},
+		},
+		bot,
+		state,
+		order,
+	);
+	handler?.({ turnId: "turn-1", origin: DM, role: "assistant", text: "stuck", final: true, deliveryId: "text" });
+	handler?.(await fileDelivery(DM, "b.png", PNG, { deliveryId: "b" }));
+	// Without a request timeout the stalled sendMessage keeps the chain open forever.
+	const drained = await Promise.race([order.drain().then(() => true), Bun.sleep(1_000).then(() => false)]);
+	expect(drained).toBe(true);
+	expect(calls).toEqual([
+		{ method: "sendMessage", signalled: true },
+		{ method: "sendPhoto", signalled: true },
+	]);
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: expect.objectContaining({ deliveryId: "text", ambiguous: true }) },
+		{ verb: "delivery.confirm", params: { deliveryId: "b" } },
+	]);
+});
+
 test("photo eligibility follows the content, not the name, and Telegram's photo size limit", () => {
 	const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 16]);
 	const webp = new Uint8Array([0x52, 0x49, 0x46, 0x46, 4, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]);
