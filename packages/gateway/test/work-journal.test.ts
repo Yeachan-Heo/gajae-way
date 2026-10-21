@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ATTEMPT_UPDATE_RETENTION_MS, HISTORY_RETENTION_MS, Store } from "../src/store";
+import { HISTORY_RETENTION_MS, Store } from "../src/store";
 
 const OLD = "2020-01-01T00:00:00.000Z";
 
