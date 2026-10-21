@@ -71,15 +71,28 @@ test("census reports the work_journal row count and its on-disk byte size", asyn
 	const f = await fixture();
 	const raw = new Database(f.path, { readonly: true });
 	const { rows, jsonBytes } = raw
-		.query("SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(row_json)), 0) AS jsonBytes FROM work_journal")
+		.query(
+			"SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(CAST(row_json AS BLOB))), 0) AS jsonBytes FROM work_journal",
+		)
 		.get() as { rows: number; jsonBytes: number };
 	const { pageSize } = raw.query("SELECT page_size AS pageSize FROM pragma_page_size()").get() as { pageSize: number };
+	// SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB take the documented estimate instead of page sizes.
+	let hasDbstat = true;
+	try {
+		raw.query("SELECT 1 FROM dbstat LIMIT 1").get();
+	} catch {
+		hasDbstat = false;
+	}
 	raw.close();
 	expect(rows).toBeGreaterThan(0);
 	const report = await runCensus(f.config);
 	expect(report.journalRowCount).toBe(rows);
-	expect(report.journalByteSize).toBeGreaterThanOrEqual(jsonBytes);
-	expect(report.journalByteSize % pageSize).toBe(0);
+	if (hasDbstat) {
+		expect(report.journalByteSize).toBeGreaterThanOrEqual(jsonBytes);
+		expect(report.journalByteSize % pageSize).toBe(0);
+	} else {
+		expect(report.journalByteSize).toBe(jsonBytes + rows * 80);
+	}
 });
 
 test("census refuses while a daemon holds the gateway lease", async () => {
