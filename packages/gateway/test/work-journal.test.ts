@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HISTORY_RETENTION_MS, Store } from "../src/store";
+import { ATTEMPT_UPDATE_RETENTION_MS, HISTORY_RETENTION_MS, Store } from "../src/store";
 
 const OLD = "2020-01-01T00:00:00.000Z";
 
@@ -170,5 +170,80 @@ test("journal compaction keeps only what replay needs", async () => {
 		expect(events(raw, "delivery", "gone")).toEqual([]);
 		expect(events(raw, "delivery", "gone-again-later")).toEqual(["delivery_queued"]);
 		wipeAndReplay(database, raw);
+	});
+});
+
+test("aggressive attempt_updated sweep deletes superseded rows correctly", async () => {
+	await withDb((_path, database, raw) => {
+		// Directly insert simulated attempt_updated journal entries to test the sweep
+		const opRef = "op-update-test";
+		const now = new Date();
+		const oldTime = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000); // 8 days ago
+		
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
+			 VALUES 
+			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${now.toISOString()}')`,
+		);
+		
+		const beforeSweep = raw.prepare(
+			"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'"
+		).get(opRef) as { cnt: number };
+		expect(beforeSweep.cnt).toBe(3);
+		
+		// Run the aggressive sweep
+		database.sweep(now);
+		
+		const afterSweep = raw.prepare(
+			"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'"
+		).get(opRef) as { cnt: number };
+		// Should have deleted the old superseded rows, keeping only the latest
+		expect(afterSweep.cnt).toBe(1);
+		
+		// Verify the remaining row is the latest one
+		const remaining = raw.prepare(
+			"SELECT recorded_at FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'"
+		).get(opRef) as { recorded_at: string };
+		expect(remaining.recorded_at).toBe(now.toISOString());
+	});
+});
+
+test("terminal attempt events are not deleted by attempt_updated sweep", async () => {
+	await withDb((_path, database, raw) => {
+		// Insert simulated journal entries with a terminal event
+		const opRef = "op-terminal";
+		const now = new Date();
+		const oldTime = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000); // 8 days ago
+		
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
+			 VALUES 
+			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_terminal', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}')`,
+		);
+		
+		const beforeSweep = raw.prepare(
+			"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_terminal'"
+		).get(opRef) as { cnt: number };
+		expect(beforeSweep.cnt).toBe(1);
+		
+		// Run the sweep at 8 days (after attempt_updated cutoff but within 30-day window)
+		database.sweep(now);
+		
+		const afterSweep = raw.prepare(
+			"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_terminal'"
+		).get(opRef) as { cnt: number };
+		// Terminal event should still be there (it's not deleted by the aggressive sweep)
+		expect(afterSweep.cnt).toBe(1);
+		
+		const updateAfterSweep = raw.prepare(
+			"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'"
+		).get(opRef) as { cnt: number };
+		// But the old update should be deleted by the standard sweep
+		expect(updateAfterSweep.cnt).toBe(0);
 	});
 });

@@ -19,7 +19,7 @@ export interface CensusReport {
 	readonly authorityCounts: CensusAuthorityCounts;
 	readonly tableCounts: Readonly<Record<string, number>>;
 	readonly quickCheck: string;
-	readonly leaseOwners: Readonly<Record<string, Awaited<ReturnType<typeof readLeaseOwner>>>>;
+	readonly leaseOwners: Readonly<Record<string, Awaited<ReturnType<typeof readLeaseOwner>>>>
 	readonly openQuarantined: Readonly<
 		Record<
 			string,
@@ -33,6 +33,8 @@ export interface CensusReport {
 			}
 		>
 	>;
+	readonly journalRowCount: number;
+	readonly journalByteSize: number;
 }
 
 function addCutoverCount(
@@ -109,6 +111,34 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 			const leaseOwners = Object.fromEntries(
 				await Promise.all(LEASE_NAMES.map(async (name) => [name, await readLeaseOwner(config.home, name)] as const)),
 			);
+			// Measure work_journal row count and byte size
+			const journalDb = database.core.groupDb("journal");
+			const journalStats = journalDb.prepare(
+				"SELECT COUNT(*) as cnt FROM work_journal"
+			).get() as { cnt: number };
+			const journalRowCount = journalStats.cnt;
+		
+			// Estimate journal byte size using page_count * page_size for the table
+			// This provides a real measurement of the journal's storage footprint
+			let journalByteSize = 0;
+			try {
+				const pageStats = journalDb.prepare(
+					"SELECT page_count FROM pragma_page_count() WHERE page_count > 0"
+				).get() as { page_count: number } | undefined;
+				const sizeStats = journalDb.prepare(
+					"SELECT page_size FROM pragma_page_size()"
+				).get() as { page_size: number };
+				if (pageStats && sizeStats) {
+					journalByteSize = pageStats.page_count * sizeStats.page_size;
+				}
+			} catch {
+				// Fallback: sum of all json column lengths + metadata overhead (64 bytes per row)
+				const fallbackSize = journalDb.prepare(
+					"SELECT COALESCE(SUM(LENGTH(row_json)), 0) + COUNT(*) * 64 as size FROM work_journal"
+				).get() as { size: number };
+				journalByteSize = fallbackSize.size;
+			}
+		
 			const report: CensusReport = {
 				schemaVersion: database.schemaVersion,
 				authority: authorityCounts.authority,
@@ -119,6 +149,8 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 				openQuarantined: Object.fromEntries(
 					[...quarantineCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
 				),
+				journalRowCount,
+				journalByteSize,
 			};
 			console.log(JSON.stringify(report, null, 2));
 			return report;

@@ -126,6 +126,37 @@ export class JournalGroup {
 			)
 			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
 	}
+
+	/**
+	 * Aggressively compact superseded attempt_updated rows older than the cutoff, keeping the
+	 * newest row per key always and terminal/transition events on the standard 30-day window.
+	 * This deletes non-latest attempt_updated rows to save space without affecting what replay
+	 * needs (only the latest snapshot per entity key).
+	 *
+	 * Readers:
+	 * - latest() only returns the latest row per key, so non-latest rows are safe to delete
+	 * - replayProjection() uses latest(), so it's unaffected
+	 * - Recovery/audit flows use latest(), so they're unaffected
+	 */
+	sweepAttemptUpdated(
+		tx: WriteTx,
+		cutoffs: { readonly updateCutoff: string; readonly terminalCutoff: string; readonly batch: number },
+	): number {
+		return this.#db
+			.prepare(
+				`DELETE FROM work_journal WHERE seq IN (
+					SELECT seq FROM work_journal AS j
+					WHERE entity = 'attempt' AND event_type = 'attempt_updated'
+						AND recorded_at < ?
+						AND EXISTS (
+							SELECT 1 FROM work_journal AS later
+							WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq
+						)
+				ORDER BY seq LIMIT ?
+			)`,
+			)
+			.run(tx, cutoffs.updateCutoff, cutoffs.batch).changes;
+	}
 }
 
 /**
