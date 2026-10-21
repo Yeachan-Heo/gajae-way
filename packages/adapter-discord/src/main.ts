@@ -258,11 +258,13 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const origin = discordMessageOrigin(message);
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	const contentMention = botId !== "" && new RegExp(`<@!?${escapeRegExp(botId)}>`).test(message.content);
+	const explicitMention = Boolean(message.mentions?.has(botUser) || contentMention);
 	const displayName = resolveAuthorDisplayName(message);
 	const serverTag = resolveServerTag(message.author);
 	const replyTo = resolveReplyContext(message, botId);
 	return {
-		mentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf),
+		mentioned: explicitMention || replyTo?.fromSelf === true,
+		explicitMention,
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
 		...(message.author.bot ? { authorIsBot: true } : {}),

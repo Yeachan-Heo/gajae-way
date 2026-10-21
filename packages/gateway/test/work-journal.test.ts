@@ -135,7 +135,7 @@ DELETE FROM schema_migrations WHERE version >= 36;
 		database.close();
 		const migrated = await Store.open(path);
 		try {
-			expect(migrated.schemaVersion).toBe(37);
+			expect(migrated.schemaVersion).toBe(38);
 			expect(events(raw, "lane_job", "lanejob-6a")).toEqual(["baseline"]);
 			expect(events(raw, "attempt", "gw-j-abababababab")).toEqual(["baseline"]);
 			expect(events(raw, "delivery", "delivery-j")).toEqual(["baseline"]);

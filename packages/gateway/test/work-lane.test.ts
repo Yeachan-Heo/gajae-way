@@ -49,6 +49,7 @@ import {
 } from "../src/orchestrator/work-lane";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { WorkAttemptStateError } from "../src/store/groups/work";
+import { hangingStatusRepo, hookPid, pidAlive, untilGone } from "./fixtures/git-hang";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
@@ -659,18 +660,21 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 
 test("simultaneous cap admission and same-name resume refuse without overlapping sends", async () => {
 	const f = await fixture();
-	const results = await Promise.allSettled([started(f, "a"), started(f, "b"), started(f, "c")]);
+	const names = ["a", "b", "c"] as const;
+	const results = await Promise.allSettled(names.map((name) => started(f, name)));
 	expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
 	const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
 	expect(rejected.reason).toMatchObject({ code: "lane_capacity", detail: { active: 2, maxLanes: 2 } });
+	// Repo facts are read asynchronously before admission, so which two win is not fixed.
+	const admitted = names[results.findIndex((r) => r.status === "fulfilled")]!;
 	for (const resume of [false, true])
-		await expect(f.manager.start({ name: "a", text: "again", cwd: f.directory, resume })).rejects.toMatchObject({
+		await expect(f.manager.start({ name: admitted, text: "again", cwd: f.directory, resume })).rejects.toMatchObject({
 			code: "invalid_params",
 			detail: { reasonCode: "attempt_open" },
 		});
 	expect(f.port.binds).toHaveLength(2);
 	expect(f.port.sends).toHaveLength(2);
-	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: false });
+	expect(await f.lanes.retire(admitted, "operator")).toMatchObject({ retired: false });
 	expect(await f.lanes.sweep(Date.now() + 1e9)).toBe(0);
 });
 
@@ -2017,6 +2021,83 @@ test("remote clones are asynchronous, preserve repo_clone_failed, and clean up m
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
 });
+test("#615: a lane start whose git never returns does not wedge other requests", async () => {
+	const hang = await hangingStatusRepo();
+	cleanups.push(hang.cleanup);
+	const f = await fixture({ gitCommandTimeoutMs: 2_000 });
+	let ticks = 0;
+	const timer = setInterval(() => ticks++, 5);
+	const stuck = f.manager.start({ name: "stuck-facts", text: "work", cwd: hang.repo });
+	try {
+		const pid = await hookPid(hang.pidFile);
+		// While that lane's git is stuck, an unrelated lane is admitted, bound and sent,
+		// and timers keep firing.
+		const other = await f.manager.start({ name: "other", text: "work", cwd: f.directory });
+		expect(other.started).toBe(true);
+		const before = ticks;
+		await Bun.sleep(50);
+		expect(ticks).toBeGreaterThan(before);
+		expect(pidAlive(pid)).toBe(true);
+		// Repo facts are optional at start: the deadline drops them and the lane proceeds.
+		expect(await stuck).toMatchObject({ started: true });
+		expect(await untilGone(pid)).toBe(true);
+	} finally {
+		clearInterval(timer);
+		await stuck.catch(() => undefined);
+	}
+});
+
+test("#615: a remote clone whose helper never answers fails typed, releases the lane, and leaves no process", async () => {
+	// Accepts TCP and never speaks TLS: git-remote-https blocks in the handshake
+	// holding git's pipes, which an abort of `git` alone never released.
+	const sockets = new Set<import("node:net").Socket>();
+	const server = createServer((socket) => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	try {
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("server did not bind a TCP port");
+		const remoteUrl = `https://127.0.0.1:${address.port}/stuck.git`;
+		const f = await fixture({ gitCommandTimeoutMs: 400 });
+		const name = "stuck-clone";
+		const startedAt = Date.now();
+		await expect(f.manager.start({ name, text: "work", repo: remoteUrl })).rejects.toMatchObject({
+			code: "verb_failed",
+			detail: { reasonCode: "git_command_timeout", command: "clone", timeoutMs: 400 },
+		});
+		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeUndefined();
+		expect(f.port.binds).toHaveLength(0);
+		await expect(lstat(managedLaneWorktreePath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(lstat(managedLaneRepositoryPath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
+		// No git or helper process for that URL survives the timed-out start.
+		if (process.platform === "linux") {
+			const survivors = async () => {
+				const { readdir } = await import("node:fs/promises");
+				const found: string[] = [];
+				for (const entry of await readdir("/proc")) {
+					if (!/^\d+$/.test(entry)) continue;
+					const cmdline = await readFile(`/proc/${entry}/cmdline`, "utf8").catch(() => "");
+					if (cmdline.includes(remoteUrl)) found.push(cmdline.replaceAll("\0", " "));
+				}
+				return found;
+			};
+			for (let i = 0; i < 200 && (await survivors()).length > 0; i++) await Bun.sleep(10);
+			expect(await survivors()).toEqual([]);
+		}
+		// The lane's lock was released: the same name starts at once from a local cwd.
+		expect(await f.manager.start({ name, text: "work", cwd: f.directory })).toMatchObject({ started: true });
+	} finally {
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
+});
+
 test("run of the caller's own open lane is attempt_open, not a cycle", async () => {
 	const f = await fixture({ allowNested: () => true });
 	const parent = await f.manager.start({ name: "same", text: "parent task", cwd: f.directory });
@@ -2175,6 +2256,152 @@ test("#562 a missing receipt stays open during turn activity and recovery until 
 	expect(outputReads).toBe(3);
 	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 });
+
+for (const endEvidence of ["idle", "dead", "receipt", "cancelled"] as const) {
+	test(`a persisted missing-receipt terminal recovers via ${endEvidence} without ending live execution`, async () => {
+		let now = Date.now();
+		let generation = 0;
+		const f = await fixture({ now: () => now, hostLostGraceMs: 100, brokerGeneration: () => generation });
+		const result = await started(f, "a", origin);
+		await f.manager.stop();
+		const runtime = f.db.work.workAttemptGet(result.opRef)!;
+		const status = {
+			status: "failed" as const,
+			clientRef: result.opRef,
+			commandId: `command-${result.opRef}`,
+			turnId: `turn-${result.opRef}`,
+			startedAt: now,
+			terminalAt: now + 1,
+			receiptState: "missing" as const,
+			error: { code: "prompt_deadline_exceeded" },
+		};
+		f.db.transaction((tx) =>
+			f.db.work.workAttemptUpdate(tx, result.opRef, runtime.version, {
+				terminal: {
+					kind: "broker",
+					observedAt: new Date(now).toISOString(),
+					reasonCode: "terminal_missing_receipt",
+					status,
+				},
+			}),
+		);
+		let running: boolean | undefined = true;
+		let probes = 0;
+		let inspections = 0;
+		let receipt = false;
+		let statusReads = 0;
+		let refresh: "normal" | "foreign" | "unknown" | "in_flight" = "normal";
+		Object.assign(f.port, {
+			turnRunning: async () => {
+				probes++;
+				return running;
+			},
+		});
+		f.port.liveness = async () => {
+			inspections++;
+			return { live: false, disowned: false };
+		};
+		const currentStatus = () =>
+			receipt
+				? {
+						...status,
+						status: "terminal_ok" as const,
+						receiptState: "present" as const,
+						error: undefined,
+						outcome: { reason: endEvidence === "cancelled" ? "cancelled" : "end_turn" },
+					}
+				: status;
+		f.port.status = async (input) => {
+			statusReads++;
+			const current = currentStatus();
+			return {
+				operationRef: input.opRef,
+				status: {
+					...current,
+					...(refresh === "foreign" ? { turnId: "foreign-turn" } : {}),
+					...(refresh === "unknown" ? { receiptState: "unknown" as const } : {}),
+					...(refresh === "in_flight" ? { status: "in_flight" as const } : {}),
+				},
+				summaryCompleted: true,
+			};
+		};
+		f.port.fetchWorkerOutput = async (input) =>
+			receipt
+				? parseWorkerOutputResponse(
+						input,
+						{
+							exitCode: 0,
+							stderr: "",
+							stdout: JSON.stringify({
+								ok: true,
+								result: {
+									kind: "prompt",
+									...currentStatus(),
+									content: { version: 1, type: "text", text: "recovered", byteLength: 9, truncated: false },
+								},
+							}),
+						},
+						now,
+					)
+				: { status: "absent", code: "output_pending" };
+		await f.restart();
+		await until(() => probes > 0);
+		now += 86_400_000;
+		const prior = probes;
+		await until(() => probes > prior);
+		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null, output: { reads: 0 } });
+		expect(f.notices).toEqual([]);
+		expect(inspections).toBe(0);
+		generation++;
+		await f.manager.onBrokerGeneration();
+		if (endEvidence === "dead") {
+			running = undefined;
+			await until(() => inspections > 0);
+			now += 99;
+			const before = inspections;
+			await until(() => inspections > before);
+			expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(0);
+			// A refreshed nonterminal status interrupts continuous-death proof.
+			refresh = "in_flight";
+			const beforeStatus = statusReads;
+			now += 1000;
+			await until(() => statusReads > beforeStatus);
+			refresh = "normal";
+			const beforeReset = inspections;
+			await until(() => inspections > beforeReset);
+			now += 99;
+			const afterReset = inspections;
+			await until(() => inspections > afterReset);
+			expect(f.db.work.workAttemptGet(result.opRef)?.output.reads).toBe(0);
+			now += 1;
+		} else if (endEvidence === "idle") running = false;
+		else {
+			receipt = true;
+			for (const blocked of ["foreign", "unknown", "in_flight"] as const) {
+				refresh = blocked;
+				const before = statusReads;
+				await until(() => statusReads > before + 1);
+				expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null, output: { reads: 0 } });
+			}
+			refresh = "normal";
+		}
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.output.reads === 1);
+		if (!receipt) {
+			await f.restart();
+			now += 1000;
+			await until(() => f.db.work.workAttemptGet(result.opRef)?.output.reads === 2);
+			now += 5000;
+		}
+		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+		expect(f.job().attempts[0]?.endState).toBe(
+			receipt ? (endEvidence === "cancelled" ? "attempt_ended" : "completed") : "terminal_missing_receipt",
+		);
+		await f.restart();
+		expect(f.notices).toHaveLength(1);
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.port.resumes).toHaveLength(0);
+	});
+}
 
 test("an idle runtime reconciles a missing receipt after lost lifecycle, including restart", async () => {
 	let now = Date.now();
@@ -2490,117 +2717,128 @@ for (const stage of ["context", "status"] as const) {
 }
 
 for (const evidence of ["idle", "dead"] as const) {
-	test(`real tail ingress invalidates ${evidence} proof behind an idle delivery backlog`, async () => {
-		const f = await fixture({ hostLostGraceMs: 0 });
-		const releaseFrames = deferred<void>();
-		const releaseStatus = deferred<void>();
-		let terminal = false;
-		let terminalAt = 0;
-		let rechecking = false;
-		let recheckReturned = false;
-		let queries = 0;
-		let backlogEntered = false;
-		let toolDelivered = false;
-		let ingress = 0;
-		let executionProbes = 0;
-		let running: boolean | undefined = evidence === "idle" ? false : undefined;
-		const relay = scriptedRelay(async () => {
-			if (terminal && ++queries === 2) {
-				rechecking = true;
-				await releaseStatus.promise;
-			}
-			return { ok: true, result: {} };
-		});
-		const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
-		let attached: TailHandle | undefined;
-		f.port.attachTail = async (input) => {
-			const tail = await runner.attach({
-				...input,
-				onTurnActivity: () => {
-					ingress++;
-					input.onTurnActivity?.();
-				},
-				onFrame: async (frame) => {
-					if (frame.kind === "activity" && frame.idle) {
-						backlogEntered = true;
-						await releaseFrames.promise;
-					}
-					if (frame.kind === "tool_execution_start") toolDelivered = true;
-					await input.onFrame?.(frame);
-				},
+	for (const ingressKind of ["tool", "agent_start", "positioned_agent_start"] as const) {
+		test(`real tail ${ingressKind} ingress invalidates ${evidence} proof behind an idle delivery backlog`, async () => {
+			const f = await fixture({ hostLostGraceMs: 0 });
+			const releaseFrames = deferred<void>();
+			const releaseStatus = deferred<void>();
+			let terminal = false;
+			let terminalAt = 0;
+			let rechecking = false;
+			let recheckReturned = false;
+			let queries = 0;
+			let backlogEntered = false;
+			let toolDelivered = false;
+			let ingress = 0;
+			let executionProbes = 0;
+			let running: boolean | undefined = evidence === "idle" ? false : undefined;
+			const relay = scriptedRelay(async () => {
+				if (terminal && ++queries === 2) {
+					rechecking = true;
+					await releaseStatus.promise;
+				}
+				return { ok: true, result: {} };
 			});
-			attached = tail;
-			return tail;
-		};
-		Object.assign(f.port, {
-			turnRunning: async () => {
-				executionProbes++;
-				return running;
-			},
-		});
-		const status = f.port.status.bind(f.port);
-		f.port.status = async (input) => {
-			const report = await status(input);
-			if (!terminal) return report;
-			if (input.relay) {
-				await (input.relay as TailHandle).query("turn.result", { kind: "prompt", clientRef: input.opRef });
-				if (queries >= 2) recheckReturned = true;
-			}
-			return {
-				...report,
-				status: {
-					...report.status,
-					status: "failed",
-					receiptState: "missing",
-					clientRef: input.opRef,
-					terminalAt,
-					error: { code: "prompt_deadline_exceeded" },
-				},
-				summaryCompleted: true,
+			const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+			let attached: TailHandle | undefined;
+			f.port.attachTail = async (input) => {
+				const tail = await runner.attach({
+					...input,
+					onTurnActivity: () => {
+						ingress++;
+						input.onTurnActivity?.();
+					},
+					onFrame: async (frame) => {
+						if (frame.kind === "activity" && frame.idle) {
+							backlogEntered = true;
+							await releaseFrames.promise;
+						}
+						if (frame.kind === "tool_execution_start") toolDelivered = true;
+						await input.onFrame?.(frame);
+					},
+				});
+				attached = tail;
+				return tail;
 			};
-		};
-		try {
-			const result = await started(f, "a", origin);
-			await until(() => attached !== undefined);
-			relay.streams[0]!.host({ type: "activity", state: "idle" });
-			await until(() => backlogEntered);
-			attached!.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
-			f.port.liveness = async () => ({ live: false, disowned: false });
-			terminalAt = Date.now();
-			terminal = true;
-			await until(() => rechecking);
-			expect(executionProbes).toBe(1);
-			relay.streams[0]!.host({ type: "activity", state: "active" });
-			relay.streams[0]!.host({
-				type: "event",
-				kind: "tool_execution_start",
-				commandId: "foreign-command",
-				turnId: "foreign-turn",
-				payload: { toolName: "bash" },
+			Object.assign(f.port, {
+				turnRunning: async () => {
+					executionProbes++;
+					return running;
+				},
 			});
-			relay.streams[0]!.host({
-				type: "event",
-				kind: "tool_execution_start",
-				commandId: `command-${result.opRef}`,
-				turnId: `turn-${result.opRef}`,
-				payload: { toolName: "bash" },
-			});
-			expect(toolDelivered).toBe(false);
-			running = true;
-			releaseStatus.resolve();
-			await until(() => recheckReturned);
-			await Bun.sleep(20);
-			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
-			expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
-			expect(f.port.workerOutputReads).toEqual([]);
-			expect(f.notices).toEqual([]);
-			expect(toolDelivered).toBe(false);
-			expect(ingress).toBe(1);
-		} finally {
-			releaseStatus.resolve();
-			releaseFrames.resolve();
-		}
-	});
+			const status = f.port.status.bind(f.port);
+			f.port.status = async (input) => {
+				const report = await status(input);
+				if (!terminal) return report;
+				if (input.relay) {
+					await (input.relay as TailHandle).query("turn.result", { kind: "prompt", clientRef: input.opRef });
+					if (queries >= 2) recheckReturned = true;
+				}
+				return {
+					...report,
+					status: {
+						...report.status,
+						status: "failed",
+						receiptState: "missing",
+						clientRef: input.opRef,
+						terminalAt,
+						error: { code: "prompt_deadline_exceeded" },
+					},
+					summaryCompleted: true,
+				};
+			};
+			try {
+				const result = await started(f, "a", origin);
+				await until(() => attached !== undefined);
+				relay.streams[0]!.host({ type: "activity", state: "idle" });
+				await until(() => backlogEntered);
+				attached!.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
+				f.port.liveness = async () => ({ live: false, disowned: false });
+				terminalAt = Date.now();
+				terminal = true;
+				await until(() => rechecking);
+				expect(executionProbes).toBe(1);
+				relay.streams[0]!.host({ type: "activity", state: "active" });
+				relay.streams[0]!.host({
+					type: "event",
+					kind: "tool_execution_start",
+					commandId: "foreign-command",
+					turnId: "foreign-turn",
+					payload: { toolName: "bash" },
+				});
+				if (ingressKind === "tool") {
+					relay.streams[0]!.host({
+						type: "event",
+						kind: "tool_execution_start",
+						commandId: `command-${result.opRef}`,
+						turnId: `turn-${result.opRef}`,
+						payload: { toolName: "bash" },
+					});
+				} else {
+					// Native execution can restart without an SDK owner, before content.
+					relay.streams[0]!.host(
+						ingressKind === "agent_start"
+							? { type: "agent_start" }
+							: { type: "event", kind: "agent_start", payload: {} },
+					);
+				}
+				expect(toolDelivered).toBe(false);
+				running = true;
+				releaseStatus.resolve();
+				await until(() => recheckReturned);
+				await Bun.sleep(20);
+				expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+				expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+				expect(f.port.workerOutputReads).toEqual([]);
+				expect(f.notices).toEqual([]);
+				expect(toolDelivered).toBe(false);
+				expect(ingress).toBe(ingressKind === "tool" ? 1 : 0);
+			} finally {
+				releaseStatus.resolve();
+				releaseFrames.resolve();
+			}
+		});
+	}
 }
 
 test("recovery cannot use CLI idle snapshots before a real correlated observer is ready", async () => {
@@ -4085,6 +4323,150 @@ test("#308 host loss must persist across the grace window before settling", asyn
 	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
 });
 
+test("#308 a native start between probes resets accumulated host-loss grace", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
+	const attach = f.port.attachTail.bind(f.port);
+	let nativeStart: (() => void) | undefined;
+	f.port.attachTail = async (input) => {
+		nativeStart = () => {
+			void input.onObserverLifecycle?.("agent_start", false);
+		};
+		return attach(input);
+	};
+	const result = await started(f, "a", origin);
+	let inspections = 0;
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.liveness = async () => {
+		inspections++;
+		return { live: false, disowned: false };
+	};
+	await until(() => inspections >= 2 && nativeStart !== undefined);
+	now += 99;
+	let prior = inspections;
+	await until(() => inspections > prior);
+	// Invoke receipt-time ingress synchronously between completed probe ticks.
+	nativeStart!();
+	now += 1;
+	prior = inspections;
+	await until(() => inspections > prior || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	now += 99;
+	prior = inspections;
+	await until(() => inspections > prior);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	now += 1;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	expect(f.notices).toHaveLength(1);
+});
+
+for (const stage of ["status", "inspect"] as const) {
+	for (const lifecycle of ["raw", "positioned"] as const) {
+		test(`native ${lifecycle} start during ${stage} restarts saved-receipt host-loss proof`, async () => {
+			let now = Date.now();
+			const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
+			const result = await started(f, "a", origin);
+			await f.manager.stop();
+			const runtime = f.db.work.workAttemptGet(result.opRef)!;
+			const terminal = {
+				kind: "broker" as const,
+				observedAt: new Date(now).toISOString(),
+				reasonCode: "terminal_missing_receipt",
+				status: {
+					status: "failed" as const,
+					clientRef: result.opRef,
+					commandId: `command-${result.opRef}`,
+					turnId: `turn-${result.opRef}`,
+					startedAt: now,
+					terminalAt: now + 1,
+					receiptState: "missing" as const,
+					error: { code: "prompt_deadline_exceeded" },
+				},
+			};
+			f.db.transaction((tx) => f.db.work.workAttemptUpdate(tx, result.opRef, runtime.version, { terminal }));
+			const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+			const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+			f.port.attachTail = (input) => runner.attach(input);
+			Object.assign(f.port, { turnRunning: async () => true });
+			let unavailable = false;
+			let block = false;
+			let entered = false;
+			let holdNextStatus = false;
+			let freshEntered = false;
+			let inspections = 0;
+			const release = deferred<void>();
+			const releaseFresh = deferred<void>();
+			f.port.status = async (input) => {
+				if (!unavailable) return { operationRef: input.opRef, status: terminal.status, summaryCompleted: true };
+				if (holdNextStatus) {
+					freshEntered = true;
+					await releaseFresh.promise;
+				} else if (block && stage === "status") {
+					entered = true;
+					await release.promise;
+				}
+				throw sessionUnavailable();
+			};
+			f.port.liveness = async () => {
+				inspections++;
+				if (block && stage === "inspect") {
+					entered = true;
+					await release.promise;
+				}
+				return { live: false, disowned: false };
+			};
+			f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+			try {
+				await f.restart();
+				await until(() => relay.streams.length > 0);
+				unavailable = true;
+				await until(() => inspections >= 2);
+				block = true;
+				now += 100;
+				await until(() => entered);
+				relay.streams[0]!.host(
+					lifecycle === "raw" ? { type: "agent_start" } : { type: "event", kind: "agent_start", payload: {} },
+				);
+				holdNextStatus = true;
+				release.resolve();
+				await until(() => freshEntered || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+					terminal,
+					settledAt: null,
+					output: { reads: 0 },
+				});
+				expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeUndefined();
+				expect(f.notices).toEqual([]);
+				// A pre-start probe must not seed a new grace after the await.
+				// Delay the first fresh status; its completion starts the new window.
+				now += 1000;
+				block = false;
+				holdNextStatus = false;
+				let prior = inspections;
+				releaseFresh.resolve();
+				await until(() => inspections > prior + 1 || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+				now += 99;
+				prior = inspections;
+				await until(() => inspections > prior);
+				expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+				now += 1;
+				await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toEqual(terminal);
+				expect(f.notices).toHaveLength(1);
+				expect(f.port.sends).toHaveLength(1);
+				expect(f.port.resumes).toHaveLength(0);
+			} finally {
+				release.resolve();
+				releaseFresh.resolve();
+			}
+		});
+	}
+}
+
 test("#308 restart recovery classifies a router-disowned open attempt as host_lost", async () => {
 	const f = await fixture();
 	const result = await started(f);
@@ -4471,7 +4853,7 @@ test("#481 settled report of a pushed lane with a red PR names the PR and failin
 	expect(text).toContain("checks=red(lint,test)");
 });
 
-test("#481 check rollup: any failure is red, unfinished is pending, all success is green", () => {
+test("#481 check rollup: latest named checks must all be terminal before settling", () => {
 	const run = (name: string, status: string, conclusion = "") => ({ __typename: "CheckRun", name, status, conclusion });
 	const headSha = "a".repeat(40);
 	expect(
@@ -4480,7 +4862,76 @@ test("#481 check rollup: any failure is red, unfinished is pending, all success 
 			run("lint", "COMPLETED", "FAILURE"),
 			run("test", "IN_PROGRESS"),
 		]),
-	).toEqual({ prNumber: 1, headSha, status: "red", failingChecks: ["lint"] });
+	).toEqual({ prNumber: 1, headSha, status: "pending", failingChecks: [] });
+	expect(
+		classifyCheckRollup(10, headSha, [
+			{ ...run("lint", "COMPLETED", "FAILURE"), startedAt: "2026-10-18T12:00:00Z" },
+			{ ...run("lint", "COMPLETED", "SUCCESS"), startedAt: "2026-10-18T12:01:00Z" },
+			run("test", "COMPLETED", "SUCCESS"),
+		]),
+	).toEqual({ prNumber: 10, headSha, status: "green", failingChecks: [] });
+	expect(
+		classifyCheckRollup(11, headSha, [
+			{ ...run("lint", "COMPLETED", "SUCCESS"), startedAt: "2026-10-18T12:00:00Z" },
+			{ ...run("lint", "COMPLETED", "FAILURE"), startedAt: "2026-10-18T12:01:00Z" },
+		]),
+	).toEqual({ prNumber: 11, headSha, status: "red", failingChecks: ["lint"] });
+	expect(
+		classifyCheckRollup(13, headSha, [
+			{
+				...run("ci", "COMPLETED", "FAILURE"),
+				checkSuite: { app: { id: "app-1" }, workflowRun: { workflow: { id: "workflow-1" } } },
+			},
+			{
+				...run("ci", "COMPLETED", "SUCCESS"),
+				checkSuite: { app: { id: "app-1" }, workflowRun: { workflow: { id: "workflow-2" } } },
+			},
+		]),
+	).toEqual({ prNumber: 13, headSha, status: "red", failingChecks: ["ci"] });
+	const sameNamedCheckRunAndStatus = [
+		{
+			...run("ci", "COMPLETED", "FAILURE"),
+			startedAt: "2026-10-18T12:00:00Z",
+			detailsUrl: "https://github.com/example/repo/actions/runs/104",
+		},
+		{
+			__typename: "StatusContext",
+			context: "ci",
+			state: "SUCCESS",
+			createdAt: "2026-10-18T12:01:00Z",
+		},
+	];
+	expect(classifyCheckRollup(12, headSha, sameNamedCheckRunAndStatus)).toEqual({
+		prNumber: 12,
+		headSha,
+		status: "red",
+		failingChecks: ["ci"],
+	});
+	expect(failedCheckLogTargets(sameNamedCheckRunAndStatus)).toEqual([{ runId: "104" }]);
+	expect(
+		failedCheckLogTargets([
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:00:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/100",
+			},
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:01:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/101",
+			},
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:02:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/102",
+			},
+			{
+				...run("lint", "COMPLETED", "FAILURE"),
+				startedAt: "2026-10-18T12:03:00Z",
+				detailsUrl: "https://github.com/example/repo/actions/runs/103",
+			},
+		]),
+	).toEqual([{ runId: "103" }]);
 	expect(classifyCheckRollup(2, headSha, [run("lint", "COMPLETED", "SUCCESS"), run("test", "QUEUED")]).status).toBe(
 		"pending",
 	);
@@ -4515,148 +4966,234 @@ test("#481 check rollup: any failure is red, unfinished is pending, all success 
 	expect(() => classifyCheckRollup(8, "invalid", [])).toThrow("PR head SHA is invalid");
 });
 
-test("#595 GH check lookup finds the PR whose current head exactly matches the requested SHA", async () => {
+async function writeGhCheckStub(
+	ghPath: string,
+	associated: readonly object[],
+	details: {
+		readonly number: number;
+		readonly headRefOid: string;
+		readonly state?: string;
+		readonly mergedAt?: string | null;
+		readonly statusCheckRollup?: readonly object[];
+		readonly hasNextPage?: boolean;
+	},
+	argsPath = `${ghPath}.args`,
+	branchCandidates: readonly object[] = [],
+): Promise<void> {
+	const script = [
+		"#!/bin/sh",
+		`if [ "$1" = api ] && [ "$2" = graphql ]; then printf 'api graphql\\n' >> ${JSON.stringify(argsPath)}; printf '%s' ${JSON.stringify(
+			JSON.stringify({
+				data: {
+					repository: {
+						pullRequest: {
+							...details,
+							state: details.state ?? "OPEN",
+							statusCheckRollup: {
+								contexts: {
+									nodes: details.statusCheckRollup ?? [],
+									pageInfo: { hasNextPage: details.hasNextPage ?? false },
+								},
+							},
+						},
+					},
+				},
+			}),
+		)}; elif [ "$1" = api ]; then printf '%s\\n' "$*" >> ${JSON.stringify(argsPath)}; if [ "$2" = "repos/{owner}/{repo}/pulls" ]; then printf '%s' ${JSON.stringify(JSON.stringify(branchCandidates))}; else printf '%s' ${JSON.stringify(JSON.stringify(associated))}; fi; fi`,
+		"",
+	].join("\n");
+	await writeFile(ghPath, script);
+	await chmod(ghPath, 0o755);
+}
+
+test("#628 resolves an exact pushed head even when its PR uses a different branch", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const argsPath = join(directory, "args.txt");
 	const headSha = "a".repeat(40);
-	const response = [
-		{
-			number: 571,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: "b".repeat(40),
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
-		{
-			number: 570,
-			state: "MERGED",
-			mergedAt: "2026-10-14T12:00:00Z",
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
-		},
-	];
 	const ghPath = join(directory, "gh");
-	await writeFile(
+	await writeGhCheckStub(
 		ghPath,
-		`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsPath)}\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`,
-	);
-	await chmod(ghPath, 0o755);
-	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
-	const recordedArgs = (await readFile(argsPath, "utf8")).trim().split("\n");
-	expect(snapshot).toMatchObject({
-		prNumber: 570,
-		headSha,
-		status: "green",
-		prState: "closed",
-		merged: true,
-	});
-	expect(recordedArgs).toEqual([
-		"pr",
-		"list",
-		"--state",
-		"all",
-		"--search",
-		headSha,
-		"--limit",
-		"100",
-		"--json",
-		"number,headRefOid,state,mergedAt,statusCheckRollup",
-	]);
-});
-
-test("#595 GH check lookup prefers the open PR when duplicate PR heads match the requested SHA", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
-	cleanups.push(() => rm(directory, { recursive: true, force: true }));
-	const headSha = "c".repeat(40);
-	const response = [
+		[
+			{
+				number: 626,
+				state: "open",
+				merged_at: null,
+				updated_at: "2026-10-19T04:00:00Z",
+				head: { ref: "feature/thread-shutup", sha: headSha },
+			},
+		],
 		{
-			number: 569,
-			state: "CLOSED",
-			mergedAt: null,
+			number: 626,
 			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
-		},
-		{
-			number: 571,
 			state: "OPEN",
 			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+			statusCheckRollup: [{ name: "lint", status: "COMPLETED", conclusion: "FAILURE" }],
 		},
-		{
-			number: 570,
-			state: "CLOSED",
-			mergedAt: "2026-10-14T12:00:00Z",
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
-		},
-	];
-	const ghPath = join(directory, "gh");
-	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
-	await chmod(ghPath, 0o755);
+		argsPath,
+	);
 
-	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
-	expect(snapshot).toMatchObject({
-		prNumber: 571,
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(
 		headSha,
-		status: "pending",
+		directory,
+		undefined,
+		"work/67772d69737375652d363235",
+	);
+	expect(snapshot).toMatchObject({
+		prNumber: 626,
+		headSha,
+		status: "red",
+		failingChecks: ["lint"],
 		prState: "open",
 		merged: false,
 	});
+	expect((await readFile(argsPath, "utf8")).trim().split("\n").sort()).toEqual(
+		[
+			`api repos/{owner}/{repo}/commits/${headSha}/pulls -X GET -F per_page=100`,
+			"api repos/{owner}/{repo}/pulls -X GET -F head={owner}:work/67772d69737375652d363235 -F state=all -F per_page=100",
+			"api graphql",
+		].sort(),
+	);
 });
 
-test("#595 GH check lookup retries when multiple open PRs share the requested head SHA", async () => {
+test("#628 re-queries the persisted PR directly after a head-branch PR closes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const argsPath = join(directory, "args.txt");
+	const headSha = "e".repeat(40);
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[],
+		{ number: 631, headRefOid: headSha, state: "CLOSED", mergedAt: null, statusCheckRollup: [] },
+		argsPath,
+	);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, 631, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 631, headSha, prState: "closed", merged: false });
+	expect((await readFile(argsPath, "utf8")).trim().split("\n")).toEqual(["api graphql"]);
+});
+
+test("#595 GH check lookup keeps the lane branch as a SHA-checked PR candidate", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "b".repeat(40);
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[],
+		{
+			number: 630,
+			headRefOid: headSha,
+			state: "OPEN",
+			mergedAt: null,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+		undefined,
+		[
+			{
+				number: 630,
+				head: { ref: "work/lane", sha: headSha },
+				state: "open",
+				merged_at: null,
+				updated_at: "2026-10-19T04:00:00Z",
+			},
+		],
+	);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, undefined, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 630, headSha, status: "pending", prState: "open", merged: false });
+});
+
+test("#595 GH check lookup chooses the lane-branch candidate deterministically for a shared head SHA", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const headSha = "c".repeat(40);
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[
+			{
+				number: 571,
+				state: "open",
+				updated_at: "2026-10-19T04:02:00Z",
+				head: { ref: "feature/other", sha: headSha },
+			},
+			{
+				number: 572,
+				state: "open",
+				updated_at: "2026-10-19T04:01:00Z",
+				head: { ref: "work/lane", sha: headSha },
+			},
+			{
+				number: 569,
+				state: "closed",
+				merged_at: null,
+				head: { ref: "work/lane", sha: headSha },
+			},
+		],
+		{
+			number: 572,
+			headRefOid: headSha,
+			state: "OPEN",
+			mergedAt: null,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+	);
+
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, undefined, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 572, headSha, status: "pending", prState: "open", merged: false });
+});
+
+test("#595 GH check lookup breaks an exact-head PR tie by newest update then number", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const headSha = "d".repeat(40);
-	const response = [
-		{
-			number: 572,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
-		{
-			number: 573,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
-	];
 	const ghPath = join(directory, "gh");
-	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
-	await chmod(ghPath, 0o755);
+	await writeGhCheckStub(
+		ghPath,
+		[
+			{ number: 580, state: "open", updated_at: "2026-10-19T04:00:00Z", head: { ref: "feature/older", sha: headSha } },
+			{ number: 581, state: "open", updated_at: "2026-10-19T04:02:00Z", head: { ref: "feature/newer", sha: headSha } },
+			{ number: 579, state: "open", updated_at: "2026-10-19T04:02:00Z", head: { ref: "feature/tied", sha: headSha } },
+		],
+		{
+			number: 579,
+			headRefOid: headSha,
+			state: "OPEN",
+			mergedAt: null,
+			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
+		},
+	);
 
-	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory);
-	expect(snapshot).toBeUndefined();
+	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, undefined, "work/lane");
+	expect(snapshot).toMatchObject({ prNumber: 579, headSha, status: "pending", prState: "open", merged: false });
 });
 
 test("#595 GH check lookup preserves the persisted PR over another open duplicate", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-gh-checks-"));
 	cleanups.push(() => rm(directory, { recursive: true, force: true }));
 	const headSha = "e".repeat(40);
-	const response = [
-		{
-			number: 574,
-			state: "OPEN",
-			mergedAt: null,
-			headRefOid: headSha,
-			statusCheckRollup: [{ name: "ci", status: "IN_PROGRESS" }],
-		},
+	const ghPath = join(directory, "gh");
+	await writeGhCheckStub(
+		ghPath,
+		[
+			{ number: 574, state: "open", head: { ref: "work/lane", sha: headSha } },
+			{
+				number: 575,
+				state: "closed",
+				merged_at: "2026-10-14T12:00:00Z",
+				head: { ref: "feature/closed", sha: headSha },
+			},
+		],
 		{
 			number: 575,
+			headRefOid: headSha,
 			state: "CLOSED",
 			mergedAt: "2026-10-14T12:00:00Z",
-			headRefOid: headSha,
 			statusCheckRollup: [{ name: "ci", status: "COMPLETED", conclusion: "SUCCESS" }],
 		},
-	];
-	const ghPath = join(directory, "gh");
-	await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(JSON.stringify(response))}\n`);
-	await chmod(ghPath, 0o755);
+	);
 
 	const snapshot = await ghCheckStatusClient(1_000, ghPath).getCheckStatus(headSha, directory, 575);
 	expect(snapshot).toMatchObject({
@@ -4677,15 +5214,14 @@ test("#595 GH check lookup treats a full result page as ambiguous, with or witho
 	const prResults = (count: number, includeExactHead = false) =>
 		Array.from({ length: count }, (_, index) => ({
 			number: index + 1,
-			state: "CLOSED",
-			mergedAt: null,
-			headRefOid: includeExactHead && index === 0 ? headSha : (index + 1).toString(16).padStart(40, "0"),
-			statusCheckRollup: [],
+			state: "closed",
+			head: {
+				ref: `old/${index + 1}`,
+				sha: includeExactHead && index === 0 ? headSha : (index + 1).toString(16).padStart(40, "0"),
+			},
 		}));
 	const lookup = async (count: number, includeExactHead = false) => {
-		const response = JSON.stringify(prResults(count, includeExactHead));
-		await writeFile(ghPath, `#!/bin/sh\nprintf '%s' ${JSON.stringify(response)}\n`);
-		await chmod(ghPath, 0o755);
+		await writeGhCheckStub(ghPath, prResults(count, includeExactHead), { number: 1, headRefOid: headSha });
 		return client.getCheckStatus(headSha, directory);
 	};
 
@@ -4838,18 +5374,25 @@ test("#595 an exact PR head settles checks when its ref is not the worktree's lo
 	expect(f.job().awaitingChecks).toBeUndefined();
 });
 
-test("#595 an unresolved PR lookup settles the checks cycle instead of waiting for its timeout", async () => {
+test("#628 a successful no-PR lookup waits for the existing timeout, then permits resume", async () => {
+	let now = Date.parse("2026-10-19T00:00:00.000Z");
 	const checks = scriptedChecks(undefined);
-	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const f = await fixture({ now: () => now, checkStatusClient: checks.client, ownerTarget: () => origin });
 	const { head } = await awaitingLane(f, "fix/review-without-pr");
 	expect(f.job().awaitingChecks).toMatchObject({ prNumber: null, headSha: head });
 	checks.set(null);
+	await pollTimes(f, 2);
+	expect(f.job().state).toBe("awaiting_checks");
+	now += 3_600_000 - 1;
+	await pollTimes(f, 2);
+	expect(f.job().state).toBe("awaiting_checks");
+	now++;
 	await pollUntil(f, () => f.job().state !== "awaiting_checks");
 	expect(f.job().state).toBe("attempt_ended");
 	expect(f.job().awaitingChecks).toBeUndefined();
-	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: pr_not_found");
-	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks")).toContain("pr_not_found");
-	const resumed = await f.manager.start({ name: "a", text: "continue without a PR", cwd: f.directory });
+	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: timeout after 60m");
+	expect(checksNotice(f, "[lane a] attempt_ended: awaiting_checks timeout")).toContain("pr=unknown");
+	const resumed = await f.manager.start({ name: "a", text: "continue after no-PR timeout", cwd: f.directory });
 	expect(resumed).toMatchObject({ started: true });
 });
 
@@ -5059,6 +5602,236 @@ test("#595 force-retiring a lane awaiting checks clears the hold and allows resu
 	expect(resumed).toMatchObject({ started: true });
 });
 
+for (const retirement of ["automatic", "force"] as const) {
+	test(`audit: ${retirement} dead-lane retirement reports the ended checks cycle to its parent`, async () => {
+		const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+		const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+		const { head, sessionId } = await awaitingLane(f, `fix/${retirement}-retire-checks-report`);
+		await until(() => f.notices.length === 1);
+		const opRef = f.job().attempts.at(-1)!.opRef;
+		const savedRuntime = f.db.work.workAttemptGet(opRef)!;
+		expect(savedRuntime).toMatchObject({ terminal: { reasonCode: "end_turn" } });
+		expect(savedRuntime.settledAt).not.toBeNull();
+		const originalRow = f.db.outbox.rows()[0]!;
+		expect(originalRow.delivery_id).toBe(savedRuntime.deliveryId);
+		expect(f.notices[0]?.text).toContain("checks=pending");
+		const close = f.port.close.bind(f.port);
+		let admittedBeforeClose = false;
+		f.port.close = async (input) => {
+			expect(f.job().state).toBe("attempt_ended");
+			expect(f.job().awaitingChecks).toBeUndefined();
+			expect(f.db.outbox.rows()).toHaveLength(2);
+			admittedBeforeClose = true;
+			return close(input);
+		};
+		f.port.setSessionState(sessionId, { live: false });
+		if (retirement === "automatic") expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+		else expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true, forced: true });
+		expect(admittedBeforeClose).toBe(true);
+		expect(f.db.work.workAttemptGet(opRef)).toEqual(savedRuntime);
+		const rows = f.db.outbox.rows();
+		expect(rows).toHaveLength(2);
+		expect(rows.find((row) => row.delivery_id === originalRow.delivery_id)).toEqual(originalRow);
+		expect(new Set(rows.map((row) => row.delivery_id)).size).toBe(2);
+		await until(() => f.notices.length === 2);
+		expect(f.notices[1]?.deliveryId).not.toBe(savedRuntime.deliveryId);
+		expect(f.notices[1]?.text).toContain("awaiting_checks lane force-retired before checks settled");
+		expect(f.notices[1]?.text).toContain(`head=${head.slice(0, 12)} pr=598`);
+		expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: false });
+		await f.manager.recover();
+		await f.restart();
+		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+		expect(f.db.outbox.rows()).toEqual(rows);
+		expect(f.notices).toHaveLength(2);
+		expect(f.db.work.workAttemptGet(opRef)).toEqual(savedRuntime);
+	});
+}
+
+test("ended checks retirement admits a distinct report to the bound persona inbox", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const nudges: string[] = [];
+	const f = await fixture({
+		checkStatusClient: checks.client,
+		ownerTarget: () => origin,
+		notifyPersona: (key) => nudges.push(key),
+	});
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
+	const { sessionId } = await awaitingLane(f, "fix/retire-checks-persona");
+	await until(() => nudges.length === 1);
+	const runtime = f.db.work.workAttemptGet(f.job().attempts.at(-1)!.opRef)!;
+	expect(f.db.inbox.pendingOldest(originKey(origin))?.message_id).toBe(runtime.reportId);
+	f.port.setSessionState(sessionId, { live: false });
+	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+	expect(f.db.inbox.pendingCount(originKey(origin))).toBe(2);
+	expect(f.db.inbox.messageExists(runtime.reportId)).toBe(true);
+	await until(() => nudges.length === 2);
+	expect(nudges).toEqual([originKey(origin), originKey(origin)]);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	expect(f.notices).toHaveLength(0);
+	await f.restart();
+	expect(f.db.inbox.pendingCount(originKey(origin))).toBe(2);
+	expect(f.db.work.workAttemptGet(runtime.opRef)).toEqual(runtime);
+});
+
+test("ended checks retirement routes a distinct conclusion through the nested lane parent", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const f = await fixture({ allowNested: () => true, checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/retire-checks-nested", true);
+	const parent = await started(f, "parent", origin);
+	const child = await f.manager.start({
+		name: "child",
+		text: "child work",
+		cwd: f.directory,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child did not start");
+	f.port.complete(child.opRef, "child result");
+	await until(
+		() =>
+			f.job("child").state === "awaiting_checks" && f.db.work.laneReportsByParent("parent")[0]?.state === "consumed",
+	);
+	const runtime = f.db.work.workAttemptGet(child.opRef)!;
+	const first = f.db.work.laneReportsByParent("parent")[0]!;
+	await f.manager.recover();
+	// Recovery is already registered; isolate callback lock ordering from recovery's parent drain.
+	f.lanes.setRecoveryGate(async () => {});
+	f.port.setSessionState(child.sessionId, { live: false });
+	const releaseParent = deferred<void>();
+	let parentLocked = false;
+	const parentLock = f.port.runExclusive(workSessionKey("parent"), async () => {
+		parentLocked = true;
+		await releaseParent.promise;
+	});
+	let retirement: ReturnType<typeof f.lanes.forceRetire> | undefined;
+	try {
+		await until(() => parentLocked);
+		let retired = false;
+		retirement = f.lanes.forceRetire("child").then((result) => {
+			retired = result.retired;
+			return result;
+		});
+		// The synchronous settlement callback must not await the parent's held lock.
+		await until(() => retired);
+		expect(f.job("child").state).toBe("attempt_ended");
+		expect(f.db.work.laneReportsByParent("parent")).toHaveLength(2);
+	} finally {
+		releaseParent.resolve();
+		await parentLock;
+		await retirement;
+		f.lanes.setRecoveryGate(() => f.manager.recover());
+	}
+	await until(() => f.db.work.laneReportsByParent("parent").filter((row) => row.state === "consumed").length === 2);
+	const reports = f.db.work.laneReportsByParent("parent");
+	const conclusion = reports.find((row) => row.report_id !== first.report_id)!;
+	expect(conclusion.child_op_ref).not.toBe(child.opRef);
+	expect(conclusion.body).toContain("lane force-retired before checks settled");
+	expect(conclusion.body).toContain(`head=${head.slice(0, 12)} pr=598`);
+	expect(f.db.work.workAttemptGet(child.opRef)).toEqual(runtime);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	await f.restart();
+	expect(f.db.work.laneReportsByParent("parent")).toEqual(reports);
+});
+
+for (const mode of ["run", "no-target", "silent"] as const) {
+	for (const conclusion of ["forced", "normal"] as const) {
+		test(`ended checks ${conclusion} conclusion preserves ${mode} report suppression`, async () => {
+			const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+			const nudges: string[] = [];
+			const f = await fixture({ checkStatusClient: checks.client, notifyPersona: (key) => nudges.push(key) });
+			await laneRepo(f.directory, `fix/checks-${conclusion}-${mode}`, true);
+			if (mode !== "no-target") f.setOwnerTarget(origin);
+			let run: ReturnType<typeof f.manager.run> | undefined;
+			if (mode === "run") run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
+			else await f.manager.start({ name: "a", text: "work", cwd: f.directory });
+			await until(() => f.port.sends.length === 1);
+			const { opRef, sessionId } = f.port.sends[0]!;
+			f.port.complete(opRef, mode === "silent" ? "[SILENT]" : "done");
+			if (run) await run;
+			await until(() => f.job().state === "awaiting_checks");
+			const runtime = f.db.work.workAttemptGet(opRef)!;
+			if (mode === "silent") expect(runtime.output.knownSilence).not.toBeNull();
+			else expect(runtime.parent).toBeNull();
+			if (conclusion === "forced") {
+				f.port.setSessionState(sessionId, { live: false });
+				expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+			} else {
+				checks.set({ prNumber: 598, status: "green", failingChecks: [] });
+				await pollUntil(f, () => f.job().state === "done");
+			}
+			expect(f.job().awaitingChecks).toBeUndefined();
+			await f.restart();
+			expect(f.db.work.workAttemptGet(opRef)).toEqual(runtime);
+			expect(f.db.outbox.rows()).toHaveLength(0);
+			expect(f.db.inbox.pendingCount(originKey(origin))).toBe(0);
+			expect(f.notices).toHaveLength(0);
+			expect(nudges).toHaveLength(0);
+		});
+	}
+}
+
+test("ended checks retirement requires dead or disowned proof, not unknown liveness", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/retire-checks-unknown");
+	await until(() => f.notices.length === 1);
+	const job = f.job();
+	const binding = f.db.bindings.getSessionRecord(workSessionKey("a"));
+	const runtime = f.db.work.workAttemptGet(job.attempts.at(-1)!.opRef);
+	const rows = f.db.outbox.rows();
+	for (const live of [true, undefined]) {
+		f.port.liveness = async () => ({ live, disowned: false });
+		expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: false });
+		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+	}
+	expect(f.job()).toEqual(job);
+	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))).toEqual(binding);
+	expect(f.db.work.workAttemptGet(runtime!.opRef)).toEqual(runtime);
+	expect(f.db.outbox.rows()).toEqual(rows);
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.closes).toHaveLength(0);
+});
+
+test("ended checks force retirement fences an already in-flight green GitHub poll", async () => {
+	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const { head, sessionId } = await awaitingLane(f, "fix/retire-checks-stale-poll");
+	await until(() => f.notices.length === 1);
+	let entered = false;
+	const release = deferred<void>();
+	checks.client.getCheckStatus = async () => {
+		entered = true;
+		await release.promise;
+		return { prNumber: 598, headSha: head, status: "green", failingChecks: [] };
+	};
+	const poll = f.manager.recover();
+	let retirement: ReturnType<typeof f.lanes.forceRetire> | undefined;
+	try {
+		await until(() => entered);
+		// The poll is explicitly registered above. Do not wait for its held network read again.
+		f.lanes.setRecoveryGate(async () => {});
+		f.port.setSessionState(sessionId, { live: false });
+		let retired = false;
+		retirement = f.lanes.forceRetire("a").then((result) => {
+			retired = result.retired;
+			return result;
+		});
+		await until(() => retired);
+		expect(await retirement).toMatchObject({ retired: true });
+		expect(f.db.outbox.rows()).toHaveLength(2);
+	} finally {
+		release.resolve();
+		await poll;
+		await retirement;
+		f.lanes.setRecoveryGate(() => f.manager.recover());
+	}
+	await until(() => f.notices.length === 2);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(checksNotice(f, "[lane a] checks passed")).toBeUndefined();
+	await f.restart();
+	expect(f.db.outbox.rows()).toHaveLength(2);
+	expect(f.notices).toHaveLength(2);
+});
+
 test("#481 awaiting_checks: the third red result settles the lane failed with the red checks in its report", async () => {
 	const red: CheckStatusAnswer = { prNumber: 491, status: "red", failingChecks: ["unit-test", "lint-check"] };
 	const checks = scriptedChecks({ prNumber: 491, status: "pending", failingChecks: [] });
@@ -5083,6 +5856,14 @@ test("#481 awaiting_checks: the third red result settles the lane failed with th
 	const report = checksNotice(f, "[lane a] failed");
 	expect(report).toContain("checks=red(unit-test,lint-check)");
 	expect(report).toContain("pr=491");
+	const resumed = await f.manager.start({
+		name: "a",
+		text: "resume after exhausted red checks",
+		cwd: f.job().lane.worktreePath,
+		resume: true,
+	});
+	expect(resumed).toMatchObject({ started: true });
+	expect(f.job().state).toBe("running");
 });
 
 test("#481 awaiting_checks: past one hour on the injected clock the lane settles with a timeout", async () => {
@@ -5106,7 +5887,7 @@ test("#481 awaiting_checks: a closed PR settles the lane with pr_closed", async 
 	const checks = scriptedChecks({ prNumber: 493, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	await awaitingLane(f, "fix/pr-closed");
-	checks.set(null);
+	checks.set({ prNumber: 493, status: "pending", failingChecks: [], prState: "closed", merged: false });
 	await pollUntil(f, () => f.job().state !== "awaiting_checks");
 	const job = f.job();
 	expect(job.state).toBe("attempt_ended");

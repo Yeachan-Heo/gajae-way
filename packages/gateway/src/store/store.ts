@@ -1,4 +1,3 @@
-import { type ChatMessagePayload, originKey } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { StoreCore, type StoreOpenOptions } from "./core";
 import { BindingsGroup, type BrokerAuthority } from "./groups/bindings";
@@ -7,7 +6,7 @@ import { JournalGroup } from "./groups/journal";
 import { MemoryGroup } from "./groups/memory";
 import { MonitorsGroup } from "./groups/monitors";
 import { OutboxGroup } from "./groups/outbox";
-import { resolveLaneReportOrigin, WorkAttemptStateError, WorkGroup } from "./groups/work";
+import { WorkAttemptStateError, WorkGroup } from "./groups/work";
 import { type OwnedTable, TABLE_OWNER } from "./ownership";
 import type { WriteTx } from "./tx";
 
@@ -88,53 +87,6 @@ export class Store {
 			const work = this.work.replayProjection(tx, this.journal.latest("attempt"), this.journal.latest("lane_job"));
 			return { ...work, deliveries: this.outbox.replayProjection(tx, this.journal.latest("delivery")) };
 		});
-	}
-
-	reconcileWorkAttempts(log: (line: string) => void = console.error): number {
-		return this.transaction((tx) =>
-			this.work.workAttemptReconcile(
-				tx,
-				(runtime, at, childFallback, personaReport) => {
-					this.bindings.touchWorkSession(
-						tx,
-						runtime.sessionKey,
-						runtime.sessionId,
-						runtime.epoch,
-						at,
-						JSON.stringify({
-							platform: "work",
-							kind: "task",
-							conversationId: runtime.sessionKey.slice("work/task/".length),
-						}),
-					);
-					const enqueueFallback = (payload: ChatMessagePayload) => {
-						if (typeof payload.deliveryId !== "string") throw new Error("reconciled work fallback has no delivery id");
-						this.outbox.enqueue(tx, {
-							deliveryId: payload.deliveryId,
-							turnId: payload.turnId,
-							originKey: originKey(payload.origin),
-							payloadJson: JSON.stringify(payload),
-						});
-					};
-					if (personaReport) {
-						const enqueued =
-							this.bindings.getSessionRecord(personaReport.row.originKey) !== undefined &&
-							this.inbox.enqueue(tx, {
-								messageId: personaReport.row.messageId,
-								originKey: personaReport.row.originKey,
-								originRefJson: resolveLaneReportOrigin(runtime.parent, personaReport.row.originRefJson),
-								body: personaReport.row.body,
-								receivedAt: personaReport.row.receivedAt,
-								source: "lane_report",
-							});
-						if (!enqueued) enqueueFallback(personaReport.fallbackPayload);
-					}
-					if (childFallback) enqueueFallback(childFallback);
-				},
-				(jobId) => this.bindings.quarantineInvalidWork(tx, jobId),
-				log,
-			),
-		);
 	}
 
 	inspectBrokerAuthority(): BrokerAuthorityCensus {

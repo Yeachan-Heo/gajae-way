@@ -144,7 +144,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 		const slo = new SloRecorder(database.core, { home: config.home });
 		sloRecorder = slo;
 		try {
-			database.reconcileWorkAttempts();
+			database.replayJournal();
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` }; // Note: broker.agentDir has been canonicalized by GlobalGjcClient
 			// Authority already checked in Store.open(); this assertion confirms immutability.
 			database.bindings.assertAuthority(authority);

@@ -5,6 +5,7 @@ import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol"
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { Store } from "../store";
+import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 
@@ -317,7 +318,7 @@ export class LaneGovernor {
 			const repositoryPath = record?.lane.repositoryPath ?? record?.lane.repository;
 			if (!expected && record?.lane.worktreePath && repositoryPath) {
 				try {
-					this.#cleanupWorktree(
+					await this.#cleanupWorktree(
 						name,
 						lane.sessionId,
 						record.lane.worktreePath,
@@ -566,13 +567,13 @@ export class LaneGovernor {
 	}
 
 	/** Cleans up a runtime-created worktree and its branch. Throws on error (issue #480). */
-	#cleanupWorktree(
+	async #cleanupWorktree(
 		name: string,
 		sessionId: string,
 		worktreePath: string,
 		repository: string,
 		removeRepository: boolean,
-	): void {
+	): Promise<void> {
 		if (removeRepository) assertManagedRepositoryPath(this.#laneRoot, name, repository);
 
 		// A previous cleanup can have removed the managed bare repository before
@@ -582,63 +583,47 @@ export class LaneGovernor {
 			return;
 		}
 		// Remove the worktree using git worktree remove --force
-		const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
-			cwd: repository,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const removeResult = await runGit(["worktree", "remove", "--force", worktreePath], { cwd: repository });
 
 		if (removeResult.exitCode !== 0) {
-			const stderr = removeResult.stderr?.toString().trim() || "unknown error";
+			const stderr = removeResult.stderr.trim() || "unknown error";
 			if (existsSync(worktreePath)) throw new Error(`git worktree remove failed: ${stderr}`);
 
 			// External deletion leaves a stale administrative worktree record. Prune
 			// only after confirming the path is absent, then verify it is unregistered.
-			const pruneResult = Bun.spawnSync(["git", "worktree", "prune"], {
-				cwd: repository,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
+			const pruneResult = await runGit(["worktree", "prune"], { cwd: repository });
 			if (pruneResult.exitCode !== 0) {
-				const pruneError = pruneResult.stderr?.toString().trim() || "unknown error";
+				const pruneError = pruneResult.stderr.trim() || "unknown error";
 				throw new Error(`git worktree prune failed: ${pruneError}`);
 			}
-			const listResult = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
-				cwd: repository,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
+			const listResult = await runGit(["worktree", "list", "--porcelain"], { cwd: repository });
 			if (listResult.exitCode !== 0) {
-				const listError = listResult.stderr?.toString().trim() || "unknown error";
+				const listError = listResult.stderr.trim() || "unknown error";
 				throw new Error(`git worktree list failed: ${listError}`);
 			}
 			const canonicalWorktreePath = canonicalPathIncludingMissing(worktreePath);
-			const stillRegistered = listResult.stdout
-				?.toString()
-				.split(/\r?\n/)
-				.some((line) => {
-					if (!line.startsWith("worktree ")) return false;
-					try {
-						return canonicalPathIncludingMissing(line.slice("worktree ".length)) === canonicalWorktreePath;
-					} catch {
-						// If a listed path cannot be canonicalized, do not delete the repository.
-						return true;
-					}
-				});
+			const stillRegistered = listResult.stdout.split(/\r?\n/).some((line) => {
+				if (!line.startsWith("worktree ")) return false;
+				try {
+					return canonicalPathIncludingMissing(line.slice("worktree ".length)) === canonicalWorktreePath;
+				} catch {
+					// If a listed path cannot be canonicalized, do not delete the repository.
+					return true;
+				}
+			});
 			if (stillRegistered) throw new Error(`worktree remains registered after pruning: ${stderr}`);
 		}
 
 		// Delete the branch using git branch -D
 		const branchName = managedLaneBranchName(name);
-		const branchResult = Bun.spawnSync(["git", "branch", "-D", branchName], {
-			cwd: repository,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-
-		// Branch deletion failure is non-fatal; only log it
+		// Branch deletion failure (including its deadline) is non-fatal; only log it
+		const branchResult = await runGit(["branch", "-D", branchName], { cwd: repository }).catch((error: unknown) => ({
+			exitCode: -1,
+			stdout: "",
+			stderr: error instanceof Error ? error.message : String(error),
+		}));
 		if (branchResult.exitCode !== 0) {
-			const stderr = branchResult.stderr?.toString().trim() || "unknown error";
+			const stderr = branchResult.stderr.trim() || "unknown error";
 			this.#log(
 				`lane_branch_delete_failed name=${name} session=${sessionId} branch=${branchName} detail=${stderr}`,
 				"warn",

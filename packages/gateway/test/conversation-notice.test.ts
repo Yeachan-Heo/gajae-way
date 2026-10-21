@@ -69,3 +69,14 @@ test("every conversation is told to stay responsive: no foreground waits, answer
 	expect(currentConversationNotice(channel)).toContain("The gateway already marks the message 👀");
 	expect(currentConversationNotice(loopback)).not.toContain("👀");
 });
+
+// Issue #625: Slack keeps a thread under the persona's own message on the channel session.
+test("SHUTUP guidance reaches threads and Slack channel sessions, not plain channels or DMs", () => {
+	const discordThread: OriginRef = { platform: "discord", kind: "thread", conversationId: "T1", parentId: "C1" };
+	const discordChannel: OriginRef = { platform: "discord", kind: "channel", conversationId: "C1" };
+	expect(currentConversationNotice(discordThread)).toContain("reply with exactly [SHUTUP]");
+	expect(currentConversationNotice(slackChannel)).toContain("Slack thread under one of your own messages");
+	expect(currentConversationNotice(slackChannel)).toContain("exactly [SHUTUP]");
+	for (const origin of [discordChannel, slackDm, loopback])
+		expect(currentConversationNotice(origin)).not.toContain("[SHUTUP]");
+});

@@ -9,6 +9,7 @@ import { gatewayHome, loadConfig } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { DEFAULT_EXIT_WRITER, installExitReporter } from "./exit-report";
 import { SecretGuard, secretSourcesFromEnv } from "./guard/secret-guard";
+import { installLivenessWatchdog } from "./liveness-watchdog";
 import { assertNoRestoreJournal } from "./offline";
 import { runCensus } from "./ops/census";
 import { runCutover } from "./ops/cutover";
@@ -144,6 +145,8 @@ if (command === "config" && args[0] === "check") {
 			broker: { onLiveOutageExceeded },
 		});
 		booted = server;
+		// A wedged main thread never exits on its own, so Restart=always never fires (#615).
+		installLivenessWatchdog();
 		const shutdown = (signal: NodeJS.Signals) => {
 			reporter.report("signal", signal, 0);
 			// The stop is bounded and the exit explicit (#225): relays, session hosts
