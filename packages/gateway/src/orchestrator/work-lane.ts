@@ -1372,6 +1372,7 @@ export class WorkLaneManager {
 				sessionId: runtime.sessionId,
 				brokerGeneration: observer.generation,
 				repo: runtime.cwd,
+				signal: observer.abort.signal,
 				originKey: runtime.sessionKey,
 				onTurnActivity: invalidateActivity,
 				onObserverLifecycle: (kind) => {

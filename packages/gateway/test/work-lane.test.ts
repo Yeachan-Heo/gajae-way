@@ -1373,6 +1373,126 @@ test("audit: a dropped observer closes its resident relay once and shutdown drai
 	}
 });
 
+for (const revoke of ["drop", "settle"] as const) {
+	test(`observer ${revoke} cancels a real capacity wait without releasing the running owner (#640 Parang5593969223)`, async () => {
+		const errors = spyOn(console, "error").mockImplementation(() => {});
+		cleanups.push(async () => errors.mockRestore());
+		const f = await fixture();
+		const canonicalAgentDir = join(f.directory, "agent");
+		const authority = initializeTestBrokerAuthority(f.db, canonicalAgentDir);
+		// The normal fixture's onBind writes legacy bindings, which authority
+		// enforcement forbids. Model successful owned creation explicitly.
+		f.port.bind = async (input) => {
+			const binding = { ...input, sessionId: crypto.randomUUID() };
+			f.port.binds.push(input);
+			expect(f.db.transaction((tx) => f.db.bindings.recordOwnedBinding(tx, { ...binding, authority }))).toBe(true);
+			f.port.setSessionState(binding.sessionId, { repo: input.repo, live: true });
+			return binding;
+		};
+		const result = await started(f, "a", origin);
+		await f.manager.stop();
+		const binds = f.port.binds.length;
+		const sends = f.port.sends.length;
+		const terminate = spyOn(f.port, "terminateHost");
+		const saturated = deferred<void>();
+		const relay = scriptedRelay(() => {
+			throw new Error("capacity-only relays must never send SDK controls or queries");
+		});
+		const runner = new TailRunner({
+			stream: relay.spawn,
+			repo: f.directory,
+			maxTailProcesses: 1,
+			log: (line) => {
+				if (line.startsWith("tail_saturation ")) saturated.resolve();
+			},
+		});
+		const commands: string[][] = [];
+		const brokerPort = new BrokerSessionPort({
+			database: f.db,
+			authority,
+			cli: async (args) => {
+				commands.push([...args]);
+				throw new Error(`unexpected broker command ${args.join(" ")}`);
+			},
+			tailRunner: runner,
+		});
+		// Keep durable status/output scripted, but use the production port's full
+		// attach input forwarding and the real runner's capacity queue.
+		f.port.attachTail = (input) => brokerPort.attachTail(input);
+		const owner = await runner.attach({ sessionId: "persona-capacity-owner", brokerGeneration: 1, repo: f.directory });
+		owner.beginTurn("persona-owned-turn");
+		owner.setTurnRunning(true);
+		const ownerClose = spyOn(owner, "close");
+		const ownerRunning = spyOn(owner, "setTurnRunning");
+		let stopping: Promise<void> | undefined;
+		try {
+			await f.restart();
+			await saturated.promise;
+			expect(runner.activeCount).toBe(1);
+			expect(relay.streams).toHaveLength(1);
+			if (revoke === "drop") {
+				tearObserverLane(f, result.opRef);
+				await until(() =>
+					errors.mock.calls.some(
+						(call) => String(call[0]).includes("work_observer_failed") && String(call[0]).includes(result.opRef),
+					),
+				);
+			} else {
+				f.port.complete(result.opRef, "settled while its observer waits for capacity");
+				await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.notices).toHaveLength(1);
+			}
+			let stopped = false;
+			stopping = f.manager.stop().then(() => {
+				stopped = true;
+			});
+			// Bounded failure on 7fdd8f: disposal joins an uncancellable attach.
+			// The running persona owner is released only in finally on failure.
+			await until(() => stopped);
+			expect(ownerClose).not.toHaveBeenCalled();
+			expect(ownerRunning).not.toHaveBeenCalled();
+			expect(owner.connectionEpoch).toBeDefined();
+			expect(relay.streams[0]?.closed).toBe(false);
+			expect(runner.activeCount).toBe(1);
+			expect(relay.streams).toHaveLength(1);
+			expect(f.port.binds).toHaveLength(binds);
+			expect(f.port.sends).toHaveLength(sends);
+			expect(f.port.resumes).toEqual([]);
+			expect(f.port.steers).toEqual([]);
+			expect(f.port.closes).toEqual([]);
+			expect(terminate).not.toHaveBeenCalled();
+			expect(commands).toEqual([]);
+			expect(relay.requests).toEqual([]);
+			if (revoke === "drop") {
+				expect(f.notices).toEqual([]);
+			}
+		} finally {
+			// Explicit normal owner cleanup, never a prerequisite for stop above.
+			await owner.close();
+			await (stopping ?? f.manager.stop());
+		}
+		expect(runner.activeCount).toBe(0);
+		expect(relay.streams).toHaveLength(1);
+		// A cancelled waiter must not spawn later or retain a reserved slot.
+		for (let i = 0; i < 2; i++) {
+			const probe = await runner.attach({
+				sessionId: `capacity-probe-${i}`,
+				brokerGeneration: 1,
+				repo: f.directory,
+				priority: "retired",
+			});
+			expect(runner.activeCount).toBe(1);
+			await probe.close();
+			expect(runner.activeCount).toBe(0);
+		}
+		expect(relay.streams.map((stream) => stream.sessionId)).toEqual([
+			"persona-capacity-owner",
+			"capacity-probe-0",
+			"capacity-probe-1",
+		]);
+	});
+}
+
 for (const boundary of ["attachment", "ready"] as const) {
 	for (const revoke of ["drop", "shutdown"] as const) {
 		test(`observer ${revoke} drains a pending ${boundary} and closes the acquired tail exactly once`, async () => {
