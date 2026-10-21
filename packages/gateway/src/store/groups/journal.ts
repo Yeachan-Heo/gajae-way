@@ -157,6 +157,32 @@ export class JournalGroup {
 			)
 			.run(tx, cutoffs.updateCutoff, cutoffs.batch).changes;
 	}
+
+	/** Measure work_journal row count and on-disk footprint. */
+	measure(): { rowCount: number; byteSize: number } {
+		const stats = this.#db.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
+		const rowCount = stats.cnt;
+
+		// Measure the on-disk footprint of work_journal (table + its indexes) with the dbstat
+		// virtual table. Only SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB fall back to an
+		// estimate (row_json bytes + ~80 bytes of per-row column overhead).
+		let byteSize: number;
+		try {
+			const dbstatResult = this.#db
+				.prepare(
+					"SELECT COALESCE(SUM(pgsize), 0) AS size FROM dbstat WHERE name IN (SELECT name FROM sqlite_schema WHERE tbl_name = 'work_journal')",
+				)
+				.get() as { size: number };
+			byteSize = dbstatResult.size;
+		} catch {
+			const sizeStats = this.#db
+				.prepare("SELECT COALESCE(SUM(LENGTH(row_json)), 0) AS json_size FROM work_journal")
+				.get() as { json_size: number };
+			byteSize = sizeStats.json_size + rowCount * 80;
+		}
+
+		return { rowCount, byteSize };
+	}
 }
 
 /**

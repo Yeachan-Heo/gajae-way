@@ -112,27 +112,7 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 				await Promise.all(LEASE_NAMES.map(async (name) => [name, await readLeaseOwner(config.home, name)] as const)),
 			);
 			// Measure work_journal row count and byte size
-			const journalDb = database.core.groupDb("journal");
-			const journalStats = journalDb.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
-			const journalRowCount = journalStats.cnt;
-
-			// Measure the on-disk footprint of work_journal (table + its indexes) with the dbstat
-			// virtual table. Only SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB fall back to an
-			// estimate (row_json bytes + ~80 bytes of per-row column overhead).
-			let journalByteSize: number;
-			try {
-				const stats = journalDb
-					.prepare(
-						"SELECT COALESCE(SUM(pgsize), 0) AS size FROM dbstat WHERE name IN (SELECT name FROM sqlite_schema WHERE tbl_name = 'work_journal')",
-					)
-					.get() as { size: number };
-				journalByteSize = stats.size;
-			} catch {
-				const sizeStats = journalDb
-					.prepare("SELECT COALESCE(SUM(LENGTH(row_json)), 0) AS json_size FROM work_journal")
-					.get() as { json_size: number };
-				journalByteSize = sizeStats.json_size + journalRowCount * 80;
-			}
+			const { rowCount: journalRowCount, byteSize: journalByteSize } = database.journal.measure();
 
 			const report: CensusReport = {
 				schemaVersion: database.schemaVersion,
