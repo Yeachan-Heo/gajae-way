@@ -278,7 +278,9 @@ test("sweep respects deletion budget between journal and attemptUpdated sweeps",
 	await withDb((_path, database, raw) => {
 		// Create old attempts with many updates
 		const now = new Date();
-		const oldTime = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000); // 8 days ago
+		// Older than HISTORY_RETENTION_MS, so both the 30-day sweep and the attempt_updated sweep
+		// have at least `batch` eligible rows; only a shared budget keeps the total at one batch.
+		const oldTime = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000); // 31 days ago
 		const opRef = "op-budget-test";
 
 		// Create 100 old attempt_updated entries
@@ -299,7 +301,7 @@ test("sweep respects deletion budget between journal and attemptUpdated sweeps",
 
 		// Total deleted should not exceed batch size (budget is per transaction)
 		const totalDeleted = result.deleted.work_journal || 0;
-		expect(totalDeleted).toBeLessThanOrEqual(10);
+		expect(totalDeleted).toBe(10);
 
 		// Should indicate more work to do
 		expect(result.more).toBe(true);
