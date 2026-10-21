@@ -1464,15 +1464,17 @@ for (const boundary of ["attachment", "ready"] as const) {
 }
 
 for (const revoke of ["stop", "generation", "binding"] as const) {
-	test(`initial start cannot send after ${revoke} revokes pending relay readiness`, async () => {
+	test(`initial start revoked by ${revoke} records local rejection and permits explicit resume after recovery`, async () => {
 		let generation = 1;
-		const f = await fixture({ brokerGeneration: () => generation });
+		const f = await fixture({ brokerGeneration: () => generation, ownerTarget: () => origin });
 		const ready = deferred<void>();
 		const attach = f.port.attachTail.bind(f.port);
 		let acquired: TailHandle | undefined;
+		let sessionActivity: (() => void) | undefined;
 		f.port.attachTail = async (input) => {
 			const tail = await attach(input);
 			if (acquired) return tail;
+			sessionActivity = input.onSessionActivity;
 			Object.defineProperty(tail, "ready", { value: ready.promise });
 			const close = tail.close.bind(tail);
 			tail.close = async () => {
@@ -1488,23 +1490,120 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 		try {
 			await until(() => acquired !== undefined);
 			const before = f.db.work.workAttemptOpen()[0]!;
+			if (revoke === "generation") {
+				// Session content touches binding activity, not the attempt version.
+				// Separately race a durable checkpoint so rejection must CAS latest.
+				expect(sessionActivity).toBeDefined();
+				sessionActivity!();
+				const checkpoint = f.db.transaction((tx) =>
+					f.db.work.workAttemptUpdate(tx, before.opRef, before.version, { sendPhase: "prepared" }),
+				);
+				expect(checkpoint).toBeDefined();
+				expect(checkpoint!.version).toBeGreaterThan(before.version);
+			}
 			let transition: Promise<void> | undefined;
 			if (revoke === "stop") transition = f.manager.stop();
 			else if (revoke === "generation") {
 				generation++;
-				transition = f.manager.onBrokerGeneration();
+				ready.resolve();
 			} else {
 				f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey("a")));
 				ready.resolve();
 			}
-			expect(await start).toBeInstanceOf(ProtocolError);
+			const error = await start;
+			expect(error).toBeInstanceOf(ProtocolError);
+			expect(error).toMatchObject(
+				revoke === "stop"
+					? { code: "gateway_shutting_down" }
+					: { code: "verb_failed", detail: { reasonCode: "send_rejected" } },
+			);
 			await transition;
 			expect(f.port.sends).toEqual([]);
 			expect(f.port.sendAttempts).toEqual([]);
-			expect(f.db.work.workAttemptGet(before.opRef)).toEqual(before);
-			expect(f.notices).toEqual([]);
-			expect(f.db.outbox.rows()).toEqual([]);
+			expect(await f.port.status({ sessionId: before.sessionId, repo: before.cwd, opRef: before.opRef })).toMatchObject(
+				{
+					status: { status: "unknown" },
+					summaryCompleted: false,
+				},
+			);
+			const checkpoint = f.db.work.workAttemptGet(before.opRef)!;
+			expect(checkpoint.terminal).toMatchObject({ kind: "local", reasonCode: "send_rejected" });
+			expect(checkpoint.terminal?.status).toBeUndefined();
+			expect(checkpoint.sendEvidence).toBeNull();
+			expect(checkpoint.sendPhase).toBe("prepared");
+			if (revoke === "stop") await f.restart();
+			else if (revoke === "generation") await f.manager.onBrokerGeneration();
+			else await f.manager.recover();
+			await until(() => f.db.work.workAttemptGet(before.opRef)?.settledAt != null);
+			expect(f.db.work.workAttemptGet(before.opRef)?.terminal).toEqual(checkpoint.terminal);
+			expect(f.job().attempts[0]).toMatchObject({ endState: "failed", errorCode: "send_rejected" });
+			expect(f.job().state).toBe("awaiting_operator");
+			expect(f.notices).toHaveLength(1);
+			expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable");
+			expect(f.db.outbox.rows()).toHaveLength(1);
+			await f.manager.recover();
+			expect(f.notices).toHaveLength(1);
+			expect(f.db.outbox.rows()).toHaveLength(1);
+			expect(f.port.sendAttempts).toEqual([]);
+			const resumed = await f.manager.start({ name: "a", text: "explicit new work", resume: true });
+			expect(resumed.started).toBe(true);
+			if (!resumed.started) throw new Error("explicit resume unexpectedly held");
+			expect(resumed.opRef).not.toBe(before.opRef);
+			expect(f.port.sendAttempts.map((input) => input.opRef)).toEqual([resumed.opRef]);
+			expect(f.db.work.workAttemptGet(resumed.opRef)).toMatchObject({ sendPhase: "accepted", terminal: null });
+			expect(f.db.work.workAttemptGet(before.opRef)?.terminal).toEqual(checkpoint.terminal);
+			expect(f.notices).toHaveLength(1);
 			expect(f.port.closes).toEqual([]);
+		} finally {
+			ready.resolve();
+			await start;
+			await f.manager.stop();
+		}
+	});
+}
+
+for (const evidence of ["acceptance", "terminal"] as const) {
+	test(`initial pre-send rejection preserves concurrent durable ${evidence}`, async () => {
+		const f = await fixture();
+		const ready = deferred<void>();
+		const attach = f.port.attachTail.bind(f.port);
+		let acquired = false;
+		f.port.attachTail = async (input) => {
+			const tail = await attach(input);
+			Object.defineProperty(tail, "ready", { value: ready.promise });
+			const close = tail.close.bind(tail);
+			tail.close = async () => {
+				await close();
+				ready.resolve();
+			};
+			acquired = true;
+			return tail;
+		};
+		const start = f.manager
+			.start({ name: "a", text: "not submitted", cwd: f.directory })
+			.catch((error: unknown) => error);
+		try {
+			await until(() => acquired);
+			const prepared = f.db.work.workAttemptOpen()[0]!;
+			const observedAt = new Date().toISOString();
+			// Model a concurrent durable writer, not a fabricated SDK completion.
+			const raced = f.db.transaction((tx) =>
+				f.db.work.workAttemptUpdate(
+					tx,
+					prepared.opRef,
+					prepared.version,
+					evidence === "acceptance"
+						? { sendPhase: "accepted", sendEvidence: { source: "status", observedAt } }
+						: { terminal: { kind: "local", reasonCode: "host_lost", observedAt } },
+				),
+			);
+			expect(raced).toBeDefined();
+			const stopping = f.manager.stop();
+			expect(await start).toBeInstanceOf(ProtocolError);
+			await stopping;
+			expect(f.db.work.workAttemptGet(prepared.opRef)).toEqual(raced);
+			expect(f.port.sendAttempts).toEqual([]);
+			expect(f.notices).toEqual([]);
 		} finally {
 			ready.resolve();
 			await start;

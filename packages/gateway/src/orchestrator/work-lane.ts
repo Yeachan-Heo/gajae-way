@@ -1001,7 +1001,17 @@ export class WorkLaneManager {
 		this.#attach(observer);
 		await observer.attaching;
 		if (!this.#writeCurrent(observer)) {
+			// This invocation has not called send. That local fact survives broker
+			// revocation, but must not overwrite a concurrent acceptance or terminal.
+			const current = this.#db.work.workAttemptGet(opRef);
+			const notSubmitted =
+				current && !current.settledAt && !current.terminal && !hasAcceptanceEvidence(current)
+					? this.#updateAttempt(opRef, current.version, {
+							terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+						})
+					: undefined;
 			this.#live();
+			if (notSubmitted) throw workError("work send rejected", "send_rejected", notSubmitted);
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
 		let accepted = false;
