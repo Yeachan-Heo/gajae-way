@@ -119,3 +119,22 @@ test("census refuses a restore journal before opening the database and releases 
 	const lease = await acquireLease(f.home, "gateway");
 	await lease.release();
 });
+
+test("census handles pre-v36 database without work_journal table", async () => {
+	const f = await fixture();
+	const raw = new Database(f.path);
+	try {
+		// Remove v36 migration to simulate pre-v36 database
+		raw.exec("DROP TABLE work_journal");
+		raw.exec("DELETE FROM schema_migrations WHERE version >= 36");
+		raw.close();
+		// Census should still work and report null/0 for journal metrics
+		const report = await runCensus(f.config);
+		expect(report.journalRowCount).toBe(0);
+		expect(report.journalByteSize).toBe(0);
+	} finally {
+		try {
+			raw.close();
+		} catch {}
+	}
+});

@@ -259,3 +259,54 @@ test("terminal attempt events are not deleted by attempt_updated sweep", async (
 		expect(updateAfterSweep.cnt).toBe(0);
 	});
 });
+
+test("sweepAttemptUpdated EXISTS subquery uses the (entity, entity_key, seq) index", async () => {
+	await withDb((_path, _database, raw) => {
+		// Verify the query plan uses the index for the EXISTS subquery
+		const plan = raw
+			.query<{ detail: string }, []>(
+				"EXPLAIN QUERY PLAN SELECT seq FROM work_journal AS j WHERE entity = 'attempt' AND event_type = 'attempt_updated' AND EXISTS (SELECT 1 FROM work_journal AS later WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq)",
+			)
+			.all();
+		const planStr = plan.map((p) => p.detail).join("\n");
+		// The plan should reference the work_journal_entity_key index
+		expect(planStr).toContain("work_journal_entity_key");
+	});
+});
+
+test("sweep respects deletion budget between journal and attemptUpdated sweeps", async () => {
+	await withDb((_path, database, raw) => {
+		// Create old attempts with many updates
+		const now = new Date();
+		const oldTime = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000); // 8 days ago
+		const opRef = "op-budget-test";
+
+		// Create 100 old attempt_updated entries
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
+			 VALUES
+			 ('attempt', '${opRef}', 'attempt_started', '{}', '${oldTime.toISOString()}'),
+			 ${Array.from({ length: 100 }, (_, _i) => `('attempt', '${opRef}', 'attempt_updated', '{}', '${oldTime.toISOString()}')`).join(",")}`,
+		);
+
+		const beforeCount = raw.prepare("SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt'").get() as {
+			cnt: number;
+		};
+		expect(beforeCount.cnt).toBe(101); // 1 started + 100 updates
+
+		// Sweep with a small batch size
+		const result = database.sweep(now, 10);
+
+		// Total deleted should not exceed batch size (budget is per transaction)
+		const totalDeleted = result.deleted.work_journal || 0;
+		expect(totalDeleted).toBeLessThanOrEqual(10);
+
+		// Should indicate more work to do
+		expect(result.more).toBe(true);
+
+		const afterCount = raw.prepare("SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt'").get() as {
+			cnt: number;
+		};
+		expect(afterCount.cnt).toBe(beforeCount.cnt - totalDeleted);
+	});
+});

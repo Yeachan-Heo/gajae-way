@@ -138,10 +138,7 @@ export class JournalGroup {
 	 * - replayProjection() uses latest(), so it's unaffected
 	 * - Recovery/audit flows use latest(), so they're unaffected
 	 */
-	sweepAttemptUpdated(
-		tx: WriteTx,
-		cutoffs: { readonly updateCutoff: string; readonly terminalCutoff: string; readonly batch: number },
-	): number {
+	sweepAttemptUpdated(tx: WriteTx, cutoffs: { readonly updateCutoff: string; readonly batch: number }): number {
 		return this.#db
 			.prepare(
 				`DELETE FROM work_journal WHERE seq IN (
@@ -152,36 +149,44 @@ export class JournalGroup {
 							SELECT 1 FROM work_journal AS later
 							WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq
 						)
-				ORDER BY seq LIMIT ?
+			ORDER BY seq LIMIT ?
 			)`,
 			)
 			.run(tx, cutoffs.updateCutoff, cutoffs.batch).changes;
 	}
 
-	/** Measure work_journal row count and on-disk footprint. */
+	/** Measure work_journal row count and on-disk footprint. Returns 0 for pre-v36 databases without work_journal table. */
 	measure(): { rowCount: number; byteSize: number } {
-		const stats = this.#db.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
-		const rowCount = stats.cnt;
-
-		// Measure the on-disk footprint of work_journal (table + its indexes) with the dbstat
-		// virtual table. Only SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB fall back to an
-		// estimate (row_json bytes + ~80 bytes of per-row column overhead).
-		let byteSize: number;
 		try {
-			const dbstatResult = this.#db
-				.prepare(
-					"SELECT COALESCE(SUM(pgsize), 0) AS size FROM dbstat WHERE name IN (SELECT name FROM sqlite_schema WHERE tbl_name = 'work_journal')",
-				)
-				.get() as { size: number };
-			byteSize = dbstatResult.size;
-		} catch {
-			const sizeStats = this.#db
-				.prepare("SELECT COALESCE(SUM(LENGTH(row_json)), 0) AS json_size FROM work_journal")
-				.get() as { json_size: number };
-			byteSize = sizeStats.json_size + rowCount * 80;
-		}
+			const stats = this.#db.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
+			const rowCount = stats.cnt;
 
-		return { rowCount, byteSize };
+			// Measure the on-disk footprint of work_journal (table + its indexes) with the dbstat
+			// virtual table. Only SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB fall back to an
+			// estimate (row_json bytes + ~80 bytes of per-row column overhead).
+			let byteSize: number;
+			try {
+				const dbstatResult = this.#db
+					.prepare(
+						"SELECT COALESCE(SUM(pgsize), 0) AS size FROM dbstat WHERE name IN (SELECT name FROM sqlite_schema WHERE tbl_name = 'work_journal')",
+					)
+					.get() as { size: number };
+				byteSize = dbstatResult.size;
+			} catch {
+				const sizeStats = this.#db
+					.prepare("SELECT COALESCE(SUM(LENGTH(CAST(row_json AS BLOB))), 0) AS json_size FROM work_journal")
+					.get() as { json_size: number };
+				byteSize = sizeStats.json_size + rowCount * 80;
+			}
+
+			return { rowCount, byteSize };
+		} catch (error) {
+			// Pre-v36 databases don't have work_journal table; report 0 for both metrics
+			if ((error as Error).message.includes("no such table")) {
+				return { rowCount: 0, byteSize: 0 };
+			}
+			throw error;
+		}
 	}
 }
 
