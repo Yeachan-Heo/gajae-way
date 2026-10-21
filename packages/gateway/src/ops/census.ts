@@ -120,8 +120,8 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 			// This provides a real measurement of the journal's storage footprint
 			let journalByteSize = 0;
 			try {
-				const pageCount = journalDb.prepare("PRAGMA page_count").get() as { page_count: number } | undefined;
-				const pageSize = journalDb.prepare("PRAGMA page_size").get() as { page_size: number } | undefined;
+				const pageCount = journalDb.query("PRAGMA page_count").get() as { page_count: number } | undefined;
+				const pageSize = journalDb.query("PRAGMA page_size").get() as { page_size: number } | undefined;
 				if (pageCount && pageSize) {
 					journalByteSize = (pageCount.page_count ?? 0) * (pageSize.page_size ?? 4096);
 				}
