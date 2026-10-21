@@ -26,7 +26,13 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
-import type { BrokerAuthority, BrokerOperationKind, BrokerOperationRecord } from "../store/groups/bindings";
+import {
+	BROKER_PROMPT_BUSY_REFUSAL,
+	type BrokerAuthority,
+	type BrokerOperationKind,
+	type BrokerOperationRecord,
+	isBrokerPromptBusyRefusal,
+} from "../store/groups/bindings";
 import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
@@ -113,6 +119,8 @@ export function isSilentReply(text: string): boolean {
 }
 
 export interface SessionPort {
+	/** Positive local non-admission evidence, not native execution-end proof. */
+	promptRefusal?(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined;
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
@@ -845,6 +853,44 @@ export class BrokerSessionPort implements SessionPort {
 			),
 		);
 	}
+	/** Concurrent status/ACK paths must return the first persisted acceptance. */
+	#completePromptOperation(intent: BrokerOperationRecord, receipt: SendReceipt): SendReceipt {
+		return this.#database.transaction((tx) => {
+			this.#database.bindings.assertAuthority(this.#authority);
+			const current = this.#database.bindings.brokerOperation(this.#authority, "turn.prompt", intent.scope);
+			if (!current || current.operationRef !== intent.operationRef || current.requestJson !== intent.requestJson)
+				throw new OpRefError("prompt journal identity changed before completion");
+			if (current.state === "complete") {
+				const cached = recordOf(JSON.parse(current.resultJson!));
+				const nativeIdentityConflict =
+					(cached?.commandId !== undefined &&
+						receipt.commandId !== undefined &&
+						cached.commandId !== receipt.commandId) ||
+					(cached?.turnId !== undefined && receipt.turnId !== undefined && cached.turnId !== receipt.turnId);
+				if (
+					cached?.sessionId === receipt.sessionId &&
+					typeof cached.sessionId === "string" &&
+					cached.sessionId.length > 0 &&
+					cached.operationRef === intent.operationRef &&
+					receipt.operationRef === intent.operationRef &&
+					typeof cached.acceptedAt === "string" &&
+					cached.taskKey === "gateway" &&
+					!nativeIdentityConflict
+				)
+					return cached as unknown as SendReceipt;
+				throw new OpRefError("prompt accepted receipt identity changed");
+			}
+			this.#database.bindings.completeBrokerOperation(
+				tx,
+				this.#authority,
+				"turn.prompt",
+				intent.scope,
+				intent.operationRef,
+				JSON.stringify(receipt),
+			);
+			return receipt;
+		});
+	}
 
 	#releaseCloseOperation(sessionId: string): void {
 		const previous = this.#database.bindings.brokerOperation(this.#authority, "session.close", sessionId);
@@ -1257,9 +1303,9 @@ export class BrokerSessionPort implements SessionPort {
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
 		// `turn.prompt` is not idempotent at the broker (a reused clientRef is
 		// refused), so the gateway journals it: intent before the relay call,
-		// receipt after. A retry of a completed op ref gets the stored receipt;
-		// a retry of a pending one (crash or broker restart mid-send) first asks
-		// the broker whether that clientRef was accepted and only sends if not.
+		// receipt after. Completed acceptance returns the stored receipt; only
+		// a durable busy refusal can be re-armed for another submission. Pending
+		// intents reconcile the same clientRef and never resend on unknown.
 		// The hash covers every field that shapes the turn, so an op ref reused
 		// with the same text but another preamble or model is a different prompt.
 		const requestJson = JSON.stringify({
@@ -1275,7 +1321,8 @@ export class BrokerSessionPort implements SessionPort {
 		);
 		if (intent.requestJson !== requestJson)
 			throw new OpRefError(`op ref ${input.opRef} was already used for a different prompt`);
-		if (intent.state === "complete") return JSON.parse(intent.resultJson!) as SendReceipt;
+		if (intent.state === "complete" && !isBrokerPromptBusyRefusal(intent))
+			return JSON.parse(intent.resultJson!) as SendReceipt;
 		let relay: TailHandle;
 		try {
 			relay =
@@ -1288,11 +1335,11 @@ export class BrokerSessionPort implements SessionPort {
 			throw error;
 		}
 		try {
-			const receipt = intent.resumed
-				? await this.#acceptedPrompt(input, relay)
-				: await this.#submitPrompt(input, relay, intent);
-			this.#completeOperation(intent, receipt);
-			return receipt;
+			const receipt =
+				intent.resumed && !isBrokerPromptBusyRefusal(intent)
+					? await this.#acceptedPrompt(input, relay)
+					: await this.#submitPrompt(input, relay, intent);
+			return this.#completePromptOperation(intent, receipt);
 		} finally {
 			if (!input.relay) await relay.close();
 		}
@@ -1325,7 +1372,7 @@ export class BrokerSessionPort implements SessionPort {
 				await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
 			} catch (error) {
 				// Model selection is preflight: no turn.prompt was issued yet.
-				this.#releaseOperation(intent);
+				if (!isBrokerPromptBusyRefusal(intent)) this.#releaseOperation(intent);
 				throw error;
 			}
 		}
@@ -1336,7 +1383,15 @@ export class BrokerSessionPort implements SessionPort {
 		// for the duration of the send.
 		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 		let waited = false;
+		let submission = intent;
 		for (;;) {
+			if (isBrokerPromptBusyRefusal(submission)) {
+				submission = this.#database.transaction((tx) =>
+					this.#database.bindings.rearmBrokerPromptOperation(tx, this.#authority, submission),
+				);
+				if (submission.state === "complete") return JSON.parse(submission.resultJson!) as SendReceipt;
+				if (submission.resumed) return await this.#acceptedPrompt(input, relay);
+			}
 			try {
 				this.#database.bindings.assertAuthority(this.#authority);
 			} catch (error) {
@@ -1371,16 +1426,31 @@ export class BrokerSessionPort implements SessionPort {
 			// `busy` is occupancy, not failure: the prompt was never accepted and
 			// the op-ref is still unused. Wait for the session to go idle
 			// (bounded) and resend under the same op-ref before giving up.
-			if (!isSessionBusy(error) || this.#now() >= deadline) {
-				this.#releaseOperation(intent);
+			if (!isSessionBusy(error)) {
+				this.#releaseOperation(submission);
 				throw error;
 			}
+			// Preserve the authenticated non-acceptance before deliberately waiting.
+			// A crash here must not look like a possibly accepted submission.
+			this.#completeOperation(submission, BROKER_PROMPT_BUSY_REFUSAL);
+			if (this.#now() >= deadline) throw error;
+			submission = { ...submission, state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) };
 			if (!waited) {
 				waited = true;
 				console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
 			}
 			await this.#sleep(BUSY_POLL_MS);
 		}
+	}
+	promptRefusal(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined {
+		this.#assertOwned(input);
+		this.#database.bindings.assertAuthority(this.#authority);
+		const intent = this.#database.bindings.brokerOperation(
+			this.#authority,
+			"turn.prompt",
+			JSON.stringify([input.sessionId, input.opRef]),
+		);
+		return intent?.operationRef === input.opRef && isBrokerPromptBusyRefusal(intent) ? "busy" : undefined;
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {

@@ -1,7 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { Store } from "../src/store";
-import { type Barrier, eventually, noticeOrigin, WorkFixture } from "./fixtures/work-lane-server";
+import { type Barrier, eventually, noticeOrigin, WorkFixture, writeFixtureJson } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];
 afterEach(async () => {
@@ -46,6 +48,62 @@ function singleEffect(f: WorkFixture, opRef: string, sessionId: string) {
 async function notice(client: Awaited<ReturnType<WorkFixture["connect"]>>) {
 	return eventually(() => client.frames.find((frame) => frame.event === "chat.message"), Boolean, "start notification");
 }
+
+test("fixture JSON publication preserves the previous document during partial writes and concurrent barrier polling", async () => {
+	// No child is needed: exercise the same barrier polling reader, without SIGKILL or scheduling races.
+	const f = await WorkFixture.create();
+	fixtures.push(f);
+	const path = join(f.home, "barrier-hit.json");
+	const previous = { point: "prepared" };
+	const next = { point: "settle-commit" };
+	writeFixtureJson(path, previous);
+	const observed: unknown[] = [];
+	const readers: ReturnType<WorkFixture["barrier"]>[] = [];
+	let temporary = "";
+	writeFixtureJson(path, next, (staged, data) => {
+		temporary = staged;
+		writeFileSync(staged, "");
+		observed.push(JSON.parse(readFileSync(path, "utf8")));
+		// Each poller reads immediately, while staging is empty, then waits for the new document.
+		readers.push(f.barrier("settle-commit"), f.barrier("settle-commit"));
+		writeFileSync(staged, data.slice(0, Math.floor(data.length / 2)));
+		observed.push(JSON.parse(readFileSync(path, "utf8")));
+		writeFileSync(staged, data);
+		observed.push(JSON.parse(readFileSync(path, "utf8")));
+	});
+	expect(await Promise.all(readers)).toEqual([next, next]);
+	expect(observed).toEqual([previous, previous, previous]);
+	expect(temporary).not.toBe(path);
+	expect(dirname(temporary)).toBe(dirname(path));
+	expect(existsSync(temporary)).toBe(false);
+	expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(next);
+});
+
+test("fixture JSON publication failure leaves the previous document and removes partial staging", async () => {
+	const f = await WorkFixture.create();
+	fixtures.push(f);
+	const path = join(f.home, "barrier-hit.json");
+	const previous = { point: "prepared" };
+	writeFixtureJson(path, previous);
+	const failure = new Error("fixture staging failure");
+	let temporary = "";
+	expect(() =>
+		writeFixtureJson(path, { point: "settle-commit" }, (staged) => {
+			temporary = staged;
+			writeFileSync(staged, '{"point":');
+			throw failure;
+		}),
+	).toThrow(failure);
+	expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(previous);
+	expect(existsSync(temporary)).toBe(false);
+});
+
+test("barrier polling still rejects malformed durable fixture JSON", async () => {
+	const f = await WorkFixture.create();
+	fixtures.push(f);
+	writeFileSync(join(f.home, "barrier-hit.json"), '{"point":');
+	await expect(f.barrier("settle-commit")).rejects.toThrow(SyntaxError);
+});
 
 test("accepted start survives SIGKILL with same live unknown operation, then settles and notifies once logically", async () => {
 	const f = await fixture();

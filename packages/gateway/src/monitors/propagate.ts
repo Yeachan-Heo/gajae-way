@@ -718,7 +718,7 @@ export class MonitorPropagator {
 							)
 								return undefined;
 							this.#database.monitors.eventUpdate(tx, row.event_id, "failed_no_retry", null);
-							this.#database.core.metaDelete(authoringTurnKey(row.event_id));
+							this.#forgetAuthoringTurn(tx, [row.event_id], expectedRaw);
 							return current;
 						});
 						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
@@ -1129,8 +1129,14 @@ export class MonitorPropagator {
 					(await this.#reusableAuthoringTurn(authoringEventIds, sessionId)) ??
 					`gw-m-${batchId.replaceAll("-", "")}`;
 				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
-				this.#database.transaction(() => {
-					for (const row of claimed) this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
+				this.#database.transaction((tx) => {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && (prior.sessionId !== sessionId || prior.opRef !== opRef))
+							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
+					}
 				});
 				dispatchPhase = "request";
 				dispatchOperation = "request";
@@ -1148,8 +1154,12 @@ export class MonitorPropagator {
 				).assistant.text;
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
 				// The turn settled: a later retry must author afresh, never re-read it.
-				this.#database.transaction(() => {
-					for (const row of claimed) this.#database.core.metaDelete(authoringTurnKey(row.event_id));
+				this.#database.transaction((tx) => {
+					this.#forgetAuthoringTurn(
+						tx,
+						claimed.map((row) => row.event_id),
+						pendingTurn,
+					);
 				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
@@ -1455,22 +1465,15 @@ export class MonitorPropagator {
 	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(eventIds[0] ?? ""));
 		if (raw === undefined) return undefined;
-		let prior: { sessionId?: unknown; opRef?: unknown; eventIds?: unknown };
-		try {
-			prior = JSON.parse(raw) as typeof prior;
-		} catch {
-			prior = {};
-		}
-		const priorIds = Array.isArray(prior.eventIds) ? prior.eventIds : [];
+		const prior = parseAuthoringTurnPointer(raw);
+		if (!prior) return undefined;
 		const forget = () => {
-			for (const id of new Set([...eventIds, ...priorIds.filter((id): id is string => typeof id === "string")]))
-				this.#database.core.metaDelete(authoringTurnKey(id));
+			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, eventIds, raw));
 		};
 		if (
 			prior.sessionId !== sessionId ||
-			typeof prior.opRef !== "string" ||
-			priorIds.length !== eventIds.length ||
-			!eventIds.every((id) => priorIds.includes(id))
+			prior.eventIds.length !== eventIds.length ||
+			!eventIds.every((id) => prior.eventIds.includes(id))
 		) {
 			forget();
 			return undefined;
@@ -1484,6 +1487,36 @@ export class MonitorPropagator {
 		}
 		forget();
 		return undefined;
+	}
+	/** Abandon only captured pointers; sibling owners and replacement pointers remain authoritative. */
+	#forgetAuthoringTurn(tx: WriteTx, eventIds: readonly string[], raw: string | undefined): void {
+		if (raw === undefined) return;
+		const prior = parseAuthoringTurnPointer(raw);
+		if (!prior) return;
+		const authority = this.#database.bindings.brokerAuthority();
+		const ownedRepo = this.#database.bindings.workLaneRepoBySessionId(prior.sessionId);
+		let owner: ReturnType<Store["bindings"]["assertOwnedSession"]> | undefined;
+		if (authority && ownedRepo) {
+			try {
+				owner = this.#database.bindings.assertOwnedSession(prior.sessionId, ownedRepo, authority);
+			} catch (error) {
+				if (!(error instanceof BrokerAuthorityError)) throw error;
+			}
+		}
+		let forgotten = false;
+		for (const eventId of eventIds) {
+			if (!prior.eventIds.includes(eventId) || this.#database.core.metaGet(authoringTurnKey(eventId)) !== raw) continue;
+			this.#database.core.metaDelete(authoringTurnKey(eventId));
+			forgotten = true;
+		}
+		if (forgotten && owner)
+			this.#database.bindings.abandonBrokerPromptBusyRefusal(tx, {
+				sessionId: prior.sessionId,
+				opRef: prior.opRef,
+				originKey: owner.originKey,
+				epoch: owner.epoch,
+				repo: owner.repo,
+			});
 	}
 	/** Read-only safety-net evidence for one session origin (ops/tests). */
 	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {

@@ -2563,6 +2563,34 @@ export class WorkLaneManager {
 					statusError = error;
 				}
 				if (!this.#current(observer)) continue;
+				if (status?.status === "unknown" && this.#port.promptRefusal) {
+					// Serialize with live send/retry owners. Unknown alone is never a
+					// rejection: only the port's durable non-admission proof may end it.
+					const rejected = await this.#port.runExclusive(runtime.sessionKey, async () => {
+						const latest = this.#db.work.workAttemptGet(runtime.opRef);
+						if (!this.#writeCurrent(observer) || !latest || latest.terminal || hasAcceptanceEvidence(latest))
+							return false;
+						try {
+							if (
+								this.#port.promptRefusal?.({ sessionId: latest.sessionId, repo: latest.cwd, opRef: latest.opRef }) !==
+								"busy"
+							)
+								return false;
+						} catch {
+							return false; // Unavailable refusal evidence remains unknown.
+						}
+						return (
+							this.#updateAttempt(latest.opRef, latest.version, {
+								terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+							}) !== undefined
+						);
+					});
+					if (rejected) {
+						this.#schedule(observer, 0);
+						continue;
+					}
+					if (!this.#current(observer)) continue;
+				}
 				const terminal = status && terminalEvidence(status, this.#at());
 				const terminalStillRunning =
 					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
