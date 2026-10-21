@@ -116,22 +116,12 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 			const journalStats = journalDb.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
 			const journalRowCount = journalStats.cnt;
 
-			// Measure journal byte size using pragma_page_count * pragma_page_size
-			// This provides a real measurement of the journal's storage footprint
-			let journalByteSize = 0;
-			try {
-				const pageCount = journalDb.query("PRAGMA page_count").get() as { page_count: number } | undefined;
-				const pageSize = journalDb.query("PRAGMA page_size").get() as { page_size: number } | undefined;
-				if (pageCount && pageSize) {
-					journalByteSize = (pageCount.page_count ?? 0) * (pageSize.page_size ?? 4096);
-				}
-			} catch {
-				// Fallback: sum of all json column lengths + metadata overhead (64 bytes per row)
-				const fallbackSize = journalDb
-					.prepare("SELECT COALESCE(SUM(LENGTH(row_json)), 0) + COUNT(*) * 64 as size FROM work_journal")
-					.get() as { size: number };
-				journalByteSize = fallbackSize.size;
-			}
+			// Measure journal byte size: sum of row_json lengths + estimated overhead per row
+			// Each row has ~80 bytes overhead (seq INTEGER, entity TEXT, entity_key TEXT, event_type TEXT, recorded_at TEXT)
+			const sizeStats = journalDb
+				.prepare("SELECT COALESCE(SUM(LENGTH(row_json)), 0) as json_size FROM work_journal")
+				.get() as { json_size: number };
+			const journalByteSize = (sizeStats?.json_size ?? 0) + journalRowCount * 80;
 
 			const report: CensusReport = {
 				schemaVersion: database.schemaVersion,
