@@ -941,6 +941,52 @@ export class BindingsGroup {
 	}
 
 	/**
+	 * Called after a non-work owner durably abandons this prompt in the same
+	 * transaction. Absence or age alone never authorizes this release.
+	 */
+	abandonBrokerPromptBusyRefusal(
+		tx: WriteTx,
+		owner: { sessionId: string; opRef: string; originKey: string; epoch: number; repo: string },
+	): number {
+		if (owner.originKey.startsWith("work/task/")) return 0;
+		return this.#db
+			.prepare(
+				`DELETE FROM broker_operations
+				WHERE operation = 'turn.prompt' AND scope = ? AND operation_ref = ?
+					AND state = 'complete' AND result_json = ?
+					AND EXISTS (
+						SELECT 1 FROM broker_owned_bindings binding
+						JOIN broker_authority authority ON authority.authority_key = binding.authority_key
+						WHERE authority.singleton = 1 AND binding.authority_key = broker_operations.authority_key
+							AND binding.session_id = ? AND binding.origin_key = ? AND binding.epoch = ? AND binding.repo = ?
+					)
+					AND NOT EXISTS (SELECT 1 FROM work_attempt_runtime WHERE op_ref = broker_operations.operation_ref)
+					AND NOT EXISTS (
+						SELECT 1 FROM inbound_messages WHERE turn_op_ref = broker_operations.operation_ref
+							AND turn_state IN ('bound', 'accepted')
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM meta WHERE key GLOB 'monitor_authoring_turn:*' AND
+							CASE WHEN json_valid(value) THEN
+								json_type(value, '$.opRef') IS NOT 'text'
+								OR json_type(value, '$.sessionId') IS NOT 'text'
+								OR json_extract(value, '$.opRef') = broker_operations.operation_ref
+							ELSE 1 END
+					)`,
+			)
+			.run(
+				tx,
+				JSON.stringify([owner.sessionId, owner.opRef]),
+				owner.opRef,
+				JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+				owner.sessionId,
+				owner.originKey,
+				owner.epoch,
+				owner.repo,
+			).changes;
+	}
+
+	/**
 	 * Bounds the journal: completed operations older than `completedBefore` and
 	 * old pending close intents. Pending creates and prompts are never age-pruned:
 	 * a create may have applied before its binding was recorded, and an unknown

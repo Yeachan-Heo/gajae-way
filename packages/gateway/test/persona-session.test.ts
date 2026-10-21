@@ -27,6 +27,7 @@ import {
 } from "../src/orchestrator/session-port";
 import type { TailAttachInput, TailFrame } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
+import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 let home = "";
@@ -178,6 +179,210 @@ async function settleFailedInbound(port: ScriptedSessionPort, messageId: string)
 	}, `failed turn ${messageId} did not settle`);
 	return sendsFor().at(-1)!;
 }
+
+function seedPersonaPrompt(
+	send: { sessionId: string; opRef: string },
+	result: "busy" | "pending" | "accepted" = "busy",
+) {
+	const store = database!;
+	const authority = store.bindings.authority!;
+	const scope = JSON.stringify([send.sessionId, send.opRef]);
+	store.transaction((tx) => {
+		store.bindings.beginBrokerOperation(tx, authority, {
+			operation: "turn.prompt",
+			scope,
+			operationRef: send.opRef,
+			requestJson: "{}",
+		});
+		if (result !== "pending")
+			store.bindings.completeBrokerOperation(
+				tx,
+				authority,
+				"turn.prompt",
+				scope,
+				send.opRef,
+				JSON.stringify(result === "busy" ? BROKER_PROMPT_BUSY_REFUSAL : { operationRef: send.opRef }),
+			);
+	});
+	return () => store.bindings.brokerOperation(authority, "turn.prompt", scope);
+}
+
+test("retryInboundTurn removes only the abandoned persona busy proof and rolls it back with its owner", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("retry-busy-proof", "retry this turn");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	const proof = seedPersonaPrompt(first);
+	const before = database!.inbox.turnRow(first.opRef);
+	expect(() =>
+		database!.transaction((tx) => {
+			expect(retryInboundTurn(database!, tx, first.opRef)).toBe(1);
+			expect(proof()).toBeUndefined();
+			throw new Error("rollback busy release");
+		}),
+	).toThrow("rollback busy release");
+	expect(database!.inbox.turnRow(first.opRef)).toEqual(before);
+	expect(proof()).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
+	expect(database!.transaction((tx) => retryInboundTurn(database!, tx, first.opRef))).toBe(1);
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ turn_state: null, bound_session_id: null });
+	expect(proof()).toBeUndefined();
+});
+
+for (const result of ["busy", "pending", "accepted"] as const)
+	test(`persona terminal completion releases only normalized busy proof (${result})`, async () => {
+		const port = new ScriptedSessionPort();
+		await harness(port);
+		enqueue(`terminal-proof-${result}`, "finish this turn");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		const proof = seedPersonaPrompt(first, result);
+		await manager!.tick(KEY);
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(proof()).toBeDefined();
+		port.complete(first.opRef, "finished");
+		await manager!.tick(KEY);
+		await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "terminal did not settle");
+		if (result === "busy") expect(proof()).toBeUndefined();
+		else expect(proof()).toMatchObject({ state: result === "pending" ? "pending" : "complete" });
+	});
+
+test("standalone persona retry uses the owned binding repo rather than the manager repo", async () => {
+	await harness(new ScriptedSessionPort());
+	const store = database!;
+	const sessionId = "standalone-owned-session";
+	const opRef = "standalone-owned-ref";
+	store.transaction((tx) =>
+		store.bindings.recordOwnedBinding(tx, {
+			authority: store.bindings.authority!,
+			sessionId,
+			originKey: KEY,
+			epoch: 0,
+			repo: join(home, "different-owned-repo"),
+		}),
+	);
+	enqueue("standalone-retry", "standalone owned repo");
+	store.transaction((tx) =>
+		store.inbox.bindTurn(tx, { messageId: "standalone-retry", originKey: KEY, epoch: 0, opRef, sessionId }),
+	);
+	const proof = seedPersonaPrompt({ sessionId, opRef });
+	expect(store.transaction((tx) => retryInboundTurn(store, tx, opRef))).toBe(1);
+	expect(proof()).toBeUndefined();
+});
+
+for (const mismatch of ["session", "origin", "epoch", "ref", "authority"] as const)
+	test(`persona retry retains busy proof with mismatched ${mismatch}`, async () => {
+		const port = new ScriptedSessionPort();
+		await harness(port);
+		enqueue(`mismatch-${mismatch}`, "retry without deleting unrelated proof");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		const authority = database!.bindings.authority!;
+		const proof = seedPersonaPrompt({
+			sessionId: mismatch === "session" ? "unrelated-session" : first.sessionId,
+			opRef: mismatch === "ref" ? "unrelated-ref" : first.opRef,
+		});
+		if (mismatch === "origin" || mismatch === "epoch") {
+			database!.transaction((tx) => {
+				database!.inbox.turnRequeue(tx, first.opRef);
+				if (mismatch === "epoch") database!.bindings.rotateEpoch(tx, KEY);
+				if (mismatch === "origin")
+					database!.inbox.enqueue(tx, {
+						messageId: "other-origin-trigger",
+						originKey: "loopback/loopback/other",
+						originRefJson: JSON.stringify({ ...ORIGIN, conversationId: "other" }),
+						body: "unrelated origin",
+					});
+				database!.inbox.bindTurn(tx, {
+					messageId: mismatch === "origin" ? "other-origin-trigger" : `mismatch-${mismatch}`,
+					originKey: mismatch === "origin" ? "loopback/loopback/other" : KEY,
+					epoch: mismatch === "epoch" ? 1 : 0,
+					opRef: first.opRef,
+					sessionId: first.sessionId,
+				});
+			});
+		}
+		if (mismatch === "authority")
+			database!.transaction((tx) =>
+				database!.bindings.setAuthority(tx, { ...authority, identity: "revoked-persona-owner" }),
+			);
+		try {
+			database!.transaction((tx) => retryInboundTurn(database!, tx, first.opRef));
+			expect(proof()).toBeDefined();
+		} finally {
+			if (mismatch === "authority") database!.transaction((tx) => database!.bindings.setAuthority(tx, authority));
+		}
+	});
+
+test("ambiguous busy send holds its proof until an unobserved transcript answer completes the turn", async () => {
+	class BusySendPort extends ScriptedSessionPort {
+		queueEmptyReads = 0;
+
+		async queueEmpty(): Promise<boolean> {
+			this.queueEmptyReads++;
+			return true;
+		}
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): ReturnType<ScriptedSessionPort["send"]> {
+			this.sendAttempts.push(input);
+			seedPersonaPrompt(input);
+			throw new GjcCliError("busy", 0, "", { code: "busy", message: "busy" });
+		}
+	}
+	const port = new BusySendPort();
+	await harness(port);
+	enqueue("bound-busy-proof", "do not abandon an unresolved send");
+	await manager!.notifyInbound(KEY);
+	const first = port.sendAttempts[0]!;
+	const authority = database!.bindings.authority!;
+	const proof = () =>
+		database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([first.sessionId, first.opRef]));
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("bound");
+	expect(proof()).toBeDefined();
+	port.setActivity(first.sessionId, "idle");
+	port.appendAssistant(first.sessionId, "recovered transcript answer");
+	await manager!.tick(KEY);
+	expect(port.queueEmptyReads).toBe(1);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(proof()).toBeUndefined();
+});
+
+test("persona terminal failed completion CAS retains its busy proof", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("failed-completion-cas", "hold on failed CAS");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	const proof = seedPersonaPrompt(first);
+	const complete = database!.inbox.turnComplete.bind(database!.inbox);
+	let attempts = 0;
+	database!.inbox.turnComplete = () => {
+		attempts++;
+		return 0;
+	};
+	try {
+		port.complete(first.opRef, "finished but not committed");
+		await manager!.tick(KEY);
+		await eventually(() => attempts > 0, "terminal completion CAS was not attempted");
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(proof()).toBeDefined();
+	} finally {
+		database!.inbox.turnComplete = complete;
+	}
+});
+
+test("persona failure completion releases its abandoned busy proof", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("failed-busy-proof", "fail this turn");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	const proof = seedPersonaPrompt(first);
+	port.fail(first.opRef, "terminal failure");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "failure did not settle");
+	expect(proof()).toBeUndefined();
+});
 
 test("persona bind failures are emitted to the SLO recorder", async () => {
 	const failures: Array<{ code: string; at: number }> = [];
@@ -1733,6 +1938,7 @@ test("atomic reset rolls completion and markers back when epoch advancement fail
 	enqueue("rollback", "original");
 	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
+	const proof = seedPersonaPrompt(first);
 	const input = {
 		originKey: KEY,
 		epoch: 0,
@@ -1749,10 +1955,12 @@ test("atomic reset rolls completion and markers back when epoch advancement fail
 		"injected transaction failure",
 	);
 	expect(database!.inbox.turnRow(first.opRef)).toEqual(before);
+	expect(proof()).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	database!.bindings.rotateEpoch = original;
 	expect(database!.transaction((tx) => resetFailedTurn(database!, tx, input))).toBe(1);
 	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(proof()).toBeUndefined();
 	expect(database!.transaction((tx) => resetFailedTurn(database!, tx, input))).toBeUndefined();
 });
 
@@ -1915,6 +2123,7 @@ test("an ACCEPTED live turn whose session answers endpoint_stale and is not live
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
 	const first = port.sends[0]!;
+	const proof = seedPersonaPrompt(first);
 	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 
 	port.dropped.add(first.sessionId);
@@ -1925,6 +2134,7 @@ test("an ACCEPTED live turn whose session answers endpoint_stale and is not live
 	);
 	// The model may already have run and acted: the trigger is closed, never re-sent.
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(proof()).toBeUndefined();
 	expect(port.sends).toHaveLength(1);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	// The owner is told the turn was cut off instead of waiting on silence.

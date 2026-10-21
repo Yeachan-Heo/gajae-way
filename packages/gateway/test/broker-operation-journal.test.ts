@@ -1578,6 +1578,160 @@ test("completeBrokerOperation accepts only an identical completed prompt answer 
 	expect(store.bindings.brokerOperation(authority, input.operation, input.scope)?.resultJson).toBe(receipt);
 });
 
+async function abandonedBusyFixture(originKey = "discord/channel/abandoned") {
+	const { path, authority, repo } = await setup();
+	const owner = { sessionId: "abandoned-sdk", opRef: "abandoned-prompt", originKey, epoch: 0, repo };
+	await createOwnedSessionFixture(database!, authority, owner);
+	const intent = {
+		operation: "turn.prompt" as const,
+		scope: JSON.stringify([owner.sessionId, owner.opRef]),
+		operationRef: owner.opRef,
+		requestJson: '{"text":"original fingerprint"}',
+	};
+	database!.transaction((tx) => {
+		database!.bindings.beginBrokerOperation(tx, authority, intent);
+		database!.bindings.completeBrokerOperation(
+			tx,
+			authority,
+			intent.operation,
+			intent.scope,
+			intent.operationRef,
+			JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+		);
+	});
+	return { path, authority, owner, intent };
+}
+
+test("explicit abandoned busy owner release rolls back and survives restart without deleting another prompt", async () => {
+	const { path, authority, owner, intent } = await abandonedBusyFixture();
+	const store = database!;
+	const proof = store.bindings.brokerOperation(authority, "turn.prompt", intent.scope);
+	expect(proof).toBeDefined();
+	expect(() =>
+		store.transaction((tx) => {
+			expect(store.bindings.abandonBrokerPromptBusyRefusal(tx, owner)).toBe(1);
+			throw new Error("crash before owner release commit");
+		}),
+	).toThrow("crash before owner release commit");
+	expect(store.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toEqual(proof);
+	store.close();
+	database = await Store.open(path);
+	expect(database.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toEqual(proof);
+	expect(
+		database.transaction((tx) =>
+			database!.bindings.abandonBrokerPromptBusyRefusal(tx, { ...owner, opRef: "another-prompt" }),
+		),
+	).toBe(0);
+	expect(database.transaction((tx) => database!.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(1);
+	expect(database.transaction((tx) => database!.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(0);
+	expect(database.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toBeUndefined();
+});
+
+for (const mismatch of [
+	"session",
+	"origin",
+	"epoch",
+	"repo",
+	"scope",
+	"authority",
+	"pending",
+	"accepted",
+	"monitor",
+	"malformed monitor",
+	"work",
+] as const) {
+	test(`explicit abandoned busy release preserves ${mismatch} evidence`, async () => {
+		const { path, authority, owner, intent } = await abandonedBusyFixture(
+			mismatch === "work" ? "work/task/a" : undefined,
+		);
+		const store = database!;
+		const requested = { ...owner };
+		if (mismatch === "session") requested.sessionId = "another-session";
+		if (mismatch === "origin") requested.originKey = "discord/channel/another-owner";
+		if (mismatch === "epoch") requested.epoch++;
+		if (mismatch === "repo") requested.repo = join(home, "another-repo");
+		if (mismatch === "monitor" || mismatch === "malformed monitor") {
+			store.transaction(() =>
+				store.core.metaSet(
+					"monitor_authoring_turn:still-owned",
+					mismatch === "monitor"
+						? JSON.stringify({ sessionId: owner.sessionId, opRef: owner.opRef, eventIds: ["still-owned"] })
+						: "{",
+				),
+			);
+		}
+		if (mismatch === "pending") {
+			store.transaction((tx) =>
+				store.bindings.rearmBrokerPromptOperation(
+					tx,
+					authority,
+					required(store.bindings.brokerOperation(authority, "turn.prompt", intent.scope), "refusal"),
+				),
+			);
+		}
+		if (["scope", "authority", "accepted"].includes(mismatch)) {
+			const sql = new Database(path);
+			try {
+				if (mismatch === "scope")
+					sql.run("UPDATE broker_operations SET scope = ? WHERE operation_ref = ?", [
+						JSON.stringify([owner.sessionId, "other-ref"]),
+						owner.opRef,
+					]);
+				if (mismatch === "authority")
+					sql.run("UPDATE broker_operations SET authority_key = 'another-authority' WHERE operation_ref = ?", [
+						owner.opRef,
+					]);
+				if (mismatch === "accepted")
+					sql.run("UPDATE broker_operations SET result_json = ? WHERE operation_ref = ?", [
+						JSON.stringify({ sessionId: owner.sessionId, operationRef: owner.opRef, commandId: "accepted-command" }),
+						owner.opRef,
+					]);
+			} finally {
+				sql.close();
+			}
+		}
+		const sql = new Database(path);
+		try {
+			const rows = () => sql.query("SELECT * FROM broker_operations WHERE operation = 'turn.prompt'").all();
+			const before = rows();
+			expect(before).toHaveLength(1);
+			expect(store.transaction((tx) => store.bindings.abandonBrokerPromptBusyRefusal(tx, requested))).toBe(0);
+			expect(rows()).toEqual(before);
+		} finally {
+			sql.close();
+		}
+	});
+}
+
+test("abandoned busy release retains a live persona owner until its durable requeue", async () => {
+	const { authority, owner, intent } = await abandonedBusyFixture();
+	const store = database!;
+	store.transaction((tx) => {
+		store.inbox.enqueue(tx, {
+			messageId: "live-owner",
+			originKey: owner.originKey,
+			originRefJson: "{}",
+			body: "work",
+			receivedAt: new Date().toISOString(),
+		});
+		store.inbox.bindTurn(tx, {
+			messageId: "live-owner",
+			originKey: owner.originKey,
+			epoch: owner.epoch,
+			opRef: owner.opRef,
+			sessionId: owner.sessionId,
+		});
+	});
+	const proof = store.bindings.brokerOperation(authority, "turn.prompt", intent.scope);
+	expect(store.transaction((tx) => store.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(0);
+	expect(store.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toEqual(proof);
+	store.transaction((tx) => {
+		expect(store.inbox.turnRequeue(tx, owner.opRef)).toBe(1);
+		expect(store.bindings.abandonBrokerPromptBusyRefusal(tx, owner)).toBe(1);
+	});
+	expect(store.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toBeUndefined();
+});
+
 test("aged known busy refusals survive pruning and reconstruction with their retry fingerprint intact", async () => {
 	const { path, authority } = await setup();
 	let store = database!;
