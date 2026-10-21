@@ -67,6 +67,21 @@ test("census is a read-only v38 view and reports quarantined invalid work by cut
 	expect(await readFile(f.path)).toEqual(before);
 });
 
+test("census reports the work_journal row count and its on-disk byte size", async () => {
+	const f = await fixture();
+	const raw = new Database(f.path, { readonly: true });
+	const { rows, jsonBytes } = raw
+		.query("SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(row_json)), 0) AS jsonBytes FROM work_journal")
+		.get() as { rows: number; jsonBytes: number };
+	const { pageSize } = raw.query("SELECT page_size AS pageSize FROM pragma_page_size()").get() as { pageSize: number };
+	raw.close();
+	expect(rows).toBeGreaterThan(0);
+	const report = await runCensus(f.config);
+	expect(report.journalRowCount).toBe(rows);
+	expect(report.journalByteSize).toBeGreaterThanOrEqual(jsonBytes);
+	expect(report.journalByteSize % pageSize).toBe(0);
+});
+
 test("census refuses while a daemon holds the gateway lease", async () => {
 	const f = await fixture();
 	const lease = await acquireLease(f.home, "gateway");
