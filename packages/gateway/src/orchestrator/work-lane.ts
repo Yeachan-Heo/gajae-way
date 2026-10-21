@@ -1646,17 +1646,21 @@ export class WorkLaneManager {
 			if (unresolvedReceipt && terminal?.reasonCode !== "terminal_missing_receipt")
 				observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
-			runtime =
-				this.#updateAttempt(runtime.opRef, runtime.version, {
-					...(status && provesAcceptance(status)
-						? {
-								sendPhase: "accepted" as const,
-								sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
-							}
-						: {}),
-					...(turnEndObservedAt && runtime.turnEndObservedAt === undefined ? { turnEndObservedAt } : {}),
-					...(terminal && !runtime.terminal ? { terminal } : {}),
-				}) ?? runtime;
+			const patchParts: Array<Partial<WorkAttemptPatch>> = [];
+			if (status && provesAcceptance(status)) {
+				patchParts.push({
+					sendPhase: "accepted" as const,
+					sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
+				});
+			}
+			if (turnEndObservedAt && runtime.turnEndObservedAt === undefined) {
+				patchParts.push({ turnEndObservedAt });
+			}
+			if (terminal && !runtime.terminal) {
+				patchParts.push({ terminal });
+			}
+			const patch = Object.assign({}, ...patchParts);
+			runtime = (Object.keys(patch).length > 0 ? this.#updateAttempt(runtime.opRef, runtime.version, patch) : undefined) ?? runtime;
 			if (!runtime.terminal) return;
 		}
 		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
