@@ -808,7 +808,9 @@ export class BindingsGroup {
 	 * row a previous attempt left. A `pending` row means an earlier call may or may
 	 * not have reached the broker (crash, restart, torn transport): the caller
 	 * replays it under the SAME `operationRef`. A `complete` row carries the
-	 * original result and the broker is not called again.
+	 * original result and the broker is not called again. The exception is an
+	 * authenticated busy refusal: the same prompt fingerprint may atomically
+	 * re-arm that unused reference before another submission.
 	 */
 	beginBrokerOperation(
 		tx: WriteTx,
@@ -836,6 +838,50 @@ export class BindingsGroup {
 		return { ...input, state: "pending", resumed: false };
 	}
 
+	/** Claim a known-refused prompt immediately before submission, not during preflight. */
+	rearmBrokerPromptOperation(
+		tx: WriteTx,
+		authority: BrokerAuthority,
+		intent: BrokerOperationRecord,
+	): BrokerOperationRecord {
+		this.assertAuthority(authority);
+		const existing = this.#db
+			.prepare(
+				"SELECT operation, scope, operation_ref, request_json, state, result_json FROM broker_operations WHERE authority_key = ? AND operation = 'turn.prompt' AND scope = ?",
+			)
+			.getWithWrite(tx, brokerAuthorityKey(authority), intent.scope) as BrokerOperationRow | null;
+		if (
+			!existing ||
+			intent.operation !== "turn.prompt" ||
+			existing.operation_ref !== intent.operationRef ||
+			existing.request_json !== intent.requestJson
+		)
+			throw new Error("prompt refusal identity changed before submission");
+		const record = brokerOperationRecord(existing);
+		if (!isBrokerPromptBusyRefusal(record)) return record;
+		const changed = this.#db
+			.prepare(
+				"UPDATE broker_operations SET state = 'pending', result_json = NULL, completed_at = NULL WHERE authority_key = ? AND operation = 'turn.prompt' AND scope = ? AND operation_ref = ? AND request_json = ? AND state = 'complete' AND result_json = ?",
+			)
+			.run(
+				tx,
+				brokerAuthorityKey(authority),
+				intent.scope,
+				intent.operationRef,
+				intent.requestJson,
+				JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+			).changes;
+		if (changed !== 1) throw new Error("busy prompt refusal could not be re-armed");
+		return {
+			operation: "turn.prompt",
+			scope: intent.scope,
+			operationRef: intent.operationRef,
+			requestJson: intent.requestJson,
+			state: "pending",
+			resumed: false,
+		};
+	}
+
 	/** Stores the broker's answer for a pending operation; a retry of the same operation then returns it. */
 	completeBrokerOperation(
 		tx: WriteTx,
@@ -859,7 +905,19 @@ export class BindingsGroup {
 				scope,
 				operationRef,
 			).changes;
-		if (changed !== 1) throw new Error(`broker operation ${operation} ${operationRef} is not pending`);
+		if (changed !== 1) {
+			// A concurrent same-reference caller can have completed a re-armed
+			// prompt while the original caller was waiting out a busy refusal.
+			const existing = this.brokerOperation(authority, operation, scope);
+			if (
+				operation === "turn.prompt" &&
+				existing?.operationRef === operationRef &&
+				existing.state === "complete" &&
+				existing.resultJson === resultJson
+			)
+				return;
+			throw new Error(`broker operation ${operation} ${operationRef} is not pending`);
+		}
 	}
 
 	/**
@@ -887,6 +945,8 @@ export class BindingsGroup {
 	 * old pending close intents. Pending creates and prompts are never age-pruned:
 	 * a create may have applied before its binding was recorded, and an unknown
 	 * prompt status never authorizes resending its non-idempotent clientRef.
+	 * Busy refusals retain their fingerprint until the caller retries; they are
+	 * completed control responses, not completed logical prompts.
 	 */
 	pruneBrokerOperations(
 		tx: WriteTx,
@@ -894,9 +954,9 @@ export class BindingsGroup {
 	): number {
 		return this.#db
 			.prepare(
-				"DELETE FROM broker_operations WHERE (state = 'complete' AND completed_at < ?) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)",
+				"DELETE FROM broker_operations WHERE (state = 'complete' AND completed_at < ? AND (operation != 'turn.prompt' OR COALESCE(result_json, '') != ?)) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)",
 			)
-			.run(tx, cutoff.completedBefore, cutoff.pendingBefore).changes;
+			.run(tx, cutoff.completedBefore, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL), cutoff.pendingBefore).changes;
 	}
 
 	brokerOperation(
@@ -914,6 +974,17 @@ export class BindingsGroup {
 }
 
 export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close";
+
+/** Normalized authenticated control refusal, never an accepted prompt receipt. */
+export const BROKER_PROMPT_BUSY_REFUSAL = { ok: false, error: { code: "busy" } } as const;
+
+export function isBrokerPromptBusyRefusal(record: BrokerOperationRecord | undefined): boolean {
+	return (
+		record?.operation === "turn.prompt" &&
+		record.state === "complete" &&
+		record.resultJson === JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL)
+	);
+}
 
 export interface BrokerOperationRecord {
 	readonly operation: BrokerOperationKind;

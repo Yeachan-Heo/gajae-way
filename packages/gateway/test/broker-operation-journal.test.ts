@@ -8,7 +8,7 @@ import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner, type TailStreamSpawner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
-import type { BrokerAuthority } from "../src/store/groups/bindings";
+import { BROKER_PROMPT_BUSY_REFUSAL, type BrokerAuthority } from "../src/store/groups/bindings";
 import { createOwnedSessionFixture, initializeTestBrokerAuthority, noRelay, scriptedRelay } from "./session-port.fake";
 
 /**
@@ -827,6 +827,536 @@ test("a fresh prompt intent is released when model selection fails before submis
 	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
 });
 
+test("audit: restart after definitive busy refusal preserves safe prompt retry", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
+	let busy = true;
+	let accepted = 0;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt") {
+			if (busy) return { ok: false, error: { code: "busy", message: "prior turn running" } };
+			accepted++;
+			return {
+				ok: true,
+				result: {
+					accepted: true,
+					clientRef: request.input.clientRef,
+					commandId: "cmd-busy",
+					turnId: "turn-busy",
+				},
+			};
+		}
+		if (request.operation === "turn.result") return { ok: true, result: { status: "unknown" } };
+		return { ok: false, error: { code: "unsupported_operation" } };
+	});
+	const broker = new FakeBroker();
+	const first = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {
+			throw new Error("fixture interruption during busy wait");
+		},
+	});
+	const send = { sessionId: "sdk-1", repo, text: "same logical work", opRef: "gw-work-audit-busy" };
+	await expect(first.send(send)).rejects.toThrow("fixture interruption during busy wait");
+	expect(accepted).toBe(0);
+	expect(
+		database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+	).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
+	busy = false;
+	const restarted = await openGateway(path, authority, broker, relay.spawn);
+	const receipt = await restarted.port.send(send);
+	expect(receipt).toMatchObject({
+		operationRef: send.opRef,
+		commandId: "cmd-busy",
+		turnId: "turn-busy",
+	});
+	expect(accepted).toBe(1);
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(2);
+	const before = relay.requests.length;
+	expect(await restarted.port.send(send)).toEqual(receipt);
+	expect(relay.requests).toHaveLength(before);
+});
+
+test("busy-refused prompt fingerprint conflicts retain safe proof and the original request can retry", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
+	let prompts = 0;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt") {
+			prompts++;
+			if (prompts === 1) return { ok: false, error: { code: "busy", message: "prior turn running" } };
+			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-original" } };
+		}
+		return { ok: true, result: { status: "unknown" } };
+	});
+	const broker = new FakeBroker();
+	const first = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {
+			throw new Error("busy sleep interrupted");
+		},
+	});
+	const send = { sessionId: "sdk-1", repo, text: "original text", opRef: "gw-busy-fingerprint" };
+	const scope = JSON.stringify([send.sessionId, send.opRef]);
+	await expect(first.send(send)).rejects.toThrow("busy sleep interrupted");
+	const proof = database!.bindings.brokerOperation(authority, "turn.prompt", scope);
+	expect(proof).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
+	const restarted = await openGateway(path, authority, broker, relay.spawn);
+	const before = relay.requests.length;
+	for (const variant of [
+		{ ...send, text: "different text" },
+		{ ...send, systemPreamble: "different policy" },
+		{ ...send, model: "anthropic/claude-opus" },
+		{ ...send, model: { preset: "deep" } },
+	]) {
+		await expect(restarted.port.send(variant)).rejects.toThrow("already used");
+		expect(restarted.database.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+		expect(relay.requests).toHaveLength(before);
+	}
+	await expect(restarted.port.send(send)).resolves.toMatchObject({
+		operationRef: send.opRef,
+		commandId: "cmd-original",
+	});
+	expect(prompts).toBe(2);
+});
+
+for (const preflight of ["attachment", "model"] as const) {
+	test(`busy proof survives interrupted ${preflight} preflight and the original fingerprint retries safely`, async () => {
+		const { path, authority, repo } = await setup();
+		await createOwnedSessionFixture(database!, authority, {
+			sessionId: "sdk-1",
+			repo,
+			originKey: "lane/busy",
+			epoch: 0,
+		});
+		const send = {
+			sessionId: "sdk-1",
+			repo,
+			text: "same work",
+			systemPreamble: "same policy",
+			model: "anthropic/claude-sonnet",
+			opRef: `gw-busy-preflight-${preflight}`,
+		};
+		const scope = JSON.stringify([send.sessionId, send.opRef]);
+		let prompts = 0;
+		let failPreflight = false;
+		let proof: ReturnType<Store["bindings"]["brokerOperation"]>;
+		const relay = scriptedRelay((request) => {
+			if (request.operation === "turn.prompt") {
+				prompts++;
+				if (prompts === 1) return { ok: false, error: { code: "busy", message: "prior turn running" } };
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
+				return { ok: true, result: { accepted: true, clientRef: send.opRef, commandId: "cmd-preflight" } };
+			}
+			return { ok: true, result: { status: "unknown" } };
+		});
+		const cli: CliRunner = async (args) => {
+			if (args.includes("model.set")) {
+				if (proof) expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+				if (preflight === "model" && failPreflight) {
+					failPreflight = false;
+					throw new Error("fixture model preflight interrupted");
+				}
+				return ok({ changed: true });
+			}
+			throw new Error(`unexpected CLI command ${args.join(" ")}`);
+		};
+		const first = new BrokerSessionPort({
+			database: database!,
+			authority,
+			cli,
+			tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+			sleep: async () => {
+				throw new Error("busy sleep interrupted");
+			},
+		});
+		await expect(first.send(send)).rejects.toThrow("busy sleep interrupted");
+		proof = database!.bindings.brokerOperation(authority, "turn.prompt", scope);
+		expect(proof).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
+		database!.close();
+		database = await Store.open(path);
+		failPreflight = true;
+		const stream: TailStreamSpawner = (sessionId) => {
+			expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+			if (preflight === "attachment" && failPreflight) {
+				failPreflight = false;
+				throw new Error("fixture attachment preflight interrupted");
+			}
+			return relay.spawn(sessionId);
+		};
+		const restarted = new BrokerSessionPort({
+			database,
+			authority,
+			cli,
+			tailRunner: new TailRunner({ stream, repo, requestTimeoutMs: 50 }),
+			sleep: async () => {
+				throw new Error("retry must not sleep");
+			},
+		});
+		await expect(restarted.send(send)).rejects.toThrow(`fixture ${preflight} preflight interrupted`);
+		expect(database.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+		expect(prompts).toBe(1);
+		await expect(restarted.send({ ...send, systemPreamble: "changed policy" })).rejects.toThrow("already used");
+		expect(database.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+		await expect(restarted.send(send)).resolves.toMatchObject({ operationRef: send.opRef, commandId: "cmd-preflight" });
+		expect(prompts).toBe(2);
+	});
+}
+
+test("busy refusal at an exhausted deadline persists safe proof without sleeping and can retry after restart", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
+	let prompts = 0;
+	let sleeps = 0;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt") {
+			prompts++;
+			if (prompts === 1) return { ok: false, error: { code: "busy", message: "prior turn running" } };
+			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-deadline" } };
+		}
+		return { ok: true, result: { status: "unknown" } };
+	});
+	const broker = new FakeBroker();
+	const first = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {
+			sleeps++;
+		},
+	});
+	const send = { sessionId: "sdk-1", repo, text: "same work", opRef: "gw-busy-deadline", busyWaitMs: 0 };
+	await expect(first.send(send)).rejects.toThrow("busy");
+	expect(sleeps).toBe(0);
+	expect(
+		database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+	).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
+	const restarted = await openGateway(path, authority, broker, relay.spawn);
+	await expect(restarted.port.send(send)).resolves.toMatchObject({
+		operationRef: send.opRef,
+		commandId: "cmd-deadline",
+	});
+	expect(prompts).toBe(2);
+});
+
+for (const status of ["unknown", "in_flight"] as const) {
+	test(`busy refusal re-arm with lost ACK stays pending and reconciles ${status} without resending`, async () => {
+		const { path, authority, repo } = await setup();
+		await createOwnedSessionFixture(database!, authority, {
+			sessionId: "sdk-1",
+			repo,
+			originKey: "lane/busy",
+			epoch: 0,
+		});
+		let prompts = 0;
+		let effects = 0;
+		const send = { sessionId: "sdk-1", repo, text: "same work", opRef: `gw-busy-lost-${status}` };
+		const scope = JSON.stringify([send.sessionId, send.opRef]);
+		const relay = scriptedRelay((request) => {
+			if (request.operation === "turn.prompt") {
+				prompts++;
+				if (prompts === 1) return { ok: false, error: { code: "busy" } };
+				// Before the next outbound effect, the refusal must already be pending.
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)?.resultJson).toBeUndefined();
+				effects++;
+				return new Promise(() => {});
+			}
+			if (request.operation === "turn.result")
+				return {
+					ok: true,
+					result:
+						status === "unknown"
+							? { status }
+							: {
+									status,
+									clientRef: send.opRef,
+									commandId: "cmd-rearmed",
+									turnId: "turn-rearmed",
+								},
+				};
+			return { ok: false, error: { code: "unsupported_operation" } };
+		});
+		const broker = new FakeBroker();
+		const first = new BrokerSessionPort({
+			database: database!,
+			authority,
+			cli: broker.cli,
+			tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+			sleep: async () => {
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({
+					state: "complete",
+					resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+				});
+			},
+		});
+		await expect(first.send(send)).rejects.toThrow();
+		expect(prompts).toBe(2);
+		expect(effects).toBe(1);
+		expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
+		const restarted = await openGateway(path, authority, broker, relay.spawn);
+		if (status === "unknown") {
+			await expect(restarted.port.send(send)).rejects.toThrow("status is unknown; refusing to resend");
+			await expect(restarted.port.send(send)).rejects.toThrow("status is unknown; refusing to resend");
+			expect(restarted.database.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({
+				state: "pending",
+			});
+		} else {
+			const receipt = await restarted.port.send(send);
+			expect(receipt).toMatchObject({ operationRef: send.opRef, commandId: "cmd-rearmed", turnId: "turn-rearmed" });
+			const before = relay.requests.length;
+			expect(await restarted.port.send(send)).toEqual(receipt);
+			expect(relay.requests).toHaveLength(before);
+		}
+		expect(prompts).toBe(2);
+		expect(effects).toBe(1);
+	});
+}
+
+test("a second caller accepts while the busy waiter sleeps and both return the identical cached receipt", async () => {
+	const { authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
+	let prompts = 0;
+	let accepted = 0;
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt") {
+			prompts++;
+			if (prompts === 1) return { ok: false, error: { code: "busy" } };
+			accepted++;
+			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-concurrent" } };
+		}
+		return { ok: true, result: { status: "unknown" } };
+	});
+	let releaseSleep!: () => void;
+	let enteredSleep!: () => void;
+	const sleeping = new Promise<void>((resolve) => {
+		enteredSleep = resolve;
+	});
+	const gate = new Promise<void>((resolve) => {
+		releaseSleep = resolve;
+	});
+	const broker = new FakeBroker();
+	const first = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		now: () => 1_000,
+		sleep: async () => {
+			enteredSleep();
+			await gate;
+		},
+	});
+	const second = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: broker.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		now: () => 2_000,
+		sleep: async () => {
+			throw new Error("second caller must not sleep");
+		},
+	});
+	const send = { sessionId: "sdk-1", repo, text: "same work", opRef: "gw-busy-concurrent" };
+	const original = first.send(send);
+	try {
+		await Promise.race([
+			sleeping,
+			original.then(() => {
+				throw new Error("original did not sleep");
+			}),
+		]);
+		const receipt = await second.send(send);
+		expect(receipt).toMatchObject({
+			operationRef: send.opRef,
+			commandId: "cmd-concurrent",
+			acceptedAt: new Date(2_000).toISOString(),
+		});
+		releaseSleep();
+		expect(await original).toEqual(receipt);
+		const before = relay.requests.length;
+		expect(await first.send(send)).toEqual(receipt);
+		expect(relay.requests).toHaveLength(before);
+		expect(prompts).toBe(2);
+		expect(accepted).toBe(1);
+	} finally {
+		releaseSleep();
+		await original.catch(() => {});
+	}
+});
+
+for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
+	test(`busy waiter with ${observed} status and delayed competing ACK never issues a third prompt`, async () => {
+		const { authority, repo } = await setup();
+		await createOwnedSessionFixture(database!, authority, {
+			sessionId: "sdk-1",
+			repo,
+			originKey: "lane/busy",
+			epoch: 0,
+		});
+		let releaseSleep!: () => void;
+		let enteredSleep!: () => void;
+		let releaseAck!: () => void;
+		let enteredPrompt!: () => void;
+		const sleeping = new Promise<void>((resolve) => {
+			enteredSleep = resolve;
+		});
+		const sleepGate = new Promise<void>((resolve) => {
+			releaseSleep = resolve;
+		});
+		const submitted = new Promise<void>((resolve) => {
+			enteredPrompt = resolve;
+		});
+		const ackGate = new Promise<void>((resolve) => {
+			releaseAck = resolve;
+		});
+		let prompts = 0;
+		const relay = scriptedRelay(async (request) => {
+			if (request.operation === "turn.prompt") {
+				prompts++;
+				if (prompts === 1) return { ok: false, error: { code: "busy" } };
+				enteredPrompt();
+				await ackGate;
+				return {
+					ok: true,
+					result: {
+						accepted: true,
+						clientRef: request.input.clientRef,
+						commandId: "cmd-competing",
+						turnId: "turn-competing",
+					},
+				};
+			}
+			return {
+				ok: true,
+				result:
+					observed === "unknown"
+						? { status: "unknown" }
+						: {
+								status: "in_flight",
+								receiptState: "absent",
+								clientRef: request.input.clientRef,
+								commandId: observed === "identity_conflict" ? "cmd-foreign" : "cmd-competing",
+								turnId: "turn-competing",
+								acceptedAt: 1_000,
+								startedAt: 1_000,
+							},
+			};
+		});
+		const broker = new FakeBroker();
+		const first = new BrokerSessionPort({
+			database: database!,
+			authority,
+			cli: broker.cli,
+			tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 1_000 }),
+			sleep: async () => {
+				enteredSleep();
+				await sleepGate;
+			},
+		});
+		const second = new BrokerSessionPort({
+			database: database!,
+			authority,
+			cli: broker.cli,
+			tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 1_000 }),
+			now: () => 2_000,
+			sleep: async () => {
+				throw new Error("second caller must not sleep");
+			},
+		});
+		const send = { sessionId: "sdk-1", repo, text: "same work", opRef: "gw-busy-competing-pending" };
+		const original = first.send(send);
+		let competing: ReturnType<typeof second.send> | undefined;
+		try {
+			await Promise.race([
+				sleeping,
+				original.then(() => {
+					throw new Error("original did not sleep");
+				}),
+			]);
+			competing = second.send(send);
+			await Promise.race([
+				submitted,
+				competing.then(() => {
+					throw new Error("competing submission did not wait");
+				}),
+			]);
+			releaseSleep();
+			let canonical: Awaited<ReturnType<typeof first.send>> | undefined;
+			if (observed === "unknown") {
+				await expect(original).rejects.toThrow("status is unknown; refusing to resend");
+				expect(
+					database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+				).toMatchObject({ state: "pending" });
+			} else {
+				canonical = await original;
+				expect(canonical.acceptedAt).toBe(new Date(1_000).toISOString());
+			}
+			expect(prompts).toBe(2);
+			releaseAck();
+			if (observed === "unknown")
+				await expect(competing).resolves.toMatchObject({ operationRef: send.opRef, commandId: "cmd-competing" });
+			else if (observed === "identity_conflict") await expect(competing).rejects.toThrow();
+			else expect(await competing).toEqual(required(canonical, "canonical accepted receipt"));
+			if (canonical)
+				expect(
+					database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
+						?.resultJson,
+				).toBe(JSON.stringify(canonical));
+			expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.prompt", "turn.result"]);
+		} finally {
+			releaseSleep();
+			releaseAck();
+			await original.catch(() => {});
+			await competing?.catch(() => {});
+		}
+	});
+}
+
+test("failure to persist a busy refusal prevents sleep and retry and leaves the intent pending", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
+	const relay = scriptedRelay(() => ({ ok: false, error: { code: "busy" } }));
+	let sleeps = 0;
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: new FakeBroker().cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
+		sleep: async () => {
+			sleeps++;
+			throw new Error("must not sleep");
+		},
+	});
+	const send = { sessionId: "sdk-1", repo, text: "same work", opRef: "gw-busy-persist-failure" };
+	const fault = new Database(path);
+	try {
+		fault.run(`CREATE TRIGGER reject_busy_refusal BEFORE UPDATE OF state ON broker_operations
+			WHEN NEW.operation = 'turn.prompt' AND NEW.state = 'complete'
+			BEGIN SELECT RAISE(ABORT, 'fixture refusal persistence failed'); END`);
+		await expect(port.send(send)).rejects.toThrow("fixture refusal persistence failed");
+		expect(sleeps).toBe(0);
+		expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+		expect(
+			database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+		).toMatchObject({ state: "pending" });
+		expect(
+			database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
+				?.resultJson,
+		).toBeUndefined();
+	} finally {
+		fault.run("DROP TRIGGER IF EXISTS reject_busy_refusal");
+		fault.close();
+	}
+});
+
 test("an aged pending turn.prompt with unknown status stays uncertain and is never resent", async () => {
 	const { path, authority, repo } = await setup();
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/q", epoch: 0 });
@@ -842,7 +1372,7 @@ test("an aged pending turn.prompt with unknown status stays uncertain and is nev
 		return { ok: false, error: { code: "unsupported_operation" } };
 	});
 	const broker = new FakeBroker();
-	let gateway = await openGateway(path, authority, broker, relay.spawn);
+	const gateway = await openGateway(path, authority, broker, relay.spawn);
 	const send = { sessionId: "sdk-1", repo, text: "do the work", opRef: "gw-work-q-1" };
 	await expect(gateway.port.send(send)).rejects.toThrow();
 	expect(promptEffects).toBe(1);
@@ -951,6 +1481,151 @@ test("beginBrokerOperation records the intent once and hands every later begin t
 		),
 	).toThrow();
 	expect(store.bindings.brokerOperation(authority, "turn.prompt", "s/9")).toBeUndefined();
+});
+
+test("begin preserves busy proof and rearmBrokerPromptOperation atomically re-arms only the matching prompt", async () => {
+	const { authority } = await setup();
+	const store = database!;
+	const input = {
+		operation: "turn.prompt",
+		scope: "busy/1",
+		operationRef: "ref-busy",
+		requestJson: '{"prompt":"original"}',
+	} as const;
+	const begin = (request: Parameters<typeof store.bindings.beginBrokerOperation>[2]) =>
+		store.transaction((tx) => store.bindings.beginBrokerOperation(tx, authority, request));
+	const complete = (request: typeof input, resultJson: string) =>
+		store.transaction((tx) =>
+			store.bindings.completeBrokerOperation(
+				tx,
+				authority,
+				request.operation,
+				request.scope,
+				request.operationRef,
+				resultJson,
+			),
+		);
+	expect(BROKER_PROMPT_BUSY_REFUSAL).toEqual({ ok: false, error: { code: "busy" } });
+	begin(input);
+	complete(input, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL));
+	const proof = required(store.bindings.brokerOperation(authority, "turn.prompt", input.scope), "busy proof");
+	const rearm = (intent: typeof proof) =>
+		store.transaction((tx) => store.bindings.rearmBrokerPromptOperation(tx, authority, intent));
+	for (const mismatch of [
+		{ ...input, operationRef: "another-ref" },
+		{ ...input, requestJson: '{"prompt":"different"}' },
+	]) {
+		expect(begin(mismatch)).toEqual(proof);
+		expect(() => rearm({ ...proof, ...mismatch })).toThrow();
+		expect(store.bindings.brokerOperation(authority, "turn.prompt", input.scope)).toEqual(proof);
+	}
+	expect(begin(input)).toEqual(proof);
+	expect(() => rearm({ ...proof, scope: "missing" })).toThrow();
+	expect(rearm(proof)).toEqual({ ...input, state: "pending", resumed: false });
+	// A second caller sees the re-armed pending intent, not another permission to send.
+	expect(rearm(proof)).toEqual({ ...input, state: "pending", resumed: true });
+	expect(begin(input)).toEqual({ ...input, state: "pending", resumed: true });
+	const receipt = JSON.stringify({ sessionId: "sdk-1", operationRef: input.operationRef, commandId: "cmd-original" });
+	complete(input, receipt);
+	expect(rearm(proof)).toEqual({ ...input, state: "complete", resultJson: receipt, resumed: true });
+	expect(begin(input)).toEqual({ ...input, state: "complete", resultJson: receipt, resumed: true });
+	for (const operation of ["session.create", "session.close"] as const) {
+		const other = { ...input, operation };
+		begin(other);
+		store.transaction((tx) =>
+			store.bindings.completeBrokerOperation(
+				tx,
+				authority,
+				operation,
+				input.scope,
+				input.operationRef,
+				JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+			),
+		);
+		expect(begin(other)).toMatchObject({
+			state: "complete",
+			resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+			resumed: true,
+		});
+	}
+});
+
+test("completeBrokerOperation accepts only an identical completed prompt answer and never overwrites it", async () => {
+	const { authority } = await setup();
+	const store = database!;
+	const input = {
+		operation: "turn.prompt",
+		scope: "prompt/idempotent",
+		operationRef: "ref-idempotent",
+		requestJson: "{}",
+	} as const;
+	store.transaction((tx) => store.bindings.beginBrokerOperation(tx, authority, input));
+	const receipt = JSON.stringify({
+		sessionId: "sdk-1",
+		operationRef: input.operationRef,
+		commandId: "cmd-1",
+		acceptedAt: "2026-01-01T00:00:00.000Z",
+	});
+	const complete = (ref: string, result: string) =>
+		store.transaction((tx) =>
+			store.bindings.completeBrokerOperation(tx, authority, input.operation, input.scope, ref, result),
+		);
+	complete(input.operationRef, receipt);
+	expect(() => complete(input.operationRef, receipt)).not.toThrow();
+	expect(() => complete("another-ref", receipt)).toThrow("is not pending");
+	expect(() => complete(input.operationRef, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL))).toThrow("is not pending");
+	expect(() => complete(input.operationRef, receipt.replace("cmd-1", "cmd-2"))).toThrow("is not pending");
+	expect(store.bindings.brokerOperation(authority, input.operation, input.scope)?.resultJson).toBe(receipt);
+});
+
+test("aged known busy refusals survive pruning and reconstruction with their retry fingerprint intact", async () => {
+	const { path, authority } = await setup();
+	let store = database!;
+	const input = {
+		operation: "turn.prompt",
+		scope: "prompt/aged-busy",
+		operationRef: "ref-aged-busy",
+		requestJson: '{"prompt":"original"}',
+	} as const;
+	store.transaction((tx) => {
+		store.bindings.beginBrokerOperation(tx, authority, input);
+		store.bindings.completeBrokerOperation(
+			tx,
+			authority,
+			input.operation,
+			input.scope,
+			input.operationRef,
+			JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+		);
+		const completed = { ...input, scope: "prompt/aged-accepted", operationRef: "ref-aged-accepted" };
+		store.bindings.beginBrokerOperation(tx, authority, completed);
+		store.bindings.completeBrokerOperation(
+			tx,
+			authority,
+			completed.operation,
+			completed.scope,
+			completed.operationRef,
+			'{"commandId":"cmd-accepted"}',
+		);
+	});
+	const proof = required(store.bindings.brokerOperation(authority, input.operation, input.scope), "aged busy proof");
+	const cutoff = { completedBefore: at(365 * 24 * 60 * 60_000), pendingBefore: at(365 * 24 * 60 * 60_000) };
+	expect(store.transaction((tx) => store.bindings.pruneBrokerOperations(tx, cutoff))).toBe(1);
+	expect(store.bindings.brokerOperation(authority, input.operation, input.scope)).toEqual(proof);
+	store.close();
+	database = await Store.open(path);
+	store = database;
+	expect(store.transaction((tx) => store.bindings.pruneBrokerOperations(tx, cutoff))).toBe(0);
+	expect(store.bindings.brokerOperation(authority, input.operation, input.scope)).toEqual(proof);
+	expect(
+		store.transaction((tx) => store.bindings.beginBrokerOperation(tx, authority, { ...input, requestJson: "{}" })),
+	).toEqual(proof);
+	expect(store.transaction((tx) => store.bindings.beginBrokerOperation(tx, authority, input))).toEqual(proof);
+	expect(
+		store.transaction((tx) =>
+			store.bindings.rearmBrokerPromptOperation(tx, authority, required(proof, "aged busy proof")),
+		),
+	).toEqual({ ...input, state: "pending", resumed: false });
 });
 
 test("completeBrokerOperation stores the result only for the pending row of the same ref", async () => {

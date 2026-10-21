@@ -32,6 +32,8 @@ import {
 	BrokerSessionPort,
 	parseWorkerOutputResponse,
 	type SessionBindInput,
+	type SessionPort,
+	type SessionSendInput,
 	type WorkerOutputResult,
 } from "../src/orchestrator/session-port";
 import { RelayClosedError, type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
@@ -1059,6 +1061,315 @@ test("live unknown restart observes without replay or false acceptance", async (
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
+});
+
+/** Real owned prompt journal and relay; no SDK process or host is launched. */
+async function interruptedBusyWorkFixture() {
+	const f = await fixture();
+	const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+	const sessionId = "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f";
+	const sessionKey = workSessionKey("a");
+	await createOwnedSessionFixture(f.db, authority, { sessionId, originKey: sessionKey, epoch: 0, repo: f.directory });
+	const commands: string[][] = [];
+	const cli: CliRunner = async (args) => {
+		commands.push([...args]);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId, live: true, deleted: false, locator: { repo: f.directory } } },
+				}),
+				stderr: "",
+			};
+		const statusIndex = args.indexOf("status");
+		if (statusIndex !== -1)
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { operationRef: args[statusIndex + 2], status: { status: "unknown" }, summary: { completed: false } },
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return { ok: false, error: { code: "busy", message: "prior turn running" } };
+		if (request.operation === "turn.result") return { ok: true, result: { status: "unknown" } };
+		throw new Error(`unexpected relay operation ${request.operation}`);
+	});
+	let sleeps = 0;
+	const realPort = new BrokerSessionPort({
+		database: f.db,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo: f.directory }),
+		sleep: async () => {
+			sleeps++;
+			throw new Error("interrupted after durable busy refusal");
+		},
+	});
+	const port: ScriptedSessionPort & Pick<SessionPort, "promptRefusal"> = f.port;
+	let sendInput: SessionSendInput | undefined;
+	let refusalReads = 0;
+	let terminateCalls = 0;
+	port.bind = (input) => realPort.bind(input);
+	port.attachTail = (input) => realPort.attachTail(input);
+	port.status = (input) => realPort.status({ ...input, relay: input.relay as TailHandle | undefined });
+	port.liveness = (input) => realPort.liveness(input);
+	port.promptRefusal = (input) => {
+		refusalReads++;
+		return realPort.promptRefusal(input);
+	};
+	port.send = (input) => {
+		const { relay: _relay, ...saved } = input;
+		sendInput = saved;
+		return realPort.send(input);
+	};
+	port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	port.terminateHost = async () => {
+		terminateCalls++;
+		throw new Error("busy refusal must not terminate the occupied host");
+	};
+	f.setOwnerTarget(origin);
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		detail: { reasonCode: "send_acceptance_uncertain" },
+	});
+	await f.manager.stop();
+	if (!sendInput) throw new Error("missing real prompt submission");
+	const input = sendInput;
+	const scope = JSON.stringify([sessionId, input.opRef]);
+	const journal = () => f.db.bindings.brokerOperation(authority, "turn.prompt", scope);
+	expect(sleeps).toBe(1);
+	expect(journal()).toMatchObject({ state: "complete" });
+	expect(realPort.promptRefusal(input)).toBe("busy");
+	expect(f.db.work.workAttemptGet(input.opRef)).toMatchObject({
+		sendPhase: "uncertain",
+		sendEvidence: null,
+		terminal: null,
+		settledAt: null,
+	});
+	return {
+		...f,
+		get manager() {
+			return f.manager;
+		},
+		port,
+		authority,
+		realPort,
+		relay,
+		input,
+		journal,
+		refusalReads: () => refusalReads,
+		assertNoHostMutation: () => {
+			expect(port.steers).toHaveLength(0);
+			expect(port.closes).toHaveLength(0);
+			expect(terminateCalls).toBe(0);
+			expect(commands.every((command) => command.includes("inspect") || command.includes("status"))).toBe(true);
+			expect(
+				relay.requests.every((request) => request.operation === "turn.prompt" || request.operation === "turn.result"),
+			).toBe(true);
+		},
+	};
+}
+
+test("restart settles a journaled busy refusal locally once without replay or native terminal proof", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const opRef = f.input.opRef;
+	let manager = await f.restart();
+	await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(opRef)).toMatchObject({
+		sendPhase: "uncertain",
+		sendEvidence: null,
+		terminal: { kind: "local", reasonCode: "send_rejected" },
+	});
+	expect(f.db.work.workAttemptGet(opRef)?.terminal?.status).toBeUndefined();
+	expect(f.job().attempts[0]?.endState).toBe("failed");
+	expect(f.job().state).toBe("awaiting_operator");
+	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] failed: send_rejected: output_unavailable"]);
+	expect(f.db.outbox.rows()).toHaveLength(1);
+	for (let i = 0; i < 2; i++) {
+		manager = await f.restart();
+		await manager.recover();
+	}
+	expect(await manager.start({ name: "a", text: "not an operator resume", cwd: f.directory })).toMatchObject({
+		started: false,
+		held: true,
+	});
+	expect(f.notices).toHaveLength(1);
+	expect(f.db.outbox.rows()).toHaveLength(1);
+	expect(f.job().attempts).toHaveLength(1);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	expect((await f.realPort.status(f.input)).status.status).toBe("unknown");
+	expect(await f.realPort.liveness(f.input)).toMatchObject({ live: true, disowned: false });
+	expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+	f.assertNoHostMutation();
+});
+
+test("rearmed pending prompt with native unknown remains open after WorkLane restart", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const refusal = f.journal();
+	if (!refusal) throw new Error("missing busy journal");
+	f.db.transaction((tx) => f.db.bindings.rearmBrokerPromptOperation(tx, f.authority, refusal));
+	expect(f.journal()).toMatchObject({ state: "pending" });
+	expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+	await f.restart();
+	expect(f.refusalReads()).toBeGreaterThan(0);
+	expect(f.db.work.workAttemptGet(f.input.opRef)).toMatchObject({
+		sendPhase: "uncertain",
+		terminal: null,
+		settledAt: null,
+	});
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toHaveLength(0);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+test("saved acceptance prevents a stale busy journal from ending an attempt on unknown restart", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
+	expect(
+		f.db.transaction((tx) =>
+			f.db.work.workAttemptUpdate(tx, runtime.opRef, runtime.version, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: runtime.startedAt },
+			}),
+		),
+	).toBeDefined();
+	await f.restart();
+	expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+	expect(f.refusalReads()).toBe(0);
+	expect(f.db.work.workAttemptGet(runtime.opRef)).toMatchObject({
+		sendPhase: "accepted",
+		terminal: null,
+		settledAt: null,
+	});
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toHaveLength(0);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+for (const evidence of ["absent", "unavailable", "unknown"] as const) {
+	test(`native unknown with ${evidence} refusal accessor holds without replay`, async () => {
+		const f = await interruptedBusyWorkFixture();
+		if (evidence === "absent") delete f.port.promptRefusal;
+		else
+			f.port.promptRefusal = () => {
+				if (evidence === "unavailable") throw new Error("refusal journal unavailable");
+				return undefined;
+			};
+		await f.restart();
+		expect(f.db.work.workAttemptGet(f.input.opRef)).toMatchObject({
+			sendPhase: "uncertain",
+			terminal: null,
+			settledAt: null,
+		});
+		expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+		f.assertNoHostMutation();
+	});
+}
+
+test("restart refusal recovery waits for a same-ref retry owner to rearm and accept under the session lock", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const reached = new Set<string>();
+	const releaseQuery = deferred<void>();
+	const releaseRetry = deferred<void>();
+	const releaseAck = deferred<void>();
+	let interceptQuery = true;
+	let retryOwnsLock = false;
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		const report = await status(input);
+		if (interceptQuery) {
+			interceptQuery = false;
+			reached.add("query");
+			await releaseQuery.promise;
+		}
+		return report;
+	};
+	const exclusive = f.port.runExclusive.bind(f.port);
+	f.port.runExclusive = <T>(key: string, work: () => Promise<T>): Promise<T> => {
+		if (retryOwnsLock && key === workSessionKey("a")) reached.add("recovery-queued");
+		return exclusive(key, work);
+	};
+	const retryRelay = scriptedRelay(async (request) => {
+		if (request.operation !== "turn.prompt") throw new Error(`unexpected retry operation ${request.operation}`);
+		reached.add("prompt");
+		await releaseAck.promise;
+		return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-retry" } };
+	});
+	const retryTail = await new TailRunner({ stream: retryRelay.spawn, repo: f.directory }).attach({
+		sessionId: f.input.sessionId,
+		brokerGeneration: 0,
+		repo: f.directory,
+	});
+	let retry: Promise<void> | undefined;
+	const restarting = f.restart();
+	try {
+		await until(() => reached.has("query"));
+		retry = f.port.runExclusive(workSessionKey("a"), async () => {
+			retryOwnsLock = true;
+			try {
+				await releaseRetry.promise;
+				const receipt = await f.realPort.send({ ...f.input, relay: retryTail });
+				expect(receipt).toMatchObject({ operationRef: f.input.opRef, commandId: "cmd-retry" });
+				const latest = f.db.work.workAttemptGet(f.input.opRef)!;
+				expect(
+					f.db.transaction((tx) =>
+						f.db.work.workAttemptUpdate(tx, latest.opRef, latest.version, {
+							sendPhase: "accepted",
+							sendEvidence: { source: "receipt", observedAt: receipt.acceptedAt },
+						}),
+					),
+				).toBeDefined();
+			} finally {
+				retryOwnsLock = false;
+			}
+		});
+		await until(() => retryOwnsLock);
+		releaseQuery.resolve();
+		await until(() => reached.has("recovery-queued"));
+		expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+		expect(f.refusalReads()).toBe(0);
+		expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toBeNull();
+		releaseRetry.resolve();
+		await until(() => reached.has("prompt"));
+		expect(f.journal()).toMatchObject({ state: "pending" });
+		expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+		expect(f.refusalReads()).toBe(0);
+		expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toBeNull();
+		releaseAck.resolve();
+		await retry;
+		await restarting;
+		expect(f.db.work.workAttemptGet(f.input.opRef)).toMatchObject({
+			sendPhase: "accepted",
+			terminal: null,
+			settledAt: null,
+		});
+		expect(f.refusalReads()).toBe(0);
+		expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+		expect((await f.realPort.status(f.input)).status.status).toBe("unknown");
+		expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+		expect(retryRelay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		f.assertNoHostMutation();
+	} finally {
+		releaseQuery.resolve();
+		releaseRetry.resolve();
+		releaseAck.resolve();
+		await retry?.catch(() => {});
+		await restarting.catch(() => {});
+		await retryTail.close();
+	}
 });
 
 test("dead restart settles uncertainty into a sticky hold, never replacement bind", async () => {
