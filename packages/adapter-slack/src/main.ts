@@ -987,8 +987,12 @@ export async function startSlackAdapter(
 		]);
 	};
 	const handleEvent = async (event: Record<string, unknown>): Promise<void> => {
-		// app_mention also arrives as message; forwarding both would double-turn.
-		if (event.type === "message") {
+		// A mention in a channel the bot has not joined yet arrives ONLY as app_mention
+		// (Slack sends no message.channels event for it, even after the user accepts the
+		// "add to channel" prompt). Both shapes share one path: the turn identity is
+		// `channel:ts`, so whichever of message/app_mention lands second is dropped by
+		// requestInbound's in-flight join + LRU (and the gateway inbox is idempotent on it).
+		if (event.type === "message" || event.type === "app_mention") {
 			const envelope = event as unknown as SlackInboundMessage;
 			const message =
 				envelope.subtype === "message_changed" && envelope.message
