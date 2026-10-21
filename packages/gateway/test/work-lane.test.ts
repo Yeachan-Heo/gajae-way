@@ -2133,10 +2133,13 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 			if (revoke === "generation") {
 				// Session content touches binding activity, not the attempt version.
 				// Separately race a durable checkpoint so rejection must CAS latest.
+				// It must change a field: no-op patches no longer bump the version (#648).
 				expect(sessionActivity).toBeDefined();
 				sessionActivity!();
 				const checkpoint = f.db.transaction((tx) =>
-					f.db.work.workAttemptUpdate(tx, before.opRef, before.version, { sendPhase: "prepared" }),
+					f.db.work.workAttemptUpdate(tx, before.opRef, before.version, {
+						turnEndObservedAt: new Date(Date.parse(before.startedAt) + 1).toISOString(),
+					}),
 				);
 				expect(checkpoint).toBeDefined();
 				expect(checkpoint!.version).toBeGreaterThan(before.version);

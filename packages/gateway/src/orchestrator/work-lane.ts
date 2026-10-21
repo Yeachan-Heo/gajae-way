@@ -1647,7 +1647,7 @@ export class WorkLaneManager {
 				observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			const patchParts: Array<Partial<WorkAttemptPatch>> = [];
-			if (status && provesAcceptance(status)) {
+			if (runtime.sendPhase !== "accepted" && status && provesAcceptance(status)) {
 				patchParts.push({
 					sendPhase: "accepted" as const,
 					sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
@@ -1660,7 +1660,9 @@ export class WorkLaneManager {
 				patchParts.push({ terminal });
 			}
 			const patch = Object.assign({}, ...patchParts);
-			runtime = (Object.keys(patch).length > 0 ? this.#updateAttempt(runtime.opRef, runtime.version, patch) : undefined) ?? runtime;
+			runtime =
+				(Object.keys(patch).length > 0 ? this.#updateAttempt(runtime.opRef, runtime.version, patch) : undefined) ??
+				runtime;
 			if (!runtime.terminal) return;
 		}
 		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
