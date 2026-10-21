@@ -945,8 +945,9 @@ export class BindingsGroup {
 	 * old pending close intents. Pending creates and prompts are never age-pruned:
 	 * a create may have applied before its binding was recorded, and an unknown
 	 * prompt status never authorizes resending its non-idempotent clientRef.
-	 * Busy refusals retain their fingerprint until the caller retries; they are
-	 * completed control responses, not completed logical prompts.
+	 * Busy refusals retain their fingerprint while retry/recovery is unresolved.
+	 * Only a durably settled work attempt with matching current-authority
+	 * ownership makes its refusal eligible for the normal completed cutoff.
 	 */
 	pruneBrokerOperations(
 		tx: WriteTx,
@@ -954,7 +955,28 @@ export class BindingsGroup {
 	): number {
 		return this.#db
 			.prepare(
-				"DELETE FROM broker_operations WHERE (state = 'complete' AND completed_at < ? AND (operation != 'turn.prompt' OR COALESCE(result_json, '') != ?)) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)",
+				`DELETE FROM broker_operations
+				WHERE (state = 'complete' AND completed_at < ? AND (
+					operation != 'turn.prompt' OR COALESCE(result_json, '') != ? OR EXISTS (
+						SELECT 1 FROM work_attempt_runtime runtime
+						JOIN lane_jobs job ON job.job_id = runtime.job_id AND job.lane_key = runtime.lane_key
+						JOIN broker_owned_bindings owner ON owner.session_id = runtime.session_id
+						JOIN broker_authority authority ON authority.authority_key = owner.authority_key
+						WHERE authority.singleton = 1
+							AND owner.authority_key = broker_operations.authority_key
+							AND runtime.op_ref = broker_operations.operation_ref
+							AND broker_operations.scope = json_array(runtime.session_id, runtime.op_ref)
+							AND runtime.settled_at IS NOT NULL
+							AND json_extract(runtime.record_json, '$.settledAt') = runtime.settled_at
+							AND owner.origin_key = json_extract(runtime.record_json, '$.sessionKey')
+							AND owner.epoch = json_extract(runtime.record_json, '$.epoch')
+							AND owner.repo = json_extract(runtime.record_json, '$.cwd')
+							AND NOT EXISTS (
+								SELECT 1 FROM broker_quarantine quarantine
+								WHERE quarantine.kind = 'work' AND quarantine.subject_id = runtime.job_id
+							)
+					)
+				)) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)`,
 			)
 			.run(tx, cutoff.completedBefore, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL), cutoff.pendingBefore).changes;
 	}

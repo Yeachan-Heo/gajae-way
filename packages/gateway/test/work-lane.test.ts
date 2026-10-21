@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -1209,6 +1210,210 @@ test("restart settles a journaled busy refusal locally once without replay or na
 	expect((await f.realPort.status(f.input)).status.status).toBe("unknown");
 	expect(await f.realPort.liveness(f.input)).toMatchObject({ live: true, disowned: false });
 	expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+	f.assertNoHostMutation();
+});
+
+const busyRetentionCutoff = {
+	completedBefore: "2001-01-01T00:00:00.000Z",
+	pendingBefore: "2001-01-01T00:00:00.000Z",
+};
+
+function ageBusyJournal(f: Awaited<ReturnType<typeof interruptedBusyWorkFixture>>) {
+	const sql = new Database(join(f.directory, "gateway.db"));
+	try {
+		sql.run(
+			"UPDATE broker_operations SET created_at = ?, completed_at = CASE WHEN state = 'complete' THEN ? ELSE NULL END WHERE operation = 'turn.prompt' AND operation_ref = ?",
+			["2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", f.input.opRef],
+		);
+	} finally {
+		sql.close();
+	}
+}
+
+async function settleBusyWork(f: Awaited<ReturnType<typeof interruptedBusyWorkFixture>>) {
+	await f.restart();
+	await until(() => f.db.work.workAttemptGet(f.input.opRef)?.settledAt != null);
+	await f.manager.stop();
+	expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toMatchObject({
+		kind: "local",
+		reasonCode: "send_rejected",
+	});
+	expect(f.notices).toHaveLength(1);
+}
+
+for (const localTerminal of [false, true]) {
+	test(`aged busy proof survives prune and reopen with ${localTerminal ? "local terminal but unsettled" : "unresolved"} runtime`, async () => {
+		const f = await interruptedBusyWorkFixture();
+		if (localTerminal) {
+			const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
+			expect(
+				f.db.transaction((tx) =>
+					f.db.work.workAttemptUpdate(tx, runtime.opRef, runtime.version, {
+						terminal: { kind: "local", reasonCode: "send_rejected", observedAt: runtime.startedAt },
+					}),
+				),
+			).toBeDefined();
+		}
+		ageBusyJournal(f);
+		const proof = f.journal()!;
+		expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+		const reopened = await Store.open(join(f.directory, "gateway.db"));
+		try {
+			expect(reopened.transaction((tx) => reopened.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+			expect(reopened.bindings.brokerOperation(f.authority, "turn.prompt", proof.scope)).toEqual(proof);
+			expect(reopened.work.workAttemptGet(f.input.opRef)?.settledAt).toBeNull();
+		} finally {
+			reopened.close();
+		}
+		expect(f.notices).toHaveLength(0);
+		expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+		f.assertNoHostMutation();
+	});
+}
+
+test("settled busy proof obeys completed cutoff, rolls back atomically and prunes exactly once without replay", async () => {
+	const f = await interruptedBusyWorkFixture();
+	await settleBusyWork(f);
+	const runtime = f.db.work.workAttemptGet(f.input.opRef);
+	const proof = f.journal()!;
+	const outbox = f.db.outbox.rows();
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+	ageBusyJournal(f);
+	expect(
+		f.db.transaction((tx) =>
+			f.db.bindings.pruneBrokerOperations(tx, {
+				...busyRetentionCutoff,
+				completedBefore: "2000-01-01T00:00:00.000Z",
+			}),
+		),
+	).toBe(0);
+	expect(() =>
+		f.db.transaction((tx) => {
+			expect(f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff)).toBe(1);
+			expect(f.journal()).toBeUndefined();
+			throw new Error("rollback busy cleanup");
+		}),
+	).toThrow("rollback busy cleanup");
+	expect(f.journal()).toEqual(proof);
+	expect(f.db.work.workAttemptGet(f.input.opRef)).toEqual(runtime);
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(1);
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+	expect(f.journal()).toBeUndefined();
+	const reopened = await Store.open(join(f.directory, "gateway.db"));
+	try {
+		expect(reopened.bindings.brokerOperation(f.authority, "turn.prompt", proof.scope)).toBeUndefined();
+		expect(reopened.work.workAttemptGet(f.input.opRef)).toEqual(runtime);
+		expect(reopened.outbox.rows()).toEqual(outbox);
+	} finally {
+		reopened.close();
+	}
+	await f.restart();
+	await f.manager.recover();
+	expect(f.db.work.workAttemptGet(f.input.opRef)).toEqual(runtime);
+	expect(f.notices).toHaveLength(1);
+	expect(f.db.outbox.rows()).toEqual(outbox);
+	expect(f.job().attempts).toHaveLength(1);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+for (const mismatch of [
+	"orphan",
+	"operation ref",
+	"scope session",
+	"scope encoding",
+	"session",
+	"lane",
+	"epoch",
+	"repo",
+	"journal authority",
+	"current authority",
+	"settlement column",
+	"settlement JSON",
+	"quarantine",
+] as const) {
+	test(`aged settled busy proof is retained with mismatched ${mismatch}`, async () => {
+		const f = await interruptedBusyWorkFixture();
+		await settleBusyWork(f);
+		ageBusyJournal(f);
+		const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
+		const sql = new Database(join(f.directory, "gateway.db"));
+		try {
+			// Only this disposable fixture is altered; mismatched provenance cannot authorize cleanup.
+			if (mismatch === "orphan") sql.run("DELETE FROM work_attempt_runtime WHERE op_ref = ?", [runtime.opRef]);
+			else if (mismatch === "operation ref")
+				sql.run("UPDATE broker_operations SET operation_ref = 'unowned-ref' WHERE operation_ref = ?", [runtime.opRef]);
+			else if (mismatch === "scope session" || mismatch === "scope encoding")
+				sql.run("UPDATE broker_operations SET scope = ? WHERE operation_ref = ?", [
+					mismatch === "scope session"
+						? JSON.stringify(["another-session", runtime.opRef])
+						: `[ ${JSON.stringify(runtime.sessionId)}, ${JSON.stringify(runtime.opRef)} ]`,
+					runtime.opRef,
+				]);
+			else if (mismatch === "journal authority")
+				sql.run("UPDATE broker_operations SET authority_key = 'unowned-authority' WHERE operation_ref = ?", [
+					runtime.opRef,
+				]);
+			else if (mismatch === "current authority")
+				sql.run("UPDATE broker_authority SET authority_key = 'revoked-authority' WHERE singleton = 1");
+			else if (mismatch === "settlement column")
+				sql.run("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?", [runtime.opRef]);
+			else if (mismatch === "quarantine")
+				sql.run("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, 'test-cutover')", [
+					runtime.jobId,
+				]);
+			else {
+				const record = { ...runtime };
+				if (mismatch === "session") record.sessionId = "another-session";
+				if (mismatch === "lane") record.laneKey = "another-lane";
+				if (mismatch === "epoch") record.epoch++;
+				if (mismatch === "repo") record.cwd = join(f.directory, "another-repo");
+				if (mismatch === "settlement JSON") record.settledAt = "2000-01-01T00:00:00.000Z";
+				sql.run("UPDATE work_attempt_runtime SET record_json = ?, session_id = ?, lane_key = ? WHERE op_ref = ?", [
+					JSON.stringify(record),
+					record.sessionId,
+					record.laneKey,
+					runtime.opRef,
+				]);
+				if (mismatch === "session")
+					sql.run("UPDATE broker_operations SET scope = ? WHERE operation_ref = ?", [
+						JSON.stringify([record.sessionId, runtime.opRef]),
+						runtime.opRef,
+					]);
+			}
+			const rows = () => sql.query("SELECT * FROM broker_operations WHERE operation = 'turn.prompt'").all();
+			const proof = rows();
+			expect(proof).toHaveLength(1);
+			expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+			expect(rows()).toEqual(proof);
+		} finally {
+			sql.close();
+		}
+		f.assertNoHostMutation();
+	});
+}
+
+test("aged rearmed lost-ACK prompt remains pending even with a durably settled runtime", async () => {
+	const f = await interruptedBusyWorkFixture();
+	await settleBusyWork(f);
+	const refusal = f.journal()!;
+	f.db.transaction((tx) => f.db.bindings.rearmBrokerPromptOperation(tx, f.authority, refusal));
+	ageBusyJournal(f);
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+	const reopened = await Store.open(join(f.directory, "gateway.db"));
+	try {
+		expect(reopened.transaction((tx) => reopened.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+		expect(reopened.bindings.brokerOperation(f.authority, "turn.prompt", refusal.scope)).toMatchObject({
+			state: "pending",
+		});
+		expect(reopened.work.workAttemptGet(f.input.opRef)?.settledAt).not.toBeNull();
+	} finally {
+		reopened.close();
+	}
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
 	f.assertNoHostMutation();
 });
 
