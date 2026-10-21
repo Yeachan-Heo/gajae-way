@@ -862,13 +862,11 @@ export class BrokerSessionPort implements SessionPort {
 				throw new OpRefError("prompt journal identity changed before completion");
 			if (current.state === "complete") {
 				const cached = recordOf(JSON.parse(current.resultJson!));
-				const sameNativeIdentity =
-					typeof receipt.commandId === "string" &&
-					receipt.commandId.length > 0 &&
-					typeof receipt.turnId === "string" &&
-					receipt.turnId.length > 0 &&
-					cached?.commandId === receipt.commandId &&
-					cached.turnId === receipt.turnId;
+				const nativeIdentityConflict =
+					(cached?.commandId !== undefined &&
+						receipt.commandId !== undefined &&
+						cached.commandId !== receipt.commandId) ||
+					(cached?.turnId !== undefined && receipt.turnId !== undefined && cached.turnId !== receipt.turnId);
 				if (
 					cached?.sessionId === receipt.sessionId &&
 					typeof cached.sessionId === "string" &&
@@ -877,7 +875,7 @@ export class BrokerSessionPort implements SessionPort {
 					receipt.operationRef === intent.operationRef &&
 					typeof cached.acceptedAt === "string" &&
 					cached.taskKey === "gateway" &&
-					(current.resultJson === JSON.stringify(receipt) || sameNativeIdentity)
+					!nativeIdentityConflict
 				)
 					return cached as unknown as SendReceipt;
 				throw new OpRefError("prompt accepted receipt identity changed");

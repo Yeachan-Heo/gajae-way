@@ -1320,6 +1320,167 @@ for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
 	});
 }
 
+const nativeReceiptVariants = [
+	{ name: "both", ids: { commandId: "cmd-overlap", turnId: "turn-overlap" } },
+	{ name: "command", ids: { commandId: "cmd-overlap" } },
+	{ name: "turn", ids: { turnId: "turn-overlap" } },
+	{ name: "neither", ids: {} },
+] as const;
+const canonicalReceiptCases = [
+	...nativeReceiptVariants.flatMap((status) =>
+		nativeReceiptVariants.map((ack) => ({
+			name: `status ${status.name}, ACK ${ack.name}`,
+			statusIds: status.ids,
+			ackIds: ack.ids,
+			conflict: false,
+		})),
+	),
+	{
+		name: "shared command conflict",
+		statusIds: { commandId: "cmd-foreign" },
+		ackIds: { commandId: "cmd-overlap", turnId: "turn-overlap" },
+		conflict: true,
+	},
+	{
+		name: "shared turn conflict",
+		statusIds: { turnId: "turn-foreign" },
+		ackIds: { commandId: "cmd-overlap", turnId: "turn-overlap" },
+		conflict: true,
+	},
+	{
+		name: "command conflict with matching turn",
+		statusIds: { commandId: "cmd-foreign", turnId: "turn-overlap" },
+		ackIds: { commandId: "cmd-overlap", turnId: "turn-overlap" },
+		conflict: true,
+	},
+	{
+		name: "turn conflict with matching command",
+		statusIds: { commandId: "cmd-overlap", turnId: "turn-foreign" },
+		ackIds: { commandId: "cmd-overlap", turnId: "turn-overlap" },
+		conflict: true,
+	},
+];
+
+for (const order of ["status first", "ACK first"] as const) {
+	for (const scenario of canonicalReceiptCases) {
+		test(`canonical accepted receipt: ${order}, ${scenario.name}`, async () => {
+			const { authority, repo } = await setup();
+			const send = { sessionId: "sdk-overlap", repo, text: "same fingerprint", opRef: "gw-canonical-overlap" };
+			await createOwnedSessionFixture(database!, authority, {
+				sessionId: send.sessionId,
+				repo,
+				originKey: "lane/overlap",
+				epoch: 0,
+			});
+			const sleeping = Promise.withResolvers<void>();
+			const sleepGate = Promise.withResolvers<void>();
+			const submitted = Promise.withResolvers<void>();
+			const ackGate = Promise.withResolvers<void>();
+			const queried = Promise.withResolvers<void>();
+			const statusGate = Promise.withResolvers<void>();
+			let prompts = 0;
+			const relay = scriptedRelay(async (request) => {
+				if (request.operation === "turn.prompt") {
+					if (++prompts === 1) return { ok: false, error: { code: "busy" } };
+					submitted.resolve();
+					await ackGate.promise;
+					return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, ...scenario.ackIds } };
+				}
+				queried.resolve();
+				await statusGate.promise;
+				return {
+					ok: true,
+					result: {
+						status: "in_flight",
+						receiptState: "absent",
+						clientRef: request.input.clientRef,
+						acceptedAt: 1_000,
+						startedAt: 1_000,
+						...scenario.statusIds,
+					},
+				};
+			});
+			const broker = new FakeBroker();
+			const statusCaller = new BrokerSessionPort({
+				database: database!,
+				authority,
+				cli: broker.cli,
+				tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 1_000 }),
+				sleep: async () => {
+					sleeping.resolve();
+					await sleepGate.promise;
+				},
+			});
+			const ackCaller = new BrokerSessionPort({
+				database: database!,
+				authority,
+				cli: broker.cli,
+				tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 1_000 }),
+				now: () => 2_000,
+			});
+			const statusSend = statusCaller.send(send);
+			// Capture errors without a pre-gate Bun rejection matcher blocking the schedule.
+			const statusOutcome = statusSend.then(
+				(receipt) => ({ receipt }),
+				(error: unknown) => ({ error }),
+			);
+			let ackSend: ReturnType<BrokerSessionPort["send"]> | undefined;
+			try {
+				await sleeping.promise;
+				ackSend = ackCaller.send(send);
+				const ackOutcome = ackSend.then(
+					(receipt) => ({ receipt }),
+					(error: unknown) => ({ error }),
+				);
+				await submitted.promise;
+				sleepGate.resolve();
+				await queried.promise;
+				const first = order === "status first" ? statusOutcome : ackOutcome;
+				const second = order === "status first" ? ackOutcome : statusOutcome;
+				(order === "status first" ? statusGate : ackGate).resolve();
+				const accepted = await first;
+				if (!("receipt" in accepted)) throw accepted.error;
+				const canonical = accepted.receipt;
+				expect(canonical.acceptedAt).toBe(new Date(order === "status first" ? 1_000 : 2_000).toISOString());
+				expect(canonical).toMatchObject(order === "status first" ? scenario.statusIds : scenario.ackIds);
+				const persisted = database!.bindings.brokerOperation(
+					authority,
+					"turn.prompt",
+					JSON.stringify([send.sessionId, send.opRef]),
+				);
+				expect(persisted?.resultJson).toBe(JSON.stringify(canonical));
+				(order === "status first" ? ackGate : statusGate).resolve();
+				const completed = await second;
+				if (scenario.conflict) {
+					expect(completed).toHaveProperty("error");
+					if ("error" in completed)
+						expect(completed.error).toMatchObject({
+							name: "OpRefError",
+							message: "prompt accepted receipt identity changed",
+						});
+				} else {
+					expect(completed).toEqual({ receipt: canonical });
+				}
+				expect(
+					database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
+						?.resultJson,
+				).toBe(persisted?.resultJson);
+				expect(relay.requests.map((request) => request.operation)).toEqual([
+					"turn.prompt",
+					"turn.prompt",
+					"turn.result",
+				]);
+			} finally {
+				sleepGate.resolve();
+				ackGate.resolve();
+				statusGate.resolve();
+				await statusSend.catch(() => {});
+				await ackSend?.catch(() => {});
+			}
+		});
+	}
+}
+
 test("failure to persist a busy refusal prevents sleep and retry and leaves the intent pending", async () => {
 	const { path, authority, repo } = await setup();
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
