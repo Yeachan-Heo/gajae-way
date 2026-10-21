@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -51,6 +51,22 @@ function json<T>(path: string, fallback: T): T {
 	return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as T) : fallback;
 }
 
+// Synchronous publication keeps barriers inside their original transaction and SIGKILL window.
+// The writer parameter lets regressions interleave readers with an incomplete temporary file.
+export function writeFixtureJson(
+	path: string,
+	value: unknown,
+	write: (path: string, data: string) => void = writeFileSync,
+): void {
+	const temporary = `${path}.${crypto.randomUUID()}.tmp`;
+	try {
+		write(temporary, JSON.stringify(value));
+		renameSync(temporary, path);
+	} finally {
+		rmSync(temporary, { force: true });
+	}
+}
+
 /** Only fixture files supply broker authority; rehydration never invokes send or bind. */
 class PersistentPort extends ScriptedSessionPort {
 	constructor(
@@ -93,7 +109,7 @@ class PersistentPort extends ScriptedSessionPort {
 			)
 		)
 			throw new Error("fixture session bind lost its epoch");
-		writeFileSync(join(this.home, `${binding.sessionId}.session.json`), JSON.stringify(binding));
+		writeFixtureJson(join(this.home, `${binding.sessionId}.session.json`), binding);
 		return binding;
 	}
 	override async resume(input: Parameters<ScriptedSessionPort["resume"]>[0]) {
@@ -104,7 +120,7 @@ class PersistentPort extends ScriptedSessionPort {
 		this.record("send", input);
 		if (existsSync(join(this.home, `${input.opRef}.send.json`))) throw new Error("fixture detected duplicate send");
 		const receipt = await super.send(input);
-		writeFileSync(join(this.home, `${input.opRef}.send.json`), JSON.stringify({ ...input, startedAt: Date.now() }));
+		writeFixtureJson(join(this.home, `${input.opRef}.send.json`), { ...input, startedAt: Date.now() });
 		this.hit("accepted-before-save");
 		return receipt;
 	}
@@ -186,8 +202,8 @@ async function serve(home: string, barrier?: Barrier) {
 	const hit = (point: Barrier) => {
 		const armed = json<{ readonly point?: Barrier | null }>(join(home, "barrier-arm.json"), {}).point;
 		if (barrier !== point && armed !== point) return;
-		writeFileSync(join(home, "barrier-hit.json"), JSON.stringify({ point, pid: process.pid }));
-		if (armed === point) writeFileSync(join(home, "barrier-arm.json"), JSON.stringify({ point: null }));
+		writeFixtureJson(join(home, "barrier-hit.json"), { point, pid: process.pid });
+		if (armed === point) writeFixtureJson(join(home, "barrier-arm.json"), { point: null });
 		// A synchronous fixture-only barrier can stop inside a real SQLite transaction.
 		// The parent SIGKILLs precisely this child; no production fault flag exists.
 		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
@@ -433,7 +449,7 @@ export class WorkFixture {
 			};
 			if (!database.transaction((tx) => database.bindings.recordOwnedBinding(tx, binding)))
 				throw new Error("persona fixture binding lost its epoch");
-			writeFileSync(join(this.home, `${sessionId}.session.json`), JSON.stringify(binding));
+			writeFixtureJson(join(this.home, `${sessionId}.session.json`), binding);
 		} finally {
 			database.close();
 		}
@@ -458,13 +474,13 @@ export class WorkFixture {
 		await rm(this.home, { recursive: true, force: true });
 	}
 	async armBarrier(point: Barrier): Promise<void> {
-		await Bun.write(join(this.home, "barrier-arm.json"), JSON.stringify({ point }));
+		writeFixtureJson(join(this.home, "barrier-arm.json"), { point });
 		await rm(join(this.home, "barrier-hit.json"), { force: true });
 	}
 	async persistAcceptedSend(opRef: string): Promise<void> {
 		const call = this.calls("send").find((entry) => entry.input.opRef === opRef);
 		if (!call) throw new Error(`missing send call for ${opRef}`);
-		await Bun.write(join(this.home, `${opRef}.send.json`), JSON.stringify({ ...call.input, startedAt: Date.now() }));
+		writeFixtureJson(join(this.home, `${opRef}.send.json`), { ...call.input, startedAt: Date.now() });
 	}
 	async control(opRef: string, control: Control) {
 		this.controls[opRef] = {
