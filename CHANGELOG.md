@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.4] - 2026-10-21
+
+### Fixes
+- **gateway**: Report force-ended checks cycles atomically so a parent receives exactly one cycle conclusion (#641)
+
+## [0.3.3] - 2026-10-20
+
+### Features
+- **gateway**: `[SHUTUP]` mutes a thread durably until a mention or reply-to unmutes it (#625, #626)
+- **gateway**: Ask a UI elicitation through chat with gateway capabilities advertised (#619, #620)
+
+### Fixes
+- **gateway**: Bound lane git commands and add an event-loop watchdog (#615, #616)
+- **gateway**: Recover repeated monitor prior-run failures (#627, #629)
+- **gateway**: Resolve awaiting-checks PRs by pushed head SHA (#628, #630)
+- **gateway**: Reconcile missing and saved receipts with runtime evidence; fence native restarts (#635, #637)
+- **gateway**: Observe worker activity after relay reconnect (#636)
+- **gateway**: Keep Discord channel lane reports at root (#634)
+- **gateway**: Replay the work journal on boot and drop caller session-create retries (#567, #568, #586, #597)
+- **gateway**: Monitors execute first instead of re-planning (#369, #623)
+- **monitors**: Detect paraphrased contract echoes (#632, #633)
+- **cli**: Hermetic restart-stack and order-independent gjc-install tests (#621, #622, #638)
+- **docs**: Align README with implemented setup and runtime (#631)
+
 ## [0.3.2] - 2026-10-18
 
 ### Features
