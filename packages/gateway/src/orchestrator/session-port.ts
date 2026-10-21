@@ -456,11 +456,9 @@ export interface BrokerSessionPortOptions {
 
 const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
 const DEFAULT_STATUS_POLL_MS = 500;
-const SESSION_CREATE_ATTEMPTS = 5;
 const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
-const SESSION_CREATE_RETRY_MS = 1_000;
 /**
  * How long a completed broker operation answers a retry of the same op ref.
  * Keys are per-attempt, so this bounds the journal's size, not its correctness:
@@ -949,31 +947,25 @@ export class BrokerSessionPort implements SessionPort {
 		idempotencyKey: string,
 		requestJson: string,
 	): Promise<{ readonly sessionId?: unknown }> {
-		let lastFailure: unknown;
-		for (let attempt = 1; attempt <= SESSION_CREATE_ATTEMPTS; attempt++) {
-			try {
-				return parseEnvelope<{ sessionId?: unknown }>(
-					await this.#cli([
-						"sdk",
-						"session",
-						"raw",
-						"global",
-						"--op",
-						"session.create",
-						"--idempotency-key",
-						idempotencyKey,
-						"--json-input",
-						requestJson,
-					]),
+		try {
+			return parseEnvelope<{ sessionId?: unknown }>(
+				await this.#cli([
+					"sdk",
+					"session",
+					"raw",
+					"global",
+					"--op",
 					"session.create",
-				);
-			} catch (error) {
-				lastFailure = error;
-				if (!isTransientCreateFailure(error) || attempt === SESSION_CREATE_ATTEMPTS) throw sanitizeSdkFailure(error);
-				await this.#sleep(SESSION_CREATE_RETRY_MS);
-			}
+					"--idempotency-key",
+					idempotencyKey,
+					"--json-input",
+					requestJson,
+				]),
+				"session.create",
+			);
+		} catch (error) {
+			throw sanitizeSdkFailure(error);
 		}
-		throw sanitizeSdkFailure(lastFailure ?? new Error("session.create did not produce a result"));
 	}
 
 	/**
@@ -2588,20 +2580,6 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 function isRefusedOutcome(error: unknown): boolean {
 	if (!(error instanceof GjcCliError)) return false;
 	return recordOf(error.details)?.outcomeCertainty === "not-applied" || isSessionGoneCode(sdkErrorCode(error));
-}
-
-/**
- * Create failures that are safe to retry under the SAME idempotency key: the
- * runtime either has not created the session (spawn_failed) or cannot yet
- * prove what it created (terminal_uncertain, uncertain_after_send). The key
- * guarantees the retry resolves to the same session, never a second one.
- * Measured: five simultaneous cold binds on one agent dir starve gjc's
- * lifecycle launcher and surface all three codes.
- */
-function isTransientCreateFailure(error: unknown): boolean {
-	if (!(error instanceof GjcCliError)) return false;
-	const code = envelopeErrorCode(error.details);
-	return code === "terminal_uncertain" || code === "uncertain_after_send" || code === "spawn_failed";
 }
 
 /**

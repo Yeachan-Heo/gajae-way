@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isSilenceToken } from "@gajae-gateway/protocol";
+import { isShutupToken, isSilenceToken } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -92,6 +92,13 @@ test("bracketing a silence token never turns it into a delivered message", () =>
 	// Stripping brackets must not turn prose into silence.
 	for (const text of ["[reply please]", "[]", "[SILENT] but actually", "[NO_REPLY] just kidding"])
 		expect(isSilenceToken(text)).toBe(false);
+});
+
+test("SHUTUP is recognized only in the first line, including beside control tokens", () => {
+	for (const text of ["[SHUTUP]", "[shutup]\nignored", "[REACT:👍][SHUTUP]", "[REACT:👍] SHUTUP"])
+		expect(isShutupToken(text)).toBe(true);
+	for (const text of ["hello\n[SHUTUP]", "hello [SHUTUP]", "[SHUTUP] after", "[REACT:👍][SHUTUP] prose"])
+		expect(isShutupToken(text)).toBe(false);
 });
 
 test("a silent turn in an open channel delivers nothing", async () => {

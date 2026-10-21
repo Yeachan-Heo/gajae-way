@@ -17,6 +17,7 @@ import {
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
 	MONITOR_DIGEST_MAX_NOTES,
+	MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD,
 	type NativeCompactionStatus,
 	unavailableCompactionPort,
 } from "../src/monitors/compaction";
@@ -1022,6 +1023,96 @@ test("a wedged prompt submission rolls the session so the next slot lands on a l
 		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
 			"authored_no_delivery",
 		);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("repeated prior-run-busy terminal failures roll within a bounded streak and replay events once", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-prior-run-busy-"));
+	try {
+		const { database, registry, pipeline, turns, sessionPort } = await harness(directory);
+		const monitor = registry.add({
+			name: "prior-run-busy",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["busy.tick"],
+			burstPolicy: "serialize",
+			channelTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } },
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "busy.tick"));
+		const priorRunReason = "Timed out waiting for prior agent run to finish before prompting.";
+		const attempts: Array<{ sessionId: string; eventIds: string[] }> = [];
+		const originalRequest = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			const marker = "entry per event: ";
+			const payload = input.text.slice(input.text.lastIndexOf(marker) + marker.length);
+			const eventIds = (JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => eventId);
+			attempts.push({ sessionId: input.sessionId, eventIds });
+			if (input.sessionId === "event-session-e0") {
+				const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
+					code: "sdk_prompt_terminal_failed",
+					reason: priorRunReason,
+				});
+				throw new Error("monitor prompt terminal failure", { cause });
+			}
+			return originalRequest(input);
+		};
+
+		expect(MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD).toBe(2);
+		const failed: string[] = [];
+		for (let index = 0; index < MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD; index += 1) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "busy.tick", { tick: index });
+			failed.push(eventId);
+			expect(database.monitors.failure(eventId)?.code).toBe("session_submission_wedged");
+			const state = pipeline.sessionSafetyState(sessionKey);
+			expect(state.priorRunBusyFailures).toBe(index + 1);
+			expect(state.pendingRoll).toBe(
+				index + 1 === MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD ? "session_prior_run_busy_stalled" : undefined,
+			);
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		}
+
+		const recovered = await pipeline.submitAwaitable(monitor.monitorId, "busy.tick", { tick: "after-roll" });
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+			lastRoll: "session_prior_run_busy_stalled",
+			priorRunBusyFailures: 0,
+		});
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === recovered)?.stage).toBe(
+			"authored",
+		);
+		await Bun.sleep(0);
+		expect(sessionPort.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
+
+		// The known terminal failure proves nothing was sent, so its rows replay
+		// immediately on the fresh session. Every durable event is authored once.
+		await pipeline.reconcile();
+		for (const eventId of [...failed, recovered]) {
+			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+			expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === eventId)?.stage).toBe(
+				"authored",
+			);
+		}
+		for (const eventId of failed)
+			expect(attempts.filter((attempt) => attempt.eventIds.includes(eventId))).toHaveLength(2);
+		expect(attempts.filter((attempt) => attempt.eventIds.includes(recovered))).toHaveLength(1);
+		expect(attempts.map(({ sessionId }) => sessionId)).toEqual([
+			"event-session-e0",
+			"event-session-e0",
+			"event-session-e1",
+			"event-session-e1",
+			"event-session-e1",
+		]);
+		expect(turns.map(({ sessionId }) => sessionId)).toEqual([
+			"event-session-e1",
+			"event-session-e1",
+			"event-session-e1",
+		]);
+		const deliveries = database.outbox.rows().map((row) => JSON.parse(row.payload_json) as { text: string });
+		for (const eventId of [...failed, recovered])
+			expect(deliveries.filter(({ text }) => text.includes(`note for ${eventId}`))).toHaveLength(1);
+		expect(database.monitors.eventRows(monitor.monitorId)).toHaveLength(failed.length + 1);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
