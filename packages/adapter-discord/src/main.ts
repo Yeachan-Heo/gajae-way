@@ -1341,8 +1341,15 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 /** Discord application-command option types used by the registration below. */
 const SUBCOMMAND_OPTION = 1;
 const STRING_OPTION = 3;
-/** Discord caps an autocomplete response at 25 choices. */
+/**
+ * Discord caps an autocomplete response at 25 choices: the
+ * APPLICATION_COMMAND_AUTOCOMPLETE_RESULT (type 8) callback's `choices` is
+ * "max of 25 choices" (docs.discord.com/developers/interactions/receiving-and-responding).
+ * gjc can list hundreds of models, so the typed text narrows them first.
+ */
 const AUTOCOMPLETE_LIMIT = 25;
+/** An application command option choice `name`/`value` string is 1-100 characters; a longer one fails the whole response. */
+const AUTOCOMPLETE_CHOICE_MAX_LENGTH = 100;
 
 /**
  * Every slash command the adapter registers. `/model` mirrors the gateway's
@@ -1420,7 +1427,7 @@ export async function handleModelAutocomplete(
 	}
 	const needle = interaction.options.getFocused().trim().toLowerCase();
 	const matches = choices
-		.filter((choice) => choice.toLowerCase().includes(needle))
+		.filter((choice) => choice.length <= AUTOCOMPLETE_CHOICE_MAX_LENGTH && choice.toLowerCase().includes(needle))
 		.slice(0, AUTOCOMPLETE_LIMIT)
 		.map((choice) => ({ name: choice, value: choice }));
 	try {
