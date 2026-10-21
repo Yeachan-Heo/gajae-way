@@ -116,17 +116,13 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 			const journalStats = journalDb.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
 			const journalRowCount = journalStats.cnt;
 
-			// Estimate journal byte size using page_count * page_size for the table
-			// This provides a real measurement of the journal's storage footprint
+			// Measure journal byte size using dbstat virtual table to get actual table footprint
 			let journalByteSize = 0;
 			try {
-				const pageStats = journalDb.prepare("SELECT page_count FROM pragma_page_count() WHERE page_count > 0").get() as
-					| { page_count: number }
-					| undefined;
-				const sizeStats = journalDb.prepare("SELECT page_size FROM pragma_page_size()").get() as { page_size: number };
-				if (pageStats && sizeStats) {
-					journalByteSize = pageStats.page_count * sizeStats.page_size;
-				}
+				const stats = journalDb
+					.prepare("SELECT COALESCE(SUM(payload), 0) as total_payload FROM dbstat('main') WHERE name = 'work_journal'")
+					.get() as { total_payload: number };
+				journalByteSize = stats.total_payload;
 			} catch {
 				// Fallback: sum of all json column lengths + metadata overhead (64 bytes per row)
 				const fallbackSize = journalDb
