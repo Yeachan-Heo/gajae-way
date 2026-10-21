@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.4] - 2026-10-21
+
+### Fixes
+- **gateway**: Report force-ended checks cycles atomically so a parent receives exactly one cycle conclusion (#641)
+
 ## [0.3.3] - 2026-10-20
 
 ### Features

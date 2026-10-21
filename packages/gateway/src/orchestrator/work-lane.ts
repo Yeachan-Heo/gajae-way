@@ -485,7 +485,8 @@ export class WorkLaneManager {
 	}
 	/**
 	 * Closes a dead lane's current attempt through the normal atomic settlement
-	 * path. LaneGovernor calls this while it owns the lane mutation lock.
+	 * path, or concludes checks without rewriting an already-settled runtime.
+	 * LaneGovernor calls this while it owns the lane mutation lock.
 	 */
 	settleForceRetiredAttempt(name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string): boolean {
 		const record = this.#job(name, true);
@@ -496,11 +497,20 @@ export class WorkLaneManager {
 		if (!runtime) return false;
 		if (runtime.settledAt !== null) {
 			if (attempt.endedAt !== runtime.settledAt) return false;
-			if (record.state === "awaiting_checks")
-				this.#putJob(
+			if (record.state === "awaiting_checks") {
+				const effects = this.#settleChecks(
 					name,
-					settleAwaitingChecks(record, endedAt, { kind: "ended", reason: "lane force-retired before checks settled" }),
+					record,
+					{ kind: "ended", reason: "lane force-retired before checks settled" },
+					undefined,
+					endedAt,
 				);
+				// Admission is already durable. Never await another lane's lock from
+				// this synchronous callback under the retiring lane's mutation lock.
+				void this.#dispatchChecksEffects(effects).catch((error: unknown) => {
+					console.error(`checks_report_dispatch_failed jobId=${record.jobId} reason=${failureReason(error)}`);
+				});
+			}
 			return true;
 		}
 		if (attempt.endedAt !== undefined) return false;
@@ -1997,6 +2007,9 @@ export class WorkLaneManager {
 			return this.#settleChecks(name, job, outcome, facts);
 		});
 		if (!effects) return;
+		await this.#dispatchChecksEffects(effects);
+	}
+	async #dispatchChecksEffects(effects: ChecksReportEffects): Promise<void> {
 		if (effects.fallback) {
 			try {
 				this.#options.deliverFallback?.(effects.fallback);
@@ -2047,12 +2060,13 @@ export class WorkLaneManager {
 		job: LaneJobRecord,
 		outcome: ChecksSettlement,
 		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+		at = this.#at(),
 	): ChecksReportEffects {
 		const cycle = job.awaitingChecks!;
-		const at = this.#at();
 		const settled = settleAwaitingChecks(job, at, outcome);
 		const last = job.attempts.at(-1);
-		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const runtime = last ? this.#attemptByOpRef(last.opRef) : undefined;
+		const parent = runtime?.output.knownSilence === null ? runtime.parent : null;
 		const text = checksReportText(name, cycle, outcome, facts);
 		const reportRef = newOpRef(`checks-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
 		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
