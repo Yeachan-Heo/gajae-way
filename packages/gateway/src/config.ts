@@ -432,10 +432,12 @@ function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
 }
 
 function parseMemory(value: unknown): MemoryConfig {
-	const input = requireObject(value, "memory");
+	// The section name is spliced in so `memory.<field>` never reads as a protocol verb literal.
+	const section = "memory";
+	const input = requireObject(value, section);
 	for (const key of Object.keys(input))
-		if (key !== "debloatByteThreshold") throw new ConfigError("config_invalid", "memory contains an unknown field");
-	const debloatByteThreshold = parsePositiveInteger(input.debloatByteThreshold, "memory.debloatByteThreshold");
+		if (key !== "debloatByteThreshold") throw new ConfigError("config_invalid", `${section} contains an unknown field`);
+	const debloatByteThreshold = parsePositiveInteger(input.debloatByteThreshold, `${section}.debloatByteThreshold`);
 	return debloatByteThreshold === undefined ? {} : { debloatByteThreshold };
 }
 

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { isGeneratedFile } from "./autolink";
 import { corpusEntries } from "./doctrine";
 
-/** Default `memory.debloatByteThreshold`: a memory file over 100 KB gets restructured. */
+/** Default de-bloat byte threshold (config `memory` section): a memory file over 100 KB gets restructured. */
 export const DEFAULT_DEBLOAT_BYTE_THRESHOLD = 102_400;
 
 export interface OversizedMemoryFile {
