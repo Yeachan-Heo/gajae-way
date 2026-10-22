@@ -577,7 +577,8 @@ function parseWorkCommons(value: unknown): WorkCommonsConfig | undefined {
 	if (Object.keys(input).some((key) => key !== "dir" && key !== "enabled"))
 		throw new ConfigError("config_invalid", "work.commons may only contain dir and enabled");
 	const dir = input.dir;
-	if (typeof dir !== "string" || !isAbsolute(dir)) throw new ConfigError("config_invalid", "work.commons.dir must be an absolute path");
+	if (typeof dir !== "string" || !isAbsolute(dir))
+		throw new ConfigError("config_invalid", "work.commons.dir must be an absolute path");
 	if (input.enabled !== undefined && typeof input.enabled !== "boolean")
 		throw new ConfigError("config_invalid", "work.commons.enabled must be a boolean");
 	return { dir, ...(input.enabled === undefined ? {} : { enabled: input.enabled }) };
