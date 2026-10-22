@@ -852,6 +852,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 	"monitorCatchUp",
+	"memory",
 	"work",
 	"interimSpeech",
 	"gjc",
