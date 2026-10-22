@@ -250,26 +250,99 @@ test("catch-all origin retains undeclared event identity", () => {
 	expect(originKey(CATCH_ALL_EVENT_ORIGIN)).toBe("monitor/eventtype/catch-all");
 });
 
-test("default memory monitors seed once and respect operator removals", async () => {
+test("default memory monitors seed per-name and respect operator removals", async () => {
 	const { mkdtemp: mkTemp } = await import("node:fs/promises");
 	const { tmpdir: tmp } = await import("node:os");
 	const { join: joinPath } = await import("node:path");
 	const { Store: Db } = await import("../src/store");
 	const { MonitorRegistry: Registry } = await import("../src/monitors/registry");
 	const { seedDefaultMonitors } = await import("../src/monitors/defaults");
+
+	// Fresh DB seeds all 3 monitors
 	const dir = await mkTemp(joinPath(tmp(), "gajaeway-seed-"));
 	const database = await Db.open(joinPath(dir, "gateway.db"));
 	const registry = new Registry(database);
-	expect(seedDefaultMonitors(registry, database)).toBe(2);
+	expect(seedDefaultMonitors(registry, database)).toBe(3);
 	const names = registry.list().map((monitor) => monitor.name);
 	expect(names).toContain("memory-canonicalize");
 	expect(names).toContain("memory-audit");
-	// Second boot: flag prevents reseeding.
+	expect(names).toContain("memory-debloat");
+
+	// Second boot: per-name flags prevent reseeding
 	expect(seedDefaultMonitors(registry, database)).toBe(0);
-	// Operator removal survives later boots.
+
+	// Operator removal survives later boots
 	const canonical = registry.list().find((monitor) => monitor.name === "memory-canonicalize");
 	registry.remove(canonical?.monitorId ?? "");
 	expect(seedDefaultMonitors(registry, database)).toBe(0);
 	expect(registry.list().map((monitor) => monitor.name)).not.toContain("memory-canonicalize");
 	database.close();
+
+	// Old-flag DB with legacy global flag: seeds only memory-debloat
+	const dir2 = await mkTemp(joinPath(tmp(), "gajaeway-seed-legacy-"));
+	const database2 = await Db.open(joinPath(dir2, "gateway.db"));
+	database2.core.metaSet("default_monitors_seeded", new Date().toISOString());
+	const registry2 = new Registry(database2);
+
+	// Seed the two old monitors manually to simulate legacy boot
+	const { DEFAULT_MEMORY_MONITORS } = await import("../src/monitors/defaults");
+	for (const spec of DEFAULT_MEMORY_MONITORS.slice(0, 2)) {
+		registry2.add(spec);
+	}
+
+	// Seed again: should only get memory-debloat
+	expect(seedDefaultMonitors(registry2, database2)).toBe(1);
+	const names2 = registry2.list().map((monitor) => monitor.name);
+	expect(names2).toContain("memory-debloat");
+	database2.close();
+});
+
+test("memory config validates debloatByteThreshold as positive integer", async () => {
+	const { parseConfigFile } = await import("../src/config");
+
+	// Valid: positive integer
+	const valid = parseConfigFile({
+		schemaVersion: 1,
+		memory: { debloatByteThreshold: 102400 },
+	});
+	expect(valid.memory?.debloatByteThreshold).toBe(102400);
+
+	// Valid: empty object is omitted from config
+	const omitted = parseConfigFile({
+		schemaVersion: 1,
+		memory: {},
+	});
+	expect(omitted.memory).toBeUndefined();
+
+	// Invalid: zero
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { debloatByteThreshold: 0 },
+		})
+	).toThrow("positive integer");
+
+	// Invalid: negative
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { debloatByteThreshold: -1 },
+		})
+	).toThrow("positive integer");
+
+	// Invalid: non-integer
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { debloatByteThreshold: 102.5 },
+		})
+	).toThrow("positive integer");
+
+	// Invalid: unknown field in memory
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { unknownField: 123 },
+		})
+	).toThrow("unknown field");
 });
