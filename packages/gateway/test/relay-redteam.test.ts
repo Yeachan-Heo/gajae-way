@@ -291,7 +291,7 @@ test("RT05b (#228) an idle broadcast on a reopened relay never settles the turn 
 	expect(f.logs.some((line) => line.includes("tail_evidence=unavailable"))).toBe(true);
 });
 
-test("RT04 unknown bound operation releases only after a second status sweep proves live idle", async () => {
+test("RT04 unknown bound operation survives repeated live-idle sweeps until its original native terminal", async () => {
 	const port = new ScriptedSessionPort();
 	Object.assign(port, { queueEmpty: async () => true });
 	let statuses = 0;
@@ -313,11 +313,35 @@ test("RT04 unknown bound operation releases only after a second status sweep pro
 	expect(statuses).toBe(1);
 	expect(f.released).toEqual([]);
 	expect(port.sendAttempts).toHaveLength(1);
-	await f.manager.reconcile(key);
-	expect(statuses).toBeGreaterThanOrEqual(2);
-	expect(f.released).toEqual([firstOp]);
+	const first = port.sendAttempts[0]!;
+	for (let sweep = 0; sweep < 3; sweep++) await f.manager.reconcile(key);
+	expect(statuses).toBeGreaterThanOrEqual(4);
+	expect(f.released).toEqual([]);
+	expect(f.terminal).toEqual([]);
 	expect(port.sendAttempts).toHaveLength(1);
+	expect(port.sends).toEqual([]);
+	expect(port.binds).toHaveLength(1);
+	expect(f.db.inbox.turnRow(firstOp)).toMatchObject({
+		state: "pending",
+		turn_state: "bound",
+		turn_op_ref: firstOp,
+		bound_session_id: first.sessionId,
+		turn_epoch: 0,
+	});
+	expect(f.db.bindings.getSessionRecord(key)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 	expect(f.db.inbox.pendingCount(key)).toBe(1);
+	port.seedOperation(firstOp, first.sessionId, "terminal_ok", "original native output");
+	await f.manager.reconcile(key);
+	await f.manager.reconcile(key);
+	await until(() => f.terminal.length === 1);
+	await f.manager.reconcile(key);
+	expect(f.terminal).toEqual(["original native output"]);
+	expect(port.workerOutputReads).toHaveLength(1);
+	expect(port.workerOutputReads[0]).toMatchObject({ sessionId: first.sessionId, opRef: firstOp });
+	expect(f.db.inbox.turnRow(firstOp)?.turn_state).toBe("done");
+	expect(f.db.inbox.pendingCount(key)).toBe(0);
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(f.released).toEqual([]);
 });
 
 test("RT06 status query timeout keeps actor accepted and held", async () => {

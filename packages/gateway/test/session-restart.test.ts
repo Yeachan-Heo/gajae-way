@@ -19,6 +19,16 @@ let home = "";
 let database: Store | undefined;
 let manager: PersonaSessionManager | undefined;
 
+const fixtureBindings = new WeakMap<ScriptedSessionPort, Pick<ScriptedSessionPort, "bind" | "resume">>();
+
+function registerFixtureBindings(port: ScriptedSessionPort): void {
+	const original = fixtureBindings.get(port) ?? { bind: port.bind.bind(port), resume: port.resume.bind(port) };
+	fixtureBindings.set(port, original);
+	port.bind = original.bind;
+	port.resume = original.resume;
+	attachTestBrokerOwnership(database!, port, join(home, "canonical-agent"));
+}
+
 class AuthorityShiftingPort extends ScriptedSessionPort {
 	#shift = false;
 	#inspects = 0;
@@ -43,7 +53,12 @@ async function eventually(predicate: () => boolean, message: string, attempts = 
 	expect(predicate(), message).toBe(true);
 }
 
-function makeManager(port: ScriptedSessionPort, logs: string[], terminal: string[] = []): PersonaSessionManager {
+function makeManager(
+	port: ScriptedSessionPort,
+	logs: string[],
+	terminal: string[] = [],
+	failures: string[] = [],
+): PersonaSessionManager {
 	return new PersonaSessionManager({
 		database: database!,
 		port,
@@ -53,6 +68,9 @@ function makeManager(port: ScriptedSessionPort, logs: string[], terminal: string
 			text: trigger.body,
 			onTerminal: ({ text }) => {
 				terminal.push(text);
+			},
+			onFailure: ({ error }) => {
+				failures.push(error.message);
 			},
 		}),
 		log: (line) => logs.push(line),
@@ -475,23 +493,24 @@ test("a recovered failed operation settles without replay and accepts genuinely 
 class UnreadableStorePort extends ScriptedSessionPort {
 	// The runtime cannot answer for this session at all (e.g. a pre-cutover
 	// store the current gjc no longer reads): inspect and status both throw.
-	async inspect(_input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
-		throw new Error("session.list returned a malformed session row.");
+	unavailable = true;
+	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
+		if (this.unavailable) throw new Error("session.list returned a malformed session row.");
+		return await super.inspect(input);
 	}
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
-		if (this.sends.length === 0) throw new Error("SDK session is unavailable through the session Router.");
+		if (this.unavailable) throw new Error("SDK session is unavailable through the session Router.");
 		return await super.status(input);
 	}
 }
 
-test("a bound, unaccepted turn on a session the runtime cannot answer for is released and re-fired on a fresh session", async () => {
+test("a bound turn on an unreadable session retains its original identity across Store reopen until exact terminal recovery", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const port = new UnreadableStorePort({ onBind: (input) => `session-${input.epoch + 1}` });
-	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	registerFixtureBindings(port);
 	const logs: string[] = [];
-	// Durable state left by the previous binary: a bound session record and a
-	// bound (never accepted) turn pointing at a session the new runtime cannot read.
+	// A bound row does not prove that the native producer never accepted it.
 	await createOwnedSessionFixture(database, initializeTestBrokerAuthority(database, join(home, "canonical-agent")), {
 		originKey: KEY,
 		epoch: 0,
@@ -509,14 +528,57 @@ test("a bound, unaccepted turn on a session the runtime cannot answer for is rel
 			sessionId: "pre-cutover-session",
 		}),
 	);
-	manager = makeManager(port, logs);
-
+	port.setSessionState("pre-cutover-session", { repo: join(home, "workspace"), live: true });
+	port.seedAcceptedSend({
+		sessionId: "pre-cutover-session",
+		repo: join(home, "workspace"),
+		opRef,
+		text: "hello after cutover",
+	});
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	manager = makeManager(port, logs, terminal, failures);
 	await manager.recover();
-	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
-	await eventually(() => port.sends.length === 1, "released turn was not re-dispatched on a fresh session");
-	expect(port.sends[0]!.text).toBe("hello after cutover");
-	expect(port.sends[0]!.opRef).not.toBe(opRef);
-	expect(port.sends[0]!.sessionId).not.toBe("pre-cutover-session");
+	await manager.stop();
+	database.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = makeManager(port, logs, terminal, failures);
+	for (let sweep = 0; sweep < 3; sweep++) {
+		await manager.recover();
+		await manager.tick(KEY);
+	}
+	expect(database.inbox.turnRow(opRef)).toMatchObject({
+		state: "pending",
+		turn_state: "bound",
+		turn_op_ref: opRef,
+		bound_session_id: "pre-cutover-session",
+		turn_epoch: 0,
+		terminal_delivery_id: null,
+	});
+	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: "pre-cutover-session", epoch: 0 });
+	expect(port.sendAttempts.map((send) => send.opRef)).toEqual([opRef]);
+	expect(port.binds).toHaveLength(0);
+	expect(port.resumes).toEqual([]);
+	expect(port.closes).toEqual([]);
+	expect(terminal).toEqual([]);
+	expect(failures).toEqual([]);
+	port.unavailable = false;
+	port.complete(opRef, "original unreadable-session answer");
+	await manager.recover();
+	await manager.tick(KEY);
+	await eventually(
+		() => database!.inbox.turnRow(opRef)?.turn_state === "done",
+		"original unreadable turn did not settle",
+	);
+	await manager.recover();
+	await manager.tick(KEY);
+	expect(terminal).toEqual(["original unreadable-session answer"]);
+	expect(failures).toEqual([]);
+	expect(port.workerOutputReads.map((read) => [read.sessionId, read.opRef])).toEqual([["pre-cutover-session", opRef]]);
+	expect(port.sends).toHaveLength(1);
+	expect(port.sendAttempts.map((send) => send.opRef)).toEqual([opRef]);
+	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: "pre-cutover-session", epoch: 0 });
 });
 
 class ColdBindFlakyPort extends ScriptedSessionPort {
@@ -558,21 +620,22 @@ test("a dispatch whose bind initially fails is retried after a backoff without s
 class DisownedButInspectablePort extends ScriptedSessionPort {
 	// gjc >= 0.16.0 on a rebooted host: inspect still answers (live=false) but the
 	// Router disowns the id on status/send.
+	unavailable = true;
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
 		const s = await super.inspect(input);
-		return s ? { ...s, live: false } : s;
+		return s && this.unavailable ? { ...s, live: false } : s;
 	}
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
-		if (this.sends.length === 0) throw new Error("gjc sdk request failed: session_unavailable");
+		if (this.unavailable) throw new Error("gjc sdk request failed: session_unavailable");
 		return await super.status(input);
 	}
 }
 
-test("a bound turn whose id the Router disowns is released and re-fired even when inspect still answers", async () => {
+test("a bound turn whose id the Router disowns retains its original identity across Store reopen until exact terminal recovery", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const port = new DisownedButInspectablePort({ onBind: (input) => `session-${input.epoch + 1}` });
-	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+	registerFixtureBindings(port);
 	const logs: string[] = [];
 	// Bind once through the fake so "stale-session" is a known scripted session,
 	// then leave its durable record pointing at it as a pre-reboot binding.
@@ -590,17 +653,53 @@ test("a bound turn whose id the Router disowns is released and re-fired even whe
 			sessionId: staleId,
 		}),
 	);
-	// The Router disowns the id, so `session.resume` cannot restore it either
-	// (a resumable closed host keeps its epoch instead; see persona-session 가8).
+	// Lost Router ownership is not native producer-exit evidence.
+	port.seedAcceptedSend({ sessionId: staleId, repo: join(home, "workspace"), opRef, text: "hello" });
 	port.failResume(staleId, "session_unavailable");
-	manager = makeManager(port, logs);
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	manager = makeManager(port, logs, terminal, failures);
 	await manager.recover();
-	expect(logs.some((line) => line.startsWith(`session_resume_failed origin=${KEY}`))).toBe(true);
-	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
-	await eventually(() => port.sends.length === 1, "disowned turn was not re-fired");
-	// The origin was rebound (epoch bumped) and the release re-fired under a fresh ref.
-	expect(database.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(port.sends[0]!.opRef).not.toBe(opRef);
+	await manager.stop();
+	database.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = makeManager(port, logs, terminal, failures);
+	for (let sweep = 0; sweep < 3; sweep++) {
+		await manager.recover();
+		await manager.tick(KEY);
+	}
+	expect(database.inbox.turnRow(opRef)).toMatchObject({
+		state: "pending",
+		turn_state: "bound",
+		turn_op_ref: opRef,
+		bound_session_id: staleId,
+		turn_epoch: 0,
+		terminal_delivery_id: null,
+	});
+	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: staleId, epoch: 0 });
+	expect(port.sendAttempts.map((send) => send.opRef)).toEqual([opRef]);
+	expect(port.binds).toHaveLength(1);
+	expect(port.resumes).toEqual([]);
+	expect(port.closes).toEqual([]);
+	expect(terminal).toEqual([]);
+	expect(failures).toEqual([]);
+	port.unavailable = false;
+	port.complete(opRef, "original disowned-session answer");
+	await manager.recover();
+	await manager.tick(KEY);
+	await eventually(
+		() => database!.inbox.turnRow(opRef)?.turn_state === "done",
+		"original disowned turn did not settle",
+	);
+	await manager.recover();
+	await manager.tick(KEY);
+	expect(terminal).toEqual(["original disowned-session answer"]);
+	expect(failures).toEqual([]);
+	expect(port.workerOutputReads.map((read) => [read.sessionId, read.opRef])).toEqual([[staleId, opRef]]);
+	expect(port.sends).toHaveLength(1);
+	expect(port.sendAttempts.map((send) => send.opRef)).toEqual([opRef]);
+	expect(database.bindings.getSessionRecord(KEY)).toEqual({ sessionId: staleId, epoch: 0 });
 });
 
 class PoisonedBindEpochPort extends ScriptedSessionPort {

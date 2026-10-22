@@ -146,7 +146,6 @@ interface Observer {
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
 	wakeRequested?: boolean;
-	text?: string;
 	touchedAt?: number;
 	turnEndObservedAt?: string;
 	/** First of an unbroken run of host-gone verdicts; any other observation resets it. */
@@ -159,6 +158,12 @@ interface Observer {
 interface Waiter {
 	readonly owner: object;
 	readonly finish: (error?: Error) => void;
+}
+interface RunCall {
+	readonly owner: object;
+	active: boolean;
+	opRef?: string;
+	text?: string;
 }
 export interface CheckStatusSnapshot {
 	readonly prNumber: number;
@@ -233,6 +238,7 @@ interface WorkInput {
 }
 interface StartContext {
 	readonly parent: WorkParent | null;
+	readonly runCall?: RunCall;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
 	/** Only the check-polling path may add an attempt while the lane is parked. */
@@ -292,6 +298,8 @@ export class WorkLaneManager {
 	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
+	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
+	readonly #runCalls = new Map<string, RunCall>();
 	readonly #detachedOwners = new WeakSet<object>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
@@ -793,27 +801,41 @@ export class WorkLaneManager {
 		return this.#start(parseInput(params), "start");
 	}
 	async run(params: unknown, owner: object, signal?: AbortSignal) {
-		const started = await this.#start(parseInput(params), "run");
-		if (!started.started) {
-			const { started: _, ...held } = started;
-			return held;
+		const call: RunCall = { owner, active: true };
+		const abort = () => this.#releaseRunCall(call);
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
+		try {
+			const started = await this.#start(parseInput(params), "run", call);
+			if (!started.started) {
+				const { started: _, ...held } = started;
+				return held;
+			}
+			await this.#wait(started.opRef, owner, signal);
+			const runtime = this.#db.work.workAttemptGet(started.opRef)!;
+			const reason = runtime.terminal?.reasonCode ?? "terminal_uncertain";
+			if (reason !== "end_turn") throw workError("work attempt did not complete", reason, runtime);
+			const text = call.text;
+			if (text === undefined) throw workError("work output unavailable", "output_unavailable", runtime);
+			return { held: false as const, text, jobId: runtime.jobId, opRef: runtime.opRef, sessionKey: runtime.sessionKey };
+		} finally {
+			signal?.removeEventListener("abort", abort);
+			this.#releaseRunCall(call);
 		}
-		await this.#wait(started.opRef, owner, signal);
-		const runtime = this.#db.work.workAttemptGet(started.opRef)!;
-		const reason = runtime.terminal?.reasonCode ?? "terminal_uncertain";
-		if (reason !== "end_turn") throw workError("work attempt did not complete", reason, runtime);
-		const text = this.#observers.get(runtime.opRef)?.text;
-		if (text === undefined) throw workError("work output unavailable", "output_unavailable", runtime);
-		return { held: false as const, text, jobId: runtime.jobId, opRef: runtime.opRef, sessionKey: runtime.sessionKey };
 	}
-	async #start(input: WorkInput, mode: "start" | "run"): Promise<WorkStartResult> {
+	#releaseRunCall(call: RunCall): void {
+		call.active = false;
+		call.text = undefined;
+		if (call.opRef !== undefined && this.#runCalls.get(call.opRef) === call) this.#runCalls.delete(call.opRef);
+	}
+	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
 		this.#job(input.name);
 		await this.recover();
 		this.#live();
 		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent }));
+		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent, runCall }));
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
@@ -998,6 +1020,10 @@ export class WorkLaneManager {
 		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 		this.#prepareAttempt(runtime, job);
 
+		if (context.runCall?.active && !this.#detachedOwners.has(context.runCall.owner)) {
+			context.runCall.opRef = opRef;
+			this.#runCalls.set(opRef, context.runCall);
+		}
 		const observer = this.#register(runtime);
 		this.#attach(observer);
 		await observer.attaching;
@@ -1747,7 +1773,8 @@ export class WorkLaneManager {
 					});
 					if (!updated) return;
 					runtime = updated;
-					if (runtime.mode === "run" && this.#waiters.has(runtime.opRef)) observer.text = result.text;
+					const call = this.#runCalls.get(runtime.opRef);
+					if (call) call.text = result.text;
 				} else if (result.status === "unavailable" || reads >= 3) {
 					runtime =
 						this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -2687,6 +2714,10 @@ export class WorkLaneManager {
 	#wait(opRef: string, owner: object, signal?: AbortSignal): Promise<void> {
 		this.#live();
 		if (this.#detachedOwners.has(owner)) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
+		if (signal?.aborted)
+			throw new ProtocolError("verb_failed", "work wait detached; attempt remains observable", {
+				reasonCode: "work_wait_detached",
+			});
 		if (this.#db.work.workAttemptGet(opRef)?.settledAt) return Promise.resolve();
 		return new Promise<void>((resolve, reject) => {
 			const set = this.#waiters.get(opRef) ?? new Set<Waiter>();
@@ -2726,6 +2757,7 @@ export class WorkLaneManager {
 	}
 	detachWaiters(owner: object): void {
 		this.#detachedOwners.add(owner);
+		for (const call of this.#runCalls.values()) if (call.owner === owner) this.#releaseRunCall(call);
 		for (const set of this.#waiters.values())
 			for (const waiter of [...set])
 				if (waiter.owner === owner) waiter.finish(new ProtocolError("gateway_shutting_down", "gateway is stopping"));
@@ -2746,6 +2778,7 @@ export class WorkLaneManager {
 	stop(): Promise<void> {
 		if (this.#stopPromise) return this.#stopPromise;
 		this.#stopped = true;
+		for (const call of this.#runCalls.values()) this.#releaseRunCall(call);
 		for (const set of this.#waiters.values())
 			for (const waiter of [...set]) waiter.finish(new ProtocolError("gateway_shutting_down", "gateway is stopping"));
 		const lanesStopped = this.#options.lanes.stop();

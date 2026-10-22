@@ -807,6 +807,80 @@ test("a disconnect before send receipt cannot leave a newly registered waiter be
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
+for (const [label, text, disposition] of [
+	["full body", "HEAD:" + "가😀".repeat(1000) + ":TAIL", "available"],
+	["silent body", "HEAD:" + "가😀".repeat(1000) + "[SILENT]", "silent"],
+] as const) {
+	test(`run retains exact ${label} when output precedes the send receipt without reporting to its parent`, async () => {
+		const f = await fixture({ allowNested: () => true, ownerTarget: () => origin });
+		const parent = await started(f, "parent");
+		const receipt = deferred<void>();
+		const accepted = deferred<string>();
+		const send = f.port.send.bind(f.port);
+		f.port.send = async (input) => {
+			const result = await send(input);
+			accepted.resolve(input.opRef);
+			await receipt.promise;
+			return result;
+		};
+		const run = f.manager
+			.run({ name: "a", text: "work", cwd: f.directory, callerSessionId: parent.sessionId }, {})
+			.then(
+				(value) => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+		const opRef = await accepted.promise;
+		f.port.complete(opRef, text);
+		await until(() => f.db.work.workAttemptGet(opRef)?.output.disposition === disposition);
+		expect(f.db.work.workAttemptGet(opRef)?.output.excerpt).not.toBe(text);
+		receipt.resolve();
+		expect(await run).toMatchObject({ value: { held: false, text, opRef } });
+		expect(f.db.work.workAttemptGet(opRef)).toMatchObject({ mode: "run", parent: null });
+		expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		expect(f.port.steers).toHaveLength(0);
+	});
+}
+
+for (const detach of ["abort", "disconnect"] as const) {
+	test(`run ${detach} before send receipt rejects even when output settles before ACK`, async () => {
+		const f = await fixture({ ownerTarget: () => origin });
+		const receipt = deferred<void>();
+		const accepted = deferred<string>();
+		const send = f.port.send.bind(f.port);
+		f.port.send = async (input) => {
+			const result = await send(input);
+			accepted.resolve(input.opRef);
+			await receipt.promise;
+			return result;
+		};
+		const owner = {};
+		const abort = new AbortController();
+		const run = f.manager
+			.run({ name: "a", text: "work", cwd: f.directory }, owner, abort.signal)
+			.catch((error: unknown) => error);
+		const opRef = await accepted.promise;
+		if (detach === "abort") abort.abort();
+		else f.manager.detachWaiters(owner);
+		f.port.complete(opRef, "finished after caller left");
+		await until(() => f.db.work.workAttemptGet(opRef)?.output.disposition === "available");
+		receipt.resolve();
+		const failure = await run;
+		expect(failure).toBeInstanceOf(ProtocolError);
+		expect(failure).toMatchObject(
+			detach === "abort"
+				? { code: "verb_failed", detail: { reasonCode: "work_wait_detached" } }
+				: { code: "gateway_shutting_down" },
+		);
+		await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
+		expect(f.job().attempts[0]?.endState).toBe("completed");
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		expect(f.port.sends).toHaveLength(1);
+	});
+}
+
 test("notification target is immutable across owner reload; no-target remains no-target", async () => {
 	let owner: OriginRef | undefined = origin;
 	const f = await fixture({ ownerTarget: () => owner });
