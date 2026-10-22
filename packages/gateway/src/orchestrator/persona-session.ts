@@ -128,6 +128,91 @@ function providerTransportRetryAttempt(
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function stalledExitProofKey(opRef: string): string {
+	return `stalled-turn-exit:${createHash("sha256")
+		.update(JSON.stringify([opRef]))
+		.digest("hex")}`;
+}
+
+type StalledExitOwner = {
+	readonly opRef: string;
+	readonly originKey: string;
+	readonly sessionId: string;
+	readonly epoch: number;
+	readonly repo: string;
+};
+
+/** The durable turn and current broker must still own the exact original producer. */
+function stalledExitOwner(store: Store, owner: StalledExitOwner) {
+	const row = store.inbox.turnRow(owner.opRef);
+	const authority = store.bindings.authority;
+	if (
+		!authority ||
+		!row ||
+		row.state !== "pending" ||
+		(row.turn_state !== "accepted" && row.turn_state !== "bound") ||
+		row.origin_key !== owner.originKey ||
+		row.bound_session_id !== owner.sessionId ||
+		row.turn_epoch !== owner.epoch ||
+		store.bindings.isQuarantined("inbound", row.message_id)
+	)
+		return undefined;
+	try {
+		const binding = store.bindings.assertOwnedSession(owner.sessionId, owner.repo, authority);
+		if (binding.originKey !== owner.originKey || binding.epoch !== owner.epoch || binding.repo !== owner.repo)
+			return undefined;
+		return { ...owner, authority };
+	} catch (error) {
+		if (error instanceof BrokerAuthorityError) return undefined;
+		throw error;
+	}
+}
+
+function confirmedStalledExit(store: Store, owner: StalledExitOwner): boolean {
+	const current = stalledExitOwner(store, owner);
+	const raw = store.core.metaGet(stalledExitProofKey(owner.opRef));
+	if (!current || raw === undefined) return false;
+	try {
+		const proof = JSON.parse(raw);
+		return (
+			proof !== null &&
+			proof.version === 1 &&
+			(proof.outcome === "terminated" || proof.outcome === "already_gone") &&
+			proof.opRef === current.opRef &&
+			proof.originKey === current.originKey &&
+			proof.sessionId === current.sessionId &&
+			proof.epoch === current.epoch &&
+			proof.repo === current.repo &&
+			proof.authority?.identity === current.authority.identity &&
+			proof.authority?.canonicalAgentDir === current.authority.canonicalAgentDir
+		);
+	} catch {
+		return false;
+	}
+}
+
+function persistStalledExit(
+	store: Store,
+	owner: ReturnType<typeof stalledExitOwner>,
+	outcome: "terminated" | "already_gone",
+): boolean {
+	if (!owner) return false;
+	return store.transaction(() => {
+		const current = stalledExitOwner(store, owner);
+		if (
+			!current ||
+			current.authority.identity !== owner.authority.identity ||
+			current.authority.canonicalAgentDir !== owner.authority.canonicalAgentDir
+		)
+			return false;
+		const key = stalledExitProofKey(owner.opRef);
+		// Never repair or overwrite a foreign/malformed proof into authority.
+		if (store.core.metaGet(key) !== undefined) return confirmedStalledExit(store, owner);
+		store.core.metaSet(key, JSON.stringify({ ...current, version: 1, outcome }));
+		return true;
+	});
+}
+
 function ownedTurnPrompt(store: Store, opRef: string) {
 	const trigger = store.inbox.turnRow(opRef);
 	if (!trigger?.bound_session_id || trigger.turn_epoch === null) return undefined;
@@ -152,8 +237,10 @@ function completeInboundTurn(
 	unlinkedReason: TerminalUnlinkedReason = "no_delivery",
 ): number {
 	const prompt = ownedTurnPrompt(store, opRef);
+	const consumeExit = prompt !== undefined && confirmedStalledExit(store, prompt);
 	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
+	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	return changed;
 }
 
@@ -1123,6 +1210,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	stallHostTerminated?: boolean;
 	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
 	stallHostTerminating?: boolean;
+	/** Original authority captured before signalling; never refreshed into a new broker's proof. */
+	stallExitOwner?: NonNullable<ReturnType<typeof stalledExitOwner>>;
 	/** A stalled retired hold already attempted its one allowed host termination. */
 	retiredHostTerminationAttempted?: boolean;
 	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
@@ -1485,6 +1574,23 @@ class OriginActor {
 				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${retired ? "retired_session_binding_unavailable" : "session_binding_unavailable"}`,
 				"warn",
 			);
+			return;
+		}
+		// Confirmed producer exit survives registry loss. Read the original native
+		// operation first, without inspect/liveness/resume or opening a new relay.
+		if (
+			confirmedStalledExit(this.#manager.database, {
+				opRef: turn.opRef,
+				originKey: this.originKey,
+				sessionId,
+				epoch: turn.epoch,
+				repo: this.#manager.repo,
+			})
+		) {
+			const status = await this.#statusForRecovery(sessionId, turn.opRef);
+			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+			bound.stallHostTerminated = true;
+			await this.#reconcileBound(bound, status);
 			return;
 		}
 		// The table's authority decision is deliberately inspect -> status -> inspect.
@@ -3080,6 +3186,14 @@ class OriginActor {
 				return false;
 			}
 		};
+		const exitOwner = stalledExitOwner(this.#manager.database, {
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			sessionId: bound.sessionId,
+			epoch: bound.epoch,
+			repo: this.#manager.repo,
+		});
+		if (!exitOwner) return false;
 		let result: TerminateHostOutcome;
 		try {
 			result = await port.terminateHost({
@@ -3098,6 +3212,7 @@ class OriginActor {
 			return false;
 		}
 		if (result.outcome === "terminating") {
+			bound.stallExitOwner ??= exitOwner;
 			bound.stallHostTerminating = true;
 			if (this.#hostTerminatingSessionId !== bound.sessionId) {
 				this.#hostTerminatingSessionId = bound.sessionId;
@@ -3141,6 +3256,8 @@ class OriginActor {
 			}
 			return false;
 		}
+		// Persist before observer, tail, status or lifecycle cleanup can yield.
+		if (!persistStalledExit(this.#manager.database, bound.stallExitOwner ?? exitOwner, result.outcome)) return false;
 		const firstHostTermination = !bound.stallHostTerminated;
 		bound.stallHostTerminated = true;
 		if (this.#observer?.sessionId === bound.sessionId) await this.#closeObserver("host_terminated");
@@ -3170,7 +3287,7 @@ class OriginActor {
 			}
 			return false;
 		}
-		if (isTerminalStatus(latest.status.status)) {
+		if (latest.operationRef !== bound.turn.opRef || isTerminalStatus(latest.status.status)) {
 			await this.#reconcileBound(bound, latest);
 			return true;
 		}
@@ -3439,6 +3556,13 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		bound.stallHostTerminated = confirmedStalledExit(this.#manager.database, {
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			sessionId: bound.sessionId,
+			epoch: bound.epoch,
+			repo: this.#manager.repo,
+		});
 		let report: StatusReport;
 		try {
 			report = knownReport ?? (await this.#statusOf(bound));
@@ -3447,7 +3571,7 @@ class OriginActor {
 			// Endpoint/registry loss cannot prove producer exit. Only the separately
 			// guarded stalled-host termination permits cutoff without native terminal.
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
-			if (state === "accepted" && bound.stallHostTerminated) {
+			if ((state === "accepted" || state === "bound") && bound.stallHostTerminated) {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
@@ -3461,11 +3585,19 @@ class OriginActor {
 			return;
 		}
 		if (this.#stopped || this.#manager.stopped) return;
+		if (bound.stallHostTerminated && report.operationRef !== bound.turn.opRef) {
+			this.#manager.log(
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_ref_mismatch`,
+				"warn",
+			);
+			this.#scheduleStatusRecheck(bound);
+			return;
+		}
 		if (report.status.status === "unknown") {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
-			if (state === "accepted" && bound.stallHostTerminated) {
+			if ((state === "accepted" || state === "bound") && bound.stallHostTerminated) {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
@@ -3482,6 +3614,10 @@ class OriginActor {
 		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
+			if (bound.stallHostTerminated) {
+				await this.#closeTerminatedStalledTurn(bound);
+				return;
+			}
 			if (
 				bound.statusRecheckAfterStall &&
 				bound.stallStartedAtMs !== undefined &&
@@ -3871,7 +4007,8 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
+			if (!bound.stallHostTerminated)
+				await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
 			return;
 		}
 		if (this.#current === bound) {
@@ -3931,6 +4068,13 @@ class OriginActor {
 	async #closeTerminatedStalledTurn(bound: BoundTurn): Promise<void> {
 		if (!bound.stallHostTerminated) return;
 		const database = this.#manager.database;
+		const owner = {
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			sessionId: bound.sessionId,
+			epoch: bound.epoch,
+			repo: this.#manager.repo,
+		};
 		// Only a still-open trigger is closed: a repeat call after completion (or
 		// after a restart that already closed it) sends no second notice.
 		const open = database.inbox.turnRow(bound.turn.opRef);
@@ -3938,6 +4082,7 @@ class OriginActor {
 			await this.#forgetClosed(bound);
 			return;
 		}
+		if (!confirmedStalledExit(database, owner)) return;
 		this.#holdSweeps.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "session_gone");
@@ -3964,13 +4109,16 @@ class OriginActor {
 		// a crash between them cannot leave the next message aimed at the dead session.
 		// Only the CURRENT turn of the CURRENT epoch rotates: a retired turn or a
 		// turn a newer epoch already replaced never tears down the live binding.
-		const rotate =
-			!bound.retired &&
-			this.#current === bound &&
-			database.bindings.getSessionRecord(this.originKey)?.epoch === bound.epoch;
 		let completed: number;
 		try {
 			completed = database.transaction((tx) => {
+				if (!confirmedStalledExit(database, owner)) throw new Error("stalled exit completion lost its fence");
+				const session = database.bindings.getSessionRecord(this.originKey);
+				const rotate =
+					!bound.retired &&
+					this.#current === bound &&
+					session?.epoch === bound.epoch &&
+					session.sessionId === bound.sessionId;
 				const changed = completeInboundTurn(database, tx, bound.turn.opRef, discarded ? "retired" : "turn_failed");
 				if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);
 				return changed;
@@ -4135,6 +4283,22 @@ class OriginActor {
 			this.#scheduleHostTerminationRecheck(sessionId);
 			return;
 		}
+		// Reset may have retired the signalled turn while its confirmation timer
+		// remained pending. Resolve only that captured original, never its successor.
+		const bound = [this.#current, ...this.#retired.values()].find((candidate) => {
+			const owner = candidate?.stallExitOwner;
+			return (
+				candidate !== undefined &&
+				owner !== undefined &&
+				candidate.sessionId === sessionId &&
+				owner.sessionId === sessionId &&
+				owner.opRef === candidate.turn.opRef &&
+				owner.originKey === this.originKey &&
+				owner.epoch === candidate.epoch &&
+				owner.repo === this.#manager.repo
+			);
+		});
+		const exitOwner = bound?.stallExitOwner;
 		let result: TerminateHostOutcome;
 		try {
 			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
@@ -4146,10 +4310,11 @@ class OriginActor {
 			this.#scheduleHostTerminationRecheck(sessionId);
 			return;
 		}
+		// No awaited cleanup may precede the durable confirmation.
+		if (bound && !persistStalledExit(this.#manager.database, exitOwner, result.outcome)) return;
 		if (this.#observer?.sessionId === sessionId) await this.#closeObserver("host_terminated");
 		this.#hostTerminatingSessionId = undefined;
 		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
-		const bound = this.#current?.sessionId === sessionId ? this.#current : undefined;
 		if (bound) {
 			bound.stallHostTerminating = false;
 			bound.stallHostTerminated = true;
