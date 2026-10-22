@@ -255,9 +255,11 @@ export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): numb
 	const prior = Number.parseInt(store.core.metaGet(key) ?? "0", 10);
 	const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
 	const prompt = ownedTurnPrompt(store, opRef);
+	const consumeExit = prompt !== undefined && confirmedStalledExit(store, prompt);
 	store.core.metaSet(key, String(attempt));
 	const changed = store.inbox.turnRequeue(tx, opRef);
 	if (changed > 0 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
+	if (changed > 0 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	return attempt;
 }
 

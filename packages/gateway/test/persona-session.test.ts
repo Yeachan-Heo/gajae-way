@@ -2954,6 +2954,135 @@ for (const outcome of ["terminated", "already_gone", "async"] as const)
 			expect(f.port.sends[1]).toMatchObject({ sessionId: "session-e1", text: "new work after confirmed exit" });
 		});
 
+test("durable stalled-host exit retry preserves native submission retry and consumes the old proof after Store reopen", async () => {
+	const f = await durableExitFixture("terminated");
+	await manager!.stop();
+	f.port.fail(f.first.opRef, "Prompt submission failed.", SUBMISSION_BUSY);
+	await f.reopen("terminal");
+	await manager!.recover();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
+		message_id: "durable-exit-original",
+		state: "pending",
+		turn_state: null,
+		turn_op_ref: null,
+		turn_epoch: null,
+		bound_session_id: null,
+	});
+	expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
+	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
+	expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(f.failures).toEqual([]);
+	expect(f.terminal).toEqual([]);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("durable stalled-host exit retry rolls back proof, trigger and attempt together before commit", async () => {
+	const f = await durableExitFixture("terminated");
+	await manager!.stop();
+	const before = database!.inbox.turnRow(f.first.opRef);
+	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
+	expect(() =>
+		database!.transaction((tx) => {
+			expect(retryInboundTurn(database!, tx, f.first.opRef)).toBe(1);
+			expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
+			expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
+			expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
+			throw new Error("rollback exit retry");
+		}),
+	).toThrow("rollback exit retry");
+	expect(database!.inbox.turnRow(f.first.opRef)).toEqual(before);
+	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
+	expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
+		state: "pending",
+		turn_state: null,
+		turn_op_ref: null,
+		bound_session_id: null,
+	});
+	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
+	expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
+});
+
+for (const mismatch of [
+	"opRef",
+	"sessionId",
+	"epoch",
+	"repo",
+	"originKey",
+	"authority",
+	"version",
+	"outcome",
+	"malformed",
+] as const)
+	test(`durable stalled-host exit retry preserves ${mismatch} proof`, async () => {
+		const f = await durableExitFixture("terminated");
+		await manager!.stop();
+		const proof = JSON.parse(f.proof);
+		if (mismatch === "authority") proof.authority = { ...proof.authority, identity: "foreign-broker" };
+		else if (mismatch === "version" || mismatch === "epoch") proof[mismatch] = 99;
+		else if (mismatch !== "malformed") proof[mismatch] = "foreign-or-unconfirmed";
+		const poisoned = mismatch === "malformed" ? "{broken-json" : JSON.stringify(proof);
+		database!.transaction(() => database!.core.metaSet(f.proofKey, poisoned));
+		expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+		expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
+		expect(database!.core.metaGet(f.proofKey)).toBe(poisoned);
+	});
+
+test("durable stalled-host exit retry preserves proof after persisted broker authority changes", async () => {
+	const f = await durableExitFixture("terminated");
+	await manager!.stop();
+	const authority = database!.bindings.authority!;
+	database!.transaction((tx) => database!.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
+	expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+	expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
+});
+
+test("durable stalled-host exit retry rejects quarantine without changing proof, trigger or attempt", async () => {
+	const f = await durableExitFixture("terminated");
+	await manager!.stop();
+	const before = database!.inbox.turnRow(f.first.opRef);
+	const authority = database!.bindings.authority!;
+	database!.transaction((tx) =>
+		database!.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: authority,
+			targetAuthority: { ...authority, identity: "cutover-broker" },
+			evidence: "test-only verified cutover snapshot",
+			disposition: "quarantine",
+		}),
+	);
+	expect(database!.bindings.isQuarantined("inbound", "durable-exit-original")).toBe(true);
+	expect(() => database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toThrow(
+		BrokerAuthorityError,
+	);
+	expect(database!.inbox.turnRow(f.first.opRef)).toEqual(before);
+	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
+});
+
+test("durable stalled-host exit retry preserves proof when requeue changes zero rows", async () => {
+	const f = await durableExitFixture("terminated");
+	await manager!.stop();
+	const before = database!.inbox.turnRow(f.first.opRef);
+	const requeue = database!.inbox.turnRequeue;
+	let calls = 0;
+	database!.inbox.turnRequeue = (_tx, opRef) => {
+		calls++;
+		expect(opRef).toBe(f.first.opRef);
+		return 0;
+	};
+	try {
+		expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+	} finally {
+		database!.inbox.turnRequeue = requeue;
+	}
+	expect(calls).toBe(1);
+	expect(database!.inbox.turnRow(f.first.opRef)).toEqual(before);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
+});
+
 test("durable stalled-host exit yields to exact original readable native terminal and consumes proof", async () => {
 	const f = await durableExitFixture("terminated");
 	f.port.seedOperation(f.first.opRef, f.first.sessionId, "terminal_ok", "exact original output after crash");
