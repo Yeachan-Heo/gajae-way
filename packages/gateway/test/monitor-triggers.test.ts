@@ -284,17 +284,32 @@ test("default memory monitors seed per-name and respect operator removals", asyn
 	database2.core.metaSet("default_monitors_seeded", new Date().toISOString());
 	const registry2 = new Registry(database2);
 
-	// Seed the two old monitors manually to simulate legacy boot
+	// Legacy boot seeded both old defaults; the operator has since removed memory-audit.
 	const { DEFAULT_MEMORY_MONITORS } = await import("../src/monitors/defaults");
-	for (const spec of DEFAULT_MEMORY_MONITORS.slice(0, 2)) {
-		registry2.add(spec);
-	}
+	registry2.add(DEFAULT_MEMORY_MONITORS[0]!);
 
-	// Seed again: should only get memory-debloat
+	// Only the new default arrives; the removed legacy default stays removed.
 	expect(seedDefaultMonitors(registry2, database2)).toBe(1);
-	const names2 = registry2.list().map((monitor) => monitor.name);
-	expect(names2).toContain("memory-debloat");
+	expect(
+		registry2
+			.list()
+			.map((monitor) => monitor.name)
+			.sort(),
+	).toEqual(["memory-canonicalize", "memory-debloat"]);
+	registry2.remove(registry2.list().find((monitor) => monitor.name === "memory-debloat")!.monitorId);
+	expect(seedDefaultMonitors(registry2, database2)).toBe(0);
 	database2.close();
+
+	// A default the operator already created by name counts as seeded, so removing it is final.
+	const dir3 = await mkTemp(joinPath(tmp(), "gajaeway-seed-existing-"));
+	const database3 = await Db.open(joinPath(dir3, "gateway.db"));
+	const registry3 = new Registry(database3);
+	registry3.add(DEFAULT_MEMORY_MONITORS[2]!);
+	expect(seedDefaultMonitors(registry3, database3)).toBe(2);
+	registry3.remove(registry3.list().find((monitor) => monitor.name === "memory-debloat")!.monitorId);
+	expect(seedDefaultMonitors(registry3, database3)).toBe(0);
+	expect(registry3.list().map((monitor) => monitor.name)).not.toContain("memory-debloat");
+	database3.close();
 });
 
 test("memory config validates debloatByteThreshold as positive integer", async () => {
@@ -307,12 +322,12 @@ test("memory config validates debloatByteThreshold as positive integer", async (
 	});
 	expect(valid.memory?.debloatByteThreshold).toBe(102400);
 
-	// Valid: empty object is omitted from config
-	const omitted = parseConfigFile({
+	// Valid: empty object keeps the default threshold
+	const empty = parseConfigFile({
 		schemaVersion: 1,
 		memory: {},
 	});
-	expect(omitted.memory).toBeUndefined();
+	expect(empty.memory?.debloatByteThreshold).toBeUndefined();
 
 	// Invalid: zero
 	expect(() =>

@@ -120,7 +120,7 @@ These are seeded automatically on a database's first boot (removals are never re
 | `memory-audit` | 06:00 daily | `memory.audit` | `dedupe` | `ownerTarget` fallback |
 | `memory-debloat` | 04:15 daily | `memory.debloat` | `dedupe` | `ownerTarget` fallback |
 
-Canonicaliz ation reads daily captures, consolidates durable facts into the relevant canonical axes, and keeps `MEMORY.md` as a generated map. The audit then reports the structural state to the owner channel. Debloat detects memory files exceeding a configurable byte threshold (default 100 KB, configurable via `memory.debloatByteThreshold`) and routes them for restructuring into a routable directory hierarchy. Review changes as ordinary Markdown and Git changes; daily capture remains the source material rather than an invisible side channel.
+Canonicalization reads daily captures, consolidates durable facts into the relevant canonical axes, and keeps `MEMORY.md` as a generated map. The audit then reports the structural state to the owner channel. De-bloat lists every corpus Markdown file larger than `memory.debloatByteThreshold` bytes (default 102400, 100 KB; `MEMORY.md` and `generated_by` files are skipped) when the event is dispatched, and the authoring turn splits each one into a directory with an index and smaller children without dropping content. With nothing over the limit the run is silent. Each default monitor is seeded once per gateway database, so a new default reaches an existing gateway on its next boot and a removed one stays removed. Review changes as ordinary Markdown and Git changes; daily capture remains the source material rather than an invisible side channel.
 
 ## Memory lease and Git lock gate
 

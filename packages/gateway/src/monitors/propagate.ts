@@ -15,6 +15,7 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
+import { oversizedMemoryFiles } from "../memory/debloat";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -72,7 +73,7 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 	"memory.audit":
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 	"memory.debloat":
-		"For memory.debloat events: split each oversized file into a routable structure under the same axis (directory + index linking topic/date-sliced children), preserve every original byte (move, never summarize-replace or delete), keep links resolvable and reachable from MEMORY.md, never hand-edit generated surfaces, then run 'gajaeway memory audit' and report.",
+		"For memory.debloat events: the payload lists every memory file larger than thresholdBytes in oversized (path, bytes); when oversized is empty the note is [SILENT]. Otherwise split each listed file into a routable structure under the same axis (a directory whose index links topic- or date-sliced children, each under the threshold), preserve every original byte (move, never summarize-replace or delete), repoint every link to the moved content and keep it reachable from MEMORY.md, never hand-edit generated surfaces, then run the memory validator (gajaeway memory audit) and report each split file with its new layout plus the audit result.",
 };
 
 /** First line of every monitor authoring prompt: execute before reporting. */
@@ -296,6 +297,7 @@ export class MonitorPropagator {
 	#closing = false;
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
+	readonly #memoryDebloat: { readonly root: string; readonly thresholdBytes: number } | undefined;
 	readonly #model: GjcModelSelection | undefined;
 	readonly #serviceTier: GjcServiceTier | undefined;
 	readonly #appliedModels = new Map<string, string>();
@@ -336,6 +338,8 @@ export class MonitorPropagator {
 		onReadinessSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
+		/** Memory corpus scanned for `memory.debloat` events, and the byte size a file must exceed. */
+		memoryDebloat?: { readonly root: string; readonly thresholdBytes: number };
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
 		model?: GjcModelSelection;
 		serviceTier?: GjcServiceTier;
@@ -396,6 +400,19 @@ export class MonitorPropagator {
 		this.#protocolFailureRollThreshold =
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
+		this.#memoryDebloat = options.memoryDebloat;
+	}
+
+	/**
+	 * Event payload as the authoring turn sees it. A `memory.debloat` event is
+	 * scanned at dispatch, not at fire, so the list reflects the corpus the turn
+	 * will actually edit and the cron tick never blocks on a tree walk.
+	 */
+	async #authoringPayload(row: { readonly event_type: string; readonly payload_json: string }): Promise<unknown> {
+		const payload = JSON.parse(row.payload_json);
+		if (row.event_type !== "memory.debloat" || !this.#memoryDebloat) return payload;
+		const { root, thresholdBytes } = this.#memoryDebloat;
+		return { ...payload, thresholdBytes, oversized: await oversizedMemoryFiles(root, thresholdBytes) };
 	}
 	/** Cancels pending burst timers so no new dispatch starts during shutdown. */
 	dispose(): void {
@@ -1117,11 +1134,13 @@ export class MonitorPropagator {
 					guidance,
 					procedure: procedure.prompt,
 					digest,
-					events: claimed.map((row) => ({
-						eventId: row.event_id,
-						eventType: row.event_type,
-						payload: JSON.parse(row.payload_json),
-					})),
+					events: await Promise.all(
+						claimed.map(async (row) => ({
+							eventId: row.event_id,
+							eventType: row.event_type,
+							payload: await this.#authoringPayload(row),
+						})),
+					),
 				});
 				// #187: a request-phase failure does not mean the prompt was refused —
 				// the turn it started may still be running. Reuse its op-ref on retry.

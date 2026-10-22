@@ -431,8 +431,7 @@ function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
 	};
 }
 
-function parseMemory(value: unknown): MemoryConfig | undefined {
-	if (value === undefined) return undefined;
+function parseMemory(value: unknown): MemoryConfig {
 	const input = requireObject(value, "memory");
 	for (const key of Object.keys(input))
 		if (key !== "debloatByteThreshold") throw new ConfigError("config_invalid", "memory contains an unknown field");
@@ -721,9 +720,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 				}),
 		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
-		...(parseMemory(input.memory) && Object.keys(parseMemory(input.memory) ?? {}).length > 0
-			? { memory: parseMemory(input.memory) }
-			: {}),
+		...(input.memory === undefined ? {} : { memory: parseMemory(input.memory) }),
 		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
 	};
 }

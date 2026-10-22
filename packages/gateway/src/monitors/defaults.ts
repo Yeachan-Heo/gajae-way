@@ -36,31 +36,29 @@ export const DEFAULT_MEMORY_MONITORS = [
 	},
 ];
 
-const SEED_FLAG = "default_monitors_seeded";
-const SEED_FLAG_PREFIX = "default_monitor_seeded:";
+/** Former once-for-all flag: a gateway that set it seeded only the first two defaults. */
+const LEGACY_SEED_FLAG = "default_monitors_seeded";
+const LEGACY_SEEDED = new Set(["memory-canonicalize", "memory-audit"]);
+const seedFlag = (name: string) => `default_monitor_seeded:${name}`;
 
+/**
+ * Seeds each default at most once per database. A default that already exists
+ * (operator-created under the same name) is recorded as seeded, so removing it
+ * later is final too.
+ */
 export function seedDefaultMonitors(registry: MonitorRegistry, database: Store): number {
 	const existingNames = new Set(registry.list().map((monitor) => monitor.name));
-	const legacyFlag = database.core.metaGet(SEED_FLAG);
+	const legacy = database.core.metaGet(LEGACY_SEED_FLAG) !== undefined;
+	const at = new Date().toISOString();
 	let seeded = 0;
-
 	for (const spec of DEFAULT_MEMORY_MONITORS) {
-		if (existingNames.has(spec.name)) continue;
-
-		// Skip if already seeded (per-name flag)
-		const perNameFlag = `${SEED_FLAG_PREFIX}${spec.name}`;
-		if (database.core.metaGet(perNameFlag)) continue;
-
-		// For legacy DBs with the global flag, skip the first two monitors
-		if (legacyFlag && spec.name !== "memory-debloat") {
-			database.core.metaSet(perNameFlag, new Date().toISOString());
-			continue;
+		const flag = seedFlag(spec.name);
+		if (database.core.metaGet(flag)) continue;
+		if (!existingNames.has(spec.name) && !(legacy && LEGACY_SEEDED.has(spec.name))) {
+			registry.add(spec);
+			seeded++;
 		}
-
-		registry.add(spec);
-		database.core.metaSet(perNameFlag, new Date().toISOString());
-		seeded++;
+		database.core.metaSet(flag, at);
 	}
-
 	return seeded;
 }

@@ -66,6 +66,7 @@ import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
+import { DEFAULT_DEBLOAT_BYTE_THRESHOLD } from "../memory/debloat";
 import { initializeMemory, memoryRoot } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
@@ -1083,6 +1084,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
 		repo: workspace,
+		memoryDebloat: {
+			root: memoryRoot(options.config.home),
+			thresholdBytes: options.config.memory?.debloatByteThreshold ?? DEFAULT_DEBLOAT_BYTE_THRESHOLD,
+		},
 		onReadinessFailure: ({ code, detail, originKey, at }) =>
 			readiness.recordFailure({
 				category: "monitor_delivery",
