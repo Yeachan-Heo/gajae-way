@@ -569,11 +569,15 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseWorkCommons(value: unknown): WorkCommonsConfig | undefined {
 	if (value === undefined) return undefined;
-	const input = requireObject(value, "work.commons");
+	// Field labels stay inside full sentences: a bare dotted `work.*` literal reads as a protocol verb
+	// to the conformance inventory (packages/conformance/test/sdk-coverage-inventory.test.ts).
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new ConfigError("config_invalid", "work.commons must be an object");
+	const input = value as Record<string, unknown>;
 	if (Object.keys(input).some((key) => key !== "dir" && key !== "enabled"))
 		throw new ConfigError("config_invalid", "work.commons may only contain dir and enabled");
-	const dir = optionalString(input.dir, "work.commons.dir");
-	if (!dir || !isAbsolute(dir)) throw new ConfigError("config_invalid", "work.commons.dir must be an absolute path");
+	const dir = input.dir;
+	if (typeof dir !== "string" || !isAbsolute(dir)) throw new ConfigError("config_invalid", "work.commons.dir must be an absolute path");
 	if (input.enabled !== undefined && typeof input.enabled !== "boolean")
 		throw new ConfigError("config_invalid", "work.commons.enabled must be a boolean");
 	return { dir, ...(input.enabled === undefined ? {} : { enabled: input.enabled }) };

@@ -166,7 +166,7 @@ function killCommonsProcessGroup(pid: number): void {
 }
 async function appendCommonsRelated(text: string, config: WorkCommonsConfig | undefined): Promise<string> {
 	if (!config || config.enabled === false) return text;
-	let child: ReturnType<typeof Bun.spawn> | undefined;
+	let child: { readonly pid: number; readonly exited: Promise<number> } | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const script = join(config.dir, "bin", "commons");
@@ -174,16 +174,17 @@ async function appendCommonsRelated(text: string, config: WorkCommonsConfig | un
 			commonsSkip("script_missing");
 			return text;
 		}
-		child = Bun.spawn(["python3", script, "related", "--stdin", "-n", "3", "--json"], {
+		const spawned = Bun.spawn(["python3", script, "related", "--stdin", "-n", "3", "--json"], {
 			cwd: config.dir,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "ignore",
 			detached: true,
 		});
-		const stdout = new Response(child.stdout).text();
-		child.stdin.write(taskExcerpt(text));
-		child.stdin.end();
+		child = spawned;
+		const stdout = new Response(spawned.stdout).text();
+		spawned.stdin.write(taskExcerpt(text));
+		spawned.stdin.end();
 		const completed = Promise.all([child.exited, stdout]).then(([exitCode, output]) => ({
 			kind: "complete" as const,
 			exitCode,
