@@ -123,6 +123,29 @@ test("work lane limits parse without materializing omitted configuration", () =>
 	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("work");
 });
 
+test("work.commons accepts an absolute directory and optional boolean enabled flag", () => {
+	expect(parseConfigFile({ schemaVersion: 1, work: { commons: { dir: "/srv/gajae-commons" } } }).work).toEqual({
+		commons: { dir: "/srv/gajae-commons" },
+	});
+	for (const enabled of [true, false])
+		expect(
+			parseConfigFile({ schemaVersion: 1, work: { commons: { dir: "/srv/gajae-commons", enabled } } }).work,
+		).toEqual({ commons: { dir: "/srv/gajae-commons", enabled } });
+	for (const commons of [
+		null,
+		[],
+		{},
+		{ dir: "relative/path" },
+		{ dir: "/srv/gajae-commons", enabled: "false" },
+		{ dir: "/srv/gajae-commons", extra: true },
+	])
+		expect(() => parseConfigFile({ schemaVersion: 1, work: { commons } })).toThrow("work.commons");
+	expect(() =>
+		parseConfigFile({ schemaVersion: 1, work: { commons: { dir: "/srv/gajae-commons", enabled: 1 } } }),
+	).toThrow("work.commons.enabled");
+	expect(() => parseConfigFile({ schemaVersion: 1, work: { unknown: true } })).toThrow("allowNested, and commons");
+});
+
 test("work.allowNested is a boolean restart-required policy and defaults disabled", async () => {
 	const path = await home();
 	const defaults = await loadConfig({ home: path });

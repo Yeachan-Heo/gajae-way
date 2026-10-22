@@ -1130,6 +1130,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		ownerTarget: () => runtime.config.ownerTarget?.origin,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		allowNested: () => runtime.config.work?.allowNested === true,
+		commons: options.config.work?.commons,
 		personaHold: (originKey) => personaSessions.admissionHold(originKey),
 		notifyPersona: (originKey) => {
 			void personaSessions.notifyInbound(originKey);

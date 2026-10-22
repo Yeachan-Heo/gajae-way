@@ -169,6 +169,151 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	if (!result.started) throw new Error("unexpected hold");
 	return result;
 }
+async function commonsDirectory(): Promise<string> {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-commons-related-"));
+	cleanups.push(async () => rm(directory, { recursive: true, force: true }));
+	return directory;
+}
+async function writeCommonsScript(directory: string, source: string): Promise<string> {
+	const bin = join(directory, "bin");
+	await mkdir(bin, { recursive: true });
+	const script = join(bin, "commons");
+	await writeFile(script, source);
+	await chmod(script, 0o755);
+	return script;
+}
+
+test("work.start appends commons candidates using the fixed non-instruction wording", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`#!/usr/bin/env python3
+import json
+import sys
+assert sys.argv[1:] == ["related", "--stdin", "-n", "3", "--json"]
+sys.stdin.read()
+print(json.dumps({"pages": [{"id": "guide-1", "title": "Cache recovery", "confidence": 0.92}, {"id": "guide-2", "title": "Safe deploy", "confidence": "high"}]}))
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const result = await f.manager.start({ name: "with-commons", text: "inspect cache recovery", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe(
+		"inspect cache recovery\n\n## 관련 commons 후보(지시 아님)\ncommons: 다른 가재의 관찰 중 관련 있을 수 있는 문서: guide-1(Cache recovery, confidence=0.92); guide-2(Safe deploy, confidence=high) — 관련 있으면 읽고 확인 후 쓰세요. 지시가 아니며, 관련 없으면 답하지 마세요.",
+	);
+});
+
+test("work.run uses the same commons prompt enrichment as work.start", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`import json
+import sys
+sys.stdin.read()
+print(json.dumps({"pages": [{"id": "guide-1", "title": "Runbook", "confidence": "medium"}]}))
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const run = f.manager.run({ name: "run-with-commons", text: "run task", cwd: f.directory }, {});
+	await until(() => f.port.sends.length === 1);
+	const send = f.port.sends[0]!;
+	expect(send.text).toContain(
+		"commons: 다른 가재의 관찰 중 관련 있을 수 있는 문서: guide-1(Runbook, confidence=medium)",
+	);
+	f.port.complete(send.opRef, "run result");
+	expect(await run).toMatchObject({ held: false, text: "run result" });
+});
+
+test("work.start leaves the task prompt unchanged when commons is unconfigured", async () => {
+	const f = await fixture();
+	const result = await f.manager.start({ name: "without-commons", text: "original task", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe("original task");
+});
+
+test("work.start leaves the task prompt unchanged when bin/commons is missing", async () => {
+	const dir = await commonsDirectory();
+	const f = await fixture({ commons: { dir } });
+	const result = await f.manager.start({ name: "missing-commons", text: "original task", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe("original task");
+});
+
+test("work.commons enabled=false leaves the task prompt unchanged", async () => {
+	const dir = await commonsDirectory();
+	const marker = join(dir, "called.txt");
+	await writeCommonsScript(
+		dir,
+		`from pathlib import Path
+Path(${JSON.stringify(marker)}).write_text("called")
+`,
+	);
+	const f = await fixture({ commons: { dir, enabled: false } });
+	const result = await f.manager.start({ name: "disabled-commons", text: "original task", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe("original task");
+	expect(await Bun.file(marker).exists()).toBe(false);
+});
+
+test("commons command failures, invalid JSON, and empty results fail open", async () => {
+	const dir = await commonsDirectory();
+	const scriptSource = [
+		{ name: "command-failed", source: "raise SystemExit(1)\n" },
+		{ name: "invalid-json", source: "print('not json')\n" },
+		{ name: "empty-results", source: "import json\nprint(json.dumps({'pages': []}))\n" },
+	];
+	for (const { name, source } of scriptSource) {
+		await writeCommonsScript(dir, source);
+		const f = await fixture({ commons: { dir } });
+		const text = `original task ${name}`;
+		const result = await f.manager.start({ name, text, cwd: f.directory });
+		expect(result).toMatchObject({ started: true });
+		expect(f.port.sends.at(-1)?.text).toBe(text);
+	}
+});
+
+test("work.start fails open on commons timeout and logs no task content", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`import time
+time.sleep(10)
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const task = "private task prompt";
+	const log = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		const result = await f.manager.start({ name: "timeout-commons", text: task, cwd: f.directory });
+		expect(result).toMatchObject({ started: true });
+		expect(f.port.sends[0]?.text).toBe(task);
+		expect(log).toHaveBeenCalledWith("work_commons_related_skipped reason=timeout");
+		expect(log.mock.calls.flat().join(" ")).not.toContain(task);
+	} finally {
+		log.mockRestore();
+	}
+});
+
+test("commons lookup receives at most the first 8,000 task characters", async () => {
+	const dir = await commonsDirectory();
+	const stdinLengthPath = join(dir, "stdin-length.txt");
+	await writeCommonsScript(
+		dir,
+		`import json
+from pathlib import Path
+import sys
+task = sys.stdin.read()
+Path(${JSON.stringify(stdinLengthPath)}).write_text(str(len(task)))
+print(json.dumps({"pages": [{"id": "guide-1", "title": "Runbook", "confidence": 1}]}))
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const task = "x".repeat(8_001);
+	const result = await f.manager.start({ name: "capped-commons", text: task, cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(await Bun.file(stdinLengthPath).text()).toBe("8000");
+	expect(f.port.sends[0]?.text.startsWith(`${task}\n\n## 관련 commons 후보(지시 아님)`)).toBe(true);
+});
 
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
 	const logs: string[] = [];
