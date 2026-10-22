@@ -38,6 +38,13 @@ export interface WorkLaneConfig {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
 	readonly allowNested?: boolean;
+	readonly commons?: WorkCommonsConfig;
+}
+
+export interface WorkCommonsConfig {
+	/** Absolute path to a gajae-commons checkout containing `bin/commons`. */
+	readonly dir: string;
+	readonly enabled?: boolean;
 }
 
 /**
@@ -528,8 +535,12 @@ function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
 
 function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
-	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested"))
-		throw new ConfigError("config_invalid", "work may only contain maxLanes, idleRetireMs, and allowNested");
+	if (
+		Object.keys(input).some(
+			(key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested" && key !== "commons",
+		)
+	)
+		throw new ConfigError("config_invalid", "work may only contain maxLanes, idleRetireMs, allowNested, and commons");
 	if (
 		input.maxLanes !== undefined &&
 		(!Number.isInteger(input.maxLanes) || (input.maxLanes as number) < 1 || (input.maxLanes as number) > 256)
@@ -547,11 +558,25 @@ function parseWork(value: unknown): WorkLaneConfig {
 		);
 	if (input.allowNested !== undefined && typeof input.allowNested !== "boolean")
 		throw new ConfigError("config_invalid", "work.allowNested must be a boolean");
+	const commons = parseWorkCommons(input.commons);
 	return {
 		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.allowNested === undefined ? {} : { allowNested: input.allowNested as boolean }),
+		...(commons === undefined ? {} : { commons }),
 	};
+}
+
+function parseWorkCommons(value: unknown): WorkCommonsConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "work.commons");
+	if (Object.keys(input).some((key) => key !== "dir" && key !== "enabled"))
+		throw new ConfigError("config_invalid", "work.commons may only contain dir and enabled");
+	const dir = optionalString(input.dir, "work.commons.dir");
+	if (!dir || !isAbsolute(dir)) throw new ConfigError("config_invalid", "work.commons.dir must be an absolute path");
+	if (input.enabled !== undefined && typeof input.enabled !== "boolean")
+		throw new ConfigError("config_invalid", "work.commons.enabled must be a boolean");
+	return { dir, ...(input.enabled === undefined ? {} : { enabled: input.enabled }) };
 }
 
 function parseSessions(value: unknown): SessionHostConfig {
