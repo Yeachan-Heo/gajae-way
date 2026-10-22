@@ -319,7 +319,7 @@ test("memory config validates debloatByteThreshold as positive integer", async (
 		parseConfigFile({
 			schemaVersion: 1,
 			memory: { debloatByteThreshold: 0 },
-		})
+		}),
 	).toThrow("positive integer");
 
 	// Invalid: negative
@@ -327,7 +327,7 @@ test("memory config validates debloatByteThreshold as positive integer", async (
 		parseConfigFile({
 			schemaVersion: 1,
 			memory: { debloatByteThreshold: -1 },
-		})
+		}),
 	).toThrow("positive integer");
 
 	// Invalid: non-integer
@@ -335,7 +335,7 @@ test("memory config validates debloatByteThreshold as positive integer", async (
 		parseConfigFile({
 			schemaVersion: 1,
 			memory: { debloatByteThreshold: 102.5 },
-		})
+		}),
 	).toThrow("positive integer");
 
 	// Invalid: unknown field in memory
@@ -343,6 +343,6 @@ test("memory config validates debloatByteThreshold as positive integer", async (
 		parseConfigFile({
 			schemaVersion: 1,
 			memory: { unknownField: 123 },
-		})
+		}),
 	).toThrow("unknown field");
 });
