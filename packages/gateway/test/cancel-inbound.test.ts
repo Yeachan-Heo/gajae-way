@@ -53,7 +53,7 @@ async function startServer(withDrain: boolean) {
 				originRefJson: '{"platform":"discord","kind":"dm","conversationId":"owner"}',
 				body: `ping ${id}`,
 				receivedAt: new Date().toISOString(),
-				engagement,
+				engagementJson: JSON.stringify(engagement),
 			}),
 		);
 	};
