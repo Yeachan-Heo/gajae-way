@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GajaewayClient } from "../../sdk/src/client";
 import { parseOpsCancelInboundParams } from "@gajae-gateway/protocol";
+import { GajaewayClient } from "../../sdk/src/client";
 
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -51,7 +51,7 @@ async function startServer(withDrain: boolean) {
 				messageId: id,
 				originKey: "discord:dm:owner",
 				originRefJson: '{"platform":"discord","kind":"dm","conversationId":"owner"}',
-				body: "ping " + id,
+				body: `ping ${id}`,
 				receivedAt: new Date().toISOString(),
 				engagement,
 			}),
@@ -102,7 +102,7 @@ test("cancels only the selected unbound pending rows while the drain is held", a
 
 test("rejects when the matching restart drain is not held", async () => {
 	const { client } = await startServer(false);
-	await expect(
-		client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ["a1"] }),
-	).rejects.toMatchObject({ code: "verb_failed" });
+	await expect(client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ["a1"] })).rejects.toMatchObject({
+		code: "verb_failed",
+	});
 });
