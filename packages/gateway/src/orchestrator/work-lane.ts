@@ -58,6 +58,7 @@ import {
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
+import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
 	type LaneForceRetireReason,
 	type LaneGovernor,
@@ -76,8 +77,16 @@ const owners = new WeakSet<Store>();
 const FAILURES_PER_READOPTION = 8;
 /** Ceiling for the failure backoff between reconciliation polls. */
 const MAX_FAILURE_BACKOFF_MS = 30_000;
-const REMOTE_REF_PROBE_TIMEOUT_MS = 5_000;
-const REMOTE_REPO_CLONE_TIMEOUT_MS = 30_000;
+/** Per-command git deadlines; a timed-out command is killed with its whole process group (#615). */
+interface GitTimeouts {
+	/** Local repository commands, including clone/fetch from a local path and worktree add/remove. */
+	readonly local: number;
+	/** Clone of a network remote. */
+	readonly clone: number;
+	/** `git ls-remote` push-state probe. */
+	readonly probe: number;
+}
+const GIT_TIMEOUTS: GitTimeouts = { local: GIT_COMMAND_TIMEOUT_MS, clone: 30_000, probe: 5_000 };
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -133,6 +142,7 @@ interface Observer {
 	readonly binding: { readonly sessionId: string | null; readonly epoch: number } | undefined;
 	tail?: TailHandle;
 	attaching?: Promise<void>;
+	disposal?: Promise<void>;
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
 	wakeRequested?: boolean;
@@ -165,11 +175,18 @@ export interface CheckStatusSnapshot {
 
 export interface CheckStatusClient {
 	/**
-	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied. Returns null only when an
-	 * unqualified lookup proves no match exists; returns undefined when lookup failed, timed out, or results are incomplete or ambiguous.
+	 * Snapshot the PR for `headSha`, preferring `prNumber` when supplied and
+	 * `branchName` when several exact-head PRs are available. Returns null only
+	 * when an unqualified lookup proves no match exists; returns undefined when
+	 * lookup failed, timed out, or results are incomplete.
 	 * Must not throw.
 	 */
-	getCheckStatus(headSha: string, cwd: string, prNumber?: number): Promise<CheckStatusSnapshot | null | undefined>;
+	getCheckStatus(
+		headSha: string,
+		cwd: string,
+		prNumber?: number,
+		branchName?: string,
+	): Promise<CheckStatusSnapshot | null | undefined>;
 }
 
 export interface WorkLaneManagerOptions {
@@ -195,6 +212,8 @@ export interface WorkLaneManagerOptions {
 	readonly checkStatusClient?: CheckStatusClient;
 	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
 	readonly brokerWait?: BrokerWaitOptions;
+	/** Test seam: one deadline for every lane git command instead of {@link GIT_TIMEOUTS}. */
+	readonly gitCommandTimeoutMs?: number;
 }
 /**
  * A lane bind issued while the supervisor restarts the broker waits for it to
@@ -268,6 +287,8 @@ export class WorkLaneManager {
 	readonly #db: Store;
 	readonly #port: SessionPort;
 	readonly #observers = new Map<string, Observer>();
+	/** Includes dropped observers no longer reachable through #observers. */
+	readonly #observerDisposals = new Set<Promise<void>>();
 	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
@@ -292,6 +313,10 @@ export class WorkLaneManager {
 	}
 	#at(): string {
 		return new Date(this.#now()).toISOString();
+	}
+	#gitTimeouts(): GitTimeouts {
+		const override = this.#options.gitCommandTimeoutMs;
+		return override === undefined ? GIT_TIMEOUTS : { local: override, clone: override, probe: override };
 	}
 	#live(): void {
 		if (this.#stopped) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
@@ -341,38 +366,6 @@ export class WorkLaneManager {
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
 	}
-	#rollbackUnpersistedWorktree(
-		name: string,
-		worktree: { readonly repository: string; readonly path: string; readonly branch: string },
-	): void {
-		try {
-			const remove = Bun.spawnSync(["git", "worktree", "remove", "--force", worktree.path], {
-				stdout: "pipe",
-				stderr: "pipe",
-				cwd: worktree.repository,
-			});
-			const deleteBranch = Bun.spawnSync(["git", "branch", "-D", worktree.branch], {
-				stdout: "pipe",
-				stderr: "pipe",
-				cwd: worktree.repository,
-			});
-			const failures = [
-				remove.exitCode === 0
-					? undefined
-					: `git worktree remove failed: ${remove.stderr?.toString().trim() || "unknown error"}`,
-				deleteBranch.exitCode === 0
-					? undefined
-					: `git branch delete failed: ${deleteBranch.stderr?.toString().trim() || "unknown error"}`,
-			].filter((failure): failure is string => failure !== undefined);
-			if (failures.length > 0) throw new Error(failures.join("; "));
-		} catch (error) {
-			const reason = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
-				.replace(/\s+/gu, " ")
-				.slice(0, 200);
-			console.error(`work_setup_rollback_failed name=${name} reason=${reason || "unknown"}`);
-		}
-	}
-
 	#updateAttempt(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
 		return this.#db.transaction((tx) => {
 			const current = this.#db.work.workAttemptGet(opRef);
@@ -495,7 +488,8 @@ export class WorkLaneManager {
 	}
 	/**
 	 * Closes a dead lane's current attempt through the normal atomic settlement
-	 * path. LaneGovernor calls this while it owns the lane mutation lock.
+	 * path, or concludes checks without rewriting an already-settled runtime.
+	 * LaneGovernor calls this while it owns the lane mutation lock.
 	 */
 	settleForceRetiredAttempt(name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string): boolean {
 		const record = this.#job(name, true);
@@ -506,11 +500,20 @@ export class WorkLaneManager {
 		if (!runtime) return false;
 		if (runtime.settledAt !== null) {
 			if (attempt.endedAt !== runtime.settledAt) return false;
-			if (record.state === "awaiting_checks")
-				this.#putJob(
+			if (record.state === "awaiting_checks") {
+				const effects = this.#settleChecks(
 					name,
-					settleAwaitingChecks(record, endedAt, { kind: "ended", reason: "lane force-retired before checks settled" }),
+					record,
+					{ kind: "ended", reason: "lane force-retired before checks settled" },
+					undefined,
+					endedAt,
 				);
+				// Admission is already durable. Never await another lane's lock from
+				// this synchronous callback under the retiring lane's mutation lock.
+				void this.#dispatchChecksEffects(effects).catch((error: unknown) => {
+					console.error(`checks_report_dispatch_failed jobId=${record.jobId} reason=${failureReason(error)}`);
+				});
+			}
 			return true;
 		}
 		if (attempt.endedAt !== undefined) return false;
@@ -897,12 +900,13 @@ export class WorkLaneManager {
 					input.name,
 					input.repo,
 					input.base,
+					this.#gitTimeouts(),
 				);
 				worktreePath = createdWorktree.worktreePath;
 				repositoryPath = createdWorktree.repositoryPath;
 			}
 			if (worktreePath === undefined) throw new Error("work lane path was not resolved");
-			const facts = await collectRepoFacts(worktreePath, undefined, false);
+			const facts = await collectRepoFacts(worktreePath, this.#gitTimeouts(), undefined, false);
 			job = createLaneJobRecord({
 				jobId,
 				branch: facts?.branch ?? managedLaneBranchName(input.name),
@@ -966,7 +970,7 @@ export class WorkLaneManager {
 				console.error(`worktree_creation_retained name=${input.name} reason=session_bind_may_reference_worktree`);
 			} else if (createdWorktree) {
 				try {
-					await discardCreatedWorktree(input.name, createdWorktree);
+					await discardCreatedWorktree(input.name, createdWorktree, this.#gitTimeouts());
 				} catch (cleanupError) {
 					console.error(
 						`worktree_creation_cleanup_failed name=${input.name} reason=${sanitizeDiagnostic(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))}`,
@@ -997,6 +1001,20 @@ export class WorkLaneManager {
 		const observer = this.#register(runtime);
 		this.#attach(observer);
 		await observer.attaching;
+		if (!this.#writeCurrent(observer)) {
+			// This invocation has not called send. That local fact survives broker
+			// revocation, but must not overwrite a concurrent acceptance or terminal.
+			const current = this.#db.work.workAttemptGet(opRef);
+			const notSubmitted =
+				current && !current.settledAt && !current.terminal && !hasAcceptanceEvidence(current)
+					? this.#updateAttempt(opRef, current.version, {
+							terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+						})
+					: undefined;
+			this.#live();
+			if (notSubmitted) throw workError("work send rejected", "send_rejected", notSubmitted);
+			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
+		}
 		let accepted = false;
 		let rejected = false;
 		let source: "receipt" | "status" = "receipt";
@@ -1264,11 +1282,45 @@ export class WorkLaneManager {
 	#dropObserver(observer: Observer, error: unknown): void {
 		const opRef = observer.runtime.opRef;
 		console.error(`work_observer_failed opRef=${JSON.stringify(opRef)} error=${failureReason(error)}`);
+		void this.#disposeObserver(observer);
+		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
+		this.#failures.delete(opRef);
+	}
+	/** Revoke callbacks immediately; dispose relays without waiting on our own tick. */
+	#disposeObserver(observer: Observer): Promise<void> {
+		if (observer.disposal) return observer.disposal;
 		observer.abort.abort();
 		if (observer.timer) clearTimeout(observer.timer);
 		observer.timer = undefined;
-		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
-		this.#failures.delete(opRef);
+		const report = (error: unknown) => {
+			console.error(`work_observer_cleanup_failed opRef=${observer.runtime.opRef} reason=${failureReason(error)}`);
+		};
+		const closeTail = async () => {
+			const tail = observer.tail;
+			observer.tail = undefined;
+			try {
+				await tail?.close();
+			} catch (error) {
+				report(error);
+			}
+		};
+		const disposal = Promise.resolve()
+			.then(async () => {
+				// Closing an acquired handle first also releases a pending ready wait.
+				await closeTail();
+				try {
+					await observer.attaching;
+				} catch (error) {
+					report(error);
+				}
+				// A late attachment is fenced and closes itself; retain cleanup ownership
+				// until that completion, including any handle acquired before revocation.
+				await closeTail();
+			})
+			.finally(() => this.#observerDisposals.delete(disposal));
+		observer.disposal = disposal;
+		this.#observerDisposals.add(disposal);
+		return disposal;
 	}
 	/** Counts the failure and reports it once per distinct reason instead of on every poll. */
 	#failed(observer: Observer, error: unknown): void {
@@ -1314,13 +1366,20 @@ export class WorkLaneManager {
 			const invalidateActivity = () => {
 				observer.activityVersion = (observer.activityVersion ?? 0) + 1;
 				observer.receiptDeadSince = undefined;
+				observer.goneSince = undefined;
 			};
 			const tail = await this.#port.attachTail({
 				sessionId: runtime.sessionId,
 				brokerGeneration: observer.generation,
 				repo: runtime.cwd,
+				signal: observer.abort.signal,
 				originKey: runtime.sessionKey,
 				onTurnActivity: invalidateActivity,
+				onObserverLifecycle: (kind) => {
+					// A native run can start without SDK correlation or content. It
+					// invalidates end proof, but cannot supply an attempt's receipt.
+					if (kind === "agent_start") invalidateActivity();
+				},
 				onRelayLost: invalidateActivity,
 				onRelayDead: () => {
 					invalidateActivity();
@@ -1491,19 +1550,27 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		if (
-			!runtime.terminal ||
-			(runtime.terminal.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined)
-		)
-			this.#attach(observer);
-		if (!runtime.terminal) {
+		const unresolvedReceipt =
+			runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+		if (!runtime.terminal || unresolvedReceipt) this.#attach(observer);
+		// A saved SDK terminal is still incomplete without execution-end proof.
+		// Recovery must refresh it through the same fenced path as a fresh status.
+		if (!runtime.terminal || unresolvedReceipt) {
+			const activityVersion = observer.activityVersion;
 			let status: PromptStatusBody | undefined;
 			try {
 				status = await this.#query(runtime, observer.tail);
 				observer.goneSince = undefined;
 			} catch (error) {
 				observer.receiptDeadSince = undefined;
-				if (!(await this.#hostGone(runtime, error))) {
+				const hostGone = await this.#hostGone(runtime, error);
+				// Both status and inspect must belong to one uninterrupted activity
+				// epoch. A start during either await cannot seed post-start grace.
+				if (!this.#writeCurrent(observer) || observer.activityVersion !== activityVersion) {
+					observer.goneSince = undefined;
+					return;
+				}
+				if (!hostGone) {
 					observer.goneSince = undefined;
 					throw error;
 				}
@@ -1521,6 +1588,22 @@ export class WorkLaneManager {
 			let terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			if (unresolvedReceipt && !terminal) {
+				observer.receiptDeadSince = undefined;
+				return;
+			}
+			if (
+				unresolvedReceipt &&
+				status &&
+				(status.clientRef !== runtime.opRef ||
+					(["commandId", "turnId"] as const).some(
+						(key) => runtime.terminal?.status?.[key] !== undefined && runtime.terminal.status[key] !== status[key],
+					) ||
+					(terminal?.reasonCode !== "terminal_missing_receipt" && status.receiptState !== "present"))
+			) {
+				observer.receiptDeadSince = undefined;
+				return;
+			}
 			if (
 				terminal?.reasonCode === "terminal_missing_receipt" &&
 				runtime.turnEndObservedAt === undefined &&
@@ -1557,6 +1640,11 @@ export class WorkLaneManager {
 				}
 			} else observer.receiptDeadSince = undefined;
 			if (!this.#writeCurrent(observer)) return;
+			// Keep saved terminal evidence immutable until output proves a late
+			// receipt. A refreshed terminal receipt or confirmed host death can
+			// release retrieval, but cannot rewrite the original outcome by itself.
+			if (unresolvedReceipt && terminal?.reasonCode !== "terminal_missing_receipt")
+				observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			runtime =
 				this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -1567,7 +1655,7 @@ export class WorkLaneManager {
 							}
 						: {}),
 					...(turnEndObservedAt && runtime.turnEndObservedAt === undefined ? { turnEndObservedAt } : {}),
-					...(terminal ? { terminal } : {}),
+					...(terminal && !runtime.terminal ? { terminal } : {}),
 				}) ?? runtime;
 			if (!runtime.terminal) return;
 		}
@@ -1671,7 +1759,7 @@ export class WorkLaneManager {
 		if (runtime.output.disposition !== "pending") await this.#settle(observer, runtime);
 	}
 	async #settle(observer: Observer, runtime: WorkAttemptRuntime): Promise<void> {
-		const facts = await collectRepoFacts(runtime.cwd, this.#options.checkStatusClient);
+		const facts = await collectRepoFacts(runtime.cwd, this.#gitTimeouts(), this.#options.checkStatusClient);
 		const result = await this.#port.runExclusive(runtime.sessionKey, async () => {
 			if (!this.#writeCurrent(observer)) return;
 			const current = this.#db.work.workAttemptGet(runtime.opRef);
@@ -1713,6 +1801,9 @@ export class WorkLaneManager {
 					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
 				}
 			}
+			// Diagnostics may suspend while shutdown, generation recovery or a
+			// binding change revokes this observer without changing runtime.version.
+			if (!this.#writeCurrent(observer)) return;
 			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
@@ -1881,8 +1972,9 @@ export class WorkLaneManager {
 		}
 		if (this.#current(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt) {
 			observer.tail?.setTurnRunning(false);
-			await observer.tail?.close();
-			observer.tail = undefined;
+			await this.#disposeObserver(observer);
+			if (this.#observers.get(runtime.opRef) === observer) this.#observers.delete(runtime.opRef);
+			this.#failures.delete(runtime.opRef);
 		}
 	}
 	#finishWaiters(opRef: string): void {
@@ -1919,6 +2011,7 @@ export class WorkLaneManager {
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
 		const facts = await collectRepoFacts(
 			observed.lane.worktreePath,
+			this.#gitTimeouts(),
 			client,
 			true,
 			cycle.headSha,
@@ -1970,6 +2063,9 @@ export class WorkLaneManager {
 			return this.#settleChecks(name, job, outcome, facts);
 		});
 		if (!effects) return;
+		await this.#dispatchChecksEffects(effects);
+	}
+	async #dispatchChecksEffects(effects: ChecksReportEffects): Promise<void> {
 		if (effects.fallback) {
 			try {
 				this.#options.deliverFallback?.(effects.fallback);
@@ -2020,12 +2116,13 @@ export class WorkLaneManager {
 		job: LaneJobRecord,
 		outcome: ChecksSettlement,
 		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
+		at = this.#at(),
 	): ChecksReportEffects {
 		const cycle = job.awaitingChecks!;
-		const at = this.#at();
 		const settled = settleAwaitingChecks(job, at, outcome);
 		const last = job.attempts.at(-1);
-		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const runtime = last ? this.#attemptByOpRef(last.opRef) : undefined;
+		const parent = runtime?.output.knownSilence === null ? runtime.parent : null;
 		const text = checksReportText(name, cycle, outcome, facts);
 		const reportRef = newOpRef(`checks-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
 		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
@@ -2447,11 +2544,9 @@ export class WorkLaneManager {
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {
-					prior.abort.abort();
-					if (prior.timer) clearTimeout(prior.timer);
-					await prior.attaching;
+					const disposal = this.#disposeObserver(prior);
 					await prior.task;
-					await prior.tail?.close();
+					await disposal;
 				}
 				if (this.#stopped) return;
 				const observer = this.#register(runtime);
@@ -2468,6 +2563,34 @@ export class WorkLaneManager {
 					statusError = error;
 				}
 				if (!this.#current(observer)) continue;
+				if (status?.status === "unknown" && this.#port.promptRefusal) {
+					// Serialize with live send/retry owners. Unknown alone is never a
+					// rejection: only the port's durable non-admission proof may end it.
+					const rejected = await this.#port.runExclusive(runtime.sessionKey, async () => {
+						const latest = this.#db.work.workAttemptGet(runtime.opRef);
+						if (!this.#writeCurrent(observer) || !latest || latest.terminal || hasAcceptanceEvidence(latest))
+							return false;
+						try {
+							if (
+								this.#port.promptRefusal?.({ sessionId: latest.sessionId, repo: latest.cwd, opRef: latest.opRef }) !==
+								"busy"
+							)
+								return false;
+						} catch {
+							return false; // Unavailable refusal evidence remains unknown.
+						}
+						return (
+							this.#updateAttempt(latest.opRef, latest.version, {
+								terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+							}) !== undefined
+						);
+					});
+					if (rejected) {
+						this.#schedule(observer, 0);
+						continue;
+					}
+					if (!this.#current(observer)) continue;
+				}
 				const terminal = status && terminalEvidence(status, this.#at());
 				const terminalStillRunning =
 					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
@@ -2609,17 +2732,14 @@ export class WorkLaneManager {
 	}
 	async #detachObservers(): Promise<void> {
 		const observers = [...this.#observers.values()];
-		for (const observer of observers) {
-			observer.abort.abort();
-			if (observer.timer) clearTimeout(observer.timer);
-		}
 		await Promise.all(
 			observers.map(async (observer) => {
-				await observer.attaching;
+				const disposal = this.#disposeObserver(observer);
 				await observer.task;
-				await observer.tail?.close();
+				await disposal;
 			}),
 		);
+		while (this.#observerDisposals.size) await Promise.all([...this.#observerDisposals]);
 		this.#observers.clear();
 	}
 
@@ -3105,7 +3225,7 @@ function checksOutcome(
 		(facts?.pushed === true && facts.remoteHeadSha === cycle.headSha) ||
 		(checks?.headSha === cycle.headSha && (cycle.prNumber === null || checks.prNumber === cycle.prNumber));
 	if (cycle.prNumber === null) {
-		if (checks === null) return { kind: "ended", reason: "pr_not_found" };
+		if (checks === null) return checksTimeoutOrWait(cycle, now);
 		if (checks?.prState === "closed") {
 			if (checks.merged)
 				return {
@@ -3114,12 +3234,7 @@ function checksOutcome(
 				};
 			return { kind: "ended", reason: `pr_closed pr=${checks.prNumber}` };
 		}
-		if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-		if (!headIsPublished) {
-			if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
-				return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
-			return { kind: "wait" };
-		}
+		if (!headIsPublished) return checksTimeoutOrWait(cycle, now);
 		if (checks?.status === "green") return { kind: "passed" };
 		if (checks?.status === "red")
 			return {
@@ -3127,13 +3242,12 @@ function checksOutcome(
 				failingChecks: checks.failingChecks,
 				...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
 			};
-		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
-			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
-		return { kind: "wait" };
+		return checksTimeoutOrWait(cycle, now);
 	}
-	// null: the branch has no open PR; a different number: the recorded PR is not the open one.
-	if (checks === null || (checks && checks.prNumber !== cycle.prNumber))
-		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
+	// A missing PR result is not proof the checks cycle ended; retain the deadline.
+	if (checks === null || checks === undefined) return checksTimeoutOrWait(cycle, now);
+	// A different number means the recorded PR is no longer the active exact-head match.
+	if (checks.prNumber !== cycle.prNumber) return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	if (checks?.prState === "closed") {
 		if (checks.merged)
 			return {
@@ -3143,11 +3257,7 @@ function checksOutcome(
 		return { kind: "ended", reason: `pr_closed pr=${cycle.prNumber}` };
 	}
 	if (checks && checks.headSha !== cycle.headSha) return checksHeadNotCurrent(cycle, facts, now);
-	if (!headIsPublished) {
-		if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
-			return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
-		return { kind: "wait" };
-	}
+	if (!headIsPublished) return checksTimeoutOrWait(cycle, now);
 	if (checks?.status === "green") return { kind: "passed" };
 	if (checks?.status === "red")
 		return {
@@ -3156,6 +3266,10 @@ function checksOutcome(
 			...(checks.failureLogTail ? { failureLogTail: checks.failureLogTail } : {}),
 		};
 	// Pending, or unavailable (lookup failed): keep waiting until the deadline.
+	return checksTimeoutOrWait(cycle, now);
+}
+
+function checksTimeoutOrWait(cycle: AwaitingChecks, now: number): ChecksOutcome {
 	if (now - Date.parse(cycle.since) >= AWAITING_CHECKS_TIMEOUT_MS)
 		return { kind: "ended", reason: `timeout after ${AWAITING_CHECKS_TIMEOUT_MS / 60_000}m` };
 	return { kind: "wait" };
@@ -3206,6 +3320,7 @@ function checksReportText(
 
 async function collectRepoFacts(
 	worktreePath: string,
+	timeouts: GitTimeouts,
 	checkClient?: CheckStatusClient,
 	includePushStatus = true,
 	checkHeadSha?: string,
@@ -3219,41 +3334,32 @@ async function collectRepoFacts(
 			pushed?: boolean | null;
 			/** Known branch head shared by every configured push URL. */
 			remoteHeadSha?: string;
-			/** null: no open PR for the branch; absent: not pushed, no client, or the lookup failed. */
+			/** null: no PR has this exact head; absent: not pushed, no client, or the lookup failed. */
 			checkStatus?: CheckStatusSnapshot | null;
 	  }
 	| undefined
 > {
 	try {
-		const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
-		const branch = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
-			stdout: "pipe",
-			stderr: "pipe",
+		const head = await runGit(["-C", worktreePath, "rev-parse", "HEAD"], { timeoutMs: timeouts.local });
+		const branch = await runGit(["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
+			timeoutMs: timeouts.local,
 		});
-		const status = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const headSha = head.stdout.toString().trim();
+		const status = await runGit(["-C", worktreePath, "status", "--porcelain"], { timeoutMs: timeouts.local });
+		const headSha = head.stdout.trim();
 		if (head.exitCode !== 0 || status.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(headSha)) return undefined;
 
-		const branchName = branch.stdout.toString().trim() || undefined;
+		const branchName = branch.stdout.trim() || undefined;
 		const result: Awaited<ReturnType<typeof collectRepoFacts>> = {
 			headSha,
-			dirtyFiles: status.stdout
-				.toString()
-				.split("\n")
-				.filter((line) => line.trim()).length,
+			dirtyFiles: status.stdout.split("\n").filter((line) => line.trim()).length,
 			branch: branchName,
 		};
 		// Bare clones do not create remote-tracking refs, so verify every configured push URL directly.
 		if (includePushStatus && branchName && branchName !== "HEAD") {
-			const pushUrlsResult = Bun.spawnSync(
-				["git", "-C", worktreePath, "remote", "get-url", "--push", "--all", "origin"],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
+			const pushUrlsResult = await runGit(["-C", worktreePath, "remote", "get-url", "--push", "--all", "origin"], {
+				timeoutMs: timeouts.local,
+			});
 			const pushUrls = pushUrlsResult.stdout
-				.toString()
 				.split(/\r?\n/)
 				.map((url) => url.trim())
 				.filter(Boolean);
@@ -3262,7 +3368,9 @@ async function collectRepoFacts(
 			} else if (pushUrls.length === 0) {
 				result.pushed = false;
 			} else {
-				const upstreamHeads = await Promise.all(pushUrls.map((url) => remoteBranchSha(url, branchName)));
+				const upstreamHeads = await Promise.all(
+					pushUrls.map((url) => remoteBranchSha(url, branchName, timeouts.probe)),
+				);
 				if (upstreamHeads.some((probe) => probe.kind === "missing")) result.pushed = false;
 				else if (upstreamHeads.some((probe) => probe.kind === "unknown")) result.pushed = null;
 				else {
@@ -3278,6 +3386,7 @@ async function collectRepoFacts(
 					checkHeadSha ?? result.remoteHeadSha ?? headSha,
 					worktreePath,
 					checkPrNumber,
+					branchName,
 				);
 				if (checkStatus !== undefined) result.checkStatus = checkStatus;
 			}
@@ -3294,17 +3403,15 @@ type RemoteBranchProbe =
 	| { readonly kind: "missing" }
 	| { readonly kind: "unknown" };
 
-async function remoteBranchSha(remoteUrl: string, branchName: string): Promise<RemoteBranchProbe> {
+async function remoteBranchSha(remoteUrl: string, branchName: string, timeoutMs: number): Promise<RemoteBranchProbe> {
 	try {
-		const child = Bun.spawn(["git", "ls-remote", "--exit-code", "--heads", remoteUrl, `refs/heads/${branchName}`], {
-			stdout: "pipe",
-			stderr: "ignore",
-			signal: AbortSignal.timeout(REMOTE_REF_PROBE_TIMEOUT_MS),
+		const probe = await runGit(["ls-remote", "--exit-code", "--heads", remoteUrl, `refs/heads/${branchName}`], {
+			timeoutMs,
 		});
-		const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-		const [sha, ref] = output.trim().split(/\s+/, 2);
-		if (exitCode === 2 && output.trim() === "") return { kind: "missing" };
-		if (exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? ""))
+		const output = probe.stdout.trim();
+		const [sha, ref] = output.split(/\s+/, 2);
+		if (probe.exitCode === 2 && output === "") return { kind: "missing" };
+		if (probe.exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? ""))
 			return { kind: "found", sha: sha! };
 		return { kind: "unknown" };
 	} catch {
@@ -3378,7 +3485,8 @@ async function createWorktreeFromRepo(
 	serviceDirectory: string,
 	laneName: string,
 	repo: string,
-	base?: string,
+	base: string | undefined,
+	timeouts: GitTimeouts,
 ): Promise<CreatedRepoWorktree> {
 	const absoluteLaneRoot = resolve(laneRoot);
 	const lanesDir = join(absoluteLaneRoot, "lanes");
@@ -3410,42 +3518,31 @@ async function createWorktreeFromRepo(
 		ownsWorktreePath = true;
 
 		if (!isRemote) {
-			const gitCheckResult = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--git-dir"], {
-				stdout: "ignore",
-				stderr: "pipe",
-			});
+			const gitCheckResult = await runGit(["-C", repo, "rev-parse", "--git-dir"], { timeoutMs: timeouts.local });
 			if (gitCheckResult.exitCode !== 0) {
-				const stderr = gitCheckResult.stderr?.toString().trim() || "not a git repository";
+				const stderr = gitCheckResult.stderr.trim() || "not a git repository";
 				throw new ProtocolError("invalid_params", `repo must be a local git repository: ${stderr}`, {
 					reasonCode: "repo_not_git",
 					repo,
 					stderr,
 				});
 			}
-			const sourceRoot = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--show-toplevel"], {
-				stdout: "pipe",
-				stderr: "ignore",
-			});
-			sourceRepository = sourceRoot.exitCode === 0 ? resolve(sourceRoot.stdout.toString().trim()) : resolve(repo);
-			const remoteHead = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], {
-				stdout: "pipe",
-				stderr: "pipe",
+			const sourceRoot = await runGit(["-C", repo, "rev-parse", "--show-toplevel"], { timeoutMs: timeouts.local });
+			sourceRepository = sourceRoot.exitCode === 0 ? resolve(sourceRoot.stdout.trim()) : resolve(repo);
+			const remoteHead = await runGit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], {
 				cwd: sourceRepository,
+				timeoutMs: timeouts.local,
 			});
 			if (remoteHead.exitCode === 0) {
-				const match = remoteHead.stdout
-					?.toString()
-					.trim()
-					.match(/^refs\/remotes\/origin\/(.+)$/);
+				const match = remoteHead.stdout.trim().match(/^refs\/remotes\/origin\/(.+)$/);
 				if (match?.[1]) defaultRef = match[1];
 			}
 			if (!defaultRef) {
-				const head = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
-					stdout: "pipe",
-					stderr: "pipe",
+				const head = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], {
 					cwd: sourceRepository,
+					timeoutMs: timeouts.local,
 				});
-				if (head.exitCode === 0) defaultRef = head.stdout?.toString().trim() || undefined;
+				if (head.exitCode === 0) defaultRef = head.stdout.trim() || undefined;
 			}
 		}
 		await mkdir(dirname(repositoryPath), { recursive: true });
@@ -3460,29 +3557,17 @@ async function createWorktreeFromRepo(
 			});
 		}
 		ownsRepositoryPath = true;
-		const cloneArgs = ["git", "clone", "--bare", "--", sourceRepository, repositoryPath];
 		let cloneExitCode: number;
 		let cloneStderr: string;
 		try {
-			if (isRemote) {
-				const clone = Bun.spawn(cloneArgs, {
-					stdout: "pipe",
-					stderr: "pipe",
-					signal: AbortSignal.timeout(REMOTE_REPO_CLONE_TIMEOUT_MS),
-				});
-				const [exitCode, , stderr] = await Promise.all([
-					clone.exited,
-					new Response(clone.stdout).arrayBuffer(),
-					new Response(clone.stderr).text(),
-				]);
-				cloneExitCode = exitCode;
-				cloneStderr = stderr.trim();
-			} else {
-				const clone = Bun.spawnSync(cloneArgs, { stdout: "pipe", stderr: "pipe" });
-				cloneExitCode = clone.exitCode;
-				cloneStderr = clone.stderr?.toString().trim() ?? "";
-			}
+			const clone = await runGit(["clone", "--bare", "--", sourceRepository, repositoryPath], {
+				timeoutMs: isRemote ? timeouts.clone : timeouts.local,
+			});
+			cloneExitCode = clone.exitCode;
+			cloneStderr = clone.stderr.trim();
 		} catch (error) {
+			// A deadline is the gateway giving up, not a bad repo argument: keep its typed error.
+			if (error instanceof ProtocolError) throw error;
 			const stderr = error instanceof Error ? error.message : String(error);
 			throw new ProtocolError("invalid_params", `failed to clone lane repository: ${stderr || "unknown error"}`, {
 				reasonCode: "repo_clone_failed",
@@ -3498,24 +3583,22 @@ async function createWorktreeFromRepo(
 		}
 		if (!isRemote) {
 			// Cloning a local checkout makes that path origin; retain its configured upstream URLs instead.
-			const sourceFetchUrls = Bun.spawnSync(["git", "-C", sourceRepository, "remote", "get-url", "--all", "origin"], {
-				stdout: "pipe",
-				stderr: "pipe",
+			const sourceFetchUrls = await runGit(["-C", sourceRepository, "remote", "get-url", "--all", "origin"], {
+				timeoutMs: timeouts.local,
 			});
 			if (sourceFetchUrls.exitCode === 0) {
 				const fetchUrls = sourceFetchUrls.stdout
-					.toString()
 					.split(/\r?\n/)
 					.map((url) => url.trim())
 					.filter(Boolean)
 					.map((url) => resolveLocalRemoteUrl(sourceRepository, url));
 				sourceHasOrigin = fetchUrls.length > 0;
 				for (const [index, fetchUrl] of fetchUrls.entries()) {
-					const setFetchUrl = Bun.spawnSync(
+					const setFetchUrl = await runGit(
 						index === 0
-							? ["git", "remote", "set-url", "origin", fetchUrl]
-							: ["git", "remote", "set-url", "--add", "origin", fetchUrl],
-						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+							? ["remote", "set-url", "origin", fetchUrl]
+							: ["remote", "set-url", "--add", "origin", fetchUrl],
+						{ cwd: repositoryPath, timeoutMs: timeouts.local },
 					);
 					if (setFetchUrl.exitCode !== 0) {
 						throw new ProtocolError("invalid_params", "failed to preserve repository fetch remote", {
@@ -3525,21 +3608,18 @@ async function createWorktreeFromRepo(
 					}
 				}
 			}
-			const sourcePushUrls = Bun.spawnSync(
-				["git", "-C", sourceRepository, "remote", "get-url", "--push", "--all", "origin"],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
+			const sourcePushUrls = await runGit(["-C", sourceRepository, "remote", "get-url", "--push", "--all", "origin"], {
+				timeoutMs: timeouts.local,
+			});
 			if (sourcePushUrls.exitCode === 0) {
 				for (const pushUrl of sourcePushUrls.stdout
-					.toString()
 					.split(/\r?\n/)
 					.map((url) => url.trim())
 					.filter(Boolean)
 					.map((url) => resolveLocalRemoteUrl(sourceRepository, url))) {
-					const setPushUrl = Bun.spawnSync(["git", "remote", "set-url", "--add", "--push", "origin", pushUrl], {
-						stdout: "pipe",
-						stderr: "pipe",
+					const setPushUrl = await runGit(["remote", "set-url", "--add", "--push", "origin", pushUrl], {
 						cwd: repositoryPath,
+						timeoutMs: timeouts.local,
 					});
 					if (setPushUrl.exitCode !== 0) {
 						throw new ProtocolError("invalid_params", "failed to preserve repository push remote", {
@@ -3551,10 +3631,9 @@ async function createWorktreeFromRepo(
 			}
 		}
 		const fetchRefspec = "+refs/heads/*:refs/remotes/origin/*";
-		const configureFetch = Bun.spawnSync(["git", "config", "--replace-all", "remote.origin.fetch", fetchRefspec], {
-			stdout: "pipe",
-			stderr: "pipe",
+		const configureFetch = await runGit(["config", "--replace-all", "remote.origin.fetch", fetchRefspec], {
 			cwd: repositoryPath,
+			timeoutMs: timeouts.local,
 		});
 		if (configureFetch.exitCode !== 0) {
 			throw new ProtocolError("invalid_params", "failed to configure lane repository fetch refspec", {
@@ -3566,10 +3645,9 @@ async function createWorktreeFromRepo(
 		const copySourceTrackingRefs = !isRemote && sourceHasOrigin;
 		const refSource = copySourceTrackingRefs ? sourceRepository : repositoryPath;
 		const sourceRefPrefix = copySourceTrackingRefs ? "refs/remotes/origin" : "refs/heads";
-		const availableRefs = Bun.spawnSync(
-			["git", "-C", refSource, "for-each-ref", "--format=%(refname)", sourceRefPrefix],
-			{ stdout: "pipe", stderr: "pipe" },
-		);
+		const availableRefs = await runGit(["-C", refSource, "for-each-ref", "--format=%(refname)", sourceRefPrefix], {
+			timeoutMs: timeouts.local,
+		});
 		if (availableRefs.exitCode !== 0) {
 			throw new ProtocolError("invalid_params", "failed to inspect lane repository refs", {
 				reasonCode: "repo_fetch_refs_failed",
@@ -3577,7 +3655,6 @@ async function createWorktreeFromRepo(
 			});
 		}
 		const refspecs = availableRefs.stdout
-			.toString()
 			.split(/\r?\n/)
 			.map((ref) => ref.trim())
 			.filter(
@@ -3590,10 +3667,9 @@ async function createWorktreeFromRepo(
 			});
 		if (refspecs.length > 0) {
 			const fetchSource = copySourceTrackingRefs ? sourceRepository : ".";
-			const populateTrackingRefs = Bun.spawnSync(["git", "fetch", "--no-tags", "--", fetchSource, ...refspecs], {
-				stdout: "pipe",
-				stderr: "pipe",
+			const populateTrackingRefs = await runGit(["fetch", "--no-tags", "--", fetchSource, ...refspecs], {
 				cwd: repositoryPath,
+				timeoutMs: timeouts.local,
 			});
 			if (populateTrackingRefs.exitCode !== 0) {
 				throw new ProtocolError("invalid_params", "failed to populate lane repository remote-tracking refs", {
@@ -3604,20 +3680,20 @@ async function createWorktreeFromRepo(
 		}
 		if (!isRemote && base === undefined && defaultRef) {
 			const localDefaultBranch = `refs/heads/${defaultRef}`;
-			const localDefaultBranchCheck = Bun.spawnSync(
-				["git", "rev-parse", "--verify", "--quiet", `${localDefaultBranch}^{commit}`],
-				{ stdout: "ignore", stderr: "ignore", cwd: repositoryPath },
+			const localDefaultBranchCheck = await runGit(
+				["rev-parse", "--verify", "--quiet", `${localDefaultBranch}^{commit}`],
+				{ cwd: repositoryPath, timeoutMs: timeouts.local },
 			);
 			if (localDefaultBranchCheck.exitCode !== 0) {
 				const sourceDefaultRef = `refs/remotes/origin/${defaultRef}`;
-				const sourceDefaultRefCheck = Bun.spawnSync(
-					["git", "-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceDefaultRef}^{commit}`],
-					{ stdout: "ignore", stderr: "ignore" },
+				const sourceDefaultRefCheck = await runGit(
+					["-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceDefaultRef}^{commit}`],
+					{ timeoutMs: timeouts.local },
 				);
 				if (sourceDefaultRefCheck.exitCode === 0) {
-					const materializeDefault = Bun.spawnSync(
-						["git", "fetch", "--no-tags", "--", sourceRepository, `+${sourceDefaultRef}:${localDefaultBranch}`],
-						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
+					const materializeDefault = await runGit(
+						["fetch", "--no-tags", "--", sourceRepository, `+${sourceDefaultRef}:${localDefaultBranch}`],
+						{ cwd: repositoryPath, timeoutMs: timeouts.local },
 					);
 					if (materializeDefault.exitCode !== 0) {
 						throw new ProtocolError(
@@ -3630,22 +3706,20 @@ async function createWorktreeFromRepo(
 			}
 		}
 		if (defaultRef) {
-			const symbolicHead = Bun.spawnSync(["git", "symbolic-ref", "HEAD", `refs/heads/${defaultRef}`], {
+			const symbolicHead = await runGit(["symbolic-ref", "HEAD", `refs/heads/${defaultRef}`], {
 				cwd: repositoryPath,
-				stdout: "pipe",
-				stderr: "pipe",
+				timeoutMs: timeouts.local,
 			});
 			if (symbolicHead.exitCode !== 0) defaultRef = undefined;
 		}
 
 		let baseRef = base ?? defaultRef;
 		if (!baseRef) {
-			const headResult = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
-				stdout: "pipe",
-				stderr: "pipe",
+			const headResult = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], {
 				cwd: repositoryPath,
+				timeoutMs: timeouts.local,
 			});
-			if (headResult.exitCode === 0) baseRef = headResult.stdout?.toString().trim() || undefined;
+			if (headResult.exitCode === 0) baseRef = headResult.stdout.trim() || undefined;
 		}
 		if (!baseRef) {
 			throw new ProtocolError("invalid_params", "could not determine the repository default branch", {
@@ -3658,15 +3732,15 @@ async function createWorktreeFromRepo(
 			let fetchedRemoteTrackingBase = false;
 			if (!isRemote) {
 				const sourceRef = `refs/remotes/${baseRef}`;
-				const sourceRefCheck = Bun.spawnSync(
-					["git", "-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceRef}^{commit}`],
-					{ stdout: "ignore", stderr: "ignore" },
+				const sourceRefCheck = await runGit(
+					["-C", sourceRepository, "rev-parse", "--verify", "--quiet", `${sourceRef}^{commit}`],
+					{ timeoutMs: timeouts.local },
 				);
 				if (sourceRefCheck.exitCode === 0) {
-					const fetch = Bun.spawnSync(
-						["git", "fetch", "--no-tags", "--", sourceRepository, `+${sourceRef}:${localBranch}`],
-						{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
-					);
+					const fetch = await runGit(["fetch", "--no-tags", "--", sourceRepository, `+${sourceRef}:${localBranch}`], {
+						cwd: repositoryPath,
+						timeoutMs: timeouts.local,
+					});
 					if (fetch.exitCode !== 0) {
 						throw new ProtocolError(
 							"invalid_params",
@@ -3682,10 +3756,9 @@ async function createWorktreeFromRepo(
 				}
 			}
 			if (!fetchedRemoteTrackingBase) {
-				const branchCheck = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `${localBranch}^{commit}`], {
-					stdout: "ignore",
-					stderr: "ignore",
+				const branchCheck = await runGit(["rev-parse", "--verify", "--quiet", `${localBranch}^{commit}`], {
 					cwd: repositoryPath,
+					timeoutMs: timeouts.local,
 				});
 				if (branchCheck.exitCode === 0) baseRef = localBranch;
 			}
@@ -3697,12 +3770,11 @@ async function createWorktreeFromRepo(
 			});
 		}
 
-		const baseResult = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], {
-			stdout: "pipe",
-			stderr: "pipe",
+		const baseResult = await runGit(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], {
 			cwd: repositoryPath,
+			timeoutMs: timeouts.local,
 		});
-		const baseSha = baseResult.stdout?.toString().trim() || "";
+		const baseSha = baseResult.stdout.trim() || "";
 		if (baseResult.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
 			throw new ProtocolError("invalid_params", "base does not resolve to a commit in the repository", {
 				reasonCode: "repo_base_not_found",
@@ -3711,12 +3783,12 @@ async function createWorktreeFromRepo(
 		}
 
 		worktreeAddAttempted = true;
-		const addResult = Bun.spawnSync(
-			["git", "worktree", "add", "-b", managedLaneBranchName(laneName), worktreePath, baseSha],
-			{ stdout: "pipe", stderr: "pipe", cwd: repositoryPath },
-		);
+		const addResult = await runGit(["worktree", "add", "-b", managedLaneBranchName(laneName), worktreePath, baseSha], {
+			cwd: repositoryPath,
+			timeoutMs: timeouts.local,
+		});
 		if (addResult.exitCode !== 0) {
-			const stderr = addResult.stderr?.toString().trim() || "unknown error";
+			const stderr = addResult.stderr.trim() || "unknown error";
 			throw new ProtocolError("invalid_params", `failed to create lane worktree from repo: ${stderr}`, {
 				reasonCode: "repo_worktree_failed",
 				repo,
@@ -3731,42 +3803,37 @@ async function createWorktreeFromRepo(
 		let partialWorktreeCleanupFailed = false;
 		if (ownsWorktreePath) {
 			if (worktreeAddAttempted && ownsRepositoryPath) {
-				Bun.spawnSync(["git", "worktree", "remove", "--force", worktreePath], {
+				// Best effort: the prune/list below decide whether the worktree is really gone.
+				await runGit(["worktree", "remove", "--force", worktreePath], {
 					cwd: repositoryPath,
-					stdout: "pipe",
-					stderr: "pipe",
-				});
+					timeoutMs: timeouts.local,
+				}).catch(() => undefined);
 				try {
 					if (await pathExists(worktreePath)) await rm(worktreePath, { recursive: true, force: true });
 				} catch {
 					partialWorktreeCleanupFailed = true;
 				}
 				if (!partialWorktreeCleanupFailed) {
-					const prune = Bun.spawnSync(["git", "worktree", "prune"], {
+					const failed = { exitCode: -1, stdout: "", stderr: "" };
+					const prune = await runGit(["worktree", "prune"], { cwd: repositoryPath, timeoutMs: timeouts.local }).catch(
+						() => failed,
+					);
+					const list = await runGit(["worktree", "list", "--porcelain"], {
 						cwd: repositoryPath,
-						stdout: "pipe",
-						stderr: "pipe",
-					});
-					const list = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
-						cwd: repositoryPath,
-						stdout: "pipe",
-						stderr: "pipe",
-					});
+						timeoutMs: timeouts.local,
+					}).catch(() => failed);
 					if (prune.exitCode !== 0 || list.exitCode !== 0) {
 						partialWorktreeCleanupFailed = true;
 					} else {
 						const expectedWorktreePath = canonicalPathIncludingMissing(worktreePath);
-						partialWorktreeCleanupFailed = list.stdout
-							.toString()
-							.split(/\r?\n/)
-							.some((line) => {
-								if (!line.startsWith("worktree ")) return false;
-								try {
-									return canonicalPathIncludingMissing(line.slice("worktree ".length)) === expectedWorktreePath;
-								} catch {
-									return true;
-								}
-							});
+						partialWorktreeCleanupFailed = list.stdout.split(/\r?\n/).some((line) => {
+							if (!line.startsWith("worktree ")) return false;
+							try {
+								return canonicalPathIncludingMissing(line.slice("worktree ".length)) === expectedWorktreePath;
+							} catch {
+								return true;
+							}
+						});
 					}
 				}
 			} else {
@@ -3802,19 +3869,20 @@ async function createWorktreeFromRepo(
 	}
 }
 
-async function discardCreatedWorktree(name: string, created: CreatedRepoWorktree): Promise<void> {
-	const removeResult = Bun.spawnSync(["git", "worktree", "remove", "--force", created.worktreePath], {
+async function discardCreatedWorktree(
+	name: string,
+	created: CreatedRepoWorktree,
+	timeouts: GitTimeouts,
+): Promise<void> {
+	const removeResult = await runGit(["worktree", "remove", "--force", created.worktreePath], {
 		cwd: created.repositoryPath,
-		stdout: "pipe",
-		stderr: "pipe",
+		timeoutMs: timeouts.local,
 	});
-	if (removeResult.exitCode !== 0)
-		throw new Error(removeResult.stderr?.toString().trim() || "git worktree remove failed");
-	Bun.spawnSync(["git", "branch", "-D", managedLaneBranchName(name)], {
+	if (removeResult.exitCode !== 0) throw new Error(removeResult.stderr.trim() || "git worktree remove failed");
+	await runGit(["branch", "-D", managedLaneBranchName(name)], {
 		cwd: created.repositoryPath,
-		stdout: "ignore",
-		stderr: "ignore",
-	});
+		timeoutMs: timeouts.local,
+	}).catch(() => undefined);
 	const { rm } = await import("node:fs/promises");
 	await rm(created.repositoryPath, { recursive: true, force: true });
 }

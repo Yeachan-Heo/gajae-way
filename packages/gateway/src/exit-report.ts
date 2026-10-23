@@ -12,6 +12,7 @@ export type ExitCause =
 	| "uncaught_exception"
 	| "unhandled_rejection"
 	| "signal"
+	| "event_loop_stalled"
 	| "unexpected_exit";
 
 export type ExitWriter = (line: string) => void;

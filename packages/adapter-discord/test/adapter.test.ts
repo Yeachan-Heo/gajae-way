@@ -158,12 +158,12 @@ test("derives engagement from Discord mentions and recognizes DMs as non-group",
 		{ id: "1", content: "hello <@!bot.1>", author, channel: { id: "channel" }, mentions: { has: () => false } },
 		bot,
 	);
-	expect(mentioned).toEqual({ mentioned: true, group: true, authorId: "author-1" });
+	expect(mentioned).toEqual({ mentioned: true, explicitMention: true, group: true, authorId: "author-1" });
 	const dm = engagementForMessage(
 		{ id: "2", content: "hello", author, channel: { id: "dm", isDMBased: () => true }, mentions: { has: () => false } },
 		bot,
 	);
-	expect(dm).toEqual({ mentioned: false, group: false, authorId: "author-1" });
+	expect(dm).toEqual({ mentioned: false, explicitMention: false, group: false, authorId: "author-1" });
 });
 
 test("reports the author's server tag, which every human in the room can already read", () => {

@@ -131,6 +131,35 @@ function providerTransportRetryAttempt(
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function ownedTurnPrompt(store: Store, opRef: string) {
+	const trigger = store.inbox.turnRow(opRef);
+	if (!trigger?.bound_session_id || trigger.turn_epoch === null) return undefined;
+	const authority = store.bindings.authority;
+	const repo = store.bindings.workLaneRepoBySessionId(trigger.bound_session_id);
+	if (!authority || !repo) return undefined;
+	try {
+		const owned = store.bindings.assertOwnedSession(trigger.bound_session_id, repo, authority);
+		if (owned.originKey !== trigger.origin_key || owned.epoch !== trigger.turn_epoch) return undefined;
+		return { sessionId: owned.sessionId, opRef, originKey: owned.originKey, epoch: owned.epoch, repo: owned.repo };
+	} catch (error) {
+		if (error instanceof BrokerAuthorityError) return undefined;
+		throw error;
+	}
+}
+
+/** Release refusal evidence only after this captured owner completes durably. */
+function completeInboundTurn(
+	store: Store,
+	tx: WriteTx,
+	opRef: string,
+	unlinkedReason: TerminalUnlinkedReason = "no_delivery",
+): number {
+	const prompt = ownedTurnPrompt(store, opRef);
+	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
+	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
+	return changed;
+}
+
 export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): number {
 	store.core.assertActive(tx);
 	const trigger = store.inbox.turnRow(opRef);
@@ -141,8 +170,10 @@ export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): numb
 	const key = freshTurnMetaKey(trigger.origin_key, trigger.turn_epoch, trigger.message_id);
 	const prior = Number.parseInt(store.core.metaGet(key) ?? "0", 10);
 	const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
+	const prompt = ownedTurnPrompt(store, opRef);
 	store.core.metaSet(key, String(attempt));
-	store.inbox.turnRequeue(tx, opRef);
+	const changed = store.inbox.turnRequeue(tx, opRef);
+	if (changed > 0 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	return attempt;
 }
 
@@ -216,7 +247,7 @@ export function resetFailedTurn(
 		(cap !== undefined && cap !== "0" && !input.bypassCap)
 	)
 		return undefined;
-	if (store.inbox.turnComplete(tx, input.opRef, "turn_failed") !== 1)
+	if (completeInboundTurn(store, tx, input.opRef, "turn_failed") !== 1)
 		throw new Error("failed turn completion lost its fence");
 	store.core.metaSet(dedupeKey, "1");
 	store.core.metaSet(capKey, "1");
@@ -3167,7 +3198,7 @@ class OriginActor {
 		this.#manager.database.transaction((tx) => {
 			if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 				this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef);
-			this.#manager.database.inbox.turnComplete(tx, bound.turn.opRef);
+			completeInboundTurn(this.#manager.database, tx, bound.turn.opRef);
 		});
 		await this.#notifySettled(bound);
 		await this.#settleAfterTerminal(bound);
@@ -4091,7 +4122,8 @@ class OriginActor {
 		const completed = resetApplied
 			? 1
 			: this.#manager.database.transaction((tx) => {
-					const changed = this.#manager.database.inbox.turnComplete(
+					const changed = completeInboundTurn(
+						this.#manager.database,
 						tx,
 						bound.turn.opRef,
 						bound.retired && !bound.answerWanted ? "retired" : "no_delivery",
@@ -4446,7 +4478,8 @@ class OriginActor {
 		let completed: number;
 		try {
 			completed = database.transaction((tx) => {
-				const changed = database.inbox.turnComplete(
+				const changed = completeInboundTurn(
+					database,
 					tx,
 					bound.turn.opRef,
 					discarded ? "retired" : (answered?.unlinkedReason ?? "turn_failed"),

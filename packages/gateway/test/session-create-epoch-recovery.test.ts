@@ -9,7 +9,7 @@ import { TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
 import { noRelay } from "./session-port.fake";
 
-test("a poisoned session-create key advances one epoch and retries with a fresh key", async () => {
+test("a poisoned session-create key advances one epoch without retrying the old key", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-epoch-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
@@ -17,12 +17,14 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
 	);
 	let creates = 0;
+	const keys: string[] = [];
 	const inputs: Array<Record<string, unknown>> = [];
 	const run: CliRunner = async (args) => {
 		if (args.includes("session.create")) {
 			creates++;
+			keys.push(args[args.indexOf("--idempotency-key") + 1]!);
 			inputs.push(JSON.parse(args[args.indexOf("--json-input") + 1]!) as Record<string, unknown>);
-			if (creates <= 5)
+			if (creates === 1)
 				return {
 					exitCode: 1,
 					stdout: JSON.stringify({
@@ -59,7 +61,9 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 			repo: join(home, "workspace"),
 			model: { preset: "gpt-heavy" },
 		});
-		expect(creates).toBe(6);
+		expect(creates).toBe(2);
+		expect(keys).toHaveLength(2);
+		expect(keys[0]).not.toBe(keys[1]);
 		expect(binding).toMatchObject({ sessionId: "fresh-session", epoch: 1, startupModelApplied: true });
 		expect(database.bindings.getSessionRecord("monitor/eventtype/memory.canonicalize")).toMatchObject({
 			epoch: 1,

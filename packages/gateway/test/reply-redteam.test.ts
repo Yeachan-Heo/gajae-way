@@ -371,14 +371,15 @@ describe("C5 turn header shape", () => {
 	});
 });
 
-describe("C6 engagement policy is untouched", () => {
-	test("Discord: mentioned is computed without any reply input", () => {
+describe("C6 engagement signal separation", () => {
+	test("Discord: explicit mentions are separate from native reply addressing", () => {
 		const source = readSource("packages/adapter-discord/src/main.ts");
-		const mentionedLine = source.split("\n").find((line) => line.includes("mentioned: Boolean(")) ?? "";
-		expect(mentionedLine).toContain("message.mentions?.has(botUser) || contentMention");
+		const explicitMentionLine = source.split("\n").find((line) => line.includes("const explicitMention =")) ?? "";
+		const mentionedLine = source.split("\n").find((line) => line.includes("mentioned: explicitMention")) ?? "";
+		expect(explicitMentionLine).toContain("message.mentions?.has(botUser) || contentMention");
 		expect(mentionedLine).toContain("replyTo?.fromSelf");
 		expect(mentionedLine).not.toContain("replyToMessageId");
-		// `replyTo` is only ever spread into the payload, never into `mentioned`.
+		// Full reply metadata remains separate; only the resolved self-author flag addresses.
 		expect(source.includes("...(replyTo ? { replyTo } : {})")).toBe(true);
 	});
 
@@ -693,12 +694,10 @@ describe("G2 C6 source-text guarantees and full divergence enumeration", () => {
 			expect(line).not.toContain("reference");
 			// The reply signal may be the resolved fromSelf flag only; the raw context
 			// must not leak into `mentioned` through any other field.
-			expect(line.replace(/\|\| replyTo\?\.fromSelf\)?,?$/, "")).not.toContain("replyTo");
+			expect(line.replace(/\|\| replyTo\?\.fromSelf === true,?$/, "")).not.toContain("replyTo");
 		}
-		// The mentioned expression is the mention check plus the addressed-signal reply.
-		expect(source).toContain(
-			"mentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf)",
-		);
+		// Only the resolved fromSelf bit joins the adapter's direct-mention signal.
+		expect(source).toContain("mentioned: explicitMention || replyTo?.fromSelf === true,");
 		// resolveReplyContext's result is only ever spread into the payload.
 		expect(source).toContain("...(replyTo ? { replyTo } : {})");
 		const replyUses = source
@@ -706,7 +705,7 @@ describe("G2 C6 source-text guarantees and full divergence enumeration", () => {
 			.filter((line) => line.includes("replyTo") && !line.includes("replyToMessageId"));
 		expect(replyUses).toEqual([
 			"\tconst replyTo = resolveReplyContext(message, botId);",
-			"\t\tmentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf),",
+			"\t\tmentioned: explicitMention || replyTo?.fromSelf === true,",
 			"\t\t...(replyTo ? { replyTo } : {}),",
 		]);
 	});
