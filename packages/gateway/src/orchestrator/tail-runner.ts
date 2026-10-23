@@ -698,9 +698,7 @@ class ManagedTailHandle implements TailHandle {
 			const hello = new Promise<void>((resolve) => {
 				this.#helloResolve = resolve;
 			});
-			let helloTimedOut = false;
 			const helloTimer = setTimeout(() => {
-				helloTimedOut = true;
 				this.#helloResolve?.();
 			}, this.#runner.helloTimeoutMs);
 			try {

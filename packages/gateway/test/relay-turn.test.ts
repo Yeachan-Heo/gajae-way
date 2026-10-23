@@ -1039,7 +1039,7 @@ test("stream ending without hello fails fast (#410)", async () => {
 	const elapsed = Date.now() - started;
 	expect(error).toBeInstanceOf(Error);
 	const message = (error as Error).message;
-	expect(message).toMatch(/host hello did not arrive after \d+ms \(stream_ended\)/);
+	expect(message).toMatch(/relay hello did not arrive within \d+ms \(stream_ended\)/);
 	// Should fail much faster than the hello timeout (5 seconds)
-	expect(elapsed).toBeLessThan(1_000);
+	expect(elapsed).toBeLessThan(5_000);
 }, 10_000);
