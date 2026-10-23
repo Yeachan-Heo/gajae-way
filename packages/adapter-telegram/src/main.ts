@@ -428,14 +428,18 @@ function telegramRefusedPhoto(error: unknown): boolean {
  * Reads the checked file again at delivery time and refuses it if it is no
  * longer the file the gateway approved: the open must not follow a symlink, the
  * descriptor must still resolve to the checked path, and the size must match
- * exactly. Every refusal is a definitive non-delivery (nothing was posted).
+ * exactly. The open is non-blocking so a path swapped for a FIFO (or a device)
+ * returns at once and is refused as not a regular file, instead of blocking the
+ * open forever and, with it, every later delivery to that chat; O_NONBLOCK has no
+ * effect on reads from a regular file. Every refusal is a definitive
+ * non-delivery (nothing was posted).
  */
 async function readOutboundFile(file: FileRef): Promise<Uint8Array> {
 	if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > OUTBOUND_FILE_MAX_BYTES)
 		throw new TelegramApiError(400, `${file.name} has an invalid checked size`);
 	let handle: Awaited<ReturnType<typeof open>>;
 	try {
-		handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 	} catch (error) {
 		throw new TelegramApiError(
 			400,

@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFile, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { appendFile, mkdtemp, open, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, OriginRef } from "@gajae-gateway/protocol";
@@ -214,6 +215,43 @@ test("a file deleted or swapped for a symlink after the gateway check is refused
 	]);
 	expect(uploads).toHaveLength(0);
 });
+
+test.skipIf(process.platform === "win32")(
+	"a file swapped for a FIFO with no writer is refused at once instead of blocking the chat",
+	async () => {
+		const { bot, uploads } = botFixture();
+		const gateway = mockGateway();
+		const state = await stateWith(DM);
+		const message = await fileDelivery(DM, "report.csv", "a,b\n");
+		if (!message.file) throw new Error("fixture has no file");
+		const fifo = message.file.path;
+		await rm(fifo);
+		const made = Bun.spawnSync(["mkfifo", fifo]);
+		if (made.exitCode !== 0) throw new Error(`mkfifo failed: ${made.stderr.toString()}`);
+		const settled = settleTelegramFile(gateway, bot, state, message).then(() => "settled" as const);
+		const outcome = await Promise.race([settled, Bun.sleep(2_000).then(() => "blocked" as const)]);
+		if (outcome === "blocked") {
+			// A blocking open never returns on its own; attach a writer so the stuck
+			// open (and this test process) can finish, then report the hang.
+			const writer = await open(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+			await settled;
+			await writer.close();
+		}
+		expect(outcome).toBe("settled");
+		expect(uploads).toHaveLength(0);
+		expect(gateway.requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "file-delivery",
+					reason: "report.csv changed after the gateway checked it",
+					ambiguous: false,
+				},
+			},
+		]);
+	},
+	10_000,
+);
 
 test("a transport failure is ambiguous, never retried as a document, and never leaks the bot token", async () => {
 	const urls: string[] = [];
