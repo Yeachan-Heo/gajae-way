@@ -2153,6 +2153,7 @@ function failureDetail(error: unknown): string {
 		"GjcCliUnavailableError",
 		"LastAssistantUnreadableError",
 		"BrokerAuthorityError",
+		"ModelNotSelectedError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -2189,13 +2190,16 @@ function failureDetail(error: unknown): string {
 		"last_assistant_no_items",
 		"last_assistant_null_item",
 		"last_assistant_non_text_item",
+		"model_not_selected",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
 	// Codes and classifiers the SDK itself produced (envelope error code, terminal
 	// error code, outcome classifiers) are bounded machine tokens. Top-level
 	// `code` fields on foreign errors stay on the explicit allowlist; nested cause
-	// codes and their redacted, length-bounded message are surfaced separately.
+	// codes and their redacted, length-bounded message are surfaced separately,
+	// and so is the thrown error's own message (#657): a plain `Error` or an
+	// unlisted class otherwise records only `{"class":"Error"}`.
 	const sdkToken = (value: unknown): string | undefined =>
 		typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : undefined;
 	const nestedCauses = (value: unknown): Record<string, unknown>[] => {
@@ -2263,6 +2267,8 @@ function failureDetail(error: unknown): string {
 	const signal = fields.signal;
 	const status = terminal.status;
 	const outerMessage = error instanceof Error ? error.message : "";
+	const outerDetail = sanitizeDiagnosticDetail(outerMessage, 128);
+	const errorMessage = outerDetail && outerDetail !== code && outerDetail !== message ? outerDetail : undefined;
 	const cause = /Database has closed|closed database/i.test(outerMessage)
 		? "database_closed"
 		: /SQLITE_BUSY|database is locked/i.test(outerMessage)
@@ -2294,6 +2300,7 @@ function failureDetail(error: unknown): string {
 		...(lastStatus ? { lastStatus } : {}),
 		...(cause ? { cause } : {}),
 		...(frame ? { frame } : {}),
+		...(errorMessage ? { errorMessage } : {}),
 		...(causeCode && causeCode !== code ? { causeCode } : {}),
 		...(message ? { message } : {}),
 	});

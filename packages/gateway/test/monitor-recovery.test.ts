@@ -18,7 +18,11 @@ import {
 	startCron,
 } from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
-import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
+import {
+	ModelNotSelectedError,
+	SessionRequestTimeoutError,
+	SessionTerminalError,
+} from "../src/orchestrator/session-port";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_RETRY_BACKOFF_MS } from "../src/store/groups/monitors";
@@ -754,17 +758,24 @@ describe("monitor crash-boundary state machine", () => {
 	});
 
 	for (const [label, error, expected] of [
-		["CLI exit", new GjcCliError("SECRET_RAW", 42, "SECRET_STDERR"), '"exitCode":42'],
+		// The thrown error's own message is persisted sanitized (#657); every other
+		// free-text field (stderr, runtime/terminal/outcome messages, foreign codes,
+		// stack) still must not reach the durable row. `SECRET` marks the latter.
+		[
+			"CLI exit",
+			new GjcCliError("gjc sdk turn.prompt exited 42", 42, "SECRET_STDERR"),
+			'"exitCode":42,"errorMessage":"gjc sdk turn.prompt exited 42"',
+		],
 		[
 			"runtime code",
-			new GjcRuntimeError("SECRET_RAW", { code: "deadline_exceeded", message: "SECRET_RUNTIME" }),
+			new GjcRuntimeError("runtime refused", { code: "deadline_exceeded", message: "SECRET_RUNTIME" }),
 			'"code":"deadline_exceeded"',
 		],
 		[
 			"terminal status",
 			new SessionTerminalError({
-				operationRef: "SECRET_OP",
-				status: { status: "failed", error: { code: "internal_error", message: "SECRET_TERMINAL" } },
+				operationRef: "op-terminal",
+				status: { status: "failed", error: { code: "internal_error", message: "terminal failure" } },
 			} as never),
 			'"terminal":"failed"',
 		],
@@ -772,7 +783,7 @@ describe("monitor crash-boundary state machine", () => {
 		// must carry the envelope code and never a misleading `exitCode: 0`.
 		[
 			"envelope refusal",
-			new GjcCliError("SECRET_RAW", 0, "", { code: "prompt_failed", message: "SECRET_ENVELOPE" }),
+			new GjcCliError("gjc sdk turn.prompt refused", 0, "", { code: "prompt_failed", message: "SECRET_ENVELOPE" }),
 			'"code":"prompt_failed","transport":"envelope"',
 		],
 		// #178: the SDK terminal code and outcome classifiers were flattened away,
@@ -780,10 +791,10 @@ describe("monitor crash-boundary state machine", () => {
 		[
 			"terminal deadline",
 			new SessionTerminalError({
-				operationRef: "SECRET_OP",
+				operationRef: "op-deadline",
 				status: {
 					status: "failed",
-					error: { code: "prompt_deadline_exceeded", message: "SECRET_TERMINAL" },
+					error: { code: "prompt_deadline_exceeded", message: "deadline reached" },
 					outcome: { kind: "failed", provenance: "deadline" },
 				},
 			} as never),
@@ -792,7 +803,7 @@ describe("monitor crash-boundary state machine", () => {
 		[
 			"terminal provider overload",
 			new SessionTerminalError({
-				operationRef: "SECRET_OP",
+				operationRef: "op-overload",
 				status: {
 					status: "failed",
 					outcome: {
@@ -811,21 +822,21 @@ describe("monitor crash-boundary state machine", () => {
 		],
 		[
 			"request wait timeout",
-			new SessionRequestTimeoutError("s1", "SECRET_OP", {
-				operationRef: "SECRET_OP",
+			new SessionRequestTimeoutError("s1", "op-timeout", {
+				operationRef: "op-timeout",
 				status: { status: "in_flight" },
 			} as never),
 			'"class":"SessionRequestTimeoutError","lastStatus":"in_flight"',
 		],
 		[
 			"untrusted fields",
-			Object.assign(new Error("SECRET_RAW"), {
+			Object.assign(new Error("vendor failed token=SECRET_RAW_abcdef123456 ghp_SECRETabcdefgh123"), {
 				code: "SECRET_CODE",
 				signal: "SECRET_SIGNAL",
 				exitCode: -1,
 				stack: "at packages/SECRET_PATH.ts:1",
 			}),
-			'"class":"Error"',
+			'"class":"Error","errorMessage":"vendor failed token=[redacted] [redacted]"',
 		],
 		["missing fields", null, '"class":"unknown"'],
 	] as const) {
@@ -847,6 +858,55 @@ describe("monitor crash-boundary state machine", () => {
 				expect(detail).not.toContain('"exitCode"');
 				expect(detail).not.toContain('"signal"');
 			}
+			expect(stage(db, eventId)).toBe("failed");
+		});
+	}
+	// #657: a send-step refusal recorded only `{"class":"Error","step":"send"}`.
+	// The class and code must survive, and the thrown error's own message must be
+	// kept with the same redaction and 128-char bound as a nested cause message.
+	for (const [label, error, expected, forbidden] of [
+		[
+			"model not selected",
+			new ModelNotSelectedError("op-model"),
+			[
+				'"class":"ModelNotSelectedError","code":"model_not_selected","errorMessage":"turn.prompt explicitly refused: model_not_selected"',
+			],
+			[],
+		],
+		[
+			"plain error message",
+			new Error("model.set succeeded without a changed receipt"),
+			['"class":"Error","errorMessage":"model.set succeeded without a changed receipt"'],
+			[],
+		],
+		[
+			"secret-looking message",
+			new Error(
+				"auth failed Bearer abcdefghijklmnop key=sk-live-0123456789abcdef via https://secret.example/hook?token=1 reading /Users/private/key.pem",
+			),
+			['"errorMessage":"auth failed Bearer [redacted] key=[redacted] via [url] reading [path]"'],
+			["abcdefghijklmnop", "0123456789abcdef", "secret.example", "/Users/", "key.pem"],
+		],
+		[
+			"oversized message",
+			new Error(`${"x".repeat(400)} tail`),
+			[`"errorMessage":"${"x".repeat(128)}"`],
+			["x".repeat(129), "tail"],
+		],
+	] as const) {
+		test(`injected ${label} persists its class, code and sanitized message (#657)`, async () => {
+			const { propagator, monitor, database: db, sessionPort } = await harness(async () => "unused");
+			sessionPort.request = async () => {
+				throw error;
+			};
+			const eventId = seedEvent(db, monitor.monitorId, "failed");
+			await propagator.reconcile();
+			const detail = db.monitors.failure(eventId)?.detail ?? "";
+			for (const fragment of expected) expect(detail).toContain(fragment);
+			for (const fragment of forbidden) expect(detail).not.toContain(fragment);
+			// The longer diagnosis must not truncate the trailing dispatch context.
+			expect(detail).toContain(`"origin":"monitor/eventtype/memory.canonicalize/parent=${monitor.monitorId}"`);
+			expect(detail).toContain('"attempt":2}');
 			expect(stage(db, eventId)).toBe("failed");
 		});
 	}
@@ -978,9 +1038,8 @@ describe("monitor crash-boundary state machine", () => {
 		expect(turns).toBe(attemptsAfter);
 		const failure = db.monitors.failure(eventId);
 		expect(failure).toBeDefined();
-		// Public-safe: no raw error body persisted.
-		expect(failure?.detail).toBeDefined();
-		expect(failure?.detail).not.toContain("turn exploded");
+		// Public-safe: only the sanitized, bounded error message is persisted (#657).
+		expect(failure?.detail).toContain('"errorMessage":"turn exploded"');
 		expect(failure?.code.length ?? 0).toBeGreaterThan(0);
 	});
 
