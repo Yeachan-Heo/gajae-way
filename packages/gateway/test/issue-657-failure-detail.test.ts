@@ -3,13 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
-import { ModelNotSelectedError, type SessionPort } from "../src/orchestrator/session-port";
-import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
-import { Store } from "../src/store";
+import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { DeliveryService } from "../src/delivery/delivery";
+import type { SessionRelayStream } from "../src/orchestrator/broker";
+import type { SessionPort } from "../src/orchestrator/session-port";
+import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
+import { Store } from "../src/store";
 
 test("plain Error with no cause chain yields sanitized failure detail message in failureDetail()", async () => {
 	// This test verifies that failureDetail() includes the top-level error.message
