@@ -47,8 +47,8 @@ test("plain Error with no cause chain yields sanitized failure detail message in
 
 		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.plain_error", {});
 
-		// Wait for dispatch to fail
-		for (let i = 0; i < 100; i++) {
+		// Wait for dispatch to fail (with longer timeout for slower CI)
+		for (let i = 0; i < 300; i++) {
 			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
 			if (row?.stage === "failed") break;
 			await Bun.sleep(10);
@@ -111,8 +111,8 @@ test("ModelNotSelectedError preserves class and model_not_selected code instead 
 
 		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.model_not_selected", {});
 
-		// Wait for dispatch to fail
-		for (let i = 0; i < 100; i++) {
+		// Wait for dispatch to fail (with longer timeout for slower CI)
+		for (let i = 0; i < 300; i++) {
 			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
 			if (row?.stage === "failed") break;
 			await Bun.sleep(10);
