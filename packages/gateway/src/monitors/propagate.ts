@@ -19,6 +19,7 @@ import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/re
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
+	ModelNotSelectedError,
 	type SessionPort,
 	SessionRequestTimeoutError,
 	SessionTerminalError,
@@ -2186,6 +2187,7 @@ function failureDetail(error: unknown): string {
 		"GjcCliUnavailableError",
 		"LastAssistantUnreadableError",
 		"BrokerAuthorityError",
+		"ModelNotSelectedError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -2222,6 +2224,7 @@ function failureDetail(error: unknown): string {
 		"last_assistant_no_items",
 		"last_assistant_null_item",
 		"last_assistant_non_text_item",
+		"model_not_selected",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
@@ -2266,7 +2269,8 @@ function failureDetail(error: unknown): string {
 		.reverse()
 		.flatMap((fields) => [fields.runtimeMessage, fields.message, fields.reason])
 		.map(safeMessage)
-		.find((candidate) => candidate !== undefined);
+		.find((candidate) => candidate !== undefined) ??
+		(error instanceof Error ? safeMessage(error.message) : undefined);
 	const outcomeBody = object(terminal.outcome);
 	// #178: a GjcCliError carries the SDK envelope code in `details`, and a
 	// terminal status carries it in `error.code` or `outcome.code`. Those are the
