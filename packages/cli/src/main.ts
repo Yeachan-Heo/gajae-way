@@ -782,7 +782,16 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const [command, path] = parsed.rest;
 				if (
 					command === undefined ||
-					!["backup", "deliveries", "redeliver", "integrity", "slo", "cycle", "cancel-inbound", "restart-stack"].includes(command)
+					![
+						"backup",
+						"deliveries",
+						"redeliver",
+						"integrity",
+						"slo",
+						"cycle",
+						"cancel-inbound",
+						"restart-stack",
+					].includes(command)
 				)
 					throw new Error(`unknown ops command: ${command ?? "(missing)"}\n${OPS_USAGE}`);
 				const deliveries = command === "deliveries" ? parseOpsDeliveriesArgs(parsed.rest.slice(1)) : undefined;
