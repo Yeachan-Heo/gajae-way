@@ -2263,10 +2263,10 @@ function failureDetail(error: unknown): string {
 		if (!cleaned || cleaned === causeCode) return undefined;
 		return cleaned;
 	};
-	// Only certain error classes are safe to expose in the message field.
-	// SessionTerminalError is excluded because it includes operation IDs.
-	// RelayHelloError and ModelNotSelectedError construct messages from safe parts.
-	const messageSourceClasses = new Set(["RelayHelloError", "RelayRefusedError", "ModelNotSelectedError"]);
+	// A top-level message is recorded only for classes that build it from fixed
+	// text and numbers. Every other message can carry operation ids or remote
+	// text (SessionTerminalError, RelayRefusedError, plain Error).
+	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError"]);
 	const message =
 		causes
 			.slice()
