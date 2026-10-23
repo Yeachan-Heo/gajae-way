@@ -1,5 +1,18 @@
 import type { Dirent } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+	appendFile,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, normalize, relative } from "node:path";
 import {
 	type AxisDescriptor,
@@ -74,25 +87,57 @@ export class MemoryGitLockedError extends Error {
 	}
 }
 
+/**
+ * Runs git with its output in files and its exit status in a third file, written
+ * (via rename, so it is complete when it appears) by the shell that ran git.
+ *
+ * Under Bun 1.4.0 a child's completion was seen never to reach the event loop: a
+ * gateway e2e teardown hung in the memory drain behind a `git init` that had
+ * exited (a zombie nobody reaped, `exitCode` still null, `exited` never settling),
+ * and in other runs behind an output pipe whose end-of-file never arrived after
+ * git exited 0. Either one wedged the memory FIFO, and with it every later intent
+ * and gateway shutdown, for good. So completion is the exit file appearing, polled
+ * alongside `exited`, and no result waits on a pipe: a helper that inherits git's
+ * output cannot hold it open past git's exit either.
+ */
+const MEMORY_GIT_SCRIPT =
+	'out=$1 err=$2 status=$3; shift 3; git "$@" >"$out" 2>"$err"; code=$?; printf %s "$code" >"$status.tmp" && /bin/mv "$status.tmp" "$status"; exit "$code"';
+const MEMORY_GIT_POLL_MIN_MS = 5;
+const MEMORY_GIT_POLL_MAX_MS = 100;
+
 async function memoryGitUnserialized(root: string, args: readonly string[]): Promise<string> {
-	// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
-	// though git exists (observed under parallel test load); one bounded retry
-	// keeps a durable closure from failing on a scheduler hiccup.
-	for (let attempt = 0; ; attempt++) {
+	const scratch = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-"));
+	try {
+		const stdoutPath = join(scratch, "stdout");
+		const stderrPath = join(scratch, "stderr");
+		const statusPath = join(scratch, "status");
+		// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
+		// though the executable exists (observed under parallel test load); one
+		// bounded retry of spawning the shell keeps a durable closure from failing on
+		// a scheduler hiccup. git's own exit status is never retried: it may have done work.
 		let child: ReturnType<typeof Bun.spawn>;
-		try {
-			child = Bun.spawn(["git", ...args], { cwd: root, env: gitEnv(), stdout: "pipe", stderr: "pipe" });
-		} catch (error) {
-			if (attempt === 0) {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				child = Bun.spawn(["/bin/sh", "-c", MEMORY_GIT_SCRIPT, "sh", stdoutPath, stderrPath, statusPath, ...args], {
+					cwd: root,
+					env: gitEnv(),
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				break;
+			} catch (error) {
+				if (attempt > 0) throw error;
 				await Bun.sleep(50);
-				continue;
 			}
-			throw error;
 		}
-		const [stdout, stderr, code] = await Promise.all([
-			new Response(child.stdout as ReadableStream).text(),
-			new Response(child.stderr as ReadableStream).text(),
-			child.exited,
+		const code = await memoryGitStatus(child, statusPath);
+		// Once the status is known nothing here waits on the shell again; a child whose
+		// exit Bun never reports must not keep the event loop alive either.
+		child.unref();
+		const [stdout, stderr] = await Promise.all([
+			readIfPresent(stdoutPath).then((text) => text ?? ""),
+			readIfPresent(stderrPath).then((text) => text ?? ""),
 		]);
 		if (code === 0) return stdout.trim();
 		const lockPath = join(root, ".git", "index.lock");
@@ -106,6 +151,44 @@ async function memoryGitUnserialized(root: string, args: readonly string[]): Pro
 			throw new MemoryGitLockedError(lockPath, ageMs);
 		}
 		throw new Error(gitFailureMessage(args, code, stdout, stderr));
+	} finally {
+		await rm(scratch, { recursive: true, force: true });
+	}
+}
+
+/**
+ * A file the shell may never have created (killed first) reads as absent; any other
+ * read failure is raised, never mistaken for empty output (an empty `log --grep`
+ * means "no such commit" to the closure, which would then commit twice).
+ */
+async function readIfPresent(path: string): Promise<string | undefined> {
+	try {
+		return await readFile(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+/** git's exit status: the status file once it appears, else the shell's own exit if that is seen first. */
+async function memoryGitStatus(child: ReturnType<typeof Bun.spawn>, statusPath: string): Promise<number> {
+	const readStatus = async (): Promise<number | undefined> => {
+		const text = await readIfPresent(statusPath);
+		if (text === undefined) return undefined;
+		// Written whole via rename, so anything but an exit code is a broken invariant.
+		if (!/^\d+$/.test(text)) throw new Error(`memory git status file is malformed: ${JSON.stringify(text)}`);
+		return Number(text);
+	};
+	let exited: number | undefined;
+	void child.exited.then((code) => {
+		exited = code;
+	});
+	for (let delay = MEMORY_GIT_POLL_MIN_MS; ; delay = Math.min(delay * 2, MEMORY_GIT_POLL_MAX_MS)) {
+		const status = await readStatus();
+		if (status !== undefined) return status;
+		// The shell ended without recording git's status (killed before it could).
+		if (exited !== undefined) return (await readStatus()) ?? exited;
+		await Promise.race([child.exited, Bun.sleep(delay)]);
 	}
 }
 

@@ -151,16 +151,28 @@ test("chat.react pairs add and remove on the one chat-scoped id and never reache
 		targetMessageId: "555",
 		emoji: "👍",
 	});
-	const bareRow = () => f.database.outbox.rows().find((row) => row.delivery_id === bare.deliveryId);
+	const row = (deliveryId: string) => f.database.outbox.rows().find((entry) => entry.delivery_id === deliveryId);
+	const bareRow = () => row(bare.deliveryId);
 	await until(() => (bareRow()?.attempts ?? 0) > 0);
 	// A definitive (non-ambiguous) failure, recorded without any Telegram call.
 	expect(bareRow()?.attempts).toBe(1);
 	expect(bareRow()?.state).toBe("pending");
 	expect(f.reactions).toEqual([["22", "555", "👍"]]);
-	await gateway.request("chat.react", { origin: dm, targetMessageId: "22:555", emoji: "👍", action: "remove" });
+	const removed = await gateway.request<{ deliveryId: string }>("chat.react", {
+		origin: dm,
+		targetMessageId: "22:555",
+		emoji: "👍",
+		action: "remove",
+	});
 	await until(() => f.reactions.length > 1);
 	expect(f.reactions).toEqual([
 		["22", "555", "👍"],
 		["22", "555", undefined],
 	]);
+	// Like the other cases, end only once the gateway has settled the last delivery:
+	// the Telegram call lands before `delivery.confirm` is sent, so tearing down on the
+	// reaction alone usually closed the client mid round trip.
+	await until(() => row(removed.deliveryId)?.state === "confirmed");
+	expect(row(removed.deliveryId)?.state).toBe("confirmed");
+	expect(bareRow()?.state).toBe("pending");
 });
