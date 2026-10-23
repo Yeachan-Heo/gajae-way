@@ -258,6 +258,41 @@ test("fails delivery ambiguously when transport times out after dispatch", async
 	}
 });
 
+test("a JSON Bot API transport error is ambiguous and never leaks the bot token", async () => {
+	const home = await temporaryHome();
+	try {
+		const token = "123456:transport-secret";
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const bot = new TelegramBotApi(token, async (url) => {
+			throw new Error(`fetch failed for ${String(url)} (token ${token})`);
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(mockGateway(requests), bot, state, delivery(origin, "reply"));
+		expect(requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "delivery-1",
+					reason:
+						"Telegram sendMessage request failed: fetch failed for https://api.telegram.org/bot<redacted>/sendMessage (token <redacted>)",
+					ambiguous: true,
+				},
+			},
+		]);
+		const polled = await bot.getUpdates().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(polled).toBeInstanceOf(Error);
+		expect((polled as Error).message).not.toContain(token);
+		expect((polled as Error).message).toStartWith("Telegram getUpdates request failed: ");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 // The delivery subscription is the merge seam: it chooses between the reaction
 // path and the text path. Deleting that choice leaves every other test green
 // while a reaction gets POSTED as the bare emoji, which is exactly the outcome

@@ -141,7 +141,7 @@ export class TelegramBotApi implements TelegramFileApi {
 		signal?: AbortSignal,
 		timeoutMs: number = this.timeouts.requestMs,
 	): Promise<T> {
-		const response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
+		const response = await this.#post(method, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(parameters),
@@ -162,10 +162,7 @@ export class TelegramBotApi implements TelegramFileApi {
 
 	/**
 	 * multipart/form-data upload: the bytes and their file name travel in one
-	 * request, so nothing is left half-posted on failure. The request url embeds
-	 * the bot token, and a transport error may echo it, so such errors are rethrown
-	 * with the token removed; they stay plain Errors so the delivery is still
-	 * treated as ambiguous (the upload may have landed).
+	 * request, so nothing is left half-posted on failure.
 	 */
 	async #upload<T>(
 		method: "sendPhoto" | "sendDocument",
@@ -178,19 +175,27 @@ export class TelegramBotApi implements TelegramFileApi {
 		if (target.messageThreadId !== undefined) form.append("message_thread_id", String(target.messageThreadId));
 		if (target.caption !== undefined) form.append("caption", target.caption);
 		form.append(field, new Blob([file.bytes as Uint8Array<ArrayBuffer>]), file.name);
-		let response: Response;
+		const response = await this.#post(method, {
+			method: "POST",
+			body: form,
+			signal: withTimeout(this.timeouts.uploadMs),
+		});
+		return this.#result<T>(method, response);
+	}
+
+	/**
+	 * The request url embeds the bot token, and a transport error may echo it, so
+	 * such errors are rethrown with the token removed. They stay plain Errors so
+	 * the delivery is still treated as ambiguous (the request may have landed).
+	 */
+	async #post(method: string, init: RequestInit): Promise<Response> {
 		try {
-			response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
-				method: "POST",
-				body: form,
-				signal: withTimeout(this.timeouts.uploadMs),
-			});
+			return await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, init);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const detail = this.token ? message.replaceAll(this.token, "<redacted>") : message;
 			throw new Error(`Telegram ${method} request failed: ${detail}`);
 		}
-		return this.#result<T>(method, response);
 	}
 
 	async #result<T>(method: string, response: Response): Promise<T> {
