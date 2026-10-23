@@ -1209,7 +1209,7 @@ export function parseOpsCancelInboundParams(value: unknown): OpsCancelInboundPar
 		!Array.isArray(params.messageIds) ||
 		params.messageIds.length === 0 ||
 		params.messageIds.length > OPS_CANCEL_INBOUND_MAX_IDS ||
-		params.messageIds.some((id) => typeof id !== "string" || !/^[^\s\u0000-\u001f\u007f]{1,256}$/.test(id)) ||
+		params.messageIds.some((id) => typeof id !== "string" || !/^[^\s\p{C}]{1,256}$/u.test(id)) ||
 		new Set(params.messageIds).size !== params.messageIds.length
 	)
 		throw new ProtocolError(
