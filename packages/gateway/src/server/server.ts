@@ -32,6 +32,7 @@ import {
 	PROFILE_VERSION,
 	ProtocolError,
 	parseFileReply,
+	parseOpsCancelInboundParams,
 	parseOriginKey,
 	parseReactionReply,
 	platformSupportsFiles,
@@ -1542,6 +1543,31 @@ async function handleRequest(
 					runtime.restartDrainOwners.delete(restartId);
 				throw error;
 			}
+			return;
+		}
+		case "ops.cancelInbound": {
+			const { restartId, messageIds } = parseOpsCancelInboundParams(request.params);
+			const owner = runtime.restartDrainOwners.get(restartId);
+			if (owner !== undefined && owner !== connection)
+				throw new ProtocolError("verb_failed", "restart drain is owned by another supervisor");
+			if (
+				runtime.stopping ||
+				runtime.pendingOwnerRestartId !== undefined ||
+				runtime.personaSessions.restartDrainId !== restartId
+			)
+				throw new ProtocolError("verb_failed", "matching restart drain is not held");
+			// No await between checking the drain and committing the batch: admission
+			// cannot release the fence or bind a selected row during this transaction.
+			const cancelledMessageIds = options.database.transaction((tx) =>
+				options.database.inbox.cancelPending(tx, restartId, messageIds),
+			);
+			await runtime.personaSessions.discardInbound(cancelledMessageIds);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { restartId, cancelledMessageIds },
+			});
 			return;
 		}
 		case "gateway.restart.cancel": {
