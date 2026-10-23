@@ -192,17 +192,34 @@ export class TelegramBotApi implements TelegramFileApi {
 		try {
 			return await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, init);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			const detail = this.token ? message.replaceAll(this.token, "<redacted>") : message;
-			throw new Error(`Telegram ${method} request failed: ${detail}`);
+			throw new Error(`Telegram ${method} request failed: ${this.#redact(error)}`);
 		}
 	}
 
+	#redact(error: unknown): string {
+		const message = error instanceof Error ? error.message : String(error);
+		return this.token ? message.replaceAll(this.token, "<redacted>") : message;
+	}
+
+	/**
+	 * The request was dispatched before any of this runs. A body that fails to
+	 * arrive (reset, timeout) or a 2xx body that is not JSON means Telegram may
+	 * already have posted, so both stay plain Errors and the delivery is reported
+	 * ambiguous. Only a parsed Telegram rejection, or an unparseable non-2xx
+	 * answer, is a definitive TelegramApiError.
+	 */
 	async #result<T>(method: string, response: Response): Promise<T> {
+		let text: string;
+		try {
+			text = await response.text();
+		} catch (error) {
+			throw new Error(`Telegram ${method} response failed: ${this.#redact(error)}`);
+		}
 		let body: unknown;
 		try {
-			body = await response.json();
+			body = JSON.parse(text);
 		} catch {
+			if (response.ok) throw new Error(`Telegram ${method} returned an invalid response`);
 			throw new TelegramApiError(response.status, `Telegram ${method} returned an invalid response`);
 		}
 		if (!response.ok || !isTelegramResult(body)) {

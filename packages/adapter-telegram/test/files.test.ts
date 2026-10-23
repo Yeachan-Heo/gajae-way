@@ -272,6 +272,71 @@ test("a transport failure is ambiguous, never retried as a document, and never l
 	expect(failure.reason).toContain("<redacted>");
 });
 
+test("a response that fails after dispatch is ambiguous; only an unparseable non-2xx answer is definitive", async () => {
+	const settle = async (answer: (signal: AbortSignal | null | undefined) => Response) => {
+		const methods: string[] = [];
+		const bot = new TelegramBotApi(
+			TOKEN,
+			async (input, init) => {
+				methods.push(String(input).split("/").at(-1) ?? "");
+				return answer(init?.signal);
+			},
+			{ requestMs: 50, uploadMs: 50 },
+		);
+		const gateway = mockGateway();
+		const state = await stateWith(TOPIC, 99);
+		await settleTelegramFile(gateway, bot, state, await fileDelivery(TOPIC, "chart.png", PNG));
+		return { methods, requests: gateway.requests };
+	};
+	// Headers arrived, then the body stalls until the upload timeout aborts it.
+	const stalled = await settle(
+		(signal) =>
+			new Response(
+				new ReadableStream({
+					start(controller) {
+						signal?.addEventListener("abort", () => controller.error(signal.reason));
+					},
+				}),
+				{ status: 200 },
+			),
+	);
+	expect(stalled.methods).toEqual(["sendPhoto"]);
+	expect(stalled.requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: expect.objectContaining({ deliveryId: "file-delivery", ambiguous: true }),
+		},
+	]);
+	expect((stalled.requests[0]?.params as { reason: string }).reason).toStartWith(
+		"Telegram sendPhoto response failed: ",
+	);
+
+	const garbled = await settle(() => new Response("<html>bad gateway</html>", { status: 200 }));
+	expect(garbled.methods).toEqual(["sendPhoto"]);
+	expect(garbled.requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: {
+				deliveryId: "file-delivery",
+				reason: "Telegram sendPhoto returned an invalid response",
+				ambiguous: true,
+			},
+		},
+	]);
+
+	const refused = await settle(() => new Response("<html>bad request</html>", { status: 400 }));
+	expect(refused.requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: {
+				deliveryId: "file-delivery",
+				reason: "Telegram sendPhoto returned an invalid response",
+				ambiguous: false,
+			},
+		},
+	]);
+});
+
 test("a recovered file upload carries the duplicate warning as its caption", async () => {
 	const { bot, uploads } = botFixture();
 	const gateway = mockGateway();
