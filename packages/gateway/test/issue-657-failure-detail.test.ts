@@ -66,6 +66,7 @@ test("plain Error with no cause chain yields sanitized failure detail message in
 		expect(detail).toContain('"class":"Error"');
 		expect(detail).toContain('"message"');
 
+		await pipeline.drain();
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
@@ -132,6 +133,7 @@ test("ModelNotSelectedError preserves class and model_not_selected code instead 
 		const failureDetailJson = JSON.parse(detail.substring(failureDetailStart, failureDetailEnd));
 		expect(failureDetailJson.code).toBe("model_not_selected");
 
+		await pipeline.drain();
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
