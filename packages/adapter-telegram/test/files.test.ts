@@ -272,7 +272,7 @@ test("a transport failure is ambiguous, never retried as a document, and never l
 	expect(failure.reason).toContain("<redacted>");
 });
 
-test("a response that fails after dispatch is ambiguous; only an unparseable non-2xx answer is definitive", async () => {
+test("a response that fails after dispatch is ambiguous; only a Telegram rejection or a 4xx is definitive", async () => {
 	const settle = async (answer: (signal: AbortSignal | null | undefined) => Response) => {
 		const methods: string[] = [];
 		const bot = new TelegramBotApi(
@@ -318,7 +318,29 @@ test("a response that fails after dispatch is ambiguous; only an unparseable non
 			verb: "delivery.fail",
 			params: {
 				deliveryId: "file-delivery",
-				reason: "Telegram sendPhoto returned an invalid response",
+				reason: "Telegram sendPhoto returned an invalid response (HTTP 200)",
+				ambiguous: true,
+			},
+		},
+	]);
+
+	// Well-formed JSON that is not a Telegram success is no proof of refusal either.
+	for (const shape of [{}, { ok: true }]) {
+		const odd = await settle(() => Response.json(shape));
+		expect(odd.requests).toEqual([
+			{ verb: "delivery.fail", params: expect.objectContaining({ deliveryId: "file-delivery", ambiguous: true }) },
+		]);
+	}
+
+	// A proxy error page: the upstream may still have accepted the upload.
+	const proxied = await settle(() => new Response("<html>502 Bad Gateway</html>", { status: 502 }));
+	expect(proxied.methods).toEqual(["sendPhoto"]);
+	expect(proxied.requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: {
+				deliveryId: "file-delivery",
+				reason: "Telegram sendPhoto returned an invalid response (HTTP 502)",
 				ambiguous: true,
 			},
 		},
@@ -330,9 +352,21 @@ test("a response that fails after dispatch is ambiguous; only an unparseable non
 			verb: "delivery.fail",
 			params: {
 				deliveryId: "file-delivery",
-				reason: "Telegram sendPhoto returned an invalid response",
+				reason: "Telegram sendPhoto returned an invalid response (HTTP 400)",
 				ambiguous: false,
 			},
+		},
+	]);
+
+	// A parsed Telegram rejection is definitive whatever the status, and its
+	// description is still scrubbed of the token.
+	const rejected = await settle(() =>
+		Response.json({ ok: false, error_code: 500, description: `Internal Server Error ${TOKEN}` }, { status: 500 }),
+	);
+	expect(rejected.requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "file-delivery", reason: "Internal Server Error <redacted>", ambiguous: false },
 		},
 	]);
 });

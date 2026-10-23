@@ -202,11 +202,12 @@ export class TelegramBotApi implements TelegramFileApi {
 	}
 
 	/**
-	 * The request was dispatched before any of this runs. A body that fails to
-	 * arrive (reset, timeout) or a 2xx body that is not JSON means Telegram may
-	 * already have posted, so both stay plain Errors and the delivery is reported
-	 * ambiguous. Only a parsed Telegram rejection, or an unparseable non-2xx
-	 * answer, is a definitive TelegramApiError.
+	 * The request was dispatched before any of this runs, so only an answer that
+	 * proves it was refused is a definitive TelegramApiError: a parsed Telegram
+	 * rejection (`ok: false`), or a 4xx whose body is not a Telegram answer. A body
+	 * that fails to arrive (reset, timeout), a 2xx that is not a well-formed
+	 * success, or a 5xx proxy page means Telegram may already have posted, so
+	 * those stay plain Errors and the delivery is reported ambiguous.
 	 */
 	async #result<T>(method: string, response: Response): Promise<T> {
 		let text: string;
@@ -219,15 +220,17 @@ export class TelegramBotApi implements TelegramFileApi {
 		try {
 			body = JSON.parse(text);
 		} catch {
-			if (response.ok) throw new Error(`Telegram ${method} returned an invalid response`);
-			throw new TelegramApiError(response.status, `Telegram ${method} returned an invalid response`);
+			body = undefined;
 		}
-		if (!response.ok || !isTelegramResult(body)) {
+		if (isObject(body) && body.ok === false) {
 			const description =
-				isObject(body) && typeof body.description === "string" ? body.description : `Telegram ${method} failed`;
+				typeof body.description === "string" ? this.#redact(body.description) : `Telegram ${method} failed`;
 			throw new TelegramApiError(response.status, description);
 		}
-		return body.result as T;
+		if (response.ok && isTelegramResult(body)) return body.result as T;
+		const detail = `Telegram ${method} returned an invalid response (HTTP ${response.status})`;
+		if (response.status >= 400 && response.status < 500) throw new TelegramApiError(response.status, detail);
+		throw new Error(detail);
 	}
 
 	getUpdates(offset?: number): Promise<TelegramUpdate[]> {
@@ -450,18 +453,22 @@ function telegramRefusedPhoto(error: unknown): boolean {
  * Reads the checked file again at delivery time and refuses it if it is no
  * longer the file the gateway approved: the open must not follow a symlink, the
  * descriptor must still resolve to the checked path, and the size must match
- * exactly. The open is non-blocking so a path swapped for a FIFO (or a device)
- * returns at once and is refused as not a regular file, instead of blocking the
- * open forever and, with it, every later delivery to that chat; O_NONBLOCK has no
- * effect on reads from a regular file. Every refusal is a definitive
- * non-delivery (nothing was posted).
+ * exactly. O_NONBLOCK keeps the open of a path swapped for a FIFO from waiting
+ * for a writer (which would block it forever and, with it, every later delivery
+ * to that chat), so the FIFO is refused as not a regular file; it does not
+ * change reads from a regular file. O_NOCTTY keeps a swapped-in terminal from
+ * becoming the controlling tty before it is refused. Every refusal is a
+ * definitive non-delivery (nothing was posted).
  */
 async function readOutboundFile(file: FileRef): Promise<Uint8Array> {
 	if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > OUTBOUND_FILE_MAX_BYTES)
 		throw new TelegramApiError(400, `${file.name} has an invalid checked size`);
 	let handle: Awaited<ReturnType<typeof open>>;
 	try {
-		handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		handle = await open(
+			file.path,
+			constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY,
+		);
 	} catch (error) {
 		throw new TelegramApiError(
 			400,
