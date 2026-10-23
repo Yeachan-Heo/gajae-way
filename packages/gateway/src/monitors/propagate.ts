@@ -2263,6 +2263,10 @@ function failureDetail(error: unknown): string {
 		if (!cleaned || cleaned === causeCode) return undefined;
 		return cleaned;
 	};
+	// Only certain error classes are safe to expose in the message field.
+	// SessionTerminalError is excluded because it includes operation IDs.
+	// RelayHelloError and ModelNotSelectedError construct messages from safe parts.
+	const messageSourceClasses = new Set(["RelayHelloError", "RelayRefusedError", "ModelNotSelectedError"]);
 	const message =
 		causes
 			.slice()
@@ -2270,7 +2274,7 @@ function failureDetail(error: unknown): string {
 			.flatMap((fields) => [fields.runtimeMessage, fields.message, fields.reason])
 			.map(safeMessage)
 			.find((candidate) => candidate !== undefined) ??
-		(error instanceof Error ? safeMessage(error.message) : undefined);
+		(messageSourceClasses.has(name) && error instanceof Error ? safeMessage(error.message) : undefined);
 	const outcomeBody = object(terminal.outcome);
 	// #178: a GjcCliError carries the SDK envelope code in `details`, and a
 	// terminal status carries it in `error.code` or `outcome.code`. Those are the
