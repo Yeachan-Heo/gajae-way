@@ -172,3 +172,143 @@ test("journal compaction keeps only what replay needs", async () => {
 		wipeAndReplay(database, raw);
 	});
 });
+
+test("aggressive attempt_updated sweep deletes superseded rows correctly", async () => {
+	await withDb((_path, database, raw) => {
+		// Directly insert simulated attempt_updated journal entries to test the sweep
+		const opRef = "op-update-test";
+		const now = new Date();
+		const oldTime = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000); // 8 days ago
+
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
+			 VALUES 
+			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${now.toISOString()}')`,
+		);
+
+		const beforeSweep = raw
+			.prepare(
+				"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'",
+			)
+			.get(opRef) as { cnt: number };
+		expect(beforeSweep.cnt).toBe(3);
+
+		// Run the aggressive sweep
+		database.sweep(now);
+
+		const afterSweep = raw
+			.prepare(
+				"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'",
+			)
+			.get(opRef) as { cnt: number };
+		// Should have deleted the old superseded rows, keeping only the latest
+		expect(afterSweep.cnt).toBe(1);
+
+		// Verify the remaining row is the latest one
+		const remaining = raw
+			.prepare(
+				"SELECT recorded_at FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'",
+			)
+			.get(opRef) as { recorded_at: string };
+		expect(remaining.recorded_at).toBe(now.toISOString());
+	});
+});
+
+test("terminal attempt events are not deleted by attempt_updated sweep", async () => {
+	await withDb((_path, database, raw) => {
+		// Insert simulated journal entries with a terminal event
+		const opRef = "op-terminal";
+		const now = new Date();
+		const oldTime = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000); // 8 days ago
+
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
+			 VALUES 
+			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
+			 ('attempt', '${opRef}', 'attempt_terminal', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}')`,
+		);
+
+		const beforeSweep = raw
+			.prepare(
+				"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_terminal'",
+			)
+			.get(opRef) as { cnt: number };
+		expect(beforeSweep.cnt).toBe(1);
+
+		// Run the sweep at 8 days (after attempt_updated cutoff but within 30-day window)
+		database.sweep(now);
+
+		const afterSweep = raw
+			.prepare(
+				"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_terminal'",
+			)
+			.get(opRef) as { cnt: number };
+		// Terminal event should still be there (it's not deleted by the aggressive sweep)
+		expect(afterSweep.cnt).toBe(1);
+
+		const updateAfterSweep = raw
+			.prepare(
+				"SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt' AND entity_key = ? AND event_type = 'attempt_updated'",
+			)
+			.get(opRef) as { cnt: number };
+		// But the old update should be deleted by the standard sweep
+		expect(updateAfterSweep.cnt).toBe(0);
+	});
+});
+
+test("sweepAttemptUpdated EXISTS subquery uses the (entity, entity_key, seq) index", async () => {
+	await withDb((_path, _database, raw) => {
+		// Verify the query plan uses the index for the EXISTS subquery
+		const plan = raw
+			.query<{ detail: string }, []>(
+				"EXPLAIN QUERY PLAN SELECT seq FROM work_journal AS j WHERE entity = 'attempt' AND event_type = 'attempt_updated' AND EXISTS (SELECT 1 FROM work_journal AS later WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq)",
+			)
+			.all();
+		const planStr = plan.map((p) => p.detail).join("\n");
+		// The plan should reference the work_journal_entity_key index
+		expect(planStr).toContain("work_journal_entity_key");
+	});
+});
+
+test("sweep respects deletion budget between journal and attemptUpdated sweeps", async () => {
+	await withDb((_path, database, raw) => {
+		// Create old attempts with many updates
+		const now = new Date();
+		// Older than HISTORY_RETENTION_MS, so both the 30-day sweep and the attempt_updated sweep
+		// have at least `batch` eligible rows; only a shared budget keeps the total at one batch.
+		const oldTime = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000); // 31 days ago
+		const opRef = "op-budget-test";
+
+		// Create 100 old attempt_updated entries
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
+			 VALUES
+			 ('attempt', '${opRef}', 'attempt_started', '{}', '${oldTime.toISOString()}'),
+			 ${Array.from({ length: 100 }, (_, _i) => `('attempt', '${opRef}', 'attempt_updated', '{}', '${oldTime.toISOString()}')`).join(",")}`,
+		);
+
+		const beforeCount = raw.prepare("SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt'").get() as {
+			cnt: number;
+		};
+		expect(beforeCount.cnt).toBe(101); // 1 started + 100 updates
+
+		// Sweep with a small batch size
+		const result = database.sweep(now, 10);
+
+		// Total deleted should not exceed batch size (budget is per transaction)
+		const totalDeleted = result.deleted.work_journal || 0;
+		expect(totalDeleted).toBe(10);
+
+		// Should indicate more work to do
+		expect(result.more).toBe(true);
+
+		const afterCount = raw.prepare("SELECT COUNT(*) as cnt FROM work_journal WHERE entity = 'attempt'").get() as {
+			cnt: number;
+		};
+		expect(afterCount.cnt).toBe(beforeCount.cnt - totalDeleted);
+	});
+});
