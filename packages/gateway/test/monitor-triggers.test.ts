@@ -250,26 +250,114 @@ test("catch-all origin retains undeclared event identity", () => {
 	expect(originKey(CATCH_ALL_EVENT_ORIGIN)).toBe("monitor/eventtype/catch-all");
 });
 
-test("default memory monitors seed once and respect operator removals", async () => {
+test("default memory monitors seed per-name and respect operator removals", async () => {
 	const { mkdtemp: mkTemp } = await import("node:fs/promises");
 	const { tmpdir: tmp } = await import("node:os");
 	const { join: joinPath } = await import("node:path");
 	const { Store: Db } = await import("../src/store");
 	const { MonitorRegistry: Registry } = await import("../src/monitors/registry");
 	const { seedDefaultMonitors } = await import("../src/monitors/defaults");
+
+	// Fresh DB seeds all 3 monitors
 	const dir = await mkTemp(joinPath(tmp(), "gajaeway-seed-"));
 	const database = await Db.open(joinPath(dir, "gateway.db"));
 	const registry = new Registry(database);
-	expect(seedDefaultMonitors(registry, database)).toBe(2);
+	expect(seedDefaultMonitors(registry, database)).toBe(3);
 	const names = registry.list().map((monitor) => monitor.name);
 	expect(names).toContain("memory-canonicalize");
 	expect(names).toContain("memory-audit");
-	// Second boot: flag prevents reseeding.
+	expect(names).toContain("memory-debloat");
+
+	// Second boot: per-name flags prevent reseeding
 	expect(seedDefaultMonitors(registry, database)).toBe(0);
-	// Operator removal survives later boots.
+
+	// Operator removal survives later boots
 	const canonical = registry.list().find((monitor) => monitor.name === "memory-canonicalize");
 	registry.remove(canonical?.monitorId ?? "");
 	expect(seedDefaultMonitors(registry, database)).toBe(0);
 	expect(registry.list().map((monitor) => monitor.name)).not.toContain("memory-canonicalize");
 	database.close();
+
+	// Old-flag DB with legacy global flag: seeds only memory-debloat
+	const dir2 = await mkTemp(joinPath(tmp(), "gajaeway-seed-legacy-"));
+	const database2 = await Db.open(joinPath(dir2, "gateway.db"));
+	database2.core.metaSet("default_monitors_seeded", new Date().toISOString());
+	const registry2 = new Registry(database2);
+
+	// Legacy boot seeded both old defaults; the operator has since removed memory-audit.
+	const { DEFAULT_MEMORY_MONITORS } = await import("../src/monitors/defaults");
+	registry2.add(DEFAULT_MEMORY_MONITORS[0]!);
+
+	// Only the new default arrives; the removed legacy default stays removed.
+	expect(seedDefaultMonitors(registry2, database2)).toBe(1);
+	expect(
+		registry2
+			.list()
+			.map((monitor) => monitor.name)
+			.sort(),
+	).toEqual(["memory-canonicalize", "memory-debloat"]);
+	registry2.remove(registry2.list().find((monitor) => monitor.name === "memory-debloat")!.monitorId);
+	expect(seedDefaultMonitors(registry2, database2)).toBe(0);
+	database2.close();
+
+	// A default the operator already created by name counts as seeded, so removing it is final.
+	const dir3 = await mkTemp(joinPath(tmp(), "gajaeway-seed-existing-"));
+	const database3 = await Db.open(joinPath(dir3, "gateway.db"));
+	const registry3 = new Registry(database3);
+	registry3.add(DEFAULT_MEMORY_MONITORS[2]!);
+	expect(seedDefaultMonitors(registry3, database3)).toBe(2);
+	registry3.remove(registry3.list().find((monitor) => monitor.name === "memory-debloat")!.monitorId);
+	expect(seedDefaultMonitors(registry3, database3)).toBe(0);
+	expect(registry3.list().map((monitor) => monitor.name)).not.toContain("memory-debloat");
+	database3.close();
+});
+
+test("memory config validates debloatByteThreshold as positive integer", async () => {
+	const { parseConfigFile } = await import("../src/config");
+
+	// Valid: positive integer
+	const valid = parseConfigFile({
+		schemaVersion: 1,
+		memory: { debloatByteThreshold: 102400 },
+	});
+	expect(valid.memory?.debloatByteThreshold).toBe(102400);
+
+	// Valid: empty object keeps the default threshold
+	const empty = parseConfigFile({
+		schemaVersion: 1,
+		memory: {},
+	});
+	expect(empty.memory?.debloatByteThreshold).toBeUndefined();
+
+	// Invalid: zero
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { debloatByteThreshold: 0 },
+		}),
+	).toThrow("positive integer");
+
+	// Invalid: negative
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { debloatByteThreshold: -1 },
+		}),
+	).toThrow("positive integer");
+
+	// Invalid: non-integer
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { debloatByteThreshold: 102.5 },
+		}),
+	).toThrow("positive integer");
+
+	// Invalid: unknown field in memory
+	expect(() =>
+		parseConfigFile({
+			schemaVersion: 1,
+			memory: { unknownField: 123 },
+		}),
+	).toThrow("unknown field");
 });

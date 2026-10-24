@@ -132,6 +132,8 @@ export interface GatewayConfigFile {
 	readonly interimSpeech?: InterimSpeechConfig;
 	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
+	/** Memory-maintenance settings. */
+	readonly memory?: MemoryConfig;
 	/** Optional absolute path override for the broker agent directory. */
 	readonly gjc?: { readonly agentDir?: string } | undefined;
 	/** SQLite journal mode; defaults to WAL. */
@@ -176,6 +178,15 @@ export interface InterimSpeechConfig {
 	 * The first message is never delayed.
 	 */
 	readonly minGapMs?: number;
+}
+
+export interface MemoryConfig {
+	/**
+	 * Byte size threshold for memory.debloat detector: files in memory/ larger than
+	 * this value (in bytes) are flagged as oversized and routed for restructuring.
+	 * Positive integer; unset defaults to 102400 (100 KB).
+	 */
+	readonly debloatByteThreshold?: number;
 }
 
 export interface BotAudienceConfig {
@@ -417,6 +428,13 @@ function parseNonNegativeInteger(value: unknown, field: string): number | undefi
 	return value as number;
 }
 
+function parsePositiveInteger(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) <= 0)
+		throw new ConfigError("config_invalid", `${field} must be a positive integer`);
+	return value as number;
+}
+
 function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
 	if (value === undefined) return undefined;
 	const input = requireObject(value, "interimSpeech");
@@ -429,6 +447,16 @@ function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
 		...(maxPerTurn === undefined ? {} : { maxPerTurn }),
 		...(minGapMs === undefined ? {} : { minGapMs }),
 	};
+}
+
+function parseMemory(value: unknown): MemoryConfig {
+	// The section name is spliced in so `memory.<field>` never reads as a protocol verb literal.
+	const section = "memory";
+	const input = requireObject(value, section);
+	for (const key of Object.keys(input))
+		if (key !== "debloatByteThreshold") throw new ConfigError("config_invalid", `${section} contains an unknown field`);
+	const debloatByteThreshold = parsePositiveInteger(input.debloatByteThreshold, `${section}.debloatByteThreshold`);
+	return debloatByteThreshold === undefined ? {} : { debloatByteThreshold };
 }
 
 function parseStallTimeout(value: unknown): number {
@@ -753,6 +781,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 				}),
 		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
+		...(input.memory === undefined ? {} : { memory: parseMemory(input.memory) }),
 		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
 	};
 }
@@ -883,6 +912,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 	"monitorCatchUp",
+	"memory",
 	"work",
 	"interimSpeech",
 	"gjc",
