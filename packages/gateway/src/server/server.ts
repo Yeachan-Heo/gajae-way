@@ -143,7 +143,7 @@ import {
 	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
-import { applyModelCommand, listModelChoices } from "./model-command";
+import { applyModelCommand, listModelChoices, ProviderModelCatalog } from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { RestartNotices, restartNoticeText } from "./restart-notice";
@@ -278,6 +278,8 @@ export interface GatewayServerOptions {
 	readonly slo?: SloRecorder;
 	/** Only gateway-owned SDK commands and relays are closed after runtime work drains. */
 	readonly broker?: GlobalGjcClient;
+	/** Test seam: `/model set` provider models; production asks gjc through the broker (`gjc --list-models`). */
+	readonly listProviderModels?: () => Promise<readonly string[]>;
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
@@ -446,6 +448,8 @@ interface Runtime {
 	readonly sessionPort: SessionPort;
 	readonly personaSessions: PersonaSessionManager;
 	readonly readiness: FunctionalReadiness;
+	/** `/model set` autocomplete's cached provider models; absent without a broker. */
+	readonly providerModels?: ProviderModelCatalog;
 	/** Ordered shutdown, wired after construction; owner `/restart` uses it. */
 	stop?: (reason?: string) => Promise<void>;
 	/** Mirrors producer quiescence so restart paths can defer to a live supervisor. */
@@ -955,6 +959,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
 	const readiness = new FunctionalReadiness();
+	const broker = options.broker;
+	const listProviderModels = options.listProviderModels ?? (broker ? () => broker.listAvailableModels() : undefined);
+	const providerModels = listProviderModels ? new ProviderModelCatalog(listProviderModels) : undefined;
 	let runtime!: Runtime;
 	const workspacePath = options.workspace ?? join(options.config.home, "workspace");
 	// gjc rejects a session cwd that is a symlink: `session.create` comes back
@@ -1292,6 +1299,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionPort,
 		personaSessions,
 		readiness,
+		providerModels,
 		connections,
 		memory,
 		registry,
@@ -1956,7 +1964,11 @@ async function handleRequest(
 			return;
 		}
 		case "session.modelChoices": {
-			const choices = await listModelChoices(options.broker?.agentDir, runtime.config.model);
+			const choices = await listModelChoices(
+				options.broker?.agentDir,
+				runtime.config.model,
+				await (runtime.providerModels?.list() ?? []),
+			);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices } });
 			return;
 		}

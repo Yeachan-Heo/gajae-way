@@ -359,6 +359,27 @@ export function isUsageRejection(result: CliResult): boolean {
 	);
 }
 
+/**
+ * Reads the `Provider models` table of `gjc --list-models` into
+ * `provider/model` ids. gjc has no machine-readable listing (through 0.18.12),
+ * so the read is deliberately narrow: rows under that heading's column header
+ * until the first blank line, and nothing at all when the header has moved.
+ */
+export function parseListModelsOutput(stdout: string): string[] {
+	const lines = stdout.split("\n");
+	const heading = lines.findIndex((line) => line.trim() === "Provider models");
+	if (heading < 0) return [];
+	const [providerColumn, modelColumn] = (lines[heading + 1] ?? "").trim().split(/\s+/);
+	if (providerColumn !== "provider" || modelColumn !== "model") return [];
+	const ids: string[] = [];
+	for (const line of lines.slice(heading + 2)) {
+		const [provider, model] = line.trim().split(/\s+/);
+		if (!provider || !model) break;
+		ids.push(`${provider}/${model}`);
+	}
+	return ids;
+}
+
 /** A client of the broker host's pinned GJC runtime; it does not own broker lifecycle. */
 export class GlobalGjcClient {
 	readonly executable: string;
@@ -493,6 +514,17 @@ export class GlobalGjcClient {
 		const version = (result.stdout || result.stderr).match(/(\d+\.\d+\.\d+)/)?.[1];
 		if (result.exitCode === 0 && version) this.#noteVersion(version);
 		return this.#gjcVersion;
+	}
+	/**
+	 * The `provider/model` ids gjc itself lists for this agent dir through its
+	 * `--list-models` command, taken as-is: which models appear is gjc's
+	 * decision, not the gateway's. Background priority so it never delays a
+	 * turn; throws on a gjc failure and the caller fails soft.
+	 */
+	async listAvailableModels(): Promise<string[]> {
+		const result = await this.#run(["--list-models"], COMMAND_TIMEOUT_MS, "background");
+		if (result.exitCode !== 0) throw new Error(`gjc --list-models exited ${result.exitCode}`);
+		return parseListModelsOutput(result.stdout);
 	}
 	#noteVersion(version: string): void {
 		const previous = this.#gjcVersion;

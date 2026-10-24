@@ -427,8 +427,9 @@ export interface SessionListResult {
 
 /**
  * `/model set` choices (session.modelChoices): preset names from the gjc
- * profile's `models.yml` `profiles:` map plus the configured gateway selector.
- * Fails soft: an unreadable catalog yields an empty list, never an error.
+ * profile's `models.yml` `profiles:` map plus the configured gateway selector,
+ * then the `provider/model` ids gjc lists (`gjc --list-models`). Fails soft: an
+ * unreadable catalog yields fewer (or no) choices, never an error.
  */
 export interface SessionModelChoicesResult {
 	readonly choices: readonly string[];
