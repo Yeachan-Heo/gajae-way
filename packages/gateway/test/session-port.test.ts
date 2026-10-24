@@ -9,6 +9,7 @@ import {
 	BrokerSessionPort,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
+	SessionContractError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
 import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
@@ -585,6 +586,48 @@ test("model thinking suffix is applied on create and explicit model changes", as
 	expect(calls.findIndex((args) => args.includes("inspect"))).toBeLessThan(
 		calls.findIndex((args) => args.includes("thinking.set")),
 	);
+});
+
+test("control setters without a boolean changed receipt throw SessionContractError with fixed text", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-contract-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const malformed = new Set<string>();
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "contract-1" } }), stderr: "" };
+		for (const op of ["model.profile.set", "model.set", "thinking.set", "service_tier.set"])
+			if (args.includes(op)) {
+				const changed = malformed.has(op) ? "yes" : false;
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed } }), stderr: "" };
+			}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const binding = await port.bind({ originKey: "discord/dm/contract", epoch: 0, repo });
+	const target = { sessionId: binding.sessionId, repo };
+	const cases: Array<[string, () => Promise<unknown>]> = [
+		["model.profile.set", () => port.setModel({ ...target, selection: { preset: "gpt-heavy" } })],
+		["model.set", () => port.setModel({ ...target, selection: "openai-codex/gpt-5.5" })],
+		["thinking.set", () => port.setModel({ ...target, selection: "openai-codex/gpt-5.5:high" })],
+		["service_tier.set", () => port.setServiceTier({ ...target, tier: "default" })],
+	];
+	for (const [op, call] of cases) {
+		malformed.clear();
+		malformed.add(op);
+		const error = await call().then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(SessionContractError);
+		expect((error as Error).message).toBe(`${op} succeeded without a changed receipt`);
+	}
 });
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
