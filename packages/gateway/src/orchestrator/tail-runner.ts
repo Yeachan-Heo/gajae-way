@@ -698,9 +698,7 @@ class ManagedTailHandle implements TailHandle {
 			const hello = new Promise<void>((resolve) => {
 				this.#helloResolve = resolve;
 			});
-			let helloTimedOut = false;
 			const helloTimer = setTimeout(() => {
-				helloTimedOut = true;
 				this.#helloResolve?.();
 			}, this.#runner.helloTimeoutMs);
 			try {
@@ -731,8 +729,7 @@ class ManagedTailHandle implements TailHandle {
 				if (!this.#connectionId) {
 					const elapsedMs = this.#runner.now() - openedAt;
 					const childState = streamEnded ? "stream_ended" : "stream_open";
-					if (helloTimedOut) throw new RelayHelloError(elapsedMs, childState);
-					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
+					throw new RelayHelloError(elapsedMs, childState);
 				}
 				if (this.#opRef && this.#streamWithRegisteredProviders !== stream) this.#registerProviders(stream);
 				if (!this.#ready) {
