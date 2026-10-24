@@ -23,7 +23,9 @@ test("the verified gjc range is inclusive of every patch of the ceiling minor an
 	expect(isVerifiedGjcVersion("0.16.0")).toBe(true);
 	expect(isVerifiedGjcVersion("gjc/0.18.1")).toBe(true);
 	expect(isVerifiedGjcVersion("0.18.99")).toBe(true);
-	expect(isVerifiedGjcVersion("0.19.0")).toBe(false);
+	expect(isVerifiedGjcVersion("gjc/0.19.0")).toBe(true);
+	expect(isVerifiedGjcVersion("0.19.99")).toBe(true);
+	expect(isVerifiedGjcVersion("0.20.0")).toBe(false);
 	expect(isVerifiedGjcVersion("1.0.0")).toBe(false);
 	expect(isVerifiedGjcVersion("not a version")).toBe(false);
 });

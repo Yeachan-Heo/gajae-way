@@ -661,7 +661,7 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId, live: true, deleted: false, locator: { repo } } },
+					result: { session: { sessionId, live: true, deleted: false, locator: { cwd: repo } } },
 				}),
 				stderr: "",
 			};

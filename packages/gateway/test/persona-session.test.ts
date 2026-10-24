@@ -4443,8 +4443,9 @@ test("a tail attach that fails before any send releases the lifecycle it created
 
 /**
  * 가8: a gjc session host closes itself after 30 idle minutes. The broker keeps
- * the saved session (inspect: live=false, deleted=false, and since gjc 0.16 no
- * `locator.repo`, so the normalized inspect is undefined). `staleLive` models a
+ * the saved session (live=false, deleted=false; canonical normalization consumes
+ * `locator.cwd`). This test double returns undefined for closed-host inspect.
+ * `staleLive` models a
  * broker that still reports the closed host live, so the send reaches the dead
  * host and fails with `host hello did not arrive`.
  */

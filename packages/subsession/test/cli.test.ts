@@ -18,7 +18,7 @@ const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
 function rawSession(overrides: Record<string, unknown> = {}) {
 	return {
 		sessionId: SESSION,
-		locator: { repo: WORKTREE, stateRoot: `${WORKTREE}/.gjc/state` },
+		locator: { cwd: WORKTREE, worktreeRoot: null, stateRoot: `${WORKTREE}/.gjc/state` },
 		pid: 94406,
 		live: true,
 		deleted: false,
@@ -64,20 +64,55 @@ describe("parseEnvelope", () => {
 			parseEnvelope({ exitCode: 0, stdout: JSON.stringify({ ok: false, error: { code: "nope" } }), stderr: "" }, "x"),
 		).toThrow(/reported failure/);
 	});
+
+	test("retains only the fixed legacy-history diagnostic code, never diagnostic text", () => {
+		const result = {
+			exitCode: 0,
+			stderr: "",
+			stdout: JSON.stringify({
+				ok: false,
+				error: { code: "operation_failed" },
+				diagnostics: [
+					null,
+					"lifecycle_legacy_history_ambiguous",
+					{ code: "untrusted" },
+					{ code: "lifecycle_legacy_history_ambiguous", message: "private diagnostic prose" },
+				],
+			}),
+		};
+		const error = (() => {
+			try {
+				parseEnvelope(result, "session.create");
+			} catch (error) {
+				return error;
+			}
+		})();
+		expect(error).toBeInstanceOf(GjcCliError);
+		expect((error as GjcCliError).diagnostics).toEqual(["lifecycle_legacy_history_ambiguous"]);
+		expect(JSON.stringify(error)).not.toContain("private diagnostic prose");
+	});
 });
 
 describe("listSessions", () => {
-	test("passes --repo and normalizes the broker rows", async () => {
+	test("selects exact cwd scope and normalizes the broker rows", async () => {
 		const calls: string[][] = [];
 		const options = controller(() => ok({ sessions: [rawSession()] }), calls);
 		const sessions = await listSessions(options);
 		expect(sessions[0]).toMatchObject({ sessionId: SESSION, repo: WORKTREE, live: true });
-		expect(calls[0]).toEqual(["sdk", "session", "list", "--repo", WORKTREE]);
+		expect(calls[0]).toEqual(["sdk", "session", "list", "--scope", "cwd", "--repo", WORKTREE]);
 	});
 
 	test("drops rows without an identity or locator instead of failing the poll", async () => {
 		const options = controller(() =>
-			ok({ sessions: [rawSession(), { sessionId: "x" }, { locator: { repo: WORKTREE } }] }),
+			ok({
+				sessions: [
+					rawSession(),
+					{ sessionId: "x" },
+					{ locator: { cwd: WORKTREE } },
+					rawSession({ locator: { repo: WORKTREE } }),
+					rawSession({ locator: { cwd: 7 } }),
+				],
+			}),
 		);
 		expect(await listSessions(options)).toHaveLength(1);
 	});
@@ -109,7 +144,7 @@ describe("verifyReady", () => {
 	});
 
 	test("rejects a session running in a different worktree", async () => {
-		const options = controller(() => ok({ session: rawSession({ locator: { repo: "/wt/other" } }) }));
+		const options = controller(() => ok({ session: rawSession({ locator: { cwd: "/wt/other" } }) }));
 		const result = await verifyReady(options, { sessionId: SESSION, worktreePath: WORKTREE });
 		expect(result).toMatchObject({ ready: false, reason: "cwd-mismatch" });
 	});

@@ -252,7 +252,7 @@ test("work.start reusing a persisted binding during a broker restart waits in th
 						sessionId: "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f",
 						live: true,
 						deleted: false,
-						locator: { repo: f.directory },
+						locator: { cwd: f.directory },
 					},
 				},
 			}),
@@ -413,7 +413,7 @@ test("managed repo cold binding retains its worktree across a broker readiness t
 					exitCode: 0,
 					stdout: JSON.stringify({
 						ok: true,
-						result: { session: { sessionId, live: true, deleted: false, locator: { repo: worktreePath } } },
+						result: { session: { sessionId, live: true, deleted: false, locator: { cwd: worktreePath } } },
 					}),
 					stderr: "",
 				};
@@ -1157,7 +1157,7 @@ async function interruptedBusyWorkFixture() {
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId, live: true, deleted: false, locator: { repo: f.directory } } },
+					result: { session: { sessionId, live: true, deleted: false, locator: { cwd: f.directory } } },
 				}),
 				stderr: "",
 			};

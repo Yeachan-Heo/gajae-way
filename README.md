@@ -74,7 +74,7 @@ For how memory, monitors, and the gateway work end to end, see [the documentatio
 
 **Local installation from source**
 
-Requirements: Bun ≥1.4.0 and an authenticated GJC source profile at `~/.gjc/agent` (credentials and model configuration). The runtime uses the exact GJC version pinned in [`packages/gateway/package.json`](packages/gateway/package.json), currently 0.18.12, installed privately under `$GAJAEWAY_HOME/gjc`; a `gjc` on your PATH is not sufficient.
+Requirements: Bun ≥1.4.0 and an authenticated GJC source profile at `~/.gjc/agent` (credentials and model configuration). The runtime uses the exact GJC version pinned in [`packages/gateway/package.json`](packages/gateway/package.json), currently 0.19.0, installed privately under `$GAJAEWAY_HOME/gjc`; a `gjc` on your PATH is not sufficient.
 
 ```sh
 # Clone and enter the repository

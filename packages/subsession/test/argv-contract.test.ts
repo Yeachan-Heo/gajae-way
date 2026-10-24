@@ -4,10 +4,9 @@ import { sendPrompt } from "../src/send";
 import { fetchOpState } from "../src/status";
 import { fetchLastAssistant, listTranscript } from "../src/transcript";
 
-// gjc 0.17.4 command registry (issue #258), verified against the official
-// 0.17.2 and 0.17.4 linux-x64 binaries: `--agent-dir` is a leaf option (the
-// family-level `sdk session --agent-dir <dir> <leaf>` exits 2 usage on
-// 0.17.4), and `--repo` exists only on the scoped leaves `list` and `tail`.
+// GJC 0.19.0 registry: `--agent-dir` is a leaf option, and `--repo` belongs
+// only on scoped commands. Explicit `--scope cwd` keeps a controller's list
+// scoped to its workspace even outside Git.
 const WORKTREE = "/wt/subsession-runtime";
 const AGENT_DIR = "/profiles/gjc-agent";
 const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
@@ -36,11 +35,21 @@ function recorder(result: unknown): { options: ControllerOptions; calls: string[
 	};
 }
 
-describe("every sdk session leaf builds argv the 0.17.4 registry parses", () => {
-	test("list keeps --repo scoping and binds the agent dir at the leaf", async () => {
+describe("every sdk session leaf builds argv the 0.19.0 registry parses", () => {
+	test("list selects cwd scope and binds the agent dir at the leaf", async () => {
 		const { options, calls } = recorder({ sessions: [] });
 		await listSessions(options);
-		expect(calls[0]).toEqual(["sdk", "session", "list", "--repo", WORKTREE, "--agent-dir", AGENT_DIR]);
+		expect(calls[0]).toEqual([
+			"sdk",
+			"session",
+			"list",
+			"--scope",
+			"cwd",
+			"--repo",
+			WORKTREE,
+			"--agent-dir",
+			AGENT_DIR,
+		]);
 		assertParses(calls[0] ?? []);
 	});
 
