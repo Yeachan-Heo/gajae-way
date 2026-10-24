@@ -136,6 +136,15 @@ export interface GatewayConfigFile {
 	readonly gjc?: { readonly agentDir?: string } | undefined;
 	/** SQLite journal mode; defaults to WAL. */
 	readonly sqlite?: { readonly journalMode?: SqliteJournalMode };
+	/** Chat notices around a stack restart; on unless `enabled` is false. */
+	readonly restartNotice?: RestartNoticeConfig;
+}
+
+export interface RestartNoticeConfig {
+	/** Announce restarts to active conversations. Unset means on. */
+	readonly enabled?: boolean;
+	/** Name the notices speak as; unset uses the first heading of workspace/SOUL.md. */
+	readonly personaName?: string;
 }
 
 export interface MonitorCatchUpConfig {
@@ -595,6 +604,21 @@ function parseSessions(value: unknown): SessionHostConfig {
 	};
 }
 
+function parseRestartNotice(value: unknown): RestartNoticeConfig {
+	const input = requireObject(value, "restartNotice");
+	if (Object.keys(input).some((key) => key !== "enabled" && key !== "personaName"))
+		throw new ConfigError("config_invalid", "restartNotice may only contain enabled and personaName");
+	if (input.enabled !== undefined && typeof input.enabled !== "boolean")
+		throw new ConfigError("config_invalid", "restartNotice.enabled must be a boolean");
+	const personaName = optionalString(input.personaName, "restartNotice.personaName")?.trim();
+	if (personaName !== undefined && (personaName.length === 0 || personaName.length > 80))
+		throw new ConfigError("config_invalid", "restartNotice.personaName must be 1 to 80 characters");
+	return {
+		...(input.enabled === undefined ? {} : { enabled: input.enabled as boolean }),
+		...(personaName === undefined ? {} : { personaName }),
+	};
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -682,6 +706,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.sessions === undefined ? {} : { sessions: parseSessions(input.sessions) }),
+		...(input.restartNotice === undefined ? {} : { restartNotice: parseRestartNotice(input.restartNotice) }),
 		...(sqlite === undefined ? {} : { sqlite }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
@@ -795,7 +820,8 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
  * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
  * `sessions` (persona host cap, host retirement, and idle session reset, applied
- * to the next bind and sweep). Each applies to the next actor event.
+ * to the next bind and sweep), and `restartNotice` (read when the next restart
+ * drain starts or closes). Each applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
@@ -805,6 +831,7 @@ export const RELOADABLE_FIELDS = [
 	"botAudience",
 	"handoffTargets",
 	"sessions",
+	"restartNotice",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
