@@ -1,9 +1,9 @@
 /**
  * The gjc error/version contract this gateway classifies against, in one place.
  *
- * gjc is the user's global runtime and is upgraded underneath a running
- * gateway (`bun install -g gajae-code@latest`). Every classification the
- * gateway makes on a gjc envelope is only as good as the gjc release it was
+ * Production uses a private exact-version runtime selected by the gateway
+ * package pin; attach-only clients can observe a newer broker. Every
+ * classification the gateway makes on a gjc envelope is only as good as the release it was
  * verified against: gjc 0.18 collapsed its internal error codes into a small
  * public set (`session_unavailable` became `endpoint_stale`,
  * `terminal_uncertain` became `operation_failed`), and code that still matched
@@ -19,11 +19,11 @@ export const MIN_GJC_VERSION = "0.18.9";
 
 /**
  * Newest gjc minor whose envelopes this build's classification was verified
- * against (`packages/gateway/test/gjc-contract.live.test.ts`). A newer minor
+ * against (`packages/gateway/test/gjc-contract.e2e.test.ts`). A newer minor
  * still runs, but `ops cycle` gates on `gjc_unverified_version` until the
  * contract test passes on it and this constant is raised.
  */
-export const VERIFIED_GJC_THROUGH = "0.18";
+export const VERIFIED_GJC_THROUGH = "0.19";
 
 function versionParts(version: string): [number, number, number] | undefined {
 	const match = /(\d+)\.(\d+)\.(\d+)/.exec(version);

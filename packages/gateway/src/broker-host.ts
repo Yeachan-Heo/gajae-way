@@ -162,8 +162,9 @@ export async function runForegroundBroker(
 	options: ForegroundBrokerOptions = {},
 	args: readonly string[] = [exe, "sdk", "broker", "run", "--agent-dir", agentDir],
 ): Promise<number> {
-	// The broker and SDK hosts share this private group, so watchdog restarts can
-	// stop them together. Linux also retains systemd's cgroup cleanup fence.
+	// Own the broker's private group. Lifecycle hosts may detach into their own
+	// groups; broker-group exit alone does not prove those hosts have exited.
+	// Linux additionally retains systemd's cgroup cleanup fence.
 	const child = Bun.spawn([...args], {
 		cwd,
 		env,

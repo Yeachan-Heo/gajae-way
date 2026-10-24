@@ -93,7 +93,7 @@ export interface SessionLiveness {
 	readonly activity?: SessionActivity;
 	/** The broker still holds the saved session but marks it deleted. */
 	readonly deleted?: boolean;
-	/** `locator.repo`, or the `locator.cwd` gjc >= 0.16.0 reports in its place. */
+	/** The broker's canonical `locator.cwd`. */
 	readonly workspace?: string;
 	/** The (last) host process identity; a closed session keeps its dead host's. */
 	readonly hostIncarnation?: string;
@@ -967,9 +967,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	/**
-	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
-	 * `locator.repo`, which makes the subsession normalizer return undefined for a
-	 * perfectly well-known session. `disowned` = the broker rejects the id.
+	 * Raw liveness judged on the broker envelope. `disowned` means the broker
+	 * rejects the id, rather than merely reporting a host that is not live.
 	 * `activity` is the host's own `{state, at}` when inspect reports one.
 	 * External probes keep transient failures unknown; resume/readiness use the
 	 * strict helper so broker outages remain retryable.
@@ -993,7 +992,7 @@ export class BrokerSessionPort implements SessionPort {
 				session?: {
 					live?: unknown;
 					deleted?: unknown;
-					locator?: { repo?: unknown; cwd?: unknown };
+					locator?: { cwd?: unknown };
 					activity?: { state?: unknown; at?: unknown };
 					hostIncarnation?: unknown;
 				};
@@ -1014,7 +1013,7 @@ export class BrokerSessionPort implements SessionPort {
 		const live = session?.live;
 		const state = session?.activity?.state;
 		const at = session?.activity?.at;
-		const workspace = session?.locator?.repo ?? session?.locator?.cwd;
+		const workspace = session?.locator?.cwd;
 		const host = session?.hostIncarnation;
 		return {
 			live: typeof live === "boolean" ? live : undefined,
@@ -2474,6 +2473,11 @@ function stableErrorCode(value: unknown): string | undefined {
  * A bare `operation_failed` without the key reference stays a same-key retry.
  */
 function poisonedCreateKeyCode(error: unknown, idempotencyKey: string): string | undefined {
+	// GJC 0.19's legacy-history fence is not a disposable poisoned key. Its
+	// public code is also operation_failed/unknown, but changing key or target
+	// would bypass the broker's explicit requirement for operator reconciliation.
+	if (error instanceof GjcCliError && error.diagnostics.includes("lifecycle_legacy_history_ambiguous"))
+		return undefined;
 	const code = sdkErrorCode(error);
 	if (isRebindableCode(code)) return code;
 	if (code !== "operation_failed" || !(error instanceof GjcCliError)) return undefined;
@@ -2552,6 +2556,7 @@ function sanitizeSdkFailure(error: unknown): Error {
 			error.exitCode,
 			sanitizeDiagnostic(error.stderr),
 			sanitizedDetails(error.details),
+			error.diagnostics,
 		);
 	}
 	return new Error(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error");

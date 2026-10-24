@@ -371,7 +371,7 @@ function makeClient(
 			cwd: fixture.home,
 			pinnedVersion: options.pinnedVersion ?? PINNED_VERSION,
 			spawn,
-			healthIntervalMs: 60_000,
+			healthIntervalMs: 100,
 			readinessAttempts: 30,
 			readinessDelayMs: 100,
 		});
@@ -644,6 +644,11 @@ async function assertRestartRecovery(
 	const discovery = await waitForLiveDiscovery(fixture, host);
 	expect(discovery.pid).not.toBe(oldPid);
 	await assertBrokerOwnedByHost(fixture, host, discovery.pid);
+	// A live discovery file is not yet client readiness. Let the client's normal
+	// attach-only observer establish the replacement broker's request path.
+	const deadline = Date.now() + 30_000;
+	while (!client.isAvailable && Date.now() < deadline) await Bun.sleep(100);
+	expect(client.isAvailable).toBe(true);
 	await client.preflight();
 	if (probes.length === 0) {
 		const result = await client.cli(brokerHealthArgs());
@@ -651,7 +656,7 @@ async function assertRestartRecovery(
 		return;
 	}
 	for (const probe of probes) {
-		const result = await client.cli(probe.args);
+		const result = await client.cli(probe.args, { timeoutMs: probe.name === "session.create" ? 90_000 : 30_000 });
 		if (probe.name === "broker health/session list") expect(isHealthySessionList(result)).toBe(true);
 		if (probe.name !== "session.create") continue;
 		const envelope = JSON.parse(result.stdout) as { ok?: unknown; result?: { sessionId?: unknown } };
@@ -692,7 +697,7 @@ function attachOnlyProbes(fixture: Fixture): Array<{ readonly name: string; read
 				"--idempotency-key",
 				createRef,
 				"--json-input",
-				JSON.stringify({ cwd: fixture.workspace }),
+				JSON.stringify({ cwd: fixture.workspace, readinessTimeoutMs: 60_000 }),
 			],
 		},
 		{
@@ -822,7 +827,7 @@ pinTest(
 	"the real broker-agent provision verb provisions an isolated home and GJC version mismatch is refused",
 	async () => {
 		await withFixture(undefined, async (fixture) => {
-			const harness = makeClient(fixture, { pinnedVersion: "0.0.0" });
+			const harness = makeClient(fixture, { pinnedVersion: "99.0.0" });
 			const mismatch = await harness.client.preflight().catch((error: unknown) => error);
 			expect(mismatch).toBeInstanceOf(Error);
 			expect((mismatch as Error).message).toContain("version mismatch");

@@ -202,6 +202,16 @@ describe("foreground broker host", () => {
 		expect(await Bun.file(fake.argsPath).exists()).toBe(false);
 	});
 
+	test("a verified minor or newer patch cannot bypass the production host's exact pin", async () => {
+		const f = await fixture();
+		await provision(f);
+		for (const version of ["0.18.12", "0.19.1", "0.20.0"]) {
+			const fake = await installFakeGjc(f, { version });
+			expect(await runBrokerHost(await configFor(f))).toBe(1);
+			expect(await Bun.file(fake.argsPath).exists()).toBe(false);
+		}
+	});
+
 	test("version mismatch and broker.env policy refuse before foreground spawn", async () => {
 		const f = await fixture();
 		await provision(f);

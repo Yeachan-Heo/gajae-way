@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
+import { type CliResult, type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner, type TailStreamSpawner } from "../src/orchestrator/tail-runner";
@@ -156,7 +156,7 @@ test("session.create success without an ID retains its key so retry recovers the
 			sessions.set(key, sessionId);
 			return createAttempts === 1 ? ok({}) : ok({ sessionId });
 		}
-		if (args.includes("inspect")) return ok({ session: { live: true, deleted: false, locator: { repo } } });
+		if (args.includes("inspect")) return ok({ session: { live: true, deleted: false, locator: { cwd: repo } } });
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
@@ -180,6 +180,86 @@ test("session.create success without an ID retains its key so retry recovers the
 	expect(binding.sessionId).toBe("sdk-created-once");
 	expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toBeUndefined();
 });
+
+for (const retry of ["same request", "changed repository", "changed model"] as const) {
+	test(`GJC0.19 legacy lifecycle ambiguity preserves the pending create on initial bind and retry with ${retry}`, async () => {
+		const { authority, repo } = await setup();
+		const originKey = "lane/legacy-ambiguous";
+		const scope = JSON.stringify([originKey, 0]);
+		const createKeys: string[] = [];
+		const createInputs: string[] = [];
+		const cli: CliRunner = async (args) => {
+			if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+			createKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			createInputs.push(args[args.indexOf("--json-input") + 1] ?? "{}");
+			return {
+				exitCode: 1,
+				stdout: JSON.stringify({
+					schema: "gjc.command-error",
+					version: 1,
+					ok: false,
+					error: {
+						code: "operation_failed",
+						outcomeCertainty: "unknown",
+						references: [{ kind: "idempotencyKey", value: createKeys[0] }],
+					},
+					diagnostics: [{ code: "lifecycle_legacy_history_ambiguous", message: "untrusted diagnostic text" }],
+				}),
+				stderr: "",
+			};
+		};
+		const port = new BrokerSessionPort({
+			database: database!,
+			authority,
+			cli,
+			tailRunner: new TailRunner({ stream: noRelay, repo }),
+			sleep: async () => {},
+		});
+		// Leave epochRecovery at its public default: ambiguity must never authorize recovery.
+		const originalInput = { originKey, epoch: 0, repo, model: "anthropic/claude-sonnet" };
+		const assertRefusal = async (input: typeof originalInput) => {
+			const error: unknown = await port.bind(input).then(
+				() => {
+					throw new Error("ambiguous lifecycle create unexpectedly bound a session");
+				},
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(GjcCliError);
+			if (!(error instanceof GjcCliError)) throw new Error("expected a safe GjcCliError");
+			expect(error.diagnostics).toEqual(["lifecycle_legacy_history_ambiguous"]);
+			expect(error.message).not.toContain("untrusted diagnostic text");
+			expect(database!.bindings.getSessionRecord(originKey)).toBeUndefined();
+			expect(database!.core.metaGet(`create_rotation:${originKey}`)).toBeUndefined();
+			expect(
+				database!.bindings.brokerOperation(authority, "session.create", JSON.stringify([originKey, 1])),
+			).toBeUndefined();
+		};
+
+		await assertRefusal(originalInput);
+		const originalKey = required(createKeys[0], "original create key");
+		const originalRequest = required(createInputs[0], "original create request");
+		const originalIntent = required(
+			database!.bindings.brokerOperation(authority, "session.create", scope),
+			"original pending create intent",
+		);
+		expect(createKeys).toEqual([originalKey]);
+		expect(originalIntent).toMatchObject({
+			state: "pending",
+			operationRef: originalKey,
+			requestJson: originalRequest,
+		});
+		expect(JSON.parse(originalRequest)).toMatchObject({ cwd: repo, modelId: originalInput.model });
+
+		await assertRefusal({
+			...originalInput,
+			...(retry === "changed repository" ? { repo: join(home, "workspace-retargeted") } : {}),
+			...(retry === "changed model" ? { model: "openai/gpt-4" } : {}),
+		});
+		expect(createKeys).toEqual([originalKey, originalKey]);
+		expect(createInputs).toEqual([originalRequest, originalRequest]);
+		expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toEqual(originalIntent);
+	});
+}
 
 test("a changed repository retires the pending create before binding a replacement session", async () => {
 	const { path, authority, repo } = await setup();
@@ -526,7 +606,7 @@ test("resuming a session invalidates pending and completed closes before a later
 					sessionId,
 					live: live.get(sessionId) ?? false,
 					deleted: false,
-					locator: { repo },
+					locator: { cwd: repo },
 					hostIncarnation: live.get(sessionId) ? "host-resumed" : "host-closed",
 				},
 			});
@@ -600,7 +680,7 @@ test("resume removes a close intent before a broker-side resume can lose its rep
 					sessionId,
 					live,
 					deleted: false,
-					locator: { repo },
+					locator: { cwd: repo },
 					hostIncarnation: live ? "new-host" : "old-host",
 				},
 			});
@@ -641,7 +721,8 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	);
 	const closeKeys: string[] = [];
 	const cli: CliRunner = async (args) => {
-		if (args.includes("inspect")) return ok({ session: { sessionId, live: true, deleted: false, locator: { repo } } });
+		if (args.includes("inspect"))
+			return ok({ session: { sessionId, live: true, deleted: false, locator: { cwd: repo } } });
 		if (args.includes("session.close")) {
 			closeKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
 			return ok({ closed: true });

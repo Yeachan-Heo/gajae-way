@@ -138,7 +138,7 @@ test("an unknown startup model fails without poisoning create keys and can be co
 				stdout: JSON.stringify({
 					ok: true,
 					result: {
-						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { repo: "/tmp/workspace" } },
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
 					},
 				}),
 				stderr: "",

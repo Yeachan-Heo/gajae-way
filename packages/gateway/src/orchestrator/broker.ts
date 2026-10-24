@@ -96,9 +96,8 @@ export interface GlobalGjcClientOptions {
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
-	 * Exact GJC version required; if set, preflight refuses to start the broker
-	 * if the running version does not match exactly. Used by the gateway to
-	 * enforce version pinning across releases.
+	 * Minimum client runtime version for this build. The independently supervised
+	 * production broker host enforces the package pin exactly before spawning.
 	 */
 	readonly pinnedVersion?: string;
 	/**
@@ -306,17 +305,16 @@ export async function preflightGjcRuntime(
 
 	const detectedVersion = version.slice(1, 4).join(".");
 
-	// The pin is a floor, not an exact match: gjc is the user's global runtime and is
-	// upgraded underneath the gateway (gjc-autoupdate), so an exact pin turns every gjc
-	// release into a boot failure. Newer releases run; one past VERIFIED_GJC_THROUGH is
-	// still flagged by `gjc_unverified_version`.
+	// Client admission uses the pin as a floor; the production broker host checks
+	// exact equality against the same package pin. Attach-only clients can observe
+	// newer releases, still flagged past VERIFIED_GJC_THROUGH by ops cycle.
 	if (options?.pinnedVersion) {
 		const pinned = options.pinnedVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
 		if (!pinned) throw new Error("gjc runtime preflight failed: invalid pinned version spec");
 		for (let i = 1; i <= 3; i++) {
 			if (Number(version[i]) < Number(pinned[i]))
 				throw new Error(
-					`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires >= ${options.pinnedVersion}). Run 'gajaeway ops upgrade' to update the gateway's gjc.`,
+					`gjc runtime preflight failed: version mismatch (running ${detectedVersion}, gateway requires >= ${options.pinnedVersion}). Run 'gajaeway update' to install the release-pinned GJC runtime.`,
 				);
 			if (Number(version[i]) > Number(pinned[i])) break;
 		}

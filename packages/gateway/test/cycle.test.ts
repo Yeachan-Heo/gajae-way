@@ -79,10 +79,10 @@ const boundSession = {
 
 describe("runtime cycle projection", () => {
 	test("a gjc newer than the verified contract is a gate; verified and unknown versions are not", () => {
-		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.0" }), generatedAt).gates).toContain(
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.20.0" }), generatedAt).gates).toContain(
 			"gjc_unverified_version",
 		);
-		expect(projectRuntimeCycle(sources({ gjcVersion: "0.18.7" }), generatedAt).gates).not.toContain(
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.0" }), generatedAt).gates).not.toContain(
 			"gjc_unverified_version",
 		);
 		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(

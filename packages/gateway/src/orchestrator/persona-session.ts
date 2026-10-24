@@ -1603,9 +1603,8 @@ class OriginActor {
 			!sameRecoveryAuthority(first.session, second.session);
 		const session = second.session;
 
-		// gjc >= 0.16.0 omits locator.repo, so the subsession normalizer yields
-		// undefined for a perfectly known session; the raw envelope is the
-		// liveness authority and the normalized record only adds repo/deleted.
+		// Raw liveness remains independent evidence when inspect did not return
+		// a normalizable record; a normalized locator also checks workspace identity.
 		const rawLive = raw?.live;
 		const knownById = rawLive !== undefined && raw?.disowned !== true;
 		const recoveryInput = {
