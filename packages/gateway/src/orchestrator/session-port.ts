@@ -20,6 +20,7 @@ import {
 	type PromptStatusBody,
 	parseEnvelope,
 	parseStatusReport,
+	projectOpState,
 	type SendReceipt,
 	type StatusReport,
 	TranscriptIncompleteError,
@@ -424,7 +425,11 @@ export class SessionTerminalError extends Error {
 	readonly status: StatusReport;
 
 	constructor(status: StatusReport) {
-		const detail = status.status.error?.message ?? status.status.error?.code ?? status.status.status;
+		const detail =
+			status.status.error?.message ??
+			status.status.error?.code ??
+			status.status.outcome?.reason ??
+			status.status.status;
 		super(`session operation ${status.operationRef} ended ${status.status.status}: ${detail}`);
 		this.name = "SessionTerminalError";
 		this.status = status;
@@ -1948,6 +1953,9 @@ export class BrokerSessionPort implements SessionPort {
 			} catch (sendError) {
 				if (sendError instanceof BrokerAuthorityError) throw markSessionRequestStep(sendError, "authority");
 				const taggedSendError = markSessionRequestStep(sendError, "send");
+				// Preserve local validation/fingerprint or journal-identity errors.
+				// Recovery must not disguise them as a prior operation's success.
+				if (sendError instanceof OpRefError) throw taggedSendError;
 				// A transport/control failure may occur after the runtime accepted the
 				// prompt. Query the SAME clientRef before retrying; monitor authoring
 				// otherwise ran the event, produced a final answer, then executed it
@@ -1976,7 +1984,10 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			if (!isTerminalStatus(status.status.status))
 				throw markSessionRequestStep(new SessionRequestTimeoutError(input.sessionId, input.opRef, status), "status");
-			if (status.status.status !== "terminal_ok")
+			// Native terminal_ok also includes cancellation, refusal and budget
+			// stops; missing/unknown receipts remain holds. Reuse the canonical
+			// projection before consuming an assistant response as this answer.
+			if (projectOpState(status.status) !== "completed")
 				throw markSessionRequestStep(new SessionTerminalError(status), "status");
 			result = {
 				receipt,
