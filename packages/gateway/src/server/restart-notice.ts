@@ -6,6 +6,7 @@ import {
 	originKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
+import type { RestartNoticeConfig, RestartNoticePhase } from "../config";
 import { buildDeliveryPayload, type DeliveryService } from "../delivery/delivery";
 import type { Store } from "../store";
 import type { WriteTx } from "../store/tx";
@@ -14,8 +15,6 @@ import type { WriteTx } from "../store/tx";
 export const RESTART_NOTICE_ACTIVE_WINDOW_MS = 30 * 60_000;
 
 const RECORD_PREFIX = "restart_notice:";
-
-type NoticePhase = "restarting" | "online" | "cancelled";
 
 /** Durable record of one restart's announcement; deleted with the closing notice. */
 interface RestartNoticeRecord {
@@ -31,7 +30,8 @@ export interface RestartNoticeOptions {
 	readonly delivery: DeliveryService;
 	/** Read at every notice, so a config reload applies to the next restart. */
 	readonly enabled: () => boolean;
-	readonly personaName: () => string;
+	/** Chat text for one phase; read at every notice so a config reload applies. */
+	readonly text: (phase: RestartNoticePhase) => string;
 	/** Hands committed notices to connected adapters; unconnected adapters receive them on their connect sweep. */
 	readonly broadcast: (payloads: readonly ChatMessagePayload[]) => void;
 	/** Restart id this process inherited as an already-held drain at boot; it was announced by its predecessor. */
@@ -53,7 +53,7 @@ export class RestartNotices {
 	readonly #database: Store;
 	readonly #delivery: DeliveryService;
 	readonly #enabled: () => boolean;
-	readonly #personaName: () => string;
+	readonly #text: RestartNoticeOptions["text"];
 	readonly #broadcast: RestartNoticeOptions["broadcast"];
 	readonly #inheritedRestartId: string | undefined;
 	readonly #bootId: string;
@@ -64,7 +64,7 @@ export class RestartNotices {
 		this.#database = options.database;
 		this.#delivery = options.delivery;
 		this.#enabled = options.enabled;
-		this.#personaName = options.personaName;
+		this.#text = options.text;
 		this.#broadcast = options.broadcast;
 		this.#inheritedRestartId = options.inheritedRestartId;
 		this.#bootId = options.bootId ?? crypto.randomUUID();
@@ -83,7 +83,7 @@ export class RestartNotices {
 				? [origin]
 				: [];
 		});
-		const name = this.#personaName();
+		const text = this.#text("restarting");
 		const payloads = this.#database.transaction((tx) => {
 			if (this.#database.core.metaGet(recordKey(restartId)) !== undefined) return [];
 			const record: RestartNoticeRecord = {
@@ -93,7 +93,7 @@ export class RestartNotices {
 				origins: targets.map((origin) => JSON.stringify(origin)),
 			};
 			this.#database.core.metaSet(recordKey(restartId), JSON.stringify(record));
-			return this.#persist(tx, restartId, "restarting", targets, restartingText(name));
+			return this.#persist(tx, restartId, "restarting", targets, text);
 		});
 		if (payloads.length > 0 || targets.length === 0)
 			this.#log(`restart_notice_sent phase=restarting id=${restartId} origins=${payloads.length}`);
@@ -134,23 +134,23 @@ export class RestartNotices {
 
 	#close(record: RestartNoticeRecord, phase: "online" | "cancelled"): void {
 		const enabled = this.#enabled();
-		const name = this.#personaName();
+		const text = this.#text(phase);
 		const origins = record.origins.flatMap((json) => {
 			const origin = chatOrigin(json);
 			return origin ? [origin] : [];
 		});
 		const payloads = this.#database.transaction((tx) => {
-			if (this.#database.core.metaGet(recordKey(record.restartId)) === undefined) return [];
+			// `record` was read before this write lock. Another gateway process on the
+			// same DB (an old generation still releasing its drain while the
+			// replacement boots) may have closed it since; the delete is the one claim.
+			if (this.#database.core.metaGet(recordKey(record.restartId)) === undefined) return undefined;
 			this.#database.core.metaDelete(recordKey(record.restartId));
-			if (!enabled) return [];
-			return this.#persist(
-				tx,
-				record.restartId,
-				phase,
-				origins,
-				phase === "online" ? onlineText(name) : cancelledText(name),
-			);
+			return enabled ? this.#persist(tx, record.restartId, phase, origins, text) : [];
 		});
+		if (payloads === undefined) {
+			this.#log(`restart_notice_skipped phase=${phase} id=${record.restartId} reason=already_closed`);
+			return;
+		}
 		this.#log(`restart_notice_sent phase=${phase} id=${record.restartId} origins=${payloads.length}`);
 		this.#broadcast(payloads);
 	}
@@ -158,7 +158,7 @@ export class RestartNotices {
 	#persist(
 		tx: WriteTx,
 		restartId: string,
-		phase: NoticePhase,
+		phase: RestartNoticePhase,
 		origins: readonly OriginRef[],
 		text: string,
 	): ChatMessagePayload[] {
@@ -207,29 +207,22 @@ function chatOrigin(json: string): OriginRef | undefined {
 	}
 }
 
-export function restartNoticeDeliveryId(restartId: string, key: string, phase: NoticePhase): string {
+export function restartNoticeDeliveryId(restartId: string, key: string, phase: RestartNoticePhase): string {
 	return `gw-r-${createHash("sha256").update(`${restartId}|${key}|${phase}`).digest("hex").slice(0, 32)}`;
 }
 
-export function restartingText(name: string): string {
-	return `⚠️ ${name} is restarting. Messages sent meanwhile are kept and answered once I'm back.`;
-}
+/** Persona name substituted for `{name}` when `restartNotice.personaName` is unset. */
+export const DEFAULT_RESTART_NOTICE_NAME = "Gajaeway";
 
-export function onlineText(name: string): string {
-	return `♻️ ${name} is back online and ready.`;
-}
+/** Neutral third-person defaults; `restartNotice.messages` replaces any of them per phase. */
+export const DEFAULT_RESTART_NOTICE_MESSAGES: { readonly [phase in RestartNoticePhase]: string } = {
+	restarting: "⚠️ {name} is restarting. Messages sent meanwhile are kept and answered after restart.",
+	online: "♻️ {name} is back online.",
+	cancelled: "↩️ {name}'s restart was cancelled. Queued messages are being answered now.",
+};
 
-export function cancelledText(name: string): string {
-	return `↩️ ${name}'s restart was cancelled; I'm still running and picking up queued messages.`;
-}
-
-/** The persona's name: configured, else the first heading of the workspace SOUL.md, else the product name. */
-export function personaNameFrom(configured: string | undefined, soul: string | undefined): string {
-	if (configured?.trim()) return configured.trim();
-	const heading = soul
-		?.split(/\r?\n/)
-		.find((line) => /^#\s+\S/.test(line))
-		?.replace(/^#\s+/, "")
-		.trim();
-	return heading && heading.length <= 80 ? heading : "Gajaeway";
+/** The chat text for `phase`: the configured template or the default, with `{name}` filled in. */
+export function restartNoticeText(config: RestartNoticeConfig | undefined, phase: RestartNoticePhase): string {
+	const template = config?.messages?.[phase] ?? DEFAULT_RESTART_NOTICE_MESSAGES[phase];
+	return template.replaceAll("{name}", config?.personaName ?? DEFAULT_RESTART_NOTICE_NAME);
 }

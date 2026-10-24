@@ -145,7 +145,7 @@ import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
-import { personaNameFrom, RestartNotices } from "./restart-notice";
+import { RestartNotices, restartNoticeText } from "./restart-notice";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -516,14 +516,6 @@ function restartReceiptKeepsDrain(home: string, restartId?: string): boolean {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 		// A corrupt receipt cannot prove the service-manager operation settled.
 		return true;
-	}
-}
-
-function readSoul(workspace: string): string | undefined {
-	try {
-		return readFileSync(join(workspace, "SOUL.md"), "utf8");
-	} catch {
-		return undefined;
 	}
 }
 
@@ -977,7 +969,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		database: options.database,
 		delivery,
 		enabled: () => currentConfig().restartNotice?.enabled !== false,
-		personaName: () => personaNameFrom(currentConfig().restartNotice?.personaName, readSoul(workspace)),
+		text: (phase) => restartNoticeText(currentConfig().restartNotice, phase),
 		broadcast: (payloads) => {
 			for (const payload of payloads) {
 				delivery.markInflight(payload.deliveryId as string);

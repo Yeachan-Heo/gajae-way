@@ -185,7 +185,28 @@ Outbound secret redaction is always on and is configured only through the gatewa
 
 `sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. The `sessions` object is reloadable.
 
-`restartNotice` controls the chat notices around a stack restart: `{ "enabled": false }` turns them off (they are on when unset), and `personaName` sets the name they speak as (1–80 characters; unset uses the first `# ` heading of `workspace/SOUL.md`, else `Gajaeway`). When a restart drain starts, every conversation with a turn in flight or a human message in the last 30 minutes gets one "restarting" notice; muted threads and bot-only rooms are skipped, and repeated `gateway.restart.prepare` calls for the same restart id do not resend. The notified origins and the restart id are recorded in the gateway DB. The replacement gateway closes that record with one "back online" notice; a drain released by the same gateway process (cancelled, timed out, or failed before the gateway was restarted) closes it with a "restart cancelled" notice instead, so no false online notice is sent. Notices are ordinary outbox deliveries, redacted and settled like any reply. The object is reloadable.
+`restartNotice` controls the chat notices around a stack restart. They are on when unset; `{ "enabled": false }` turns them off and writes no restart record. `personaName` (1–80 characters) is the name filled into `{name}`; unset means `Gajaeway`. `workspace/SOUL.md` is never read for the name. The default texts are neutral third person:
+
+| Phase | Default text |
+| --- | --- |
+| `restarting` | `⚠️ {name} is restarting. Messages sent meanwhile are kept and answered after restart.` |
+| `online` | `♻️ {name} is back online.` |
+| `cancelled` | `↩️ {name}'s restart was cancelled. Queued messages are being answered now.` |
+
+`messages` replaces any of them per phase, for example a Korean persona:
+
+```json
+"restartNotice": {
+  "personaName": "카미",
+  "messages": {
+    "restarting": "⚠️ {name} 재시작 중입니다. 그동안 보낸 메시지는 재시작 후 답변합니다.",
+    "online": "♻️ {name} 다시 연결됐습니다.",
+    "cancelled": "↩️ {name} 재시작이 취소됐습니다. 대기 중인 메시지에 지금 답변합니다."
+  }
+}
+```
+
+A template is 1–1000 characters, may use `{name}` any number of times, and is rejected if it contains any other `{word}` placeholder or a key other than `restarting`, `online` or `cancelled`. A phase without a template uses its default. When a restart drain starts, every conversation with a turn in flight or a human message in the last 30 minutes gets one "restarting" notice; muted threads and bot-only rooms are skipped, and repeated `gateway.restart.prepare` calls for the same restart id do not resend. The notified origins and the restart id are recorded in the gateway DB. The replacement gateway closes that record with one "back online" notice; a drain released by the same gateway process (cancelled, timed out, or failed before the gateway was restarted) closes it with a "restart cancelled" notice instead, so no false online notice is sent. Notices are ordinary outbox deliveries, redacted and settled like any reply. The object is reloadable.
 
 `sqlite.journalMode` accepts `DELETE`, `TRUNCATE`, `PERSIST`, or `WAL` (default `WAL`); `MEMORY` and `OFF` are rejected to preserve database durability. Use `DELETE` or `TRUNCATE` for a single gateway instance on an NFS volume, and change this setting only while the gateway is stopped.
 
