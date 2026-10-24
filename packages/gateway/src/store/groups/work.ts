@@ -695,6 +695,13 @@ export class WorkGroup {
 		const current = this.workAttemptGet(opRef);
 		if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 		this.#assertNotQuarantined(current.jobId);
+		// Skip no-op updates where patch contains no actual field changes (only version bumps).
+		const patchedFields = ["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output"] as const;
+		const changed = patchedFields.some((field) => {
+			if (!Object.hasOwn(patch, field)) return false;
+			return JSON.stringify(current[field]) !== JSON.stringify(patch[field as keyof typeof patch]);
+		});
+		if (!changed) return current;
 		const next = this.#workPatched(current, patch);
 		workAssert(next.decision === "undecided" && next.settledAt === null);
 		if (!this.#workCas(tx, current, next)) return undefined;

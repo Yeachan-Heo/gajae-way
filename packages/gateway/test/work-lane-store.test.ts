@@ -1051,4 +1051,133 @@ DELETE FROM schema_migrations WHERE version >= 21;
 		).toBe("no_target");
 		expect(migrated.outbox.rows()).toHaveLength(0);
 	});
+
+	test("no-op update does not journal attempt_updated and does not bump version", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// Attempt a no-op patch (all fields already set to same values)
+		const patched = f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: current.sendPhase,
+				output: current.output,
+			};
+			return updateAttempt(f.database, tx, f.runtime.opRef, current.version, patch);
+		});
+
+		// No-op update should return the current runtime without bumping version
+		expect(patched).toBeTruthy();
+		expect(patched!.version).toBe(0);
+
+		// No journal entry should be created for no-op update
+		const journalEvents = f.raw
+			.query<{ event_type: string }, [string]>(
+				"SELECT event_type FROM work_journal WHERE entity = 'attempt' AND entity_key = ? ORDER BY seq",
+			)
+			.all(f.runtime.opRef)
+			.map((row) => row.event_type);
+
+		// Should only have the initial "attempt_started" event
+		expect(journalEvents).toEqual(["attempt_started"]);
+	});
+
+	test("real field change journals attempt_updated and bumps version", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// Attempt an actual update (changing a field)
+		const patched = f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: "accepted",
+				sendEvidence: { source: "status", observedAt: START },
+			};
+			return updateAttempt(f.database, tx, f.runtime.opRef, current.version, patch);
+		});
+
+		// Update should succeed and bump version
+		expect(patched).toBeTruthy();
+		expect(patched!.version).toBe(1);
+		expect(patched!.sendPhase).toBe("accepted");
+
+		// Journal should have the acceptance event (not update, since this changes acceptance status)
+		const journalEventsReal = f.raw
+			.query<{ event_type: string }, [string]>(
+				"SELECT event_type FROM work_journal WHERE entity = 'attempt' AND entity_key = ? ORDER BY seq",
+			)
+			.all(f.runtime.opRef)
+			.map((row) => row.event_type);
+
+		expect(journalEventsReal).toEqual(["attempt_started", "attempt_accepted"]);
+	});
+
+	test("stale expected version on no-op patch still conflicts", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// First, bump the version with a real update
+		f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: "accepted",
+				sendEvidence: { source: "status", observedAt: START },
+			};
+			updateAttempt(f.database, tx, f.runtime.opRef, current.version, patch);
+		});
+
+		// Now try a no-op update with the stale version (0, but current is 1)
+		const patched = f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: current.sendPhase,
+			};
+			// Use stale version
+			return updateAttempt(f.database, tx, f.runtime.opRef, 0, patch);
+		});
+
+		// Should fail due to version mismatch
+		expect(patched).toBeUndefined();
+	});
+
+	test("boot replay with no-op updates still reconstructs state correctly", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// Do some mixed updates: real changes and no-ops
+		f.database.transaction((tx) => {
+			let current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const realPatch: WorkAttemptPatch = {
+				sendPhase: "accepted",
+				sendEvidence: { source: "status", observedAt: START },
+			};
+			current = updateAttempt(f.database, tx, f.runtime.opRef, current.version, realPatch)!;
+
+			// No-op update (should not journal)
+			const noopPatch: WorkAttemptPatch = {
+				sendPhase: current.sendPhase,
+			};
+			current = updateAttempt(f.database, tx, f.runtime.opRef, current.version, noopPatch) || current;
+
+			// Another no-op update
+			const anotherNoop: WorkAttemptPatch = {
+				output: current.output,
+			};
+			updateAttempt(f.database, tx, f.runtime.opRef, current.version, anotherNoop);
+		});
+
+		// Store the runtime before wiping
+		const beforeWipe = f.database.work.workAttemptGet(f.runtime.opRef)!;
+
+		// Wipe the runtime table and replay from journal
+		f.raw.exec("DELETE FROM work_attempt_runtime");
+		const replayResult = f.database.replayJournal();
+		expect(replayResult.attempts).toBe(1);
+
+		// Verify replayed state matches what we had before
+		const afterReplay = f.database.work.workAttemptGet(f.runtime.opRef)!;
+		expect(afterReplay.version).toBe(beforeWipe.version);
+		expect(afterReplay.sendPhase).toBe(beforeWipe.sendPhase);
+		expect(afterReplay.sendEvidence).toEqual(beforeWipe.sendEvidence);
+	});
 });
