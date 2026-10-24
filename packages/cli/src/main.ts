@@ -8,6 +8,7 @@ import type {
 	MonitorRecord,
 	MonitorScheduleProjection,
 	MonitorSpec,
+	OpsCancelInboundParams,
 	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
@@ -23,7 +24,13 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import {
+	LOOPBACK_ORIGIN,
+	OPS_CYCLE_MAX_LIMIT,
+	originKey,
+	parseOpsCancelInboundParams,
+	WORK_JOBS_MAX_LIMIT,
+} from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -87,7 +94,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops cancel-inbound --restart-id ID --message-id ID [--message-id ID ...]|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -447,7 +454,21 @@ export function sloExitCode(result: OpsSloResult): number {
 }
 
 const OPS_USAGE =
-	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status|--recover --confirm-service-manager-settled]";
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|cancel-inbound --restart-id ID --message-id ID [--message-id ID ...]|restart-stack [--status|--recover --confirm-service-manager-settled]";
+
+function parseOpsCancelInboundArgs(args: readonly string[]): OpsCancelInboundParams {
+	let restartId: string | undefined;
+	const messageIds: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		const value = args[++index];
+		if (!value || value.startsWith("--")) throw new Error(OPS_USAGE);
+		if (flag === "--restart-id" && restartId === undefined) restartId = value;
+		else if (flag === "--message-id") messageIds.push(value);
+		else throw new Error(OPS_USAGE);
+	}
+	return parseOpsCancelInboundParams({ restartId, messageIds });
+}
 
 const OPS_CYCLE_USAGE = "usage: gajaeway ops cycle [--limit N] [--offset N] [--json]";
 
@@ -761,12 +782,23 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const [command, path] = parsed.rest;
 				if (
 					command === undefined ||
-					!["backup", "deliveries", "redeliver", "integrity", "slo", "cycle", "restart-stack"].includes(command)
+					![
+						"backup",
+						"deliveries",
+						"redeliver",
+						"integrity",
+						"slo",
+						"cycle",
+						"cancel-inbound",
+						"restart-stack",
+					].includes(command)
 				)
 					throw new Error(`unknown ops command: ${command ?? "(missing)"}\n${OPS_USAGE}`);
 				const deliveries = command === "deliveries" ? parseOpsDeliveriesArgs(parsed.rest.slice(1)) : undefined;
 				const slo = command === "slo" ? parseOpsSloArgs(parsed.rest.slice(1)) : undefined;
 				const cycle = command === "cycle" ? parseOpsCycleArgs(parsed.rest.slice(1)) : undefined;
+				const cancelInbound =
+					command === "cancel-inbound" ? parseOpsCancelInboundArgs(parsed.rest.slice(1)) : undefined;
 				if (command === "restart-stack") {
 					// Deliberately socket-free: the reason to run this is a gateway that
 					// has to come back, so it must not need the gateway to answer first.
@@ -838,6 +870,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						else for (const line of renderDeliveries(result)) console.log(line);
 					} else if (redeliverParams)
 						console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
+					else if (cancelInbound) console.log(JSON.stringify(await client.opsCancelInbound(cancelInbound)));
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
 					else if (cycle) {
 						const result = await client.opsCycle(cycle.params);
