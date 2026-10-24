@@ -189,6 +189,29 @@ Outbound secret redaction is always on and is configured only through the gatewa
 
 `sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. The `sessions` object is reloadable.
 
+`restartNotice` controls the chat notices around a stack restart. They are on when unset; `{ "enabled": false }` turns them off and writes no restart record. `personaName` (1–80 characters) is the name filled into `{name}`; unset means `Gajaeway`. `workspace/SOUL.md` is never read for the name. The default texts are neutral third person:
+
+| Phase | Default text |
+| --- | --- |
+| `restarting` | `⚠️ {name} is restarting. Messages sent meanwhile are kept and answered after restart.` |
+| `online` | `♻️ {name} is back online.` |
+| `cancelled` | `↩️ {name}'s restart was cancelled. Queued messages are being answered now.` |
+
+`messages` replaces any of them per phase, for example a Korean persona:
+
+```json
+"restartNotice": {
+  "personaName": "카미",
+  "messages": {
+    "restarting": "⚠️ {name} 재시작 중입니다. 그동안 보낸 메시지는 재시작 후 답변합니다.",
+    "online": "♻️ {name} 다시 연결됐습니다.",
+    "cancelled": "↩️ {name} 재시작이 취소됐습니다. 대기 중인 메시지에 지금 답변합니다."
+  }
+}
+```
+
+A template is 1–1000 characters, may use `{name}` any number of times, and is rejected if it contains any other `{word}` placeholder or a key other than `restarting`, `online` or `cancelled`. A phase without a template uses its default. When a restart drain starts, every conversation with a turn in flight or a human message in the last 30 minutes gets one "restarting" notice; muted threads and bot-only rooms are skipped, and repeated `gateway.restart.prepare` calls for the same restart id do not resend. The notified origins and the restart id are recorded in the gateway DB. The replacement gateway closes that record with one "back online" notice; a drain released by the same gateway process (cancelled, timed out, or failed before the gateway was restarted) closes it with a "restart cancelled" notice instead, so no false online notice is sent. Notices are ordinary outbox deliveries, redacted and settled like any reply. The object is reloadable.
+
 `sqlite.journalMode` accepts `DELETE`, `TRUNCATE`, `PERSIST`, or `WAL` (default `WAL`); `MEMORY` and `OFF` are rejected to preserve database durability. Use `DELETE` or `TRUNCATE` for a single gateway instance on an NFS volume, and change this setting only while the gateway is stopped.
 
 `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
@@ -444,7 +467,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>] note [HANDOFFDONE]`, `[WAKE:<alias>]`, `[WATCH:<alias>]`, and as a `[POST:<alias>]` target spelling). Verify the next event through the path consuming the changed policy.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, `sessions`, `restartNotice`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>] note [HANDOFFDONE]`, `[WAKE:<alias>]`, `[WATCH:<alias>]`, and as a `[POST:<alias>]` target spelling). Verify the next event through the path consuming the changed policy.
 - `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, `gjc`, `sqlite`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.

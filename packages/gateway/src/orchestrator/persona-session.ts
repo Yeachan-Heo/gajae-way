@@ -594,6 +594,12 @@ export interface PersonaSessionManagerOptions {
 	}) => void;
 	/** Reports a session as ready after it accepts an inbound turn. */
 	readonly onSessionReady?: (input: { readonly originKey: string; readonly at: number }) => void;
+	/** Fires once when a restart drain id first takes the dispatch hold; repeated drain calls for it do not. */
+	readonly onRestartDrainStarted?: (restartId: string) => void;
+	/** Fires when a restart drain is cancelled and dispatch resumes without this process exiting for it. */
+	readonly onRestartDrainCancelled?: (restartId: string) => void;
+	/** Fires when a supervisor's dispatch hold is handed to an owner restart. */
+	readonly onRestartDrainTransferred?: (restartId: string, nextRestartId: string) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
@@ -648,6 +654,9 @@ export class PersonaSessionManager {
 	readonly #onSessionCreateFailure: PersonaSessionManagerOptions["onSessionCreateFailure"];
 	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
 	readonly #onSessionReady: PersonaSessionManagerOptions["onSessionReady"];
+	readonly #onRestartDrainStarted: PersonaSessionManagerOptions["onRestartDrainStarted"];
+	readonly #onRestartDrainCancelled: PersonaSessionManagerOptions["onRestartDrainCancelled"];
+	readonly #onRestartDrainTransferred: PersonaSessionManagerOptions["onRestartDrainTransferred"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	/** Host slots claimed by bind attempts that have not yet become live actors. */
@@ -696,6 +705,17 @@ export class PersonaSessionManager {
 		this.#onSessionCreateFailure = options.onSessionCreateFailure;
 		this.#onPreSendFailure = options.onPreSendFailure;
 		this.#onSessionReady = options.onSessionReady;
+		this.#onRestartDrainStarted = options.onRestartDrainStarted;
+		this.#onRestartDrainCancelled = options.onRestartDrainCancelled;
+		this.#onRestartDrainTransferred = options.onRestartDrainTransferred;
+	}
+
+	#observeRestartDrain(event: string, notify: () => void): void {
+		try {
+			notify();
+		} catch (error) {
+			this.#log(`persona restart drain ${event} observer failed: ${safeDiagnostic(error)}`, "error");
+		}
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -968,9 +988,11 @@ export class PersonaSessionManager {
 		if (this.#stopped) return "stopped";
 		if (this.#restartDrainId !== undefined && this.#restartDrainId !== restartId)
 			throw new Error(`restart drain already owned by ${this.#restartDrainId}`);
+		const firstEntry = this.#restartDrainId === undefined;
 		this.#restartDrainId = restartId;
 		const deadline = Date.now() + waitMs;
 		this.#log(`persona_restart_drain_started id=${restartId} waitMs=${waitMs}`);
+		if (firstEntry) this.#observeRestartDrain("start", () => this.#onRestartDrainStarted?.(restartId));
 		for (;;) {
 			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
@@ -1011,6 +1033,7 @@ export class PersonaSessionManager {
 		if (this.#restartDrainId !== restartId) return false;
 		this.#restartDrainId = undefined;
 		this.#log(`persona_restart_drain_cancelled id=${restartId}`);
+		this.#observeRestartDrain("cancel", () => this.#onRestartDrainCancelled?.(restartId));
 		for (const actor of this.#actors.values())
 			void actor
 				.enqueue(async () => await actor.admit())
@@ -1026,6 +1049,7 @@ export class PersonaSessionManager {
 		if (this.#restartDrainId !== restartId) return false;
 		this.#restartDrainId = nextRestartId;
 		this.#log(`persona_restart_drain_transferred from=${restartId} to=${nextRestartId}`);
+		this.#observeRestartDrain("transfer", () => this.#onRestartDrainTransferred?.(restartId, nextRestartId));
 		return true;
 	}
 

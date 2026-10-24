@@ -136,7 +136,25 @@ export interface GatewayConfigFile {
 	readonly gjc?: { readonly agentDir?: string } | undefined;
 	/** SQLite journal mode; defaults to WAL. */
 	readonly sqlite?: { readonly journalMode?: SqliteJournalMode };
+	/** Chat notices around a stack restart; on unless `enabled` is false. */
+	readonly restartNotice?: RestartNoticeConfig;
 }
+
+export interface RestartNoticeConfig {
+	/** Announce restarts to active conversations. Unset means on. */
+	readonly enabled?: boolean;
+	/** Name substituted for `{name}` in the notices; unset means `Gajaeway`. */
+	readonly personaName?: string;
+	/** Per-phase text templates replacing the built-in English notices. */
+	readonly messages?: RestartNoticeMessages;
+}
+
+export type RestartNoticePhase = "restarting" | "online" | "cancelled";
+
+export type RestartNoticeMessages = { readonly [phase in RestartNoticePhase]?: string };
+
+const RESTART_NOTICE_PHASES: readonly RestartNoticePhase[] = ["restarting", "online", "cancelled"];
+const RESTART_NOTICE_MESSAGE_MAX = 1000;
 
 export interface MonitorCatchUpConfig {
 	readonly maxSlots?: number;
@@ -595,6 +613,46 @@ function parseSessions(value: unknown): SessionHostConfig {
 	};
 }
 
+function parseRestartNotice(value: unknown): RestartNoticeConfig {
+	const input = requireObject(value, "restartNotice");
+	if (Object.keys(input).some((key) => key !== "enabled" && key !== "personaName" && key !== "messages"))
+		throw new ConfigError("config_invalid", "restartNotice may only contain enabled, personaName and messages");
+	if (input.enabled !== undefined && typeof input.enabled !== "boolean")
+		throw new ConfigError("config_invalid", "restartNotice.enabled must be a boolean");
+	const personaName = optionalString(input.personaName, "restartNotice.personaName")?.trim();
+	if (personaName !== undefined && (personaName.length === 0 || personaName.length > 80))
+		throw new ConfigError("config_invalid", "restartNotice.personaName must be 1 to 80 characters");
+	const messages = input.messages === undefined ? undefined : parseRestartNoticeMessages(input.messages);
+	return {
+		...(input.enabled === undefined ? {} : { enabled: input.enabled as boolean }),
+		...(personaName === undefined ? {} : { personaName }),
+		...(messages === undefined ? {} : { messages }),
+	};
+}
+
+function parseRestartNoticeMessages(value: unknown): RestartNoticeMessages {
+	const input = requireObject(value, "restartNotice.messages");
+	if (Object.keys(input).some((key) => !RESTART_NOTICE_PHASES.includes(key as RestartNoticePhase)))
+		throw new ConfigError(
+			"config_invalid",
+			`restartNotice.messages may only contain ${RESTART_NOTICE_PHASES.join(", ")}`,
+		);
+	const messages: { [phase in RestartNoticePhase]?: string } = {};
+	for (const phase of RESTART_NOTICE_PHASES) {
+		const field = `restartNotice.messages.${phase}`;
+		const template = optionalString(input[phase], field);
+		if (template === undefined) continue;
+		if (!template.trim() || template.length > RESTART_NOTICE_MESSAGE_MAX)
+			throw new ConfigError("config_invalid", `${field} must be 1 to ${RESTART_NOTICE_MESSAGE_MAX} characters`);
+		// `{name}` is the only placeholder; any other `{word}` is a typo that would be posted verbatim.
+		const unknown = template.match(/\{\w+\}/g)?.find((token) => token !== "{name}");
+		if (unknown !== undefined)
+			throw new ConfigError("config_invalid", `${field} has unknown placeholder ${unknown}; only {name} is supported`);
+		messages[phase] = template;
+	}
+	return messages;
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -682,6 +740,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.sessions === undefined ? {} : { sessions: parseSessions(input.sessions) }),
+		...(input.restartNotice === undefined ? {} : { restartNotice: parseRestartNotice(input.restartNotice) }),
 		...(sqlite === undefined ? {} : { sqlite }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
@@ -795,7 +854,8 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
  * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
  * `sessions` (persona host cap, host retirement, and idle session reset, applied
- * to the next bind and sweep). Each applies to the next actor event.
+ * to the next bind and sweep), and `restartNotice` (read when the next restart
+ * drain starts or closes). Each applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
@@ -805,6 +865,7 @@ export const RELOADABLE_FIELDS = [
 	"botAudience",
 	"handoffTargets",
 	"sessions",
+	"restartNotice",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */

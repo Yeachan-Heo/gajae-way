@@ -145,6 +145,7 @@ import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
+import { RestartNotices, restartNoticeText } from "./restart-notice";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -961,6 +962,24 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	// gateway's workspace at the SSOT directory with a symlink, so resolve it
 	// before it reaches gjc.
 	const workspace = existsSync(workspacePath) ? realpathSync(workspacePath) : workspacePath;
+	const restartDrainId = persistedRestartDrainId(options.config.home);
+	// Config reloads replace runtime.config; the notices read whichever is current.
+	const currentConfig = (): GatewayConfig => (runtime === undefined ? options.config : runtime.config);
+	const restartNotices = new RestartNotices({
+		database: options.database,
+		delivery,
+		enabled: () => currentConfig().restartNotice?.enabled !== false,
+		text: (phase) => restartNoticeText(currentConfig().restartNotice, phase),
+		broadcast: (payloads) => {
+			for (const payload of payloads) {
+				delivery.markInflight(payload.deliveryId as string);
+				for (const recipient of connections)
+					if (recipient.negotiated)
+						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+			}
+		},
+		...(restartDrainId === undefined ? {} : { inheritedRestartId: restartDrainId }),
+	});
 	const personaSessions = new PersonaSessionManager({
 		database: options.database,
 		port: sessionPort,
@@ -1054,8 +1073,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				at,
 			}),
 		onSessionReady: () => readiness.recordSuccess("session_create"),
+		onRestartDrainStarted: (restartId) => restartNotices.restarting(restartId),
+		onRestartDrainCancelled: (restartId) => restartNotices.released(restartId),
+		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
-	const restartDrainId = persistedRestartDrainId(options.config.home);
 	if (restartDrainId !== undefined) {
 		void personaSessions
 			.drainForRestart(restartDrainId, 0)
@@ -1303,6 +1324,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			options.secretGuard ??
 			new SecretGuard(secretSourcesFromEnv(process.env, options.broker?.agentDir, options.config.home)),
 	};
+	try {
+		restartNotices.resumeAfterBoot();
+	} catch (error) {
+		console.error(`restart notice recovery failed: ${diagnostic(error)}`);
+	}
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
 		.recover()
