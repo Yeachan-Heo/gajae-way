@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { inspectSession, listSessions, parseEnvelope } from "@gajae-gateway/subsession";
@@ -77,8 +77,7 @@ type InspectedSession = {
 	readonly hostIncarnation?: string;
 };
 
-async function processSnapshot(env: Record<string, string>): Promise<ProcessRecord[]> {
-	const args = process.platform === "darwin" ? ["-axo", "pid=,ppid=,command="] : ["-eo", "pid=,ppid=,args="];
+async function psOutput(args: string[], env: Record<string, string>): Promise<string> {
 	const child = Bun.spawn(["ps", ...args], { env, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -89,38 +88,91 @@ async function processSnapshot(env: Record<string, string>): Promise<ProcessReco
 			}),
 		]);
 		if (result[0] !== 0) throw new Error("could not establish process ownership with ps");
-		const records = result[1].split("\n").flatMap((line) => {
-			const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-			if (!match) {
-				if (line.trim()) throw new Error("unparseable process ownership snapshot");
-				return [];
-			}
-			const command = match[3]!.trim();
-			return [{ pid: Number(match[1]), ppid: Number(match[2]), command }];
-		});
-		if (records.length === 0) throw new Error("empty process ownership snapshot");
-		return records;
+		return result[1];
 	} finally {
 		clearTimeout(timer);
 		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 	}
 }
 
-async function reapOwnedProcesses(agentDir: string, env: Record<string, string>): Promise<void> {
-	const exactAgentDir = new RegExp(`(?:^|[\\s"'=])${agentDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|[\\s"'])`);
-	const isOwned = ({ command }: ProcessRecord) =>
-		exactAgentDir.test(command) && /\bsdk\s+(?:session-host-internal|broker-internal|broker\s+run)\b/.test(command);
+async function processSnapshot(env: Record<string, string>, pid?: number): Promise<ProcessRecord[]> {
+	const columns = process.platform === "darwin" ? "pid=,ppid=,command=" : "pid=,ppid=,args=";
+	// A global snapshot is also used for revalidation: ps commonly exits 1 for
+	// a vanished single PID, which must not be confused with an unreadable host.
+	const output = await psOutput(["-axo", columns], env);
+	const records = output.split("\n").flatMap((line) => {
+		const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+		if (!match) {
+			if (line.trim()) throw new Error("unparseable process ownership snapshot");
+			return [];
+		}
+		const command = match[3]!.trim();
+		return [{ pid: Number(match[1]), ppid: Number(match[2]), command }];
+	});
+	if (records.length === 0) throw new Error("empty process ownership snapshot");
+	return pid === undefined ? records : records.filter((record) => record.pid === pid);
+}
+
+async function reapOwnedProcesses(agentDir: string, env: Record<string, string>, executable: string): Promise<void> {
+	if (process.platform !== "linux" && process.platform !== "darwin")
+		throw new Error("process environment ownership unsupported; retaining scratch state");
+	const canonicalAgentDir = await realpath(agentDir);
+	const runtime = await realpath(executable);
+	// npm's wrapper launches a sibling coding-agent entrypoint. Restrict probes
+	// to that installation, or to the exact standalone executable, before reading
+	// process environment evidence. Unrelated runtime installations are untouched.
+	const modules = runtime.indexOf("/node_modules/");
+	const runtimeFamily = modules < 0 ? runtime : runtime.slice(0, modules + "/node_modules/".length);
+	const owner = env.GAJAEWAY_TEST_OWNER;
+	if (!owner) throw new Error("missing fixture ownership marker; retaining scratch state");
+	const isCandidate = ({ pid, command }: ProcessRecord) =>
+		pid !== process.pid &&
+		command.includes(runtimeFamily) &&
+		/(?:^|\s)sdk\s+(?:session-host-internal|broker-internal|broker\s+run)(?:\s|$)/.test(command);
+	const isOwned = async ({ pid }: ProcessRecord): Promise<boolean> => {
+		try {
+			// Detached GJC hosts have no agentDir in argv. Read only per-PID
+			// environment evidence; never put it (or a read error) in diagnostics.
+			const entries =
+				process.platform === "linux"
+					? (await readFile(`/proc/${pid}/environ`, { encoding: "utf8", signal: AbortSignal.timeout(1_000) })).split(
+							"\0",
+						)
+					: (await psOutput(["eww", "-p", String(pid), "-o", "command="], env)).trim().split(/\s+/);
+			if (process.platform === "darwin" && /\s/.test(canonicalAgentDir))
+				throw new Error("ambiguous ps environment directory");
+			if (process.platform === "darwin" && !entries.some((entry) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(entry)))
+				throw new Error("ps environment unavailable");
+			return (
+				entries.includes(`GAJAEWAY_TEST_OWNER=${owner}`) &&
+				["GJC_AGENT_DIR", "GJC_CODING_AGENT_DIR"].some((key) => entries.includes(`${key}=${canonicalAgentDir}`))
+			);
+		} catch {
+			if ((await processSnapshot(env, pid)).length === 0) return false;
+			throw new Error(`cannot establish environment ownership for process ${pid}; retaining scratch state`);
+		}
+	};
+	const ownedProcesses = async () => {
+		const owned: ProcessRecord[] = [];
+		const deadline = Date.now() + 10_000;
+		for (const record of (await processSnapshot(env)).filter(isCandidate)) {
+			if (Date.now() >= deadline) throw new Error("process ownership scan timed out; retaining scratch state");
+			if (await isOwned(record)) owned.push(record);
+		}
+		return owned;
+	};
 	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
 		const deadline = Date.now() + 3_000;
 		do {
-			const owned = (await processSnapshot(env)).filter(isOwned);
+			const owned = await ownedProcesses();
 			if (owned.length === 0) return;
 			for (const record of owned) {
+				if (Date.now() >= deadline) break;
 				// Re-read ownership immediately before each signal: never kill by name
 				// or by a stale PID from a previous snapshot.
-				const current = (await processSnapshot(env)).find(({ pid }) => pid === record.pid);
+				const current = (await processSnapshot(env, record.pid))[0];
 				if (!current) continue;
-				if (current.command !== record.command)
+				if (current.command !== record.command || !isCandidate(current) || !(await isOwned(current)))
 					throw new Error(`process ${record.pid} changed identity; retaining scratch state`);
 				try {
 					process.kill(record.pid, signal);
@@ -131,10 +183,103 @@ async function reapOwnedProcesses(agentDir: string, env: Record<string, string>)
 			await Bun.sleep(100);
 		} while (Date.now() < deadline);
 	}
-	const remaining = (await processSnapshot(env)).filter(isOwned);
+	const remaining = await ownedProcesses();
 	if (remaining.length !== 0)
-		throw new Error(`owned processes remain: ${JSON.stringify(remaining)}; retaining scratch state`);
+		throw new Error(`owned processes remain: ${remaining.map(({ pid }) => pid).join(", ")}; retaining scratch state`);
 }
+
+test("cleanup finds an env-only SDK host without signaling a differently owned sibling", async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-gjc-reaper-")));
+	const agentDir = join(root, "agent");
+	await mkdir(agentDir);
+	const env = {
+		PATH: process.env.PATH ?? "/usr/bin:/bin",
+		HOME: root,
+		LANG: "C",
+		GAJAEWAY_TEST_OWNER: randomUUID(),
+		GJC_AGENT_DIR: agentDir,
+	};
+	const launch = (owner: string) =>
+		Bun.spawn(
+			[
+				process.execPath,
+				"--eval",
+				'console.log("ready"); setInterval(() => {}, 1000)',
+				"--",
+				"sdk",
+				"session-host-internal",
+			],
+			{ env: { ...env, GAJAEWAY_TEST_OWNER: owner }, stdin: "ignore", stdout: "pipe", stderr: "ignore" },
+		);
+	const children: ReturnType<typeof launch>[] = [];
+	const errors: unknown[] = [];
+	try {
+		const owned = launch(env.GAJAEWAY_TEST_OWNER);
+		children.push(owned);
+		const sibling = launch(randomUUID());
+		children.push(sibling);
+		for (const child of children) {
+			const reader = child.stdout.getReader();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const ready = await Promise.race([
+					reader.read(),
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(() => reject(new Error("SDK host-shaped child startup timed out")), 2_000);
+					}),
+				]);
+				expect(new TextDecoder().decode(ready.value).trim()).toBe("ready");
+			} finally {
+				clearTimeout(timer);
+				reader.releaseLock();
+			}
+		}
+		const before = await processSnapshot(env);
+		for (const child of children) {
+			const record = before.find(({ pid }) => pid === child.pid);
+			expect(record?.command).toContain("sdk session-host-internal");
+			expect(record?.command).not.toContain(agentDir);
+		}
+		// No session.create result or session.close reply is available here.
+		await reapOwnedProcesses(agentDir, env, process.execPath);
+		expect((await processSnapshot(env)).some(({ pid }) => pid === owned.pid)).toBe(false);
+		expect((await processSnapshot(env)).some(({ pid }) => pid === sibling.pid)).toBe(true);
+		expect(sibling.exitCode).toBeNull();
+		expect(sibling.signalCode).toBeNull();
+		process.kill(sibling.pid, 0);
+	} catch (error) {
+		errors.push(error);
+	} finally {
+		let allStopped = true;
+		// Stop the deliberately unowned sibling by its direct child handle, not
+		// by the ownership sweep. Keep these waits independent and bounded.
+		for (const child of children) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				await Promise.race([
+					child.exited,
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(() => reject(new Error("SDK host-shaped child exit unconfirmed")), 2_000);
+					}),
+				]);
+			} catch (error) {
+				allStopped = false;
+				errors.push(error);
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+		if (allStopped) {
+			try {
+				await rm(root, { recursive: true, force: true });
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+	}
+	if (errors.length) throw new AggregateError(errors, `env-only host cleanup regression failed (${root})`);
+}, 30_000);
 
 liveTest(
 	"the pinned package preserves lifecycle idempotency, relay queries, and close/resume identity",
@@ -151,6 +296,7 @@ liveTest(
 			USERPROFILE: home,
 			LANG: "C",
 			TMPDIR: home,
+			GAJAEWAY_TEST_OWNER: randomUUID(),
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_SDK_BROKER_AUTOSTART: "0",
 		};
@@ -266,7 +412,7 @@ liveTest(
 				}
 			}
 			try {
-				await reapOwnedProcesses(agentDir, env);
+				await reapOwnedProcesses(agentDir, env, executable);
 				// Never delete broker/session authority until ps proves no owned
 				// broker or detached host remains. Snapshot failure retains root.
 				await rm(root, { recursive: true, force: true });
