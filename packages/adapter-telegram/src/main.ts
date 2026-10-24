@@ -207,15 +207,17 @@ export async function settleTelegramReaction(
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
+		const target = telegramReactionMessageId(reaction.targetMessageId, route.chatId);
+		if (typeof target !== "string") throw new TelegramApiError(400, target.invalid);
 		if (action === "remove") {
 			// Remove the reaction by passing no emoji
-			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, undefined);
+			await bot.setMessageReaction(route.chatId, target, undefined);
 		} else {
 			const mapped = telegramReactionFor(reaction);
 			// TelegramApiError keeps `deliveryFailureIsAmbiguous` honest: an emoji Telegram
 			// refuses is definitively not delivered, exactly like a rejected API call.
 			if ("unsupported" in mapped) throw new TelegramApiError(400, mapped.unsupported);
-			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, mapped.emoji);
+			await bot.setMessageReaction(route.chatId, target, mapped.emoji);
 		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
@@ -283,9 +285,41 @@ export class TelegramAdapter {
 			origin,
 			text: describeInboundBody(content, attachment, stored),
 			engagement,
+			messageId: telegramInboundMessageId(message.chat.id, message.message_id),
 		});
 		return true;
 	}
+}
+
+/**
+ * The gateway-wide id of a Telegram message. A Telegram message id is unique
+ * only within its chat, while the gateway keys inbound rows, context entries and
+ * reaction targets by one global id, so the id carries the chat (`<chat id>:<message
+ * id>`, the same shape as Slack's `channel:ts`). Every id this adapter reports
+ * (the message itself, the message it replies to, the message a user reacted to)
+ * uses this shape, so the persona sees one id per message and can react to it.
+ */
+export function telegramInboundMessageId(chatId: number | string, messageId: number | string): string {
+	return `${chatId}:${messageId}`;
+}
+
+/**
+ * Resolves a gateway reaction target to a Telegram message id in `chatId`. Only an
+ * id from telegramInboundMessageId for that same chat resolves: the gateway keys
+ * its reaction budget (duplicates, per-message cap, add/remove pairing) by the
+ * target string, so one Telegram message must have exactly one spelling, and a
+ * bare id would be a second one. Anything else (a bare id, an id of another chat,
+ * or a gateway-minted UUID from a row keyed before inbound ids carried the chat)
+ * fails definitively without calling Telegram.
+ */
+export function telegramReactionMessageId(targetMessageId: string, chatId: string): string | { invalid: string } {
+	// Canonical decimals only (no leading zero): `22:0555` would alias `22:555` at Telegram.
+	const scoped = /^(-?\d+):([1-9]\d*)$/.exec(targetMessageId);
+	const messageId = scoped?.[1] === chatId ? scoped[2] : undefined;
+	if (messageId !== undefined && Number.isSafeInteger(Number(messageId))) return messageId;
+	return {
+		invalid: `Telegram cannot react to message ${targetMessageId}: it is not a <chat id>:<message id> in chat ${chatId}`,
+	};
 }
 
 export interface TelegramReactionEvent {
@@ -326,7 +360,7 @@ export function describeTelegramReaction(
 	const authorName = update.user?.username ?? update.user?.first_name ?? update.actor_chat?.title;
 	return {
 		origin,
-		targetMessageId: String(update.message_id),
+		targetMessageId: telegramInboundMessageId(update.chat.id, update.message_id),
 		emoji,
 		action,
 		engagement: {
@@ -363,7 +397,10 @@ export function engagementForMessage(
 		...(message.from?.is_bot ? { authorIsBot: true } : {}),
 		...(authorName ? { authorName } : {}),
 		...(message.chat.title ? { channelLabel: message.chat.title } : {}),
-		...(replyTo ? { replyTo } : {}),
+		// `reply_to_message` is always in the same chat, so its id is scoped like the message's own.
+		...(replyTo
+			? { replyTo: { ...replyTo, messageId: telegramInboundMessageId(message.chat.id, replyTo.messageId) } }
+			: {}),
 	};
 }
 

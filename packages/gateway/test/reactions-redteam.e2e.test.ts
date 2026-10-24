@@ -1176,7 +1176,7 @@ function telegramDelivery(emoji: string, emojiName: string): ChatMessagePayload 
 		text: emoji,
 		final: true,
 		deliveryId: "delivery-1",
-		reaction: { targetMessageId: "555", emoji, emojiName },
+		reaction: { targetMessageId: "22:555", emoji, emojiName },
 	};
 }
 

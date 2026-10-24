@@ -112,6 +112,7 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 			origin: { platform: "telegram", kind: "topic", conversationId: "-100123.99", parentId: "-100123" },
 			text: "hello @agent",
 			engagement: { mentioned: true, group: true, authorId: "42" },
+			messageId: "-100123:7",
 		});
 	} finally {
 		await rm(home, { recursive: true, force: true });
@@ -165,6 +166,7 @@ test("forwards a captioned photo with the downloaded local path and never the to
 					origin: { platform: "telegram", kind: "channel", conversationId: "-20" },
 					text: `what is this @agent\n[image · 122.1 KB · ${path}]`,
 					engagement: { mentioned: true, group: true, authorId: "42" },
+					messageId: "-20:31",
 				},
 			},
 		]);
@@ -201,6 +203,7 @@ test("still forwards an attachment-only message when the download fails", async 
 		expect(requests.map((request) => (request.params as { text: string }).text)).toEqual([
 			"[image · scan.png · not downloaded: download failed]",
 		]);
+		expect((requests[0]?.params as { messageId: string }).messageId).toBe("22:32");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -293,7 +296,7 @@ test("the delivery subscription routes a reaction to setMessageReaction and neve
 		);
 		handler?.({
 			...delivery(origin, "👍"),
-			reaction: { targetMessageId: "77", emoji: "👍", emojiName: "thumbsup" },
+			reaction: { targetMessageId: "22:77", emoji: "👍", emojiName: "thumbsup" },
 		});
 		for (let attempt = 0; attempt < 20 && requests.length === 0; attempt++) await Bun.sleep(5);
 		expect(reacted).toEqual([{ chatId: "22", messageId: "77", emoji: "👍" }]);
