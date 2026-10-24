@@ -313,10 +313,32 @@ for (const reaction of [false, true]) {
 	}
 }
 
+test("Slack status line is never set for a root channel or DM message, so no empty thread opens", async () => {
+	const dm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1" };
+	for (const root of [origin, dm]) {
+		const f = fixture();
+		const channel = root.conversationId;
+		f.status.arm(root, `${channel}:1.000`);
+		await flush();
+		// Presence still shows as reactions on the message itself.
+		expect(f.adds).toEqual([`${channel}:1.000:hourglass_flowing_sand`]);
+		f.tick(PRESENCE_MIN_SWAP_MS);
+		await f.status.update(progress({ origin: root, elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
+		const refresh = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
+		await refresh?.fn();
+		await f.status.reassert(channel);
+		await f.status.clear(channel);
+		await flush();
+		expect(f.statuses).toEqual([]);
+		expect(f.removes.length).toBeGreaterThan(0);
+	}
+});
+
 test("Slack interim delivery keeps presence and re-sets the status line; the final reply clears it", async () => {
 	const f = fixture();
 	const gateway = new Gateway();
-	f.status.arm(origin, "C1:1.000");
+	const origin: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	f.status.arm(origin, "C1:1.002");
 	await flush();
 	expect(f.statuses).toEqual([`C1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`]);
 	const interim = { origin, text: "still working", deliveryId: "d1", final: false } as ChatMessagePayload;
@@ -331,7 +353,7 @@ test("Slack interim delivery keeps presence and re-sets the status line; the fin
 		text: "👍",
 		deliveryId: "d2",
 		final: false,
-		reaction: { targetMessageId: "C1:1.000", emoji: "👍", emojiName: "thumbsup" },
+		reaction: { targetMessageId: "C1:1.002", emoji: "👍", emojiName: "thumbsup" },
 	} as ChatMessagePayload;
 	await settleSlackDelivery(gateway, f.api, reaction, console, f.status);
 	await flush();
@@ -512,7 +534,9 @@ test("Slack presence: a change arriving during the last pass is still applied", 
 
 test("Slack presence: periodic refresh keeps status alive across multiple turns", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	// The status line only exists for threaded turns.
+	const origin: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	f.status.arm(origin, "C1:1.002");
 	await flush();
 	// Initial arm sets the queued marker and status line
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand"]);
@@ -544,13 +568,13 @@ test("Slack presence: periodic refresh keeps status alive across multiple turns"
 
 	// Now simulate a progress update at 90 seconds (old stale timeout would have fired here)
 	f.tick(PRESENCE_MIN_SWAP_MS);
-	await f.status.update(progress({ elapsedMs: 95_000 }));
+	await f.status.update(progress({ origin, elapsedMs: 95_000 }));
 	await flush();
 	// The turn should still be active (markers still present, not removed)
 	expect(f.removes).toEqual([]);
 
 	// Explicitly clear the status
-	await f.status.clear("C1");
+	await f.status.clear("C1:1.000");
 	await flush();
 	// Now the markers should be removed
 	expect(f.removes.length).toBeGreaterThan(0);
