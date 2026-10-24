@@ -454,10 +454,18 @@ export class ModelNotSelectedError extends Error {
  * A fixed-text assertion failure from the session-port send-step invariant checks.
  * These errors indicate contract violations in the SDK's control responses where
  * expected fields are malformed or missing. All messages are fixed text with no
- * interpolated user or session data.
+ * interpolated user or session data; the closed message type keeps it that way,
+ * because monitor failure details record this class's message verbatim.
  */
+export type SessionContractMessage =
+	| "model.profile.set succeeded without a changed receipt"
+	| "model.set succeeded without a changed receipt"
+	| "thinking.set succeeded without a changed receipt"
+	| "service_tier.set succeeded without a changed receipt"
+	| "session request completed without a result";
+
 export class SessionContractError extends Error {
-	constructor(message: string) {
+	constructor(message: SessionContractMessage) {
 		super(message);
 		this.name = "SessionContractError";
 	}
