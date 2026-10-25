@@ -438,6 +438,14 @@ export class LaneGovernor {
 				updatedAt: at,
 				escalations: [...job.escalations, `${at} operator retired unbound history; attempts and worktree preserved`],
 			};
+			// Parsing validates history but normalizes its schema and known fields.
+			// Disposition must not rewrite that retained evidence payload.
+			const disposedJson = JSON.stringify({
+				...JSON.parse(json),
+				state: disposed.state,
+				updatedAt: disposed.updatedAt,
+				escalations: disposed.escalations,
+			});
 			const written = this.#database.transaction((tx) => {
 				this.#database.bindings.assertAuthority(authority);
 				if (
@@ -467,7 +475,7 @@ export class LaneGovernor {
 					)
 						return false;
 				}
-				this.#database.work.putLaneJob(tx, { ...disposed, laneKey, json: JSON.stringify(disposed) });
+				this.#database.work.putLaneJob(tx, { ...disposed, laneKey, json: disposedJson });
 				return true;
 			});
 			if (!written) return refused("historical job changed during disposition; inspect it again");

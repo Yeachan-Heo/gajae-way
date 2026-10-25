@@ -181,6 +181,28 @@ test("operator retirement dispositions proven terminal unbound history without d
 	expect(f.database.work.projectionRows()).toEqual(disposed);
 });
 
+for (const schemaVersion of [2, 3]) {
+	test(`disposition preserves the original validated history payload (schema ${schemaVersion})`, async () => {
+		const f = await fixture();
+		const before = {
+			...f.history(),
+			schemaVersion,
+			operatorEvidence: { receipt: "preserve-original-evidence" },
+			attempts: f.history().attempts.map((attempt) => ({ ...attempt, evidenceRef: "preserve-attempt-evidence" })),
+		};
+		f.raw.query("UPDATE lane_jobs SET record_json = ? WHERE job_id = ?").run(JSON.stringify(before), f.identity.jobId);
+		expect((await f.governor.retire("a", "operator")).retired).toBe(true);
+		const json = f.database.work.laneJobJson(f.identity.jobId);
+		if (json === undefined) throw new Error("disposed history missing");
+		expect(JSON.parse(json)).toEqual({
+			...before,
+			state: "aborted",
+			updatedAt: END,
+			escalations: [...before.escalations, `${END} operator retired unbound history; attempts and worktree preserved`],
+		});
+	});
+}
+
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const refusals: Array<[string, (f: Fixture) => void]> = [
 	...(["awaiting_operator", "stalled", "running", "awaiting_checks", "done", "aborted"] as const).map(
