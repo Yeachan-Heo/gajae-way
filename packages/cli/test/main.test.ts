@@ -1317,6 +1317,19 @@ describe("work operator commands", () => {
 		});
 	}
 
+	test("work retire prints historical disposition without claiming session closure", async () => {
+		const output = await run(["retire", "fix"], {
+			retired: true,
+			sessionKey: "work/task/fix",
+			sessionId: "",
+			closed: false,
+			disposition: "aborted",
+		});
+		expect(output.requests).toEqual([{ verb: "work.retire", params: { name: "fix" } }]);
+		expect(output.lines).toEqual(["disposed: work/task/fix state=aborted (history and worktree preserved)"]);
+		expect(output.closed).toBe(true);
+	});
+
 	test("work retire prints refusal without inventing a session", async () => {
 		const output = await run(["retire", "fix"], {
 			retired: false,

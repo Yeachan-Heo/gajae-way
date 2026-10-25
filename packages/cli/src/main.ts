@@ -1048,7 +1048,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								const forced = result.retired && result.forced ? " (forced)" : "";
 								console.log(
 									result.retired
-										? `retired: ${result.sessionKey} session=${result.sessionId} closed=${result.closed}${forced}`
+										? result.disposition
+											? `disposed: ${result.sessionKey} state=${result.disposition} (history and worktree preserved)`
+											: `retired: ${result.sessionKey} session=${result.sessionId} closed=${result.closed}${forced}`
 										: `not retired: ${result.reason}`,
 								);
 							}

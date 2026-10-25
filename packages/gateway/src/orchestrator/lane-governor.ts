@@ -2,9 +2,10 @@ import { existsSync, lstatSync, realpathSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
-import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { type LaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { Store } from "../store";
+import { terminalEvidence, workAttemptEndState } from "../store/groups/work";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
@@ -72,6 +73,7 @@ export type LaneRetireOutcome =
 			readonly sessionId: string;
 			readonly closed: boolean;
 			readonly forced?: boolean;
+			readonly disposition?: "aborted";
 	  }
 	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
 
@@ -95,6 +97,7 @@ export interface LaneGovernorOptions {
 	readonly laneRoot?: string;
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
+	readonly brokerGeneration?: () => number;
 	readonly now?: () => number;
 	readonly log?: (line: string, level?: LogLevel) => void;
 }
@@ -115,6 +118,7 @@ export class LaneGovernor {
 	readonly maxLanes: number;
 	readonly idleRetireMs: number;
 	readonly #now: () => number;
+	readonly #brokerGeneration: () => number;
 	readonly #log: (line: string, level?: LogLevel) => void;
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
@@ -128,6 +132,7 @@ export class LaneGovernor {
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
 		this.#now = options.now ?? (() => Date.now());
+		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
 		this.#log = options.log ?? ((line, level) => console[level ?? "info"](line));
 	}
 
@@ -253,7 +258,10 @@ export class LaneGovernor {
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
 				(candidate) => candidate.name === name,
 			);
-			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
+			if (!lane) {
+				if (reason === "operator" && !expected) return this.#disposeHistory(name);
+				return { retired: false, sessionKey, reason: "no bound lane for that name" };
+			}
 			if (expected && lane.sessionId !== expected.sessionId)
 				return { retired: false, sessionKey, reason: `lane was rebound to ${lane.sessionId} since it was selected` };
 			if (lane.attemptOpen) return unsettled(sessionKey, lane);
@@ -336,6 +344,138 @@ export class LaneGovernor {
 			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${reason} closed=${closed}`, "info");
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed };
 		});
+	}
+
+	/** Explicit disposition, not session retirement or proof that the deliverable succeeded. */
+	async #disposeHistory(name: string): Promise<LaneRetireOutcome> {
+		const sessionKey = workSessionKey(name);
+		const { jobId, laneKey } = laneJobIdentity(name);
+		const refused = (reason: string): LaneRetireOutcome => ({ retired: false, sessionKey, reason });
+		try {
+			const json = this.#database.work.laneJobJson(jobId);
+			if (json === undefined) return refused("no bound lane for that name");
+			const job = parseLaneJobRecord(json);
+			const jobRow = this.#database.work.laneJobRows(true).find((row) => row.job_id === jobId);
+			if (
+				job.jobId !== jobId ||
+				this.#database.work.laneJobJsonByLaneKey(laneKey) !== json ||
+				!jobRow ||
+				jobRow.lane_key !== laneKey ||
+				jobRow.state !== job.state ||
+				jobRow.branch !== job.lane.branch ||
+				jobRow.worktree_path !== job.lane.worktreePath ||
+				jobRow.updated_at !== job.updatedAt
+			)
+				return refused("historical job identity mismatch");
+			if (job.state !== "attempt_ended" || job.awaitingChecks || job.stalledContinuations >= MAX_STALLED_CONTINUATIONS)
+				return refused(`historical job is ${job.state}; only unheld attempt_ended history can be disposed`);
+			if (!job.attempts.length || job.attempts.some((attempt) => !attempt.endedAt))
+				return refused("historical job has no settled attempt history");
+			const binding = this.#database.bindings.getSessionRecord(sessionKey);
+			const authority = this.#database.bindings.brokerAuthority();
+			if (!authority || !binding || binding.sessionId)
+				return refused("historical job has no proven retired broker binding");
+			if (this.#database.work.workAttemptOpenByLane(laneKey)) return refused("historical runtime is still open");
+			const generation = this.#brokerGeneration();
+			const runtimes = this.#database.work.workAttemptRows().filter((row) => row.job_id === jobId);
+			if (
+				runtimes.length !== job.attempts.length ||
+				runtimes.some((row) => !job.attempts.some((attempt) => attempt.opRef === row.op_ref))
+			)
+				return refused("historical runtime and attempt history disagree");
+			const runtimeSnapshots = new Map<string, string>();
+			const reportsUnresolved = () => {
+				const counts = this.#database.work.laneReportCounts(name);
+				return (
+					counts.pending + counts.claimed + counts.held + counts.undeliverable > 0 ||
+					job.attempts.some((attempt) => {
+						const runtime = this.#database.work.workAttemptGet(attempt.opRef);
+						const report = runtime && this.#database.work.laneReportGet(runtime.reportId);
+						return report && ["pending", "claimed", "held", "undeliverable"].includes(report.state);
+					})
+				);
+			};
+			if (reportsUnresolved()) return refused("historical job has unresolved lane reports");
+			const sessions = new Set([...job.sessions, ...job.attempts.map((attempt) => attempt.sessionId)]);
+			for (const sessionId of sessions) {
+				const owned = this.#database.bindings.assertOwnedSession(sessionId, job.lane.worktreePath, authority);
+				if (
+					owned.originKey !== sessionKey ||
+					owned.epoch >= binding.epoch ||
+					this.#database.bindings.originForSessionId(sessionId) !== sessionKey
+				)
+					return refused("historical session ownership mismatch");
+				for (const attempt of job.attempts.filter((item) => item.sessionId === sessionId)) {
+					const runtime = this.#database.work.workAttemptGet(attempt.opRef);
+					const terminal = runtime?.terminal;
+					if (
+						!runtime ||
+						runtime.jobId !== jobId ||
+						runtime.laneKey !== laneKey ||
+						runtime.sessionKey !== sessionKey ||
+						runtime.epoch !== owned.epoch ||
+						runtime.settledAt === null ||
+						runtime.decision === "recovery_indeterminate" ||
+						terminal?.kind !== "broker" ||
+						terminal.status?.clientRef !== attempt.opRef ||
+						terminal.status.receiptState !== "present" ||
+						terminalEvidence(terminal.status, terminal.observedAt)?.reasonCode !== terminal.reasonCode ||
+						workAttemptEndState(terminal.reasonCode) !== attempt.endState
+					)
+						return refused(`historical attempt ${attempt.opRef} lacks correlated broker terminal evidence`);
+					runtimeSnapshots.set(attempt.opRef, JSON.stringify(runtime));
+				}
+				const liveness = await this.#safeLiveness(sessionId, job.lane.worktreePath);
+				if (liveness.live !== false || liveness.disowned)
+					return refused(`historical session ${sessionId} is live, unknown or disowned`);
+			}
+			// Recovery and authority changes need not take this lane lock. Re-prove
+			// the snapshot after every awaited probe, before the synchronous write.
+			const at = new Date(this.#now()).toISOString();
+			const disposed = {
+				...job,
+				state: "aborted" as const,
+				updatedAt: at,
+				escalations: [...job.escalations, `${at} operator retired unbound history; attempts and worktree preserved`],
+			};
+			const written = this.#database.transaction((tx) => {
+				this.#database.bindings.assertAuthority(authority);
+				if (
+					this.#stopped ||
+					this.#brokerGeneration() !== generation ||
+					this.#database.bindings.isQuarantined("work", jobId) ||
+					JSON.stringify(this.#database.bindings.getSessionRecord(sessionKey)) !== JSON.stringify(binding) ||
+					this.#database.work.laneJobJson(jobId) !== json ||
+					this.#database.work.laneJobJsonByLaneKey(laneKey) !== json ||
+					JSON.stringify(this.#database.work.laneJobRows(true).find((row) => row.job_id === jobId)) !==
+						JSON.stringify(jobRow) ||
+					JSON.stringify(this.#database.work.workAttemptRows().filter((row) => row.job_id === jobId)) !==
+						JSON.stringify(runtimes) ||
+					this.#database.work.workAttemptOpenByLane(laneKey) ||
+					reportsUnresolved() ||
+					[...runtimeSnapshots].some(
+						([opRef, snapshot]) => JSON.stringify(this.#database.work.workAttemptGet(opRef)) !== snapshot,
+					)
+				)
+					return false;
+				for (const sessionId of sessions) {
+					const owned = this.#database.bindings.assertOwnedSession(sessionId, job.lane.worktreePath, authority);
+					if (
+						owned.originKey !== sessionKey ||
+						owned.epoch >= binding.epoch ||
+						this.#database.bindings.originForSessionId(sessionId) !== sessionKey
+					)
+						return false;
+				}
+				this.#database.work.putLaneJob(tx, { ...disposed, laneKey, json: JSON.stringify(disposed) });
+				return true;
+			});
+			if (!written) return refused("historical job changed during disposition; inspect it again");
+			this.#log(`lane_history_disposed name=${name} jobId=${jobId} state=aborted`);
+			return { retired: true, sessionKey, sessionId: "", closed: false, disposition: "aborted" };
+		} catch (error) {
+			return refused(`historical disposition refused: ${sanitizeDiagnostic(diagnostic(error))}`);
+		}
 	}
 
 	/**
