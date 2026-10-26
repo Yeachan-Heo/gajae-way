@@ -2148,6 +2148,11 @@ class OriginActor {
 		} catch (error) {
 			// No prompt was sent, so this lifecycle can never reach a terminal: the
 			// trigger is re-dispatched under a new one (below, or by recovery).
+			try {
+				await tail.close();
+			} catch (closeError) {
+				this.#manager.log(safeDiagnostic(closeError), "warn");
+			}
 			await this.#releaseLifecycle(lifecycle, {
 				originKey: this.originKey,
 				epoch,
