@@ -22,65 +22,80 @@ afterEach(async () => {
 	home = "";
 });
 
-test("recovery requeues bound turn with unknown operation status when prompt intent missing", async () => {
-	// Tests the fix for issue #675: when a turn is bound to a session but the
-	// prompt intent row doesn't exist (prompt was never sent), recovery should
-	// requeue the trigger so it can be re-dispatched instead of holding it.
-	// This prevents stranded bound turns that can never complete.
-	const db = await openDatabase();
-	const port = new ScriptedSessionPort();
-	const originKey = "loopback/loopback/bound-recovery";
-	const origin = { platform: "loopback", kind: "loopback", conversationId: "bound-recovery" } as const;
-	const repo = join(home, "workspace");
+test(
+	"recovery requeues bound turn with unknown operation status when prompt intent missing",
+	async () => {
+		// Tests the fix for issue #675: when a turn is bound to a session but the
+		// prompt intent row doesn't exist (prompt was never sent), recovery should
+		// requeue the trigger so it can be re-dispatched instead of holding it.
+		// This prevents stranded bound turns that can never complete.
+		const db = await openDatabase();
+		const port = new ScriptedSessionPort();
+		const originKey = "loopback/loopback/bound-recovery";
+		const origin = { platform: "loopback", kind: "loopback", conversationId: "bound-recovery" } as const;
+		const repo = join(home, "workspace");
 
-	// Create a binding
-	const binding = await port.bind({ originKey, epoch: 0, repo });
-	expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, originKey, binding.sessionId, 0))).toBe(true);
+		// Create a binding
+		const binding = await port.bind({ originKey, epoch: 0, repo });
+		expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, originKey, binding.sessionId, 0))).toBe(true);
 
-	const receivedAt = new Date().toISOString();
+		const receivedAt = new Date().toISOString();
 
-	// Create a bound turn WITHOUT any prompt intent row
-	// This simulates a turn that was bound but the prompt was never sent
-	const opRef = personaTurnOpRef("test", originKey, 0, "m-1");
-	expect(
+		// Create a bound turn WITHOUT any prompt intent row
+		// This simulates a turn that was bound but the prompt was never sent
+		const opRef = personaTurnOpRef("test", originKey, 0, "m-1");
+		expect(
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, {
+					messageId: "m-1",
+					originKey,
+					originRefJson: JSON.stringify(origin),
+					body: "message that never had a prompt sent",
+					receivedAt,
+				}),
+			),
+		).toBe(true);
+
 		db.transaction((tx) =>
-			db.inbox.enqueue(tx, {
+			db.inbox.bindTurn(tx, {
 				messageId: "m-1",
 				originKey,
-				originRefJson: JSON.stringify(origin),
-				body: "message that never had a prompt sent",
-				receivedAt,
+				epoch: 0,
+				opRef,
+				sessionId: binding.sessionId,
 			}),
-		),
-	).toBe(true);
+		);
 
-	db.transaction((tx) =>
-		db.inbox.bindTurn(tx, {
-			messageId: "m-1",
-			originKey,
-			epoch: 0,
-			opRef,
-			sessionId: binding.sessionId,
-		}),
-	);
+		// Verify the turn is bound before recovery
+		const boundBefore = db.inbox.turnRow(opRef);
+		expect(boundBefore).toMatchObject({
+			turn_state: "bound",
+			bound_session_id: binding.sessionId,
+		});
 
-	// Verify the turn is bound before recovery
-	const boundBefore = db.inbox.turnRow(opRef);
-	expect(boundBefore).toMatchObject({
-		turn_state: "bound",
-		bound_session_id: binding.sessionId,
-	});
+		const manager = new PersonaSessionManager({
+			database: db,
+			port,
+			instanceId: "test",
+			repo,
+			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		});
 
-	const manager = new PersonaSessionManager({
-		database: db,
-		port,
-		instanceId: "test",
-		repo,
-		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
-	});
+		let recoverError: Error | undefined;
+		try {
+			await manager.recover();
+		} catch (error) {
+			recoverError = error as Error;
+		} finally {
+			try {
+				await manager.stop();
+			} catch {
+				// Ignore stop errors
+			}
+		}
 
-	try {
-		await manager.recover();
+		// The recovery should complete without errors
+		expect(recoverError).toBeUndefined();
 
 		// Verify that the bound turn WITHOUT prompt intent was requeued to pending
 		// This is the key fix: without a prompt row, the turn cannot recover and
@@ -95,7 +110,6 @@ test("recovery requeues bound turn with unknown operation status when prompt int
 			// If still in inbox, should not be bound
 			expect(requeued.turn_state).not.toBe("bound");
 		}
-	} finally {
-		await manager.stop();
-	}
-});
+	},
+	{ timeout: 10_000 }, // 10 second timeout to prevent CI hangs
+);
