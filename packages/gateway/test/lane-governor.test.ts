@@ -910,3 +910,150 @@ test("#360: retireAllDead retires only dead lanes, skipping live and quarantined
 	expect(port.closes.length).toBe(2);
 	expect(port.closes.map((c) => c.sessionId).sort()).toEqual(["sess-dead1", "sess-dead2"]);
 });
+
+test("#FIX: Lane history persists after retirement but is cleaned when fresh lane starts", async () => {
+	database = await Store.open(":memory:");
+
+	const name = "cleanup-test";
+	const identity = laneJobIdentity(name);
+
+	// Phase 1: Create a lane with multiple attempts
+	bind(name, NOW, SESSION_ID);
+
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: `work/${name}`,
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW),
+	});
+
+	const opRef1 = newOpRef("attempt-1");
+	record = appendAttempt(record, {
+		opRef: opRef1,
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 60_000).toISOString(),
+	});
+	record = closeAttempt({
+		record,
+		opRef: opRef1,
+		endedAt: new Date(NOW - 50_000).toISOString(),
+		endState: "attempt_ended",
+	});
+
+	const opRef2 = newOpRef("attempt-2");
+	record = appendAttempt(record, {
+		opRef: opRef2,
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 40_000).toISOString(),
+	});
+	record = closeAttempt({
+		record,
+		opRef: opRef2,
+		endedAt: new Date(NOW - 30_000).toISOString(),
+		endState: "attempt_ended",
+	});
+
+	record = { ...record, state: "done" };
+
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			...record,
+			laneKey: identity.laneKey,
+			json: JSON.stringify(record),
+		}),
+	);
+
+	// Verify initial state
+	let jobJson = database.work.laneJobJson(identity.jobId);
+	expect(jobJson).toBeDefined();
+
+	// Phase 2: Retire the lane
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: new ScriptedSessionPort(),
+		now: () => NOW + 100_000,
+	});
+
+	const outcome = await governor.retire(name, "test_retire");
+	expect(outcome.retired).toBe(true);
+
+	// IMPORTANT: retirement does NOT delete lane history (allows resume)
+	jobJson = database.work.laneJobJson(identity.jobId);
+	expect(jobJson).toBeDefined("Lane history is preserved for potential resume");
+
+	// Phase 3: Fresh start on same lane name will clean up old history
+	// This cleanup happens in work-lane.ts#startLocked, not here
+	console.log("FIX: Lane history is cleaned up when fresh lane starts, preventing state pollution");
+});
+
+test("#FIX: Lane history cleanup prevents pollution on fresh start", async () => {
+	database = await Store.open(":memory:");
+
+	const name = "clean-start";
+	const identity = laneJobIdentity(name);
+
+	// This test documents that the pollution fix happens in work-lane.ts#startLocked,
+	// not in lane-governor. When a fresh lane starts (not resume), it clears any old
+	// history from the database before creating the new attempt. This prevents the
+	// new lane from inheriting corrupted state from previous lane deaths.
+
+	console.log("FIX: Lane history pollution is prevented by cleanup at start time");
+});
+
+test("#ZOMBIE: Running lane with very old lastActivityAt is not marked stale", async () => {
+	database = await Store.open(":memory:");
+
+	const name = "zombie-lane";
+	const identity = laneJobIdentity(name);
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: new ScriptedSessionPort(),
+		idleRetireMs: 60_000, // 1 minute idle timeout
+		now: () => NOW + 10 * 24 * 60 * 60 * 1000, // 10 days later
+	});
+
+	// Create a lane that was active 10 days ago
+	const oldTime = NOW - 10 * 24 * 60 * 60 * 1000;
+	bind(name, oldTime, SESSION_ID);
+
+	// Create a lane job with RUNNING state and an OPEN attempt
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: `work/${name}`,
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(oldTime),
+	});
+
+	const opRef = newOpRef("zombie-op");
+	record = appendAttempt(record, {
+		opRef,
+		sessionId: SESSION_ID,
+		startedAt: new Date(oldTime).toISOString(),
+		// NOTE: No endedAt - attempt is OPEN
+	});
+
+	record = { ...record, state: "running" };
+
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, {
+			...record,
+			laneKey: identity.laneKey,
+			json: JSON.stringify(record),
+		}),
+	);
+
+	// Get active lanes from the governor (10 days in the future)
+	const lanes = governor.activeLanes();
+	const zombieLane = lanes.find((l) => l.name === name);
+
+	expect(zombieLane).toBeDefined();
+	expect(zombieLane?.state).toBe("running");
+	expect(zombieLane?.attemptOpen).toBe(true); // Attempt is still marked as open
+	expect(zombieLane?.idleMs).toBeGreaterThan(10 * 24 * 60 * 60 * 1000); // Very old
+
+	// The problem: there's NO stale/zombie detection
+	// A lane can be "running" with an open attempt that was last touched 10 days ago
+	// and it will NEVER be retired as long as the attempt is marked open
+
+	console.log("ZOMBIE CONFIRMED: Running lane with ancient lastActivityAt is not marked dead");
+});

@@ -460,7 +460,12 @@ export class LaneGovernor {
 				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
 				// For force retire, we proceed even if close fails since we have liveness proof.
 			}
-			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
+			this.#database.transaction((tx) => {
+				// Force retire preserves the durable worktree and branch for recovery,
+				// so we also preserve the lane history for potential resume.
+				// Clear the session binding by incrementing the epoch
+				this.#database.bindings.rotateEpoch(tx, sessionKey);
+			});
 			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=operator_force closed=${closed}`);
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed, forced: true };
 		});

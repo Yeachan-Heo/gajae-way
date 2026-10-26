@@ -8094,3 +8094,52 @@ test("issue #579: a compiled binary resolves the service directory from its own 
 		await rm(dir, { recursive: true, force: true });
 	}
 }, 60_000);
+
+test("lane state pollution fix: fresh start clears old history, resume preserves it", async () => {
+	const f = await fixture();
+	const origin: OriginRef = { platform: "discord", kind: "channel", conversationId: "work-results" };
+
+	// Phase 1: Start with lane "a" and complete first attempt
+	const result1 = await started(f, "a", origin);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.job().attempts).toHaveLength(1);
+	f.port.complete(result1.opRef, "done");
+	await until(() => f.db.work.workAttemptGet(result1.opRef)?.settledAt !== null);
+
+	// Phase 2: Retire the lane
+	expect(await f.lanes.retire("a", "test")).toMatchObject({ retired: true });
+
+	// Verify old state persists (for potential resume)
+	const oldJob = f.job();
+	expect(oldJob.attempts).toHaveLength(1);
+	expect(oldJob.attempts[0].opRef).toBe(result1.opRef);
+
+	// Phase 3: Fresh start (no resume) - history should be cleared
+	const result2 = await f.manager.start({ name: "a", text: "fresh start", cwd: f.directory, resume: false });
+	expect(result2.started).toBe(true);
+
+	// After fresh start, the lane should have only 1 new attempt, not 2 (not polluted)
+	const freshJob = f.job();
+	expect(freshJob.attempts).toHaveLength(1);
+	expect(freshJob.attempts[0].opRef).not.toBe(result1.opRef); // Different attempt
+	expect(freshJob.attempts[0].sessionId).toBe(result2.sessionId);
+
+	// Phase 4: Retire again and resume
+	f.port.complete(result2.opRef, "done");
+	await until(() => f.db.work.workAttemptGet(result2.opRef)?.settledAt !== null);
+
+	expect(await f.lanes.retire("a", "test")).toMatchObject({ retired: true });
+
+	// Phase 5: Resume should preserve history
+	const result3 = await f.manager.start({ name: "a", text: "resume", cwd: f.directory, resume: true });
+	expect(result3.started).toBe(true);
+
+	// After resume, lane should have 2 attempts (preserved old one + new one)
+	const resumedJob = f.job();
+	expect(resumedJob.attempts).toHaveLength(2);
+	expect(resumedJob.attempts[0].opRef).toBe(result2.opRef);
+	expect(resumedJob.attempts[1].opRef).not.toBe(result2.opRef);
+	expect(resumedJob.attempts[1].sessionId).toBe(result3.sessionId);
+
+	console.log("POLLUTION FIX VERIFIED: Fresh starts get clean history, resumes get preserved history");
+});

@@ -1118,6 +1118,16 @@ export class WorkGroup {
 		)?.record_json;
 	}
 
+	/**
+	 * Clear all persisted state for a lane upon retirement.
+	 * Deletes the lane_jobs record and all associated work_attempt_runtime rows.
+	 * This prevents new attempts on the same lane name from inheriting corrupted or stale state.
+	 */
+	clearLaneHistory(tx: WriteTx, jobId: string, laneKey: string): void {
+		this.#db.prepare("DELETE FROM work_attempt_runtime WHERE lane_key = ?").run(tx, laneKey);
+		this.#db.prepare("DELETE FROM lane_jobs WHERE job_id = ?").run(tx, jobId);
+	}
+
 	laneJobHistoryRows(): readonly {
 		readonly job_id: string;
 		readonly lane_key: string;
