@@ -7,7 +7,7 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "../src/orchestrator/broker";
 import type { FailedTurnEvidence } from "../src/orchestrator/failed-turn-evidence";
 import type {
 	RunningHostJob,
@@ -1230,7 +1230,7 @@ export class ScriptedRelayStream implements SessionRelayStream {
 	}
 
 	write(line: string): void {
-		if (this.closed) throw new Error("relay closed");
+		if (this.closed) throw new RelayStreamUnwrittenError("relay closed");
 		const frame = JSON.parse(line) as Record<string, unknown>;
 		this.written.push(frame);
 		if (frame.type === "hello") {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
-import type { SessionRelayStream } from "./broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "./broker";
 import { isSessionGoneCode } from "./gjc-contract";
 import { runtimeErrorOfLine, sanitizeDiagnostic } from "./rebind";
 
@@ -638,7 +638,11 @@ class ManagedTailHandle implements TailHandle {
 		try {
 			stream.write(JSON.stringify(frame));
 		} catch (error) {
-			throw new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed", false);
+			throw new RelayClosedError(
+				this.sessionId,
+				sanitizeDiagnostic(messageOf(error)) || "write_failed",
+				!(error instanceof RelayStreamUnwrittenError),
+			);
 		}
 	}
 
@@ -666,7 +670,15 @@ class ManagedTailHandle implements TailHandle {
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);
-				reject(new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed", false));
+				// Only the stream's own pre-write refusal proves the host never saw the
+				// frame; a throw after stdin.write (e.g. its flush) may follow delivery.
+				reject(
+					new RelayClosedError(
+						this.sessionId,
+						sanitizeDiagnostic(messageOf(error)) || "write_failed",
+						!(error instanceof RelayStreamUnwrittenError),
+					),
+				);
 			}
 		});
 	}

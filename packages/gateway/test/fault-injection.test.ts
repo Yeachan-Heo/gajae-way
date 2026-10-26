@@ -270,7 +270,7 @@ async function journaledOrigin(name: string, port: JournaledBusyPort) {
 	return f;
 }
 
-test("host death during busy-wait: the real busy loop keeps the refusal, the trigger is requeued and resubmitted once (#689)", async () => {
+test("host death during busy-wait: the real busy loop keeps the refusal and the trigger is answered once within the budget (#689)", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-fault-busy-host-death-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const db = database;
@@ -283,12 +283,31 @@ test("host death during busy-wait: the real busy loop keeps the refusal, the tri
 	await mkdir(join(agentDir, "sessions", "bucket"), { recursive: true });
 	await writeFile(join(agentDir, "sessions", "bucket", "2026-10-26T00-00-00_sdk-1.jsonl"), '{"type":"session"}\n');
 	const prompts: string[] = [];
+	const answered = { commandId: "command-2", turnId: "turn-2" };
+	let finished = false;
 	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.result") {
+			const done = finished && request.input.clientRef === prompts[1];
+			return {
+				ok: true,
+				result: done
+					? {
+							status: "terminal_ok",
+							...answered,
+							clientRef: request.input.clientRef,
+							startedAt: Date.now() - 1_000,
+							terminalAt: Date.now(),
+							receiptState: "present",
+							outcome: { reason: "end_turn" },
+						}
+					: { status: "in_flight", ...answered },
+			};
+		}
 		if (request.operation !== "turn.prompt") return { ok: true, result: {} };
 		prompts.push(String(request.input.clientRef));
 		return prompts.length === 1
 			? { ok: false, error: { code: "busy", message: "host busy" } }
-			: { ok: true, result: { accepted: true } };
+			: { ok: true, result: { accepted: true, receipt: answered } };
 	});
 	let hostLive = true;
 	const cli: CliRunner = async (args) => {
@@ -330,8 +349,18 @@ test("host death during busy-wait: the real busy loop keeps the refusal, the tri
 			const i = timers.indexOf(timer as Timer);
 			if (i >= 0) timers.splice(i, 1);
 		},
-		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				answers.push({ opRef: turn.opRef, text });
+			},
+		}),
 	});
+	const answers: Array<{ opRef: string; text: string }> = [];
+	/** Fires the timers due within the recovery budget, as the running gateway would. */
+	const elapseBudget = () => {
+		for (const timer of timers.splice(0).filter((timer) => timer.delay <= RECOVERY_BUDGET_MS)) timer.work();
+	};
 	db.transaction((tx) =>
 		db.inbox.enqueue(tx, {
 			messageId: "m-1",
@@ -354,10 +383,28 @@ test("host death during busy-wait: the real busy loop keeps the refusal, the tri
 		).toBe(true);
 		// The host is back; the dispatch retry submits the trigger once, under a fresh op-ref.
 		hostLive = true;
-		for (const timer of timers.splice(0).filter((timer) => timer.delay <= 60_000)) timer.work();
+		elapseBudget();
 		await until(() => prompts.length === 2);
 		expect(prompts[1]).not.toBe(refused);
+		// The resubmitted turn answers and ends on the relay that submitted it.
+		const host = relay.streams.at(-1)!;
+		host.host({
+			type: "event",
+			kind: "message_end",
+			...answered,
+			payload: {
+				event: { message: { id: "message-2", role: "assistant", content: [{ type: "text", text: "the answer" }] } },
+			},
+		});
+		finished = true;
+		host.host({ type: "agent_end", ...answered });
+		for (let i = 0; i < 40 && answers.length === 0; i++) {
+			elapseBudget();
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		expect(answers).toEqual([{ opRef: prompts[1]!, text: "the answer" }]);
 		expect(new Set(prompts).size).toBe(2);
+		expect(prompts).toHaveLength(2);
 	} finally {
 		await manager.stop();
 	}

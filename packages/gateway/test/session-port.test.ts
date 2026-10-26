@@ -1988,8 +1988,8 @@ test("a stall bound longer than the default busy wait is still reached, not requ
 	expect(clock).toBe(15 * 60_000);
 });
 
-for (const when of ["before", "after"] as const) {
-	test(`a busy retry whose relay dies ${when} writing the prompt ${when === "before" ? "keeps the busy refusal" : "stays ambiguous"} (#689)`, async () => {
+for (const when of ["before", "flush", "after"] as const) {
+	test(`a busy retry whose relay dies ${when === "flush" ? "flushing" : `${when} writing`} the prompt ${when === "before" ? "keeps the busy refusal" : "stays ambiguous"} (#689)`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -2018,7 +2018,17 @@ for (const when of ["before", "after"] as const) {
 			},
 			tailRunner: new TailRunner({ stream: relay.spawn, repo }),
 			sleep: async () => {
-				if (when === "before") relay.streams.at(-1)?.close();
+				const stream = relay.streams.at(-1);
+				if (when === "before") stream?.close();
+				if (when === "flush" && stream) {
+					// Production writes to the pipe and then flushes; a flush failure
+					// follows a frame that may already be on its way to the host.
+					const write = stream.write.bind(stream);
+					stream.write = (line: string) => {
+						write(line);
+						if (line.includes('"turn.prompt"')) throw new Error("EPIPE: broken pipe on flush");
+					};
+				}
 			},
 		});
 		const opRef = `gw-p-busy-${when}`;
@@ -2027,6 +2037,12 @@ for (const when of ["before", "after"] as const) {
 		if (when === "before") {
 			expect(prompts).toBe(1);
 			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBe("busy");
+		} else if (when === "flush") {
+			expect(
+				relay.streams.flatMap((stream) => stream.written).filter((frame) => frame.operation === "turn.prompt"),
+			).toHaveLength(2);
+			expect(intent?.state).toBe("pending");
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBeUndefined();
 		} else {
 			expect(prompts).toBe(2);
 			expect(intent?.state).toBe("pending");

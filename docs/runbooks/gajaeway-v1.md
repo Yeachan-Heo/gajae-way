@@ -180,7 +180,7 @@ CI runs the fault-injection matrix with `bun test packages/`: `build.yml` on eve
 | Broker restart mid-attach | `fault-injection.test.ts` |
 | Broker restart mid-send (receipt lost after acceptance) | `fault-injection.test.ts` |
 | Session host death mid-turn | `fault-injection.test.ts`, `unresolved-hold-escalation.test.ts` |
-| Session host death during busy-wait (real `BrokerSessionPort` busy loop; a retry the relay never wrote keeps the busy refusal) | `fault-injection.test.ts`, `session-port.test.ts` |
+| Session host death during busy-wait (real `BrokerSessionPort` busy loop; only a retry the relay provably never wrote keeps the busy refusal, a failure after the write stays ambiguous) | `fault-injection.test.ts`, `session-port.test.ts` |
 | Busy host making no progress | `session-port.test.ts`, `send-intent-recovery.test.ts` |
 | Relay timeout during host compaction (host finishes, or dies) | `fault-injection.test.ts` |
 | Escalated hold context, late answer and notice across restarts | `unresolved-hold-escalation.test.ts`, `unresolved-hold-escalation-server.test.ts` |

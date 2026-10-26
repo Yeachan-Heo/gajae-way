@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpRefRejectedError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
@@ -65,7 +65,7 @@ class Host implements SessionRelayStream {
 		this.raw(JSON.stringify(frame));
 	}
 	write(line: string) {
-		if (this.closed) throw new Error("closed");
+		if (this.closed) throw new RelayStreamUnwrittenError("closed");
 		const frame = JSON.parse(line) as Record<string, unknown>;
 		this.written.push(frame);
 		if (frame.type === "hello" && this.hello) this.host({ type: "hello", connectionId: this.connectionId });
