@@ -15,6 +15,7 @@ import { envelopeErrorCode, GjcCliError } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
+import { oversizedMemoryFiles } from "../memory/debloat";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -71,6 +72,8 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 		"For memory.canonicalize events: read the memory tree's daily/ captures, append the durable facts into their canonical axis files (people/ projects/ decisions/ events/ tasks/ channels/ ops/ reflections/ plus any axis registered in the corpus's axes.json), keep every original byte (never delete or summarize-replace, move stray root files into an axis directory with their raw content preserved), and make new files reachable from MEMORY.md. ops/ holds repeatable operating rules, runtime/session/tool procedure, principles distilled from failure, and state the next executor picks up; it is routable, so write into ops/rules/, ops/distillations/ or ops/handoffs/ and never one growing file, and never put raw transcript, secrets or dated small talk there. reflections/ holds what you learned about your own behaviour as dated append-only entries named reflections/YYYY-MM-DD.md (several entries per day are fine, per-subject files are not); each entry records source/time, the observed failure or drift, the invariant learned, why it matters, the concrete next action, and its promotion target - an operating invariant promotes to ops/rules, a cross-incident learning to ops/distillations, and a project or person correction to that axis. ops constrains what to do before acting; decisions/ records what was chosen at a point in time and why. Metadata for the graph: give each canonical file YAML frontmatter with `aliases:` (Korean AND romanized name pairs - a matcher that only knows one script misses the other) and `tags:` (a few stable topic labels; tags power retrieval boosts and Obsidian tag groups). The mechanical crosslinking itself is deterministic: run `gajaeway memory autolink` at the end of your pass - it wraps the first mention of every aliased canonical file in a relative link without touching any other byte. You may still hand-link where judgment is needed, and you may append `근거:`/`관련:` evidence lines at the END of a file when you personally know the causal source (never fabricate causality from date coincidence; existing wording stays untouched). The gateway commits; you only write files.",
 	"memory.audit":
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
+	"memory.debloat":
+		"For memory.debloat events: the payload lists every memory file larger than thresholdBytes in oversized (path, bytes); when oversized is empty the note is [SILENT]. Otherwise split each listed file into a routable structure under the same axis: a directory whose index.md holds only one-line pointers to topic- or date-sliced children, each under the threshold; an index.md that is itself listed is split the same way into sub-directories with their own index.md, so indexes nest instead of growing flat; preserve every original byte (move, never summarize-replace or delete), repoint every link to the moved content and keep it reachable from MEMORY.md, never hand-edit generated surfaces, then run the memory validator (gajaeway memory audit) and report each split file with its new layout plus the audit result.",
 };
 
 /** First line of every monitor authoring prompt: execute before reporting. */
@@ -294,6 +297,7 @@ export class MonitorPropagator {
 	#closing = false;
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
+	readonly #memoryDebloat: { readonly root: string; readonly thresholdBytes: number } | undefined;
 	readonly #model: GjcModelSelection | undefined;
 	readonly #serviceTier: GjcServiceTier | undefined;
 	readonly #appliedModels = new Map<string, string>();
@@ -334,6 +338,8 @@ export class MonitorPropagator {
 		onReadinessSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
+		/** Memory corpus scanned for `memory.debloat` events, and the byte size a file must exceed. */
+		memoryDebloat?: { readonly root: string; readonly thresholdBytes: number };
 		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
 		model?: GjcModelSelection;
 		serviceTier?: GjcServiceTier;
@@ -394,6 +400,19 @@ export class MonitorPropagator {
 		this.#protocolFailureRollThreshold =
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
+		this.#memoryDebloat = options.memoryDebloat;
+	}
+
+	/**
+	 * Event payload as the authoring turn sees it. A `memory.debloat` event is
+	 * scanned at dispatch, not at fire, so the list reflects the corpus the turn
+	 * will actually edit and the cron tick never blocks on a tree walk.
+	 */
+	async #authoringPayload(row: { readonly event_type: string; readonly payload_json: string }): Promise<unknown> {
+		const payload = JSON.parse(row.payload_json);
+		if (row.event_type !== "memory.debloat" || !this.#memoryDebloat) return payload;
+		const { root, thresholdBytes } = this.#memoryDebloat;
+		return { ...payload, thresholdBytes, oversized: await oversizedMemoryFiles(root, thresholdBytes) };
 	}
 	/** Cancels pending burst timers so no new dispatch starts during shutdown. */
 	dispose(): void {
@@ -718,7 +737,7 @@ export class MonitorPropagator {
 							)
 								return undefined;
 							this.#database.monitors.eventUpdate(tx, row.event_id, "failed_no_retry", null);
-							this.#database.core.metaDelete(authoringTurnKey(row.event_id));
+							this.#forgetAuthoringTurn(tx, [row.event_id], expectedRaw);
 							return current;
 						});
 						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
@@ -1115,11 +1134,13 @@ export class MonitorPropagator {
 					guidance,
 					procedure: procedure.prompt,
 					digest,
-					events: claimed.map((row) => ({
-						eventId: row.event_id,
-						eventType: row.event_type,
-						payload: JSON.parse(row.payload_json),
-					})),
+					events: await Promise.all(
+						claimed.map(async (row) => ({
+							eventId: row.event_id,
+							eventType: row.event_type,
+							payload: await this.#authoringPayload(row),
+						})),
+					),
 				});
 				// #187: a request-phase failure does not mean the prompt was refused —
 				// the turn it started may still be running. Reuse its op-ref on retry.
@@ -1129,8 +1150,14 @@ export class MonitorPropagator {
 					(await this.#reusableAuthoringTurn(authoringEventIds, sessionId)) ??
 					`gw-m-${batchId.replaceAll("-", "")}`;
 				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
-				this.#database.transaction(() => {
-					for (const row of claimed) this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
+				this.#database.transaction((tx) => {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && (prior.sessionId !== sessionId || prior.opRef !== opRef))
+							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
+					}
 				});
 				dispatchPhase = "request";
 				dispatchOperation = "request";
@@ -1148,8 +1175,12 @@ export class MonitorPropagator {
 				).assistant.text;
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
 				// The turn settled: a later retry must author afresh, never re-read it.
-				this.#database.transaction(() => {
-					for (const row of claimed) this.#database.core.metaDelete(authoringTurnKey(row.event_id));
+				this.#database.transaction((tx) => {
+					this.#forgetAuthoringTurn(
+						tx,
+						claimed.map((row) => row.event_id),
+						pendingTurn,
+					);
 				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
@@ -1455,22 +1486,15 @@ export class MonitorPropagator {
 	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(eventIds[0] ?? ""));
 		if (raw === undefined) return undefined;
-		let prior: { sessionId?: unknown; opRef?: unknown; eventIds?: unknown };
-		try {
-			prior = JSON.parse(raw) as typeof prior;
-		} catch {
-			prior = {};
-		}
-		const priorIds = Array.isArray(prior.eventIds) ? prior.eventIds : [];
+		const prior = parseAuthoringTurnPointer(raw);
+		if (!prior) return undefined;
 		const forget = () => {
-			for (const id of new Set([...eventIds, ...priorIds.filter((id): id is string => typeof id === "string")]))
-				this.#database.core.metaDelete(authoringTurnKey(id));
+			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, eventIds, raw));
 		};
 		if (
 			prior.sessionId !== sessionId ||
-			typeof prior.opRef !== "string" ||
-			priorIds.length !== eventIds.length ||
-			!eventIds.every((id) => priorIds.includes(id))
+			prior.eventIds.length !== eventIds.length ||
+			!eventIds.every((id) => prior.eventIds.includes(id))
 		) {
 			forget();
 			return undefined;
@@ -1484,6 +1508,36 @@ export class MonitorPropagator {
 		}
 		forget();
 		return undefined;
+	}
+	/** Abandon only captured pointers; sibling owners and replacement pointers remain authoritative. */
+	#forgetAuthoringTurn(tx: WriteTx, eventIds: readonly string[], raw: string | undefined): void {
+		if (raw === undefined) return;
+		const prior = parseAuthoringTurnPointer(raw);
+		if (!prior) return;
+		const authority = this.#database.bindings.brokerAuthority();
+		const ownedRepo = this.#database.bindings.workLaneRepoBySessionId(prior.sessionId);
+		let owner: ReturnType<Store["bindings"]["assertOwnedSession"]> | undefined;
+		if (authority && ownedRepo) {
+			try {
+				owner = this.#database.bindings.assertOwnedSession(prior.sessionId, ownedRepo, authority);
+			} catch (error) {
+				if (!(error instanceof BrokerAuthorityError)) throw error;
+			}
+		}
+		let forgotten = false;
+		for (const eventId of eventIds) {
+			if (!prior.eventIds.includes(eventId) || this.#database.core.metaGet(authoringTurnKey(eventId)) !== raw) continue;
+			this.#database.core.metaDelete(authoringTurnKey(eventId));
+			forgotten = true;
+		}
+		if (forgotten && owner)
+			this.#database.bindings.abandonBrokerPromptBusyRefusal(tx, {
+				sessionId: prior.sessionId,
+				opRef: prior.opRef,
+				originKey: owner.originKey,
+				epoch: owner.epoch,
+				repo: owner.repo,
+			});
 	}
 	/** Read-only safety-net evidence for one session origin (ops/tests). */
 	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {
@@ -2153,6 +2207,7 @@ function failureDetail(error: unknown): string {
 		"GjcCliUnavailableError",
 		"LastAssistantUnreadableError",
 		"BrokerAuthorityError",
+		"ModelNotSelectedError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -2189,6 +2244,7 @@ function failureDetail(error: unknown): string {
 		"last_assistant_no_items",
 		"last_assistant_null_item",
 		"last_assistant_non_text_item",
+		"model_not_selected",
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
@@ -2228,12 +2284,18 @@ function failureDetail(error: unknown): string {
 		if (!cleaned || cleaned === causeCode) return undefined;
 		return cleaned;
 	};
-	const message = causes
-		.slice()
-		.reverse()
-		.flatMap((fields) => [fields.runtimeMessage, fields.message, fields.reason])
-		.map(safeMessage)
-		.find((candidate) => candidate !== undefined);
+	// A top-level message is recorded only for classes that build it from fixed
+	// text and numbers. Every other message can carry operation ids or remote
+	// text (SessionTerminalError, RelayRefusedError, plain Error).
+	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError"]);
+	const message =
+		causes
+			.slice()
+			.reverse()
+			.flatMap((fields) => [fields.runtimeMessage, fields.message, fields.reason])
+			.map(safeMessage)
+			.find((candidate) => candidate !== undefined) ??
+		(messageSourceClasses.has(name) && error instanceof Error ? safeMessage(error.message) : undefined);
 	const outcomeBody = object(terminal.outcome);
 	// #178: a GjcCliError carries the SDK envelope code in `details`, and a
 	// terminal status carries it in `error.code` or `outcome.code`. Those are the

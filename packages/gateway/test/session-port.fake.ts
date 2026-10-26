@@ -103,7 +103,7 @@ export async function createOwnedSessionFixture(
 				stdout: JSON.stringify({
 					ok: true,
 					result: {
-						session: { sessionId: binding.sessionId, live: true, deleted: false, locator: { repo: binding.repo } },
+						session: { sessionId: binding.sessionId, live: true, deleted: false, locator: { cwd: binding.repo } },
 					},
 				}),
 				stderr: "",

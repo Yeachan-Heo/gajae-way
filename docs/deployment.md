@@ -64,7 +64,11 @@ On macOS, `bun run build` finishes with `scripts/sign-dist.sh`, which re-signs e
 
 Each adapter binary runs in the foreground. Discord and Slack `--help` and `--version` return without connecting. Every adapter acquires its own non-blocking home lease (`adapter-discord`, `adapter-slack`, or `adapter-telegram`) and refuses a second owner for the same `$GAJAEWAY_HOME`; no PID file decides ownership.
 
-The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.18.12`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
+The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.19.0`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
+
+The gateway's error contract is verified through GJC 0.19.x. Client preflight admits the package pin or newer, but this is not production runtime selection: the broker host requires exact equality with the package pin before spawning. A newer unverified minor raises `gjc_unverified_version`. Updating a host-global `gjc` does not upgrade the private runtime or an already-running broker. GJC 0.19.0 keeps a supervised foreground broker alive when idle; only detached autostart brokers reap themselves when abandoned. The gateway continues to use the public foreground command and owns shutdown through its service manager.
+
+GJC lifecycle hosts can detach into their own process groups (also in 0.18.12). Terminating the broker's group is not proof that every session host exited; Linux systemd adds a cgroup fence, while other supervisors need independent host-liveness evidence. Preserve the lifecycle ledger. In 0.19.0, `lifecycle_legacy_history_ambiguous` is an explicit admission fence: retain the original operation, key, target and pending intent for operator reconciliation; never rotate the key or infer no effect from a stopped host or empty transcript.
 
 The gateway and broker host pass `GJC_SDK_BROKER_AUTOSTART=0` to GJC child processes. GJC 0.18.9 and later honor this attach-only contract: a client that finds no live broker fails with `broker_unavailable` instead of spawning, retiring, or restarting one, and `gjc doctor` refuses broker restarts. The gateway refuses any GJC older than 0.18.9. The broker service runs the public foreground command `gjc sdk broker run --agent-dir <gjc.agentDir>` as its child; the broker never detaches, a live incumbent makes it exit 1 without being touched, and its exit code propagates to the service manager.
 
@@ -184,6 +188,29 @@ Outbound secret redaction is always on and is configured only through the gatewa
 `socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, `stallTimeoutMs`, `sessions`, and `sqlite` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`.
 
 `sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. The `sessions` object is reloadable.
+
+`restartNotice` controls the chat notices around a stack restart. They are on when unset; `{ "enabled": false }` turns them off and writes no restart record. `personaName` (1–80 characters) is the name filled into `{name}`; unset means `Gajaeway`. `workspace/SOUL.md` is never read for the name. The default texts are neutral third person:
+
+| Phase | Default text |
+| --- | --- |
+| `restarting` | `⚠️ {name} is restarting. Messages sent meanwhile are kept and answered after restart.` |
+| `online` | `♻️ {name} is back online.` |
+| `cancelled` | `↩️ {name}'s restart was cancelled. Queued messages are being answered now.` |
+
+`messages` replaces any of them per phase, for example a Korean persona:
+
+```json
+"restartNotice": {
+  "personaName": "카미",
+  "messages": {
+    "restarting": "⚠️ {name} 재시작 중입니다. 그동안 보낸 메시지는 재시작 후 답변합니다.",
+    "online": "♻️ {name} 다시 연결됐습니다.",
+    "cancelled": "↩️ {name} 재시작이 취소됐습니다. 대기 중인 메시지에 지금 답변합니다."
+  }
+}
+```
+
+A template is 1–1000 characters, may use `{name}` any number of times, and is rejected if it contains any other `{word}` placeholder or a key other than `restarting`, `online` or `cancelled`. A phase without a template uses its default. When a restart drain starts, every conversation with a turn in flight or a human message in the last 30 minutes gets one "restarting" notice; muted threads and bot-only rooms are skipped, and repeated `gateway.restart.prepare` calls for the same restart id do not resend. The notified origins and the restart id are recorded in the gateway DB. The replacement gateway closes that record with one "back online" notice; a drain released by the same gateway process (cancelled, timed out, or failed before the gateway was restarted) closes it with a "restart cancelled" notice instead, so no false online notice is sent. Notices are ordinary outbox deliveries, redacted and settled like any reply. The object is reloadable.
 
 `sqlite.journalMode` accepts `DELETE`, `TRUNCATE`, `PERSIST`, or `WAL` (default `WAL`); `MEMORY` and `OFF` are rejected to preserve database durability. Use `DELETE` or `TRUNCATE` for a single gateway instance on an NFS volume, and change this setting only while the gateway is stopped.
 
@@ -387,6 +414,8 @@ For each enabled adapter, create a configuration file:
 }
 ```
 
+The gateway accepts standalone `MEDIA:<absolute-path>` lines for Telegram replies as well as Slack: the adapter uploads each checked file into the same chat and forum topic as the reply with multipart `sendPhoto` (JPEG/PNG/WebP up to 10 MB) or `sendDocument` (everything else, and any photo Telegram refuses as a photo). The bot needs permission to send photos and documents in the chat.
+
 ### 5. Start the gateway
 
 ```sh
@@ -440,7 +469,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>] note [HANDOFFDONE]`, `[WAKE:<alias>]`, `[WATCH:<alias>]`, and as a `[POST:<alias>]` target spelling). Verify the next event through the path consuming the changed policy.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, `sessions`, `restartNotice`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>] note [HANDOFFDONE]`, `[WAKE:<alias>]`, `[WATCH:<alias>]`, and as a `[POST:<alias>]` target spelling). Verify the next event through the path consuming the changed policy.
 - `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, `gjc`, `sqlite`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.

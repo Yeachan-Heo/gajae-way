@@ -112,6 +112,7 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 			origin: { platform: "telegram", kind: "topic", conversationId: "-100123.99", parentId: "-100123" },
 			text: "hello @agent",
 			engagement: { mentioned: true, group: true, authorId: "42" },
+			messageId: "-100123:7",
 		});
 	} finally {
 		await rm(home, { recursive: true, force: true });
@@ -165,6 +166,7 @@ test("forwards a captioned photo with the downloaded local path and never the to
 					origin: { platform: "telegram", kind: "channel", conversationId: "-20" },
 					text: `what is this @agent\n[image · 122.1 KB · ${path}]`,
 					engagement: { mentioned: true, group: true, authorId: "42" },
+					messageId: "-20:31",
 				},
 			},
 		]);
@@ -201,6 +203,7 @@ test("still forwards an attachment-only message when the download fails", async 
 		expect(requests.map((request) => (request.params as { text: string }).text)).toEqual([
 			"[image · scan.png · not downloaded: download failed]",
 		]);
+		expect((requests[0]?.params as { messageId: string }).messageId).toBe("22:32");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -258,6 +261,41 @@ test("fails delivery ambiguously when transport times out after dispatch", async
 	}
 });
 
+test("a JSON Bot API transport error is ambiguous and never leaks the bot token", async () => {
+	const home = await temporaryHome();
+	try {
+		const token = "123456:transport-secret";
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const bot = new TelegramBotApi(token, async (url) => {
+			throw new Error(`fetch failed for ${String(url)} (token ${token})`);
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(mockGateway(requests), bot, state, delivery(origin, "reply"));
+		expect(requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "delivery-1",
+					reason:
+						"Telegram sendMessage request failed: fetch failed for https://api.telegram.org/bot<redacted>/sendMessage (token <redacted>)",
+					ambiguous: true,
+				},
+			},
+		]);
+		const polled = await bot.getUpdates().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(polled).toBeInstanceOf(Error);
+		expect((polled as Error).message).not.toContain(token);
+		expect((polled as Error).message).toStartWith("Telegram getUpdates request failed: ");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 // The delivery subscription is the merge seam: it chooses between the reaction
 // path and the text path. Deleting that choice leaves every other test green
 // while a reaction gets POSTED as the bare emoji, which is exactly the outcome
@@ -293,7 +331,7 @@ test("the delivery subscription routes a reaction to setMessageReaction and neve
 		);
 		handler?.({
 			...delivery(origin, "👍"),
-			reaction: { targetMessageId: "77", emoji: "👍", emojiName: "thumbsup" },
+			reaction: { targetMessageId: "22:77", emoji: "👍", emojiName: "thumbsup" },
 		});
 		for (let attempt = 0; attempt < 20 && requests.length === 0; attempt++) await Bun.sleep(5);
 		expect(reacted).toEqual([{ chatId: "22", messageId: "77", emoji: "👍" }]);

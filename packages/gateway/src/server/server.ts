@@ -66,6 +66,7 @@ import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
+import { DEFAULT_DEBLOAT_BYTE_THRESHOLD } from "../memory/debloat";
 import { initializeMemory, memoryRoot } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
@@ -142,9 +143,10 @@ import {
 	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
-import { applyModelCommand, listModelChoices } from "./model-command";
+import { applyModelCommand, listModelChoices, ProviderModelCatalog } from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
+import { RestartNotices, restartNoticeText } from "./restart-notice";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -276,6 +278,8 @@ export interface GatewayServerOptions {
 	readonly slo?: SloRecorder;
 	/** Only gateway-owned SDK commands and relays are closed after runtime work drains. */
 	readonly broker?: GlobalGjcClient;
+	/** Test seam: `/model set` provider models; production asks gjc through the broker (`gjc --list-models`). */
+	readonly listProviderModels?: () => Promise<readonly string[]>;
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
@@ -444,6 +448,8 @@ interface Runtime {
 	readonly sessionPort: SessionPort;
 	readonly personaSessions: PersonaSessionManager;
 	readonly readiness: FunctionalReadiness;
+	/** `/model set` autocomplete's cached provider models; absent without a broker. */
+	readonly providerModels?: ProviderModelCatalog;
 	/** Ordered shutdown, wired after construction; owner `/restart` uses it. */
 	stop?: (reason?: string) => Promise<void>;
 	/** Mirrors producer quiescence so restart paths can defer to a live supervisor. */
@@ -953,6 +959,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
 	const readiness = new FunctionalReadiness();
+	const broker = options.broker;
+	const listProviderModels = options.listProviderModels ?? (broker ? () => broker.listAvailableModels() : undefined);
+	const providerModels = listProviderModels ? new ProviderModelCatalog(listProviderModels) : undefined;
 	let runtime!: Runtime;
 	const workspacePath = options.workspace ?? join(options.config.home, "workspace");
 	// gjc rejects a session cwd that is a symlink: `session.create` comes back
@@ -961,6 +970,24 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	// gateway's workspace at the SSOT directory with a symlink, so resolve it
 	// before it reaches gjc.
 	const workspace = existsSync(workspacePath) ? realpathSync(workspacePath) : workspacePath;
+	const restartDrainId = persistedRestartDrainId(options.config.home);
+	// Config reloads replace runtime.config; the notices read whichever is current.
+	const currentConfig = (): GatewayConfig => (runtime === undefined ? options.config : runtime.config);
+	const restartNotices = new RestartNotices({
+		database: options.database,
+		delivery,
+		enabled: () => currentConfig().restartNotice?.enabled !== false,
+		text: (phase) => restartNoticeText(currentConfig().restartNotice, phase),
+		broadcast: (payloads) => {
+			for (const payload of payloads) {
+				delivery.markInflight(payload.deliveryId as string);
+				for (const recipient of connections)
+					if (recipient.negotiated)
+						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+			}
+		},
+		...(restartDrainId === undefined ? {} : { inheritedRestartId: restartDrainId }),
+	});
 	const personaSessions = new PersonaSessionManager({
 		database: options.database,
 		port: sessionPort,
@@ -1054,8 +1081,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				at,
 			}),
 		onSessionReady: () => readiness.recordSuccess("session_create"),
+		onRestartDrainStarted: (restartId) => restartNotices.restarting(restartId),
+		onRestartDrainCancelled: (restartId) => restartNotices.released(restartId),
+		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
-	const restartDrainId = persistedRestartDrainId(options.config.home);
 	if (restartDrainId !== undefined) {
 		void personaSessions
 			.drainForRestart(restartDrainId, 0)
@@ -1083,6 +1112,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		model: options.config.model,
 		serviceTier: options.config.serviceTier,
 		repo: workspace,
+		memoryDebloat: {
+			root: memoryRoot(options.config.home),
+			thresholdBytes: options.config.memory?.debloatByteThreshold ?? DEFAULT_DEBLOAT_BYTE_THRESHOLD,
+		},
 		onReadinessFailure: ({ code, detail, originKey, at }) =>
 			readiness.recordFailure({
 				category: "monitor_delivery",
@@ -1266,6 +1299,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionPort,
 		personaSessions,
 		readiness,
+		providerModels,
 		connections,
 		memory,
 		registry,
@@ -1303,6 +1337,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			options.secretGuard ??
 			new SecretGuard(secretSourcesFromEnv(process.env, options.broker?.agentDir, options.config.home)),
 	};
+	try {
+		restartNotices.resumeAfterBoot();
+	} catch (error) {
+		console.error(`restart notice recovery failed: ${diagnostic(error)}`);
+	}
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
 		.recover()
@@ -1925,7 +1964,11 @@ async function handleRequest(
 			return;
 		}
 		case "session.modelChoices": {
-			const choices = await listModelChoices(options.broker?.agentDir, runtime.config.model);
+			const choices = await listModelChoices(
+				options.broker?.agentDir,
+				runtime.config.model,
+				await (runtime.providerModels?.list() ?? []),
+			);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices } });
 			return;
 		}

@@ -1288,6 +1288,31 @@ test("/model autocomplete filters gateway choices and fails soft to an empty lis
 	expect(responded[2]).toEqual([]);
 });
 
+test("/model autocomplete narrows provider models by typed text and drops choices Discord would reject", async () => {
+	const responded: Array<Array<{ name: string; value: string }>> = [];
+	const interaction = (focused: string) => ({
+		isAutocomplete: () => true,
+		commandName: "model",
+		options: { getFocused: () => focused },
+		respond: async (choices: Array<{ name: string; value: string }>) => {
+			responded.push(choices);
+		},
+	});
+	const tooLong = `xai/${"g".repeat(97)}`;
+	const bedrock = Array.from({ length: 30 }, (_, index) => `amazon-bedrock/model-${index}`);
+	const choices = ["base", "openai-codex/gpt-6-luna", "xai/grok-4.7", tooLong, ...bedrock];
+	await handleModelAutocomplete(interaction(" XAI/") as never, { modelChoices: async () => choices });
+	await handleModelAutocomplete(interaction("") as never, { modelChoices: async () => choices });
+	expect(responded[0]).toEqual([{ name: "xai/grok-4.7", value: "xai/grok-4.7" }]);
+	expect(responded[1]).toHaveLength(25);
+	expect(responded[1]?.slice(0, 3).map((choice) => choice.value)).toEqual([
+		"base",
+		"openai-codex/gpt-6-luna",
+		"xai/grok-4.7",
+	]);
+	expect(responded[1]?.some((choice) => choice.value === tooLong)).toBe(false);
+});
+
 test("a declined slash command answers not-authorized instead of claiming a reset", async () => {
 	const gateway = { requestInbound: async () => ({ engaged: false }) };
 	let replied = "";

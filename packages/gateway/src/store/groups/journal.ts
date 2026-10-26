@@ -86,6 +86,30 @@ const RECORD_SQL: Readonly<Record<JournalEntity, string>> = Object.fromEntries(
 	}),
 ) as Record<JournalEntity, string>;
 
+/**
+ * Sweep statements take `(seqBound, cutoff, batch)`. Each walks the rowid range up to the
+ * bound in seq order and stops after `batch` matches, so a call stays O(batch) on a journal
+ * of millions of rows. The unary `+` keeps SQLite from driving the scan through the entity or
+ * recorded_at index, which would visit every candidate and sort it before applying the limit.
+ */
+export const HISTORY_SWEEP_SQL = `DELETE FROM work_journal WHERE seq IN (
+	SELECT seq FROM work_journal AS j WHERE seq <= ? AND +recorded_at < ? AND (
+		EXISTS (SELECT 1 FROM work_journal AS later WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq)
+		OR (row_json IS NULL AND NOT EXISTS (SELECT 1 FROM work_journal AS earlier WHERE earlier.entity = j.entity AND earlier.entity_key = j.entity_key AND earlier.seq < j.seq))
+	) ORDER BY seq LIMIT ?
+)`;
+
+export const ATTEMPT_UPDATED_SWEEP_SQL = `DELETE FROM work_journal WHERE seq IN (
+	SELECT j.seq FROM work_journal AS j
+	WHERE j.seq <= ? AND +j.entity = 'attempt' AND j.event_type = 'attempt_updated'
+		AND EXISTS (
+			SELECT 1 FROM work_journal AS later
+			WHERE later.entity = 'attempt' AND later.entity_key = j.entity_key AND later.seq > j.seq
+		)
+		AND +j.recorded_at < ?
+	ORDER BY j.seq LIMIT ?
+)`;
+
 export class JournalGroup {
 	readonly #db: GroupDb;
 
@@ -111,20 +135,76 @@ export class JournalGroup {
 	}
 
 	/**
+	 * Highest seq recorded before `cutoff`, or `undefined` when nothing is that old. Seq and
+	 * recorded_at both grow with appends, so this bounds a sweep to the rowid range that can
+	 * hold eligible rows; the per-row `recorded_at` check still decides eligibility.
+	 */
+	#seqBefore(tx: WriteTx, cutoff: string): number | undefined {
+		const row = this.#db
+			.prepare("SELECT seq FROM work_journal WHERE recorded_at < ? ORDER BY recorded_at DESC LIMIT 1")
+			.getWithWrite(tx, cutoff) as { seq: number } | null;
+		return row?.seq;
+	}
+
+	/**
 	 * Compact history older than the cutoff without changing what replay produces: superseded
 	 * snapshots go first, and a tombstone goes only once it is the sole event left for its key.
 	 */
 	sweep(tx: WriteTx, cutoffs: { readonly historyCutoff: string; readonly batch: number }): number {
-		return this.#db
-			.prepare(
-				`DELETE FROM work_journal WHERE seq IN (
-					SELECT seq FROM work_journal AS j WHERE recorded_at < ? AND (
-						EXISTS (SELECT 1 FROM work_journal AS later WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq)
-						OR (row_json IS NULL AND NOT EXISTS (SELECT 1 FROM work_journal AS earlier WHERE earlier.entity = j.entity AND earlier.entity_key = j.entity_key AND earlier.seq < j.seq))
-					) ORDER BY seq LIMIT ?
-				)`,
-			)
-			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
+		const bound = this.#seqBefore(tx, cutoffs.historyCutoff);
+		if (bound === undefined) return 0;
+		return this.#db.prepare(HISTORY_SWEEP_SQL).run(tx, bound, cutoffs.historyCutoff, cutoffs.batch).changes;
+	}
+
+	/**
+	 * Aggressively compact superseded attempt_updated rows older than the cutoff, keeping the
+	 * newest row per key always and terminal/transition events on the standard 30-day window.
+	 * This deletes non-latest attempt_updated rows to save space without affecting what replay
+	 * needs (only the latest snapshot per entity key).
+	 *
+	 * Readers:
+	 * - latest() only returns the latest row per key, so non-latest rows are safe to delete
+	 * - replayProjection() uses latest(), so it's unaffected
+	 * - Recovery/audit flows use latest(), so they're unaffected
+	 */
+	sweepAttemptUpdated(tx: WriteTx, cutoffs: { readonly updateCutoff: string; readonly batch: number }): number {
+		const bound = this.#seqBefore(tx, cutoffs.updateCutoff);
+		if (bound === undefined) return 0;
+		return this.#db.prepare(ATTEMPT_UPDATED_SWEEP_SQL).run(tx, bound, cutoffs.updateCutoff, cutoffs.batch).changes;
+	}
+
+	/** Measure work_journal row count and on-disk footprint. Returns 0 for pre-v36 databases without work_journal table. */
+	measure(): { rowCount: number; byteSize: number } {
+		try {
+			const stats = this.#db.prepare("SELECT COUNT(*) as cnt FROM work_journal").get() as { cnt: number };
+			const rowCount = stats.cnt;
+
+			// Measure the on-disk footprint of work_journal (table + its indexes) with the dbstat
+			// virtual table. Only SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB fall back to an
+			// estimate (row_json bytes + ~80 bytes of per-row column overhead).
+			let byteSize: number;
+			try {
+				const dbstatResult = this.#db
+					.prepare(
+						"SELECT COALESCE(SUM(pgsize), 0) AS size FROM dbstat WHERE name IN (SELECT name FROM sqlite_schema WHERE tbl_name = 'work_journal')",
+					)
+					.get() as { size: number };
+				byteSize = dbstatResult.size;
+			} catch {
+				const sizeStats = this.#db
+					.prepare("SELECT COALESCE(SUM(LENGTH(CAST(row_json AS BLOB))), 0) AS json_size FROM work_journal")
+					.get() as { json_size: number };
+				byteSize = sizeStats.json_size + rowCount * 80;
+			}
+
+			return { rowCount, byteSize };
+		} catch (error) {
+			// Pre-v36 databases don't have work_journal table; report 0 for both metrics
+			if ((error as Error).message.includes("no such table")) {
+				return { rowCount: 0, byteSize: 0 };
+			}
+			throw error;
+		}
 	}
 }
 

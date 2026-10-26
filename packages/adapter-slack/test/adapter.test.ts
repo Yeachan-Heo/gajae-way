@@ -252,7 +252,7 @@ for (const shape of [
 		}
 	});
 
-test("Slack rejects self, service, hidden, authorless and empty messages and ignores app_mention", async () => {
+test("Slack rejects self, service, hidden, authorless and empty messages and self app_mention", async () => {
 	const f = await fixture();
 	try {
 		for (const extra of [
@@ -267,8 +267,93 @@ test("Slack rejects self, service, hidden, authorless and empty messages and ign
 		]) {
 			await f.event({ ...inbound(extra) });
 		}
-		await f.event({ ...inbound(), type: "app_mention", text: "<@UBOT>" });
+		await f.event({ ...inbound({ user: "UBOT" }), type: "app_mention", text: "<@UBOT>" });
 		expect(f.client.requests).toEqual([]);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+// Slack sends app_mention without channel_type, subtype or parent_user_id.
+const appMention = (extra: Record<string, unknown> = {}) => ({
+	type: "app_mention",
+	channel: "C1",
+	user: "U1",
+	ts: "1700000000.123456",
+	event_ts: "1700000000.123456",
+	text: "<@UBOT> hello",
+	...extra,
+});
+const chatSends = (gateway: Gateway) =>
+	gateway.requests.filter((r) => r.verb === "chat.send").map((r) => r.params as Record<string, unknown>);
+
+test("Slack app_mention alone (bot invited from the mention prompt) becomes exactly one threaded turn", async () => {
+	const f = await fixture();
+	try {
+		await f.event(appMention());
+		const sends = chatSends(f.client);
+		expect(sends).toHaveLength(1);
+		expect(sends[0]).toMatchObject({
+			messageId: "C1:1700000000.123456",
+			// A channel mention auto-threads at the mention, same as the message path.
+			origin: { platform: "slack", kind: "thread", conversationId: "C1:1700000000.123456", parentId: "C1" },
+			text: "@UBOT hello",
+			engagement: { mentioned: true, explicitMention: true, group: true, authorId: "U1" },
+		});
+		await f.event(appMention());
+		expect(chatSends(f.client)).toHaveLength(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+for (const order of ["message-first", "app_mention-first"] as const)
+	test(`Slack message + app_mention for one ts is one turn (${order})`, async () => {
+		const f = await fixture();
+		try {
+			const message = inbound({ text: "<@UBOT> hello", channel_type: "channel" });
+			const events = order === "message-first" ? [message, appMention()] : [appMention(), message];
+			for (const event of events) await f.event({ ...event });
+			const sends = chatSends(f.client);
+			expect(sends).toHaveLength(1);
+			expect(sends[0]?.messageId).toBe("C1:1700000000.123456");
+		} finally {
+			f.socket.stop();
+		}
+	});
+
+test("Slack message + app_mention delivered concurrently still forward once", async () => {
+	const f = await fixture();
+	try {
+		await Promise.all([f.handleEvent({ ...inbound({ text: "<@UBOT> hello" }) }), f.handleEvent(appMention())]);
+		await f.ingress.drain();
+		await flush();
+		expect(chatSends(f.client)).toHaveLength(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack app_mention-only inside a thread is one turn in that thread, not a new one", async () => {
+	const f = await fixture();
+	try {
+		const mention = appMention({
+			ts: "1700000000.200000",
+			event_ts: "1700000000.200000",
+			thread_ts: "1699999999.000001",
+		});
+		await f.event(mention);
+		const sends = chatSends(f.client);
+		expect(sends).toHaveLength(1);
+		// The existing thread is the session; the reply is never re-rooted at the mention.
+		expect(sends[0]).toMatchObject({
+			messageId: "C1:1700000000.200000",
+			origin: { platform: "slack", kind: "thread", conversationId: "C1:1699999999.000001", parentId: "C1" },
+			engagement: { mentioned: true, replyTo: { messageId: "C1:1699999999.000001" } },
+		});
+		// A late message twin of the same ts stays deduped.
+		await f.event({ ...inbound({ ts: "1700000000.200000", thread_ts: "1699999999.000001", text: "<@UBOT> hello" }) });
+		expect(chatSends(f.client)).toHaveLength(1);
 	} finally {
 		f.socket.stop();
 	}

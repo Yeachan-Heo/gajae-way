@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -32,6 +33,8 @@ import {
 	BrokerSessionPort,
 	parseWorkerOutputResponse,
 	type SessionBindInput,
+	type SessionPort,
+	type SessionSendInput,
 	type WorkerOutputResult,
 } from "../src/orchestrator/session-port";
 import { RelayClosedError, type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
@@ -249,7 +252,7 @@ test("work.start reusing a persisted binding during a broker restart waits in th
 						sessionId: "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f",
 						live: true,
 						deleted: false,
-						locator: { repo: f.directory },
+						locator: { cwd: f.directory },
 					},
 				},
 			}),
@@ -410,7 +413,7 @@ test("managed repo cold binding retains its worktree across a broker readiness t
 					exitCode: 0,
 					stdout: JSON.stringify({
 						ok: true,
-						result: { session: { sessionId, live: true, deleted: false, locator: { repo: worktreePath } } },
+						result: { session: { sessionId, live: true, deleted: false, locator: { cwd: worktreePath } } },
 					}),
 					stderr: "",
 				};
@@ -804,6 +807,80 @@ test("a disconnect before send receipt cannot leave a newly registered waiter be
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
+for (const [label, text, disposition] of [
+	["full body", "HEAD:" + "가😀".repeat(1000) + ":TAIL", "available"],
+	["silent body", "HEAD:" + "가😀".repeat(1000) + "[SILENT]", "silent"],
+] as const) {
+	test(`run retains exact ${label} when output precedes the send receipt without reporting to its parent`, async () => {
+		const f = await fixture({ allowNested: () => true, ownerTarget: () => origin });
+		const parent = await started(f, "parent");
+		const receipt = deferred<void>();
+		const accepted = deferred<string>();
+		const send = f.port.send.bind(f.port);
+		f.port.send = async (input) => {
+			const result = await send(input);
+			accepted.resolve(input.opRef);
+			await receipt.promise;
+			return result;
+		};
+		const run = f.manager
+			.run({ name: "a", text: "work", cwd: f.directory, callerSessionId: parent.sessionId }, {})
+			.then(
+				(value) => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+		const opRef = await accepted.promise;
+		f.port.complete(opRef, text);
+		await until(() => f.db.work.workAttemptGet(opRef)?.output.disposition === disposition);
+		expect(f.db.work.workAttemptGet(opRef)?.output.excerpt).not.toBe(text);
+		receipt.resolve();
+		expect(await run).toMatchObject({ value: { held: false, text, opRef } });
+		expect(f.db.work.workAttemptGet(opRef)).toMatchObject({ mode: "run", parent: null });
+		expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		expect(f.port.steers).toHaveLength(0);
+	});
+}
+
+for (const detach of ["abort", "disconnect"] as const) {
+	test(`run ${detach} before send receipt rejects even when output settles before ACK`, async () => {
+		const f = await fixture({ ownerTarget: () => origin });
+		const receipt = deferred<void>();
+		const accepted = deferred<string>();
+		const send = f.port.send.bind(f.port);
+		f.port.send = async (input) => {
+			const result = await send(input);
+			accepted.resolve(input.opRef);
+			await receipt.promise;
+			return result;
+		};
+		const owner = {};
+		const abort = new AbortController();
+		const run = f.manager
+			.run({ name: "a", text: "work", cwd: f.directory }, owner, abort.signal)
+			.catch((error: unknown) => error);
+		const opRef = await accepted.promise;
+		if (detach === "abort") abort.abort();
+		else f.manager.detachWaiters(owner);
+		f.port.complete(opRef, "finished after caller left");
+		await until(() => f.db.work.workAttemptGet(opRef)?.output.disposition === "available");
+		receipt.resolve();
+		const failure = await run;
+		expect(failure).toBeInstanceOf(ProtocolError);
+		expect(failure).toMatchObject(
+			detach === "abort"
+				? { code: "verb_failed", detail: { reasonCode: "work_wait_detached" } }
+				: { code: "gateway_shutting_down" },
+		);
+		await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
+		expect(f.job().attempts[0]?.endState).toBe("completed");
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		expect(f.port.sends).toHaveLength(1);
+	});
+}
+
 test("notification target is immutable across owner reload; no-target remains no-target", async () => {
 	let owner: OriginRef | undefined = origin;
 	const f = await fixture({ ownerTarget: () => owner });
@@ -1065,6 +1142,519 @@ test("live unknown restart observes without replay or false acceptance", async (
 	expect(f.port.resumes).toHaveLength(0);
 });
 
+/** Real owned prompt journal and relay; no SDK process or host is launched. */
+async function interruptedBusyWorkFixture() {
+	const f = await fixture();
+	const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+	const sessionId = "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f";
+	const sessionKey = workSessionKey("a");
+	await createOwnedSessionFixture(f.db, authority, { sessionId, originKey: sessionKey, epoch: 0, repo: f.directory });
+	const commands: string[][] = [];
+	const cli: CliRunner = async (args) => {
+		commands.push([...args]);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId, live: true, deleted: false, locator: { cwd: f.directory } } },
+				}),
+				stderr: "",
+			};
+		const statusIndex = args.indexOf("status");
+		if (statusIndex !== -1)
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { operationRef: args[statusIndex + 2], status: { status: "unknown" }, summary: { completed: false } },
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const relay = scriptedRelay((request) => {
+		if (request.operation === "turn.prompt")
+			return { ok: false, error: { code: "busy", message: "prior turn running" } };
+		if (request.operation === "turn.result") return { ok: true, result: { status: "unknown" } };
+		throw new Error(`unexpected relay operation ${request.operation}`);
+	});
+	let sleeps = 0;
+	const realPort = new BrokerSessionPort({
+		database: f.db,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo: f.directory }),
+		sleep: async () => {
+			sleeps++;
+			throw new Error("interrupted after durable busy refusal");
+		},
+	});
+	const port: ScriptedSessionPort & Pick<SessionPort, "promptRefusal"> = f.port;
+	let sendInput: SessionSendInput | undefined;
+	let refusalReads = 0;
+	let terminateCalls = 0;
+	port.bind = (input) => realPort.bind(input);
+	port.attachTail = (input) => realPort.attachTail(input);
+	port.status = (input) => realPort.status({ ...input, relay: input.relay as TailHandle | undefined });
+	port.liveness = (input) => realPort.liveness(input);
+	port.promptRefusal = (input) => {
+		refusalReads++;
+		return realPort.promptRefusal(input);
+	};
+	port.send = (input) => {
+		const { relay: _relay, ...saved } = input;
+		sendInput = saved;
+		return realPort.send(input);
+	};
+	port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	port.terminateHost = async () => {
+		terminateCalls++;
+		throw new Error("busy refusal must not terminate the occupied host");
+	};
+	f.setOwnerTarget(origin);
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		detail: { reasonCode: "send_acceptance_uncertain" },
+	});
+	await f.manager.stop();
+	if (!sendInput) throw new Error("missing real prompt submission");
+	const input = sendInput;
+	const scope = JSON.stringify([sessionId, input.opRef]);
+	const journal = () => f.db.bindings.brokerOperation(authority, "turn.prompt", scope);
+	expect(sleeps).toBe(1);
+	expect(journal()).toMatchObject({ state: "complete" });
+	expect(realPort.promptRefusal(input)).toBe("busy");
+	expect(f.db.work.workAttemptGet(input.opRef)).toMatchObject({
+		sendPhase: "uncertain",
+		sendEvidence: null,
+		terminal: null,
+		settledAt: null,
+	});
+	return {
+		...f,
+		get manager() {
+			return f.manager;
+		},
+		port,
+		authority,
+		realPort,
+		relay,
+		input,
+		journal,
+		refusalReads: () => refusalReads,
+		assertNoHostMutation: () => {
+			expect(port.steers).toHaveLength(0);
+			expect(port.closes).toHaveLength(0);
+			expect(terminateCalls).toBe(0);
+			expect(commands.every((command) => command.includes("inspect") || command.includes("status"))).toBe(true);
+			expect(
+				relay.requests.every((request) => request.operation === "turn.prompt" || request.operation === "turn.result"),
+			).toBe(true);
+		},
+	};
+}
+
+test("restart settles a journaled busy refusal locally once without replay or native terminal proof", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const opRef = f.input.opRef;
+	let manager = await f.restart();
+	await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(opRef)).toMatchObject({
+		sendPhase: "uncertain",
+		sendEvidence: null,
+		terminal: { kind: "local", reasonCode: "send_rejected" },
+	});
+	expect(f.db.work.workAttemptGet(opRef)?.terminal?.status).toBeUndefined();
+	expect(f.job().attempts[0]?.endState).toBe("failed");
+	expect(f.job().state).toBe("awaiting_operator");
+	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] failed: send_rejected: output_unavailable"]);
+	expect(f.db.outbox.rows()).toHaveLength(1);
+	for (let i = 0; i < 2; i++) {
+		manager = await f.restart();
+		await manager.recover();
+	}
+	expect(await manager.start({ name: "a", text: "not an operator resume", cwd: f.directory })).toMatchObject({
+		started: false,
+		held: true,
+	});
+	expect(f.notices).toHaveLength(1);
+	expect(f.db.outbox.rows()).toHaveLength(1);
+	expect(f.job().attempts).toHaveLength(1);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	expect((await f.realPort.status(f.input)).status.status).toBe("unknown");
+	expect(await f.realPort.liveness(f.input)).toMatchObject({ live: true, disowned: false });
+	expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+	f.assertNoHostMutation();
+});
+
+const busyRetentionCutoff = {
+	completedBefore: "2001-01-01T00:00:00.000Z",
+	pendingBefore: "2001-01-01T00:00:00.000Z",
+};
+
+function ageBusyJournal(f: Awaited<ReturnType<typeof interruptedBusyWorkFixture>>) {
+	const sql = new Database(join(f.directory, "gateway.db"));
+	try {
+		sql.run(
+			"UPDATE broker_operations SET created_at = ?, completed_at = CASE WHEN state = 'complete' THEN ? ELSE NULL END WHERE operation = 'turn.prompt' AND operation_ref = ?",
+			["2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", f.input.opRef],
+		);
+	} finally {
+		sql.close();
+	}
+}
+
+async function settleBusyWork(f: Awaited<ReturnType<typeof interruptedBusyWorkFixture>>) {
+	await f.restart();
+	await until(() => f.db.work.workAttemptGet(f.input.opRef)?.settledAt != null);
+	await f.manager.stop();
+	expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toMatchObject({
+		kind: "local",
+		reasonCode: "send_rejected",
+	});
+	expect(f.notices).toHaveLength(1);
+}
+
+for (const localTerminal of [false, true]) {
+	test(`aged busy proof survives prune and reopen with ${localTerminal ? "local terminal but unsettled" : "unresolved"} runtime`, async () => {
+		const f = await interruptedBusyWorkFixture();
+		if (localTerminal) {
+			const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
+			expect(
+				f.db.transaction((tx) =>
+					f.db.work.workAttemptUpdate(tx, runtime.opRef, runtime.version, {
+						terminal: { kind: "local", reasonCode: "send_rejected", observedAt: runtime.startedAt },
+					}),
+				),
+			).toBeDefined();
+		}
+		ageBusyJournal(f);
+		const proof = f.journal()!;
+		expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+		const reopened = await Store.open(join(f.directory, "gateway.db"));
+		try {
+			expect(reopened.transaction((tx) => reopened.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+			expect(reopened.bindings.brokerOperation(f.authority, "turn.prompt", proof.scope)).toEqual(proof);
+			expect(reopened.work.workAttemptGet(f.input.opRef)?.settledAt).toBeNull();
+		} finally {
+			reopened.close();
+		}
+		expect(f.notices).toHaveLength(0);
+		expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+		f.assertNoHostMutation();
+	});
+}
+
+test("settled busy proof obeys completed cutoff, rolls back atomically and prunes exactly once without replay", async () => {
+	const f = await interruptedBusyWorkFixture();
+	await settleBusyWork(f);
+	const runtime = f.db.work.workAttemptGet(f.input.opRef);
+	const proof = f.journal()!;
+	const outbox = f.db.outbox.rows();
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+	ageBusyJournal(f);
+	expect(
+		f.db.transaction((tx) =>
+			f.db.bindings.pruneBrokerOperations(tx, {
+				...busyRetentionCutoff,
+				completedBefore: "2000-01-01T00:00:00.000Z",
+			}),
+		),
+	).toBe(0);
+	expect(() =>
+		f.db.transaction((tx) => {
+			expect(f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff)).toBe(1);
+			expect(f.journal()).toBeUndefined();
+			throw new Error("rollback busy cleanup");
+		}),
+	).toThrow("rollback busy cleanup");
+	expect(f.journal()).toEqual(proof);
+	expect(f.db.work.workAttemptGet(f.input.opRef)).toEqual(runtime);
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(1);
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+	expect(f.journal()).toBeUndefined();
+	const reopened = await Store.open(join(f.directory, "gateway.db"));
+	try {
+		expect(reopened.bindings.brokerOperation(f.authority, "turn.prompt", proof.scope)).toBeUndefined();
+		expect(reopened.work.workAttemptGet(f.input.opRef)).toEqual(runtime);
+		expect(reopened.outbox.rows()).toEqual(outbox);
+	} finally {
+		reopened.close();
+	}
+	await f.restart();
+	await f.manager.recover();
+	expect(f.db.work.workAttemptGet(f.input.opRef)).toEqual(runtime);
+	expect(f.notices).toHaveLength(1);
+	expect(f.db.outbox.rows()).toEqual(outbox);
+	expect(f.job().attempts).toHaveLength(1);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+for (const mismatch of [
+	"orphan",
+	"operation ref",
+	"scope session",
+	"scope encoding",
+	"session",
+	"lane",
+	"epoch",
+	"repo",
+	"journal authority",
+	"current authority",
+	"settlement column",
+	"settlement JSON",
+	"quarantine",
+] as const) {
+	test(`aged settled busy proof is retained with mismatched ${mismatch}`, async () => {
+		const f = await interruptedBusyWorkFixture();
+		await settleBusyWork(f);
+		ageBusyJournal(f);
+		const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
+		const sql = new Database(join(f.directory, "gateway.db"));
+		try {
+			// Only this disposable fixture is altered; mismatched provenance cannot authorize cleanup.
+			if (mismatch === "orphan") sql.run("DELETE FROM work_attempt_runtime WHERE op_ref = ?", [runtime.opRef]);
+			else if (mismatch === "operation ref")
+				sql.run("UPDATE broker_operations SET operation_ref = 'unowned-ref' WHERE operation_ref = ?", [runtime.opRef]);
+			else if (mismatch === "scope session" || mismatch === "scope encoding")
+				sql.run("UPDATE broker_operations SET scope = ? WHERE operation_ref = ?", [
+					mismatch === "scope session"
+						? JSON.stringify(["another-session", runtime.opRef])
+						: `[ ${JSON.stringify(runtime.sessionId)}, ${JSON.stringify(runtime.opRef)} ]`,
+					runtime.opRef,
+				]);
+			else if (mismatch === "journal authority")
+				sql.run("UPDATE broker_operations SET authority_key = 'unowned-authority' WHERE operation_ref = ?", [
+					runtime.opRef,
+				]);
+			else if (mismatch === "current authority")
+				sql.run("UPDATE broker_authority SET authority_key = 'revoked-authority' WHERE singleton = 1");
+			else if (mismatch === "settlement column")
+				sql.run("UPDATE work_attempt_runtime SET settled_at = NULL WHERE op_ref = ?", [runtime.opRef]);
+			else if (mismatch === "quarantine")
+				sql.run("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, 'test-cutover')", [
+					runtime.jobId,
+				]);
+			else {
+				const record = { ...runtime };
+				if (mismatch === "session") record.sessionId = "another-session";
+				if (mismatch === "lane") record.laneKey = "another-lane";
+				if (mismatch === "epoch") record.epoch++;
+				if (mismatch === "repo") record.cwd = join(f.directory, "another-repo");
+				if (mismatch === "settlement JSON") record.settledAt = "2000-01-01T00:00:00.000Z";
+				sql.run("UPDATE work_attempt_runtime SET record_json = ?, session_id = ?, lane_key = ? WHERE op_ref = ?", [
+					JSON.stringify(record),
+					record.sessionId,
+					record.laneKey,
+					runtime.opRef,
+				]);
+				if (mismatch === "session")
+					sql.run("UPDATE broker_operations SET scope = ? WHERE operation_ref = ?", [
+						JSON.stringify([record.sessionId, runtime.opRef]),
+						runtime.opRef,
+					]);
+			}
+			const rows = () => sql.query("SELECT * FROM broker_operations WHERE operation = 'turn.prompt'").all();
+			const proof = rows();
+			expect(proof).toHaveLength(1);
+			expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+			expect(rows()).toEqual(proof);
+		} finally {
+			sql.close();
+		}
+		f.assertNoHostMutation();
+	});
+}
+
+test("aged rearmed lost-ACK prompt remains pending even with a durably settled runtime", async () => {
+	const f = await interruptedBusyWorkFixture();
+	await settleBusyWork(f);
+	const refusal = f.journal()!;
+	f.db.transaction((tx) => f.db.bindings.rearmBrokerPromptOperation(tx, f.authority, refusal));
+	ageBusyJournal(f);
+	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+	const reopened = await Store.open(join(f.directory, "gateway.db"));
+	try {
+		expect(reopened.transaction((tx) => reopened.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
+		expect(reopened.bindings.brokerOperation(f.authority, "turn.prompt", refusal.scope)).toMatchObject({
+			state: "pending",
+		});
+		expect(reopened.work.workAttemptGet(f.input.opRef)?.settledAt).not.toBeNull();
+	} finally {
+		reopened.close();
+	}
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+test("rearmed pending prompt with native unknown remains open after WorkLane restart", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const refusal = f.journal();
+	if (!refusal) throw new Error("missing busy journal");
+	f.db.transaction((tx) => f.db.bindings.rearmBrokerPromptOperation(tx, f.authority, refusal));
+	expect(f.journal()).toMatchObject({ state: "pending" });
+	expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+	await f.restart();
+	expect(f.refusalReads()).toBeGreaterThan(0);
+	expect(f.db.work.workAttemptGet(f.input.opRef)).toMatchObject({
+		sendPhase: "uncertain",
+		terminal: null,
+		settledAt: null,
+	});
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toHaveLength(0);
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+test("saved acceptance prevents a stale busy journal from ending an attempt on unknown restart", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
+	expect(
+		f.db.transaction((tx) =>
+			f.db.work.workAttemptUpdate(tx, runtime.opRef, runtime.version, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: runtime.startedAt },
+			}),
+		),
+	).toBeDefined();
+	await f.restart();
+	expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+	expect(f.refusalReads()).toBe(0);
+	expect(f.db.work.workAttemptGet(runtime.opRef)).toMatchObject({
+		sendPhase: "accepted",
+		terminal: null,
+		settledAt: null,
+	});
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toHaveLength(0);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	f.assertNoHostMutation();
+});
+
+for (const evidence of ["absent", "unavailable", "unknown"] as const) {
+	test(`native unknown with ${evidence} refusal accessor holds without replay`, async () => {
+		const f = await interruptedBusyWorkFixture();
+		if (evidence === "absent") delete f.port.promptRefusal;
+		else
+			f.port.promptRefusal = () => {
+				if (evidence === "unavailable") throw new Error("refusal journal unavailable");
+				return undefined;
+			};
+		await f.restart();
+		expect(f.db.work.workAttemptGet(f.input.opRef)).toMatchObject({
+			sendPhase: "uncertain",
+			terminal: null,
+			settledAt: null,
+		});
+		expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+		f.assertNoHostMutation();
+	});
+}
+
+test("restart refusal recovery waits for a same-ref retry owner to rearm and accept under the session lock", async () => {
+	const f = await interruptedBusyWorkFixture();
+	const reached = new Set<string>();
+	const releaseQuery = deferred<void>();
+	const releaseRetry = deferred<void>();
+	const releaseAck = deferred<void>();
+	let interceptQuery = true;
+	let retryOwnsLock = false;
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		const report = await status(input);
+		if (interceptQuery) {
+			interceptQuery = false;
+			reached.add("query");
+			await releaseQuery.promise;
+		}
+		return report;
+	};
+	const exclusive = f.port.runExclusive.bind(f.port);
+	f.port.runExclusive = <T>(key: string, work: () => Promise<T>): Promise<T> => {
+		if (retryOwnsLock && key === workSessionKey("a")) reached.add("recovery-queued");
+		return exclusive(key, work);
+	};
+	const retryRelay = scriptedRelay(async (request) => {
+		if (request.operation !== "turn.prompt") throw new Error(`unexpected retry operation ${request.operation}`);
+		reached.add("prompt");
+		await releaseAck.promise;
+		return { ok: true, result: { accepted: true, clientRef: request.input.clientRef, commandId: "cmd-retry" } };
+	});
+	const retryTail = await new TailRunner({ stream: retryRelay.spawn, repo: f.directory }).attach({
+		sessionId: f.input.sessionId,
+		brokerGeneration: 0,
+		repo: f.directory,
+	});
+	let retry: Promise<void> | undefined;
+	const restarting = f.restart();
+	try {
+		await until(() => reached.has("query"));
+		retry = f.port.runExclusive(workSessionKey("a"), async () => {
+			retryOwnsLock = true;
+			try {
+				await releaseRetry.promise;
+				const receipt = await f.realPort.send({ ...f.input, relay: retryTail });
+				expect(receipt).toMatchObject({ operationRef: f.input.opRef, commandId: "cmd-retry" });
+				const latest = f.db.work.workAttemptGet(f.input.opRef)!;
+				expect(
+					f.db.transaction((tx) =>
+						f.db.work.workAttemptUpdate(tx, latest.opRef, latest.version, {
+							sendPhase: "accepted",
+							sendEvidence: { source: "receipt", observedAt: receipt.acceptedAt },
+						}),
+					),
+				).toBeDefined();
+			} finally {
+				retryOwnsLock = false;
+			}
+		});
+		await until(() => retryOwnsLock);
+		releaseQuery.resolve();
+		await until(() => reached.has("recovery-queued"));
+		expect(f.realPort.promptRefusal(f.input)).toBe("busy");
+		expect(f.refusalReads()).toBe(0);
+		expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toBeNull();
+		releaseRetry.resolve();
+		await until(() => reached.has("prompt"));
+		expect(f.journal()).toMatchObject({ state: "pending" });
+		expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+		expect(f.refusalReads()).toBe(0);
+		expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toBeNull();
+		releaseAck.resolve();
+		await retry;
+		await restarting;
+		expect(f.db.work.workAttemptGet(f.input.opRef)).toMatchObject({
+			sendPhase: "accepted",
+			terminal: null,
+			settledAt: null,
+		});
+		expect(f.refusalReads()).toBe(0);
+		expect(f.realPort.promptRefusal(f.input)).toBeUndefined();
+		expect((await f.realPort.status(f.input)).status.status).toBe("unknown");
+		expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+		expect(retryRelay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+		expect(f.notices).toHaveLength(0);
+		expect(f.db.outbox.rows()).toHaveLength(0);
+		f.assertNoHostMutation();
+	} finally {
+		releaseQuery.resolve();
+		releaseRetry.resolve();
+		releaseAck.resolve();
+		await retry?.catch(() => {});
+		await restarting.catch(() => {});
+		await retryTail.close();
+	}
+});
+
 test("dead restart settles uncertainty into a sticky hold, never replacement bind", async () => {
 	const f = await fixture();
 	const result = await started(f, "a", origin);
@@ -1297,6 +1887,448 @@ test("a lane row torn under a live observer is logged and dropped, not an unhand
 	expect(rejections).toEqual([]);
 });
 
+function tearObserverLane(f: Awaited<ReturnType<typeof fixture>>, opRef: string) {
+	const torn = closeAttempt({
+		record: f.job(),
+		opRef,
+		endState: "attempt_ended",
+		errorCode: "host_lost",
+		endedAt: new Date(Date.now() + 1000).toISOString(),
+	});
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, { ...torn, laneKey: laneJobIdentity("a").laneKey, json: JSON.stringify(torn) }),
+	);
+}
+
+test("audit: a dropped observer closes its resident relay once and shutdown drains rejected cleanup", async () => {
+	const rejections: unknown[] = [];
+	const onRejection = (reason: unknown) => rejections.push(reason);
+	process.on("unhandledRejection", onRejection);
+	cleanups.push(async () => {
+		process.off("unhandledRejection", onRejection);
+	});
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const f = await fixture();
+	const terminate = spyOn(f.port, "terminateHost");
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	const runner = new TailRunner({ stream: relay.spawn, repo: f.directory });
+	const attach = f.port.attachTail.bind(f.port);
+	let resident: TailHandle | undefined;
+	f.port.attachTail = async (input) => {
+		if (input.originKey !== workSessionKey("a")) return attach(input);
+		resident = await runner.attach(input);
+		return resident;
+	};
+	const result = await started(f, "a", origin);
+	const healthy = await started(f, "b", origin);
+	if (!resident) throw new Error("resident relay was not acquired");
+	const tail = resident;
+	const releaseClose = deferred<void>();
+	const originalClose = tail.close.bind(tail);
+	const close = spyOn(tail, "close").mockImplementation(async () => {
+		await originalClose();
+		await releaseClose.promise;
+		throw new Error("fixture cleanup rejection");
+	});
+	cleanups.push(async () => {
+		releaseClose.resolve();
+	});
+	try {
+		tearObserverLane(f, result.opRef);
+		await until(() => close.mock.calls.length === 1);
+		expect(relay.streams[0]?.closed).toBe(true);
+		f.port.complete(healthy.opRef, "other lane still served");
+		await until(() => f.db.work.workAttemptGet(healthy.opRef)?.settledAt != null);
+		expect(f.notices).toHaveLength(1);
+		expect(f.notices[0]?.text).toContain("[lane b] completed");
+		let stopped = false;
+		const stopping = f.manager.stop().then(() => {
+			stopped = true;
+		});
+		expect(f.manager.stop()).toBe(f.manager.stop());
+		await Bun.sleep(0);
+		expect(stopped).toBe(false);
+		releaseClose.resolve();
+		await stopping;
+		await Bun.sleep(0);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(errors.mock.calls.some((call) => String(call[0]).includes("work_observer_cleanup_failed"))).toBe(true);
+		expect(rejections).toEqual([]);
+		expect(terminate).not.toHaveBeenCalled();
+		expect(f.port.closes).toEqual([]);
+	} finally {
+		releaseClose.resolve();
+		await originalClose();
+	}
+});
+
+for (const revoke of ["drop", "settle"] as const) {
+	test(`observer ${revoke} cancels a real capacity wait without releasing the running owner (#640 Parang5593969223)`, async () => {
+		const errors = spyOn(console, "error").mockImplementation(() => {});
+		cleanups.push(async () => errors.mockRestore());
+		const f = await fixture();
+		const canonicalAgentDir = join(f.directory, "agent");
+		const authority = initializeTestBrokerAuthority(f.db, canonicalAgentDir);
+		// The normal fixture's onBind writes legacy bindings, which authority
+		// enforcement forbids. Model successful owned creation explicitly.
+		f.port.bind = async (input) => {
+			const binding = { ...input, sessionId: crypto.randomUUID() };
+			f.port.binds.push(input);
+			expect(f.db.transaction((tx) => f.db.bindings.recordOwnedBinding(tx, { ...binding, authority }))).toBe(true);
+			f.port.setSessionState(binding.sessionId, { repo: input.repo, live: true });
+			return binding;
+		};
+		const result = await started(f, "a", origin);
+		await f.manager.stop();
+		const binds = f.port.binds.length;
+		const sends = f.port.sends.length;
+		const terminate = spyOn(f.port, "terminateHost");
+		const saturated = deferred<void>();
+		const relay = scriptedRelay(() => {
+			throw new Error("capacity-only relays must never send SDK controls or queries");
+		});
+		const runner = new TailRunner({
+			stream: relay.spawn,
+			repo: f.directory,
+			maxTailProcesses: 1,
+			log: (line) => {
+				if (line.startsWith("tail_saturation ")) saturated.resolve();
+			},
+		});
+		const commands: string[][] = [];
+		const brokerPort = new BrokerSessionPort({
+			database: f.db,
+			authority,
+			cli: async (args) => {
+				commands.push([...args]);
+				throw new Error(`unexpected broker command ${args.join(" ")}`);
+			},
+			tailRunner: runner,
+		});
+		// Keep durable status/output scripted, but use the production port's full
+		// attach input forwarding and the real runner's capacity queue.
+		f.port.attachTail = (input) => brokerPort.attachTail(input);
+		const owner = await runner.attach({ sessionId: "persona-capacity-owner", brokerGeneration: 1, repo: f.directory });
+		owner.beginTurn("persona-owned-turn");
+		owner.setTurnRunning(true);
+		const ownerClose = spyOn(owner, "close");
+		const ownerRunning = spyOn(owner, "setTurnRunning");
+		let stopping: Promise<void> | undefined;
+		try {
+			await f.restart();
+			await saturated.promise;
+			expect(runner.activeCount).toBe(1);
+			expect(relay.streams).toHaveLength(1);
+			if (revoke === "drop") {
+				tearObserverLane(f, result.opRef);
+				await until(() =>
+					errors.mock.calls.some(
+						(call) => String(call[0]).includes("work_observer_failed") && String(call[0]).includes(result.opRef),
+					),
+				);
+			} else {
+				f.port.complete(result.opRef, "settled while its observer waits for capacity");
+				await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.notices).toHaveLength(1);
+			}
+			let stopped = false;
+			stopping = f.manager.stop().then(() => {
+				stopped = true;
+			});
+			// Bounded failure on 7fdd8f: disposal joins an uncancellable attach.
+			// The running persona owner is released only in finally on failure.
+			await until(() => stopped);
+			expect(ownerClose).not.toHaveBeenCalled();
+			expect(ownerRunning).not.toHaveBeenCalled();
+			expect(owner.connectionEpoch).toBeDefined();
+			expect(relay.streams[0]?.closed).toBe(false);
+			expect(runner.activeCount).toBe(1);
+			expect(relay.streams).toHaveLength(1);
+			expect(f.port.binds).toHaveLength(binds);
+			expect(f.port.sends).toHaveLength(sends);
+			expect(f.port.resumes).toEqual([]);
+			expect(f.port.steers).toEqual([]);
+			expect(f.port.closes).toEqual([]);
+			expect(terminate).not.toHaveBeenCalled();
+			expect(commands).toEqual([]);
+			expect(relay.requests).toEqual([]);
+			if (revoke === "drop") {
+				expect(f.notices).toEqual([]);
+			}
+		} finally {
+			// Explicit normal owner cleanup, never a prerequisite for stop above.
+			await owner.close();
+			await (stopping ?? f.manager.stop());
+		}
+		expect(runner.activeCount).toBe(0);
+		expect(relay.streams).toHaveLength(1);
+		// A cancelled waiter must not spawn later or retain a reserved slot.
+		for (let i = 0; i < 2; i++) {
+			const probe = await runner.attach({
+				sessionId: `capacity-probe-${i}`,
+				brokerGeneration: 1,
+				repo: f.directory,
+				priority: "retired",
+			});
+			expect(runner.activeCount).toBe(1);
+			await probe.close();
+			expect(runner.activeCount).toBe(0);
+		}
+		expect(relay.streams.map((stream) => stream.sessionId)).toEqual([
+			"persona-capacity-owner",
+			"capacity-probe-0",
+			"capacity-probe-1",
+		]);
+	});
+}
+
+for (const boundary of ["attachment", "ready"] as const) {
+	for (const revoke of ["drop", "shutdown"] as const) {
+		test(`observer ${revoke} drains a pending ${boundary} and closes the acquired tail exactly once`, async () => {
+			const rejections: unknown[] = [];
+			const onRejection = (reason: unknown) => rejections.push(reason);
+			process.on("unhandledRejection", onRejection);
+			cleanups.push(async () => {
+				process.off("unhandledRejection", onRejection);
+			});
+			const errors = spyOn(console, "error").mockImplementation(() => {});
+			cleanups.push(async () => errors.mockRestore());
+			const f = await fixture();
+			const terminate = spyOn(f.port, "terminateHost");
+			const result = await started(f, "a", origin);
+			await f.manager.stop();
+			const before = f.db.work.workAttemptGet(result.opRef)!;
+			const releaseAttachment = deferred<void>();
+			const releaseReady = deferred<void>();
+			const releaseClose = deferred<void>();
+			const attach = f.port.attachTail.bind(f.port);
+			let acquired = false;
+			let closeCalls = 0;
+			f.port.attachTail = async (input) => {
+				if (input.sessionId !== result.sessionId) return attach(input);
+				const tail = await attach(input);
+				if (boundary === "ready") Object.defineProperty(tail, "ready", { value: releaseReady.promise });
+				const close = tail.close.bind(tail);
+				tail.close = async () => {
+					closeCalls++;
+					await close();
+					// A real close releases ready; waiting for ready before close deadlocks.
+					releaseReady.resolve();
+					await releaseClose.promise;
+				};
+				acquired = true;
+				if (boundary === "attachment") await releaseAttachment.promise;
+				return tail;
+			};
+			cleanups.push(async () => {
+				releaseAttachment.resolve();
+				releaseReady.resolve();
+				releaseClose.resolve();
+			});
+			try {
+				await f.restart();
+				await until(() => acquired);
+				if (revoke === "drop") {
+					const healthy = await started(f, "b", origin);
+					tearObserverLane(f, result.opRef);
+					await until(() =>
+						errors.mock.calls.some(
+							(call) => String(call[0]).includes("work_observer_failed") && String(call[0]).includes(result.opRef),
+						),
+					);
+					f.port.complete(healthy.opRef, "healthy during cleanup");
+					await until(() => f.db.work.workAttemptGet(healthy.opRef)?.settledAt != null);
+					expect(f.notices).toHaveLength(1);
+					expect(f.notices[0]?.text).toContain("[lane b] completed");
+				}
+				let stopped = false;
+				const stopping = f.manager.stop().then(() => {
+					stopped = true;
+				});
+				if (boundary === "attachment") {
+					await Bun.sleep(0);
+					expect(stopped).toBe(false);
+					expect(closeCalls).toBe(0);
+					releaseAttachment.resolve();
+				}
+				await until(() => closeCalls === 1);
+				expect(stopped).toBe(false);
+				expect(f.port.tailsOf(result.sessionId)).toEqual([]);
+				releaseClose.resolve();
+				await stopping;
+				await f.manager.stop();
+				await Bun.sleep(0);
+				expect(closeCalls).toBe(1);
+				if (revoke === "shutdown") {
+					expect(f.db.work.workAttemptGet(result.opRef)).toEqual(before);
+					expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+					expect(f.notices).toEqual([]);
+				}
+				expect(rejections).toEqual([]);
+				expect(terminate).not.toHaveBeenCalled();
+				expect(f.port.closes).toEqual([]);
+			} finally {
+				releaseAttachment.resolve();
+				releaseReady.resolve();
+				releaseClose.resolve();
+			}
+		});
+	}
+}
+
+for (const revoke of ["stop", "generation", "binding"] as const) {
+	test(`initial start revoked by ${revoke} records local rejection and permits explicit resume after recovery`, async () => {
+		let generation = 1;
+		const f = await fixture({ brokerGeneration: () => generation, ownerTarget: () => origin });
+		const ready = deferred<void>();
+		const attach = f.port.attachTail.bind(f.port);
+		let acquired: TailHandle | undefined;
+		let sessionActivity: (() => void) | undefined;
+		f.port.attachTail = async (input) => {
+			const tail = await attach(input);
+			if (acquired) return tail;
+			sessionActivity = input.onSessionActivity;
+			Object.defineProperty(tail, "ready", { value: ready.promise });
+			const close = tail.close.bind(tail);
+			tail.close = async () => {
+				await close();
+				ready.resolve();
+			};
+			acquired = tail;
+			return tail;
+		};
+		const start = f.manager
+			.start({ name: "a", text: "not submitted", cwd: f.directory })
+			.catch((error: unknown) => error);
+		try {
+			await until(() => acquired !== undefined);
+			const before = f.db.work.workAttemptOpen()[0]!;
+			if (revoke === "generation") {
+				// Session content touches binding activity, not the attempt version.
+				// Separately race a durable checkpoint so rejection must CAS latest.
+				// It must change a field: no-op patches no longer bump the version (#648).
+				expect(sessionActivity).toBeDefined();
+				sessionActivity!();
+				const checkpoint = f.db.transaction((tx) =>
+					f.db.work.workAttemptUpdate(tx, before.opRef, before.version, {
+						turnEndObservedAt: new Date(Date.parse(before.startedAt) + 1).toISOString(),
+					}),
+				);
+				expect(checkpoint).toBeDefined();
+				expect(checkpoint!.version).toBeGreaterThan(before.version);
+			}
+			let transition: Promise<void> | undefined;
+			if (revoke === "stop") transition = f.manager.stop();
+			else if (revoke === "generation") {
+				generation++;
+				ready.resolve();
+			} else {
+				f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey("a")));
+				ready.resolve();
+			}
+			const error = await start;
+			expect(error).toBeInstanceOf(ProtocolError);
+			expect(error).toMatchObject(
+				revoke === "stop"
+					? { code: "gateway_shutting_down" }
+					: { code: "verb_failed", detail: { reasonCode: "send_rejected" } },
+			);
+			await transition;
+			expect(f.port.sends).toEqual([]);
+			expect(f.port.sendAttempts).toEqual([]);
+			expect(await f.port.status({ sessionId: before.sessionId, repo: before.cwd, opRef: before.opRef })).toMatchObject(
+				{
+					status: { status: "unknown" },
+					summaryCompleted: false,
+				},
+			);
+			const checkpoint = f.db.work.workAttemptGet(before.opRef)!;
+			expect(checkpoint.terminal).toMatchObject({ kind: "local", reasonCode: "send_rejected" });
+			expect(checkpoint.terminal?.status).toBeUndefined();
+			expect(checkpoint.sendEvidence).toBeNull();
+			expect(checkpoint.sendPhase).toBe("prepared");
+			if (revoke === "stop") await f.restart();
+			else if (revoke === "generation") await f.manager.onBrokerGeneration();
+			else await f.manager.recover();
+			await until(() => f.db.work.workAttemptGet(before.opRef)?.settledAt != null);
+			expect(f.db.work.workAttemptGet(before.opRef)?.terminal).toEqual(checkpoint.terminal);
+			expect(f.job().attempts[0]).toMatchObject({ endState: "failed", errorCode: "send_rejected" });
+			expect(f.job().state).toBe("awaiting_operator");
+			expect(f.notices).toHaveLength(1);
+			expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable");
+			expect(f.db.outbox.rows()).toHaveLength(1);
+			await f.manager.recover();
+			expect(f.notices).toHaveLength(1);
+			expect(f.db.outbox.rows()).toHaveLength(1);
+			expect(f.port.sendAttempts).toEqual([]);
+			const resumed = await f.manager.start({ name: "a", text: "explicit new work", resume: true });
+			expect(resumed.started).toBe(true);
+			if (!resumed.started) throw new Error("explicit resume unexpectedly held");
+			expect(resumed.opRef).not.toBe(before.opRef);
+			expect(f.port.sendAttempts.map((input) => input.opRef)).toEqual([resumed.opRef]);
+			expect(f.db.work.workAttemptGet(resumed.opRef)).toMatchObject({ sendPhase: "accepted", terminal: null });
+			expect(f.db.work.workAttemptGet(before.opRef)?.terminal).toEqual(checkpoint.terminal);
+			expect(f.notices).toHaveLength(1);
+			expect(f.port.closes).toEqual([]);
+		} finally {
+			ready.resolve();
+			await start;
+			await f.manager.stop();
+		}
+	});
+}
+
+for (const evidence of ["acceptance", "terminal"] as const) {
+	test(`initial pre-send rejection preserves concurrent durable ${evidence}`, async () => {
+		const f = await fixture();
+		const ready = deferred<void>();
+		const attach = f.port.attachTail.bind(f.port);
+		let acquired = false;
+		f.port.attachTail = async (input) => {
+			const tail = await attach(input);
+			Object.defineProperty(tail, "ready", { value: ready.promise });
+			const close = tail.close.bind(tail);
+			tail.close = async () => {
+				await close();
+				ready.resolve();
+			};
+			acquired = true;
+			return tail;
+		};
+		const start = f.manager
+			.start({ name: "a", text: "not submitted", cwd: f.directory })
+			.catch((error: unknown) => error);
+		try {
+			await until(() => acquired);
+			const prepared = f.db.work.workAttemptOpen()[0]!;
+			const observedAt = new Date().toISOString();
+			// Model a concurrent durable writer, not a fabricated SDK completion.
+			const raced = f.db.transaction((tx) =>
+				f.db.work.workAttemptUpdate(
+					tx,
+					prepared.opRef,
+					prepared.version,
+					evidence === "acceptance"
+						? { sendPhase: "accepted", sendEvidence: { source: "status", observedAt } }
+						: { terminal: { kind: "local", reasonCode: "host_lost", observedAt } },
+				),
+			);
+			expect(raced).toBeDefined();
+			const stopping = f.manager.stop();
+			expect(await start).toBeInstanceOf(ProtocolError);
+			await stopping;
+			expect(f.db.work.workAttemptGet(prepared.opRef)).toEqual(raced);
+			expect(f.port.sendAttempts).toEqual([]);
+			expect(f.notices).toEqual([]);
+		} finally {
+			ready.resolve();
+			await start;
+			await f.manager.stop();
+		}
+	});
+}
+
 test("saved terminal proof wins over dead liveness and output recovery consumes saved budget", async () => {
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
@@ -1406,6 +2438,83 @@ test("stop releases run before draining a blocked finite output read and preserv
 	expect(f.db.work.workAttemptGet(op)?.output.disposition).toBe("pending");
 	expect(f.notices).toHaveLength(0);
 });
+
+for (const revoke of ["stop", "generation", "binding"] as const) {
+	test(`audit: ${revoke} during transport diagnostics revokes observer settlement and reporting authority`, async () => {
+		let generation = 1;
+		const rejections: unknown[] = [];
+		const onRejection = (reason: unknown) => rejections.push(reason);
+		process.on("unhandledRejection", onRejection);
+		cleanups.push(async () => {
+			process.off("unhandledRejection", onRejection);
+		});
+		const f = await fixture({ brokerGeneration: () => generation });
+		const terminate = spyOn(f.port, "terminateHost");
+		const gate = deferred<{ kind: "transport"; nativeErrorCode: "ECONNRESET" }>();
+		let entered = false;
+		f.port.failedTransportCause = async () => {
+			entered = true;
+			return gate.promise;
+		};
+		cleanups.push(async () => {
+			gate.resolve({ kind: "transport", nativeErrorCode: "ECONNRESET" });
+		});
+		const result = await started(f, "a", origin);
+		f.port.status = async (input) => ({
+			operationRef: input.opRef,
+			status: { status: "failed", receiptState: "missing" },
+			summaryCompleted: true,
+		});
+		f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+		f.port.fail(result.opRef, "fixture failure", { code: "sdk_failed" });
+		await until(() => entered);
+		const before = f.db.work.workAttemptGet(result.opRef)!;
+		const jobBefore = f.db.work.laneJobJson(laneJobIdentity("a").jobId);
+		// Readoption may legitimately settle saved terminal proof. Isolate the old
+		// observer, not the replacement recovery's separate write authority.
+		const recover = spyOn(f.manager, "recover").mockImplementation(async () => {});
+		let stopped = false;
+		let stopping: Promise<void> | undefined;
+		if (revoke === "stop")
+			stopping = f.manager.stop().then(() => {
+				stopped = true;
+			});
+		else if (revoke === "generation") generation++;
+		else f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, result.sessionKey));
+		try {
+			await Bun.sleep(0);
+			if (stopping) expect(stopped).toBe(false);
+			gate.resolve({ kind: "transport", nativeErrorCode: "ECONNRESET" });
+			// Queue behind the settlement lock held across failedTransportCause.
+			await f.port.runExclusive(result.sessionKey, async () => {});
+			if (stopping) await stopping;
+			if (revoke === "binding") await until(() => recover.mock.calls.length > 0);
+			expect(f.db.work.workAttemptGet(result.opRef)).toEqual(before);
+			expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+			expect(f.db.work.laneJobJson(laneJobIdentity("a").jobId)).toBe(jobBefore);
+			expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+			expect(f.notices).toEqual([]);
+			expect(f.db.outbox.rows()).toEqual([]);
+			expect(f.port.steers).toEqual([]);
+			recover.mockRestore();
+			if (revoke === "generation") {
+				// A new generation may recover the same proof, but only after the
+				// revoked observer's immutable-state assertions above have passed.
+				await f.manager.onBrokerGeneration();
+				await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+				expect(f.notices).toHaveLength(1);
+			}
+			await f.manager.stop();
+			await Bun.sleep(0);
+			expect(rejections).toEqual([]);
+			expect(terminate).not.toHaveBeenCalled();
+			expect(f.port.closes).toEqual([]);
+		} finally {
+			gate.resolve({ kind: "transport", nativeErrorCode: "ECONNRESET" });
+			recover.mockRestore();
+		}
+	});
+}
 
 test("invalid shared parameters have no bind/send effects and manager registration is unique", async () => {
 	const f = await fixture();

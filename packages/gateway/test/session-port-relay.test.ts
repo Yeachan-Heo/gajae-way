@@ -6,12 +6,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CliResult, type CliRunner, TranscriptIncompleteError } from "@gajae-gateway/subsession";
+import { type CliResult, type CliRunner, OpRefError, TranscriptIncompleteError } from "@gajae-gateway/subsession";
 import type { SessionRelayStream } from "../src/orchestrator/broker";
 import {
 	BrokerSessionPort,
 	LastAssistantUnreadableError,
 	SESSION_REQUEST_STEPS,
+	SessionTerminalError,
 	sessionRequestStep,
 } from "../src/orchestrator/session-port";
 import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
@@ -310,6 +311,91 @@ test("session request exposes the exact closed diagnostic step vocabulary", () =
 	expect(SESSION_REQUEST_STEPS).toEqual(["authority", "attach", "send", "status", "last_assistant", "close"]);
 });
 
+for (const reason of ["cancelled", "refusal", "max_tokens", "max_turn_requests", undefined]) {
+	test(`session request rejects terminal_ok/${reason ?? "missing outcome"} without reading a prior assistant`, async () => {
+		const outcome =
+			reason === undefined
+				? undefined
+				: { kind: "stopped", reason, provenance: reason === "cancelled" ? "client_cancel" : "agent" };
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							status: "terminal_ok",
+							clientRef: request.input.clientRef,
+							receiptState: "present",
+							...(outcome ? { outcome } : {}),
+						},
+					};
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: ["stale authoring response from a prior turn"], complete: true } };
+				return { ok: true, result: { accepted: true, clientRef: request.input.clientRef } };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		const observed = await f.port
+			.request({ sessionId: "sdk-1", repo: f.repo, text: "author event", opRef: "gw-terminal-outcome" })
+			.catch((error: unknown) => error);
+		expect(observed).toBeInstanceOf(SessionTerminalError);
+		expect(sessionRequestStep(observed)).toBe("status");
+		if (reason) expect((observed as Error).message).toContain(reason);
+		expect((observed as SessionTerminalError).status.status).toMatchObject({
+			status: "terminal_ok",
+			...(outcome ? { outcome } : {}),
+		});
+		expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
+		expect(f.cli).toEqual([]);
+		expect(f.relay.streams).toHaveLength(2);
+		expect(f.relay.streams[0]!.closed).toBe(false);
+		expect(f.relay.streams[1]!.closed).toBe(true);
+		await f.handle.close();
+	});
+}
+
+for (const receiptState of ["missing", "unknown"] as const) {
+	test(`session request holds end_turn with ${receiptState} receipt`, async () => {
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState,
+							outcome: { reason: "end_turn" },
+						},
+					};
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: ["unproven response"], complete: true } };
+				return { ok: true, result: { accepted: true, clientRef: request.input.clientRef } };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		const failure = await f.port
+			.request({ sessionId: "sdk-1", repo: f.repo, text: "author event", opRef: "gw-receipt-hold" })
+			.catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(SessionTerminalError);
+		expect(sessionRequestStep(failure)).toBe("status");
+		expect((failure as SessionTerminalError).status.status.receiptState).toBe(receiptState);
+		expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
+		expect(f.relay.streams).toHaveLength(2);
+		expect(f.relay.streams[0]!.closed).toBe(false);
+		expect(f.relay.streams[1]!.closed).toBe(true);
+		await f.handle.close();
+	});
+}
+
 test("session request tags a failed send and a failed status probe independently", async () => {
 	const f = await fixture({
 		mode: "answer",
@@ -334,6 +420,85 @@ test("session request tags a failed send and a failed status probe independently
 	expect(Object.isFrozen(statusFailure)).toBe(true);
 	expect(sessionRequestStep(sendFailure)).toBe("send");
 	expect(sessionRequestStep(statusFailure)).toBe("status");
+	await f.handle.close();
+});
+
+test("session request preserves local prompt fingerprint rejection instead of recovering another prompt", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "turn.result")
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: request.input.clientRef,
+						status: "terminal_ok",
+						receiptState: "present",
+						outcome: { reason: "end_turn" },
+					},
+				};
+			if (request.operation === "session.last_assistant")
+				return { ok: true, page: { items: ["answer to prompt A"], complete: true } };
+			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef } };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = { sessionId: "sdk-1", repo: f.repo, opRef: "gw-fingerprint", relay: f.handle };
+	await f.port.send({ ...input, text: "prompt A" });
+	const failure = await f.port.request({ ...input, text: "prompt B" }).catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(OpRefError);
+	expect((failure as Error).message).toContain("already used for a different prompt");
+	expect(sessionRequestStep(failure)).toBe("send");
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	expect(f.cli).toEqual([]);
+	expect(f.relay.streams).toHaveLength(2);
+	expect(f.relay.streams[0]!.closed).toBe(false);
+	expect(f.relay.streams[1]!.closed).toBe(true);
+	await f.handle.close();
+});
+
+test("session request still reconciles native client-ref conflict without another submission", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "turn.prompt") return { ok: false, error: { code: "client_ref_conflict" } };
+			if (request.operation === "turn.result")
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: request.input.clientRef,
+						status: "terminal_ok",
+						receiptState: "present",
+						outcome: { reason: "end_turn", provenance: "agent" },
+					},
+				};
+			return { ok: true, page: { items: ["recovered original result"], complete: true } };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const result = await f.port.request({
+		sessionId: "sdk-1",
+		repo: f.repo,
+		text: "prompt",
+		opRef: "gw-native-conflict",
+	});
+	expect(result.assistant.text).toBe("recovered original result");
+	expect(result.status.operationRef).toBe("gw-native-conflict");
+	expect(f.relay.requests.map((request) => request.operation)).toEqual([
+		"turn.prompt",
+		"turn.result",
+		"session.last_assistant",
+	]);
+	expect(f.relay.requests[1]?.input).toEqual({ kind: "prompt", clientRef: "gw-native-conflict" });
+	expect(f.relay.streams).toHaveLength(2);
+	expect(f.relay.streams[0]!.closed).toBe(false);
+	expect(f.relay.streams[1]!.closed).toBe(true);
 	await f.handle.close();
 });
 
@@ -385,7 +550,15 @@ test("session request tags status and last_assistant failures at their own stage
 		mode: "answer",
 		relayReply: (request) => {
 			if (request.operation === "turn.result")
-				return { ok: true, result: { kind: "prompt", status: "terminal_ok", clientRef: request.input.clientRef } };
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						status: "terminal_ok",
+						clientRef: request.input.clientRef,
+						outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" },
+					},
+				};
 			if (request.operation === "session.last_assistant") return { ok: true, page: { items: [null], complete: true } };
 			return { ok: true, result: {} };
 		},

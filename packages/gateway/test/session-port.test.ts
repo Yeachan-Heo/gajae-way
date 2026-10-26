@@ -138,7 +138,7 @@ test("an unknown startup model fails without poisoning create keys and can be co
 				stdout: JSON.stringify({
 					ok: true,
 					result: {
-						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { repo: "/tmp/workspace" } },
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
 					},
 				}),
 				stderr: "",
@@ -445,7 +445,15 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 				result: { commandId: "cmd-1", turnId: "turn-1", accepted: true, clientRef: request.input.clientRef },
 			};
 		if (request.operation === "turn.result")
-			return { ok: true, result: { kind: "prompt", status: "terminal_ok", clientRef: request.input.clientRef } };
+			return {
+				ok: true,
+				result: {
+					kind: "prompt",
+					status: "terminal_ok",
+					clientRef: request.input.clientRef,
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" },
+				},
+			};
 		if (request.operation === "session.last_assistant")
 			return { ok: true, page: { items: ["finished body"], complete: true } };
 		return { ok: false, error: { code: "unsupported_operation" } };
@@ -1852,7 +1860,11 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 					ok: true,
 					result: {
 						operationRef: "gw-torn-1",
-						status: { status: cliReports < 2 ? "in_flight" : "terminal_ok", clientRef: "gw-torn-1" },
+						status: {
+							status: cliReports < 2 ? "in_flight" : "terminal_ok",
+							clientRef: "gw-torn-1",
+							...(cliReports >= 2 ? { outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" } } : {}),
+						},
 						summary: { completed: cliReports >= 2 },
 					},
 				}),
@@ -1923,6 +1935,7 @@ for (const progressing of [true, false]) {
 					kind: "prompt",
 					status: polls >= 6 ? "terminal_ok" : "in_flight",
 					clientRef: request.input.clientRef,
+					...(polls >= 6 ? { outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" } } : {}),
 				},
 			};
 		});

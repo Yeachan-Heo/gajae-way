@@ -19,8 +19,12 @@ type Timer = { unref?(): void };
 type Entry = {
 	readonly channel: string;
 	readonly ts: string;
-	/** Thread the native status line hangs under: the message's own thread, or the message as a new root. */
-	readonly threadTs: string;
+	/**
+	 * Thread the native status line hangs under. Only set when the turn lives in a
+	 * thread; a root channel/DM message has no thread for the reply to land in, and
+	 * setting a status on it would open an empty thread under the user's message.
+	 */
+	readonly threadTs: string | undefined;
 	/** Coalescing state: what the gradient should show, decided by presenceTransition. */
 	state: PresenceState;
 	/** Marker names we know are on the message; only successful API calls change it. */
@@ -78,8 +82,10 @@ export function presenceStatusText(snapshot: PresenceSnapshot): string {
  *
  * The same snapshot also drives Slack's native "<app> <status>" line
  * (assistant.threads.setStatus) under the thread the reply will land in - the
- * affordance users know from Slack's AI apps. It works on channel threads and
- * DMs with an ordinary bot token (verified live 2026-09-17), needs no Agent
+ * affordance users know from Slack's AI apps. Only threaded turns get it: a
+ * root channel/DM message is answered at the root, and a status keyed to its
+ * ts would open an empty thread under it. It works on channel and DM threads
+ * with an ordinary bot token (verified live 2026-09-17), needs no Agent
  * registration, and is reconciled exactly like a marker: desired text vs
  * confirmed text. Slack clears it when the reply posts and expires it after
  * two minutes; retiring the entry clears it explicitly for silent turns.
@@ -122,10 +128,10 @@ export class WorkingStatus {
 		// A different message in the same conversation takes over; the old
 		// gradient is retired through its own reconcile (desired = nothing).
 		if (prior) this.#retire(key, prior);
-		// Inside a thread the status hangs under that thread; a channel/DM message
-		// becomes its own root, which is exactly where the reply will land.
-		const threadTs =
-			(origin.kind === "thread" ? parseSlackMessageId(origin.conversationId)?.ts : undefined) ?? target.ts;
+		// Inside a thread the status hangs under that thread. A root channel/DM
+		// message gets no status line: its reply posts at the root, so a status
+		// keyed to the message's ts would open a thread nothing ever lands in.
+		const threadTs = origin.kind === "thread" ? parseSlackMessageId(origin.conversationId)?.ts : undefined;
 		const entry: Entry = {
 			channel: target.channel,
 			ts: target.ts,
@@ -240,11 +246,12 @@ export class WorkingStatus {
 				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.slackName) : []);
 				const remove = [...entry.shown].filter((name) => !desired.has(name));
 				const add = [...desired].filter((name) => !entry.shown.has(name));
-				const desiredStatus = entry.wanted ? presenceStatusText(entry.state.snapshot) : "";
+				const desiredStatus =
+					entry.wanted && entry.threadTs !== undefined ? presenceStatusText(entry.state.snapshot) : "";
 				// The line goes first: it is the one signal a reader actually sees as
 				// "the app is working", and it costs one request per change. A refusal
 				// leaves it un-shown for the next pass; the reactions still carry presence.
-				if (entry.shownStatus !== desiredStatus) {
+				if (entry.threadTs !== undefined && entry.shownStatus !== desiredStatus) {
 					try {
 						await this.api.setThreadStatus(entry.channel, entry.threadTs, desiredStatus);
 						entry.shownStatus = desiredStatus;

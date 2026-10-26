@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type GatewayReadinessResult,
 	type MemoryOperationStatusResult,
 	originKey,
 	WORK_JOBS_DEFAULT_LIMIT,
@@ -431,35 +432,90 @@ test("generic tail attachment failures degrade session-create readiness without 
 	client.close();
 });
 
-test("create-attach-send-disown cycles degrade session-create readiness", async () => {
-	let sendAttempts = 0;
-	const { client } = await startDeliveryServer({
-		send: async () => {
-			sendAttempts += 1;
+test("post-send disown ambiguity retains the original operation without degrading session-create readiness", async () => {
+	let port: ScriptedSessionPort | undefined;
+	let unknown = true;
+	let finish!: () => void;
+	const terminal = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const conversationId = "readiness-send-disowned-session";
+	const key = `loopback/loopback/${conversationId}`;
+	const { client, database } = await startDeliveryServer({
+		respond: async () => {
+			await terminal;
+			return "original native operation recovered";
+		},
+		send: async function (this: ScriptedSessionPort, input) {
+			port = this;
+			const status = this.status.bind(this);
+			this.status = async (query) => {
+				const report = await status(query);
+				return unknown ? { operationRef: query.opRef, status: { status: "unknown" }, summaryCompleted: false } : report;
+			};
+			this.liveness = async () => ({ live: undefined, disowned: true });
+			// The native prompt was admitted, but its acknowledgement was lost.
+			await ScriptedSessionPort.prototype.send.call(this, input);
 			throw new Error("session_unavailable: broker disowned new session");
 		},
 	});
-	client.send({
-		v: "0.1",
-		type: "request",
-		id: "send-disowned-session",
-		verb: "chat.send",
-		params: {
-			origin: { platform: "loopback", kind: "loopback", conversationId: "readiness-send-disowned-session" },
-			text: "hello",
-		},
-	});
-	await waitFrame(client.frames, "send-disowned-session");
-	for (let attempt = 0; attempt < 400 && sendAttempts < 3; attempt++) await Bun.sleep(5);
-	expect(sendAttempts).toBeGreaterThanOrEqual(3);
-	client.send({ v: "0.1", type: "request", id: "send-disowned-status", verb: "gateway.status" });
-	await waitFrame(client.frames, "send-disowned-status");
-	const readiness = client.frames.find((frame) => frame.id === "send-disowned-status").result.readiness;
-	expect(readiness).toMatchObject({
-		ready: false,
-		failure: { category: "session_create", code: "session_send_disowned", consecutiveFailures: 3 },
-	});
-	client.close();
+	try {
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "send-disowned-session",
+			verb: "chat.send",
+			params: { origin: { platform: "loopback", kind: "loopback", conversationId }, text: "hello" },
+		});
+		await waitFrame(client.frames, "send-disowned-session");
+		for (let attempt = 0; attempt < 400 && !port?.statusReads.length; attempt++) await Bun.sleep(5);
+		expect(port?.statusReads.length).toBeGreaterThan(0);
+		const original = port!.sends[0]!;
+		expect(database.inbox.turnRow(original.opRef)).toMatchObject({
+			turn_state: "bound",
+			turn_op_ref: original.opRef,
+			bound_session_id: original.sessionId,
+		});
+		for (let index = 0; index < 3; index++) {
+			const id = `send-disowned-status-${index}`;
+			client.send({ v: "0.1", type: "request", id, verb: "gateway.status" });
+			await waitFrame(client.frames, id);
+			expect(client.frames.find((frame) => frame.id === id).result.readiness).toMatchObject({
+				ready: true,
+				state: "ready",
+				failure: null,
+			});
+		}
+		expect(port!.sends).toHaveLength(1);
+		expect(port!.sendAttempts).toHaveLength(1);
+		expect(port!.binds).toHaveLength(1);
+		expect(database.bindings.getSessionRecord(key)).toEqual({ sessionId: original.sessionId, epoch: 0 });
+
+		unknown = false;
+		finish();
+		const replies = () =>
+			client.frames.filter(
+				(frame) => frame.event === "chat.message" && frame.payload?.text === "original native operation recovered",
+			);
+		for (
+			let attempt = 0;
+			attempt < 400 && (database.inbox.turnRow(original.opRef)?.turn_state !== "done" || replies().length === 0);
+			attempt++
+		)
+			await Bun.sleep(5);
+		expect(database.inbox.turnRow(original.opRef)?.turn_state).toBe("done");
+		expect(replies()).toHaveLength(1);
+		expect(port!.sends).toHaveLength(1);
+		expect(port!.sendAttempts).toHaveLength(1);
+		expect(port!.binds).toHaveLength(1);
+		expect(database.bindings.getSessionRecord(key)).toEqual({ sessionId: original.sessionId, epoch: 0 });
+	} finally {
+		// Always provide the real native terminal, including when an assertion fails,
+		// so server shutdown never drains an intentionally unresolved operation.
+		unknown = false;
+		finish();
+		client.close();
+	}
 });
 
 test("turn readiness details redact broker URLs", async () => {
@@ -523,15 +579,22 @@ test("pre-send service-tier configuration failures degrade turn readiness", asyn
 		});
 		await waitFrame(client.frames, `pre-send-failure-${index}`);
 	}
-	client.send({ v: "0.1", type: "request", id: "pre-send-status", verb: "gateway.status" });
-	await waitFrame(client.frames, "pre-send-status");
-	const readiness = client.frames.find((frame) => frame.id === "pre-send-status").result.readiness;
+	// chat.send acknowledges admission, not completion of asynchronous preflight.
+	let readiness: GatewayReadinessResult | undefined;
+	for (let attempt = 0; attempt < 400; attempt++) {
+		const id = `pre-send-status-${attempt}`;
+		client.send({ v: "0.1", type: "request", id, verb: "gateway.status" });
+		await waitFrame(client.frames, id);
+		readiness = client.frames.find((frame) => frame.id === id).result.readiness;
+		if (readiness?.failure?.consecutiveFailures === 3) break;
+		await Bun.sleep(5);
+	}
 	expect(readiness).toMatchObject({
 		ready: false,
 		failure: { category: "turn", code: "pre_send_configuration_failed", consecutiveFailures: 3 },
 	});
-	expect(readiness.failure.detail).toContain("[path]");
-	expect(readiness.failure.detail).not.toContain("/private/service-tier/config");
+	expect(readiness?.failure?.detail).toContain("[path]");
+	expect(readiness?.failure?.detail).not.toContain("/private/service-tier/config");
 	client.close();
 });
 

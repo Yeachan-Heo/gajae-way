@@ -22,15 +22,100 @@ export interface ModelCommandOutcome {
 	readonly rebind?: ModelRebindIntent;
 }
 
+/** A provider model listing is served this long before a background refresh. */
+export const PROVIDER_MODELS_TTL_MS = 5 * 60_000;
+/** A failed listing is retried no sooner than this, so a broken gjc is not respawned per keystroke. */
+export const PROVIDER_MODELS_RETRY_MS = 30_000;
+/**
+ * Discord drops an autocomplete answer after 3s. A cold listing (gjc start plus
+ * catalog resolution) is waited for at most this long; past it the choices go
+ * out without provider models and the listing lands for the next keystroke.
+ */
+export const PROVIDER_MODELS_WAIT_MS = 1_500;
+
+export interface ProviderModelCatalogOptions {
+	readonly ttlMs?: number;
+	readonly retryMs?: number;
+	readonly waitMs?: number;
+	readonly now?: () => number;
+	readonly log?: (line: string) => void;
+}
+
+/**
+ * Cached `provider/model` ids from gjc's own model listing for `/model set`
+ * autocomplete. One listing runs at a time; a fresh listing is served from
+ * memory, a stale one is served while it refreshes, and a failed one keeps the
+ * last good listing (or none). It never throws: suggestions are a convenience
+ * and a typed choice is accepted either way.
+ */
+export class ProviderModelCatalog {
+	readonly #load: () => Promise<readonly string[]>;
+	readonly #ttlMs: number;
+	readonly #retryMs: number;
+	readonly #waitMs: number;
+	readonly #now: () => number;
+	readonly #log: (line: string) => void;
+	#models: readonly string[] = [];
+	#loaded = false;
+	#refreshAt = 0;
+	#inflight: Promise<void> | undefined;
+
+	constructor(load: () => Promise<readonly string[]>, options: ProviderModelCatalogOptions = {}) {
+		this.#load = load;
+		this.#ttlMs = options.ttlMs ?? PROVIDER_MODELS_TTL_MS;
+		this.#retryMs = options.retryMs ?? PROVIDER_MODELS_RETRY_MS;
+		this.#waitMs = options.waitMs ?? PROVIDER_MODELS_WAIT_MS;
+		this.#now = options.now ?? Date.now;
+		this.#log = options.log ?? ((line) => console.error(line));
+	}
+
+	async list(): Promise<readonly string[]> {
+		if (this.#now() >= this.#refreshAt) this.#refresh();
+		const inflight = this.#inflight;
+		// Only a cold catalog waits; a stale one answers now and refreshes behind.
+		if (inflight && !this.#loaded) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([inflight, new Promise<void>((resolve) => (timer = setTimeout(resolve, this.#waitMs)))]);
+			if (timer !== undefined) clearTimeout(timer);
+		}
+		return this.#models;
+	}
+
+	#refresh(): void {
+		if (this.#inflight) return;
+		this.#inflight = Promise.resolve()
+			.then(() => this.#load())
+			.then(
+				(models) => {
+					this.#models = [...models];
+					this.#loaded = true;
+					this.#refreshAt = this.#now() + this.#ttlMs;
+				},
+				(error: unknown) => {
+					this.#refreshAt = this.#now() + this.#retryMs;
+					this.#log(
+						`model_choices_provider_list_failed reason=${error instanceof Error ? error.message : String(error)}`,
+					);
+				},
+			)
+			.finally(() => {
+				this.#inflight = undefined;
+			});
+	}
+}
+
 /**
  * `/model set` autocomplete choices: the preset names in the gjc profile's
- * `models.yml` `profiles:` map, plus the configured gateway selector. Fails soft
- * to whatever could be read: a missing or unreadable models file must not break
+ * `models.yml` `profiles:` map plus the configured gateway selector, sorted,
+ * then the `provider/model` ids gjc lists, sorted. Named choices lead so an
+ * empty query still shows them inside Discord's 25-choice window. Fails soft to
+ * whatever could be read: a missing or unreadable models file must not break
  * the command, because a typed choice is still accepted.
  */
 export async function listModelChoices(
 	agentDir: string | undefined,
 	configModel: GjcModelSelection | undefined,
+	providerModels: readonly string[] = [],
 ): Promise<string[]> {
 	const choices = new Set<string>();
 	if (configModel) choices.add(typeof configModel === "string" ? configModel : configModel.preset);
@@ -45,7 +130,10 @@ export async function listModelChoices(
 		}
 	}
 	// A name with whitespace could never round-trip through `/model set <choice>`.
-	return [...choices].filter((choice) => choice !== "" && !/\s/.test(choice)).sort();
+	const usable = (choice: string): boolean => choice !== "" && !/\s/.test(choice);
+	const named = [...choices].filter(usable).sort();
+	const provided = [...new Set(providerModels)].filter((choice) => usable(choice) && !choices.has(choice)).sort();
+	return [...named, ...provided];
 }
 
 /** Renders a selection the way the owner typed it. */

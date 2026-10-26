@@ -18,7 +18,12 @@ import {
 	startCron,
 } from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
-import { SessionRequestTimeoutError, SessionTerminalError } from "../src/orchestrator/session-port";
+import {
+	ModelNotSelectedError,
+	SessionRequestTimeoutError,
+	SessionTerminalError,
+} from "../src/orchestrator/session-port";
+import { RelayHelloError, RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_RETRY_BACKOFF_MS } from "../src/store/groups/monitors";
@@ -816,6 +821,21 @@ describe("monitor crash-boundary state machine", () => {
 				status: { status: "in_flight" },
 			} as never),
 			'"class":"SessionRequestTimeoutError","lastStatus":"in_flight"',
+		],
+		[
+			"relay hello missing",
+			new RelayHelloError(1234, "stream_ended"),
+			'"class":"RelayHelloError","code":"relay_hello_missing","message":"relay hello did not arrive within 1234ms (stream_ended)"',
+		],
+		[
+			"model not selected",
+			new ModelNotSelectedError("SECRET_OP"),
+			'"class":"ModelNotSelectedError","code":"model_not_selected","message":"turn.prompt explicitly refused: model_not_selected"',
+		],
+		[
+			"relay refusal with remote text",
+			new RelayRefusedError("SECRET_SESSION", "session_gone", "SECRET remote text"),
+			'"class":"RelayRefusedError"',
 		],
 		[
 			"untrusted fields",

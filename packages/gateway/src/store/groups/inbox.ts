@@ -662,6 +662,19 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Platform origins a person is plausibly watching: one with a turn still in
+	 * flight, or one where a non-bot author spoke at or after `since`. The origin
+	 * ref is the most recent row's, so a notice lands where the talk last was.
+	 */
+	activeConversationOrigins(since: string): Array<{ readonly origin_key: string; readonly origin_ref_json: string }> {
+		return this.#db
+			.prepare(
+				`SELECT origin_key, origin_ref_json, MAX(rowid) AS last_row FROM inbound_messages WHERE source = 'platform' AND (turn_state IN ('bound', 'accepted') OR (received_at >= ? AND COALESCE(json_extract(engagement_json, '$.authorIsBot'), 0) <> 1)) AND ${REPLAYABLE_INBOUND} GROUP BY origin_key ORDER BY origin_key`,
+			)
+			.all(since) as Array<{ origin_key: string; origin_ref_json: string }>;
+	}
+
 	nonterminalOrigins(): readonly string[] {
 		return this.#db
 			.prepare(

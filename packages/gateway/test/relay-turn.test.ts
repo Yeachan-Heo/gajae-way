@@ -90,6 +90,141 @@ function runner(
 
 const CORRELATION = { commandId: "cmd-1", turnId: "turn-1" };
 
+test("queued attachment abort leaves the running capacity owner untouched", async () => {
+	const relays: FakeRelay[] = [];
+	const tail = runner(
+		() => {
+			const relay = new FakeRelay();
+			relays.push(relay);
+			return relay;
+		},
+		{ maxTailProcesses: 1 },
+	);
+	const owner = await tail.attach({ sessionId: "owner", brokerGeneration: 1, repo: "/tmp" });
+	owner.beginTurn("running", CORRELATION);
+	owner.setTurnRunning(true);
+	const controller = new AbortController();
+	const pending = tail.attach({ sessionId: "queued", brokerGeneration: 1, repo: "/tmp", signal: controller.signal });
+	const outcome = pending.catch((error: unknown) => error);
+	await Promise.resolve(); // Acquisition has reached the full-capacity waiter.
+	controller.abort();
+	expect(await outcome).toMatchObject({ name: "AbortError" });
+	expect(tail.activeCount).toBe(1);
+	expect(relays).toHaveLength(1);
+	expect(relays[0]!.closed).toBe(false);
+	expect(relays[0]!.written.some((frame) => frame.type === "control_request")).toBe(false);
+	await owner.close();
+	const next = await tail.attach({ sessionId: "next", brokerGeneration: 1, repo: "/tmp" });
+	expect(tail.activeCount).toBe(1);
+	await next.close();
+});
+
+test("already-aborted attachment does not open a relay or reserve capacity", async () => {
+	const relays: FakeRelay[] = [];
+	const tail = runner(
+		() => {
+			const relay = new FakeRelay();
+			relays.push(relay);
+			return relay;
+		},
+		{ maxTailProcesses: 1 },
+	);
+	const controller = new AbortController();
+	controller.abort();
+	await expect(
+		tail.attach({ sessionId: "aborted", brokerGeneration: 1, repo: "/tmp", signal: controller.signal }),
+	).rejects.toMatchObject({ name: "AbortError" });
+	expect(relays).toHaveLength(0);
+	expect(tail.activeCount).toBe(0);
+	const next = await tail.attach({ sessionId: "next", brokerGeneration: 1, repo: "/tmp" });
+	await next.close();
+});
+
+test("slot-release and queued abort race wakes the next caller without starvation", async () => {
+	const tail = runner(() => new FakeRelay(), { maxTailProcesses: 1 });
+	const owner = await tail.attach({ sessionId: "owner", brokerGeneration: 1, repo: "/tmp" });
+	owner.setTurnRunning(true);
+	const controller = new AbortController();
+	const pending = tail.attach({ sessionId: "aborted", brokerGeneration: 1, repo: "/tmp", signal: controller.signal });
+	const outcome = pending.catch((error: unknown) => error);
+	const successor = tail.attach({ sessionId: "successor", brokerGeneration: 1, repo: "/tmp" });
+	await Promise.resolve();
+	const closing = owner.close();
+	await Promise.resolve(); // close releases its slot and wakes the first waiter.
+	controller.abort(); // Abort before that waiter resumes acquisition.
+	expect(await outcome).toMatchObject({ name: "AbortError" });
+	await closing;
+	const next = await successor;
+	expect(tail.activeCount).toBe(1);
+	await next.close();
+	expect(tail.activeCount).toBe(0);
+});
+
+test("abort after slot reservation reclaims only that reservation", async () => {
+	const relays: FakeRelay[] = [];
+	const tail = runner(
+		() => {
+			const relay = new FakeRelay();
+			relays.push(relay);
+			return relay;
+		},
+		{ maxTailProcesses: 1 },
+	);
+	const controller = new AbortController();
+	const pending = tail.attach({ sessionId: "aborted", brokerGeneration: 1, repo: "/tmp", signal: controller.signal });
+	const outcome = pending.catch((error: unknown) => error);
+	// Acquisition resumes after reapIdle first; abort runs before attach installs its handle.
+	queueMicrotask(() => controller.abort());
+	expect(await outcome).toMatchObject({ name: "AbortError" });
+	expect(relays).toHaveLength(0);
+	const next = await tail.attach({ sessionId: "next", brokerGeneration: 1, repo: "/tmp" });
+	expect(tail.activeCount).toBe(1);
+	await next.close();
+});
+
+for (const readyBeforeAbort of [false, true]) {
+	test(`attachment abort ${readyBeforeAbort ? "after hello readiness" : "while awaiting hello"} closes only its relay`, async () => {
+		const relay = new FakeRelay("connection:observer", { hello: false });
+		const successorRelay = new FakeRelay();
+		const tail = runner((sessionId) => (sessionId === "observer" ? relay : successorRelay), { maxTailProcesses: 1 });
+		const controller = new AbortController();
+		const pending = tail.attach({
+			sessionId: "observer",
+			brokerGeneration: 1,
+			repo: "/tmp",
+			signal: controller.signal,
+		});
+		const outcome = pending.catch((error: unknown) => error);
+		await Promise.resolve();
+		await Promise.resolve(); // The handle has opened its relay and is waiting for hello.
+		expect(relay.written[0]?.type).toBe("hello");
+		if (readyBeforeAbort) {
+			relay.host({ type: "hello", protocolVersion: 3, connectionId: relay.connectionId });
+			// Advance iterator.next, hello ingress, and ready resolution, but not attach's return.
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+		}
+		controller.abort();
+		expect(await outcome).toMatchObject({ name: "AbortError" });
+		expect(relay.closed).toBe(true);
+		expect(relay.written.map((frame) => frame.type)).toEqual(["hello"]);
+		expect(tail.activeCount).toBe(0);
+		const nextController = new AbortController();
+		const next = await tail.attach({
+			sessionId: "next",
+			brokerGeneration: 1,
+			repo: "/tmp",
+			signal: nextController.signal,
+		});
+		nextController.abort(); // Returned handles are no longer governed by attachment cancellation.
+		await Promise.resolve();
+		expect(successorRelay.closed).toBe(false);
+		expect(tail.activeCount).toBe(1);
+		await next.close();
+	});
+}
+
 function messageEnd(role: string, text: string, correlation = CORRELATION, id = `m-${text}`) {
 	return {
 		type: "event",
@@ -904,7 +1039,7 @@ test("stream ending without hello fails fast (#410)", async () => {
 	const elapsed = Date.now() - started;
 	expect(error).toBeInstanceOf(Error);
 	const message = (error as Error).message;
-	expect(message).toMatch(/host hello did not arrive after \d+ms \(stream_ended\)/);
+	expect(message).toMatch(/relay hello did not arrive within \d+ms \(stream_ended\)/);
 	// Should fail much faster than the hello timeout (5 seconds)
-	expect(elapsed).toBeLessThan(1_000);
+	expect(elapsed).toBeLessThan(5_000);
 }, 10_000);

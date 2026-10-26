@@ -328,14 +328,14 @@ test("RT-SLACK-06b same-named image-only messages in two threads reach the gatew
 	expect(texts[2]).toBe("[file · id F0C8PARTIAL]");
 });
 
-test("RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send", async () => {
+test("RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and duplicate app_mention never send", async () => {
 	const f = await fixture();
 	for (const extra of [
 		{ user: "UBOT" },
 		{ bot_id: "BBOT" },
 		{ hidden: true },
 		...[...SKIPPED_SUBTYPES].map((subtype) => ({ subtype })),
-		{ type: "app_mention" },
+		{ type: "app_mention", user: "UBOT" },
 		...["body", ""].map((text) => ({
 			subtype: "message_changed",
 			message: { channel: "C1", user: "U1", ts: "1.0", text },
@@ -344,6 +344,11 @@ test("RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and 
 	])
 		await f.event(extra);
 	expect(f.client.calls).toEqual([]);
+	// The app_mention twin of an already-forwarded message (and a redelivered one) is never a second turn.
+	await f.event({ ts: "9.0", text: "<@UBOT> hi" });
+	await f.event({ type: "app_mention", ts: "9.0", text: "<@UBOT> hi" });
+	await f.event({ type: "app_mention", ts: "9.0", text: "<@UBOT> hi" });
+	expect(f.client.calls.filter((c) => c.verb === "chat.send")).toHaveLength(1);
 });
 
 test("RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf", async () => {

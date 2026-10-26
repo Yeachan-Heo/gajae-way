@@ -539,7 +539,46 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 	}
 });
 
-test("red-team: an unknown unaccepted send is held once, then a live-idle session releases it onto a fresh epoch instead of bricking the origin", async () => {
+function assertUnknownOperationHeld(target: Fixture, first: InboundTurn): void {
+	expect(target.database.inbox.turnRow(first.opRef)).toMatchObject({
+		state: "pending",
+		turn_state: "bound",
+		turn_op_ref: first.opRef,
+		bound_session_id: first.sessionId,
+		turn_epoch: first.epoch,
+	});
+	expect(target.database.bindings.getSessionRecord(ORIGIN_KEY)).toMatchObject({
+		epoch: first.epoch,
+		sessionId: first.sessionId,
+	});
+	expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(1);
+	expect(target.port.sendAttempts).toHaveLength(1);
+	expect(target.port.sends).toEqual([]);
+	expect(target.port.binds).toHaveLength(1);
+	expect(target.terminal).toEqual([]);
+	expect(target.logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
+	expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session"))).toBe(false);
+	expect(target.logs.some((line) => line.includes("unobserved_answer_delivered"))).toBe(false);
+}
+
+async function settleOriginalUnknownOperation(target: Fixture, first: InboundTurn): Promise<void> {
+	const sessionId = required(first.sessionId ?? undefined, "original session missing");
+	target.port.seedOperation(first.opRef, sessionId, "terminal_ok", "exact original native output");
+	await target.manager.tick(ORIGIN_KEY);
+	await target.manager.tick(ORIGIN_KEY);
+	await eventually(() => target.terminal.length === 1, "original native operation did not settle");
+	await target.manager.tick(ORIGIN_KEY);
+	expect(target.terminal).toEqual(["exact original native output"]);
+	expect(target.database.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
+	expect(target.port.workerOutputReads).toHaveLength(1);
+	expect(target.port.workerOutputReads[0]).toMatchObject({ sessionId, opRef: first.opRef });
+	expect(target.port.sendAttempts).toHaveLength(1);
+	expect(target.port.sends).toEqual([]);
+	expect(target.port.binds).toHaveLength(1);
+}
+
+test("red-team: an unknown unaccepted send preserves its operation and epoch through repeated live-idle sweeps", async () => {
 	const port = new ConflictUnknownPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
@@ -556,19 +595,10 @@ test("red-team: an unknown unaccepted send is held once, then a live-idle sessio
 		expect(target.logs.some((line) => line.includes("reason=operation_state_unknown sweeps=1"))).toBe(true);
 		expect(port.sends).toEqual([]);
 
-		// Second sweep: status still says unknown, but liveness says the session
-		// is live and its prompt queue is empty. Since the row is only BOUND (not
-		// acknowledged), the send did not land and is safe to release once.
-		await target.manager.tick(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 1, "live-idle unknown operation did not re-dispatch");
-		const replacement = port.sends[0]!;
-		expect(replacement.opRef).not.toBe(first.opRef);
-		expect(replacement.text).toBe("operation identity is unknown");
-		expect(target.logs.some((line) => line.includes("reason=unknown_op_on_live_idle_session sweeps=2"))).toBe(true);
-		port.complete(replacement.opRef, "recovered without an operator");
-		await eventually(() => target.terminal.length === 1, "replacement did not complete");
-		expect(target.terminal).toEqual(["recovered without an operator"]);
-		expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
+		// Missing acknowledgement and an empty live queue do not prove non-admission.
+		for (let sweep = 0; sweep < 3; sweep++) await target.manager.tick(ORIGIN_KEY);
+		assertUnknownOperationHeld(target, first);
+		await settleOriginalUnknownOperation(target, first);
 	} finally {
 		await target.close();
 	}
@@ -586,12 +616,8 @@ class UnobservedAnswerPort extends ConflictUnknownPort {
 	}
 }
 
-test("red-team: an unknown op on a live-idle session whose transcript already holds this turn's answer delivers it instead of releasing", async () => {
-	// Unobservable is not failed. gajae-code#5681: a wedged event ring makes
-	// tail return nothing and status read `unknown`, while the persona keeps
-	// working and writes its reply. Releasing that as unlanded posted
-	// `[turn failed]` to the room with the answer sitting in the transcript
-	// (4 of 4 such failures, 2026-09-17/18).
+test("red-team: a post-dispatch transcript timestamp cannot settle or release an unknown native operation", async () => {
+	// A session-wide answer is neither native terminal proof nor exact operation output.
 	const port = new UnobservedAnswerPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
@@ -602,24 +628,19 @@ test("red-team: an unknown op on a live-idle session whose transcript already ho
 			"client_ref_conflict was not reconciled",
 		);
 		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
-		// The persona answered after dispatch; only the gateway could not see it.
+		// Even a recent answer could belong to a different invocation.
 		port.answer = { text: "written while you were not looking", atMs: Date.now() + 1 };
-		await target.manager.tick(ORIGIN_KEY);
-		await eventually(() => target.terminal.length === 1, "unobserved answer was not delivered");
-		expect(target.terminal).toEqual(["written while you were not looking"]);
-		expect(port.probes).toBeGreaterThan(0);
-		// Delivered as THIS turn: no re-dispatch, no fresh epoch, no [turn failed].
-		expect(port.sends).toEqual([]);
-		expect(target.logs.some((line) => line.includes("unobserved_answer_delivered"))).toBe(true);
-		expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session"))).toBe(false);
-		expect(target.database.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
-		expect(target.database.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
+		for (let sweep = 0; sweep < 3; sweep++) await target.manager.tick(ORIGIN_KEY);
+		assertUnknownOperationHeld(target, first);
+		expect(port.probes).toBe(0);
+		await settleOriginalUnknownOperation(target, first);
+		expect(port.probes).toBe(0);
 	} finally {
 		await target.close();
 	}
 });
 
-test("red-team: an unobserved-answer probe that finds only a PRE-dispatch row still releases (that row is the previous turn's)", async () => {
+test("red-team: a pre-dispatch transcript row cannot prove an unknown native operation was unaccepted", async () => {
 	const port = new UnobservedAnswerPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
@@ -630,10 +651,12 @@ test("red-team: an unobserved-answer probe that finds only a PRE-dispatch row st
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		await target.manager.tick(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 1, "stale-answer session was not released");
-		expect(target.terminal).toEqual([]);
-		expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session sweeps=2"))).toBe(true);
+		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
+		for (let sweep = 0; sweep < 3; sweep++) await target.manager.tick(ORIGIN_KEY);
+		assertUnknownOperationHeld(target, first);
+		expect(port.probes).toBe(0);
+		await settleOriginalUnknownOperation(target, first);
+		expect(port.probes).toBe(0);
 	} finally {
 		await target.close();
 	}

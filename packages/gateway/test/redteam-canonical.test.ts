@@ -954,7 +954,7 @@ test("C6a: terminal recovery after a stop invokes the reconstructed lifecycle on
 	}
 });
 
-test("C6b: an accepted operation on a broker-disowned dead session is closed at recovery, never re-sent under a new opRef", async () => {
+test("C6b: broker-disowned liveness holds an accepted operation until its original native terminal", async () => {
 	const port = new DisownedStatusPort();
 	const fixture = await directFixture({ port, instanceId: "canonical-recover-requeue" });
 	let recovered: PersonaSessionManager | undefined;
@@ -977,24 +977,59 @@ test("C6b: an accepted operation on a broker-disowned dead session is closed at 
 			}),
 			log: (line) => fixture.logs.push(line),
 		});
-		await recovered.recover();
-		// The model may already have run and acted: the accepted trigger is closed,
-		// not replayed into a fresh session.
-		await eventually(
-			() => fixture.database.inbox.turnRow(first.opRef)?.turn_state === "done",
-			"disowned accepted operation was not closed",
-		);
+		for (let sweep = 0; sweep < 3; sweep++) {
+			await recovered.recover();
+			await recovered.tick(DIRECT_ORIGIN_KEY);
+		}
+		// Registry absence is not proof that the producer exited.
+		expect(fixture.database.inbox.turnRow(first.opRef)).toMatchObject({
+			state: "pending",
+			turn_state: "accepted",
+			turn_op_ref: first.opRef,
+			bound_session_id: first.sessionId,
+			turn_epoch: 0,
+		});
+		expect(fixture.database.bindings.getSessionRecord(DIRECT_ORIGIN_KEY)).toMatchObject({
+			epoch: 0,
+			sessionId: first.sessionId,
+		});
+		expect(fixture.terminals).toEqual([]);
 		expect(fixture.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
-			true,
+			false,
 		);
 		expect(fixture.logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 		expect(port.sendAttempts).toHaveLength(1);
 		expect(port.sends).toHaveLength(1);
-		// A genuinely new message after the close is sent on a fresh session.
+		expect(port.binds).toHaveLength(1);
+		port.disownedOps.delete(first.opRef);
+		port.setSessionState(first.sessionId, { live: true });
+		port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "original disowned operation output");
+		await recovered.recover();
+		await recovered.tick(DIRECT_ORIGIN_KEY);
+		await eventually(() => fixture.terminals.length === 1, "original operation did not settle after recovery");
+		await recovered.recover();
+		await recovered.tick(DIRECT_ORIGIN_KEY);
+		expect(fixture.terminals).toEqual([{ trigger: "recover-requeue", text: "original disowned operation output" }]);
+		expect(fixture.database.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+		expect(fixture.database.inbox.pendingCount(DIRECT_ORIGIN_KEY)).toBe(0);
+		expect(port.workerOutputReads).toHaveLength(1);
+		expect(port.workerOutputReads[0]).toMatchObject({ sessionId: first.sessionId, opRef: first.opRef });
+		expect(port.sendAttempts).toHaveLength(1);
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds).toHaveLength(1);
+		// New work proceeds only after native settlement, without an inferred-death rotation.
 		enqueue(fixture, "after-close", "a new question");
 		await recovered.notifyInbound(DIRECT_ORIGIN_KEY);
-		await eventually(() => port.sends.length === 2, "new message was not sent after the close");
-		expect(port.sends[1]!.sessionId).not.toBe(first.sessionId);
+		await eventually(() => port.sends.length === 2, "new message was not sent after native settlement");
+		const next = port.sends[1]!;
+		expect(next.sessionId).toBe(first.sessionId);
+		expect(next.opRef).not.toBe(first.opRef);
+		port.complete(next.opRef, "new question output");
+		await eventually(() => fixture.terminals.length === 2, "new question did not settle");
+		expect(fixture.terminals).toEqual([
+			{ trigger: "recover-requeue", text: "original disowned operation output" },
+			{ trigger: "after-close", text: "new question output" },
+		]);
 	} finally {
 		await recovered?.stop();
 		await fixture.close();

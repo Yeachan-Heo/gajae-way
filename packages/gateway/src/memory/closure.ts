@@ -1,6 +1,13 @@
 import { originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { Store } from "../store";
-import { appendDaily, CorpusWriter, initializeMemory, MemoryGitLockedError, memoryGit } from "./doctrine";
+import {
+	appendDaily,
+	CorpusWriter,
+	initializeMemory,
+	MemoryGitLockedError,
+	MemoryGitTimeoutError,
+	memoryGit,
+} from "./doctrine";
 
 export interface DailyCaptureMutation {
 	readonly kind: "daily_capture" | "monitor-event";
@@ -91,7 +98,8 @@ export class MemoryClosureQueue {
 			try {
 				await this.#recover(intent);
 			} catch (error) {
-				if (error instanceof MemoryGitLockedError) {
+				// A lock or a stuck git is transient: quarantine would end the intent for good.
+				if (error instanceof MemoryGitLockedError || error instanceof MemoryGitTimeoutError) {
 					this.failures++;
 					console.error(`memory intent ${intent.id} failed; left for boot recovery: ${error.name}: ${error.message}`);
 					continue;

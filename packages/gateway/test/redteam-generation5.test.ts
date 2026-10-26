@@ -45,6 +45,9 @@ type DirectFixture = {
 	readonly manager: PersonaSessionManager;
 	readonly logs: string[];
 	readonly discarded: string[];
+	readonly terminal: string[];
+	readonly failures: string[];
+	reopen(): Promise<void>;
 	close(): Promise<void>;
 };
 
@@ -91,37 +94,65 @@ function timerSeam(timers: ScheduledTimer[]) {
 
 async function directFixture(options: DirectFixtureOptions = {}): Promise<DirectFixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-generation5-"));
-	const database = await Store.open(join(home, "gateway.db"));
+	let database = await Store.open(join(home, "gateway.db"));
 	const clock = options.clock ?? new FixtureClock();
 	const port =
 		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	const originalBindings = { bind: port.bind.bind(port), resume: port.resume.bind(port) };
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
 	const discarded: string[] = [];
-	const manager = new PersonaSessionManager({
-		database,
-		port,
-		instanceId: "generation5-redteam",
-		repo: join(home, "workspace"),
-		now: clock.now,
-		...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
-		...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
-		...(options.onSteerAccepted ? { onSteerAccepted: options.onSteerAccepted } : {}),
-		...(options.onHeldSteerAccepted ? { onHeldSteerAccepted: options.onHeldSteerAccepted } : {}),
-		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
-		onInboundDiscard: (messageIds) => {
-			discarded.push(...messageIds);
-		},
-		log: (line) => logs.push(line),
-	});
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	const makeManager = () =>
+		new PersonaSessionManager({
+			database,
+			port,
+			instanceId: "generation5-redteam",
+			repo: join(home, "workspace"),
+			now: clock.now,
+			...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
+			...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
+			...(options.onSteerAccepted ? { onSteerAccepted: options.onSteerAccepted } : {}),
+			...(options.onHeldSteerAccepted ? { onHeldSteerAccepted: options.onHeldSteerAccepted } : {}),
+			onTurnStart: ({ trigger }) => ({
+				text: trigger.body,
+				onTerminal: ({ text }) => {
+					terminal.push(text);
+				},
+				onFailure: ({ error }) => {
+					failures.push(error.message);
+				},
+			}),
+			onInboundDiscard: (messageIds) => {
+				discarded.push(...messageIds);
+			},
+			log: (line) => logs.push(line),
+		});
+	let manager = makeManager();
 	return {
 		home,
 		clock,
-		database,
+		get database() {
+			return database;
+		},
 		port,
-		manager,
+		get manager() {
+			return manager;
+		},
 		logs,
 		discarded,
+		terminal,
+		failures,
+		async reopen() {
+			await manager.stop();
+			database.close();
+			database = await Store.open(join(home, "gateway.db"));
+			port.bind = originalBindings.bind;
+			port.resume = originalBindings.resume;
+			attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
+			manager = makeManager();
+		},
 		async close() {
 			await manager.stop();
 			database.close();
@@ -173,13 +204,14 @@ class AcceptedLivenessPort extends ScriptedSessionPort {
 	staleOpRef = "";
 	staleSessionId = "";
 	live: boolean | undefined = undefined;
+	unavailable = true;
 
 	constructor() {
 		super({ onBind: (input) => `${input.originKey}-accepted-liveness-${input.epoch}` });
 	}
 
 	async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
-		if (input.opRef === this.staleOpRef) throw sessionUnavailable();
+		if (this.unavailable && input.opRef === this.staleOpRef) throw sessionUnavailable();
 		return await super.status(input);
 	}
 
@@ -193,6 +225,7 @@ class BoundLivenessPort extends ScriptedSessionPort {
 	failedOpRef = "";
 	failedSessionId = "";
 	#failFirstSend = true;
+	unavailable = true;
 
 	constructor() {
 		super({ onBind: (input) => `${input.originKey}-bound-liveness-${input.epoch}` });
@@ -203,14 +236,14 @@ class BoundLivenessPort extends ScriptedSessionPort {
 			this.#failFirstSend = false;
 			this.failedOpRef = input.opRef;
 			this.failedSessionId = input.sessionId;
-			this.sendAttempts.push(input);
+			await super.send(input);
 			throw new Error("torn send after inboundBindTurn");
 		}
 		return await super.send(input);
 	}
 
 	async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
-		if (input.opRef === this.failedOpRef) throw sessionUnavailable();
+		if (this.unavailable && input.opRef === this.failedOpRef) throw sessionUnavailable();
 		return await super.status(input);
 	}
 
@@ -222,6 +255,7 @@ class BoundLivenessPort extends ScriptedSessionPort {
 
 class SendUnavailablePort extends ScriptedSessionPort {
 	remainingFailures = 0;
+	unavailable = true;
 
 	constructor() {
 		super({ onBind: (input) => `${input.originKey}-send-unavailable-${input.epoch}` });
@@ -230,10 +264,15 @@ class SendUnavailablePort extends ScriptedSessionPort {
 	async send(input: SessionSendInput) {
 		if (this.remainingFailures > 0) {
 			this.remainingFailures--;
-			this.sendAttempts.push(input);
+			await super.send(input);
 			throw sessionUnavailable();
 		}
 		return await super.send(input);
+	}
+
+	async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+		if (this.unavailable) throw sessionUnavailable();
+		return await super.status(input);
 	}
 }
 
@@ -396,7 +435,7 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 	}
 });
 
-test("G5: accepted turns are closed (never re-sent) on positive death evidence, while bound turns release on an unknown liveness result", async () => {
+test("G5: accepted and bound turns survive registry loss and Store reopen until the same operation reaches terminal", async () => {
 	const acceptedPort = new AcceptedLivenessPort();
 	const accepted = await directFixture({ port: acceptedPort });
 	try {
@@ -412,18 +451,46 @@ test("G5: accepted turns are closed (never re-sent) on positive death evidence, 
 		expect(acceptedPort.sends).toHaveLength(1);
 
 		acceptedPort.live = false;
+		await accepted.reopen();
+		for (let sweep = 0; sweep < 3; sweep++) {
+			await accepted.manager.recover();
+			await accepted.manager.tick(ORIGIN_KEY);
+		}
+		// Broker non-liveness is not native producer-exit evidence.
+		expect(accepted.database.inbox.turnRow(first.opRef)).toMatchObject({
+			state: "pending",
+			turn_state: "accepted",
+			turn_op_ref: first.opRef,
+			bound_session_id: first.sessionId,
+			turn_epoch: 0,
+			terminal_delivery_id: null,
+		});
+		expect(accepted.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: first.sessionId, epoch: 0 });
+		expect(acceptedPort.sendAttempts.map((send) => send.opRef)).toEqual([first.opRef]);
+		expect(acceptedPort.binds).toHaveLength(1);
+		expect(acceptedPort.resumes).toEqual([]);
+		expect(acceptedPort.closes).toEqual([]);
+		expect(accepted.terminal).toEqual([]);
+		expect(accepted.failures).toEqual([]);
+		acceptedPort.unavailable = false;
+		acceptedPort.live = true;
+		acceptedPort.complete(first.opRef, "original accepted answer");
+		await accepted.manager.recover();
 		await accepted.manager.tick(ORIGIN_KEY);
-		// The model may already have run and acted: positive death evidence closes
-		// the accepted turn with a notice instead of re-sending it under a new opRef.
 		await eventually(
 			() => accepted.database.inbox.turnRow(first.opRef)?.turn_state === "done",
-			"positive dead evidence did not close the accepted turn",
+			"accepted original did not settle",
 		);
-		expect(accepted.logs.some((line) => line.startsWith("accepted_turn_closed") && line.includes(first.opRef))).toBe(
-			true,
-		);
+		await accepted.manager.recover();
 		await accepted.manager.tick(ORIGIN_KEY);
+		expect(accepted.terminal).toEqual(["original accepted answer"]);
+		expect(accepted.failures).toEqual([]);
+		expect(acceptedPort.workerOutputReads.map((read) => [read.sessionId, read.opRef])).toEqual([
+			[first.sessionId, first.opRef],
+		]);
 		expect(acceptedPort.sends).toHaveLength(1);
+		expect(acceptedPort.sendAttempts.map((send) => send.opRef)).toEqual([first.opRef]);
+		expect(accepted.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: first.sessionId, epoch: 0 });
 	} finally {
 		await accepted.close();
 	}
@@ -433,20 +500,52 @@ test("G5: accepted turns are closed (never re-sent) on positive death evidence, 
 	try {
 		enqueue(bound, "bound", "bound request");
 		await bound.manager.notifyInbound(ORIGIN_KEY);
-		await eventually(() => boundPort.sends.length === 1, "bound turn did not release after unknown liveness");
-		const released = required(boundPort.sends[0], "bound replacement missing");
-		expect(boundPort.failedOpRef).not.toBe("");
-		expect(released.opRef).not.toBe(boundPort.failedOpRef);
-		expect(boundPort.sendAttempts).toHaveLength(2);
-		expect(bound.database.inbox.turnRow(boundPort.failedOpRef)).toBeUndefined();
+		const original = required(boundPort.sends[0], "native acceptance before lost ACK missing");
+		expect(original.opRef).toBe(boundPort.failedOpRef);
+		await bound.reopen();
+		for (let sweep = 0; sweep < 3; sweep++) {
+			await bound.manager.recover();
+			await bound.manager.tick(ORIGIN_KEY);
+		}
+		expect(bound.database.inbox.turnRow(original.opRef)).toMatchObject({
+			state: "pending",
+			turn_state: "bound",
+			turn_op_ref: original.opRef,
+			bound_session_id: original.sessionId,
+			turn_epoch: 0,
+			terminal_delivery_id: null,
+		});
+		expect(bound.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: original.sessionId, epoch: 0 });
+		expect(boundPort.sendAttempts.map((send) => send.opRef)).toEqual([original.opRef]);
+		expect(boundPort.binds).toHaveLength(1);
+		expect(boundPort.resumes).toEqual([]);
+		expect(boundPort.closes).toEqual([]);
+		expect(bound.terminal).toEqual([]);
+		expect(bound.failures).toEqual([]);
+		boundPort.unavailable = false;
+		boundPort.complete(original.opRef, "original bound answer");
+		await bound.manager.recover();
 		await bound.manager.tick(ORIGIN_KEY);
+		await eventually(
+			() => bound.database.inbox.turnRow(original.opRef)?.turn_state === "done",
+			"bound original did not settle",
+		);
+		await bound.manager.recover();
+		await bound.manager.tick(ORIGIN_KEY);
+		expect(bound.terminal).toEqual(["original bound answer"]);
+		expect(bound.failures).toEqual([]);
+		expect(boundPort.workerOutputReads.map((read) => [read.sessionId, read.opRef])).toEqual([
+			[original.sessionId, original.opRef],
+		]);
 		expect(boundPort.sends).toHaveLength(1);
+		expect(boundPort.sendAttempts.map((send) => send.opRef)).toEqual([original.opRef]);
+		expect(bound.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: original.sessionId, epoch: 0 });
 	} finally {
 		await bound.close();
 	}
 });
 
-test("G6: session-unavailable send failures are bounded per actor and reset after a successful send", async () => {
+test("G6: post-send session-unavailable retains the admitted operation across Store reopen without retry or rotation", async () => {
 	const timers: ScheduledTimer[] = [];
 	const port = new SendUnavailablePort();
 	port.remainingFailures = 3;
@@ -454,40 +553,65 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 	try {
 		enqueue(fixture, "first", "first request");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
-		const goneAttempts = fixture.logs
-			.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
-			.map((line) => /attempt=(\d+)/.exec(line)?.[1]);
-		expect(goneAttempts).toEqual(["1", "2", "3"]);
-		expect(
-			fixture.logs.filter(
-				(line) => line.startsWith("persona_send_unrecoverable") && line.includes("reason=session_unavailable"),
-			),
-		).toHaveLength(1);
-		const retry = required(
-			timers.find((timer) => timer.delayMs === 8_000),
-			"8s send retry was not armed",
+		const original = required(port.sends[0], "native acceptance before endpoint loss missing");
+		await fixture.reopen();
+		for (let sweep = 0; sweep < 3; sweep++) {
+			await fixture.manager.recover();
+			await fixture.manager.tick(ORIGIN_KEY);
+		}
+		// Exercise any stale timer too: it cannot replay a possibly admitted prompt.
+		for (const timer of [...timers]) timer.work();
+		await fixture.manager.tick(ORIGIN_KEY);
+		expect(fixture.database.inbox.turnRow(original.opRef)).toMatchObject({
+			state: "pending",
+			turn_state: "bound",
+			turn_op_ref: original.opRef,
+			bound_session_id: original.sessionId,
+			turn_epoch: 0,
+			terminal_delivery_id: null,
+		});
+		expect(fixture.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: original.sessionId, epoch: 0 });
+		expect(port.remainingFailures).toBe(2);
+		expect(port.sendAttempts.map((send) => send.opRef)).toEqual([original.opRef]);
+		expect(port.binds).toHaveLength(1);
+		expect(port.resumes).toEqual([]);
+		expect(port.closes).toEqual([]);
+		expect(fixture.terminal).toEqual([]);
+		expect(fixture.failures).toEqual([]);
+		expect(fixture.logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))).toBe(
+			false,
 		);
+		expect(fixture.logs.some((line) => line.startsWith("persona_send_unrecoverable"))).toBe(false);
+		port.unavailable = false;
+		port.complete(original.opRef, "first answer");
+		await fixture.manager.recover();
+		await fixture.manager.tick(ORIGIN_KEY);
+		await eventually(
+			() => fixture.database.inbox.turnRow(original.opRef)?.turn_state === "done",
+			"original unavailable-send turn did not settle",
+		);
+		await fixture.manager.recover();
+		await fixture.manager.tick(ORIGIN_KEY);
+		expect(fixture.terminal).toEqual(["first answer"]);
+		expect(fixture.failures).toEqual([]);
+		expect(port.workerOutputReads.map((read) => [read.sessionId, read.opRef])).toEqual([
+			[original.sessionId, original.opRef],
+		]);
+		expect(port.sendAttempts.map((send) => send.opRef)).toEqual([original.opRef]);
+		expect(fixture.database.bindings.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: original.sessionId, epoch: 0 });
 
-		retry.work();
-		await eventually(() => port.sends.length === 1, "armed retry did not send after recovery");
-		const recovered = required(port.sends[0], "recovered send missing");
-		port.complete(recovered.opRef, "first answer");
-		await eventually(() => fixture.database.inbox.pendingCount(ORIGIN_KEY) === 0, "recovered turn did not complete");
-
-		port.remainingFailures = 1;
+		port.remainingFailures = 0;
 		enqueue(fixture, "second", "second request");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 2, "second request did not recover after one unavailable send");
-		expect(
-			fixture.logs
-				.filter((line) => line.startsWith("send_session_disowned action=inline_rebind stage=send"))
-				.map((line) => /attempt=(\d+)/.exec(line)?.[1]),
-		).toEqual(["1", "2", "3", "1"]);
-		expect(
-			fixture.logs.filter(
-				(line) => line.startsWith("persona_send_unrecoverable") && line.includes("reason=session_unavailable"),
-			),
-		).toHaveLength(1);
+		await eventually(() => port.sends.length === 2, "new input did not dispatch after original settlement");
+		const second = required(port.sends[1], "new input send missing");
+		expect(second.opRef).not.toBe(original.opRef);
+		expect(second.sessionId).toBe(original.sessionId);
+		port.complete(second.opRef, "second answer");
+		await eventually(() => fixture.database.inbox.pendingCount(ORIGIN_KEY) === 0, "new input did not settle");
+		expect(fixture.terminal).toEqual(["first answer", "second answer"]);
+		expect(fixture.failures).toEqual([]);
+		expect(port.sendAttempts.map((send) => send.opRef)).toEqual([original.opRef, second.opRef]);
 	} finally {
 		await fixture.close();
 	}

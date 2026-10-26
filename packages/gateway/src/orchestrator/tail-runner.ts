@@ -102,6 +102,8 @@ export interface TailAttachInput {
 	readonly repo: string;
 	/** Caller-owned origin identity for grep-stable observability. */
 	readonly originKey?: string;
+	/** Cancels attachment only; the returned handle remains owned by its caller. */
+	readonly signal?: AbortSignal;
 	/** Current tails may wait for capacity; parked retired holds must not consume it. */
 	priority?: "current" | "retired";
 	/** Lifecycle-only notification; no content stream capabilities required. */
@@ -331,17 +333,44 @@ export class TailRunner {
 	 * changing durable inbound state; callers retain their bound turn.
 	 */
 	async attach(input: TailAttachInput): Promise<TailHandle> {
-		await this.#acquireSlot(input.priority ?? "current");
-		const handle = new ManagedTailHandle(this, { ...input, repo: input.repo || this.#repo });
-		this.#reservedSlots--;
-		this.#handles.add(handle);
-		handle.start();
+		const { signal } = input;
 		try {
-			await handle.ready;
+			await this.#acquireSlot(input.priority ?? "current", signal);
+		} catch (error) {
+			// An aborted caller may have consumed a wake-up before reserving a slot.
+			if (signal?.aborted) this.notifyEvictable();
+			throw error;
+		}
+		let reserved = true;
+		let handle: ManagedTailHandle | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			signal?.throwIfAborted();
+			handle = new ManagedTailHandle(this, { ...input, repo: input.repo || this.#repo });
+			this.#reservedSlots--;
+			reserved = false;
+			this.#handles.add(handle);
+			let ready = handle.ready;
+			if (signal) {
+				const aborted = new Promise<never>((_resolve, reject) => {
+					onAbort = () => reject(signal.reason);
+					signal.addEventListener("abort", onAbort, { once: true });
+				});
+				ready = Promise.race([ready, aborted]);
+			}
+			handle.start();
+			await ready;
+			signal?.throwIfAborted();
 			return handle;
 		} catch (error) {
-			await handle.close();
+			await handle?.close();
 			throw error;
+		} finally {
+			if (onAbort) signal?.removeEventListener("abort", onAbort);
+			if (reserved) {
+				this.#reservedSlots--;
+				this.notifyEvictable();
+			}
 		}
 	}
 
@@ -372,8 +401,10 @@ export class TailRunner {
 		);
 	}
 
-	async #acquireSlot(priority: "current" | "retired"): Promise<void> {
+	async #acquireSlot(priority: "current" | "retired", signal?: AbortSignal): Promise<void> {
+		signal?.throwIfAborted();
 		await this.reapIdle();
+		signal?.throwIfAborted();
 		while (this.#handles.size + this.#reservedSlots >= this.#maxTailProcesses) {
 			const evictable = [...this.#handles]
 				.filter((handle) => !handle.running)
@@ -382,11 +413,27 @@ export class TailRunner {
 				)[0];
 			if (evictable) {
 				await evictable.close();
+				signal?.throwIfAborted();
 				continue;
 			}
 			this.#logSaturation();
 			if (priority === "retired") throw new TailCapacityError();
-			await new Promise<void>((resolve) => this.#waiters.push(resolve));
+			signal?.throwIfAborted();
+			await new Promise<void>((resolve, reject) => {
+				const wake = () => {
+					signal?.removeEventListener("abort", onAbort);
+					resolve();
+				};
+				const onAbort = () => {
+					const index = this.#waiters.indexOf(wake);
+					if (index !== -1) this.#waiters.splice(index, 1);
+					signal?.removeEventListener("abort", onAbort);
+					reject(signal?.reason);
+				};
+				this.#waiters.push(wake);
+				signal?.addEventListener("abort", onAbort, { once: true });
+			});
+			signal?.throwIfAborted();
 		}
 		// Reserve before yielding back to attach: eviction's release can wake a
 		// second waiter before the first caller has installed its new handle.
@@ -651,9 +698,7 @@ class ManagedTailHandle implements TailHandle {
 			const hello = new Promise<void>((resolve) => {
 				this.#helloResolve = resolve;
 			});
-			let helloTimedOut = false;
 			const helloTimer = setTimeout(() => {
-				helloTimedOut = true;
 				this.#helloResolve?.();
 			}, this.#runner.helloTimeoutMs);
 			try {
@@ -684,8 +729,7 @@ class ManagedTailHandle implements TailHandle {
 				if (!this.#connectionId) {
 					const elapsedMs = this.#runner.now() - openedAt;
 					const childState = streamEnded ? "stream_ended" : "stream_open";
-					if (helloTimedOut) throw new RelayHelloError(elapsedMs, childState);
-					throw new Error(`host hello did not arrive after ${elapsedMs}ms (${childState})`);
+					throw new RelayHelloError(elapsedMs, childState);
 				}
 				if (this.#opRef && this.#streamWithRegisteredProviders !== stream) this.#registerProviders(stream);
 				if (!this.#ready) {

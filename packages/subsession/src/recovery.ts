@@ -211,7 +211,7 @@ export function detectContamination(input: ContaminationInput): readonly Contami
 	add(
 		"authority",
 		"locator_mismatch",
-		"same session id but locator.repo is not the expected worktree",
+		"same session id but locator.cwd is not the expected worktree",
 		input.locatorMismatch,
 	);
 	add(
