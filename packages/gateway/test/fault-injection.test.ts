@@ -49,7 +49,50 @@ async function until(check: () => boolean, attempts = 400): Promise<void> {
 	expect(check()).toBe(true);
 }
 
-type Timer = { work: () => void; delay: number };
+type Timer = { work: () => void; due: number };
+
+/**
+ * Gateway time owned by the test: timers fire at their absolute due time.
+ * `elapse(budgetMs)` is ONE recovery deadline: it fires every timer due before
+ * it in due order (including timers those callbacks schedule), advances the
+ * clock as they fire, and leaves later timers pending. A retry chain whose
+ * delays add up past the budget therefore does not recover within it.
+ */
+function virtualTime(start = Date.now()) {
+	let clock = start;
+	const timers: Timer[] = [];
+	return {
+		now: () => clock,
+		advance: (ms: number) => {
+			clock += ms;
+		},
+		setTimeout: (work: () => void, delay: number) => {
+			const timer = { work, due: clock + delay };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: (timer: unknown) => {
+			const i = timers.indexOf(timer as Timer);
+			if (i >= 0) timers.splice(i, 1);
+		},
+		elapse: (budgetMs: number) => {
+			const deadline = clock + budgetMs;
+			fireUntil(deadline);
+			clock = deadline;
+		},
+		/** Fires timers due by `deadline`, leaving the clock at the last one fired, so one deadline spans several calls. */
+		fireUntil: (deadline: number) => fireUntil(deadline),
+	};
+	function fireUntil(deadline: number): void {
+		for (;;) {
+			const next = timers.filter((timer) => timer.due <= deadline).sort((a, b) => a.due - b.due)[0];
+			if (!next) return;
+			timers.splice(timers.indexOf(next), 1);
+			clock = Math.max(clock, next.due);
+			next.work();
+		}
+	}
+}
 
 /** One persona origin over a scripted host; the test owns time and the retry timers. */
 async function origin(name: string, port: ScriptedSessionPort, options: { unresolvedHoldMs?: number } = {}) {
@@ -59,29 +102,21 @@ async function origin(name: string, port: ScriptedSessionPort, options: { unreso
 	const originKey = `loopback/loopback/${name}`;
 	const originRefJson = JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: name });
 	const repo = join(home, "workspace");
-	const timers: Timer[] = [];
+	const time = virtualTime();
 	const logs: string[] = [];
 	const answers: Array<{ opRef: string; text: string }> = [];
 	let generation = 0;
-	let clock = Date.now();
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,
 		instanceId: "fault",
 		repo,
-		now: () => clock,
+		now: time.now,
 		brokerGeneration: () => generation,
 		...(options.unresolvedHoldMs ? { unresolvedHoldMs: options.unresolvedHoldMs } : {}),
 		log: (line: string) => logs.push(line),
-		setTimeout: (work: () => void, delay: number) => {
-			const timer = { work, delay };
-			timers.push(timer);
-			return timer;
-		},
-		clearTimeout: (timer: unknown) => {
-			const i = timers.indexOf(timer as Timer);
-			if (i >= 0) timers.splice(i, 1);
-		},
+		setTimeout: time.setTimeout,
+		clearTimeout: time.clearTimeout,
 		onTurnStart: ({ trigger, turn }) => ({
 			text: trigger.body,
 			onTerminal: ({ text }) => {
@@ -92,20 +127,15 @@ async function origin(name: string, port: ScriptedSessionPort, options: { unreso
 	const enqueue = (messageId: string, body: string) =>
 		expect(
 			db.transaction((tx) =>
-				db.inbox.enqueue(tx, { messageId, originKey, originRefJson, body, receivedAt: new Date(clock).toISOString() }),
+				db.inbox.enqueue(tx, {
+					messageId,
+					originKey,
+					originRefJson,
+					body,
+					receivedAt: new Date(time.now()).toISOString(),
+				}),
 			),
 		).toBe(true);
-	/**
-	 * Lets `budgetMs` of gateway time pass: fires only the timers due within it,
-	 * in due order, and advances the clock. A recovery that needs a later timer
-	 * does not happen within the budget, so the bound itself is asserted.
-	 */
-	const elapse = (budgetMs: number) => {
-		const due = timers.filter((timer) => timer.delay <= budgetMs).sort((a, b) => a.delay - b.delay);
-		for (const timer of due) timers.splice(timers.indexOf(timer), 1);
-		clock += budgetMs;
-		for (const timer of due) timer.work();
-	};
 	return {
 		db,
 		manager,
@@ -113,14 +143,12 @@ async function origin(name: string, port: ScriptedSessionPort, options: { unreso
 		logs,
 		answers,
 		enqueue,
-		elapse,
+		elapse: time.elapse,
 		bumpGeneration: async () => {
 			generation += 1;
 			await manager.onBrokerGeneration(generation);
 		},
-		advance: (ms: number) => {
-			clock += ms;
-		},
+		advance: time.advance,
 	};
 }
 
@@ -332,23 +360,17 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 			relay.streams.at(-1)?.close();
 		},
 	});
-	const timers: Timer[] = [];
+	const time = virtualTime();
 	const logs: string[] = [];
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,
 		instanceId: "fault",
 		repo,
+		now: time.now,
 		log: (line: string) => logs.push(line),
-		setTimeout: (work: () => void, delay: number) => {
-			const timer = { work, delay };
-			timers.push(timer);
-			return timer;
-		},
-		clearTimeout: (timer: unknown) => {
-			const i = timers.indexOf(timer as Timer);
-			if (i >= 0) timers.splice(i, 1);
-		},
+		setTimeout: time.setTimeout,
+		clearTimeout: time.clearTimeout,
 		onTurnStart: ({ trigger, turn }) => ({
 			text: trigger.body,
 			onTerminal: ({ text }) => {
@@ -357,10 +379,6 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 		}),
 	});
 	const answers: Array<{ opRef: string; text: string }> = [];
-	/** Fires the timers due within the recovery budget, as the running gateway would. */
-	const elapseBudget = () => {
-		for (const timer of timers.splice(0).filter((timer) => timer.delay <= RECOVERY_BUDGET_MS)) timer.work();
-	};
 	db.transaction((tx) =>
 		db.inbox.enqueue(tx, {
 			messageId: "m-1",
@@ -381,9 +399,10 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 		expect(
 			logs.some((line) => line.startsWith("send_unadmitted_requeue") && line.includes("prompt_busy_refused")),
 		).toBe(true);
-		// The host is back; the dispatch retry submits the trigger once, under a fresh op-ref.
+		// The host is back. From here the whole recovery shares ONE deadline.
 		hostLive = true;
-		elapseBudget();
+		const deadline = time.now() + RECOVERY_BUDGET_MS;
+		time.fireUntil(deadline);
 		await until(() => prompts.length === 2);
 		expect(prompts[1]).not.toBe(refused);
 		// The resubmitted turn answers and ends on the relay that submitted it.
@@ -399,10 +418,11 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 		finished = true;
 		host.host({ type: "agent_end", ...answered });
 		for (let i = 0; i < 40 && answers.length === 0; i++) {
-			elapseBudget();
+			time.fireUntil(deadline);
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
 		expect(answers).toEqual([{ opRef: prompts[1]!, text: "the answer" }]);
+		expect(time.now()).toBeLessThanOrEqual(deadline);
 		expect(new Set(prompts).size).toBe(2);
 		expect(prompts).toHaveLength(2);
 	} finally {
