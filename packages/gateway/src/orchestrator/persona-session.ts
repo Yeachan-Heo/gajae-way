@@ -1518,7 +1518,8 @@ class OriginActor {
 		const dispatchedAt = new Date(fullRow.dispatched_at).getTime();
 		const heldMs = this.#manager.now() - dispatchedAt;
 		if (heldMs < this.#manager.boundedRecoveryHoldMs) return;
-		if (!(await this.#sessionProvablyGone(ambiguousHold.sessionId, new Error("bounded_recovery_hold_deadline")))) return;
+		if (!(await this.#sessionProvablyGone(ambiguousHold.sessionId, new Error("bounded_recovery_hold_deadline"))))
+			return;
 		// Escalate to recovery hold: close the current turn if it's this one
 		if (this.#current?.turn.opRef === ambiguousHold.opRef) {
 			await this.#closeObserver("recovery_hold_escalation");
