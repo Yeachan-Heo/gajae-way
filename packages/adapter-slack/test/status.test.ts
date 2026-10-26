@@ -117,6 +117,19 @@ test("presence markers never collide with the persona's reaction allowlist", asy
 	expect(isPresenceReaction("+1")).toBe(false);
 });
 
+test("a root DM turn shows the native status line under the triggering message (0.4.0 regression)", async () => {
+	const f = fixture();
+	const dm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1" };
+	f.status.arm(dm, "D1:1.000");
+	await flush();
+	expect(f.statuses).toEqual([
+		`D1:1.000:${presenceStatusText(presenceSnapshot(progress({ elapsedMs: 0, toolCalls: 0, outputTokens: 0 })))}`,
+	]);
+	await f.status.clear(dm.conversationId);
+	await flush();
+	expect(f.statuses.at(-1)).toBe("D1:1.000:");
+});
+
 test("Slack presence is reactions on the triggering message, never a posted or edited message", async () => {
 	const f = fixture();
 	f.status.arm(origin, "C1:1.000");
