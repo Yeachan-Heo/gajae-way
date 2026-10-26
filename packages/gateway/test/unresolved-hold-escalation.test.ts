@@ -306,3 +306,29 @@ test("a failed escalation notice is still posted after its turn settles with no 
 		await restarted.stop();
 	}
 });
+
+test("retention keeps an old trigger until its escalation notice is posted, then sweeps it (#686)", async () => {
+	const DAY = 24 * 60 * MINUTE;
+	const f = await heldOrigin("notice-retention", { heldForMs: 31 * DAY, live: false, newerMessage: false });
+	const sweep = () =>
+		f.db.transaction((tx) =>
+			f.db.inbox.sweep(tx, { historyCutoff: new Date(Date.now() - 30 * DAY).toISOString(), batch: 100 }),
+		);
+	f.failNotices(1);
+	await f.manager.recover();
+	expect(f.notices).toHaveLength(0);
+	f.port.setSessionState(f.binding.sessionId, { live: true });
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	f.port.complete(f.heldOpRef, "late answer");
+	await f.manager.reconcile(f.originKey);
+	await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+	// The settled trigger is past the 30-day horizon, but its notice is still owed.
+	sweep();
+	expect(f.db.inbox.turnRow(f.heldOpRef)).toBeDefined();
+	await f.manager.recover();
+	expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED]);
+	expect(f.logs.some((line) => line.startsWith("escalation_notice_unresolvable"))).toBe(false);
+	sweep();
+	expect(f.db.inbox.turnRow(f.heldOpRef)).toBeUndefined();
+	await f.manager.stop();
+});

@@ -138,7 +138,10 @@ function escalatedHoldKey(opRef: string): string {
 
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
 
-/** Durable intent to post an escalation notice, deleted once the delivery ledger owns it. */
+/**
+ * Durable intent to post an escalation notice, deleted once the delivery ledger
+ * owns it. Inbox retention keeps the trigger row while this key exists.
+ */
 function escalationNoticeKey(originKey: string, opRef: string): string {
 	return `${ESCALATION_NOTICE_PREFIX}${originKey}#${opRef}`;
 }

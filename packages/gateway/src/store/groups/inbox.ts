@@ -117,6 +117,13 @@ export interface ConversationContextWindow {
 
 const REPLAYABLE_INBOUND =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)";
+/**
+ * A trigger whose escalation notice (#686) is still undelivered keeps its row:
+ * the notice is posted from it. Mirrors persona-session's
+ * `escalation-notice:<originKey>#<opRef>` intent key.
+ */
+const ESCALATION_NOTICE_KEY_SQL =
+	"'escalation-notice:' || inbound_messages.origin_key || '#' || inbound_messages.turn_op_ref";
 const INBOUND_COLUMNS =
 	"message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
 
@@ -1239,7 +1246,7 @@ export class InboxGroup {
 	sweep(tx: WriteTx, cutoffs: { historyCutoff: string; batch: number }): number {
 		return this.#db
 			.prepare(
-				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') LIMIT ?)`,
+				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ${ESCALATION_NOTICE_KEY_SQL}) LIMIT ?)`,
 			)
 			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
 	}
