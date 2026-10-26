@@ -1842,6 +1842,51 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 	expect(sends).toBe(4);
 });
 
+test("send waits briefly on busy and does not fail if host makes progress", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-wedge",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	let clock = 0;
+	let sends = 0;
+	const run: CliRunner = async () => {
+		throw new Error("unexpected command");
+	};
+	const relay = scriptedRelay(() => {
+		sends++;
+		if (sends <= 2) return { ok: false, error: { code: "busy", message: "busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+
+	const receipt = await port.send({
+		sessionId: "sdk-1",
+		repo,
+		text: "hi",
+		opRef: "gw-p-busy-basic",
+		busyWaitMs: 10_000,
+	});
+	expect(receipt.operationRef).toBe("gw-p-busy-basic");
+	// Should have retried the busy condition
+	expect(sends).toBeGreaterThanOrEqual(3);
+});
+
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));

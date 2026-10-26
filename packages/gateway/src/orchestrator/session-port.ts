@@ -490,6 +490,8 @@ function createRotationMetaKey(originKey: string): string {
 export const SESSION_BUSY_CODE = "busy";
 const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
+/** Maximum silence on a busy host before it's judged wedged and terminated. */
+const BUSY_WEDGE_PROGRESS_TIMEOUT_MS = 60_000;
 const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
 /**
  * `compaction.run` answers only after gjc finished compacting, which takes tens
@@ -1388,6 +1390,8 @@ export class BrokerSessionPort implements SessionPort {
 		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 		let waited = false;
 		let submission = intent;
+		let busyWedgeLastActivityAt: number | undefined;
+		let busyWedgeHostTerminated = false;
 		for (;;) {
 			if (isBrokerPromptBusyRefusal(submission)) {
 				submission = this.#database.transaction((tx) =>
@@ -1443,6 +1447,40 @@ export class BrokerSessionPort implements SessionPort {
 				waited = true;
 				console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
 			}
+
+			// Detect busy host with no progress: sample activity and terminate if stuck.
+			if (!busyWedgeHostTerminated) {
+				try {
+					const liveness = await this.#readLiveness({ sessionId: input.sessionId, repo: input.repo });
+					const activityAt = liveness.activity?.at;
+					const activityState = liveness.activity?.state;
+
+					if (activityAt !== undefined) {
+						busyWedgeLastActivityAt ??= activityAt;
+
+						// If host is not idle and hasn't changed activity for the progress timeout,
+						// it's wedged. Rearm activity only when it changes (different timestamp).
+						if (activityAt !== busyWedgeLastActivityAt) {
+							busyWedgeLastActivityAt = activityAt;
+						} else if (activityState !== "idle" && this.#now() - activityAt >= BUSY_WEDGE_PROGRESS_TIMEOUT_MS) {
+							busyWedgeHostTerminated = true;
+							const terminateResult = await this.terminateHost({
+								sessionId: input.sessionId,
+								repo: input.repo,
+							});
+							console.info(
+								`session_busy_wedged_host_terminated session=${input.sessionId} opRef=${input.opRef} outcome=${terminateResult.outcome} activityState=${activityState}`,
+							);
+						}
+					}
+				} catch (error) {
+					// Log liveness check failures but continue waiting; don't let detection errors block the turn.
+					console.error(
+						`session_busy_wedge_check_failed session=${input.sessionId} error=${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
+
 			await this.#sleep(BUSY_POLL_MS);
 		}
 	}
