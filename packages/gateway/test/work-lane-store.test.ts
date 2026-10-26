@@ -11,6 +11,7 @@ import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
+	WORK_REFUSAL_CODES,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -534,6 +535,86 @@ describe("work attempt durable transactions", () => {
 				}),
 			),
 		).toThrow();
+	});
+
+	for (const refusalCode of [
+		"busy",
+		"steer_refused",
+		"invalid_params",
+		"not_running",
+		"no_active_turn",
+		"client_ref_conflict",
+		"session_not_found",
+		"sdk_refused",
+	]) {
+		test(`send rejection persists validated refusal diagnostic ${refusalCode}`, async () => {
+			const f = await fixture();
+			expect(WORK_REFUSAL_CODES.has(refusalCode)).toBe(refusalCode !== "sdk_refused");
+			expect(WORK_REFUSAL_CODES.size).toBe(7);
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			const terminal = { kind: "local" as const, observedAt: END, reasonCode: "send_rejected", refusalCode };
+			const staged = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }))!;
+			expect(f.database.work.workAttemptGet(staged.opRef)?.terminal).toEqual(terminal);
+			const closed = closeAttempt({
+				record: f.record,
+				opRef: staged.opRef,
+				endState: "failed",
+				errorCode: "send_rejected",
+				endedAt: END,
+			});
+			expect(
+				f.database.transaction((tx) =>
+					settleAttempt(
+						f.database,
+						tx,
+						staged.opRef,
+						staged.version,
+						closed,
+						{ ...f.settlement, terminal },
+						f.admission,
+					),
+				)?.runtime.decision,
+			).toBe("fallback");
+			const reopened = await Store.open(f.path);
+			handles.push(reopened);
+			expect(reopened.work.workAttemptGet(staged.opRef)?.terminal).toEqual(terminal);
+			expect(parseLaneJobRecord(reopened.work.laneJobJson(staged.jobId)!).attempts[0]?.endState).toBe("failed");
+		});
+	}
+
+	test("refusal diagnostics reject unsafe values and non-rejection terminal evidence", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		const terminal = { kind: "local" as const, observedAt: END, reasonCode: "send_rejected", refusalCode: "busy" };
+		for (const invalid of [
+			...["unknown", "Busy", "busy\n", "", "private diagnostic", null, 7, {}].map((refusalCode) => ({
+				...terminal,
+				refusalCode: refusalCode as string,
+			})),
+			{ ...terminal, reasonCode: "session_dead" },
+			{ ...terminal, status: f.settlement.terminal!.status },
+			{ ...terminal, kind: "broker" as const, status: f.settlement.terminal!.status },
+		]) {
+			expect(() =>
+				f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: invalid })),
+			).toThrow(WorkAttemptStateError);
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(f.runtime);
+		}
+	});
+
+	test("refusal diagnostic is immutable once terminal evidence is recorded", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		const terminal = { kind: "local" as const, observedAt: END, reasonCode: "send_rejected", refusalCode: "busy" };
+		const staged = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }))!;
+		for (const refusalCode of ["steer_refused", "sdk_refused", undefined]) {
+			expect(() =>
+				f.database.transaction((tx) =>
+					updateAttempt(f.database, tx, staged.opRef, staged.version, { terminal: { ...terminal, refusalCode } }),
+				),
+			).toThrow(WorkAttemptStateError);
+			expect(f.database.work.workAttemptGet(staged.opRef)).toEqual(staged);
+		}
 	});
 
 	test("terminal evidence is write-once except a proven missing-to-present receipt (#248)", async () => {
