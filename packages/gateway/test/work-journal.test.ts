@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HISTORY_RETENTION_MS, Store } from "../src/store";
+import { ATTEMPT_UPDATED_SWEEP_SQL, HISTORY_SWEEP_SQL } from "../src/store/groups/journal";
 
 const OLD = "2020-01-01T00:00:00.000Z";
 
@@ -260,17 +261,58 @@ test("terminal attempt events are not deleted by attempt_updated sweep", async (
 	});
 });
 
-test("sweepAttemptUpdated EXISTS subquery uses the (entity, entity_key, seq) index", async () => {
+test("journal sweeps walk a bounded rowid range in seq order instead of sorting every candidate", async () => {
 	await withDb((_path, _database, raw) => {
-		// Verify the query plan uses the index for the EXISTS subquery
-		const plan = raw
-			.query<{ detail: string }, []>(
-				"EXPLAIN QUERY PLAN SELECT seq FROM work_journal AS j WHERE entity = 'attempt' AND event_type = 'attempt_updated' AND EXISTS (SELECT 1 FROM work_journal AS later WHERE later.entity = j.entity AND later.entity_key = j.entity_key AND later.seq > j.seq)",
-			)
-			.all();
-		const planStr = plan.map((p) => p.detail).join("\n");
-		// The plan should reference the work_journal_entity_key index
-		expect(planStr).toContain("work_journal_entity_key");
+		// Regression: a production journal of 3M attempt_updated rows made the index-driven form of
+		// this statement scan and sort every attempt row inside one write transaction; the gateway
+		// stopped answering its socket and ignored SIGTERM. The bounded form stays O(batch).
+		for (const sql of [ATTEMPT_UPDATED_SWEEP_SQL, HISTORY_SWEEP_SQL]) {
+			const plan = raw
+				.query<{ detail: string }, [number, string, number]>(`EXPLAIN QUERY PLAN ${sql}`)
+				.all(1, OLD, 10)
+				.map((row) => row.detail);
+			expect(plan).toContain("SEARCH j USING INTEGER PRIMARY KEY (rowid<?)");
+			expect(plan.some((detail) => detail.includes("TEMP B-TREE"))).toBe(false);
+			expect(plan.some((detail) => /SCAN j\b/.test(detail))).toBe(false);
+			expect(plan.some((detail) => detail.includes("COVERING INDEX work_journal_entity_key"))).toBe(true);
+		}
+	});
+});
+
+test("attempt_updated sweep never deletes rows recorded after the cutoff, even below an out-of-order bound", async () => {
+	await withDb((_path, database, raw) => {
+		const now = new Date();
+		const old = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
+		const recent = now.toISOString();
+		// A clock step backwards leaves a recent row at a lower seq than an old one.
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at) VALUES
+			 ('attempt', 'op-skew', 'attempt_updated', '{}', '${recent}'),
+			 ('attempt', 'op-skew', 'attempt_updated', '{}', '${old}'),
+			 ('attempt', 'op-skew', 'attempt_updated', '{}', '${recent}')`,
+		);
+		expect(database.sweep(now).deleted.work_journal).toBe(1);
+		expect(
+			raw
+				.query<{ recorded_at: string }, []>(
+					"SELECT recorded_at FROM work_journal WHERE entity_key = 'op-skew' ORDER BY seq",
+				)
+				.all()
+				.map((row) => row.recorded_at),
+		).toEqual([recent, recent]);
+	});
+});
+
+test("journal sweeps are no-ops when nothing is older than the cutoff", async () => {
+	await withDb((_path, database, raw) => {
+		const now = new Date();
+		raw.exec(
+			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at) VALUES
+			 ('attempt', 'op-new', 'attempt_updated', '{}', '${now.toISOString()}'),
+			 ('attempt', 'op-new', 'attempt_updated', '{}', '${now.toISOString()}')`,
+		);
+		expect(database.sweep(now).deleted.work_journal).toBe(0);
+		expect(events(raw, "attempt", "op-new")).toEqual(["attempt_updated", "attempt_updated"]);
 	});
 });
 
