@@ -42,7 +42,7 @@ test("gjc direct spawn floor is detected in both modes", () => {
 
 	for (const pattern of blockedPatterns) {
 		const result = guard.checkCommand(pattern);
-		expect(result).toMatchObject({ refused: true, floor: "gjc-direct-spawn" }, `Failed for: ${pattern}`);
+		expect(result, pattern).toMatchObject({ refused: true, floor: "gjc-direct-spawn" });
 	}
 });
 
@@ -80,7 +80,7 @@ test("gjc direct spawn floor allows legitimate commands", () => {
 
 	for (const pattern of allowedPatterns) {
 		const result = guard.checkCommand(pattern);
-		expect(result).toMatchObject({ allowed: true }, `Should allow: ${pattern}`);
+		expect(result, pattern).toMatchObject({ allowed: true });
 	}
 });
 
