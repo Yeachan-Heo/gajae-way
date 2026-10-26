@@ -120,8 +120,8 @@ async function fixture(
 	};
 	const terminal = () => {
 		const value = database.work.workAttemptGet(runtime.opRef)?.terminal;
-		if (!value) throw new Error("fixture terminal missing");
-		return value;
+		if (!value?.status) throw new Error("fixture broker terminal status missing");
+		return { ...value, status: value.status };
 	};
 	const patchRuntime = (patch: Partial<WorkAttemptRuntime>) => {
 		const stored = database.work.workAttemptGet(runtime.opRef);
@@ -204,8 +204,82 @@ for (const schemaVersion of [2, 3]) {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
+const terminalHistories: Array<{
+	name: string;
+	endState: NonNullable<Fixture["closed"]["attempts"][number]["endState"]>;
+	reasonCode: string;
+	status: NonNullable<NonNullable<WorkAttemptRuntime["terminal"]>["status"]>;
+}> = [
+	{
+		name: "completed",
+		endState: "completed",
+		reasonCode: "end_turn",
+		status: { status: "terminal_ok", receiptState: "present", outcome: { reason: "end_turn" } },
+	},
+	{
+		name: "failed",
+		endState: "failed",
+		reasonCode: "sdk_failed",
+		status: { status: "failed", receiptState: "present", error: { code: "sdk_failed" } },
+	},
+	{
+		name: "terminal_uncertain",
+		endState: "terminal_uncertain",
+		reasonCode: "terminal_uncertain",
+		status: { status: "terminal_ok", receiptState: "unknown" },
+	},
+	{
+		name: "terminal_missing_receipt",
+		endState: "terminal_missing_receipt",
+		reasonCode: "terminal_missing_receipt",
+		status: { status: "terminal_ok", receiptState: "missing" },
+	},
+	{
+		name: "cancelled without deliverable success",
+		endState: "attempt_ended",
+		reasonCode: "cancelled",
+		status: { status: "terminal_ok", receiptState: "present", outcome: { reason: "cancelled" } },
+	},
+];
+
+for (const state of ["attempt_ended", "awaiting_operator"] as const) {
+	for (const { name, endState, reasonCode, status } of terminalHistories) {
+		test(`operator dispositions ${state} ${name} history without promoting its outcome`, async () => {
+			const f = await fixture();
+			f.putHistory({ state, attempts: [{ ...f.closed.attempts[0], endState }] });
+			f.patchRuntime({
+				terminal: { kind: "broker", observedAt: END, reasonCode, status: { ...status, clientRef: f.runtime.opRef } },
+			});
+			const before = f.history();
+			const runtime = f.database.work.workAttemptGet(f.runtime.opRef);
+			const binding = f.database.bindings.getSessionRecord(f.sessionKey);
+			expect(await f.governor.retire("a", "operator")).toMatchObject({
+				retired: true,
+				closed: false,
+				disposition: "aborted",
+			});
+			expect(f.history()).toEqual({
+				...before,
+				state: "aborted",
+				updatedAt: END,
+				escalations: [
+					...before.escalations,
+					`${END} operator retired unbound history; attempts and worktree preserved`,
+				],
+			});
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(runtime);
+			expect(f.database.bindings.getSessionRecord(f.sessionKey)).toEqual(binding);
+			const disposed = f.database.work.projectionRows();
+			expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+			expect(f.database.work.projectionRows()).toEqual(disposed);
+			expect(f.port.closes).toEqual([]);
+			expect(f.port.sends).toEqual([]);
+		});
+	}
+}
+
 const refusals: Array<[string, (f: Fixture) => void]> = [
-	...(["awaiting_operator", "stalled", "running", "awaiting_checks", "done", "aborted"] as const).map(
+	...(["stalled", "running", "awaiting_checks", "done", "aborted"] as const).map(
 		(state): [string, (f: Fixture) => void] => [
 			`job state ${state}`,
 			(f) =>
@@ -270,6 +344,22 @@ const refusals: Array<[string, (f: Fixture) => void]> = [
 		},
 	],
 	["local terminal", (f) => f.patchRuntime({ terminal: { kind: "local", observedAt: END, reasonCode: "end_turn" } })],
+	...(["absent", undefined] as const).map((receiptState): [string, (f: Fixture) => void] => [
+		`${receiptState ?? "omitted"} receipt state`,
+		(f) => {
+			f.putHistory({ attempts: [{ ...f.closed.attempts[0], endState: "attempt_ended" }] });
+			f.patchRuntime({
+				terminal: {
+					kind: "broker",
+					observedAt: END,
+					reasonCode: "stopped_incomplete",
+					status: { status: "terminal_ok", clientRef: f.runtime.opRef, receiptState },
+				},
+			});
+		},
+	]),
+	["indeterminate recovery decision", (f) => f.patchRuntime({ decision: "recovery_indeterminate" })],
+	["unsettled runtime", (f) => f.patchRuntime({ decision: "undecided", settledAt: null })],
 	[
 		"mismatched client reference",
 		(f) =>
@@ -286,7 +376,7 @@ const refusals: Array<[string, (f: Fixture) => void]> = [
 			}),
 	],
 	[
-		"missing receipt",
+		"missing receipt with mismatched completed attempt",
 		(f) =>
 			f.patchRuntime({
 				terminal: {
@@ -298,7 +388,7 @@ const refusals: Array<[string, (f: Fixture) => void]> = [
 			}),
 	],
 	[
-		"unknown receipt",
+		"unknown receipt with mismatched completed attempt",
 		(f) =>
 			f.patchRuntime({
 				terminal: {
@@ -321,6 +411,8 @@ const refusals: Array<[string, (f: Fixture) => void]> = [
 		(f) => f.putHistory({ attempts: [{ ...f.closed.attempts[0], endState: "attempt_ended" }] }),
 	],
 	["live historical session", (f) => f.port.setSessionState(SESSION, { live: true, repo: f.directory })],
+	["wrong runtime session", (f) => f.patchRuntime({ sessionId: "22222222-2584-4d13-b7b6-c6ac24a1087f" })],
+	["wrong runtime repository", (f) => f.patchRuntime({ cwd: join(f.directory, "other") })],
 	["wrong runtime epoch", (f) => f.patchRuntime({ epoch: 9 })],
 	[
 		"unretired epoch",
@@ -361,9 +453,73 @@ const refusals: Array<[string, (f: Fixture) => void]> = [
 	],
 ];
 
-for (const [name, change] of refusals) {
-	test(`historical disposition refuses ${name} without mutating history`, async () => {
+for (const receiptState of ["missing", "unknown"] as const) {
+	for (const [name, change] of [
+		["wrong runtime session", (f: Fixture) => f.patchRuntime({ sessionId: "22222222-2584-4d13-b7b6-c6ac24a1087f" })],
+		["wrong runtime repository", (f: Fixture) => f.patchRuntime({ cwd: join(f.directory, "other") })],
+		[
+			"uncorrelated client reference",
+			(f: Fixture) =>
+				f.patchRuntime({
+					terminal: { ...f.terminal(), status: { ...f.terminal().status, clientRef: "gw-other" } },
+				}),
+		],
+		[
+			"absent client reference",
+			(f: Fixture) =>
+				f.patchRuntime({
+					terminal: { ...f.terminal(), status: { ...f.terminal().status, clientRef: undefined } },
+				}),
+		],
+		[
+			"inconsistent recorded reason",
+			(f: Fixture) => f.patchRuntime({ terminal: { ...f.terminal(), reasonCode: "end_turn" } }),
+		],
+		[
+			"malformed receipt state",
+			(f: Fixture) => {
+				f.raw.exec(
+					"UPDATE work_attempt_runtime SET record_json = json_set(record_json, '$.terminal.status.receiptState', 'invalid')",
+				);
+			},
+		],
+		[
+			"nonterminal broker status",
+			(f: Fixture) => {
+				f.raw.exec(
+					"UPDATE work_attempt_runtime SET record_json = json_set(record_json, '$.terminal.status.status', 'running')",
+				);
+			},
+		],
+	] as const) {
+		test(`awaiting_operator refuses ${receiptState} receipt with ${name}`, async () => {
+			const f = await fixture();
+			const endState = receiptState === "missing" ? "terminal_missing_receipt" : "terminal_uncertain";
+			f.putHistory({ state: "awaiting_operator", attempts: [{ ...f.closed.attempts[0], endState }] });
+			f.patchRuntime({
+				terminal: {
+					kind: "broker",
+					observedAt: END,
+					reasonCode: endState,
+					status: { status: "terminal_ok", clientRef: f.runtime.opRef, receiptState },
+				},
+			});
+			change(f);
+			const before = f.database.work.projectionRows();
+			expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+			expect(f.database.work.projectionRows()).toEqual(before);
+			expect(f.port.closes).toEqual([]);
+			expect(f.port.sends).toEqual([]);
+		});
+	}
+}
+
+for (const [state, name, change] of (["attempt_ended", "awaiting_operator"] as const).flatMap((state) =>
+	refusals.map(([name, change]) => [state, name, change] as const),
+)) {
+	test(`${state} disposition refuses ${name} without mutating history`, async () => {
 		const f = await fixture();
+		f.putHistory({ state });
 		change(f);
 		const before = f.database.work.projectionRows();
 		expect((await f.governor.retire("a", "operator")).retired).toBe(false);

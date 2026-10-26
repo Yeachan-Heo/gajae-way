@@ -367,8 +367,14 @@ export class LaneGovernor {
 				jobRow.updated_at !== job.updatedAt
 			)
 				return refused("historical job identity mismatch");
-			if (job.state !== "attempt_ended" || job.awaitingChecks || job.stalledContinuations >= MAX_STALLED_CONTINUATIONS)
-				return refused(`historical job is ${job.state}; only unheld attempt_ended history can be disposed`);
+			if (
+				(job.state !== "attempt_ended" && job.state !== "awaiting_operator") ||
+				job.awaitingChecks ||
+				job.stalledContinuations >= MAX_STALLED_CONTINUATIONS
+			)
+				return refused(
+					`historical job is ${job.state}; only unheld attempt_ended or awaiting_operator history can be disposed`,
+				);
 			if (!job.attempts.length || job.attempts.some((attempt) => !attempt.endedAt))
 				return refused("historical job has no settled attempt history");
 			const binding = this.#database.bindings.getSessionRecord(sessionKey);
@@ -413,12 +419,14 @@ export class LaneGovernor {
 						runtime.jobId !== jobId ||
 						runtime.laneKey !== laneKey ||
 						runtime.sessionKey !== sessionKey ||
+						runtime.sessionId !== attempt.sessionId ||
+						runtime.cwd !== job.lane.worktreePath ||
 						runtime.epoch !== owned.epoch ||
 						runtime.settledAt === null ||
 						runtime.decision === "recovery_indeterminate" ||
 						terminal?.kind !== "broker" ||
 						terminal.status?.clientRef !== attempt.opRef ||
-						terminal.status.receiptState !== "present" ||
+						!["present", "missing", "unknown"].includes(terminal.status.receiptState ?? "") ||
 						terminalEvidence(terminal.status, terminal.observedAt)?.reasonCode !== terminal.reasonCode ||
 						workAttemptEndState(terminal.reasonCode) !== attempt.endState
 					)
@@ -439,7 +447,8 @@ export class LaneGovernor {
 				escalations: [...job.escalations, `${at} operator retired unbound history; attempts and worktree preserved`],
 			};
 			// Parsing validates history but normalizes its schema and known fields.
-			// Disposition must not rewrite that retained evidence payload.
+			// Operator cancellation is not deliverable success, including for uncertain
+			// or missing receipts. Preserve the original attempts and runtime evidence.
 			const disposedJson = JSON.stringify({
 				...JSON.parse(json),
 				state: disposed.state,
