@@ -27,7 +27,7 @@ async function until(check: () => boolean): Promise<void> {
 
 const never = <T>() => new Promise<T>(() => {});
 
-type Stage = "start_turn" | "attach" | "set_model" | "set_service_tier" | "send";
+type Stage = "start_turn" | "attach" | "context_usage" | "run_compaction" | "set_model" | "set_service_tier" | "send";
 
 /** A port that can wedge any pre-send await forever: a process killed there never resumes it. */
 class CrashablePort extends ScriptedSessionPort {
@@ -45,6 +45,15 @@ class CrashablePort extends ScriptedSessionPort {
 
 	override attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
 		return this.#gate("attach", () => super.attachTail(input));
+	}
+
+	/** Above PERSONA_COMPACTION_TOKENS, so every turn also awaits a compaction before it is sent. */
+	contextUsage() {
+		return this.#gate("context_usage", async () => ({ percent: 95, tokens: 250_000 }));
+	}
+
+	override runCompaction(input: Parameters<ScriptedSessionPort["runCompaction"]>[0]) {
+		return this.#gate("run_compaction", () => super.runCompaction(input));
 	}
 
 	override setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
@@ -116,7 +125,15 @@ async function fixture(name: string) {
 	};
 }
 
-for (const stage of ["start_turn", "attach", "set_model", "set_service_tier"] as const) {
+// Every await between bindTurn and the send stamp, in production order (#685).
+for (const stage of [
+	"start_turn",
+	"attach",
+	"context_usage",
+	"run_compaction",
+	"set_model",
+	"set_service_tier",
+] as const) {
 	test(`a crash at ${stage} between bindTurn and send is answered exactly once after restart, with no operator action (#685)`, async () => {
 		const f = await fixture(`crash-${stage}`);
 		if (stage === "start_turn") f.hangStartTurn(true);

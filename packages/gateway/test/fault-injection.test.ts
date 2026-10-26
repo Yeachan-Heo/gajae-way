@@ -1,0 +1,356 @@
+/**
+ * #689 fault-injection matrix. Each case injects the fault at the session-port
+ * boundary the gateway actually observes (a thrown attach/send, a broker
+ * generation change, a host that stops being live, a send that times out), and
+ * asserts that the origin answers again within a bound and that no possibly
+ * accepted operation is ever submitted twice. The "gateway crash between bind
+ * and send" row lives in send-intent-recovery.test.ts (every pre-send await).
+ *
+ * Process-level faults (a real SIGKILL of a session host or broker) are not
+ * reproduced here; they reach the gateway as exactly these port observations.
+ */
+import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import type { SessionSendInput } from "../src/orchestrator/session-port";
+import { Store } from "../src/store";
+import {
+	BROKER_PROMPT_BUSY_REFUSAL,
+	type BrokerAuthority,
+	isBrokerPromptBusyRefusal,
+} from "../src/store/groups/bindings";
+import { attachTestBrokerOwnership, initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
+
+const MINUTE = 60_000;
+let home = "";
+let database: Store | undefined;
+
+afterEach(async () => {
+	database?.close();
+	database = undefined;
+	if (home) await rm(home, { recursive: true, force: true });
+	home = "";
+});
+
+async function until(check: () => boolean, attempts = 400): Promise<void> {
+	for (let i = 0; i < attempts && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+	expect(check()).toBe(true);
+}
+
+type Timer = { work: () => void; delay: number };
+
+/** One persona origin over a scripted host; the test owns time and the retry timers. */
+async function origin(name: string, port: ScriptedSessionPort, options: { unresolvedHoldMs?: number } = {}) {
+	home = await mkdtemp(join(tmpdir(), `gajaeway-fault-${name}-`));
+	database = await Store.open(join(home, "gateway.db"));
+	const db = database;
+	const originKey = `loopback/loopback/${name}`;
+	const originRefJson = JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: name });
+	const repo = join(home, "workspace");
+	const timers: Timer[] = [];
+	const logs: string[] = [];
+	const answers: Array<{ opRef: string; text: string }> = [];
+	let generation = 0;
+	let clock = Date.now();
+	const manager = new PersonaSessionManager({
+		database: db,
+		port,
+		instanceId: "fault",
+		repo,
+		now: () => clock,
+		brokerGeneration: () => generation,
+		...(options.unresolvedHoldMs ? { unresolvedHoldMs: options.unresolvedHoldMs } : {}),
+		log: (line: string) => logs.push(line),
+		setTimeout: (work: () => void, delay: number) => {
+			const timer = { work, delay };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: (timer: unknown) => {
+			const i = timers.indexOf(timer as Timer);
+			if (i >= 0) timers.splice(i, 1);
+		},
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				answers.push({ opRef: turn.opRef, text });
+			},
+		}),
+	});
+	const enqueue = (messageId: string, body: string) =>
+		expect(
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, { messageId, originKey, originRefJson, body, receivedAt: new Date(clock).toISOString() }),
+			),
+		).toBe(true);
+	/** Fires every due dispatch retry, as the running gateway's timers would. */
+	const fireRetries = () => {
+		for (const timer of timers.splice(0)) timer.work();
+	};
+	return {
+		db,
+		manager,
+		originKey,
+		logs,
+		answers,
+		enqueue,
+		fireRetries,
+		bumpGeneration: async () => {
+			generation += 1;
+			await manager.onBrokerGeneration(generation);
+		},
+		advance: (ms: number) => {
+			clock += ms;
+		},
+	};
+}
+
+/** Every attempt under one op-ref; a possibly accepted op must never have more than one. */
+function attemptsByOpRef(port: ScriptedSessionPort): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const send of port.sendAttempts) counts.set(send.opRef, (counts.get(send.opRef) ?? 0) + 1);
+	return counts;
+}
+
+test("broker restart mid-attach: the never-sent trigger is answered once after the broker returns (#689)", async () => {
+	let brokerDown = true;
+	const port = new (class extends ScriptedSessionPort {
+		override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+			if (brokerDown) throw new Error("broker_unavailable (client stopped or broker unavailable)");
+			return await super.attachTail(input);
+		}
+	})({ onSend: (input, scripted) => scripted.complete(input.opRef, "answer") });
+	const f = await origin("broker-mid-attach", port);
+	f.enqueue("m-1", "answer me");
+	try {
+		await f.manager.recover();
+		expect(port.sendAttempts).toHaveLength(0);
+		// The broker restarts: a new generation, then the retry timer fires.
+		brokerDown = false;
+		await f.bumpGeneration();
+		f.fireRetries();
+		await until(() => f.answers.length === 1);
+		expect(port.sendAttempts).toHaveLength(1);
+		expect(f.answers[0]!.text).toBe("answer");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("broker restart mid-send: an accepted prompt whose receipt was lost is reconciled, never resent (#689)", async () => {
+	let tearReceipt = true;
+	const port = new (class extends ScriptedSessionPort {
+		override async send(input: SessionSendInput) {
+			const receipt = await super.send(input);
+			if (tearReceipt) {
+				tearReceipt = false;
+				throw new Error("relay closed: broker exited before the receipt");
+			}
+			return receipt;
+		}
+	})();
+	const f = await origin("broker-mid-send", port);
+	f.enqueue("m-1", "answer me");
+	try {
+		await f.manager.recover();
+		const opRef = port.sendAttempts[0]!.opRef;
+		expect(f.db.inbox.turnRow(opRef)?.turn_state).not.toBe("done");
+		await f.bumpGeneration();
+		await f.manager.recover();
+		f.fireRetries();
+		// The original op finishes on the host; the gateway learns it from status.
+		port.complete(opRef, "late answer");
+		await f.manager.reconcile(f.originKey);
+		await until(() => f.answers.length === 1);
+		expect(f.answers[0]).toEqual({ opRef, text: "late answer" });
+		expect([...attemptsByOpRef(port).values()]).toEqual([1]);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("host death mid-turn: past the hold bound the origin answers new messages, the held op is never resent (#689)", async () => {
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			if (!input.text.includes("held")) scripted.complete(input.opRef, "fresh answer");
+		},
+	});
+	const f = await origin("host-death-mid-turn", port, { unresolvedHoldMs: 10 * MINUTE });
+	f.enqueue("m-1", "held request");
+	try {
+		await f.manager.recover();
+		const held = port.sendAttempts[0]!;
+		// The host is killed while the turn runs: no longer live, its operation unreadable.
+		port.setSessionState(held.sessionId, { live: false });
+		port.forgetOperation(held.opRef);
+		f.enqueue("m-2", "newer message");
+		await f.manager.reconcile(f.originKey);
+		expect(port.sendAttempts).toHaveLength(1);
+		f.advance(11 * MINUTE);
+		await f.manager.reconcile(f.originKey);
+		await until(() => f.answers.some((answer) => answer.text === "fresh answer"));
+		expect(attemptsByOpRef(port).get(held.opRef)).toBe(1);
+		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(true);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/**
+ * A host that refuses as `busy` while the gateway waits, with the refusal
+ * journaled in broker_operations exactly as BrokerSessionPort records it, and
+ * read back from that journal (never from test memory).
+ */
+class JournaledBusyPort extends ScriptedSessionPort {
+	authority!: BrokerAuthority;
+	store!: Store;
+	busy: "hang" | "host_killed" | undefined;
+
+	override async send(input: SessionSendInput) {
+		if (this.busy === undefined) return await super.send(input);
+		this.sendAttempts.push(input);
+		const scope = JSON.stringify([input.sessionId, input.opRef]);
+		this.store.transaction((tx) => {
+			this.store.bindings.beginBrokerOperation(tx, this.authority, {
+				operation: "turn.prompt",
+				scope,
+				operationRef: input.opRef,
+				requestJson: "{}",
+			});
+			this.store.bindings.completeBrokerOperation(
+				tx,
+				this.authority,
+				"turn.prompt",
+				scope,
+				input.opRef,
+				JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+			);
+		});
+		if (this.busy === "hang") return await new Promise<never>(() => {});
+		this.busy = undefined;
+		this.setSessionState(input.sessionId, { live: false });
+		throw new Error("relay closed: session host exited during busy wait");
+	}
+
+	promptRefusal(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined {
+		const intent = this.store.bindings.brokerOperation(
+			this.authority,
+			"turn.prompt",
+			JSON.stringify([input.sessionId, input.opRef]),
+		);
+		return intent?.operationRef === input.opRef && isBrokerPromptBusyRefusal(intent) ? "busy" : undefined;
+	}
+}
+
+async function journaledOrigin(name: string, port: JournaledBusyPort) {
+	const f = await origin(name, port);
+	port.store = f.db;
+	port.authority = initializeTestBrokerAuthority(f.db, join(home, "agent"));
+	attachTestBrokerOwnership(f.db, port, join(home, "agent"));
+	return f;
+}
+
+test("host death during busy-wait: the journaled refusal proves non-admission and the trigger is answered once (#689)", async () => {
+	const port = new JournaledBusyPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "answer") });
+	port.busy = "host_killed";
+	const f = await journaledOrigin("host-death-busy-wait", port);
+	f.enqueue("m-1", "answer me");
+	try {
+		await f.manager.recover();
+		const refused = port.sendAttempts[0]!.opRef;
+		expect(
+			f.logs.some((line) => line.includes("send_unadmitted_requeue") && line.includes("prompt_busy_refused")),
+		).toBe(true);
+		f.fireRetries();
+		await until(() => f.answers.length === 1);
+		expect(f.answers[0]!.opRef).not.toBe(refused);
+		expect(port.resumes).toHaveLength(1);
+		expect([...attemptsByOpRef(port).values()]).toEqual([1, 1]);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("gateway crash during the busy wait: restart requeues from the journaled refusal alone (#685, #689)", async () => {
+	const port = new JournaledBusyPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "answer") });
+	port.busy = "hang";
+	const f = await journaledOrigin("crash-busy-wait", port);
+	f.enqueue("m-1", "answer me");
+	void f.manager.recover();
+	await until(() => port.sendAttempts.length === 1);
+	const refused = port.sendAttempts[0]!.opRef;
+	expect(f.db.inbox.sendAttempted(refused)).toBe(true);
+	// The process dies mid-wait. A new process sees only the database.
+	port.busy = undefined;
+	const restarted = new PersonaSessionManager({
+		database: f.db,
+		port,
+		instanceId: "fault",
+		repo: join(home, "workspace"),
+		log: (line: string) => f.logs.push(line),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				f.answers.push({ opRef: turn.opRef, text });
+			},
+		}),
+	});
+	try {
+		await restarted.recover();
+		await until(() => f.answers.length === 1);
+		expect(f.answers[0]!.opRef).not.toBe(refused);
+		expect(
+			f.logs.some(
+				(line) =>
+					line.startsWith("recovery_requeue_unsent") &&
+					line.includes(`opRef=${refused}`) &&
+					line.includes("prompt_busy_refused"),
+			),
+		).toBe(true);
+		expect([...attemptsByOpRef(port).values()]).toEqual([1, 1]);
+	} finally {
+		await restarted.stop();
+	}
+});
+
+for (const outcome of ["host_finishes", "host_dies"] as const) {
+	test(`relay timeout during host compaction (${outcome}): the ambiguous op is never resent and the origin answers again (#689)`, async () => {
+		let timeoutNext = true;
+		const port = new (class extends ScriptedSessionPort {
+			override async send(input: SessionSendInput) {
+				if (!timeoutNext) return await super.send(input);
+				timeoutNext = false;
+				// The host was compacting: it took the prompt, but the relay gave up first.
+				this.seedAcceptedSend(input);
+				throw new Error("relay request timed out after 30000ms (turn.prompt)");
+			}
+		})({ onSend: (input, scripted) => scripted.complete(input.opRef, "fresh answer") });
+		const f = await origin(`compaction-timeout-${outcome}`, port, { unresolvedHoldMs: 10 * MINUTE });
+		f.enqueue("m-1", "request during compaction");
+		try {
+			await f.manager.recover();
+			const ambiguous = port.sendAttempts[0]!;
+			expect(f.db.inbox.turnRow(ambiguous.opRef)?.turn_state).not.toBe("done");
+			if (outcome === "host_finishes") {
+				port.complete(ambiguous.opRef, "answer after compaction");
+				await f.manager.reconcile(f.originKey);
+				// The tail grace for terminal evidence elapses; status then settles the turn.
+				f.fireRetries();
+				await until(() => f.answers.length === 1);
+				expect(f.answers[0]).toEqual({ opRef: ambiguous.opRef, text: "answer after compaction" });
+			} else {
+				port.setSessionState(ambiguous.sessionId, { live: false });
+				port.forgetOperation(ambiguous.opRef);
+				f.enqueue("m-2", "newer message");
+				f.advance(11 * MINUTE);
+				await f.manager.reconcile(f.originKey);
+				await until(() => f.answers.some((answer) => answer.text === "fresh answer"));
+			}
+			expect(attemptsByOpRef(port).get(ambiguous.opRef)).toBe(1);
+		} finally {
+			await f.manager.stop();
+		}
+	});
+}

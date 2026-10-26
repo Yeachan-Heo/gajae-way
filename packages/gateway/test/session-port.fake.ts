@@ -806,6 +806,11 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	/** The host lost the operation (killed, or its record gone): status reads `unknown` from now on. */
+	forgetOperation(opRef: string): void {
+		this.#operations.delete(opRef);
+	}
+
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
 		this.sends.push(input);

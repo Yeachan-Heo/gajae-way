@@ -170,7 +170,23 @@ A release candidate runs on the dogfood host for 24 hours before it is tagged; a
 - every delivery confirmed and readiness never degraded;
 - no `ops cycle` gate that was absent before the swap.
 
-The fault-injection suites `send-intent-recovery`, `unresolved-hold-escalation` and `origin-silent` (gateway tests) must pass in CI: a crash at every await between bind and send is answered exactly once after restart, a crash after the send stamp is reconciled and never resent, a busy host without progress is ended and the turn answered on a resumed host, a held turn on a dead host stops silencing its origin within `sessions.unresolvedHoldMs`, and a held turn raises exactly one owner alert and one cleared notice. A failure in any of them blocks the tag.
+CI (`bun test packages/` in `build.yml` and `release.yml`) gates the release on the fault-injection matrix; a failure in any row blocks the tag. Faults are injected at the session-port boundary the gateway observes (a thrown attach or send, a broker generation change, a host that stops being live, a relay timeout); a real SIGKILL of a broker or host process is not reproduced in CI and reaches the gateway as exactly these observations. Every row asserts that the origin answers again and that no possibly accepted operation is submitted twice:
+
+| Fault | Test |
+| --- | --- |
+| Gateway crash at each await between bind and send (lifecycle start, attach, context read, compaction, model, service tier) | `send-intent-recovery.test.ts` |
+| Gateway crash after the send stamp | `send-intent-recovery.test.ts` |
+| Gateway crash during the busy wait (recovered from the journaled `busy` refusal) | `fault-injection.test.ts` |
+| Broker restart mid-attach | `fault-injection.test.ts` |
+| Broker restart mid-send (receipt lost after acceptance) | `fault-injection.test.ts` |
+| Session host death mid-turn | `fault-injection.test.ts`, `unresolved-hold-escalation.test.ts` |
+| Session host death during busy-wait | `fault-injection.test.ts` |
+| Busy host making no progress | `session-port.test.ts`, `send-intent-recovery.test.ts` |
+| Relay timeout during host compaction (host finishes, or dies) | `fault-injection.test.ts` |
+| Escalated hold context, late answer and notice across restarts | `unresolved-hold-escalation.test.ts`, `unresolved-hold-escalation-server.test.ts` |
+| Owner alert and clear for a silent origin | `origin-silent.test.ts` |
+
+The 24-hour soak itself is a manual release step: CI does not run it, and the release PR must carry the report above.
 
 ## Backup and restore drill
 
