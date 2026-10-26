@@ -3200,7 +3200,7 @@ test("an idle runtime reconciles a missing receipt after lost lifecycle, includi
 	expect(reads).toBe(3);
 	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 	expect(f.notices.map((notice) => notice.text)).toEqual([
-		`[lane a] attempt_ended: terminal_missing_receipt: final_response_missing opRef=${result.opRef}`,
+		`[lane a] attempt_ended: terminal_missing_receipt: final_response_missing opRef=${result.opRef} cause=prompt_deadline_exceeded`,
 	]);
 	await f.restart();
 	expect(f.notices).toHaveLength(1);
@@ -4066,7 +4066,7 @@ test("broker deadline ends the attempt but caller timeout never does", async () 
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.status?.error).toEqual({ code: "prompt_deadline_exceeded" });
-	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: prompt_deadline_exceeded: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: prompt_deadline_exceeded: output_unavailable cause=prompt_deadline_exceeded");
 });
 
 test("torn send accepts only same-op status evidence; unknown remains open with no resend", async () => {

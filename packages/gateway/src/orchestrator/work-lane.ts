@@ -568,7 +568,7 @@ export class WorkLaneManager {
 						: {}),
 				}
 			: undefined;
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts, terminal.failureCode);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -1896,7 +1896,7 @@ export class WorkLaneManager {
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
-			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
+			const text = reportText(name, endState, reason, runtime.opRef, output, facts, runtime.terminal?.failureCode);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -3167,6 +3167,7 @@ export function reportText(
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
+	failureCode?: string,
 ): string {
 	const checks = facts?.checkStatus;
 	const checksVerified =
@@ -3186,6 +3187,10 @@ export function reportText(
 				? `final_response_missing opRef=${opRef}`
 				: "output_unavailable"
 			: (output.excerpt ?? "");
+	// Include failure code if present and output is unavailable
+	if (failureCode && output.disposition === "unavailable") {
+		body = body ? `${body} cause=${failureCode}` : `cause=${failureCode}`;
+	}
 	// Include transport cause details if present
 	if (reason === "terminal_missing_receipt" && output.transportCause) {
 		const transport = output.transportCause;

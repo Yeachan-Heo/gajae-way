@@ -102,6 +102,7 @@ export interface WorkAttemptTerminalEvidence {
 	readonly kind: "broker" | "local";
 	readonly observedAt: string;
 	readonly reasonCode: string;
+	readonly failureCode?: string;
 	readonly status?: PromptStatusBody;
 }
 
@@ -125,7 +126,12 @@ export function terminalEvidence(
 						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
 							? status.outcome!.reason!
 							: "stopped_incomplete";
-	return { kind: "broker", observedAt, reasonCode, status };
+	// Extract failure code from failed status errors, restricting to allowlist
+	const failureCode =
+		status.status === "failed" && typeof status.error?.code === "string" && WORK_FAILURE_CODES.has(status.error.code)
+			? status.error.code
+			: undefined;
+	return { kind: "broker", observedAt, reasonCode, failureCode, status };
 }
 
 export interface WorkAttemptRuntime {
@@ -273,6 +279,16 @@ const WORK_REASON_CODES = new Set([
 	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
+]);
+
+/** Allowlist of safe failure codes that can be surfaced in reports. */
+const WORK_FAILURE_CODES = new Set([
+	"prompt_deadline_exceeded",
+	"server_is_overloaded",
+	"provider_rate_limited",
+	"provider_quota_exhausted",
+	"provider_refusal",
+	"sdk_failed",
 ]);
 
 export function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {
