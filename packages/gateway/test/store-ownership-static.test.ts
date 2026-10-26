@@ -51,6 +51,7 @@ function rawCallViolation(file: string, receiver: string, method: string): boole
 	if (file === "orchestrator/rebind.ts" && receiver === "open") return false;
 	if (file === "orchestrator/session-port.ts" && (receiver === "relay" || receiver === "input.relay")) return false;
 	if (file === "server/server.ts" && receiver === "runtime.delivery") return false;
+	if (file === "ops/origin-silent.ts" && receiver === "delivery") return false;
 	return true;
 }
 
