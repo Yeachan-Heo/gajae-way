@@ -25,7 +25,7 @@ import {
 } from "../src/orchestrator/session-port";
 import type { TailAttachInput, TailFrame } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
-import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
+import { BROKER_PROMPT_BUSY_REFUSAL, isBrokerPromptBusyRefusal } from "../src/store/groups/bindings";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 let home = "";
@@ -4590,6 +4590,44 @@ test("가8: a deleted saved session is never resumed", async () => {
 		bound_session_id: sessionId,
 		turn_epoch: 0,
 	});
+});
+
+test("#675: a busy send that ended because the wedged host was terminated is answered once after resume", async () => {
+	const { port, terminal, sessionId, logs } = await idleClosedHarness();
+	port.closed.delete(sessionId);
+	const authority = database!.bindings.authority!;
+	Object.assign(port, {
+		promptRefusal: (input: { sessionId: string; opRef: string }) =>
+			isBrokerPromptBusyRefusal(
+				database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([input.sessionId, input.opRef])),
+			)
+				? "busy"
+				: undefined,
+	});
+	const send = port.send.bind(port);
+	let wedged = true;
+	port.send = async (input) => {
+		if (!wedged) return await send(input);
+		wedged = false;
+		port.sendAttempts.push(input);
+		// session-port recorded the busy refusal, terminated the wedged host and surfaced `busy`.
+		seedPersonaPrompt(input, "busy");
+		port.closed.add(input.sessionId);
+		for (const tail of port.tailsOf(input.sessionId)) await tail.close();
+		throw new GjcCliError("busy", 0, "", { code: "busy", message: "busy" });
+	};
+	enqueue("after-wedge", "컴팩션 후 답");
+	await manager!.notifyInbound(KEY).catch(() => undefined);
+	for (let round = 0; round < 20 && terminal.length < 2; round++) {
+		await manager!.recover();
+		await manager!.tick(KEY);
+		const pending = port.sends.find((entry) => entry.text === "컴팩션 후 답");
+		if (pending) port.complete(pending.opRef, "웨지 후 답");
+		await Bun.sleep(5);
+	}
+	expect(logs.some((line) => line.startsWith("recovery_requeue_busy_refused"))).toBe(true);
+	expect(terminal).toEqual(["earlier answer", "웨지 후 답"]);
+	expect(port.sends.filter((entry) => entry.text === "컴팩션 후 답")).toHaveLength(1);
 });
 
 test("가8: a deleted closed binding is not resumed before the send either", async () => {

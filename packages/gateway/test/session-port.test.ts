@@ -7,6 +7,7 @@ import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
+	isSessionBusy,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
 	SessionRequestTimeoutError,
@@ -1888,7 +1889,6 @@ test("busy + activity.at frozen + state active for > wedge window -> terminateHo
 		return { ok: false, error: { code: "busy", message: "busy" } };
 	});
 
-	let terminateHostCalled = false;
 	const port = new BrokerSessionPort({
 		database,
 		authority,
@@ -1898,33 +1898,26 @@ test("busy + activity.at frozen + state active for > wedge window -> terminateHo
 		sleep: async (ms) => {
 			clock += ms;
 		},
-		busyWedgeMs: 60_000, // 60s wedge window
+		busyWedgeMs: 60_000,
 	});
-
-	// Hook into terminateHost to track calls (by wrapping it)
-	const origTerminate = port.terminateHost.bind(port);
+	const terminations: string[] = [];
 	port.terminateHost = async (input) => {
-		terminateHostCalled = true;
-		return origTerminate(input);
+		terminations.push(input.sessionId);
+		return { outcome: "terminating", pid: 12345 };
 	};
 
-	// Set deadline to more than the wedge window
-	await expect(
-		port.send({
-			sessionId: "sdk-1",
-			repo,
-			text: "hi",
-			opRef: "gw-p-wedged",
-			busyWaitMs: 600_000, // 10 min, enough for termination
-		}),
-	).rejects.toThrow(/busy/);
-
-	// Should have called liveness check at least once
+	const failure = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-wedged", busyWaitMs: 600_000 })
+		.catch((error: unknown) => error);
+	// The wait ends at the wedge window, long before the 10-minute deadline.
+	expect(isSessionBusy(failure)).toBe(true);
+	expect(terminations).toEqual(["sdk-1"]);
+	expect(clock).toBeGreaterThanOrEqual(60_000);
+	expect(clock).toBeLessThan(70_000);
 	expect(livenessCalls).toBeGreaterThan(0);
-	// Should have sent at least once (the first attempt)
-	expect(sends).toBeGreaterThan(0);
-	// Should have called terminateHost
-	expect(terminateHostCalled).toBe(true);
+	// The prompt is still provably unaccepted, so a resend under the same op-ref is safe.
+	expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef: "gw-p-wedged" })).toBe("busy");
+	expect(sends).toBe(Math.floor(clock / 2_000) + 1);
 });
 
 test("busy + activity.at advancing -> no terminateHost call, send eventually accepted", async () => {

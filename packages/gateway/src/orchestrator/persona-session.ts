@@ -3600,6 +3600,26 @@ class OriginActor {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
+			// The broker's journaled `busy` refusal proves this prompt was never
+			// accepted, and the host is gone (e.g. terminated as wedged, #675):
+			// nothing can still answer it, so it is re-sent rather than held forever.
+			if (
+				state === "bound" &&
+				this.#current === bound &&
+				!bound.retired &&
+				this.#manager.port.promptRefusal?.({
+					sessionId: bound.sessionId,
+					repo: this.#manager.repo,
+					opRef: bound.turn.opRef,
+				}) === "busy"
+			) {
+				this.#manager.log(
+					`recovery_requeue_busy_refused origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+				await this.#releaseForSubmissionRetry(bound);
+				return;
+			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
 				"warn",

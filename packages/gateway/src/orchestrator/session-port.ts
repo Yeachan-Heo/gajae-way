@@ -1395,9 +1395,8 @@ export class BrokerSessionPort implements SessionPort {
 		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 		let waited = false;
 		let submission = intent;
-		let busyWedgeLastActivityAt: number | undefined;
-		let busyWedgeLastActivityObservedAtMs: number | undefined;
-		let busyWedgeHostTerminated = false;
+		let busyActivityAt: number | undefined;
+		let busyActivityObservedAtMs = this.#now();
 		for (;;) {
 			if (isBrokerPromptBusyRefusal(submission)) {
 				submission = this.#database.transaction((tx) =>
@@ -1454,42 +1453,33 @@ export class BrokerSessionPort implements SessionPort {
 				console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
 			}
 
-			// Detect busy host with no progress: sample activity and terminate if stuck.
-			if (!busyWedgeHostTerminated) {
-				try {
-					const liveness = await this.#readLiveness({ sessionId: input.sessionId, repo: input.repo });
-					const activityAt = liveness.activity?.at;
-					const activityState = liveness.activity?.state;
-
-					if (activityAt !== undefined && activityState !== "idle") {
-						const now = this.#now();
-						if (activityAt !== busyWedgeLastActivityAt) {
-							// Activity changed; reset tracking to this new activity.at
-							busyWedgeLastActivityAt = activityAt;
-							busyWedgeLastActivityObservedAtMs = now;
-						} else if (
-							busyWedgeLastActivityObservedAtMs !== undefined &&
-							now - busyWedgeLastActivityObservedAtMs >= this.#busyWedgeMs
-						) {
-							// Same activity.at for longer than the wedge window; host is wedged
-							busyWedgeHostTerminated = true;
-							const terminateResult = await this.terminateHost({
-								sessionId: input.sessionId,
-								repo: input.repo,
-							});
-							console.info(
-								`session_busy_wedged_host_terminated session=${input.sessionId} opRef=${input.opRef} outcome=${terminateResult.outcome} activityState=${activityState}`,
-							);
-						}
-					}
-				} catch (error) {
-					// Log liveness check failures but continue waiting; don't let detection errors block the turn.
-					console.error(
-						`session_busy_wedge_check_failed session=${input.sessionId} error=${error instanceof Error ? error.message : String(error)}`,
+			// A host that stays busy with an unchanged activity stamp for the wedge
+			// window (twice the longest compaction) is wedged (#675). The refusal
+			// above proves this prompt was never accepted, so the host is terminated
+			// and the busy error surfaces exactly as an exhausted wait does; the
+			// next dispatch finds the host gone and resumes the saved session.
+			let wedged = false;
+			try {
+				const activity = (await this.#readLiveness({ sessionId: input.sessionId, repo: input.repo })).activity;
+				const now = this.#now();
+				if (activity === undefined || activity.state === "idle" || activity.at !== busyActivityAt) {
+					busyActivityAt = activity?.at;
+					busyActivityObservedAtMs = now;
+				} else if (now - busyActivityObservedAtMs >= this.#busyWedgeMs) {
+					const result = await this.terminateHost({ sessionId: input.sessionId, repo: input.repo });
+					console.info(
+						`session_busy_wedged_host_terminated session=${input.sessionId} opRef=${input.opRef} outcome=${result.outcome} state=${activity.state}`,
 					);
+					// A refused termination leaves the host alive; keep waiting on it.
+					wedged = result.outcome !== "refused";
+					if (!wedged) busyActivityObservedAtMs = now;
 				}
+			} catch (probeError) {
+				console.error(
+					`session_busy_wedge_check_failed session=${input.sessionId} opRef=${input.opRef} detail=${sanitizeDiagnostic(probeError instanceof Error ? probeError.message : String(probeError))}`,
+				);
 			}
-
+			if (wedged) throw error;
 			await this.#sleep(BUSY_POLL_MS);
 		}
 	}
