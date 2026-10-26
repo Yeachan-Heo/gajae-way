@@ -58,6 +58,12 @@ const SETTLED_JOB_STATES = new Set(["attempt_ended", "done", "aborted"]);
  */
 export const INBOUND_STARVATION_MS = 10 * 60_000;
 /**
+ * Oldest pending platform inbound message from a non-bot author without
+ * any delivery activity on the origin since it arrived. A silent origin
+ * suggests the message is not being processed or delivered.
+ */
+export const ORIGIN_SILENT_THRESHOLD_MS = 15 * 60_000;
+/**
 
  * Monitor authoring loss (#160): scheduled events exhausting retries with no
  * authored output while chat delivery stays healthy. Only the latest window
@@ -192,6 +198,21 @@ export interface RuntimeCycleSources {
 	readonly brokerExitRecord: unknown;
 	readonly brokerAgent: BrokerAgentDrift | null;
 	readonly slo: OpsSloResult;
+	/**
+	 * Platform inbound messages from non-bot authors pending or bound older
+	 * than the threshold with no delivery on the origin since they arrived,
+	 * and not in muted threads. Per origin: oldest pending age, message id,
+	 * received timestamp, and blocking turn op-ref if part of a turn.
+	 */
+	readonly originSilence: ReadonlyMap<
+		string,
+		{
+			readonly oldestPendingMs: number;
+			readonly messageId: string;
+			readonly receivedAt: string;
+			readonly turnOpRef: string | null;
+		}
+	>;
 }
 
 export class RuntimeCycleProjector {
@@ -308,6 +329,7 @@ export class RuntimeCycleProjector {
 					? null
 					: readBrokerAgentDrift({ home: this.#home, agentDir: this.#agentDir }),
 			slo: evaluateSlo(this.#database.core, DEFAULT_SLO_DAYS, new Date(nowMs)),
+			originSilence: this.#originSilence(nowMs),
 		};
 	}
 
@@ -329,6 +351,96 @@ export class RuntimeCycleProjector {
 				origins.add(originKey(monitorSessionOrigin(row.monitor_id, CATCH_ALL_EVENT_ORIGIN.conversationId)));
 		}
 		return origins;
+	}
+
+	/**
+	 * Platform inbound messages from non-bot authors pending or bound older
+	 * than the threshold with no delivery on the origin since they arrived, and
+	 * not in muted threads. Issue #688.
+	 */
+	#originSilence(nowMs: number): Map<
+		string,
+		{
+			readonly oldestPendingMs: number;
+			readonly messageId: string;
+			readonly receivedAt: string;
+			readonly turnOpRef: string | null;
+		}
+	> {
+		const silence = new Map<
+			string,
+			{
+				oldestPendingMs: number;
+				messageId: string;
+				receivedAt: string;
+				turnOpRef: string | null;
+			}
+		>();
+
+		// Query for pending platform inbound messages from non-bot authors, oldest
+		// per origin. Exclude muted threads and messages without a recent delivery.
+		const db = (this.#database as unknown as { core: { db: any } }).core.db;
+		const rows = db
+			.prepare(
+				`SELECT
+					i.origin_key,
+					i.message_id,
+					i.received_at,
+					i.turn_op_ref,
+					MIN(CASE WHEN COALESCE(json_extract(i.engagement_json, '$.authorIsBot'), 0) <> 1 THEN i.received_at ELSE NULL END) AS oldest_non_bot_at
+				FROM inbound_messages i
+				WHERE i.source = 'platform'
+				  AND i.state IN ('pending', 'processing')
+				  AND (i.turn_state IN ('bound', 'accepted') OR i.turn_state IS NULL)
+				  AND COALESCE(json_extract(i.engagement_json, '$.authorIsBot'), 0) <> 1
+				  AND NOT EXISTS (
+				    SELECT 1 FROM thread_mutes t
+				    WHERE i.origin_key LIKE 'slack/thread/%' AND t.thread_origin_key = i.origin_key
+				       OR i.origin_key LIKE 'discord/thread/%' AND t.thread_origin_key = i.origin_key
+				  )
+				  AND NOT EXISTS (
+				    SELECT 1 FROM broker_quarantine q
+				    WHERE q.kind = 'inbound' AND q.subject_id = i.message_id
+				  )
+				GROUP BY i.origin_key
+				HAVING oldest_non_bot_at IS NOT NULL
+			`,
+			)
+			.all() as Array<{
+			origin_key: string;
+			message_id: string;
+			received_at: string;
+			turn_op_ref: string | null;
+			oldest_non_bot_at: string | null;
+		}>;
+
+		for (const row of rows) {
+			if (!row.oldest_non_bot_at) continue;
+			const receivedMs = Date.parse(row.oldest_non_bot_at);
+			if (!Number.isFinite(receivedMs)) continue;
+			const ageMs = nowMs - receivedMs;
+
+			// Check if there's been any delivery on this origin since the message arrived
+			const hasDeliverySince = db
+				.prepare(
+					`SELECT 1 FROM outbound_deliveries
+					WHERE origin_key = ? AND state = 'confirmed' AND confirmed_at >= ?
+					LIMIT 1`,
+				)
+				.get(row.origin_key, row.oldest_non_bot_at);
+
+			// Only gate if older than threshold and no delivery since arrival
+			if (ageMs >= ORIGIN_SILENT_THRESHOLD_MS && !hasDeliverySince) {
+				silence.set(row.origin_key, {
+					oldestPendingMs: ageMs,
+					messageId: row.message_id,
+					receivedAt: row.oldest_non_bot_at,
+					turnOpRef: row.turn_op_ref,
+				});
+			}
+		}
+
+		return silence;
 	}
 }
 
@@ -457,6 +569,10 @@ export function projectRuntimeCycle(
 	if (sources.monitorTerminalStreak >= MONITOR_TERMINAL_STREAK_THRESHOLD) gates.add("monitor_dispatch_failing");
 	if (sources.brokerRespawnChurn) gates.add("broker_respawn_churn");
 	if (isBrokerIndexLockBlocked(sources.brokerExitRecord)) gates.add("broker_index_lock_blocked");
+	// Issue #688: platform messages from non-bot authors pending or bound older
+	// than the threshold with no delivery on the origin since arrival, and not in
+	// muted threads. A silent origin suggests the message is not being processed.
+	if (sources.originSilence.size > 0) gates.add("origin_silent");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);
