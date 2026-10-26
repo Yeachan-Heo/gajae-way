@@ -131,6 +131,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			cwd: personaWorkspace,
 			agentDir: config.gjc.agentDir,
 			pinnedVersion,
+			maxPoolSize: config.sessions?.maxLiveHosts,
 			onUnavailable: (at) => {
 				sloRecorder?.note("broker_unavailable", at);
 				options.broker?.onUnavailable?.(at);

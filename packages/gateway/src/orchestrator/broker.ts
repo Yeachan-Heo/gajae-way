@@ -95,6 +95,8 @@ export interface GlobalGjcClientOptions {
 	readonly readinessDelayMs?: number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
+	/** Maximum concurrent CLI commands; defaults to sessions.maxLiveHosts if provided, otherwise 4. */
+	readonly maxPoolSize?: number;
 	/**
 	 * Minimum client runtime version for this build. The independently supervised
 	 * production broker host enforces the package pin exactly before spawning.
@@ -420,6 +422,7 @@ export class GlobalGjcClient {
 	/** Start of the current run of failures against a broker discovery calls live. */
 	#liveOutageSince: number | undefined;
 	readonly #liveOutageLimit: number;
+	readonly #maxPoolSize: number;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
@@ -448,6 +451,7 @@ export class GlobalGjcClient {
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
+		this.#maxPoolSize = integer(options.maxPoolSize, 4, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) =>
@@ -844,13 +848,14 @@ export class GlobalGjcClient {
 		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
-		// Interactive waiters always have headroom. Background can max 2 in flight, interactive can max 2.
+		// Interactive waiters always have headroom. Background can max ceil(maxPoolSize/2) in flight, interactive can max ceil(maxPoolSize/2).
+		const maxBackground = Math.ceil(this.#maxPoolSize / 2);
 		const canProceed = (): boolean => {
 			if (priority === "interactive") {
-				return this.#inflight < 4;
+				return this.#inflight < this.#maxPoolSize;
 			}
-			// Background: must be under 4 total AND under 2 background concurrent
-			return this.#inflight < 4 && this.#backgroundInFlight < 2;
+			// Background: must be under maxPoolSize total AND under maxBackground concurrent
+			return this.#inflight < this.#maxPoolSize && this.#backgroundInFlight < maxBackground;
 		};
 		while (!canProceed()) {
 			let resolve: (() => void) | undefined;
@@ -870,7 +875,7 @@ export class GlobalGjcClient {
 					if (i >= 0) this.#queue.splice(i, 1);
 				}
 			}
-			if (Date.now() >= deadline) this.#unavailable("command queue timed out");
+			if (Date.now() >= deadline) throw new Error("command queue timed out");
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
