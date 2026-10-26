@@ -439,6 +439,8 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 				sessionId: binding.sessionId,
 			}),
 		);
+		// The prompt was handed to the port (marker written) before the crash.
+		target.database.transaction((tx) => target.database.inbox.markSendAttempted(tx, opRef));
 		port.seedAcceptedSend({ sessionId: binding.sessionId, repo, text: "accepted before attribution", opRef });
 
 		await target.manager.recover();
