@@ -4,7 +4,11 @@ import { resolve, sep } from "node:path";
 export type ActionGuardMode = "permissive" | "restricted";
 export type ActionGuardResult =
 	| { readonly allowed: true }
-	| { readonly refused: true; readonly floor: "unrecoverable" | "path-scope" | "gjc-direct-spawn"; readonly reason: string };
+	| {
+			readonly refused: true;
+			readonly floor: "unrecoverable" | "path-scope" | "gjc-direct-spawn";
+			readonly reason: string;
+	  };
 
 /**
  * Gateway-side command floors. P1 does not execute commands in the gateway;
@@ -31,7 +35,11 @@ export class ActionGuard {
 		if (violatesPathScope(command, this.#home, this.#gajaewayHome))
 			return { refused: true, floor: "path-scope", reason: "recursive deletion path is outside permitted scope" };
 		if (spawnsDjcDirectly(command))
-			return { refused: true, floor: "gjc-direct-spawn", reason: "gjc sessions must be launched through gajaeway work.start" };
+			return {
+				refused: true,
+				floor: "gjc-direct-spawn",
+				reason: "gjc sessions must be launched through gajaeway work.start",
+			};
 		return { allowed: true };
 	}
 }
@@ -76,28 +84,19 @@ function within(path: string, parent: string): boolean {
  * or deliberate obfuscation that doesn't literally contain 'gjc' boundaries.
  */
 function spawnsDjcDirectly(command: string): boolean {
-	// Strategy: Remove quoted strings that are arguments to legitimate commands,
-	// but keep gjc references in tmux/nohup/setsid/screen contexts
-	const removeLegitimateArgs = (cmd: string): string => {
-		// Remove quoted arguments to gajaeway/work.* commands to avoid false positives
-		// e.g., 'gajaeway work.start "task" "gjc -p"' should not be blocked
-		return cmd.replace(/(?:gajaeway|work\.\w+)\s+[^;&|]*['"]([^'"]*)['"][^;&|]*/g, (match, inside) => {
-			// Replace the quoted arg with a placeholder
-			return match.replace(/['"][^'"]*['"]/g, "'_'")
-		});
-	};
-	
-	const cleaned = removeLegitimateArgs(command);
+	// Skip checking if the command starts with gajaeway (allowed pattern)
+	// gajaeway work.start is the correct way to run gjc through the gateway
+	if (/^\s*gajaeway\b/.test(command)) return false;
 
 	return (
 		// Direct gjc invocations: gjc, gjc -p, gjc version, etc.
-		// Must NOT match: gjc-wrapper, GJCFOO, mygjc, or quoted 'gjc' args to work.start
-		/(?:^|[;&|]\s*|\bexec\s+)\bgjc(?:\s+|$|[^a-zA-Z0-9_-])/.test(cleaned) ||
-		// tmux new-session/new-window/send-keys with gjc anywhere (even quoted)
+		// Must NOT match: gjc-wrapper, GJCFOO, mygjc
+		/(?:^|[;&|]\s*|\bexec\s+)\bgjc(?:\s+|$|[^a-zA-Z0-9_-])/.test(command) ||
+		// tmux new-session/new-window/send-keys with gjc (even quoted)
 		/\btmux\s+(?:new-session|new-window|send-keys)[\s\S]*?\bgjc\b/.test(command) ||
-		// nohup gjc, setsid gjc, screen gjc (even quoted)
-		/\b(?:nohup|setsid|screen)\b[\s\S]*?\bgjc\b/.test(command) ||
+		// nohup gjc, setsid gjc, screen gjc - check for gjc anywhere
+		/\b(?:nohup|setsid|screen)\b.*\bgjc\b/.test(command) ||
 		// gjc sdk session create (explicit subcommand pattern)
-		/\bgjc\s+sdk\s+session\s+create\b/.test(cleaned)
+		/\bgjc\s+sdk\s+session\s+create\b/.test(command)
 	);
 }

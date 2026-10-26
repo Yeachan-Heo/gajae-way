@@ -31,7 +31,7 @@ test("gjc direct spawn floor is detected in both modes", () => {
 		"gjc version",
 		"nohup gjc -p",
 		"setsid gjc sdk session create",
-		"tmux new-session -d -c /tmp \"gjc -p\"",
+		'tmux new-session -d -c /tmp "gjc -p"',
 		"tmux send-keys -t session 'gjc version'",
 		"exec gjc -p",
 		"screen -S mysession gjc -p",
