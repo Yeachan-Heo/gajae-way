@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_SESSIONS_BUSY_STALL_MS, DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS } from "../src/config";
 import {
 	type PersonaBindHoldInput,
 	PersonaSessionManager,
@@ -39,8 +40,8 @@ class HoldPort extends ScriptedSessionPort {
 
 const MINUTE = 60_000;
 
-async function heldOrigin(name: string, options: { heldForMs: number; live: boolean }) {
-	home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
+async function heldOrigin(name: string, options: { heldForMs: number; live: boolean; reuseHome?: boolean }) {
+	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const db = database;
 	const port = new HoldPort({
@@ -68,25 +69,53 @@ async function heldOrigin(name: string, options: { heldForMs: number; live: bool
 			sessionId: binding.sessionId,
 			dispatchedAt: sentAt,
 		});
-		expect(db.inbox.markSendAttempted(tx, heldOpRef, sentAt)).toBe(true);
+		expect(db.inbox.markSendAttempted(tx, heldOpRef, [], sentAt)).toBe(true);
 	});
 	port.setSessionState(binding.sessionId, { live: options.live });
 	enqueue("m-next", "a newer message", new Date().toISOString());
 	const logs: string[] = [];
 	const notices: PersonaBindHoldInput[] = [];
-	const manager = new PersonaSessionManager({
-		database: db,
+	const answers: Array<{ opRef: string; text: string }> = [];
+	let noticeFailures = 0;
+	const startManager = () =>
+		new PersonaSessionManager({
+			database: db,
+			port,
+			instanceId: "hold-test",
+			repo,
+			unresolvedHoldMs: 10 * MINUTE,
+			log: (line: string) => logs.push(line),
+			onBindHold: (input) => {
+				if (noticeFailures > 0) {
+					noticeFailures--;
+					throw new Error("adapter offline");
+				}
+				notices.push(input);
+			},
+			onTurnStart: ({ trigger, turn }) => ({
+				text: trigger.body,
+				onTerminal: ({ text }) => {
+					answers.push({ opRef: turn.opRef, text });
+				},
+			}),
+		});
+	const manager = startManager();
+	return {
+		db,
 		port,
-		instanceId: "hold-test",
-		repo,
-		unresolvedHoldMs: 10 * MINUTE,
-		log: (line: string) => logs.push(line),
-		onBindHold: (input) => {
-			notices.push(input);
+		originKey,
+		binding,
+		heldOpRef,
+		logs,
+		notices,
+		answers,
+		manager,
+		startManager,
+		enqueue,
+		failNotices: (count: number) => {
+			noticeFailures = count;
 		},
-		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
-	});
-	return { db, port, originKey, binding, heldOpRef, logs, notices, manager, enqueue };
+	};
 }
 
 test("a held ambiguous turn on a dead host past the bound moves to a retired hold and the origin answers new messages (#686)", async () => {
@@ -122,6 +151,8 @@ test("a held ambiguous turn on a dead host past the bound moves to a retired hol
 		expect(f.port.sends.map((send) => send.opRef)).toEqual([next!.opRef, f.heldOpRef]);
 		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(1);
 		expect(f.notices).toHaveLength(1);
+		// The late answer reaches the origin, as the hold notice promised.
+		expect(f.answers).toContainEqual({ opRef: f.heldOpRef, text: "late answer" });
 	} finally {
 		await f.manager.stop();
 	}
@@ -177,5 +208,71 @@ test("an adopted turn swept as unknown escalates once its host dies past the bou
 		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(true);
 	} finally {
 		await f.manager.stop();
+	}
+});
+
+test("an escalated hold keeps its late answer across a restart (#686)", async () => {
+	const f = await heldOrigin("restart", { heldForMs: 11 * MINUTE, live: false });
+	await f.manager.recover();
+	await until(() => f.port.sends.length === 1);
+	await f.manager.stop();
+	// The gateway restarts; then the held op finishes.
+	f.port.setSessionState(f.binding.sessionId, { live: true });
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	f.port.complete(f.heldOpRef, "late answer after restart");
+	const restarted = f.startManager();
+	try {
+		await restarted.recover();
+		await restarted.reconcile(f.originKey);
+		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+		expect(f.answers).toContainEqual({ opRef: f.heldOpRef, text: "late answer after restart" });
+		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(1);
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await restarted.stop();
+	}
+});
+
+test("a failed escalation notice is durable and posted by the next recovery sweep, once (#686)", async () => {
+	const f = await heldOrigin("notice-retry", { heldForMs: 11 * MINUTE, live: false });
+	f.failNotices(1);
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(0);
+		expect(f.logs.some((line) => line.startsWith("persona_bind_hold_notice_failed"))).toBe(true);
+		await f.manager.recover();
+		expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED]);
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("the recovery bounds reload live and fall back to their defaults (#686, #687)", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const manager = new PersonaSessionManager({
+		database,
+		port: new HoldPort(),
+		instanceId: "bounds",
+		repo: join(home, "workspace"),
+		busyStallMs: 120_000,
+		unresolvedHoldMs: 180_000,
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	try {
+		expect([manager.busyStallMs, manager.unresolvedHoldMs]).toEqual([120_000, 180_000]);
+		manager.setHostLimits({ busyStallMs: 900_000, unresolvedHoldMs: 60_000 });
+		expect([manager.busyStallMs, manager.unresolvedHoldMs]).toEqual([900_000, 60_000]);
+		manager.setHostLimits(undefined);
+		expect([manager.busyStallMs, manager.unresolvedHoldMs]).toEqual([
+			DEFAULT_SESSIONS_BUSY_STALL_MS,
+			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+		]);
+	} finally {
+		await manager.stop();
 	}
 });

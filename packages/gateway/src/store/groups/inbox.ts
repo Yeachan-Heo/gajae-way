@@ -26,6 +26,11 @@ export interface InboundMessageRow {
 	readonly terminal_delivery_id: string | null;
 }
 
+/** The original platform message an edit row (`edit:<id>:<hash>`) carries new text for. */
+export function editedOriginalId(inboundMessageId: string): string | undefined {
+	return /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId)?.[1];
+}
+
 export interface CrossSessionWatchRow {
 	readonly watch_id: string;
 	readonly watcher_origin_key: string;
@@ -408,7 +413,7 @@ export class InboxGroup {
 		if ((existing?.n ?? 0) > 0) throw new InboundTurnConflictError(input.originKey, input.epoch);
 		const changes = this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = 'trigger', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ?, bound_session_id = ?, dispatched_at = ?, send_attempted_at = NULL, terminal_delivery_id = NULL WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL",
+				"UPDATE inbound_messages SET turn_role = 'trigger', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ?, bound_session_id = ?, dispatched_at = ?, send_attempted_at = NULL, send_context_json = NULL, terminal_delivery_id = NULL WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL",
 			)
 			.run(
 				tx,
@@ -427,15 +432,51 @@ export class InboxGroup {
 	 * Durable send intent (#685): stamped immediately before the prompt is
 	 * handed to the broker. A bound trigger without it provably never reached
 	 * `turn.prompt` and is requeued; with it, only reconcile may settle it.
+	 * `contextMessageIds` claims the conversation-context rows the prompt
+	 * rendered (#686): once the prompt may have landed they belong to this op.
 	 */
-	markSendAttempted(tx: WriteTx, opRef: string, at: string = new Date().toISOString()): boolean {
+	markSendAttempted(
+		tx: WriteTx,
+		opRef: string,
+		contextMessageIds: readonly string[] = [],
+		at: string = new Date().toISOString(),
+	): boolean {
 		return (
 			this.#db
 				.prepare(
-					"UPDATE inbound_messages SET send_attempted_at = COALESCE(send_attempted_at, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
+					"UPDATE inbound_messages SET send_attempted_at = COALESCE(send_attempted_at, ?), send_context_json = COALESCE(send_context_json, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
 				)
-				.run(tx, at, opRef).changes === 1
+				.run(tx, at, JSON.stringify([...new Set(contextMessageIds)]), opRef).changes === 1
 		);
+	}
+
+	/**
+	 * Conversation-context ids a sent op owns: those its prompt claimed, its
+	 * trigger, and every steer attributed to it (with the original id of an edit).
+	 */
+	sentContextIds(opRef: string): string[] {
+		const trigger = this.#db
+			.prepare(
+				"SELECT message_id, send_context_json FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+			)
+			.get(opRef) as { message_id: string; send_context_json: string | null } | null;
+		if (!trigger) return [];
+		const ids = new Set<string>([trigger.message_id]);
+		if (trigger.send_context_json !== null) {
+			const claimed: unknown = JSON.parse(trigger.send_context_json);
+			if (!Array.isArray(claimed) || !claimed.every((id) => typeof id === "string"))
+				throw new Error(`turn ${opRef} has a malformed send context claim`);
+			for (const id of claimed) ids.add(id);
+		}
+		const steers = this.#db
+			.prepare("SELECT message_id FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'steer'")
+			.all(opRef) as Array<{ message_id: string }>;
+		for (const steer of steers) {
+			ids.add(steer.message_id);
+			const original = editedOriginalId(steer.message_id);
+			if (original) ids.add(original);
+		}
+		return [...ids];
 	}
 
 	sendAttemptedAt(opRef: string): string | undefined {
@@ -544,7 +585,7 @@ export class InboxGroup {
 	turnRequeue(tx: WriteTx, opRef: string): number {
 		return this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, send_attempted_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
+				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, send_attempted_at = NULL, send_context_json = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
 			)
 			.run(tx, opRef).changes;
 	}
@@ -705,42 +746,40 @@ export class InboxGroup {
 	}
 
 	/**
-	 * Origins with platform messages from non-bot authors still pending since
-	 * `cutoff` or earlier, and no confirmed delivery on that origin since such a
-	 * message arrived (#688); gateway hold notices and silence alerts are not
-	 * answers. Muted threads are excluded; declined (policy-ignored)
-	 * messages never enter the queue. Oldest qualifying message per origin.
+	 * Platform messages from non-bot authors still pending since `cutoff` or
+	 * earlier with no confirmed reply on their origin since they arrived (#688).
+	 * Gateway hold notices (gw-h-) and silence alerts (gw-s-) are not replies.
+	 * Declined (policy-ignored) messages never enter the queue; thread mutes are
+	 * judged by the caller with the intake's own per-message mute key.
 	 */
-	unansweredOrigins(cutoff: string): Array<{
+	unansweredMessages(cutoff: string): Array<{
 		readonly origin_key: string;
 		readonly origin_ref_json: string;
 		readonly message_id: string;
 		readonly received_at: string;
-		readonly unanswered: number;
+		readonly engagement_json: string | null;
 	}> {
 		return this.#db
 			.prepare(
-				`SELECT origin_key, origin_ref_json, message_id, MIN(received_at) AS received_at, COUNT(*) AS unanswered
+				`SELECT origin_key, origin_ref_json, message_id, received_at, engagement_json
 				FROM inbound_messages
 				WHERE source = 'platform' AND state = 'pending' AND received_at <= ?
 					AND COALESCE(json_extract(engagement_json, '$.authorIsBot'), 0) <> 1
 					AND ${REPLAYABLE_INBOUND}
-					AND NOT EXISTS (SELECT 1 FROM thread_mutes m WHERE m.thread_origin_key = inbound_messages.origin_key)
 					AND NOT EXISTS (
 						SELECT 1 FROM deliveries d
 						WHERE d.origin_key = inbound_messages.origin_key AND d.state = 'confirmed'
 							AND d.created_at >= inbound_messages.received_at
-							-- Hold notices (gw-h-) and silence alerts (gw-s-) are not answers.
 							AND d.delivery_id NOT LIKE 'gw-h-%' AND d.delivery_id NOT LIKE 'gw-s-%'
 					)
-				GROUP BY origin_key ORDER BY origin_key`,
+				ORDER BY origin_key, received_at, rowid`,
 			)
 			.all(cutoff) as Array<{
 			origin_key: string;
 			origin_ref_json: string;
 			message_id: string;
 			received_at: string;
-			unanswered: number;
+			engagement_json: string | null;
 		}>;
 	}
 

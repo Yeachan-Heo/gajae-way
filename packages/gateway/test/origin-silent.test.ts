@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { findSilentOrigins, ORIGIN_SILENT_MS, OriginSilentAlerter } from "../src/ops/origin-silent";
 import { Store } from "../src/store";
+import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
+import { createOwnedSessionFixture, initializeTestBrokerAuthority } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -28,7 +30,13 @@ async function open(): Promise<Store> {
 
 function enqueue(
 	db: Store,
-	input: { messageId: string; originKey?: string; ageMs: number; authorIsBot?: boolean; source?: "platform" },
+	input: {
+		messageId: string;
+		originKey?: string;
+		ageMs: number;
+		authorIsBot?: boolean;
+		replyTo?: string;
+	},
 ): void {
 	const originKey = input.originKey ?? CHANNEL;
 	const [platform, kind, conversationId] = originKey.split("/");
@@ -39,7 +47,11 @@ function enqueue(
 				originKey,
 				originRefJson: JSON.stringify({ platform, kind, conversationId }),
 				body: "hello?",
-				engagementJson: JSON.stringify({ mentioned: true, authorIsBot: input.authorIsBot ?? false }),
+				engagementJson: JSON.stringify({
+					mentioned: true,
+					authorIsBot: input.authorIsBot ?? false,
+					...(input.replyTo ? { replyTo: { messageId: input.replyTo, fromSelf: true } } : {}),
+				}),
 				receivedAt: new Date(NOW - input.ageMs).toISOString(),
 			}),
 		),
@@ -87,13 +99,40 @@ test("a held turn with unanswered user messages raises origin_silent with its bl
 
 test("hold reasons distinguish unsent, busy-refused, running and unbound origins (#688)", async () => {
 	const db = await open();
+	const authority = initializeTestBrokerAuthority(db, join(home, "agent"));
 	enqueue(db, { messageId: "m-1", ageMs: 20 * MINUTE });
 	const opRef = `gw-p-unsent`;
-	db.transaction((tx) => {
-		db.bindings.bindAtEpoch(tx, CHANNEL, "sdk-held", 0);
-		db.inbox.bindTurn(tx, { messageId: "m-1", originKey: CHANNEL, epoch: 0, opRef, sessionId: "sdk-held" });
+	await createOwnedSessionFixture(db, authority, {
+		sessionId: "sdk-held",
+		repo: join(home, "workspace"),
+		originKey: CHANNEL,
+		epoch: 0,
 	});
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "m-1", originKey: CHANNEL, epoch: 0, opRef, sessionId: "sdk-held" }),
+	);
 	expect(findSilentOrigins(db, NOW)[0]).toMatchObject({ blockingOpRef: opRef, holdReason: "send_not_attempted" });
+	db.transaction((tx) => db.inbox.markSendAttempted(tx, opRef));
+	expect(findSilentOrigins(db, NOW)[0]).toMatchObject({ blockingOpRef: opRef, holdReason: "operation_state_unknown" });
+	// The host refused the prompt as busy: a durable refusal in the broker operation journal.
+	db.transaction((tx) => {
+		const scope = JSON.stringify(["sdk-held", opRef]);
+		db.bindings.beginBrokerOperation(tx, authority, {
+			operation: "turn.prompt",
+			scope,
+			operationRef: opRef,
+			requestJson: "{}",
+		});
+		db.bindings.completeBrokerOperation(
+			tx,
+			authority,
+			"turn.prompt",
+			scope,
+			opRef,
+			JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
+		);
+	});
+	expect(findSilentOrigins(db, NOW)[0]).toMatchObject({ blockingOpRef: opRef, holdReason: "session_busy_wait" });
 	db.transaction((tx) => db.inbox.turnAccept(tx, opRef));
 	expect(findSilentOrigins(db, NOW)[0]).toMatchObject({ blockingOpRef: opRef, holdReason: "turn_running" });
 
@@ -114,6 +153,15 @@ test("the gate stays quiet under the threshold, for bot authors, muted threads, 
 	const thread = "discord/thread/muted";
 	enqueue(db, { messageId: "muted", originKey: thread, ageMs: 60 * MINUTE });
 	db.transaction((tx) => db.inbox.muteThread(tx, thread));
+	// A Slack reply under the persona's message stays on the channel session; its thread mute still applies.
+	const slackChannel = "slack/channel/C1";
+	enqueue(db, {
+		messageId: "slack-reply",
+		originKey: slackChannel,
+		ageMs: 60 * MINUTE,
+		replyTo: "C1:1700000000.000100",
+	});
+	db.transaction((tx) => db.inbox.muteThread(tx, "slack/thread/C1:1700000000.000100/parent=C1"));
 	// An origin answered after the message arrived is not silent...
 	enqueue(db, { messageId: "answered", originKey: "discord/channel/answered", ageMs: 60 * MINUTE });
 	deliver(db, "gw-d-answer", 30 * MINUTE, "discord/channel/answered");
@@ -123,23 +171,33 @@ test("the gate stays quiet under the threshold, for bot authors, muted threads, 
 	expect(findSilentOrigins(db, NOW).map((origin) => origin.originKey)).toEqual(["discord/channel/noticed"]);
 });
 
-test("today's incident alerts the owner once per origin per incident, and once more when it clears (#688)", async () => {
+const OWNER = { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: "owner" } as const;
+
+test("today's incident queues one owner DM per origin per incident, and one more when it clears (#688)", async () => {
 	const db = await open();
 	enqueue(db, { messageId: "m-1", ageMs: 16 * MINUTE });
 	const opRef = holdTurn(db, "m-1");
-	const alerter = new OriginSilentAlerter(db);
+	const alerter = new OriginSilentAlerter(db, () => OWNER, { log: () => {} });
 
 	const first = alerter.sweep(NOW);
 	expect(first).toHaveLength(1);
 	expect(first[0]).toMatchObject({ kind: "silent", originKey: CHANNEL });
 	expect(first[0]!.deliveryId).toMatch(/^gw-s-[0-9a-f]{32}$/);
-	expect(first[0]!.notice).toContain(CHANNEL);
-	expect(first[0]!.notice).toContain("reason=operation_state_unknown");
-	expect(first[0]!.notice).toContain(`op=${opRef}`);
+	// The DM is in the delivery ledger, committed with the incident.
+	const queued = db.outbox.get(first[0]!.deliveryId);
+	expect(queued?.state).toBe("pending");
+	expect(queued?.originKey).toBe("discord/dm/owner-dm/peer=owner");
+	const text = first[0]!.payload!.text;
+	expect(text).toContain(CHANNEL);
+	expect(text).toContain("reason=operation_state_unknown");
+	expect(text).toContain(`op=${opRef}`);
 	// Later sweeps of the same incident, and a reopened store, stay quiet.
 	enqueue(db, { messageId: "m-2", ageMs: 20 * MINUTE });
 	expect(alerter.sweep(NOW + MINUTE)).toEqual([]);
-	expect(new OriginSilentAlerter(db).sweep(NOW + 2 * MINUTE)).toEqual([]);
+	expect(new OriginSilentAlerter(db, () => OWNER).sweep(NOW + 2 * MINUTE)).toEqual([]);
+	// The owner DM itself is not an answer on the silent origin.
+	db.transaction((tx) => db.outbox.confirm(tx, first[0]!.deliveryId));
+	expect(findSilentOrigins(db, NOW + 2 * MINUTE)).toHaveLength(1);
 
 	// The hold clears and the origin answers.
 	db.transaction((tx) => db.inbox.turnComplete(tx, opRef));
@@ -148,8 +206,54 @@ test("today's incident alerts the owner once per origin per incident, and once m
 	expect(cleared).toHaveLength(1);
 	expect(cleared[0]).toMatchObject({ kind: "cleared", originKey: CHANNEL });
 	expect(cleared[0]!.deliveryId).not.toBe(first[0]!.deliveryId);
+	expect(db.outbox.get(cleared[0]!.deliveryId)?.state).toBe("pending");
 	expect(alerter.sweep(NOW + 4 * MINUTE)).toEqual([]);
 	expect(new RuntimeCycleProjector(db, { queueDepth: 0 }).project(new Date(NOW + 4 * MINUTE)).gates).not.toContain(
 		"origin_silent",
 	);
+});
+
+test("an incident transition never commits without its owner DM: a failed ledger write retries both (#688)", async () => {
+	const db = await open();
+	enqueue(db, { messageId: "m-1", ageMs: 16 * MINUTE });
+	const alerter = new OriginSilentAlerter(db, () => OWNER, { log: () => {} });
+	const create = db.outbox.create.bind(db.outbox);
+	let fail = true;
+	db.outbox.create = (...args) => {
+		if (fail) throw new Error("disk full");
+		return create(...args);
+	};
+	expect(() => alerter.sweep(NOW)).toThrow("disk full");
+	fail = false;
+	// Rolled back with the failed DM: the next sweep (or a restarted gateway) alerts again.
+	const retried = new OriginSilentAlerter(db, () => OWNER, { log: () => {} }).sweep(NOW + MINUTE);
+	expect(retried.map((transition) => transition.kind)).toEqual(["silent"]);
+	expect(db.outbox.get(retried[0]!.deliveryId)?.state).toBe("pending");
+
+	// Same for the clear: the incident stays until the cleared DM is queued.
+	deliver(db, "gw-d-reply", 0);
+	fail = true;
+	expect(() => alerter.sweep(NOW + 2 * MINUTE)).toThrow("disk full");
+	fail = false;
+	expect(alerter.sweep(NOW + 3 * MINUTE).map((transition) => transition.kind)).toEqual(["cleared"]);
+});
+
+test("a corrupt incident row is kept as evidence, not read as a valid incident, and the clear is still sent (#688)", async () => {
+	const db = await open();
+	const logs: string[] = [];
+	db.core.metaSet(`origin_silent:${CHANNEL}`, "{not json");
+	const cleared = new OriginSilentAlerter(db, () => OWNER, { log: (line) => logs.push(line) }).sweep(NOW);
+	expect(cleared.map((transition) => transition.kind)).toEqual(["cleared"]);
+	expect(db.outbox.get(cleared[0]!.deliveryId)?.state).toBe("pending");
+	expect(db.core.metaGet(`origin_silent:${CHANNEL}`)).toBeUndefined();
+	expect(db.core.metaGet(`origin_silent_corrupt:${CHANNEL}`)).toBe("{not json");
+	expect(logs.some((line) => line.startsWith("origin_silent_incident_corrupt"))).toBe(true);
+});
+
+test("without an owner target the incident is recorded for ops cycle and no DM is queued (#688)", async () => {
+	const db = await open();
+	enqueue(db, { messageId: "m-1", ageMs: 16 * MINUTE });
+	const [transition] = new OriginSilentAlerter(db, () => undefined, { log: () => {} }).sweep(NOW);
+	expect(transition).toMatchObject({ kind: "silent", payload: undefined });
+	expect(db.outbox.get(transition!.deliveryId)).toBeUndefined();
 });

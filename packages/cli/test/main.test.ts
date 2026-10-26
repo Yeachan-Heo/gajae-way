@@ -1003,6 +1003,41 @@ describe("cycle rendering", () => {
 		expect(renderCycle(cycleResult())).toContain("monitor failures: none");
 	});
 
+	test("cycle renderer lists each silent origin with its age, hold reason and blocking op-ref (#688)", () => {
+		const lines = renderCycle(
+			cycleResult({
+				gates: ["origin_silent"],
+				phase: "degraded",
+				silentOrigins: [
+					{
+						originKey: "discord/channel/1508659103637966858",
+						oldestMessageId: "m-1",
+						oldestPendingAgeMs: 41 * 60_000 + 5_000,
+						unanswered: 18,
+						blockingOpRef: "gw-p-held",
+						holdReason: "operation_state_unknown",
+					},
+					{
+						originKey: "discord/channel/queued",
+						oldestMessageId: "q-1",
+						oldestPendingAgeMs: 16 * 60_000,
+						unanswered: 1,
+						blockingOpRef: null,
+						holdReason: "dispatch_pending",
+					},
+				],
+			}),
+		);
+		expect(lines).toContain("gates: origin_silent");
+		expect(lines).toContain(
+			"origin silent: discord/channel/1508659103637966858 unanswered=18 oldest=41m reason=operation_state_unknown op=gw-p-held",
+		);
+		expect(lines).toContain("origin silent: discord/channel/queued unanswered=1 oldest=16m reason=dispatch_pending");
+		expect(renderCycle(cycleResult())).toContain("origin silence: none");
+		const older = { ...cycleResult(), silentOrigins: undefined } as unknown as OpsCycleResult;
+		expect(renderCycle(older)).toContain("origin silence: not reported by the running gateway");
+	});
+
 	test("cycle renderer explicitly rejects gateways without monitor failure diagnostics", () => {
 		const olderGatewayResult = { ...cycleResult(), monitorFailures: undefined } as unknown as OpsCycleResult;
 		expect(() => renderCycle(olderGatewayResult)).toThrow(

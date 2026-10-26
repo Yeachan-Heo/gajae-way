@@ -112,7 +112,12 @@ import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } fro
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
-import { type InboundMessageRow, type TerminalUnlinkedReason, terminalDeliveryIds } from "../store/groups/inbox";
+import {
+	editedOriginalId,
+	type InboundMessageRow,
+	type TerminalUnlinkedReason,
+	terminalDeliveryIds,
+} from "../store/groups/inbox";
 import type { MonitorEventStage } from "../store/groups/monitors";
 import type { ExpiredDeliveryRow } from "../store/groups/outbox";
 import { deriveActivity } from "./activity";
@@ -1039,7 +1044,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				? undefined
 				: (JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
 					? undefined
-					: (editedMessageId(row.message_id) ?? row.message_id),
+					: (editedOriginalId(row.message_id) ?? row.message_id),
 		onHeldSteerAccepted: ({ row, abandoned }) => {
 			const turnId = runtime.inbound.get(row.message_id)?.turnId;
 			runtime.inbound.delete(row.message_id);
@@ -1174,7 +1179,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
 	});
-	const originSilent = new OriginSilentAlerter(options.database);
+	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
 		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
@@ -2968,12 +2973,6 @@ export function messageEditId(messageId: string, text: string): string {
 	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
 }
 
-/** The platform message an edit row points at, or undefined for an ordinary inbound row. */
-export function editedMessageId(inboundMessageId: string): string | undefined {
-	const match = /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId);
-	return match?.[1];
-}
-
 async function editChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -3162,7 +3161,7 @@ async function createInboundTurnLifecycle(
 		// lives there); commit that id, not the synthetic edit row.
 		contextMessageIds = laneReport
 			? [...prepared.selectedMessageIds]
-			: [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
+			: [...prepared.selectedMessageIds, editedOriginalId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
@@ -3306,7 +3305,7 @@ async function createInboundTurnLifecycle(
 		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey);
 		return hop.ok ? { ...resolved, chain: hop.chain } : hop;
 	};
-	const relaySourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+	const relaySourceMessageId = editedOriginalId(row.message_id) ?? row.message_id;
 	const relayProvenance = (chain: readonly string[]): HandoffProvenance => ({
 		chain,
 		sourceOriginKey: key,
@@ -3700,8 +3699,8 @@ async function createInboundTurnLifecycle(
 				? undefined
 				: origin.kind === "channel" &&
 						nonLoopback &&
-						isSlackMessageId(editedMessageId(row.message_id) ?? row.message_id)
-					? (editedMessageId(row.message_id) ?? row.message_id)
+						isSlackMessageId(editedOriginalId(row.message_id) ?? row.message_id)
+					? (editedOriginalId(row.message_id) ?? row.message_id)
 					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
 						? engagement.replyTo.messageId
 						: undefined;
@@ -4005,7 +4004,7 @@ async function createInboundTurnLifecycle(
 		steered.source === "lane_report"
 			? undefined
 			: nonLoopback
-				? (editedMessageId(steered.message_id) ?? steered.message_id)
+				? (editedOriginalId(steered.message_id) ?? steered.message_id)
 				: undefined;
 	// A Slack channel session carries several bot-rooted threads, so [SHUTUP]
 	// mutes the thread of the latest chat message this turn took in, not the
@@ -4388,7 +4387,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		const origin = validateOriginRef(JSON.parse(steered.origin_ref_json) as OriginRef);
 		if (!isChatPlatform(origin.platform)) return;
 		if (!steerAddressedPersona(steered)) return;
-		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
+		const targetMessageId = editedOriginalId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");
 		if (!eyes || eyes.isCustom === true || !platformSupportsReaction(origin.platform, eyes.name)) return;
@@ -4425,23 +4424,20 @@ function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): v
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
 }
 
-/** Owner DM per `origin_silent` incident and when it clears (#688); the incident record dedupes across sweeps and restarts. */
+/** Owner DM per `origin_silent` incident and when it clears (#688); each DM is queued with its incident transition. */
 function alertSilentOrigins(runtime: Runtime, alerter: OriginSilentAlerter): void {
-	let alerts: ReturnType<OriginSilentAlerter["sweep"]>;
+	let transitions: ReturnType<OriginSilentAlerter["sweep"]>;
 	try {
-		alerts = alerter.sweep(Date.now());
+		transitions = alerter.sweep(Date.now());
 	} catch (error) {
 		console.error(`origin silent sweep failed: ${diagnostic(error)}`);
 		return;
 	}
-	const owner = runtime.config.ownerTarget?.origin;
-	for (const alert of alerts) {
+	for (const transition of transitions) {
 		console.warn(
-			`origin_silent_${alert.kind} origin=${alert.originKey} delivery=${alert.deliveryId}${owner ? "" : " owner=unconfigured"}`,
+			`origin_silent_${transition.kind} origin=${transition.originKey} delivery=${transition.deliveryId}${transition.payload ? "" : " owner=unconfigured"}`,
 		);
-		if (!owner) continue;
-		const payload = runtime.delivery.prepare(alert.deliveryId, owner, alert.notice, undefined, alert.deliveryId);
-		if (payload) broadcastDelivery(runtime, payload);
+		if (transition.payload) broadcastDelivery(runtime, transition.payload);
 	}
 }
 

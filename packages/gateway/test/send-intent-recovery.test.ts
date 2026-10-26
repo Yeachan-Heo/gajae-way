@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -253,6 +254,161 @@ test("a host that stays busy without progress during pre-send wait is ended and 
 		).toBe(true);
 		await until(() => f.db.inbox.turnRow(retried!.opRef)?.turn_state === "done");
 		expect(f.db.inbox.turnRow(wedged!.opRef)).toBeUndefined();
+	} finally {
+		await manager.stop();
+	}
+});
+
+test("upgrading to schema 39 stamps legacy bound/accepted turns so recovery reconciles, never replays, them (#685)", async () => {
+	const f = await fixture("legacy-upgrade");
+	const db = f.db;
+	const boundOpRef = "gw-p-legacy-bound";
+	const acceptedOpRef = "gw-p-legacy-accepted";
+	const legacyOrigin = `${f.originKey}-accepted`;
+	expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, legacyOrigin, f.binding.sessionId, 0))).toBe(true);
+	db.transaction((tx) => {
+		db.inbox.enqueue(tx, {
+			messageId: "m-accepted",
+			originKey: legacyOrigin,
+			originRefJson: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "legacy-accepted" }),
+			body: "accepted before the upgrade",
+			receivedAt: "2026-10-26T06:00:00.000Z",
+		});
+		db.inbox.bindTurn(tx, {
+			messageId: "m-1",
+			originKey: f.originKey,
+			epoch: 0,
+			opRef: boundOpRef,
+			sessionId: f.binding.sessionId,
+		});
+		db.inbox.bindTurn(tx, {
+			messageId: "m-accepted",
+			originKey: legacyOrigin,
+			epoch: 0,
+			opRef: acceptedOpRef,
+			sessionId: f.binding.sessionId,
+			dispatchedAt: "2026-10-26T06:00:05.000Z",
+		});
+		db.inbox.turnAccept(tx, acceptedOpRef);
+	});
+	const path = join(home, "gateway.db");
+	db.close();
+	database = undefined;
+	// Restore the schema-38 shape: no send columns, and a bound row whose dispatch floor is unknown.
+	const raw = new Database(path);
+	raw.exec(`UPDATE inbound_messages SET dispatched_at = NULL WHERE turn_op_ref = '${boundOpRef}'`);
+	raw.exec(
+		"ALTER TABLE inbound_messages DROP COLUMN send_attempted_at; ALTER TABLE inbound_messages DROP COLUMN send_context_json",
+	);
+	raw.exec("DELETE FROM schema_migrations WHERE version >= 39");
+	raw.close();
+
+	database = await Store.open(path);
+	const upgraded = database;
+	expect(upgraded.schemaVersion).toBe(39);
+	const received = upgraded.inbox.turnRow(boundOpRef)!.received_at;
+	expect(upgraded.inbox.sendAttemptedAt(boundOpRef)).toBe(received);
+	expect(upgraded.inbox.sendAttemptedAt(acceptedOpRef)).toBe("2026-10-26T06:00:05.000Z");
+	// Idempotent: a rerun keeps the existing stamps.
+	upgraded.close();
+	const rerun = new Database(path);
+	rerun.exec("DELETE FROM schema_migrations WHERE version >= 39");
+	rerun.close();
+	database = await Store.open(path);
+	expect(database.inbox.sendAttemptedAt(boundOpRef)).toBe(received);
+
+	// Unknown legacy history is held for reconcile, never requeued or resent.
+	const logs: string[] = [];
+	const manager = new PersonaSessionManager({
+		database,
+		port: f.port,
+		instanceId: "send-intent",
+		repo: join(home, "workspace"),
+		log: (line: string) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	try {
+		await manager.recover();
+		await manager.tick();
+		expect(f.port.sendAttempts).toHaveLength(0);
+		expect(database.inbox.turnRow(boundOpRef)?.turn_state).toBe("bound");
+		expect(logs.some((line) => line.startsWith("recovery_requeue_unsent"))).toBe(false);
+		expect(logs.some((line) => line.includes(`opRef=${boundOpRef}`) && line.includes("operation_state_unknown"))).toBe(
+			true,
+		);
+	} finally {
+		await manager.stop();
+	}
+});
+
+for (const outcome of ["refused", "thrown", "terminating"] as const) {
+	test(`a busy-stalled host whose termination is ${outcome} keeps the trigger pending for a later retry, never resending (#687)`, async () => {
+		const f = await fixture(`busy-${outcome}`);
+		const port = f.port;
+		const refused = new Set<string>();
+		Object.assign(port, {
+			promptRefusal: ({ opRef }: { opRef: string }) => (refused.has(opRef) ? "busy" : undefined),
+			send: async (input: SessionSendInput) => {
+				port.sendAttempts.push(input);
+				refused.add(input.opRef);
+				throw new SessionBusyStalledError(input.sessionId, input.opRef, 300_000, "activity=active@1000");
+			},
+			terminateHost: async () => {
+				if (outcome === "thrown") throw new Error("inspect timed out");
+				return outcome === "refused"
+					? { outcome: "refused", reason: "process_inspection_failed:eperm" }
+					: { outcome: "terminating", pid: 4242 };
+			},
+		});
+		const manager = f.startManager();
+		try {
+			await manager.recover();
+			await until(() => f.logs.some((line) => line.startsWith("session_busy_stalled")));
+			// The host was not proven gone: no immediate redispatch onto it.
+			expect(port.sendAttempts).toHaveLength(1);
+			expect(port.resumes).toHaveLength(0);
+			const wedged = port.sendAttempts[0]!.opRef;
+			expect(f.db.inbox.turnRow(wedged)).toBeUndefined();
+			expect(f.db.inbox.pendingOldest(f.originKey)?.message_id).toBe("m-1");
+			expect(
+				f.logs.some((line) =>
+					outcome === "thrown"
+						? line.startsWith("session_busy_host_terminate_failed")
+						: line.startsWith("session_busy_host_terminated") && line.includes(`outcome=${outcome}`),
+				),
+			).toBe(true);
+		} finally {
+			await manager.stop();
+		}
+	});
+}
+
+test("an unreadable busy-refusal record keeps a stamped turn held and is logged, not silently treated as no refusal (#685)", async () => {
+	const f = await fixture("refusal-unreadable");
+	const opRef = "gw-p-refusal-unreadable";
+	f.db.transaction((tx) => {
+		f.db.inbox.bindTurn(tx, {
+			messageId: "m-1",
+			originKey: f.originKey,
+			epoch: 0,
+			opRef,
+			sessionId: f.binding.sessionId,
+		});
+		f.db.inbox.markSendAttempted(tx, opRef);
+	});
+	Object.assign(f.port, {
+		promptRefusal: () => {
+			throw new Error("journal read failed");
+		},
+	});
+	const manager = f.startManager();
+	try {
+		await manager.recover();
+		expect(f.port.sendAttempts).toHaveLength(0);
+		expect(f.db.inbox.turnRow(opRef)?.turn_state).toBe("bound");
+		expect(
+			f.logs.some((line) => line.startsWith("send_unadmitted_probe_failed") && line.includes(`opRef=${opRef}`)),
+		).toBe(true);
 	} finally {
 		await manager.stop();
 	}

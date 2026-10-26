@@ -131,6 +131,16 @@ function providerTransportRetryAttempt(
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+/** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
+function escalatedHoldKey(opRef: string): string {
+	return `escalated-hold:${opRef}`;
+}
+
+/** Durable intent to post an escalation notice, deleted once the delivery ledger owns it. */
+function escalationNoticeKey(originKey: string, opRef: string): string {
+	return `escalation-notice:${originKey}#${opRef}`;
+}
+
 function stalledExitProofKey(opRef: string): string {
 	return `stalled-turn-exit:${createHash("sha256")
 		.update(JSON.stringify([opRef]))
@@ -244,6 +254,7 @@ function completeInboundTurn(
 	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
 	return changed;
 }
 
@@ -1214,11 +1225,14 @@ export class PersonaSessionManager {
 		await this.#onHeldSteerAccepted?.(input);
 	}
 
-	async emitBindHold(input: PersonaBindHoldInput): Promise<void> {
+	/** False when the notice hook failed; a durable notice intent is then retried. */
+	async emitBindHold(input: PersonaBindHoldInput): Promise<boolean> {
 		try {
 			await this.#onBindHold?.(input);
+			return true;
 		} catch (error) {
 			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`, "error");
+			return false;
 		}
 	}
 
@@ -1594,6 +1608,7 @@ class OriginActor {
 
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
+		await this.#emitEscalationNotices();
 		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
@@ -1636,6 +1651,11 @@ class OriginActor {
 				: undefined;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
+			// No refusal evidence is readable: the turn keeps the conservative hold.
+			this.#manager.log(
+				`send_unadmitted_probe_failed origin=${this.originKey} session=${sessionId} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
 			return undefined;
 		}
 	}
@@ -1689,7 +1709,18 @@ class OriginActor {
 		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;
-		const nextEpoch = database.transaction((tx) => database.bindings.rotateEpoch(tx, this.originKey));
+		// One transaction: the fresh epoch, the held op's answer-wanted
+		// disposition, its replayable notice, and a fence over every input its
+		// prompt may have carried (trigger, claimed context, steers) so the fresh
+		// session never sees the possibly accepted request as unread. Messages
+		// that arrived after the send keep their unread context.
+		const nextEpoch = database.transaction((tx) => {
+			const epoch = database.bindings.rotateEpoch(tx, this.originKey);
+			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
+			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
+			database.inbox.contextConsume(tx, database.inbox.sentContextIds(turn.opRef));
+			return epoch;
+		});
 		this.#holdSweeps.delete(turn.opRef);
 		this.#manager.log(
 			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
@@ -1697,6 +1728,7 @@ class OriginActor {
 		);
 		if (bound) {
 			bound.retired = true;
+			bound.answerWanted = true;
 			this.#clearStallReconciliation(bound);
 			bound.tail?.setTurnRunning(false);
 			await bound.tail?.close();
@@ -1725,14 +1757,35 @@ class OriginActor {
 			`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_escalated`,
 			"warn",
 		);
-		await this.#manager.emitBindHold({
-			originKey: this.originKey,
-			trigger,
-			reason: UNRESOLVED_HOLD_ESCALATED,
-			notice: UNRESOLVED_HOLD_NOTICE,
-			verdict: undefined,
-		});
+		await this.#emitEscalationNotices();
 		return true;
+	}
+
+	/**
+	 * Posts every escalation notice whose intent is durable but not yet handed to
+	 * the delivery ledger. Delivery ids are deterministic per trigger, so a notice
+	 * replayed after a crash or a failed hook is posted once.
+	 */
+	async #emitEscalationNotices(): Promise<void> {
+		const database = this.#manager.database;
+		const prefix = escalationNoticeKey(this.originKey, "");
+		for (const key of database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+			const opRef = key.slice(prefix.length);
+			const trigger = database.inbox.turnRow(opRef);
+			if (!trigger) {
+				// Kept as evidence: without its trigger the notice has no origin to post to.
+				this.#manager.log(`escalation_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "error");
+				continue;
+			}
+			const delivered = await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: UNRESOLVED_HOLD_ESCALATED,
+				notice: UNRESOLVED_HOLD_NOTICE,
+				verdict: undefined,
+			});
+			if (delivered) database.core.metaDelete(key);
+		}
 	}
 
 	async #recoverTurn(turn: InboundTurn): Promise<void> {
@@ -1942,7 +1995,7 @@ class OriginActor {
 			hadToolActivity: true,
 			permissionRequestObserved: false,
 			agentErrorRetryScheduled: false,
-			answerWanted: false,
+			answerWanted: this.#manager.database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined,
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
@@ -2469,9 +2522,14 @@ class OriginActor {
 			return;
 		}
 		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
-		// Durable send intent (#685): from here on the prompt may land, so recovery
-		// must reconcile this turn instead of requeueing it.
-		if (!this.#manager.database.transaction((tx) => this.#manager.database.inbox.markSendAttempted(tx, opRef))) {
+		// Durable send intent (#685) and the context rows this prompt rendered
+		// (#686): from here on the prompt may land, so recovery must reconcile
+		// this turn instead of requeueing it, and its inputs belong to it.
+		if (
+			!this.#manager.database.transaction((tx) =>
+				this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
+			)
+		) {
 			// The row left `bound` underneath this actor; nothing was sent for it.
 			this.#current = undefined;
 			this.#state = "idle";

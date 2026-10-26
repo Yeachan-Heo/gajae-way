@@ -1414,8 +1414,15 @@ export class BrokerSessionPort implements SessionPort {
 		// connection OWNS the turn: the host streams the turn's content only to
 		// the connection that submitted it. A caller without a relay gets one
 		// for the duration of the send.
-		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 		const stallMs = input.busyStallMs ?? DEFAULT_SESSIONS_BUSY_STALL_MS;
+		// A configured stall bound is always reachable: the busy wait outlasts it
+		// by one sample, so a wedged host is replaced rather than requeued forever.
+		const deadline =
+			this.#now() +
+			Math.max(
+				input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS,
+				input.busyStallMs === undefined ? 0 : input.busyStallMs + BUSY_PROGRESS_SAMPLE_MS,
+			);
 		let waited = false;
 		let submission = intent;
 		// Progress evidence while the host refuses with `busy` (#687): a host that
@@ -1477,7 +1484,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (sampledAt >= nextSampleAt) {
 				nextSampleAt = sampledAt + BUSY_PROGRESS_SAMPLE_MS;
 				const sample = await this.#busyProgress(input);
-				// An unanswerable probe is not evidence of a stall: restart the clock.
+				// An incomplete sample is not evidence of a stall: restart the clock.
 				if (sample === undefined || sample !== progress) {
 					progress = sample;
 					progressAt = sampledAt;
@@ -1494,25 +1501,35 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	/** Fingerprint of a busy host's progress: inspect activity stamp plus saved transcript size/mtime. */
-	async #busyProgress(input: { sessionId: string; repo: string }): Promise<string | undefined> {
-		const parts: string[] = [];
+	/**
+	 * Fingerprint of a busy host's progress: the inspect activity stamp AND the
+	 * saved transcript's size/mtime. Both are required; with either unreadable
+	 * the sample is undefined, so a stall is never concluded from partial
+	 * evidence (a quiet long call may move only the part that could not be read).
+	 */
+	async #busyProgress(input: { sessionId: string; repo: string; opRef: string }): Promise<string | undefined> {
+		const unavailable = (source: string, detail: string): undefined => {
+			console.warn(
+				`session_busy_probe_unavailable session=${input.sessionId} opRef=${input.opRef} source=${source} detail=${sanitizeDiagnostic(detail)}`,
+			);
+			return undefined;
+		};
+		let activity: SessionActivity | undefined;
 		try {
-			const liveness = await this.#readLiveness(input);
-			if (liveness.activity) parts.push(`activity=${liveness.activity.state}@${liveness.activity.at}`);
+			activity = (await this.#readLiveness(input)).activity;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
+			return unavailable("inspect", String(error));
 		}
+		if (!activity) return unavailable("inspect", "no activity stamp");
 		const transcript = await locateSavedTranscript(this.#authority.canonicalAgentDir, input.sessionId);
-		if (transcript !== undefined) {
-			try {
-				const info = await stat(transcript);
-				parts.push(`transcript=${info.size}@${Math.trunc(info.mtimeMs)}`);
-			} catch {
-				// A transcript that vanished between locate and stat is no evidence either way.
-			}
+		if (transcript === undefined) return unavailable("transcript", "saved transcript not located");
+		try {
+			const info = await stat(transcript);
+			return `activity=${activity.state}@${activity.at} transcript=${info.size}@${Math.trunc(info.mtimeMs)}`;
+		} catch (error) {
+			return unavailable("transcript", String(error));
 		}
-		return parts.length === 0 ? undefined : parts.join(" ");
 	}
 	promptRefusal(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined {
 		this.#assertOwned(input);

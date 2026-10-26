@@ -1931,6 +1931,63 @@ test("a busy host whose transcript keeps growing is waited out, not reported sta
 	expect(clock).toBe(198_000);
 });
 
+async function busyRefusalOutcome(
+	options: { readonly cli: CliRunner; readonly writeTranscript: boolean; readonly busyStallMs: number },
+	opRef: string,
+): Promise<{ readonly error: unknown; readonly clock: number }> {
+	const { repo, transcript, authority } = await busyHostFixture(opRef);
+	if (!options.writeTranscript) await rm(transcript);
+	let clock = 0;
+	const relay = scriptedRelay(() => ({ ok: false, error: { code: "busy", message: "busy" } }));
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: options.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const error = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef, busyStallMs: options.busyStallMs })
+		.catch((caught: unknown) => caught);
+	return { error, clock };
+}
+
+test("an unreadable inspect beside a static transcript is not stall evidence (#687)", async () => {
+	const failingInspect: CliRunner = async () => {
+		throw new Error("inspect timed out");
+	};
+	const { error, clock } = await busyRefusalOutcome(
+		{ cli: failingInspect, writeTranscript: true, busyStallMs: 60_000 },
+		"gw-p-partial1",
+	);
+	expect(error).not.toBeInstanceOf(SessionBusyStalledError);
+	expect(String(error)).toMatch(/busy/);
+	// The wait ran to its deadline (stall bound + one sample), never concluding a stall.
+	expect(clock).toBeGreaterThanOrEqual(90_000);
+});
+
+test("a static activity stamp without a readable transcript is not stall evidence (#687)", async () => {
+	const { error } = await busyRefusalOutcome(
+		{ cli: wedgedInspect, writeTranscript: false, busyStallMs: 60_000 },
+		"gw-p-partial2",
+	);
+	expect(error).not.toBeInstanceOf(SessionBusyStalledError);
+	expect(String(error)).toMatch(/busy/);
+});
+
+test("a stall bound longer than the default busy wait is still reached, not requeued at ten minutes (#687)", async () => {
+	const { error, clock } = await busyRefusalOutcome(
+		{ cli: wedgedInspect, writeTranscript: true, busyStallMs: 15 * 60_000 },
+		"gw-p-long-stall",
+	);
+	expect(error).toBeInstanceOf(SessionBusyStalledError);
+	expect((error as SessionBusyStalledError).silentMs).toBe(15 * 60_000);
+	expect(clock).toBe(15 * 60_000);
+});
+
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));

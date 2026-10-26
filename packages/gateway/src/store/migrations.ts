@@ -850,6 +850,9 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		// it never reached `turn.prompt` and is requeued by recovery. Rows bound
 		// before this column existed have unknown send history, so they are
 		// stamped conservatively and keep the reconcile path (never resent).
+		// send_context_json (#686): the conversation-context ids the prompt
+		// rendered, claimed with the intent so a held or settled operation's
+		// inputs are never re-rendered as unread into a later prompt.
 		host.withTransaction(() => {
 			const columns = new Set(
 				host.database
@@ -857,8 +860,8 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					.all()
 					.map((row) => row.name),
 			);
-			if (!columns.has("send_attempted_at"))
-				host.database.execute("ALTER TABLE inbound_messages ADD COLUMN send_attempted_at TEXT");
+			for (const name of ["send_attempted_at", "send_context_json"])
+				if (!columns.has(name)) host.database.execute(`ALTER TABLE inbound_messages ADD COLUMN ${name} TEXT`);
 			host.database.execute(`
 				UPDATE inbound_messages SET send_attempted_at = COALESCE(dispatched_at, received_at)
 					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_attempted_at IS NULL;
