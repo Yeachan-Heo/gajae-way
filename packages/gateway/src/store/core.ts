@@ -346,7 +346,11 @@ export class StoreCore {
 
 		// Only log if we actually ran VACUUM (i.e., for legacy databases with significant data)
 		if (pagesBefore > 1 && durationMs > 0) {
-			console.info(JSON.stringify({ store_auto_vacuum_enabled: { pages_before: pagesBefore, pages_after: pagesAfter, ms: durationMs } }));
+			console.info(
+				JSON.stringify({
+					store_auto_vacuum_enabled: { pages_before: pagesBefore, pages_after: pagesAfter, ms: durationMs },
+				}),
+			);
 		}
 	}
 
