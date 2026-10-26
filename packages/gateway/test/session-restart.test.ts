@@ -331,6 +331,8 @@ test("a bound turn whose operation is unknown stays held and is never resent", a
 			sessionId: binding.sessionId,
 		}),
 	);
+	// The prompt was handed to the port: its outcome is what recovery must prove.
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	manager = makeManager(port, logs);
 	await manager.recover();
 	expect(port.sendAttempts).toEqual([]);
@@ -528,6 +530,8 @@ test("a bound turn on an unreadable session retains its original identity across
 			sessionId: "pre-cutover-session",
 		}),
 	);
+	// The prompt was handed to the port: its outcome is what recovery must prove.
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	port.setSessionState("pre-cutover-session", { repo: join(home, "workspace"), live: true });
 	port.seedAcceptedSend({
 		sessionId: "pre-cutover-session",
@@ -653,6 +657,8 @@ test("a bound turn whose id the Router disowns retains its original identity acr
 			sessionId: staleId,
 		}),
 	);
+	// The prompt was handed to the port: its outcome is what recovery must prove.
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	// Lost Router ownership is not native producer-exit evidence.
 	port.seedAcceptedSend({ sessionId: staleId, repo: join(home, "workspace"), opRef, text: "hello" });
 	port.failResume(staleId, "session_unavailable");
@@ -919,4 +925,97 @@ test("model.set session_unavailable rotates the epoch immediately before retryin
 	expect(port.sends[0]!.text).toBe("retry me on a fresh session");
 	await eventually(() => terminal.length === 1, "fresh session turn did not complete");
 	expect(database.inbox.pendingCount(KEY)).toBe(0);
+});
+
+/**
+ * #685 crash injection: the gateway dies while a bound trigger waits at a
+ * pre-send await. A second Store handle on the same file plays the restarted
+ * process; the dead actor's promise never settles.
+ */
+async function crashAt(stage: "start_turn" | "attach" | "send"): Promise<{
+	port: ScriptedSessionPort;
+	opRef: string;
+	restart: (terminal: string[], logs: string[]) => Promise<void>;
+}> {
+	home = await mkdtemp(join(tmpdir(), `gajaeway-crash-${stage}-`));
+	const path = join(home, "gateway.db");
+	const crashed = await Store.open(path);
+	database = crashed;
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.epoch + 1}` });
+	attachTestBrokerOwnership(crashed, port, join(home, "canonical-agent"));
+	let reached = false;
+	const never = () => {
+		reached = true;
+		return new Promise<never>(() => undefined);
+	};
+	const attachTail = port.attachTail.bind(port);
+	const send = port.send.bind(port);
+	let hang = true;
+	if (stage === "attach") port.attachTail = async (input) => (hang ? never() : attachTail(input));
+	if (stage === "send")
+		port.send = async (input) => {
+			if (!hang) return await send(input);
+			port.sendAttempts.push(input);
+			return never();
+		};
+	const dead = new PersonaSessionManager({
+		database: crashed,
+		port,
+		instanceId: "restart-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => (stage === "start_turn" ? never() : { text: trigger.body }),
+		log: () => undefined,
+	});
+	enqueue("m-crash", "answer me once");
+	void dead.notifyInbound(KEY).catch(() => undefined);
+	await eventually(() => reached, `${stage} was not reached`);
+	const opRef = crashed.inbox.nonterminalTurns(KEY)[0]!.opRef;
+	expect(crashed.inbox.turnRow(opRef)?.turn_state).toBe("bound");
+	return {
+		port,
+		opRef,
+		restart: async (terminal, logs) => {
+			hang = false;
+			database = await Store.open(path);
+			registerFixtureBindings(port);
+			manager = makeManager(port, logs, terminal);
+			await manager.recover();
+		},
+	};
+}
+
+for (const stage of ["start_turn", "attach"] as const)
+	test(`#685: a crash at ${stage} before any send is answered exactly once after restart, without operator action`, async () => {
+		const { port, opRef, restart } = await crashAt(stage);
+		const terminal: string[] = [];
+		const logs: string[] = [];
+		await restart(terminal, logs);
+		expect(logs.some((line) => line.startsWith("recovery_requeue") && line.includes("reason=never_sent"))).toBe(true);
+		await eventually(() => port.sends.length === 1, "requeued trigger was not sent");
+		expect(port.sends[0]).toMatchObject({ text: "answer me once" });
+		expect(port.sends[0]!.opRef).not.toBe(opRef);
+		port.complete(port.sends[0]!.opRef, "answered once");
+		await eventually(() => terminal.length === 1, "requeued trigger was not answered");
+		expect(terminal).toEqual(["answered once"]);
+		expect(port.sends).toHaveLength(1);
+	});
+
+test("#685: a crash after the send-attempt marker is held for reconcile and never resent", async () => {
+	const { port, opRef, restart } = await crashAt("send");
+	expect(database!.inbox.turnRow(opRef)?.send_attempted_at).not.toBeNull();
+	port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	const terminal: string[] = [];
+	const logs: string[] = [];
+	await restart(terminal, logs);
+	await manager!.tick(KEY);
+	expect(logs.some((line) => line.includes("reason=never_sent"))).toBe(false);
+	expect(logs.some((line) => line.startsWith("recovery_hold") && line.includes(`opRef=${opRef}`))).toBe(true);
+	expect(port.sends).toHaveLength(0);
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(database!.inbox.turnRow(opRef)).toMatchObject({ turn_state: "bound", turn_op_ref: opRef });
+	expect(terminal).toEqual([]);
 });

@@ -53,7 +53,7 @@ test("census is a read-only v38 view and reports quarantined invalid work by cut
 	const f = await fixture();
 	const before = await readFile(f.path);
 	const report = await runCensus(f.config);
-	expect(report.schemaVersion).toBe(38);
+	expect(report.schemaVersion).toBe(39);
 	expect(report.authority).toEqual({
 		canonicalAgentDir: join(f.home, "agent"),
 		identity: `gjc:${join(f.home, "agent")}`,

@@ -850,8 +850,23 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		// a bound turn that was never sent (NULL) and one that was sent but outcome is unknown.
 		// This enables recovery to requeue never-sent turns instead of holding them indefinitely.
 		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+					.all()
+					.map((column) => column.name),
+			);
+			if (columns.has("send_attempted_at")) {
+				host.database
+					.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(39, new Date().toISOString());
+				return;
+			}
+			host.database.execute("ALTER TABLE inbound_messages ADD COLUMN send_attempted_at TEXT");
+			// A turn bound before this column existed may already have been sent;
+			// only rows bound from now on can prove they never were.
 			host.database.execute(
-				"ALTER TABLE inbound_messages ADD COLUMN send_attempted_at TEXT"
+				"UPDATE inbound_messages SET send_attempted_at = COALESCE(dispatched_at, 'pre-migration-39') WHERE turn_state IN ('bound', 'accepted')",
 			);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")

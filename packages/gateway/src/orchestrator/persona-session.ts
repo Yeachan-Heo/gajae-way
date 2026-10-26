@@ -1602,6 +1602,23 @@ class OriginActor {
 			);
 			return;
 		}
+		// No send-attempt marker (#685): the prompt was never handed to the port, so
+		// nothing can have been admitted. Requeue under a fresh op-ref attempt
+		// without asking GJC; `recover` dispatches once every turn is scanned.
+		if (
+			turn.state === "bound" &&
+			!retired &&
+			this.#manager.database.inbox.turnRow(turn.opRef)?.send_attempted_at === null
+		) {
+			const attempt = this.#manager.database.transaction((tx) =>
+				retryInboundTurn(this.#manager.database, tx, turn.opRef),
+			);
+			this.#manager.log(
+				`recovery_requeue origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=never_sent attempt=${attempt}`,
+				"warn",
+			);
+			return;
+		}
 		// Confirmed producer exit survives registry loss. Read the original native
 		// operation first, without inspect/liveness/resume or opening a new relay.
 		if (
@@ -1631,20 +1648,6 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
-			const turnRow = this.#manager.database.inbox.turnRow(turn.opRef);
-			const sendAttempted = turnRow?.send_attempted_at !== null && turnRow?.send_attempted_at !== undefined;
-			if (!sendAttempted) {
-				// Bound but never sent: requeue without GJC query.
-				const attempt = this.#manager.database.transaction((tx) =>
-					retryInboundTurn(this.#manager.database, tx, turn.opRef),
-				);
-				this.#manager.log(
-					`recovery_requeue origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=never_sent attempt=${attempt}`,
-				);
-				await this.#dispatchNext();
-				return;
-			}
-			// Send was attempted but outcome unknown; use reconcile path.
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=operation_state_unknown`,
 				"warn",

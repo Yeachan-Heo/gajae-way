@@ -147,6 +147,8 @@ test("missing recovery evidence holds a bound turn instead of replaying it", asy
 	db.transaction((tx) =>
 		db.inbox.bindTurn(tx, { messageId: "m-1", originKey, epoch: 0, opRef, sessionId: binding.sessionId }),
 	);
+	// The prompt was handed to the port; only its outcome is missing.
+	db.transaction((tx) => db.inbox.markSendAttempted(tx, opRef));
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,

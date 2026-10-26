@@ -60,7 +60,7 @@ test("cutover backs up, exports open work, then quarantines under one lease", as
 	const backupDb = await Store.openReadonly(backup);
 	try {
 		expect(backupDb.core.quickCheckDetail()).toBe("ok");
-		expect(backupDb.schemaVersion).toBe(38);
+		expect(backupDb.schemaVersion).toBe(39);
 	} finally {
 		backupDb.close();
 	}

@@ -114,7 +114,7 @@ export interface ConversationContextWindow {
 const REPLAYABLE_INBOUND =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)";
 const INBOUND_COLUMNS =
-	"message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
+	"message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id, send_attempted_at";
 
 /** Persistence for inbound queueing, turn lifecycle, conversation context, and recall. */
 export class InboxGroup {

@@ -4323,6 +4323,8 @@ test("startup recovery preserves a bound operation whose running status is known
 	database?.transaction((tx) =>
 		database?.inbox.bindTurn(tx, { messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: orphan.sessionId }),
 	);
+	// The old runtime had handed the prompt to the port before it stopped.
+	database?.transaction((tx) => database?.inbox.markSendAttempted(tx, opRef));
 	expect(database?.inbox.turnRow(opRef)).toMatchObject({ turn_state: "bound" });
 
 	const logs: string[] = [];
@@ -4523,7 +4525,7 @@ test("가8: the first message after the host closed itself resumes the same sess
 	expect(terminal).toEqual(["earlier answer", "이어서 답"]);
 });
 
-test("가8: ambiguous bound recovery after a closed host preserves identity rather than resending", async () => {
+test("가8: a send that never left after a closed host is requeued on recovery, never resent under its op-ref or resumed", async () => {
 	const { port, logs, terminal, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	enqueue("after-idle", "작업다됨?");
@@ -4532,64 +4534,58 @@ test("가8: ambiguous bound recovery after a closed host preserves identity rath
 	const opRef = latestOpRef;
 	expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
 
-	await manager!.recover();
+	// The requeued trigger is dispatched again and fails at attach again.
+	await manager!.recover().catch(() => undefined);
 	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// The attach failed before any send (#685): recovery requeued the trigger
+	// under a fresh op-ref attempt instead of holding it forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(logs.some((line) => line.includes(`opRef=${opRef} reason=never_sent`))).toBe(true);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(terminal).toEqual(["earlier answer"]);
 	expect(database!.inbox.pendingCount(KEY)).toBe(1);
 });
 
-test("가8: a failed resume cannot authorize replay of an ambiguous bound prompt", async () => {
+test("가8: a failed resume cannot authorize a resume or a resend of the unsent op-ref", async () => {
 	const { port, logs, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	port.failResume(sessionId);
 	enqueue("after-idle", "결론");
 	await manager!.notifyInbound(KEY).catch(() => undefined);
 	const opRef = latestOpRef;
-	await manager!.recover();
+	// The requeued trigger is dispatched again and fails at attach again.
+	await manager!.recover().catch(() => undefined);
 	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// The attach failed before any send (#685): recovery requeued the trigger
+	// under a fresh op-ref attempt instead of holding it forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(logs.some((line) => line.includes(`opRef=${opRef} reason=never_sent`))).toBe(true);
 });
 
 test("가8: a deleted saved session is never resumed", async () => {
-	const { port, sessionId } = await idleClosedHarness();
+	const { port, logs } = await idleClosedHarness();
 	port.staleLive = true;
 	port.deleted = true;
 	enqueue("after-idle", "로컬에놔둬");
 	await manager!.notifyInbound(KEY).catch(() => undefined);
 	const opRef = latestOpRef;
-	await manager!.recover();
+	// The requeued trigger is dispatched again and fails at attach again.
+	await manager!.recover().catch(() => undefined);
 	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// The attach failed before any send (#685): recovery requeued the trigger
+	// under a fresh op-ref attempt instead of holding it forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(logs.some((line) => line.includes(`opRef=${opRef} reason=never_sent`))).toBe(true);
 });
 
 test("가8: a deleted closed binding is not resumed before the send either", async () => {
