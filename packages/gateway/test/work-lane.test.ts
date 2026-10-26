@@ -3117,7 +3117,18 @@ for (const receiptState of ["missing", "unknown", "absent", undefined] as const)
 			};
 			let reads = 0;
 			f.port.fetchWorkerOutput = async (input) => {
-				if (++reads === 1) return { status: "absent", code: "output_pending" };
+				if (++reads === 1) {
+					const initial = await f.port.status(input);
+					return parseWorkerOutputResponse(
+						input,
+						{
+							exitCode: 0,
+							stdout: JSON.stringify({ ok: true, result: { kind: "prompt", ...initial.status } }),
+							stderr: "",
+						},
+						now,
+					);
+				}
 				const text = "original operation output";
 				return parseWorkerOutputResponse(
 					input,
