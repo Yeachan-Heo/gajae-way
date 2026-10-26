@@ -166,7 +166,6 @@ export class InboxGroup {
 				AND COALESCE(json_extract(m.engagement_json, '$.authorIsBot'), 0) <> 1
 				AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.thread_origin_key = m.origin_key)
 				AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.origin_key = m.origin_key AND d.created_at >= m.received_at AND d.delivery_id NOT LIKE 'gw-s-%')
-				AND m.turn_state = 'bound'
 				AND ${REPLAYABLE_INBOUND.replaceAll("inbound_messages.", "m.")}
 				ORDER BY m.received_at, m.rowid`,
 			)

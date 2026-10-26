@@ -332,10 +332,12 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 				receivedAt: old,
 			}),
 		);
-		const busy = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		const busy = new RuntimeCycleProjector(database, { queueDepth: 0 }, { originSilentMs: 60 * 60_000 }).project();
 		expect(busy.gates).toEqual([]);
 		expect(busy.phase).toBe("dispatching");
 		expect(busy.inFlightInbound).toBe(1);
+		// Past the default origin_silent threshold the same held turn is a silent origin (#688), not starvation.
+		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project().gates).toEqual(["origin_silent"]);
 		// Another origin with an old unbound row and nothing in flight is stuck.
 		const other = { ...discordDm, conversationId: "c2", peerId: "p2" };
 		const otherKey = "discord/dm/c2/peer=p2";
@@ -349,7 +351,7 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 				receivedAt: old,
 			}),
 		);
-		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }, { originSilentMs: 60 * 60_000 }).project();
 		expect(starved.gates).toEqual(["inbound_starved"]);
 	} finally {
 		database.close();
