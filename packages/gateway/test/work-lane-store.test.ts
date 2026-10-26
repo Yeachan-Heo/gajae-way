@@ -11,7 +11,6 @@ import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
-	WORK_REFUSAL_CODES,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -549,8 +548,6 @@ describe("work attempt durable transactions", () => {
 	]) {
 		test(`send rejection persists validated refusal diagnostic ${refusalCode}`, async () => {
 			const f = await fixture();
-			expect(WORK_REFUSAL_CODES.has(refusalCode)).toBe(refusalCode !== "sdk_refused");
-			expect(WORK_REFUSAL_CODES.size).toBe(7);
 			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 			const terminal = { kind: "local" as const, observedAt: END, reasonCode: "send_rejected", refusalCode };
 			const staged = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }))!;

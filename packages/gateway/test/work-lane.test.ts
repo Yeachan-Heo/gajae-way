@@ -2290,7 +2290,7 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 			expect(f.job().attempts[0]).toMatchObject({ endState: "failed", errorCode: "send_rejected" });
 			expect(f.job().state).toBe("awaiting_operator");
 			expect(f.notices).toHaveLength(1);
-			expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: prompt_not_accepted");
+			expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable");
 			expect(f.db.outbox.rows()).toHaveLength(1);
 			await f.manager.recover();
 			expect(f.notices).toHaveLength(1);
@@ -4154,7 +4154,36 @@ test("unknown SDK rejection codes are redacted in durable evidence, errors and r
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	const attempt = f.job().attempts[0]!;
 	expect(f.db.work.workAttemptGet(attempt.opRef)?.terminal).toMatchObject({ refusalCode: "sdk_refused" });
-	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: prompt_not_accepted cause=sdk_refused");
+	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable cause=sdk_refused");
+});
+
+test("client-ref conflict retains its safe cause without asserting that logical work was never admitted", async () => {
+	const f = await fixture();
+	let submissions = 0;
+	let outputReads = 0;
+	f.port.send = async (input) => {
+		submissions++;
+		throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { message: "already used reference" });
+	};
+	f.port.fetchWorkerOutput = async () => {
+		outputReads++;
+		throw new Error("local rejection must not query output");
+	};
+	f.setOwnerTarget(origin);
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		detail: { reasonCode: "send_rejected", cause: "client_ref_conflict" },
+	});
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	const attempt = f.job().attempts[0]!;
+	expect(f.db.work.workAttemptGet(attempt.opRef)?.terminal).toMatchObject({ refusalCode: "client_ref_conflict" });
+	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable cause=client_ref_conflict");
+	expect(f.job().state).toBe("awaiting_operator");
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(submissions).toBe(1);
+	expect(outputReads).toBe(0);
+	expect(f.port.steers).toHaveLength(0);
+	expect(f.port.closes).toHaveLength(0);
 });
 
 test("rejection report never exposes unvalidated cause and preserves unavailable completed output", () => {
@@ -4167,7 +4196,7 @@ test("rejection report never exposes unvalidated cause and preserves unavailable
 		knownSilence: null,
 	};
 	expect(reportText("a", "failed", "send_rejected", "op-ref", output, undefined, "private secret")).toBe(
-		"[lane a] failed: send_rejected: prompt_not_accepted",
+		"[lane a] failed: send_rejected: output_unavailable",
 	);
 	expect(reportText("a", "completed", "end_turn", "op-ref", output, undefined, "busy")).toBe(
 		"[lane a] completed: output_unavailable",

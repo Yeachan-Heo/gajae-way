@@ -3183,14 +3183,20 @@ export function reportText(
 		endState === "completed" && checksVerified ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
+	const safeRefusalCode =
+		reason === "send_rejected" && refusalCode && (refusalCodes.has(refusalCode) || refusalCode === "sdk_refused")
+			? refusalCode
+			: undefined;
 	let body =
 		output.disposition === "unavailable"
-			? reason === "send_rejected"
-				? `prompt_not_accepted${refusalCode && (refusalCodes.has(refusalCode) || refusalCode === "sdk_refused") ? ` cause=${refusalCode}` : ""}`
+			? safeRefusalCode === "busy"
+				? "prompt_not_accepted"
 				: reason === "terminal_missing_receipt"
 					? `final_response_missing opRef=${opRef}`
 					: "output_unavailable"
 			: (output.excerpt ?? "");
+	// A client-ref conflict can name already-admitted work; only busy proves non-admission here.
+	if (output.disposition === "unavailable" && safeRefusalCode) body += ` cause=${safeRefusalCode}`;
 	// Include transport cause details if present
 	if (reason === "terminal_missing_receipt" && output.transportCause) {
 		const transport = output.transportCause;
