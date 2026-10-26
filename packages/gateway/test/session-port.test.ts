@@ -1988,6 +1988,53 @@ test("a stall bound longer than the default busy wait is still reached, not requ
 	expect(clock).toBe(15 * 60_000);
 });
 
+for (const when of ["before", "after"] as const) {
+	test(`a busy retry whose relay dies ${when} writing the prompt ${when === "before" ? "keeps the busy refusal" : "stays ambiguous"} (#689)`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		await createOwnedSessionFixture(database, authority, {
+			sessionId: "sdk-1",
+			repo,
+			originKey: `busy-${when}`,
+			epoch: 0,
+		});
+		let prompts = 0;
+		let relay!: ReturnType<typeof scriptedRelay>;
+		relay = scriptedRelay((request) => {
+			if (request.operation !== "turn.prompt") throw new Error(`unexpected request ${request.operation}`);
+			prompts++;
+			if (prompts === 1) return { ok: false, error: { code: "busy", message: "busy" } };
+			// The frame reached the host, which then died before answering.
+			relay.streams.at(-1)?.close();
+			return new Promise<never>(() => {});
+		});
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: async () => {
+				throw new Error("unexpected command");
+			},
+			tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+			sleep: async () => {
+				if (when === "before") relay.streams.at(-1)?.close();
+			},
+		});
+		const opRef = `gw-p-busy-${when}`;
+		await expect(port.send({ sessionId: "sdk-1", repo, text: "hi", opRef })).rejects.toThrow(/closed/);
+		const intent = database.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify(["sdk-1", opRef]));
+		if (when === "before") {
+			expect(prompts).toBe(1);
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBe("busy");
+		} else {
+			expect(prompts).toBe(2);
+			expect(intent?.state).toBe("pending");
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBeUndefined();
+		}
+	});
+}
+
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));

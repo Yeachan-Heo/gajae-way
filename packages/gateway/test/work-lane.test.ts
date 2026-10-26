@@ -7395,7 +7395,7 @@ test("#439 relay transport failure triggers exactly one CLI fallback per status 
 		const isRelay = input.relay !== undefined;
 		if (input.opRef === result.opRef) {
 			if (isRelay && relayCalls++ === 0) {
-				throw new RelayClosedError(input.sessionId, "test relay failure");
+				throw new RelayClosedError(input.sessionId, "test relay failure", true);
 			}
 			if (!isRelay) {
 				fallbackCalls++;

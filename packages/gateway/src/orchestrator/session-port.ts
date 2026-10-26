@@ -48,6 +48,7 @@ import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
+	isUnwrittenRelayRequest,
 	type RelayResponse,
 	type TailAttachInput,
 	type TailHandle,
@@ -1432,7 +1433,8 @@ export class BrokerSessionPort implements SessionPort {
 		let progressAt = this.#now();
 		let nextSampleAt = 0;
 		for (;;) {
-			if (isBrokerPromptBusyRefusal(submission)) {
+			const retryingBusy = isBrokerPromptBusyRefusal(submission);
+			if (retryingBusy) {
 				submission = this.#database.transaction((tx) =>
 					this.#database.bindings.rearmBrokerPromptOperation(tx, this.#authority, submission),
 				);
@@ -1445,7 +1447,17 @@ export class BrokerSessionPort implements SessionPort {
 				this.#releaseOperation(intent);
 				throw error;
 			}
-			const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+			let response: RelayResponse;
+			try {
+				response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+			} catch (error) {
+				// The retry never reached the host (relay gone before the frame was
+				// written, e.g. the host exited while we waited): the authenticated
+				// busy refusal still stands, so the op stays provably unadmitted (#689).
+				if (retryingBusy && isUnwrittenRelayRequest(error))
+					this.#completeOperation(submission, BROKER_PROMPT_BUSY_REFUSAL);
+				throw error;
+			}
 			this.#database.bindings.assertAuthority(this.#authority);
 			if (response.ok) {
 				const result = recordOf(response.result) ?? {};

@@ -10,20 +10,30 @@
  * reproduced here; they reach the gateway as exactly these port observations.
  */
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CliRunner } from "@gajae-gateway/subsession";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import type { SessionSendInput } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, type SessionSendInput } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
 import {
 	BROKER_PROMPT_BUSY_REFUSAL,
 	type BrokerAuthority,
 	isBrokerPromptBusyRefusal,
 } from "../src/store/groups/bindings";
-import { attachTestBrokerOwnership, initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
+import {
+	attachTestBrokerOwnership,
+	createOwnedSessionFixture,
+	initializeTestBrokerAuthority,
+	ScriptedSessionPort,
+	scriptedRelay,
+} from "./session-port.fake";
 
 const MINUTE = 60_000;
+/** Gateway time a recoverable fault may take before its origin answers again (retry and grace timers). */
+const RECOVERY_BUDGET_MS = 5_000;
 let home = "";
 let database: Store | undefined;
 
@@ -85,9 +95,16 @@ async function origin(name: string, port: ScriptedSessionPort, options: { unreso
 				db.inbox.enqueue(tx, { messageId, originKey, originRefJson, body, receivedAt: new Date(clock).toISOString() }),
 			),
 		).toBe(true);
-	/** Fires every due dispatch retry, as the running gateway's timers would. */
-	const fireRetries = () => {
-		for (const timer of timers.splice(0)) timer.work();
+	/**
+	 * Lets `budgetMs` of gateway time pass: fires only the timers due within it,
+	 * in due order, and advances the clock. A recovery that needs a later timer
+	 * does not happen within the budget, so the bound itself is asserted.
+	 */
+	const elapse = (budgetMs: number) => {
+		const due = timers.filter((timer) => timer.delay <= budgetMs).sort((a, b) => a.delay - b.delay);
+		for (const timer of due) timers.splice(timers.indexOf(timer), 1);
+		clock += budgetMs;
+		for (const timer of due) timer.work();
 	};
 	return {
 		db,
@@ -96,7 +113,7 @@ async function origin(name: string, port: ScriptedSessionPort, options: { unreso
 		logs,
 		answers,
 		enqueue,
-		fireRetries,
+		elapse,
 		bumpGeneration: async () => {
 			generation += 1;
 			await manager.onBrokerGeneration(generation);
@@ -130,7 +147,7 @@ test("broker restart mid-attach: the never-sent trigger is answered once after t
 		// The broker restarts: a new generation, then the retry timer fires.
 		brokerDown = false;
 		await f.bumpGeneration();
-		f.fireRetries();
+		f.elapse(RECOVERY_BUDGET_MS);
 		await until(() => f.answers.length === 1);
 		expect(port.sendAttempts).toHaveLength(1);
 		expect(f.answers[0]!.text).toBe("answer");
@@ -159,7 +176,7 @@ test("broker restart mid-send: an accepted prompt whose receipt was lost is reco
 		expect(f.db.inbox.turnRow(opRef)?.turn_state).not.toBe("done");
 		await f.bumpGeneration();
 		await f.manager.recover();
-		f.fireRetries();
+		f.elapse(RECOVERY_BUDGET_MS);
 		// The original op finishes on the host; the gateway learns it from status.
 		port.complete(opRef, "late answer");
 		await f.manager.reconcile(f.originKey);
@@ -190,7 +207,11 @@ test("host death mid-turn: past the hold bound the origin answers new messages, 
 		expect(port.sendAttempts).toHaveLength(1);
 		f.advance(11 * MINUTE);
 		await f.manager.reconcile(f.originKey);
-		await until(() => f.answers.some((answer) => answer.text === "fresh answer"));
+		await until(() => f.answers.length === 1);
+		const after = port.sendAttempts.slice(1);
+		expect(after).toHaveLength(1);
+		expect(after[0]!.text).toContain("newer message");
+		expect(after[0]!.text).not.toContain("held request");
 		expect(attemptsByOpRef(port).get(held.opRef)).toBe(1);
 		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(true);
 	} finally {
@@ -206,7 +227,7 @@ test("host death mid-turn: past the hold bound the origin answers new messages, 
 class JournaledBusyPort extends ScriptedSessionPort {
 	authority!: BrokerAuthority;
 	store!: Store;
-	busy: "hang" | "host_killed" | undefined;
+	busy: "hang" | undefined;
 
 	override async send(input: SessionSendInput) {
 		if (this.busy === undefined) return await super.send(input);
@@ -228,10 +249,7 @@ class JournaledBusyPort extends ScriptedSessionPort {
 				JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
 			);
 		});
-		if (this.busy === "hang") return await new Promise<never>(() => {});
-		this.busy = undefined;
-		this.setSessionState(input.sessionId, { live: false });
-		throw new Error("relay closed: session host exited during busy wait");
+		return await new Promise<never>(() => {});
 	}
 
 	promptRefusal(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined {
@@ -252,24 +270,96 @@ async function journaledOrigin(name: string, port: JournaledBusyPort) {
 	return f;
 }
 
-test("host death during busy-wait: the journaled refusal proves non-admission and the trigger is answered once (#689)", async () => {
-	const port = new JournaledBusyPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "answer") });
-	port.busy = "host_killed";
-	const f = await journaledOrigin("host-death-busy-wait", port);
-	f.enqueue("m-1", "answer me");
+test("host death during busy-wait: the real busy loop keeps the refusal, the trigger is requeued and resubmitted once (#689)", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-fault-busy-host-death-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const db = database;
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(db, agentDir);
+	const repo = join(home, "workspace");
+	const sessionId = "sdk-1";
+	const originKey = "loopback/loopback/busy-host-death";
+	await createOwnedSessionFixture(db, authority, { sessionId, originKey, epoch: 0, repo });
+	await mkdir(join(agentDir, "sessions", "bucket"), { recursive: true });
+	await writeFile(join(agentDir, "sessions", "bucket", "2026-10-26T00-00-00_sdk-1.jsonl"), '{"type":"session"}\n');
+	const prompts: string[] = [];
+	const relay = scriptedRelay((request) => {
+		if (request.operation !== "turn.prompt") return { ok: true, result: {} };
+		prompts.push(String(request.input.clientRef));
+		return prompts.length === 1
+			? { ok: false, error: { code: "busy", message: "host busy" } }
+			: { ok: true, result: { accepted: true } };
+	});
+	let hostLive = true;
+	const cli: CliRunner = async (args) => {
+		if (args.join(" ") !== `sdk session inspect ${sessionId}`) throw new Error(`unexpected CLI ${args.join(" ")}`);
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify({
+				ok: true,
+				result: { session: { live: hostLive, activity: { state: "active", at: 1_000 } } },
+			}),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database: db,
+		authority,
+		cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		// The host process exits while the gateway sleeps out its busy refusal.
+		sleep: async () => {
+			hostLive = false;
+			relay.streams.at(-1)?.close();
+		},
+	});
+	const timers: Timer[] = [];
+	const logs: string[] = [];
+	const manager = new PersonaSessionManager({
+		database: db,
+		port,
+		instanceId: "fault",
+		repo,
+		log: (line: string) => logs.push(line),
+		setTimeout: (work: () => void, delay: number) => {
+			const timer = { work, delay };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: (timer: unknown) => {
+			const i = timers.indexOf(timer as Timer);
+			if (i >= 0) timers.splice(i, 1);
+		},
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	db.transaction((tx) =>
+		db.inbox.enqueue(tx, {
+			messageId: "m-1",
+			originKey,
+			originRefJson: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "busy-host-death" }),
+			body: "answer me",
+			receivedAt: new Date().toISOString(),
+		}),
+	);
 	try {
-		await f.manager.recover();
-		const refused = port.sendAttempts[0]!.opRef;
+		await manager.recover();
+		const refused = prompts[0]!;
+		// The retry never reached the host, so the journal still proved non-admission
+		// when the actor read it (the refusal is released with the requeued attempt).
+		expect(prompts).toEqual([refused]);
+		expect(db.inbox.turnRow(refused)).toBeUndefined();
+		expect(db.inbox.pendingOldest(originKey)?.message_id).toBe("m-1");
 		expect(
-			f.logs.some((line) => line.includes("send_unadmitted_requeue") && line.includes("prompt_busy_refused")),
+			logs.some((line) => line.startsWith("send_unadmitted_requeue") && line.includes("prompt_busy_refused")),
 		).toBe(true);
-		f.fireRetries();
-		await until(() => f.answers.length === 1);
-		expect(f.answers[0]!.opRef).not.toBe(refused);
-		expect(port.resumes).toHaveLength(1);
-		expect([...attemptsByOpRef(port).values()]).toEqual([1, 1]);
+		// The host is back; the dispatch retry submits the trigger once, under a fresh op-ref.
+		hostLive = true;
+		for (const timer of timers.splice(0).filter((timer) => timer.delay <= 60_000)) timer.work();
+		await until(() => prompts.length === 2);
+		expect(prompts[1]).not.toBe(refused);
+		expect(new Set(prompts).size).toBe(2);
 	} finally {
-		await f.manager.stop();
+		await manager.stop();
 	}
 });
 
@@ -337,7 +427,7 @@ for (const outcome of ["host_finishes", "host_dies"] as const) {
 				port.complete(ambiguous.opRef, "answer after compaction");
 				await f.manager.reconcile(f.originKey);
 				// The tail grace for terminal evidence elapses; status then settles the turn.
-				f.fireRetries();
+				f.elapse(RECOVERY_BUDGET_MS);
 				await until(() => f.answers.length === 1);
 				expect(f.answers[0]).toEqual({ opRef: ambiguous.opRef, text: "answer after compaction" });
 			} else {
@@ -346,7 +436,14 @@ for (const outcome of ["host_finishes", "host_dies"] as const) {
 				f.enqueue("m-2", "newer message");
 				f.advance(11 * MINUTE);
 				await f.manager.reconcile(f.originKey);
-				await until(() => f.answers.some((answer) => answer.text === "fresh answer"));
+				await until(() => f.answers.length === 1);
+				// Exactly one new prompt: the newer message, never the ambiguous request under a fresh op-ref.
+				const after = port.sendAttempts.slice(1);
+				expect(after).toHaveLength(1);
+				expect(after[0]!.text).toContain("newer message");
+				expect(after[0]!.text).not.toContain("request during compaction");
+				expect(f.answers[0]!.opRef).toBe(after[0]!.opRef);
+				expect(f.db.inbox.turnRow(ambiguous.opRef)?.turn_state).not.toBe("done");
 			}
 			expect(attemptsByOpRef(port).get(ambiguous.opRef)).toBe(1);
 		} finally {

@@ -1021,11 +1021,11 @@ export class ScriptedTailHandle implements TailHandle {
 		_input: Record<string, unknown>,
 		_options?: RelayRequestOptions,
 	): Promise<RelayResponse> {
-		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods");
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods", false);
 	}
 
 	async query(_name: string, _input: Record<string, unknown>, _options?: RelayRequestOptions): Promise<RelayResponse> {
-		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods");
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods", false);
 	}
 
 	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
@@ -1143,7 +1143,7 @@ export class ScriptedTailHandle implements TailHandle {
 		result?: unknown;
 		error?: { code: string; message: string };
 	}): Promise<void> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		// Scripted handles do not send reverse responses
 	}
 

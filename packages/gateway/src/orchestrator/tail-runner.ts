@@ -218,10 +218,18 @@ export class TailCapacityError extends Error {
 
 export class RelayClosedError extends Error {
 	readonly code = "relay_closed";
-	constructor(sessionId: string, detail: string) {
+	/** False only when the request frame provably never reached the stream: nothing was submitted. */
+	readonly requestWritten: boolean;
+	constructor(sessionId: string, detail: string, requestWritten: boolean) {
 		super(`relay for ${sessionId} closed before the host answered: ${detail}`);
 		this.name = "RelayClosedError";
+		this.requestWritten = requestWritten;
 	}
+}
+
+/** The relay failed before the request frame was written, so the host never saw it. */
+export function isUnwrittenRelayRequest(error: unknown): boolean {
+	return (error instanceof RelayClosedError && !error.requestWritten) || error instanceof RelayHelloError;
 }
 
 /** A relay never completed its hello handshake before a prompt could be sent. */
@@ -608,10 +616,10 @@ class ManagedTailHandle implements TailHandle {
 		result?: unknown;
 		error?: { code: string; message: string };
 	}): Promise<void> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		await this.ready;
 		const stream = this.#stream;
-		if (!stream) throw new RelayClosedError(this.sessionId, "relay not open");
+		if (!stream) throw new RelayClosedError(this.sessionId, "relay not open", false);
 		const frame: Record<string, unknown> = {
 			type: "reverse_response",
 			id: input.id,
@@ -630,7 +638,7 @@ class ManagedTailHandle implements TailHandle {
 		try {
 			stream.write(JSON.stringify(frame));
 		} catch (error) {
-			throw new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed");
+			throw new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed", false);
 		}
 	}
 
@@ -640,11 +648,11 @@ class ManagedTailHandle implements TailHandle {
 		body: Record<string, unknown>,
 		options?: RelayRequestOptions,
 	): Promise<RelayResponse> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		await this.ready;
 		const stream = this.#stream;
 		const connectionId = this.#connectionId;
-		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open");
+		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open", false);
 		const id = `gw-${this.brokerGeneration}-${++this.#requestSeq}`;
 		const timeoutMs = options?.timeoutMs ?? this.#runner.requestTimeoutMs;
 		return await new Promise<RelayResponse>((resolve, reject) => {
@@ -658,7 +666,7 @@ class ManagedTailHandle implements TailHandle {
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);
-				reject(new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed"));
+				reject(new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed", false));
 			}
 		});
 	}
@@ -667,7 +675,7 @@ class ManagedTailHandle implements TailHandle {
 		for (const [id, pending] of this.#pending) {
 			clearTimeout(pending.timer);
 			this.#pending.delete(id);
-			pending.reject(new RelayClosedError(this.sessionId, detail));
+			pending.reject(new RelayClosedError(this.sessionId, detail, true));
 		}
 	}
 

@@ -170,7 +170,7 @@ A release candidate runs on the dogfood host for 24 hours before it is tagged; a
 - every delivery confirmed and readiness never degraded;
 - no `ops cycle` gate that was absent before the swap.
 
-CI (`bun test packages/` in `build.yml` and `release.yml`) gates the release on the fault-injection matrix; a failure in any row blocks the tag. Faults are injected at the session-port boundary the gateway observes (a thrown attach or send, a broker generation change, a host that stops being live, a relay timeout); a real SIGKILL of a broker or host process is not reproduced in CI and reaches the gateway as exactly these observations. Every row asserts that the origin answers again and that no possibly accepted operation is submitted twice:
+CI runs the fault-injection matrix with `bun test packages/`: `build.yml` on every push and pull request, and `release.yml` on a pushed version tag before it publishes anything, so a failing row stops the release from being published. Confirm a green `build.yml` run on the release commit before pushing the tag. Faults are injected at the session-port boundary the gateway observes (a thrown attach or send, a broker generation change, a host that stops being live, a relay timeout); a real SIGKILL of a broker or host process is not reproduced in CI and reaches the gateway as exactly these observations. Every row asserts, within a bounded amount of gateway time, that the origin answers again and that no possibly accepted operation is submitted twice:
 
 | Fault | Test |
 | --- | --- |
@@ -180,7 +180,7 @@ CI (`bun test packages/` in `build.yml` and `release.yml`) gates the release on 
 | Broker restart mid-attach | `fault-injection.test.ts` |
 | Broker restart mid-send (receipt lost after acceptance) | `fault-injection.test.ts` |
 | Session host death mid-turn | `fault-injection.test.ts`, `unresolved-hold-escalation.test.ts` |
-| Session host death during busy-wait | `fault-injection.test.ts` |
+| Session host death during busy-wait (real `BrokerSessionPort` busy loop; a retry the relay never wrote keeps the busy refusal) | `fault-injection.test.ts`, `session-port.test.ts` |
 | Busy host making no progress | `session-port.test.ts`, `send-intent-recovery.test.ts` |
 | Relay timeout during host compaction (host finishes, or dies) | `fault-injection.test.ts` |
 | Escalated hold context, late answer and notice across restarts | `unresolved-hold-escalation.test.ts`, `unresolved-hold-escalation-server.test.ts` |

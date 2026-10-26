@@ -362,7 +362,7 @@ test("an ambiguous send-stage relay close does not roll the session", async () =
 	};
 	brokerPort.attachTail = async () => relay as never;
 	brokerPort.send = async () => {
-		throw new RelayClosedError("s1", "connection closed after prompt submission");
+		throw new RelayClosedError("s1", "connection closed after prompt submission", true);
 	};
 	brokerPort.status = async () => ({ status: { status: "unknown" } }) as never;
 	const brokerRequest = brokerPort.request.bind(brokerPort);

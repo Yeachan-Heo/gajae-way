@@ -238,7 +238,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 		port.send = async (input) => {
 			port.sendAttempts.push(input);
 			sequence.push("send");
-			throw new RelayClosedError(input.sessionId, "before receipt");
+			throw new RelayClosedError(input.sessionId, "before receipt", true);
 		};
 		port.status = async (input) => {
 			sequence.push("status");
@@ -301,7 +301,7 @@ test("RT04 unknown bound operation survives repeated live-idle sweeps until its 
 		if (firstOp) return send(input);
 		firstOp = input.opRef;
 		port.sendAttempts.push(input);
-		throw new RelayClosedError(input.sessionId, "before receipt");
+		throw new RelayClosedError(input.sessionId, "before receipt", true);
 	};
 	const status = port.status.bind(port);
 	port.status = async (input) => {
@@ -432,7 +432,7 @@ test("RT09 steer uses owned connection and held steer replay retains clientRef w
 	let accept = false;
 	const port = new ScriptedSessionPort({
 		onSteer: () => {
-			if (!accept) throw new RelayClosedError("s", "torn");
+			if (!accept) throw new RelayClosedError("s", "torn", true);
 		},
 	});
 	const f = await actor(port);
