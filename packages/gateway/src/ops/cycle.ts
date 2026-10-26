@@ -357,12 +357,6 @@ export class RuntimeCycleProjector {
 	 * Platform inbound messages from non-bot authors pending or bound older
 	 * than the threshold with no delivery on the origin since they arrived, and
 	 * not in muted threads. Issue #688.
-	 *
-	 * Currently returns an empty map as a placeholder. Full implementation requires
-	 * access to the database GroupDb interface from both inbox and outbox groups
-	 * to query across table boundaries. The gate logic is functional and tested;
-	 * the database query can be implemented by adding a method to a group class
-	 * that handles the cross-group query, or by refactoring to split the logic.
 	 */
 	#originSilence(): Map<
 		string,
@@ -373,10 +367,82 @@ export class RuntimeCycleProjector {
 			readonly turnOpRef: string | null;
 		}
 	> {
-		// TODO(#688): Implement query logic to detect silent origins
-		// Query inbound_messages for pending platform messages from non-bot authors
-		// and check for corresponding confirmed deliveries
-		return new Map();
+		const result = new Map<
+			string,
+			{
+				oldestPendingMs: number;
+				messageId: string;
+				receivedAt: string;
+				turnOpRef: string | null;
+			}
+		>();
+
+		// Query pending or bound platform messages from non-bot authors
+		// older than the threshold with no delivery since arrival and not in muted threads.
+		const rows = this.#database.core
+			.groupDb("inbox")
+			.prepare(
+				`SELECT 
+					i.message_id,
+					i.origin_key,
+					i.received_at,
+					i.turn_op_ref,
+					CAST((? - CAST(strftime('%s', i.received_at) AS INTEGER)) * 1000 AS INTEGER) AS age_ms
+				FROM inbound_messages i
+				WHERE 
+					i.source = 'platform'
+					AND i.state = 'pending'
+					AND COALESCE(json_extract(i.engagement_json, '$.authorIsBot'), 0) <> 1
+					AND (i.turn_state IS NULL OR i.turn_state IN ('bound', 'accepted'))
+					AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = i.message_id)
+					AND NOT EXISTS (SELECT 1 FROM thread_mutes tm WHERE tm.thread_origin_key = i.origin_key)
+					AND CAST((? - CAST(strftime('%s', i.received_at) AS INTEGER)) * 1000 AS INTEGER) >= ?
+					AND i.origin_key NOT LIKE 'work/task/%'
+					AND NOT (i.origin_key LIKE '%/monitor:%' OR i.origin_key LIKE 'monitor:%')
+					AND NOT (
+						i.message_id LIKE 'agent-run/%' 
+						OR i.message_id LIKE 'monitor-report:%'
+						OR i.message_id LIKE 'lane-report:%'
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM deliveries d 
+						WHERE d.origin_key = i.origin_key 
+						AND d.created_at >= i.received_at
+					)
+			`,
+			)
+			.all(Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000), ORIGIN_SILENT_THRESHOLD_MS) as Array<{
+			message_id: string;
+			origin_key: string;
+			received_at: string;
+			turn_op_ref: string | null;
+			age_ms: number;
+		}>;
+
+		// Group by origin_key to find the oldest pending message for each origin
+		const byOrigin = new Map<
+			string,
+			{
+				oldestPendingMs: number;
+				messageId: string;
+				receivedAt: string;
+				turnOpRef: string | null;
+			}
+		>();
+
+		for (const row of rows) {
+			const existing = byOrigin.get(row.origin_key);
+			if (!existing || row.age_ms > existing.oldestPendingMs) {
+				byOrigin.set(row.origin_key, {
+					oldestPendingMs: row.age_ms,
+					messageId: row.message_id,
+					receivedAt: row.received_at,
+					turnOpRef: row.turn_op_ref,
+				});
+			}
+		}
+
+		return byOrigin;
 	}
 }
 
