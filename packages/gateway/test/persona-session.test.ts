@@ -12,6 +12,7 @@ import {
 	PERSONA_PREAMBLE_REFRESH_SENDS,
 	type PersonaFailureInput,
 	PersonaSessionManager,
+	type PersonaSessionManagerOptions,
 	personaTurnOpRef,
 	resetFailedTurn,
 	retryInboundTurn,
@@ -125,6 +126,7 @@ async function harness(
 		maxLiveHosts?: number;
 		hostIdleRetireMs?: number;
 		boundedRecoveryHoldMs?: number;
+		onBindHold?: PersonaSessionManagerOptions["onBindHold"];
 		setTimeout?: (work: () => void, delayMs: number) => unknown;
 		clearTimeout?: (timer: unknown) => void;
 		now?: () => number;
@@ -5730,3 +5732,131 @@ test("recovery hold escalation uses retire helper to keep reconciling retired ho
 	expect(manager!.boundedRecoveryHoldMs).toBe(1_000);
 });
 
+/** #686: one accepted turn whose host may die, plus a message queued behind it. */
+async function heldBehindHarness(hostState: "dead" | "live") {
+	let clock = Date.now();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const notices: { reason: string; notice: string }[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line), {
+		now: () => clock,
+		boundedRecoveryHoldMs: 600_000,
+		onBindHold: (input) => {
+			notices.push({ reason: input.reason, notice: input.notice });
+		},
+	});
+	enqueue("held-1", "작업 결과?");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "first turn did not start");
+	const held = port.sends[0]!;
+	const status = port.status.bind(port);
+	port.status = async (input) =>
+		input.opRef === held.opRef
+			? { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false }
+			: await status(input);
+	const liveness = port.liveness.bind(port);
+	port.liveness = async (input) =>
+		input.sessionId === held.sessionId && hostState === "dead"
+			? { live: false, disowned: false }
+			: await liveness(input);
+	// The gateway restarts: the turn is now a recovered hold, not a running one,
+	// so the next message queues behind it instead of steering into it.
+	await manager!.stop();
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		submissionRetryDelayMs: 1,
+		log: (line) => logs.push(line),
+		now: () => clock,
+		boundedRecoveryHoldMs: 600_000,
+		onBindHold: (input) => {
+			notices.push({ reason: input.reason, notice: input.notice });
+		},
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+		}),
+	});
+	await manager.recover();
+	enqueue("behind-1", "다음 질문");
+	await manager.notifyInbound(KEY);
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("behind-1");
+	return {
+		port,
+		logs,
+		terminal,
+		notices,
+		held,
+		advance: (ms: number) => {
+			clock += ms;
+		},
+	};
+}
+
+test("#686: a held ambiguous turn on a dead host past the deadline stops blocking the origin, without a resend", async () => {
+	const { port, logs, terminal, notices, held, advance } = await heldBehindHarness("dead");
+	expect(port.sends).toHaveLength(1);
+	advance(11 * 60_000);
+	await manager!.tick(KEY);
+	await manager!.tick(KEY);
+
+	expect(logs.filter((line) => line.startsWith("recovery_hold_escalated"))).toHaveLength(1);
+	expect(logs.find((line) => line.startsWith("recovery_hold_escalated"))).toContain(`opRef=${held.opRef}`);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(notices.filter((notice) => notice.reason === "recovery_hold_escalation")).toHaveLength(1);
+	await eventually(() => port.sends.length === 2, "the queued message was not sent on a fresh session");
+	const next = port.sends[1]!;
+	expect(next.text).toBe("다음 질문");
+	expect(next.sessionId).not.toBe(held.sessionId);
+	expect(port.sends.filter((send) => send.opRef === held.opRef)).toHaveLength(1);
+	port.complete(next.opRef, "새 세션 답");
+	await eventually(() => terminal.includes("새 세션 답"), "the queued message was not answered");
+	// The held operation is retired, not dropped: it is still nonterminal and unresent.
+	expect(database!.inbox.turnRow(held.opRef)?.turn_state).not.toBe("done");
+	expect(port.sends.filter((send) => send.opRef === held.opRef)).toHaveLength(1);
+});
+
+test("#686: a held ambiguous turn is never escalated while its host is live", async () => {
+	const { port, logs, notices, advance } = await heldBehindHarness("live");
+	advance(30 * 60_000);
+	await manager!.tick(KEY);
+	expect(logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(false);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(notices).toEqual([]);
+	expect(port.sends).toHaveLength(1);
+});
+
+test("#686: a dead host does not escalate a held turn before the deadline", async () => {
+	const { port, logs, notices, advance } = await heldBehindHarness("dead");
+	advance(9 * 60_000);
+	await manager!.tick(KEY);
+	expect(logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(false);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(notices).toEqual([]);
+	expect(port.sends).toHaveLength(1);
+});
+
+test("#686: an escalated turn that later completes is reconciled as a retired hold, not dropped or re-noticed", async () => {
+	const { port, logs, notices, held, advance } = await heldBehindHarness("dead");
+	advance(11 * 60_000);
+	await manager!.tick(KEY);
+	await eventually(() => port.sends.length === 2, "the queued message was not sent");
+	port.status = ScriptedSessionPort.prototype.status.bind(port);
+	port.complete(held.opRef, "늦게 끝난 답");
+	for (let round = 0; round < 20 && database!.inbox.turnRow(held.opRef)?.turn_state !== "done"; round++) {
+		// The held-row sweep runs on its own cadence.
+		advance(61_000);
+		await manager!.tick(KEY);
+		await Bun.sleep(5);
+	}
+	expect(database!.inbox.turnRow(held.opRef)?.turn_state).toBe("done");
+	expect(logs.some((line) => line.startsWith("terminal_status_reconciled") && line.includes(held.opRef))).toBe(true);
+	expect(logs.filter((line) => line.startsWith("recovery_hold_escalated"))).toHaveLength(1);
+	expect(notices.filter((notice) => notice.reason === "recovery_hold_escalation")).toHaveLength(1);
+	expect(port.sends.filter((send) => send.opRef === held.opRef)).toHaveLength(1);
+});

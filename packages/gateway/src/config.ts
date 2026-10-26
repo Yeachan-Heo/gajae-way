@@ -608,8 +608,16 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseSessions(value: unknown): SessionHostConfig {
 	const input = requireObject(value, "sessions");
-	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs" && key !== "boundedRecoveryHoldMs"))
-		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts, idleRetireMs, idleResetMs, and boundedRecoveryHoldMs");
+	if (
+		Object.keys(input).some(
+			(key) =>
+				key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs" && key !== "boundedRecoveryHoldMs",
+		)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			"sessions may only contain maxLiveHosts, idleRetireMs, idleResetMs, and boundedRecoveryHoldMs",
+		);
 	if (
 		input.maxLiveHosts !== undefined &&
 		(!Number.isInteger(input.maxLiveHosts) ||
@@ -654,7 +662,9 @@ function parseSessions(value: unknown): SessionHostConfig {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.idleResetMs === undefined ? {} : { idleResetMs: input.idleResetMs as number }),
-		...(input.boundedRecoveryHoldMs === undefined ? {} : { boundedRecoveryHoldMs: input.boundedRecoveryHoldMs as number }),
+		...(input.boundedRecoveryHoldMs === undefined
+			? {}
+			: { boundedRecoveryHoldMs: input.boundedRecoveryHoldMs as number }),
 	};
 }
 

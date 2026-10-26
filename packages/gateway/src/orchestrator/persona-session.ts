@@ -81,6 +81,8 @@ const HOST_TERMINATION_RECHECK_MS = 1_000;
 /** Tolerated clock skew between the host's startedAt and the gateway's dispatch stamp. */
 const TURN_FLOOR_SKEW_MS = 2_000;
 const DISPATCH_FAILURE_RETRY_MS = 2_000;
+/** An escalated hold nothing else reconciles is re-read by recovery at this cadence (#686). */
+const ESCALATED_HOLD_RECHECK_MS = 60_000;
 /**
  * A prompt the host rejected in its submission phase never ran (gjc's
  * AgentBusy wait expired, #424). It is re-sent once after this pause, which
@@ -1297,6 +1299,8 @@ class OriginActor {
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
+	/** Escalated (#686) holds without a BoundTurn, by op-ref, with the next recheck time. */
+	readonly #escalatedHolds = new Map<string, number>();
 	/** The session whose host this origin counts as holding; cleared when that host is ended. */
 	#hostSessionId: string | undefined;
 	/** A signalled host remains counted but cannot be reused until its process exits. */
@@ -1543,10 +1547,44 @@ class OriginActor {
 			notice: "[Gateway notice] The earlier request's outcome could not be confirmed. Starting fresh.",
 			verdict: undefined,
 		});
+		// A held turn this process only recovered (no live BoundTurn) now belongs to
+		// a retired epoch: recovery adopts it as a retired hold that keeps
+		// reconciling, exactly as after a restart, so a late outcome still lands.
+		if (!this.#retired.has(retiredKey({ epoch: ambiguousHold.epoch, turn: ambiguousHold })))
+			this.#escalatedHolds.set(ambiguousHold.opRef, 0);
+		await this.#recheckEscalatedHolds();
 		// Terminate the old session
 		if (previousSessionId) await this.#terminateRetiredSession(previousSessionId, "recovery_hold_escalation");
 		// Dispatch next turn with fresh session
 		await this.#dispatchNext();
+	}
+
+	/**
+	 * An escalated hold this process never adopted (it was only recovered) has no
+	 * BoundTurn for the tick to reconcile, so recovery re-reads it on the sweep
+	 * cadence until it settles: a late outcome lands, the op is never resent.
+	 */
+	async #recheckEscalatedHolds(): Promise<void> {
+		const now = this.#manager.now();
+		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
+			const due = this.#escalatedHolds.get(turn.opRef);
+			if (due === undefined || due > now) continue;
+			if (this.#retired.has(retiredKey({ epoch: turn.epoch, turn }))) {
+				this.#escalatedHolds.delete(turn.opRef);
+				continue;
+			}
+			this.#escalatedHolds.set(turn.opRef, now + ESCALATED_HOLD_RECHECK_MS);
+			try {
+				await this.#recoverTurn(turn);
+			} catch (error) {
+				this.#manager.log(
+					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+					"error",
+				);
+			}
+		}
+		for (const opRef of this.#escalatedHolds.keys())
+			if (this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done") this.#escalatedHolds.delete(opRef);
 	}
 
 	async tick(): Promise<void> {
@@ -1554,6 +1592,7 @@ class OriginActor {
 		// by a clientRef replay; the periodic tick is that retry when nothing
 		// else is admitted.
 		await this.#escalateBoundedRecoveryHolds();
+		await this.#recheckEscalatedHolds();
 		await this.#resolveStaleHolds();
 		if (this.#current) await this.#reconcileBound(this.#current);
 		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);
