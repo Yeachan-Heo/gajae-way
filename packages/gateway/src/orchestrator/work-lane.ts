@@ -1755,11 +1755,10 @@ export class WorkLaneManager {
 					};
 					const silent = isSilentOutput(result.text);
 					const terminal = runtime.terminal!;
-					// A terminal first observed with receiptState=missing whose same-op
-					// final body then proves present is a late receipt, not a missing one
-					// (#248): re-derive the end state from the reconciled receipt.
+					// A proven original same-op body resolves receipt uncertainty, not
+					// execution by inference. Re-derive its actual terminal outcome.
 					const reconciled =
-						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
+						terminal.kind === "broker" && terminal.status !== undefined && unresolvedTerminalReceipt(terminal)
 							? terminalEvidence(
 									safeStatus({
 										...terminal.status,

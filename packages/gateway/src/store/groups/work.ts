@@ -143,7 +143,7 @@ export function unresolvedTerminalReceipt(terminal: WorkAttemptTerminalEvidence 
 		terminal?.kind === "broker" &&
 		(terminal.status?.status === "failed"
 			? terminal.status.receiptState !== "present"
-			: ["missing", "unknown", "absent"].includes(terminal.status?.receiptState ?? ""))
+			: terminal.status?.receiptState === "missing")
 	);
 }
 
@@ -484,7 +484,8 @@ function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRun
 		before?.kind === "broker" &&
 		after?.kind === "broker" &&
 		before.observedAt === after.observedAt &&
-		before.status?.receiptState === "missing" &&
+		before.status !== undefined &&
+		unresolvedTerminalReceipt(before) &&
 		after.status?.receiptState === "present" &&
 		after.status.status === "terminal_ok" &&
 		after.reasonCode === terminalEvidence(after.status, after.observedAt)?.reasonCode &&

@@ -2860,7 +2860,9 @@ for (const [receiptState, reasonCode, endState] of [["unknown", "terminal_uncert
 for (const failure of ["provider", "deadline"] as const) {
 	for (const receiptState of ["missing", "unknown", undefined] as const) {
 		test(`#696 authenticated ${failure} status retains cause with ${receiptState} receipt without treating it as execution end`, async () => {
-			const f = await fixture();
+			let now = Date.now();
+			const f = await fixture({ now: () => now });
+			const terminate = spyOn(f.port, "terminateHost");
 			const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
 			f.port.bind = async (input) => {
 				const binding = { ...input, sessionId: crypto.randomUUID() };
@@ -2952,6 +2954,7 @@ for (const failure of ["provider", "deadline"] as const) {
 			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
 			expect(outputReads).toBe(0);
 			active = false;
+			now += 60 * 60_000;
 			let before = queries;
 			await until(() => queries > before + 1);
 			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
@@ -2983,6 +2986,7 @@ for (const failure of ["provider", "deadline"] as const) {
 			await f.restart();
 			expect(f.notices).toHaveLength(1);
 			expect(f.port.sends).toHaveLength(1);
+			expect(terminate).not.toHaveBeenCalled();
 			expect(f.port.resumes).toHaveLength(0);
 		});
 	}
@@ -3025,7 +3029,8 @@ test("#696 safe report keeps bounded causal fields for present receipts and reje
 });
 
 test("#696 confirmed host death ends execution without replacing an observed provider failure", async () => {
-	const f = await fixture({ hostLostGraceMs: 0 });
+	const now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 0 });
 	const result = await started(f, "a", origin);
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	let running: boolean | undefined = true;
@@ -3079,6 +3084,89 @@ test("#696 confirmed host death ends execution without replacing an observed pro
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
 });
+
+for (const receiptState of ["missing", "unknown", "absent", undefined] as const) {
+	for (const reason of ["end_turn", undefined] as const) {
+		test(`#696 failed ${receiptState} receipt reconciles a proven late ${reason} body across recovery`, async () => {
+			let now = Date.now();
+			const f = await fixture({ now: () => now });
+			const result = await started(f, "a", origin);
+			f.port.complete(result.opRef, "original operation output");
+			const completed = await f.port.status({ sessionId: result.sessionId, repo: f.directory, opRef: result.opRef });
+			let queries = 0;
+			f.port.status = async () => {
+				queries++;
+				return {
+					...completed,
+					status: {
+						...completed.status,
+						status: "failed",
+						receiptState,
+						clientRef: result.opRef,
+						outcome: {
+							kind: "failed",
+							code: "prompt_failed",
+							phase: "post_start",
+							category: "provider_transport",
+							provenance: "agent_failed",
+							providerCode: "server_is_overloaded",
+						},
+						error: { code: "agent_error" },
+					},
+				};
+			};
+			let reads = 0;
+			f.port.fetchWorkerOutput = async (input) => {
+				if (++reads === 1) return { status: "absent", code: "output_pending" };
+				const text = "original operation output";
+				return parseWorkerOutputResponse(
+					input,
+					{
+						exitCode: 0,
+						stdout: JSON.stringify({
+							ok: true,
+							result: {
+								kind: "prompt",
+								...completed.status,
+								clientRef: result.opRef,
+								status: "terminal_ok",
+								receiptState: "present",
+								outcome: reason ? { reason } : undefined,
+								content: { version: 1, type: "text", text, byteLength: Buffer.byteLength(text), truncated: false },
+							},
+						}),
+						stderr: "",
+					},
+					now,
+				);
+			};
+			await until(() => queries > 0);
+			f.port.emitTurnEnd(result.sessionId, result.opRef, "agent_failed");
+			await until(() => reads === 1);
+			const before = f.db.work.workAttemptGet(result.opRef)!;
+			expect(before.terminal?.reasonCode).toBe("provider_transport");
+			expect(before.terminal?.status?.receiptState).toBe(receiptState);
+			expect(before.settledAt).toBeNull();
+			await f.restart();
+			now += 1000;
+			await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+			const after = f.db.work.workAttemptGet(result.opRef)!;
+			expect(after.terminal?.status?.receiptState).toBe("present");
+			expect(after.terminal?.observedAt).toBe(before.terminal?.observedAt);
+			expect(after.terminal?.status?.commandId).toBe(before.terminal?.status?.commandId);
+			expect(after.terminal?.status?.turnId).toBe(before.terminal?.status?.turnId);
+			expect(after.terminal?.reasonCode).toBe(reason ?? "stopped_incomplete");
+			expect(f.job().attempts[0]?.endState).toBe(reason ? "completed" : "attempt_ended");
+			expect(after.output.proof?.opRef).toBe(result.opRef);
+			expect(reads).toBe(2);
+			expect(f.notices).toHaveLength(1);
+			await f.restart();
+			expect(f.notices).toHaveLength(1);
+			expect(f.port.sends).toHaveLength(1);
+			expect(f.port.resumes).toHaveLength(0);
+		});
+	}
+}
 
 test("late receipt after a missing-receipt terminal is reconciled once, without resend (#248)", async () => {
 	let now = Date.now();
@@ -4483,7 +4571,7 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
 				const opRef = f.job().attempts[0]!.opRef;
-				if (receiptState !== "present" && (status === "failed" || receiptState !== undefined))
+				if (receiptState === "missing" || (status === "failed" && receiptState !== "present"))
 					f.port.emitTurnEnd(f.job().attempts[0]!.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
 				const runtime = f.db.work.workAttemptGet(opRef)!;
