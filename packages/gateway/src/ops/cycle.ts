@@ -367,16 +367,6 @@ export class RuntimeCycleProjector {
 			readonly turnOpRef: string | null;
 		}
 	> {
-		const result = new Map<
-			string,
-			{
-				oldestPendingMs: number;
-				messageId: string;
-				receivedAt: string;
-				turnOpRef: string | null;
-			}
-		>();
-
 		// Query pending or bound platform messages from non-bot authors
 		// older than the threshold with no delivery since arrival and not in muted threads.
 		const rows = this.#database.core
