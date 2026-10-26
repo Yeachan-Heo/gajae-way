@@ -54,12 +54,18 @@ export const DEFAULT_SESSIONS_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const SESSIONS_MAX_LIVE_HOSTS_MAX = 256;
 const SESSIONS_IDLE_RESET_MIN_MS = 60_000;
 const SESSIONS_IDLE_RESET_MAX_MS = 30 * 24 * 60 * 60_000;
+/** An ambiguous held bound/accepted turn with dead host past this deadline is escalated to recovery hold. */
+export const DEFAULT_SESSIONS_BOUNDED_RECOVERY_HOLD_MS = 10 * 60 * 1000;
+const SESSIONS_BOUNDED_RECOVERY_HOLD_MIN_MS = 60_000;
+const SESSIONS_BOUNDED_RECOVERY_HOLD_MAX_MS = 60 * 60 * 1000;
 
 export interface SessionHostConfig {
 	readonly maxLiveHosts?: number;
 	readonly idleRetireMs?: number;
 	/** Idle persona sessions rotate like `/new`; unset disables automatic reset. */
 	readonly idleResetMs?: number;
+	/** Ambiguous held bound/accepted turn escalates to recovery hold past this deadline if host is provably dead; unset defaults to 10 min. */
+	readonly boundedRecoveryHoldMs?: number;
 }
 export type GjcServiceTier =
 	| "none"
@@ -602,8 +608,8 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseSessions(value: unknown): SessionHostConfig {
 	const input = requireObject(value, "sessions");
-	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs"))
-		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts, idleRetireMs, and idleResetMs");
+	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs" && key !== "boundedRecoveryHoldMs"))
+		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts, idleRetireMs, idleResetMs, and boundedRecoveryHoldMs");
 	if (
 		input.maxLiveHosts !== undefined &&
 		(!Number.isInteger(input.maxLiveHosts) ||
@@ -634,10 +640,21 @@ function parseSessions(value: unknown): SessionHostConfig {
 			"config_invalid",
 			`sessions.idleResetMs must be an integer between ${SESSIONS_IDLE_RESET_MIN_MS} and ${SESSIONS_IDLE_RESET_MAX_MS}`,
 		);
+	if (
+		input.boundedRecoveryHoldMs !== undefined &&
+		(!Number.isInteger(input.boundedRecoveryHoldMs) ||
+			(input.boundedRecoveryHoldMs as number) < SESSIONS_BOUNDED_RECOVERY_HOLD_MIN_MS ||
+			(input.boundedRecoveryHoldMs as number) > SESSIONS_BOUNDED_RECOVERY_HOLD_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.boundedRecoveryHoldMs must be an integer between ${SESSIONS_BOUNDED_RECOVERY_HOLD_MIN_MS} and ${SESSIONS_BOUNDED_RECOVERY_HOLD_MAX_MS}`,
+		);
 	return {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.idleResetMs === undefined ? {} : { idleResetMs: input.idleResetMs as number }),
+		...(input.boundedRecoveryHoldMs === undefined ? {} : { boundedRecoveryHoldMs: input.boundedRecoveryHoldMs as number }),
 	};
 }
 

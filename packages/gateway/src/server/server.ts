@@ -995,10 +995,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		repo: workspace,
 		brokerAgentDir: options.broker?.agentDir,
 		sessionModel: options.config.model,
-		stallTimeoutMs: options.config.stallTimeoutMs,
+		statuReportTimeoutMs: options.config.stallTimeoutMs,
 		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
+		boundedRecoveryHoldMs: options.config.sessions?.boundedRecoveryHoldMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called

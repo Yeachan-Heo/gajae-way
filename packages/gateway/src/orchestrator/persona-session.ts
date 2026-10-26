@@ -14,6 +14,7 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import {
+	DEFAULT_SESSIONS_BOUNDED_RECOVERY_HOLD_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
 	type GjcModelSelection,
@@ -604,6 +605,8 @@ export interface PersonaSessionManagerOptions {
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
 	readonly hostIdleRetireMs?: number;
+	/** Ambiguous held bound/accepted turn escalates to recovery hold past this deadline if host is dead; default DEFAULT_SESSIONS_BOUNDED_RECOVERY_HOLD_MS. */
+	readonly boundedRecoveryHoldMs?: number;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -665,6 +668,7 @@ export class PersonaSessionManager {
 	#hostReplacementAdmissionOwner: OriginActor | undefined;
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
+	#boundedRecoveryHoldMs: number;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -698,6 +702,11 @@ export class PersonaSessionManager {
 			options.hostIdleRetireMs,
 			DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 			"hostIdleRetireMs",
+		);
+		this.#boundedRecoveryHoldMs = positiveInteger(
+			options.boundedRecoveryHoldMs,
+			DEFAULT_SESSIONS_BOUNDED_RECOVERY_HOLD_MS,
+			"boundedRecoveryHoldMs",
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
@@ -782,6 +791,10 @@ export class PersonaSessionManager {
 
 	get hostIdleRetireMs(): number {
 		return this.#hostIdleRetireMs;
+	}
+
+	get boundedRecoveryHoldMs(): number {
+		return this.#boundedRecoveryHoldMs;
 	}
 
 	/** Origins this gateway counts as holding a live session host; idle IDs do not count while the broker is unavailable. */
@@ -1475,10 +1488,67 @@ class OriginActor {
 		await this.#dispatchNext();
 	}
 
+	async #escalateBoundedRecoveryHolds(): Promise<void> {
+		const epoch = this.#epoch();
+		const ambiguousHold = this.#manager.database.inbox
+			.nonterminalTurns(this.originKey)
+			.find((turn) => turn.epoch === epoch && (turn.state === "bound" || turn.state === "accepted"));
+		if (!ambiguousHold) return;
+		if (!ambiguousHold.sessionId || !ambiguousHold.dispatchedAtMs) return;
+		const heldMs = this.#manager.now() - ambiguousHold.dispatchedAtMs;
+		if (heldMs < this.#manager.boundedRecoveryHoldMs) return;
+		if (!(await this.#sessionProvablyGone(ambiguousHold.sessionId, new Error("bounded_recovery_hold_deadline")))) return;
+		// Escalate to recovery hold: close the current turn if it's this one
+		if (this.#current?.turn.opRef === ambiguousHold.opRef) {
+			await this.#closeObserver("recovery_hold_escalation");
+			this.#current.retired = true;
+			this.#clearStallReconciliation(this.#current);
+			this.#current.tail?.setTurnRunning(false);
+			await this.#current.tail?.close();
+			this.#current.detached = true;
+			this.#retired.set(retiredKey(this.#current), this.#current);
+			await this.#current.lifecycle.onRetired?.(this.#current);
+			this.#current = undefined;
+		}
+		// Rotate epoch and post notice
+		let nextEpoch = 0;
+		const previousSessionId = ambiguousHold.sessionId;
+		const noticeMessageId = `recovery_hold_escalated_${randomUUID()}`;
+		const originRef = JSON.parse(ambiguousHold.origin_ref_json) as { platform?: string; kind?: string; conversationId?: string; peerId?: string };
+		this.#manager.database.transaction((tx) => {
+			nextEpoch = this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
+			// Post exactly one notice to the origin
+			if (originRef.platform !== "loopback") {
+				const noticeAccepted = this.#manager.database.inbox.enqueue(tx, {
+					messageId: noticeMessageId,
+					originKey: this.originKey,
+					originRefJson: ambiguousHold.origin_ref_json,
+					body: "[Gateway notice] The earlier request's outcome could not be confirmed. Starting fresh.",
+					source: "platform",
+				});
+				if (!noticeAccepted) {
+					this.#manager.log(
+						`recovery_hold_escalated_notice_failed origin=${this.originKey} reason=duplicate_message_id`,
+						"warn",
+					);
+				}
+			}
+		});
+		this.#state = "idle";
+		this.#manager.log(
+			`recovery_hold_escalated origin=${this.originKey} opRef=${ambiguousHold.opRef} heldMs=${heldMs} evidence=host_provably_dead nextEpoch=${nextEpoch}`,
+		);
+		// Terminate the old session
+		if (previousSessionId) await this.#terminateRetiredSession(previousSessionId, "recovery_hold_escalation");
+		// Dispatch next turn with fresh session
+		await this.#dispatchNext();
+	}
+
 	async tick(): Promise<void> {
 		// A steer held on a turn that has already ended is only ever resolved
 		// by a clientRef replay; the periodic tick is that retry when nothing
 		// else is admitted.
+		await this.#escalateBoundedRecoveryHolds();
 		await this.#resolveStaleHolds();
 		if (this.#current) await this.#reconcileBound(this.#current);
 		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);

@@ -124,6 +124,7 @@ async function harness(
 		onSessionReady?: (input: { originKey: string; at: number }) => void;
 		maxLiveHosts?: number;
 		hostIdleRetireMs?: number;
+		boundedRecoveryHoldMs?: number;
 		setTimeout?: (work: () => void, delayMs: number) => unknown;
 		clearTimeout?: (timer: unknown) => void;
 		now?: () => number;
@@ -5689,4 +5690,18 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 	await eventually(() => f.port.steers.length === 1, "notice was not steered");
 	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
 	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
+});
+
+test("bounded recovery hold configuration is properly passed to the manager", async () => {
+	const port = new ScriptedSessionPort();
+	let time = 0;
+	await harness(port, {}, () => {}, {
+		now: () => time,
+		setTimeout: () => {},
+		clearTimeout: () => {},
+		boundedRecoveryHoldMs: 7500, // custom value
+	});
+
+	// Verify that the manager received the configuration
+	expect(manager!.boundedRecoveryHoldMs).toBe(7500);
 });
