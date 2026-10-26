@@ -76,6 +76,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
+import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
@@ -92,6 +93,7 @@ import {
 	type PersonaTurnLifecycle,
 	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
+	UNRESOLVED_HOLD_ESCALATED,
 } from "../orchestrator/persona-session";
 import {
 	formatFailureChatNotice,
@@ -999,11 +1001,13 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
+		busyStallMs: options.config.sessions?.busyStallMs,
+		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
-		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
+		onBindHold: ({ originKey, trigger, notice, reason }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {
 				origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
@@ -1016,7 +1020,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
-			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id);
+			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, reason);
 			const payload = runtime.delivery.prepare(
 				context?.turnId ?? crypto.randomUUID(),
 				origin,
@@ -1170,7 +1174,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
 	});
+	const originSilent = new OriginSilentAlerter(options.database);
 	const reconcileTimer = setInterval(() => {
+		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
 		void personaSessions
 			.recover()
@@ -4419,6 +4425,26 @@ function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): v
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
 }
 
+/** Owner DM per `origin_silent` incident and when it clears (#688); the incident record dedupes across sweeps and restarts. */
+function alertSilentOrigins(runtime: Runtime, alerter: OriginSilentAlerter): void {
+	let alerts: ReturnType<OriginSilentAlerter["sweep"]>;
+	try {
+		alerts = alerter.sweep(Date.now());
+	} catch (error) {
+		console.error(`origin silent sweep failed: ${diagnostic(error)}`);
+		return;
+	}
+	const owner = runtime.config.ownerTarget?.origin;
+	for (const alert of alerts) {
+		console.warn(
+			`origin_silent_${alert.kind} origin=${alert.originKey} delivery=${alert.deliveryId}${owner ? "" : " owner=unconfigured"}`,
+		);
+		if (!owner) continue;
+		const payload = runtime.delivery.prepare(alert.deliveryId, owner, alert.notice, undefined, alert.deliveryId);
+		if (payload) broadcastDelivery(runtime, payload);
+	}
+}
+
 function reportDeliveryExpired(
 	runtime: Runtime,
 	database: Store,
@@ -4498,8 +4524,10 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 	return `gw-x-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 32)}`;
 }
 
-function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {
-	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
+/** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
+function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }
 
 /** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */

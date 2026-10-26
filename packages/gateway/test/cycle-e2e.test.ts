@@ -332,6 +332,11 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 				receivedAt: old,
 			}),
 		);
+		// The long turn has been answering (an interim reply landed), so the origin is not silent (#688).
+		database.transaction((tx) => {
+			database.outbox.create(tx, { deliveryId: "gw-d-interim", turnId: "t", originKey: key, payloadJson: "{}" });
+			database.outbox.confirm(tx, "gw-d-interim");
+		});
 		const busy = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(busy.gates).toEqual([]);
 		expect(busy.phase).toBe("dispatching");
@@ -350,7 +355,9 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 			}),
 		);
 		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
-		expect(starved.gates).toEqual(["inbound_starved"]);
+		// Its user has also gone unanswered for 20 minutes (#688).
+		expect(starved.gates).toEqual(["inbound_starved", "origin_silent"]);
+		expect(starved.silentOrigins.map((origin) => origin.originKey)).toEqual([otherKey]);
 	} finally {
 		database.close();
 	}

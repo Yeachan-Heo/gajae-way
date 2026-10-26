@@ -408,7 +408,7 @@ export class InboxGroup {
 		if ((existing?.n ?? 0) > 0) throw new InboundTurnConflictError(input.originKey, input.epoch);
 		const changes = this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = 'trigger', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ?, bound_session_id = ?, dispatched_at = ?, terminal_delivery_id = NULL WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL",
+				"UPDATE inbound_messages SET turn_role = 'trigger', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ?, bound_session_id = ?, dispatched_at = ?, send_attempted_at = NULL, terminal_delivery_id = NULL WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL",
 			)
 			.run(
 				tx,
@@ -421,6 +421,35 @@ export class InboxGroup {
 			).changes;
 		if (changes !== 1) throw new Error(`inbound ${input.messageId} is not a pending unbound row`);
 		return this.turnRow(input.opRef) as InboundMessageRow;
+	}
+
+	/**
+	 * Durable send intent (#685): stamped immediately before the prompt is
+	 * handed to the broker. A bound trigger without it provably never reached
+	 * `turn.prompt` and is requeued; with it, only reconcile may settle it.
+	 */
+	markSendAttempted(tx: WriteTx, opRef: string, at: string = new Date().toISOString()): boolean {
+		return (
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET send_attempted_at = COALESCE(send_attempted_at, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
+				)
+				.run(tx, at, opRef).changes === 1
+		);
+	}
+
+	sendAttemptedAt(opRef: string): string | undefined {
+		return (
+			(
+				this.#db
+					.prepare("SELECT send_attempted_at FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'")
+					.get(opRef) as { send_attempted_at: string | null } | null
+			)?.send_attempted_at ?? undefined
+		);
+	}
+
+	sendAttempted(opRef: string): boolean {
+		return this.sendAttemptedAt(opRef) !== undefined;
 	}
 
 	turnAccept(tx: WriteTx, opRef: string): boolean {
@@ -515,7 +544,7 @@ export class InboxGroup {
 	turnRequeue(tx: WriteTx, opRef: string): number {
 		return this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
+				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, send_attempted_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
 			)
 			.run(tx, opRef).changes;
 	}
@@ -673,6 +702,46 @@ export class InboxGroup {
 				`SELECT origin_key, origin_ref_json, MAX(rowid) AS last_row FROM inbound_messages WHERE source = 'platform' AND (turn_state IN ('bound', 'accepted') OR (received_at >= ? AND COALESCE(json_extract(engagement_json, '$.authorIsBot'), 0) <> 1)) AND ${REPLAYABLE_INBOUND} GROUP BY origin_key ORDER BY origin_key`,
 			)
 			.all(since) as Array<{ origin_key: string; origin_ref_json: string }>;
+	}
+
+	/**
+	 * Origins with platform messages from non-bot authors still pending since
+	 * `cutoff` or earlier, and no confirmed delivery on that origin since such a
+	 * message arrived (#688); gateway hold notices and silence alerts are not
+	 * answers. Muted threads are excluded; declined (policy-ignored)
+	 * messages never enter the queue. Oldest qualifying message per origin.
+	 */
+	unansweredOrigins(cutoff: string): Array<{
+		readonly origin_key: string;
+		readonly origin_ref_json: string;
+		readonly message_id: string;
+		readonly received_at: string;
+		readonly unanswered: number;
+	}> {
+		return this.#db
+			.prepare(
+				`SELECT origin_key, origin_ref_json, message_id, MIN(received_at) AS received_at, COUNT(*) AS unanswered
+				FROM inbound_messages
+				WHERE source = 'platform' AND state = 'pending' AND received_at <= ?
+					AND COALESCE(json_extract(engagement_json, '$.authorIsBot'), 0) <> 1
+					AND ${REPLAYABLE_INBOUND}
+					AND NOT EXISTS (SELECT 1 FROM thread_mutes m WHERE m.thread_origin_key = inbound_messages.origin_key)
+					AND NOT EXISTS (
+						SELECT 1 FROM deliveries d
+						WHERE d.origin_key = inbound_messages.origin_key AND d.state = 'confirmed'
+							AND d.created_at >= inbound_messages.received_at
+							-- Hold notices (gw-h-) and silence alerts (gw-s-) are not answers.
+							AND d.delivery_id NOT LIKE 'gw-h-%' AND d.delivery_id NOT LIKE 'gw-s-%'
+					)
+				GROUP BY origin_key ORDER BY origin_key`,
+			)
+			.all(cutoff) as Array<{
+			origin_key: string;
+			origin_ref_json: string;
+			message_id: string;
+			received_at: string;
+			unanswered: number;
+		}>;
 	}
 
 	nonterminalOrigins(): readonly string[] {

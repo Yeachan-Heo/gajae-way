@@ -149,9 +149,11 @@ test("missing recovery evidence holds a bound turn instead of replaying it", asy
 			}),
 		),
 	).toBe(true);
-	db.transaction((tx) =>
-		db.inbox.bindTurn(tx, { messageId: "m-1", originKey, epoch: 0, opRef, sessionId: binding.sessionId }),
-	);
+	db.transaction((tx) => {
+		db.inbox.bindTurn(tx, { messageId: "m-1", originKey, epoch: 0, opRef, sessionId: binding.sessionId });
+		// The send was attempted (#685): only reconcile evidence may settle it.
+		expect(db.inbox.markSendAttempted(tx, opRef)).toBe(true);
+	});
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,

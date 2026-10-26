@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
@@ -25,7 +26,7 @@ import {
 	type StatusReport,
 	TranscriptIncompleteError,
 } from "@gajae-gateway/subsession";
-import type { GjcModelSelection, GjcServiceTier } from "../config";
+import { DEFAULT_SESSIONS_BUSY_STALL_MS, type GjcModelSelection, type GjcServiceTier } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
 	BROKER_PROMPT_BUSY_REFUSAL,
@@ -274,6 +275,11 @@ export interface SessionSendInput {
 	/** How long a `busy` refusal is retried before it surfaces as a failure. */
 	readonly busyWaitMs?: number;
 	/**
+	 * How long a `busy` host may show no progress (activity stamp and transcript
+	 * unchanged) before the wait gives up with `SessionBusyStalledError` (#687).
+	 */
+	readonly busyStallMs?: number;
+	/**
 	 * The session's resident relay. The prompt is submitted on it so the host
 	 * streams the turn's content to this handle; without one the port opens a
 	 * throwaway relay for the send (the turn then has no live observer).
@@ -450,6 +456,27 @@ export class ModelNotSelectedError extends Error {
 	}
 }
 
+/**
+ * The pre-send busy wait saw the host report `busy` with no progress evidence
+ * (activity stamp and transcript size/mtime unchanged) for `silentMs`. The
+ * busy refusal is already durable, so the prompt was provably never accepted.
+ */
+export class SessionBusyStalledError extends Error {
+	readonly sessionId: string;
+	readonly opRef: string;
+	readonly silentMs: number;
+	readonly evidence: string;
+
+	constructor(sessionId: string, opRef: string, silentMs: number, evidence: string) {
+		super(`session ${sessionId} stayed busy without progress for ${silentMs}ms`);
+		this.name = "SessionBusyStalledError";
+		this.sessionId = sessionId;
+		this.opRef = opRef;
+		this.silentMs = silentMs;
+		this.evidence = evidence;
+	}
+}
+
 export interface BrokerSessionPortOptions {
 	readonly database: Store;
 	readonly cli: CliRunner;
@@ -490,6 +517,8 @@ function createRotationMetaKey(originKey: string): string {
 export const SESSION_BUSY_CODE = "busy";
 const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
+/** Progress probes (one `session inspect` plus a transcript stat) run at most this often. */
+const BUSY_PROGRESS_SAMPLE_MS = 30_000;
 const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
 /**
  * `compaction.run` answers only after gjc finished compacting, which takes tens
@@ -1386,8 +1415,15 @@ export class BrokerSessionPort implements SessionPort {
 		// the connection that submitted it. A caller without a relay gets one
 		// for the duration of the send.
 		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+		const stallMs = input.busyStallMs ?? DEFAULT_SESSIONS_BUSY_STALL_MS;
 		let waited = false;
 		let submission = intent;
+		// Progress evidence while the host refuses with `busy` (#687): a host that
+		// claims to be busy but never moves its activity stamp or transcript is
+		// wedged, and waiting it out would block the origin until the deadline.
+		let progress: string | undefined;
+		let progressAt = this.#now();
+		let nextSampleAt = 0;
 		for (;;) {
 			if (isBrokerPromptBusyRefusal(submission)) {
 				submission = this.#database.transaction((tx) =>
@@ -1437,6 +1473,17 @@ export class BrokerSessionPort implements SessionPort {
 			// Preserve the authenticated non-acceptance before deliberately waiting.
 			// A crash here must not look like a possibly accepted submission.
 			this.#completeOperation(submission, BROKER_PROMPT_BUSY_REFUSAL);
+			const sampledAt = this.#now();
+			if (sampledAt >= nextSampleAt) {
+				nextSampleAt = sampledAt + BUSY_PROGRESS_SAMPLE_MS;
+				const sample = await this.#busyProgress(input);
+				// An unanswerable probe is not evidence of a stall: restart the clock.
+				if (sample === undefined || sample !== progress) {
+					progress = sample;
+					progressAt = sampledAt;
+				} else if (sampledAt - progressAt >= stallMs)
+					throw new SessionBusyStalledError(input.sessionId, input.opRef, sampledAt - progressAt, sample);
+			}
 			if (this.#now() >= deadline) throw error;
 			submission = { ...submission, state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) };
 			if (!waited) {
@@ -1445,6 +1492,27 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			await this.#sleep(BUSY_POLL_MS);
 		}
+	}
+
+	/** Fingerprint of a busy host's progress: inspect activity stamp plus saved transcript size/mtime. */
+	async #busyProgress(input: { sessionId: string; repo: string }): Promise<string | undefined> {
+		const parts: string[] = [];
+		try {
+			const liveness = await this.#readLiveness(input);
+			if (liveness.activity) parts.push(`activity=${liveness.activity.state}@${liveness.activity.at}`);
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+		}
+		const transcript = await locateSavedTranscript(this.#authority.canonicalAgentDir, input.sessionId);
+		if (transcript !== undefined) {
+			try {
+				const info = await stat(transcript);
+				parts.push(`transcript=${info.size}@${Math.trunc(info.mtimeMs)}`);
+			} catch {
+				// A transcript that vanished between locate and stat is no evidence either way.
+			}
+		}
+		return parts.length === 0 ? undefined : parts.join(" ");
 	}
 	promptRefusal(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined {
 		this.#assertOwned(input);

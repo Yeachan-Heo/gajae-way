@@ -983,7 +983,35 @@ export type CycleGateReason =
 	| "monitor_dispatch_failing"
 	| "broker_respawn_churn"
 	| "broker_index_lock_blocked"
-	| "broker_agent_unprovisioned";
+	| "broker_agent_unprovisioned"
+	| "origin_silent";
+
+/**
+ * Why an unanswered origin is not moving, derived from durable state only:
+ * `send_not_attempted` (bound, prompt never sent), `session_busy_wait` (the host
+ * refused the prompt as busy), `operation_state_unknown` (sent, acceptance
+ * unconfirmed), `turn_running` (accepted, not finished), `dispatch_pending`
+ * (nothing bound: waiting on bind, host capacity or dispatch retry).
+ */
+export type OriginHoldReason =
+	| "send_not_attempted"
+	| "session_busy_wait"
+	| "operation_state_unknown"
+	| "turn_running"
+	| "dispatch_pending";
+
+/** An origin whose user messages have gone unanswered past the silence threshold (#688). */
+export interface SilentOriginView {
+	readonly originKey: string;
+	/** Oldest unanswered platform message on the origin. */
+	readonly oldestMessageId: string;
+	readonly oldestPendingAgeMs: number;
+	/** Unanswered messages older than the threshold. */
+	readonly unanswered: number;
+	/** The nonterminal trigger that owns the origin's current epoch; null when none is bound. */
+	readonly blockingOpRef: string | null;
+	readonly holdReason: OriginHoldReason;
+}
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -1121,6 +1149,8 @@ export interface OpsCycleResult {
 		readonly consecutive: number;
 		readonly lastFiredAt: string;
 	}[];
+	/** Origins with user messages unanswered past the silence threshold; non-empty raises `origin_silent`. */
+	readonly silentOrigins: readonly SilentOriginView[];
 	/** Delivery ledger census across all states. */
 	readonly deliveries: {
 		readonly pending: number;

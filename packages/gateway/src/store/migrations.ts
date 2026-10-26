@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 38;
+export const LATEST_SCHEMA_VERSION = 39;
 
 export interface MigrationHost {
 	readonly database: {
@@ -843,6 +843,29 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(38, new Date().toISOString());
+		});
+	}
+	if (current < 39) {
+		// Issue #685: durable send intent on a bound trigger. A bound row without
+		// it never reached `turn.prompt` and is requeued by recovery. Rows bound
+		// before this column existed have unknown send history, so they are
+		// stamped conservatively and keep the reconcile path (never resent).
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("send_attempted_at"))
+				host.database.execute("ALTER TABLE inbound_messages ADD COLUMN send_attempted_at TEXT");
+			host.database.execute(`
+				UPDATE inbound_messages SET send_attempted_at = COALESCE(dispatched_at, received_at)
+					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_attempted_at IS NULL;
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(39, new Date().toISOString());
 		});
 	}
 }

@@ -840,6 +840,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		monitorEvents: [],
 		monitorFailures: [],
 		monitorAuthoringLost: [],
+		silentOrigins: [],
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
 		inFlightInbound: 0,
 		pendingInbound: 0,

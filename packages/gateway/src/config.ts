@@ -54,12 +54,29 @@ export const DEFAULT_SESSIONS_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const SESSIONS_MAX_LIVE_HOSTS_MAX = 256;
 const SESSIONS_IDLE_RESET_MIN_MS = 60_000;
 const SESSIONS_IDLE_RESET_MAX_MS = 30 * 24 * 60 * 60_000;
+/**
+ * A host that keeps refusing a prompt as `busy` while its activity stamp and
+ * transcript never move is wedged; past this it is ended and rebound (#687).
+ */
+export const DEFAULT_SESSIONS_BUSY_STALL_MS = 5 * 60_000;
+/**
+ * A turn whose operation state stays unknown while its host is not live holds
+ * its origin at most this long; then it moves to a retired hold and the origin
+ * continues on a fresh session (#686). The held operation is never resent.
+ */
+export const DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS = 10 * 60_000;
+const SESSIONS_RECOVERY_BOUND_MIN_MS = 60_000;
+const SESSIONS_RECOVERY_BOUND_MAX_MS = 24 * 60 * 60_000;
 
 export interface SessionHostConfig {
 	readonly maxLiveHosts?: number;
 	readonly idleRetireMs?: number;
 	/** Idle persona sessions rotate like `/new`; unset disables automatic reset. */
 	readonly idleResetMs?: number;
+	/** Pre-send busy wait without host progress before the host is ended; default DEFAULT_SESSIONS_BUSY_STALL_MS. */
+	readonly busyStallMs?: number;
+	/** Bound on an unresolved turn's hold of its origin when its host is gone; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS. */
+	readonly unresolvedHoldMs?: number;
 }
 export type GjcServiceTier =
 	| "none"
@@ -602,8 +619,9 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseSessions(value: unknown): SessionHostConfig {
 	const input = requireObject(value, "sessions");
-	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs" && key !== "idleResetMs"))
-		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts, idleRetireMs, and idleResetMs");
+	const keys = ["maxLiveHosts", "idleRetireMs", "idleResetMs", "busyStallMs", "unresolvedHoldMs"];
+	if (Object.keys(input).some((key) => !keys.includes(key)))
+		throw new ConfigError("config_invalid", `sessions may only contain ${keys.join(", ")}`);
 	if (
 		input.maxLiveHosts !== undefined &&
 		(!Number.isInteger(input.maxLiveHosts) ||
@@ -634,10 +652,23 @@ function parseSessions(value: unknown): SessionHostConfig {
 			"config_invalid",
 			`sessions.idleResetMs must be an integer between ${SESSIONS_IDLE_RESET_MIN_MS} and ${SESSIONS_IDLE_RESET_MAX_MS}`,
 		);
+	for (const key of ["busyStallMs", "unresolvedHoldMs"] as const)
+		if (
+			input[key] !== undefined &&
+			(!Number.isInteger(input[key]) ||
+				(input[key] as number) < SESSIONS_RECOVERY_BOUND_MIN_MS ||
+				(input[key] as number) > SESSIONS_RECOVERY_BOUND_MAX_MS)
+		)
+			throw new ConfigError(
+				"config_invalid",
+				`sessions.${key} must be an integer between ${SESSIONS_RECOVERY_BOUND_MIN_MS} and ${SESSIONS_RECOVERY_BOUND_MAX_MS}`,
+			);
 	return {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.idleResetMs === undefined ? {} : { idleResetMs: input.idleResetMs as number }),
+		...(input.busyStallMs === undefined ? {} : { busyStallMs: input.busyStallMs as number }),
+		...(input.unresolvedHoldMs === undefined ? {} : { unresolvedHoldMs: input.unresolvedHoldMs as number }),
 	};
 }
 

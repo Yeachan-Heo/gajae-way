@@ -4331,6 +4331,7 @@ test("startup recovery preserves a bound operation whose running status is known
 	database?.transaction((tx) =>
 		database?.inbox.bindTurn(tx, { messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: orphan.sessionId }),
 	);
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	expect(database?.inbox.turnRow(opRef)).toMatchObject({ turn_state: "bound" });
 
 	const logs: string[] = [];

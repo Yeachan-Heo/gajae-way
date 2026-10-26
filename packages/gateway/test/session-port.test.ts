@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
@@ -9,6 +9,7 @@ import {
 	BrokerSessionPort,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
+	SessionBusyStalledError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
 import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
@@ -1840,6 +1841,94 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 	).rejects.toThrow(/busy/);
 	// Attempts at 0s, 2s, 4s, 6s; the 6s refusal lands past the 5s deadline and surfaces.
 	expect(sends).toBe(4);
+});
+
+async function busyHostFixture(originKey: string) {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey, epoch: 0 });
+	const bucket = join(agentDir, "sessions", "bucket");
+	await mkdir(bucket, { recursive: true });
+	const transcript = join(bucket, "2026-10-26T00-00-00_sdk-1.jsonl");
+	await writeFile(transcript, '{"type":"session"}\n');
+	return { repo, transcript, authority };
+}
+
+/** `session inspect` for a host that reports `active` with an activity stamp that never moves. */
+const wedgedInspect: CliRunner = async (args) => {
+	if (args.join(" ") !== "sdk session inspect sdk-1") throw new Error(`unexpected command ${args.join(" ")}`);
+	return {
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { session: { live: true, activity: { state: "active", at: 1_000 } } } }),
+		stderr: "",
+	};
+};
+
+test("a busy host whose activity stamp and transcript never move is reported stalled, never having sent (#687)", async () => {
+	const { repo, authority } = await busyHostFixture("busy-stalled");
+	let clock = 0;
+	let sends = 0;
+	const relay = scriptedRelay(() => {
+		sends++;
+		return { ok: false, error: { code: "busy", message: "busy" } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: wedgedInspect,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const error = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-stall1", busyStallMs: 60_000 })
+		.catch((caught: unknown) => caught);
+	expect(error).toBeInstanceOf(SessionBusyStalledError);
+	expect((error as SessionBusyStalledError).silentMs).toBe(60_000);
+	expect((error as SessionBusyStalledError).evidence).toContain("activity=active@1000");
+	// The busy refusal is durable: the prompt was provably never accepted.
+	expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef: "gw-p-stall1" })).toBe("busy");
+	// Sampled at 0s, 30s and 60s; it gave up at 60s, long before the 10-minute busy deadline.
+	expect(clock).toBe(60_000);
+	expect(sends).toBe(31);
+});
+
+test("a busy host whose transcript keeps growing is waited out, not reported stalled (#687)", async () => {
+	const { repo, transcript, authority } = await busyHostFixture("busy-progress");
+	let clock = 0;
+	let sends = 0;
+	const relay = scriptedRelay(() => {
+		sends++;
+		if (sends < 100) return { ok: false, error: { code: "busy", message: "busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: wedgedInspect,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+			// The running turn keeps writing its transcript.
+			await appendFile(transcript, `{"type":"message","n":${clock}}\n`);
+		},
+	});
+	const receipt = await port.send({
+		sessionId: "sdk-1",
+		repo,
+		text: "hi",
+		opRef: "gw-p-progress1",
+		busyStallMs: 60_000,
+	});
+	expect(receipt.operationRef).toBe("gw-p-progress1");
+	// 99 busy refusals spanned 198s, more than three stall windows, without a stall.
+	expect(clock).toBe(198_000);
 });
 
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
