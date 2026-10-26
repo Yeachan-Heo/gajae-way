@@ -285,3 +285,4 @@ test("authored-note digest never returns contract_unmet echoes (#369)", async ()
 		expect(database.monitors.recentAuthoredNotes("m1", 5).map((r) => r.note)).toEqual(["published r-1"]);
 	});
 });
+

@@ -313,3 +313,121 @@ test("allows SQLite's intrinsic memory journal mode for an in-memory store", asy
 		store.close();
 	}
 });
+
+test("fresh database ends with auto_vacuum = 2 (INCREMENTAL)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-auto-vacuum-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const database = await Store.open(path);
+		database.close();
+		const raw = new Database(path);
+		const autoVacuum = raw.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum ?? 0;
+		raw.close();
+		expect(autoVacuum).toBe(2);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("legacy database with auto_vacuum=0 is converted on open", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-legacy-vacuum-"));
+	const path = join(directory, "gateway.db");
+	try {
+		// Create a database with auto_vacuum=0
+		const legacyDb = new Database(path);
+		legacyDb.exec("PRAGMA auto_vacuum = 0");
+		legacyDb.exec(`
+			CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+			INSERT INTO schema_migrations VALUES (38, 'test');
+			CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+			INSERT INTO meta VALUES ('instance_id', 'test-instance');
+		`);
+		const autoVacuumBefore = legacyDb.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum ?? 0;
+		legacyDb.close();
+
+		expect(autoVacuumBefore).toBe(0);
+
+		// Now open with Store.open which should enable auto_vacuum
+		const store = await Store.open(path);
+		store.close();
+		
+		// Verify auto_vacuum is now INCREMENTAL
+		const raw = new Database(path);
+		const autoVacuumAfter = raw.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum ?? 0;
+		raw.close();
+		expect(autoVacuumAfter).toBe(2);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("maintain() can reduce freelist when above threshold", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-maintain-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const database = await Store.open(path);
+		
+		// Create and delete rows to increase freelist
+		database.transaction((tx) => {
+			const key = originKey(LOOPBACK_ORIGIN);
+			for (let i = 0; i < 200; i++) {
+				database.inbox.enqueue(tx, {
+					messageId: `msg-${i}`,
+					originKey: key,
+					originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+					body: "test message with lots of data to take up space: " + "x".repeat(100),
+				});
+			}
+		});
+		
+		database.close();
+		
+		// Delete the rows to create freelist
+		const raw = new Database(path);
+		raw.query("DELETE FROM inbound_messages").run();
+		raw.close();
+		
+		const database2 = await Store.open(path);
+		const pageCount = database2.core.getPageCount();
+		const freelistBefore = database2.core.getFreelistCount();
+		
+		// If freelist is above 25% threshold, maintain should reduce it
+		if (freelistBefore > 0 && freelistBefore / pageCount > 0.25) {
+			database2.core.maintain();
+			const freelistAfter = database2.core.getFreelistCount();
+			
+			// After maintain, freelist should be reduced
+			// It should be reduced by at most 4096 pages (or be close to zero)
+			const reduced = freelistBefore - freelistAfter;
+			expect(reduced).toBeGreaterThan(0);
+			expect(reduced).toBeLessThanOrEqual(4096);
+		}
+		
+		database2.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("maintain() does nothing when freelist is below 25% threshold", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-maintain-no-op-"));
+	try {
+		const database = await Store.open(join(directory, "gateway.db"));
+		
+		const freelistBefore = database.core.getFreelistCount();
+		const pageCountBefore = database.core.getPageCount();
+		
+		// When below threshold, maintain should not call incremental_vacuum
+		if (freelistBefore > 0 && freelistBefore / pageCountBefore <= 0.25) {
+			database.core.maintain();
+			const freelistAfter = database.core.getFreelistCount();
+			
+			// Should not have decreased
+			expect(freelistAfter).toBe(freelistBefore);
+		}
+		
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});

@@ -149,3 +149,16 @@ test("census handles pre-v36 database without work_journal table", async () => {
 		} catch {}
 	}
 });
+
+test("census reports page_count, freelist_count, and freelistByteSize", async () => {
+	const f = await fixture();
+	const raw = new Database(f.path, { readonly: true });
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()?.page_size ?? 4096;
+	raw.close();
+	
+	const report = await runCensus(f.config);
+	
+	expect(report.pageCount).toBeGreaterThan(0);
+	expect(report.freelistCount).toBeGreaterThanOrEqual(0);
+	expect(report.freelistByteSize).toBe(report.freelistCount * pageSize);
+});

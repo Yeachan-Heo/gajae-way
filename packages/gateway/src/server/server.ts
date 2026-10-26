@@ -1251,7 +1251,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			for (let pass = 0; pass < 200 && !retentionStopped; pass++) {
 				const result = options.database.sweep();
 				const total = Object.values(result.deleted).reduce((sum, n) => sum + n, 0);
-				if (total > 0) console.error(JSON.stringify({ retention: result.deleted }));
+				if (total > 0) console.info(JSON.stringify({ retention: result.deleted }));
 				if (!result.more) break;
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
