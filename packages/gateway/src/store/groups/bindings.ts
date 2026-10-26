@@ -1023,8 +1023,8 @@ export class BindingsGroup {
 							)
 					)
 				)) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)`,
-		)
-		.run(tx, cutoff.completedBefore, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL), cutoff.pendingBefore).changes;
+			)
+			.run(tx, cutoff.completedBefore, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL), cutoff.pendingBefore).changes;
 	}
 
 	brokerOperation(
