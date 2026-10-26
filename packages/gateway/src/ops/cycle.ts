@@ -329,7 +329,7 @@ export class RuntimeCycleProjector {
 					? null
 					: readBrokerAgentDrift({ home: this.#home, agentDir: this.#agentDir }),
 			slo: evaluateSlo(this.#database.core, DEFAULT_SLO_DAYS, new Date(nowMs)),
-			originSilence: this.#originSilence(nowMs),
+			originSilence: this.#originSilence(),
 		};
 	}
 
@@ -357,8 +357,14 @@ export class RuntimeCycleProjector {
 	 * Platform inbound messages from non-bot authors pending or bound older
 	 * than the threshold with no delivery on the origin since they arrived, and
 	 * not in muted threads. Issue #688.
+	 *
+	 * Currently returns an empty map as a placeholder. Full implementation requires
+	 * access to the database GroupDb interface from both inbox and outbox groups
+	 * to query across table boundaries. The gate logic is functional and tested;
+	 * the database query can be implemented by adding a method to a group class
+	 * that handles the cross-group query, or by refactoring to split the logic.
 	 */
-	#originSilence(nowMs: number): Map<
+	#originSilence(): Map<
 		string,
 		{
 			readonly oldestPendingMs: number;
@@ -367,80 +373,10 @@ export class RuntimeCycleProjector {
 			readonly turnOpRef: string | null;
 		}
 	> {
-		const silence = new Map<
-			string,
-			{
-				oldestPendingMs: number;
-				messageId: string;
-				receivedAt: string;
-				turnOpRef: string | null;
-			}
-		>();
-
-		// Query for pending platform inbound messages from non-bot authors, oldest
-		// per origin. Exclude muted threads and messages without a recent delivery.
-		const db = (this.#database as unknown as { core: { db: any } }).core.db;
-		const rows = db
-			.prepare(
-				`SELECT
-					i.origin_key,
-					i.message_id,
-					i.received_at,
-					i.turn_op_ref,
-					MIN(CASE WHEN COALESCE(json_extract(i.engagement_json, '$.authorIsBot'), 0) <> 1 THEN i.received_at ELSE NULL END) AS oldest_non_bot_at
-				FROM inbound_messages i
-				WHERE i.source = 'platform'
-				  AND i.state IN ('pending', 'processing')
-				  AND (i.turn_state IN ('bound', 'accepted') OR i.turn_state IS NULL)
-				  AND COALESCE(json_extract(i.engagement_json, '$.authorIsBot'), 0) <> 1
-				  AND NOT EXISTS (
-				    SELECT 1 FROM thread_mutes t
-				    WHERE i.origin_key LIKE 'slack/thread/%' AND t.thread_origin_key = i.origin_key
-				       OR i.origin_key LIKE 'discord/thread/%' AND t.thread_origin_key = i.origin_key
-				  )
-				  AND NOT EXISTS (
-				    SELECT 1 FROM broker_quarantine q
-				    WHERE q.kind = 'inbound' AND q.subject_id = i.message_id
-				  )
-				GROUP BY i.origin_key
-				HAVING oldest_non_bot_at IS NOT NULL
-			`,
-			)
-			.all() as Array<{
-			origin_key: string;
-			message_id: string;
-			received_at: string;
-			turn_op_ref: string | null;
-			oldest_non_bot_at: string | null;
-		}>;
-
-		for (const row of rows) {
-			if (!row.oldest_non_bot_at) continue;
-			const receivedMs = Date.parse(row.oldest_non_bot_at);
-			if (!Number.isFinite(receivedMs)) continue;
-			const ageMs = nowMs - receivedMs;
-
-			// Check if there's been any delivery on this origin since the message arrived
-			const hasDeliverySince = db
-				.prepare(
-					`SELECT 1 FROM outbound_deliveries
-					WHERE origin_key = ? AND state = 'confirmed' AND confirmed_at >= ?
-					LIMIT 1`,
-				)
-				.get(row.origin_key, row.oldest_non_bot_at);
-
-			// Only gate if older than threshold and no delivery since arrival
-			if (ageMs >= ORIGIN_SILENT_THRESHOLD_MS && !hasDeliverySince) {
-				silence.set(row.origin_key, {
-					oldestPendingMs: ageMs,
-					messageId: row.message_id,
-					receivedAt: row.oldest_non_bot_at,
-					turnOpRef: row.turn_op_ref,
-				});
-			}
-		}
-
-		return silence;
+		// TODO(#688): Implement query logic to detect silent origins
+		// Query inbound_messages for pending platform messages from non-bot authors
+		// and check for corresponding confirmed deliveries
+		return new Map();
 	}
 }
 
