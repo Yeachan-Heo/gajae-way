@@ -4,11 +4,7 @@ import { resolve, sep } from "node:path";
 export type ActionGuardMode = "permissive" | "restricted";
 export type ActionGuardResult =
 	| { readonly allowed: true }
-	| {
-			readonly refused: true;
-			readonly floor: "unrecoverable" | "path-scope" | "gjc-direct-spawn";
-			readonly reason: string;
-	  };
+	| { readonly refused: true; readonly floor: "unrecoverable" | "path-scope" | "gjc-direct-spawn"; readonly reason: string };
 
 /**
  * Gateway-side command floors. P1 does not execute commands in the gateway;
@@ -34,12 +30,8 @@ export class ActionGuard {
 			return { refused: true, floor: "unrecoverable", reason: "unrecoverable command floor" };
 		if (violatesPathScope(command, this.#home, this.#gajaewayHome))
 			return { refused: true, floor: "path-scope", reason: "recursive deletion path is outside permitted scope" };
-		if (spawnsDjcDirectly(command))
-			return {
-				refused: true,
-				floor: "gjc-direct-spawn",
-				reason: "gjc sessions must be launched through gajaeway work.start",
-			};
+		if (spawnsGjcDirectly(command))
+			return { refused: true, floor: "gjc-direct-spawn", reason: "gjc sessions must be launched through gajaeway work.start" };
 		return { allowed: true };
 	}
 }
@@ -78,25 +70,68 @@ function within(path: string, parent: string): boolean {
 
 /**
  * Detects patterns that attempt to spawn gjc sessions directly from a turn.
- * Blocked patterns: gjc -p, gjc <subcommand>, tmux/nohup/setsid gjc, etc.
- * Does NOT block: gajaeway work.start, legitimate gjc wrapper invocations.
+ * Blocked patterns: bare gjc, gjc -p/--print, gjc <prompt>, gjc sdk session create, tmux/nohup/setsid/screen gjc.
+ * Does NOT block: gjc state, gjc accounts, gjc --version, gjc help, or other non-spawn subcommands.
+ * Does NOT block: gajaeway work.start with gjc commands, legitimate gjc wrapper invocations.
  * Known bypass: complex shell syntax like printf/echo/eval, $(subshell gjc),
  * or deliberate obfuscation that doesn't literally contain 'gjc' boundaries.
  */
-function spawnsDjcDirectly(command: string): boolean {
-	// Skip checking if the command starts with gajaeway (allowed pattern)
-	// gajaeway work.start is the correct way to run gjc through the gateway
-	if (/^\s*gajaeway\b/.test(command)) return false;
+function spawnsGjcDirectly(command: string): boolean {
+	// Strategy: Only block gjc invocations that spawn new sessions.
+	// Subcommands like 'state', 'accounts', 'help', etc. do not spawn sessions and are allowed.
+	
+	const removeLegitimateArgs = (cmd: string): string => {
+		// Remove quoted arguments to gajaeway/work.* commands to avoid false positives
+		// e.g., 'gajaeway work.start "task" "gjc -p"' should not be blocked
+		return cmd.replace(/(?:gajaeway|work\.\w+)\s+[^;&|]*['"]([^'"]*)['"][^;&|]*/g, (match, inside) => {
+			return match.replace(/['"][^'"]*['"]/g, "'_'");
+		});
+	};
+	
+	const cleaned = removeLegitimateArgs(command);
 
-	return (
-		// Direct gjc invocations: gjc, gjc -p, gjc version, etc.
-		// Must NOT match: gjc-wrapper, GJCFOO, mygjc
-		/(?:^|[;&|]\s*|\bexec\s+)\bgjc(?:\s+|$|[^a-zA-Z0-9_-])/.test(command) ||
-		// tmux new-session/new-window/send-keys with gjc (even quoted)
-		/\btmux\s+(?:new-session|new-window|send-keys)[\s\S]*?\bgjc\b/.test(command) ||
-		// nohup gjc, setsid gjc, screen gjc - check for gjc anywhere
-		/\b(?:nohup|setsid|screen)\b.*\bgjc\b/.test(command) ||
-		// gjc sdk session create (explicit subcommand pattern)
-		/\bgjc\s+sdk\s+session\s+create\b/.test(command)
-	);
+	// Block execution wrappers: tmux, nohup, setsid, screen
+	if (/\btmux\s+(?:new-session|new-window|send-keys)[\s\S]*?\bgjc\b/.test(command)) return true;
+	if (/\b(?:nohup|setsid|screen)\b[\s\S]*?\bgjc\b/.test(command)) return true;
+
+	// Block explicit spawn subcommand
+	if (/\bgjc\s+sdk\s+session\s+create\b/.test(cleaned)) return true;
+
+	// Check for bare gjc (no arguments) or gjc with only separators/redirects after it
+	if (/(?:^|[;&|]\s*|\bexec\s+)\bgjc(?:\s*(?:[;&|]|$))/.test(cleaned)) return true;
+
+	// Check for gjc with arguments
+	const gjcWithArgsMatch = /(?:^|[;&|]\s*|\bexec\s+)\bgjc\s+([^\s;&|]+)/.exec(cleaned);
+	if (gjcWithArgsMatch) {
+		const firstArg = gjcWithArgsMatch[1];
+
+		// Block print flags (-p, --print)
+		if (firstArg === "-p" || firstArg === "--print") return true;
+
+		// Known non-spawning subcommands and flags
+		// These are gjc commands that don't launch sessions, so they should be allowed
+		const nonSpawningPatterns = new Set([
+			// Informational subcommands
+			"state", "--version", "-v", "version", "help", "-h", "--help",
+			// Configuration/account subcommands
+			"accounts", "setup", "skill", "move",
+			// SDK subcommands (sdk itself doesn't spawn; specific ones like 'sdk session create' are blocked separately)
+			"sdk",
+		]);
+
+		// If first arg is a flag starting with -, allow it (these are options to gjc itself, not prompts)
+		if (firstArg.startsWith("-") && !nonSpawningPatterns.has(firstArg)) {
+			// Unknown flag - but don't block flags, as they might be valid gjc options
+			return false;
+		}
+
+		// If it's a known non-spawning subcommand, it's safe
+		if (nonSpawningPatterns.has(firstArg)) return false;
+
+		// Otherwise, treat as a positional prompt argument and block it
+		// (e.g., 'gjc "write a function"')
+		return true;
+	}
+
+	return false;
 }
