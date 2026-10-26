@@ -183,7 +183,7 @@ test("aggressive attempt_updated sweep deletes superseded rows correctly", async
 
 		raw.exec(
 			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
-			 VALUES 
+			 VALUES
 			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
@@ -227,7 +227,7 @@ test("terminal attempt events are not deleted by attempt_updated sweep", async (
 
 		raw.exec(
 			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
-			 VALUES 
+			 VALUES
 			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_terminal', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}')`,
