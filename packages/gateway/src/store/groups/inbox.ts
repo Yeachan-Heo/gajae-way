@@ -24,6 +24,7 @@ export interface InboundMessageRow {
 	readonly bound_session_id: string | null;
 	readonly dispatched_at: string | null;
 	readonly terminal_delivery_id: string | null;
+	readonly send_attempted_at: string | null;
 }
 
 export interface CrossSessionWatchRow {
@@ -439,6 +440,16 @@ export class InboxGroup {
 		return accepted;
 	}
 
+	markSendAttempted(tx: WriteTx, opRef: string, sentAt = new Date().toISOString()): boolean {
+		const marked =
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET send_attempted_at = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND turn_state = 'bound' AND send_attempted_at IS NULL",
+				)
+				.run(tx, sentAt, opRef).changes > 0;
+		return marked;
+	}
+
 	turnDispatchedAt(opRef: string): string | undefined {
 		return (
 			(
@@ -515,7 +526,7 @@ export class InboxGroup {
 	turnRequeue(tx: WriteTx, opRef: string): number {
 		return this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
+				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL, send_attempted_at = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
 			)
 			.run(tx, opRef).changes;
 	}

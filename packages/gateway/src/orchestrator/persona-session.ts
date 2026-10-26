@@ -1631,6 +1631,20 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
+			const turnRow = this.#manager.database.inbox.turnRow(turn.opRef);
+			const sendAttempted = turnRow?.send_attempted_at !== null && turnRow?.send_attempted_at !== undefined;
+			if (!sendAttempted) {
+				// Bound but never sent: requeue without GJC query.
+				const attempt = this.#manager.database.transaction((tx) =>
+					retryInboundTurn(this.#manager.database, tx, turn.opRef),
+				);
+				this.#manager.log(
+					`recovery_requeue origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=never_sent attempt=${attempt}`,
+				);
+				await this.#dispatchNext();
+				return;
+			}
+			// Send was attempted but outcome unknown; use reconcile path.
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=operation_state_unknown`,
 				"warn",
@@ -2186,6 +2200,9 @@ class OriginActor {
 			return;
 		}
 		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
+		// Write send_attempted marker in its own transaction immediately before port.send.
+		// If a crash occurs between this marker and port.send, recovery knows the send was attempted.
+		this.#manager.database.transaction((tx) => this.#manager.database.inbox.markSendAttempted(tx, opRef));
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
