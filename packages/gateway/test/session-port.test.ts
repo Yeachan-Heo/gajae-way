@@ -1842,7 +1842,7 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 	expect(sends).toBe(4);
 });
 
-test("send waits briefly on busy and does not fail if host makes progress", async () => {
+test("busy + activity.at frozen + state active for > wedge window -> terminateHost called once", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
 
@@ -1856,14 +1856,39 @@ test("send waits briefly on busy and does not fail if host makes progress", asyn
 	const repo = join(home, "workspace");
 	let clock = 0;
 	let sends = 0;
-	const run: CliRunner = async () => {
-		throw new Error("unexpected command");
+	let livenessCalls = 0;
+	const activityAt = 1000; // Fixed activity timestamp
+	const run: CliRunner = async (args) => {
+		if (args.includes("inspect")) {
+			livenessCalls++;
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: {
+							sessionId: "sdk-1",
+							pid: 12345,
+							live: true,
+							deleted: false,
+							locator: { cwd: repo },
+							// Activity is frozen at activityAt; state is active
+							activity: { state: "compacting", at: activityAt },
+						},
+					},
+				}),
+				stderr: "",
+			};
+		}
+		throw new Error(`unexpected command: ${args.join(" ")}`);
 	};
 	const relay = scriptedRelay(() => {
 		sends++;
-		if (sends <= 2) return { ok: false, error: { code: "busy", message: "busy" } };
-		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+		// Always return busy
+		return { ok: false, error: { code: "busy", message: "busy" } };
 	});
+
+	let terminateHostCalled = false;
 	const port = new BrokerSessionPort({
 		database,
 		authority,
@@ -1873,18 +1898,193 @@ test("send waits briefly on busy and does not fail if host makes progress", asyn
 		sleep: async (ms) => {
 			clock += ms;
 		},
+		busyWedgeMs: 60_000, // 60s wedge window
 	});
+
+	// Hook into terminateHost to track calls (by wrapping it)
+	const origTerminate = port.terminateHost.bind(port);
+	port.terminateHost = async (input) => {
+		terminateHostCalled = true;
+		return origTerminate(input);
+	};
+
+	// Set deadline to more than the wedge window
+	await expect(
+		port.send({
+			sessionId: "sdk-1",
+			repo,
+			text: "hi",
+			opRef: "gw-p-wedged",
+			busyWaitMs: 600_000, // 10 min, enough for termination
+		}),
+	).rejects.toThrow(/busy/);
+
+	// Should have called liveness check at least once
+	expect(livenessCalls).toBeGreaterThan(0);
+	// Should have sent at least once (the first attempt)
+	expect(sends).toBeGreaterThan(0);
+	// Should have called terminateHost
+	expect(terminateHostCalled).toBe(true);
+});
+
+test("busy + activity.at advancing -> no terminateHost call, send eventually accepted", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-progress",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	let clock = 0;
+	let sends = 0;
+	let currentActivityAt = 1000; // Activity advances over time
+	const run: CliRunner = async (args) => {
+		if (args.includes("inspect")) {
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: {
+							sessionId: "sdk-1",
+							pid: 12345,
+							live: true,
+							deleted: false,
+							locator: { cwd: repo },
+							// Activity advances with time
+							activity: { state: "compacting", at: currentActivityAt },
+						},
+					},
+				}),
+				stderr: "",
+			};
+		}
+		throw new Error(`unexpected command: ${args.join(" ")}`);
+	};
+	const relay = scriptedRelay(() => {
+		sends++;
+		// After 3 attempts, accept
+		if (sends <= 3) return { ok: false, error: { code: "busy", message: "busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+
+	let terminateHostCalled = false;
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+			// Activity advances with each poll
+			currentActivityAt += Math.floor(ms / 100);
+		},
+		busyWedgeMs: 60_000,
+	});
+
+	// Hook into terminateHost to track calls
+	const origTerminate = port.terminateHost.bind(port);
+	port.terminateHost = async (input) => {
+		terminateHostCalled = true;
+		return origTerminate(input);
+	};
 
 	const receipt = await port.send({
 		sessionId: "sdk-1",
 		repo,
 		text: "hi",
-		opRef: "gw-p-busy-basic",
-		busyWaitMs: 10_000,
+		opRef: "gw-p-progress",
+		busyWaitMs: 600_000,
 	});
-	expect(receipt.operationRef).toBe("gw-p-busy-basic");
-	// Should have retried the busy condition
+
+	expect(receipt.operationRef).toBe("gw-p-progress");
+	// terminateHost should never be called because activity keeps advancing
+	expect(terminateHostCalled).toBe(false);
+	// Should have sent at least 3 times before accepting
 	expect(sends).toBeGreaterThanOrEqual(3);
+});
+
+test("busy + activity.at frozen but shorter than wedge window -> no termination", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo: join(home, "workspace"),
+		originKey: "busy-short-freeze",
+		epoch: 0,
+	});
+	const repo = join(home, "workspace");
+	let clock = 0;
+	let sends = 0;
+	const activityAt = 1000; // Fixed activity timestamp
+	const run: CliRunner = async (args) => {
+		if (args.includes("inspect")) {
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: {
+							sessionId: "sdk-1",
+							pid: 12345,
+							live: true,
+							deleted: false,
+							locator: { cwd: repo },
+							// Activity is frozen at activityAt; state is active
+							activity: { state: "compacting", at: activityAt },
+						},
+					},
+				}),
+				stderr: "",
+			};
+		}
+		throw new Error(`unexpected command: ${args.join(" ")}`);
+	};
+	const relay = scriptedRelay(() => {
+		sends++;
+		if (sends <= 2) return { ok: false, error: { code: "busy", message: "busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+
+	let terminateHostCalled = false;
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+		busyWedgeMs: 60_000, // 60s wedge window
+	});
+
+	// Hook into terminateHost to track calls
+	const origTerminate = port.terminateHost.bind(port);
+	port.terminateHost = async (input) => {
+		terminateHostCalled = true;
+		return origTerminate(input);
+	};
+
+	// Set deadline shorter than the wedge window (only 5s)
+	const receipt = await port.send({
+		sessionId: "sdk-1",
+		repo,
+		text: "hi",
+		opRef: "gw-p-short",
+		busyWaitMs: 5_000, // Only 5s, much less than 60s wedge window
+	});
+
+	expect(receipt.operationRef).toBe("gw-p-short");
+	// terminateHost should not be called because we hit the deadline before the wedge window
+	expect(terminateHostCalled).toBe(false);
 });
 
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {

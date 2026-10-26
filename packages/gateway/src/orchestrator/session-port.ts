@@ -457,6 +457,8 @@ export interface BrokerSessionPortOptions {
 	readonly authority: BrokerAuthority;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
+	/** Test override for busy wedge detection timeout (default: BUSY_WEDGE_PROGRESS_TIMEOUT_MS). */
+	readonly busyWedgeMs?: number;
 }
 
 const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
@@ -488,10 +490,6 @@ function createRotationMetaKey(originKey: string): string {
  * go idle (bounded) and resend under the same op-ref before giving up.
  */
 export const SESSION_BUSY_CODE = "busy";
-const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
-const BUSY_POLL_MS = 2_000;
-/** Maximum silence on a busy host before it's judged wedged and terminated. */
-const BUSY_WEDGE_PROGRESS_TIMEOUT_MS = 60_000;
 const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
 /**
  * `compaction.run` answers only after gjc finished compacting, which takes tens
@@ -499,6 +497,11 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
+/** Maximum silence on a busy host before it's judged wedged and terminated. */
+const BUSY_WEDGE_PROGRESS_TIMEOUT_MS = 2 * COMPACTION_TIMEOUT_MS;
+/** How long a `busy` refusal is retried before it surfaces as a failure; must exceed BUSY_WEDGE_PROGRESS_TIMEOUT_MS. */
+const DEFAULT_BUSY_WAIT_MS = BUSY_WEDGE_PROGRESS_TIMEOUT_MS + 2 * 60_000;
+const BUSY_POLL_MS = 2_000;
 
 type SignaledHost = {
 	readonly pid: number;
@@ -519,6 +522,7 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #tailRunner: TailRunner;
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
+	readonly #busyWedgeMs: number;
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly #bindings = new Map<string, Promise<SessionBinding>>();
 	readonly #signaledHosts = new Map<string, SignaledHost>();
@@ -539,6 +543,7 @@ export class BrokerSessionPort implements SessionPort {
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+		this.#busyWedgeMs = options.busyWedgeMs ?? BUSY_WEDGE_PROGRESS_TIMEOUT_MS;
 	}
 
 	async failedTurnEvidence(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined> {
@@ -1391,6 +1396,7 @@ export class BrokerSessionPort implements SessionPort {
 		let waited = false;
 		let submission = intent;
 		let busyWedgeLastActivityAt: number | undefined;
+		let busyWedgeLastActivityObservedAtMs: number | undefined;
 		let busyWedgeHostTerminated = false;
 		for (;;) {
 			if (isBrokerPromptBusyRefusal(submission)) {
@@ -1455,14 +1461,17 @@ export class BrokerSessionPort implements SessionPort {
 					const activityAt = liveness.activity?.at;
 					const activityState = liveness.activity?.state;
 
-					if (activityAt !== undefined) {
-						busyWedgeLastActivityAt ??= activityAt;
-
-						// If host is not idle and hasn't changed activity for the progress timeout,
-						// it's wedged. Rearm activity only when it changes (different timestamp).
+					if (activityAt !== undefined && activityState !== "idle") {
+						const now = this.#now();
 						if (activityAt !== busyWedgeLastActivityAt) {
+							// Activity changed; reset tracking to this new activity.at
 							busyWedgeLastActivityAt = activityAt;
-						} else if (activityState !== "idle" && this.#now() - activityAt >= BUSY_WEDGE_PROGRESS_TIMEOUT_MS) {
+							busyWedgeLastActivityObservedAtMs = now;
+						} else if (
+							busyWedgeLastActivityObservedAtMs !== undefined &&
+							now - busyWedgeLastActivityObservedAtMs >= this.#busyWedgeMs
+						) {
+							// Same activity.at for longer than the wedge window; host is wedged
 							busyWedgeHostTerminated = true;
 							const terminateResult = await this.terminateHost({
 								sessionId: input.sessionId,
