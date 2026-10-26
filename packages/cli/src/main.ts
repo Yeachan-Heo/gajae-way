@@ -23,7 +23,13 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import {
+	LOOPBACK_ORIGIN,
+	OPS_CYCLE_MAX_LIMIT,
+	originKey,
+	ProtocolError,
+	WORK_JOBS_MAX_LIMIT,
+} from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -1199,7 +1205,34 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				throw new Error(CLI_USAGE);
 		}
 	} catch (error) {
-		console.error(error instanceof Error ? error.message : String(error));
+		const detail = error instanceof ProtocolError ? error.detail : undefined;
+		if (
+			parsed.command === "work" &&
+			(parsed.rest[0] === "run" || parsed.rest[0] === "start") &&
+			error instanceof ProtocolError &&
+			error.code === "verb_failed" &&
+			typeof detail === "object" &&
+			detail !== null &&
+			!Array.isArray(detail) &&
+			"reasonCode" in detail &&
+			detail.reasonCode === "send_rejected"
+		) {
+			// Never print structured detail or a remote refusal message. Only these
+			// exact diagnostic tokens are safe; none implies automatic replay.
+			const cause = "cause" in detail ? detail.cause : undefined;
+			const safeCause =
+				typeof cause === "string" &&
+				[
+					"busy",
+					"steer_refused",
+					"invalid_params",
+					"not_running",
+					"no_active_turn",
+					"client_ref_conflict",
+					"session_not_found",
+				].includes(cause);
+			console.error(`work send rejected${safeCause ? ` cause=${cause}` : ""}`);
+		} else console.error(error instanceof Error ? error.message : String(error));
 		process.exitCode = 1;
 	}
 }
