@@ -26,18 +26,18 @@ test("gjc direct spawn floor is detected in both modes", () => {
 
 	// Blocked patterns - only patterns that actually spawn sessions
 	const blockedPatterns = [
-		"gjc",                              // bare gjc with no args
-		"gjc -p",                          // print flag
-		"gjc --print",                     // print flag long form
-		"gjc sdk session create",          // explicit spawn subcommand
-		"nohup gjc -p",                    // wrapped in nohup
-		"setsid gjc sdk session create",   // wrapped in setsid
-		"tmux new-session -d -c /tmp \"gjc -p\"",  // wrapped in tmux new-session
+		"gjc", // bare gjc with no args
+		"gjc -p", // print flag
+		"gjc --print", // print flag long form
+		"gjc sdk session create", // explicit spawn subcommand
+		"nohup gjc -p", // wrapped in nohup
+		"setsid gjc sdk session create", // wrapped in setsid
+		'tmux new-session -d -c /tmp "gjc -p"', // wrapped in tmux new-session
 		"tmux send-keys -t session 'gjc'", // wrapped in tmux send-keys
-		"exec gjc -p",                     // exec gjc -p
-		"screen -S mysession gjc -p",      // wrapped in screen
-		"setsid gjc 2>&1",                 // bare gjc wrapped in setsid
-		"gjc \"write a function\"",         // gjc with prompt argument
+		"exec gjc -p", // exec gjc -p
+		"screen -S mysession gjc -p", // wrapped in screen
+		"setsid gjc 2>&1", // bare gjc wrapped in setsid
+		'gjc "write a function"', // gjc with prompt argument
 	];
 
 	for (const pattern of blockedPatterns) {
@@ -54,21 +54,21 @@ test("gjc direct spawn floor allows legitimate commands", () => {
 		// gajaeway work.start with gjc commands (wrapped in work.start)
 		"gajaeway work.start mywork 'gjc -p'",
 		"gajaeway work.start 'exec-task' --cwd /tmp 'gjc sdk session create'",
-		
+
 		// Non-spawn gjc subcommands
-		"gjc state",                      // state subcommand
-		"gjc accounts",                   // accounts subcommand
-		"gjc --version",                  // version flag
-		"gjc -v",                         // version short flag
-		"gjc version",                    // version subcommand
-		"gjc help",                       // help subcommand
-		"gjc -h",                         // help short flag
-		"gjc --help",                     // help long flag
-		"gjc skill",                      // skill subcommand
-		"gjc setup",                      // setup subcommand
-		"gjc move",                       // move subcommand
-		"gjc sdk",                        // sdk subcommand (spawning requires 'gjc sdk session create')
-		
+		"gjc state", // state subcommand
+		"gjc accounts", // accounts subcommand
+		"gjc --version", // version flag
+		"gjc -v", // version short flag
+		"gjc version", // version subcommand
+		"gjc help", // help subcommand
+		"gjc -h", // help short flag
+		"gjc --help", // help long flag
+		"gjc skill", // skill subcommand
+		"gjc setup", // setup subcommand
+		"gjc move", // move subcommand
+		"gjc sdk", // sdk subcommand (spawning requires 'gjc sdk session create')
+
 		// Non-gjc commands
 		"git config core.hooksPath",
 		"echo 'gjc' | cat",
