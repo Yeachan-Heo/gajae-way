@@ -1424,6 +1424,23 @@ class OriginActor {
 		return true;
 	}
 
+	/** Retire a bound turn (current or recovered) and schedule its reattachment. */
+	async #retireBoundTurn(bound: BoundTurn, reason: string): Promise<void> {
+		bound.retired = true;
+		this.#clearStallReconciliation(bound);
+		bound.tail?.setTurnRunning(false);
+		await bound.tail?.close();
+		bound.detached = true;
+		this.#retired.set(retiredKey(bound), bound);
+		if (this.#current === bound) this.#current = undefined;
+		await bound.lifecycle.onRetired?.(bound);
+		this.#manager.log(
+			`retired_hold originKey=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${reason}`,
+			"warn",
+		);
+		this.#scheduleRetiredReattach(bound);
+	}
+
 	async #holdForHostCapacity(trigger: InboundMessageRow, epoch: number, live: number): Promise<void> {
 		const max = this.#manager.maxLiveHosts;
 		this.#manager.log(
@@ -1505,43 +1522,26 @@ class OriginActor {
 		// Escalate to recovery hold: close the current turn if it's this one
 		if (this.#current?.turn.opRef === ambiguousHold.opRef) {
 			await this.#closeObserver("recovery_hold_escalation");
-			this.#current.retired = true;
-			this.#clearStallReconciliation(this.#current);
-			this.#current.tail?.setTurnRunning(false);
-			await this.#current.tail?.close();
-			this.#current.detached = true;
-			this.#retired.set(retiredKey(this.#current), this.#current);
-			await this.#current.lifecycle.onRetired?.(this.#current);
-			this.#current = undefined;
+			await this.#retireBoundTurn(this.#current, "recovery_hold_escalation");
 		}
-		// Rotate epoch and post notice
+		// Rotate epoch
 		let nextEpoch = 0;
 		const previousSessionId = ambiguousHold.sessionId;
-		const noticeMessageId = `recovery_hold_escalated_${randomUUID()}`;
-		const originRef = JSON.parse(fullRow.origin_ref_json) as { platform?: string; kind?: string; conversationId?: string; peerId?: string };
 		this.#manager.database.transaction((tx) => {
 			nextEpoch = this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-			// Post exactly one notice to the origin
-			if (originRef.platform !== "loopback") {
-				const noticeAccepted = this.#manager.database.inbox.enqueue(tx, {
-					messageId: noticeMessageId,
-					originKey: this.originKey,
-					originRefJson: fullRow.origin_ref_json,
-					body: "[Gateway notice] The earlier request's outcome could not be confirmed. Starting fresh.",
-					source: "platform",
-				});
-				if (!noticeAccepted) {
-					this.#manager.log(
-						`recovery_hold_escalated_notice_failed origin=${this.originKey} reason=duplicate_message_id`,
-						"warn",
-					);
-				}
-			}
 		});
 		this.#state = "idle";
 		this.#manager.log(
 			`recovery_hold_escalated origin=${this.originKey} opRef=${ambiguousHold.opRef} heldMs=${heldMs} evidence=host_provably_dead nextEpoch=${nextEpoch}`,
 		);
+		// Emit notice through outbound delivery path with deterministic ID based on opRef
+		await this.#manager.emitBindHold({
+			originKey: this.originKey,
+			trigger: fullRow,
+			reason: "recovery_hold_escalation",
+			notice: "[Gateway notice] The earlier request's outcome could not be confirmed. Starting fresh.",
+			verdict: undefined,
+		});
 		// Terminate the old session
 		if (previousSessionId) await this.#terminateRetiredSession(previousSessionId, "recovery_hold_escalation");
 		// Dispatch next turn with fresh session
@@ -1577,19 +1577,7 @@ class OriginActor {
 		this.#modelRefusalPaused = false;
 		await this.#manager.discardInbound(discarded);
 		if (previous) {
-			previous.retired = true;
-			this.#clearStallReconciliation(previous);
-			previous.tail?.setTurnRunning(false);
-			await previous.tail?.close();
-			previous.detached = true;
-			this.#retired.set(retiredKey(previous), previous);
-			this.#current = undefined;
-			await previous.lifecycle.onRetired?.(previous);
-			this.#manager.log(
-				`retired_hold originKey=${this.originKey} epoch=${previous.epoch} opRef=${previous.turn.opRef} reason=/new`,
-				"warn",
-			);
-			this.#scheduleRetiredReattach(previous);
+			await this.#retireBoundTurn(previous, "/new");
 		}
 		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
 			if (turn.epoch < nextEpoch && !this.#retired.has(`${turn.epoch}:${turn.opRef}`)) {

@@ -1004,7 +1004,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
-		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
+		onBindHold: ({ originKey, trigger, reason, notice }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {
 				origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
@@ -1017,7 +1017,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
-			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id);
+			// Recovery hold escalation uses opRef for deterministic ID to avoid duplication on restart.
+			// All other hold reasons use message_id.
+			const deliveryId =
+				reason === "recovery_hold_escalation" && trigger.turn_op_ref
+					? `gw-h-${createHash("sha256").update(`${originKey}|${trigger.turn_op_ref}|recovery_hold_escalation`).digest("hex").slice(0, 32)}`
+					: deterministicBindHoldDeliveryId(originKey, trigger.message_id);
 			const payload = runtime.delivery.prepare(
 				context?.turnId ?? crypto.randomUUID(),
 				origin,
