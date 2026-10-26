@@ -540,6 +540,80 @@ class ProbePort extends ScriptedSessionPort {
 	}
 }
 
+function insertChecksReport(f: Fixture, state: "pending" | "claimed" | "held" | "undeliverable") {
+	const reportId = workAttemptReportId(f.database.instanceId, f.identity.jobId, "gw-checks-a");
+	f.database.transaction((tx) => {
+		f.database.work.laneReportInsert(
+			tx,
+			{
+				reportId,
+				parentName: "parent",
+				childName: "a",
+				childOpRef: "gw-checks-a",
+				body: "Checks cycle ended",
+				root: null,
+			},
+			END,
+		);
+		if (state === "claimed" || state === "held") {
+			expect(f.database.work.laneReportClaim(tx, reportId, "wake", "gw-parent-wake", null)).toBeDefined();
+			if (state === "held") expect(f.database.work.laneReportHold(tx, reportId, "recovery_indeterminate")).toBe(true);
+		}
+		if (state === "undeliverable") expect(f.database.work.laneReportUndeliverable(tx, reportId)).toBe(true);
+	});
+	return reportId;
+}
+
+for (const historyState of ["attempt_ended", "awaiting_operator"] as const) {
+	for (const reportState of ["pending", "claimed", "held", "undeliverable"] as const) {
+		for (const duringProbe of [false, true]) {
+			test(`${historyState} refuses fresh ${reportState} outgoing checks report ${duringProbe ? "during" : "before"} death probe`, async () => {
+				const port = new ProbePort();
+				const f = await fixture(port);
+				f.putHistory({ state: historyState });
+				// The attempt report has already been delivered; checks uses a fresh ID.
+				f.database.transaction((tx) => {
+					f.database.work.laneReportInsert(
+						tx,
+						{
+							reportId: f.runtime.reportId,
+							parentName: "parent",
+							childName: "a",
+							childOpRef: f.runtime.opRef,
+							body: "Attempt ended",
+							root: null,
+						},
+						END,
+					);
+					expect(
+						f.database.work.laneReportClaim(tx, f.runtime.reportId, "wake", "gw-original-wake", null),
+					).toBeDefined();
+					expect(f.database.work.laneReportConsume(tx, f.runtime.reportId, "gw-original-wake")).toBe(true);
+				});
+				let probes = 0;
+				let before = f.database.work.projectionRows();
+				const binding = f.database.bindings.getSessionRecord(f.sessionKey);
+				const insert = () => {
+					const id = insertChecksReport(f, reportState);
+					expect(id).not.toBe(f.runtime.reportId);
+					before = f.database.work.projectionRows();
+				};
+				if (!duringProbe) insert();
+				port.onProbe = () => {
+					probes++;
+					if (duringProbe) insert();
+				};
+				expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+				expect(probes).toBe(duringProbe ? 1 : 0);
+				expect(f.database.work.projectionRows()).toEqual(before);
+				expect(f.database.bindings.getSessionRecord(f.sessionKey)).toEqual(binding);
+				expect(f.port.closes).toEqual([]);
+				expect(f.port.sends).toEqual([]);
+			});
+		}
+	}
+}
+
 for (const [name, change] of [
 	["history", (f: Fixture) => f.putHistory({ report: "new evidence" })],
 	[

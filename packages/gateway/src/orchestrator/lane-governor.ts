@@ -391,9 +391,8 @@ export class LaneGovernor {
 				return refused("historical runtime and attempt history disagree");
 			const runtimeSnapshots = new Map<string, string>();
 			const reportsUnresolved = () => {
-				const counts = this.#database.work.laneReportCounts(name);
 				return (
-					counts.pending + counts.claimed + counts.held + counts.undeliverable > 0 ||
+					this.#database.work.laneHasUnresolvedReports(name) ||
 					job.attempts.some((attempt) => {
 						const runtime = this.#database.work.workAttemptGet(attempt.opRef);
 						const report = runtime && this.#database.work.laneReportGet(runtime.reportId);
