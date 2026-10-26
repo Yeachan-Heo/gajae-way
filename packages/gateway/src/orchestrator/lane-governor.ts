@@ -419,8 +419,6 @@ export class LaneGovernor {
 						runtime.jobId !== jobId ||
 						runtime.laneKey !== laneKey ||
 						runtime.sessionKey !== sessionKey ||
-						runtime.sessionId !== attempt.sessionId ||
-						runtime.cwd !== job.lane.worktreePath ||
 						runtime.epoch !== owned.epoch ||
 						runtime.settledAt === null ||
 						runtime.decision === "recovery_indeterminate" ||

@@ -128,8 +128,10 @@ async function fixture(
 		if (!stored) throw new Error("fixture runtime missing");
 		const next = { ...stored, ...patch };
 		raw
-			.query("UPDATE work_attempt_runtime SET record_json = ?, settled_at = ?, version = ? WHERE op_ref = ?")
-			.run(JSON.stringify(next), next.settledAt, next.version, runtime.opRef);
+			.query(
+				"UPDATE work_attempt_runtime SET record_json = ?, session_id = ?, settled_at = ?, version = ? WHERE op_ref = ?",
+			)
+			.run(JSON.stringify(next), next.sessionId, next.settledAt, next.version, runtime.opRef);
 	};
 	return {
 		database,
