@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 38;
+export const LATEST_SCHEMA_VERSION = 39;
 
 export interface MigrationHost {
 	readonly database: {
@@ -843,6 +843,19 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(38, new Date().toISOString());
+		});
+	}
+	if (current < 39) {
+		// Issue #685: send_attempted marker. A nullable column to distinguish between
+		// a bound turn that was never sent (NULL) and one that was sent but outcome is unknown.
+		// This enables recovery to requeue never-sent turns instead of holding them indefinitely.
+		host.withTransaction(() => {
+			host.database.execute(
+				"ALTER TABLE inbound_messages ADD COLUMN send_attempted_at TEXT"
+			);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(39, new Date().toISOString());
 		});
 	}
 }
