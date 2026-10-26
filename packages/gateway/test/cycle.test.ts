@@ -56,6 +56,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		brokerExitRecord: undefined,
 		brokerAgent: null,
 		slo: { days: [], windows: [], ok: false },
+		originSilence: new Map(),
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -661,5 +662,78 @@ describe("runtime cycle projection", () => {
 			database.close();
 			await rm(directory, { recursive: true, force: true });
 		}
+	});
+
+	// Issue #688: origin_silent gates when a platform inbound message from a
+	// non-bot author is pending or bound older than the threshold with no delivery
+	// on the origin since arrival, and not in muted threads.
+	test("pending platform message from non-bot author older than threshold with no delivery gates origin_silent", () => {
+		const nowMs = Date.parse(generatedAt);
+		const holdThresholdMs = 15 * 60_000;
+		const messageAge = holdThresholdMs + 1_000; // 1 second past threshold
+		const messageTime = new Date(nowMs - messageAge).toISOString();
+		const result = projectRuntimeCycle(
+			sources({
+				originSilence: new Map([
+					[
+						"discord/dm/c1/peer=p1",
+						{
+							oldestPendingMs: messageAge,
+							messageId: "msg-1",
+							receivedAt: messageTime,
+							turnOpRef: null,
+						},
+					],
+				]),
+			}),
+			generatedAt,
+		);
+		expect(result.gates).toContain("origin_silent");
+		expect(result.phase).toBe("degraded");
+	});
+
+	test("empty origin silence (all below threshold) does not gate origin_silent", () => {
+		const result = projectRuntimeCycle(
+			sources({
+				originSilence: new Map(), // No messages above threshold
+			}),
+			generatedAt,
+		);
+		expect(result.gates).not.toContain("origin_silent");
+		expect(result.phase).toBe("idle");
+	});
+
+	test("multiple origins with silent messages reports all and gates", () => {
+		const nowMs = Date.parse(generatedAt);
+		const holdThresholdMs = 15 * 60_000;
+		const messageAge = holdThresholdMs + 1_000;
+		const messageTime = new Date(nowMs - messageAge).toISOString();
+		const result = projectRuntimeCycle(
+			sources({
+				originSilence: new Map([
+					[
+						"discord/dm/c1/peer=p1",
+						{
+							oldestPendingMs: messageAge,
+							messageId: "msg-1",
+							receivedAt: messageTime,
+							turnOpRef: "op-1",
+						},
+					],
+					[
+						"slack/dm/u123/ch456",
+						{
+							oldestPendingMs: messageAge * 2,
+							messageId: "msg-2",
+							receivedAt: new Date(nowMs - messageAge * 2).toISOString(),
+							turnOpRef: null,
+						},
+					],
+				]),
+			}),
+			generatedAt,
+		);
+		expect(result.gates).toContain("origin_silent");
+		expect(result.phase).toBe("degraded");
 	});
 });
