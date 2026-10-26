@@ -460,14 +460,16 @@ export class InboxGroup {
 				"SELECT message_id, send_context_json FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'",
 			)
 			.get(opRef) as { message_id: string; send_context_json: string | null } | null;
-		if (!trigger) return [];
-		const ids = new Set<string>([trigger.message_id]);
-		if (trigger.send_context_json !== null) {
-			const claimed: unknown = JSON.parse(trigger.send_context_json);
-			if (!Array.isArray(claimed) || !claimed.every((id) => typeof id === "string"))
-				throw new Error(`turn ${opRef} has a malformed send context claim`);
-			for (const id of claimed) ids.add(id);
-		}
+		if (!trigger) throw new Error(`turn ${opRef} has no trigger`);
+		// Every stamped trigger carries an explicit claim (schema 39 claims legacy
+		// ones at upgrade); a missing or malformed claim is corruption.
+		if (trigger.send_context_json === null) throw new Error(`turn ${opRef} has no send context claim`);
+		const claimed: unknown = JSON.parse(trigger.send_context_json);
+		if (!Array.isArray(claimed) || !claimed.every((id) => typeof id === "string"))
+			throw new Error(`turn ${opRef} has a malformed send context claim`);
+		const ids = new Set<string>([trigger.message_id, ...claimed]);
+		const editedTrigger = editedOriginalId(trigger.message_id);
+		if (editedTrigger) ids.add(editedTrigger);
 		const steers = this.#db
 			.prepare("SELECT message_id FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'steer'")
 			.all(opRef) as Array<{ message_id: string }>;

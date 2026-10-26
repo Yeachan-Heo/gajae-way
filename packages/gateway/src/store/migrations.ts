@@ -862,9 +862,19 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			);
 			for (const name of ["send_attempted_at", "send_context_json"])
 				if (!columns.has(name)) host.database.execute(`ALTER TABLE inbound_messages ADD COLUMN ${name} TEXT`);
+			// The legacy prompt's rendered context is unknown, and the backfilled
+			// stamp is only a lower bound on when it rendered. The defensible upper
+			// bound is this migration: no pre-upgrade prompt can have rendered a row
+			// that did not exist yet. Claim every unread row of the origin now, so a
+			// legacy hold never re-renders its inputs and later rows stay unread.
 			host.database.execute(`
 				UPDATE inbound_messages SET send_attempted_at = COALESCE(dispatched_at, received_at)
 					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_attempted_at IS NULL;
+				UPDATE inbound_messages SET send_context_json = (
+						SELECT json_group_array(c.message_id) FROM conversation_context c
+						WHERE c.origin_key = inbound_messages.origin_key AND c.consumed_at IS NULL
+					)
+					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_context_json IS NULL;
 			`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")

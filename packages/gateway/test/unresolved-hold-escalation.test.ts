@@ -40,7 +40,10 @@ class HoldPort extends ScriptedSessionPort {
 
 const MINUTE = 60_000;
 
-async function heldOrigin(name: string, options: { heldForMs: number; live: boolean; reuseHome?: boolean }) {
+async function heldOrigin(
+	name: string,
+	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean },
+) {
 	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const db = database;
@@ -72,7 +75,7 @@ async function heldOrigin(name: string, options: { heldForMs: number; live: bool
 		expect(db.inbox.markSendAttempted(tx, heldOpRef, [], sentAt)).toBe(true);
 	});
 	port.setSessionState(binding.sessionId, { live: options.live });
-	enqueue("m-next", "a newer message", new Date().toISOString());
+	if (options.newerMessage !== false) enqueue("m-next", "a newer message", new Date().toISOString());
 	const logs: string[] = [];
 	const notices: PersonaBindHoldInput[] = [];
 	const answers: Array<{ opRef: string; text: string }> = [];
@@ -274,5 +277,32 @@ test("the recovery bounds reload live and fall back to their defaults (#686, #68
 		]);
 	} finally {
 		await manager.stop();
+	}
+});
+
+test("a failed escalation notice is still posted after its turn settles with no newer message, also after a restart (#686)", async () => {
+	const f = await heldOrigin("notice-orphan", { heldForMs: 11 * MINUTE, live: false, newerMessage: false });
+	f.failNotices(1);
+	await f.manager.recover();
+	expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(true);
+	expect(f.notices).toHaveLength(0);
+	// The held op settles; nothing else is pending and the rotated binding has no session.
+	f.port.setSessionState(f.binding.sessionId, { live: true });
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	f.port.complete(f.heldOpRef, "late answer");
+	await f.manager.reconcile(f.originKey);
+	await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+	expect(f.db.inbox.nonterminalOrigins()).not.toContain(f.originKey);
+	expect(f.db.inbox.pendingOrigins()).not.toContain(f.originKey);
+	await f.manager.stop();
+
+	const restarted = f.startManager();
+	try {
+		await restarted.recover();
+		expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED]);
+		await restarted.recover();
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await restarted.stop();
 	}
 });

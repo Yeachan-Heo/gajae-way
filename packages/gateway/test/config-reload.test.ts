@@ -235,6 +235,9 @@ test("sessions host limits parse, omit absent fields, and reload live", async ()
 	expect(
 		parseConfigFile({ schemaVersion: 1, sessions: { busyStallMs: 60_000, unresolvedHoldMs: 86_400_000 } }).sessions,
 	).toEqual({ busyStallMs: 60_000, unresolvedHoldMs: 86_400_000 });
+	expect(
+		parseConfigFile({ schemaVersion: 1, sessions: { busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 } }).sessions,
+	).toEqual({ busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 });
 	const path = await home();
 	await Bun.write(
 		join(path, "config.json"),
@@ -275,6 +278,8 @@ for (const [sessions, field] of [
 	[{ busyStallMs: "300000" }, "sessions.busyStallMs"],
 	[{ unresolvedHoldMs: 59_999 }, "sessions.unresolvedHoldMs"],
 	[{ unresolvedHoldMs: 600_000.5 }, "sessions.unresolvedHoldMs"],
+	[{ unresolvedHoldMs: 86_400_001 }, "sessions.unresolvedHoldMs"],
+	[{ unresolvedHoldMs: null }, "sessions.unresolvedHoldMs"],
 	[{ maxHosts: 1 }, "sessions may only contain maxLiveHosts, idleRetireMs, idleResetMs, busyStallMs, unresolvedHoldMs"],
 ] as const) {
 	test(`rejects invalid sessions configuration ${JSON.stringify(sessions)}`, () => {

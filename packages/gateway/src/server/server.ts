@@ -3153,7 +3153,13 @@ async function createInboundTurnLifecycle(
 	let turnText = laneReport ? internalTriggerText() : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
-	if (nonLoopback) {
+	if (nonLoopback && input.sentContextIds !== undefined) {
+		// Settling a turn that was already sent: it owns exactly what its prompt
+		// claimed. Preparing a window now would expire/truncate rows and hand it
+		// unread context it never saw (#686). No omission revision is committed.
+		contextMessageIds = [...input.sentContextIds];
+		contextOmissionRevision = -1;
+	} else if (nonLoopback) {
 		const prepared = options.database.transaction((tx) =>
 			options.database.inbox.contextWindow(tx, key, row.message_id),
 		);

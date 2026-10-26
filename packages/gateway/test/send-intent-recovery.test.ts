@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { SessionBusyStalledError, type SessionSendInput } from "../src/orchestrator/session-port";
-import { Store } from "../src/store";
+import { BrokerAuthorityError, Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 let home = "";
@@ -409,6 +409,92 @@ test("an unreadable busy-refusal record keeps a stamped turn held and is logged,
 		expect(
 			f.logs.some((line) => line.startsWith("send_unadmitted_probe_failed") && line.includes(`opRef=${opRef}`)),
 		).toBe(true);
+	} finally {
+		await manager.stop();
+	}
+});
+
+async function busyStalledOnce(
+	f: Awaited<ReturnType<typeof fixture>>,
+	terminate: () => Promise<unknown>,
+): Promise<void> {
+	const port = f.port;
+	const refused = new Set<string>();
+	const send = port.send.bind(port);
+	let stalled = false;
+	Object.assign(port, {
+		promptRefusal: ({ opRef }: { opRef: string }) => (refused.has(opRef) ? "busy" : undefined),
+		send: async (input: SessionSendInput) => {
+			if (stalled) return await send(input);
+			stalled = true;
+			port.sendAttempts.push(input);
+			refused.add(input.opRef);
+			throw new SessionBusyStalledError(input.sessionId, input.opRef, 300_000, "activity=active@1000");
+		},
+		terminateHost: terminate,
+	});
+}
+
+test("a busy-stalled host already gone is not waited on: the trigger is answered once on a resumed host (#687)", async () => {
+	const f = await fixture("busy-already-gone");
+	await busyStalledOnce(f, async () => {
+		f.port.setSessionState(f.binding.sessionId, { live: false });
+		return { outcome: "already_gone" };
+	});
+	const manager = f.startManager();
+	try {
+		await manager.recover();
+		await until(() => f.port.sendAttempts.length === 2);
+		const [wedged, answered] = f.port.sendAttempts;
+		expect(answered!.opRef).not.toBe(wedged!.opRef);
+		expect(f.port.resumes.map((resume) => resume.sessionId)).toEqual([f.binding.sessionId]);
+		await until(() => f.db.inbox.turnRow(answered!.opRef)?.turn_state === "done");
+		expect(f.port.sendAttempts).toHaveLength(2);
+	} finally {
+		await manager.stop();
+	}
+});
+
+test("a busy-stalled host still terminating is dispatched exactly once after its exit is confirmed (#687)", async () => {
+	const f = await fixture("busy-terminating-confirmed");
+	let calls = 0;
+	await busyStalledOnce(f, async () => {
+		calls++;
+		if (calls === 1) return { outcome: "terminating", pid: 4242 };
+		f.port.setSessionState(f.binding.sessionId, { live: false });
+		return { outcome: "terminated", pid: 4242 };
+	});
+	const manager = f.startManager();
+	try {
+		await manager.recover();
+		await until(() => f.logs.some((line) => line.includes("outcome=terminating")));
+		expect(f.port.sendAttempts).toHaveLength(1);
+		for (let i = 0; i < 160 && f.port.sendAttempts.length < 2; i++)
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(f.logs.some((line) => line.startsWith("persona_host_exit_confirmed"))).toBe(true);
+		expect(f.port.sendAttempts).toHaveLength(2);
+		const answered = f.port.sendAttempts[1]!;
+		await until(() => f.db.inbox.turnRow(answered.opRef)?.turn_state === "done");
+		await manager.tick();
+		expect(f.port.sendAttempts).toHaveLength(2);
+	} finally {
+		await manager.stop();
+	}
+});
+
+test("lost broker authority while ending a busy-stalled host fails closed: nothing is resent (#687)", async () => {
+	const f = await fixture("busy-authority");
+	await busyStalledOnce(f, async () => {
+		throw new BrokerAuthorityError("authority_mismatch");
+	});
+	const manager = f.startManager();
+	try {
+		// The authority error propagates out of the actor instead of being absorbed as a refusal.
+		await expect(manager.recover()).rejects.toBeInstanceOf(BrokerAuthorityError);
+		expect(f.logs.some((line) => line.startsWith("session_busy_stalled"))).toBe(true);
+		expect(f.port.sendAttempts).toHaveLength(1);
+		expect(f.port.resumes).toHaveLength(0);
+		expect(f.db.inbox.pendingOldest(f.originKey)?.message_id).toBe("m-1");
 	} finally {
 		await manager.stop();
 	}

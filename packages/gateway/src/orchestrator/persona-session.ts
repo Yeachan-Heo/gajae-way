@@ -136,9 +136,18 @@ function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
 }
 
+const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
+
 /** Durable intent to post an escalation notice, deleted once the delivery ledger owns it. */
 function escalationNoticeKey(originKey: string, opRef: string): string {
-	return `escalation-notice:${originKey}#${opRef}`;
+	return `${ESCALATION_NOTICE_PREFIX}${originKey}#${opRef}`;
+}
+
+/** Origins holding an undelivered escalation notice; op-refs never contain `#`, origin keys may. */
+function escalationNoticeOrigins(store: Store): string[] {
+	return store.core
+		.metaKeysInRange(ESCALATION_NOTICE_PREFIX, `${ESCALATION_NOTICE_PREFIX}\uffff`)
+		.map((key) => key.slice(ESCALATION_NOTICE_PREFIX.length, key.lastIndexOf("#")));
 }
 
 function stalledExitProofKey(opRef: string): string {
@@ -466,6 +475,12 @@ export interface PersonaTurnIdentity {
 export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 	/** The trigger row; the one prompt body of this turn. */
 	readonly trigger: InboundMessageRow;
+	/**
+	 * Present only for a settlement lifecycle of an already sent turn (adopted
+	 * after a restart or escalation): the context its prompt durably claimed.
+	 * No new context window is prepared or committed for it (#686).
+	 */
+	readonly sentContextIds?: readonly string[];
 }
 
 export interface PersonaTailFrameInput extends PersonaTurnIdentity {
@@ -939,10 +954,16 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
 	}
 
-	/** Recovers nonterminal turns, pending inputs, and terminal turns' unresolved held steers after restart. */
+	/**
+	 * Recovers nonterminal turns, pending inputs, terminal turns' unresolved held
+	 * steers and undelivered escalation notices after restart. A notice intent is
+	 * its own discovery source: its turn may have settled and its binding been
+	 * cleared, leaving nothing else that would ever visit the origin.
+	 */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
+			...escalationNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
@@ -1956,6 +1977,7 @@ class OriginActor {
 			sessionId,
 			turn,
 			trigger,
+			sentContextIds: this.#manager.database.inbox.sentContextIds(turn.opRef),
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;

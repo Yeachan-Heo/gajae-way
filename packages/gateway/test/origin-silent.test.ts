@@ -238,17 +238,26 @@ test("an incident transition never commits without its owner DM: a failed ledger
 	expect(alerter.sweep(NOW + 3 * MINUTE).map((transition) => transition.kind)).toEqual(["cleared"]);
 });
 
-test("a corrupt incident row is kept as evidence, not read as a valid incident, and the clear is still sent (#688)", async () => {
-	const db = await open();
-	const logs: string[] = [];
-	db.core.metaSet(`origin_silent:${CHANNEL}`, "{not json");
-	const cleared = new OriginSilentAlerter(db, () => OWNER, { log: (line) => logs.push(line) }).sweep(NOW);
-	expect(cleared.map((transition) => transition.kind)).toEqual(["cleared"]);
-	expect(db.outbox.get(cleared[0]!.deliveryId)?.state).toBe("pending");
-	expect(db.core.metaGet(`origin_silent:${CHANNEL}`)).toBeUndefined();
-	expect(db.core.metaGet(`origin_silent_corrupt:${CHANNEL}`)).toBe("{not json");
-	expect(logs.some((line) => line.startsWith("origin_silent_incident_corrupt"))).toBe(true);
-});
+for (const raw of [
+	"{not json",
+	"null",
+	"42",
+	'"text"',
+	"[]",
+	'{"messageId":7,"alertedAt":"2026-10-26T00:00:00.000Z"}',
+]) {
+	test(`a corrupt incident row ${raw} is kept as evidence, not read as a valid incident, and the clear is still sent (#688)`, async () => {
+		const db = await open();
+		const logs: string[] = [];
+		db.core.metaSet(`origin_silent:${CHANNEL}`, raw);
+		const cleared = new OriginSilentAlerter(db, () => OWNER, { log: (line) => logs.push(line) }).sweep(NOW);
+		expect(cleared.map((transition) => transition.kind)).toEqual(["cleared"]);
+		expect(db.outbox.get(cleared[0]!.deliveryId)?.state).toBe("pending");
+		expect(db.core.metaGet(`origin_silent:${CHANNEL}`)).toBeUndefined();
+		expect(db.core.metaGet(`origin_silent_corrupt:${CHANNEL}`)).toBe(raw);
+		expect(logs.some((line) => line.startsWith("origin_silent_incident_corrupt"))).toBe(true);
+	});
+}
 
 test("without an owner target the incident is recorded for ops cycle and no DM is queued (#688)", async () => {
 	const db = await open();
