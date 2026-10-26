@@ -1494,8 +1494,12 @@ class OriginActor {
 			.nonterminalTurns(this.originKey)
 			.find((turn) => turn.epoch === epoch && (turn.state === "bound" || turn.state === "accepted"));
 		if (!ambiguousHold) return;
-		if (!ambiguousHold.sessionId || !ambiguousHold.dispatchedAtMs) return;
-		const heldMs = this.#manager.now() - ambiguousHold.dispatchedAtMs;
+		if (!ambiguousHold.sessionId) return;
+		// Get the full row to access dispatched_at and origin_ref_json
+		const fullRow = this.#manager.database.inbox.turnRow(ambiguousHold.opRef);
+		if (!fullRow?.dispatched_at) return;
+		const dispatchedAt = new Date(fullRow.dispatched_at).getTime();
+		const heldMs = this.#manager.now() - dispatchedAt;
 		if (heldMs < this.#manager.boundedRecoveryHoldMs) return;
 		if (!(await this.#sessionProvablyGone(ambiguousHold.sessionId, new Error("bounded_recovery_hold_deadline")))) return;
 		// Escalate to recovery hold: close the current turn if it's this one
@@ -1514,7 +1518,7 @@ class OriginActor {
 		let nextEpoch = 0;
 		const previousSessionId = ambiguousHold.sessionId;
 		const noticeMessageId = `recovery_hold_escalated_${randomUUID()}`;
-		const originRef = JSON.parse(ambiguousHold.origin_ref_json) as { platform?: string; kind?: string; conversationId?: string; peerId?: string };
+		const originRef = JSON.parse(fullRow.origin_ref_json) as { platform?: string; kind?: string; conversationId?: string; peerId?: string };
 		this.#manager.database.transaction((tx) => {
 			nextEpoch = this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
 			// Post exactly one notice to the origin
@@ -1522,7 +1526,7 @@ class OriginActor {
 				const noticeAccepted = this.#manager.database.inbox.enqueue(tx, {
 					messageId: noticeMessageId,
 					originKey: this.originKey,
-					originRefJson: ambiguousHold.origin_ref_json,
+					originRefJson: fullRow.origin_ref_json,
 					body: "[Gateway notice] The earlier request's outcome could not be confirmed. Starting fresh.",
 					source: "platform",
 				});

@@ -995,7 +995,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		repo: workspace,
 		brokerAgentDir: options.broker?.agentDir,
 		sessionModel: options.config.model,
-		statuReportTimeoutMs: options.config.stallTimeoutMs,
+		stallTimeoutMs: options.config.stallTimeoutMs,
 		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
