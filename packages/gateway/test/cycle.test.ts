@@ -56,7 +56,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		brokerExitRecord: undefined,
 		brokerAgent: null,
 		slo: { days: [], windows: [], ok: false },
-		originSilence: new Map(),
+		silentOrigins: [],
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -664,76 +664,79 @@ describe("runtime cycle projection", () => {
 		}
 	});
 
-	// Issue #688: origin_silent gates when a platform inbound message from a
-	// non-bot author is pending or bound older than the threshold with no delivery
-	// on the origin since arrival, and not in muted threads.
-	test("pending platform message from non-bot author older than threshold with no delivery gates origin_silent", () => {
-		const nowMs = Date.parse(generatedAt);
-		const holdThresholdMs = 15 * 60_000;
-		const messageAge = holdThresholdMs + 1_000; // 1 second past threshold
-		const messageTime = new Date(nowMs - messageAge).toISOString();
-		const result = projectRuntimeCycle(
-			sources({
-				originSilence: new Map([
-					[
-						"discord/dm/c1/peer=p1",
-						{
-							oldestPendingMs: messageAge,
-							messageId: "msg-1",
-							receivedAt: messageTime,
-							turnOpRef: null,
-						},
-					],
-				]),
-			}),
-			generatedAt,
-		);
-		expect(result.gates).toContain("origin_silent");
-		expect(result.phase).toBe("degraded");
+	test("origin_silent gates only while a silent origin is reported (#688)", () => {
+		const silent = {
+			originKey: "discord/channel/c1",
+			messageId: "m-1",
+			oldestPendingMs: 20 * 60_000,
+			turnOpRef: "gw-p-held",
+			holdReason: "operation_state_unknown" as const,
+		};
+		const gated = projectRuntimeCycle(sources({ silentOrigins: [silent] }), "2026-10-26T12:00:00.000Z");
+		expect(gated.gates).toContain("origin_silent");
+		expect(gated.phase).toBe("degraded");
+		expect(gated.silentOrigins).toEqual([silent]);
+		const clear = projectRuntimeCycle(sources({ silentOrigins: [] }), "2026-10-26T12:00:00.000Z");
+		expect(clear.gates).not.toContain("origin_silent");
 	});
 
-	test("empty origin silence (all below threshold) does not gate origin_silent", () => {
-		const result = projectRuntimeCycle(
-			sources({
-				originSilence: new Map(), // No messages above threshold
-			}),
-			generatedAt,
-		);
-		expect(result.gates).not.toContain("origin_silent");
-		expect(result.phase).toBe("idle");
-	});
+	test("the projector reports only unanswered human messages past the threshold (#688)", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-silent-"));
+		const database = await Store.open(join(directory, "gateway.db"));
+		try {
+			const now = Date.now();
+			const at = (minutesAgo: number) => new Date(now - minutesAgo * 60_000).toISOString();
+			const enqueue = (originKey: string, messageId: string, minutesAgo: number, engagement?: object) =>
+				database.transaction((tx) =>
+					database.inbox.enqueue(tx, {
+						messageId,
+						originKey,
+						originRefJson: "{}",
+						body: "hello",
+						receivedAt: at(minutesAgo),
+						...(engagement ? { engagementJson: JSON.stringify(engagement) } : {}),
+					}),
+				);
+			enqueue("discord/channel/held", "held-1", 30, { authorIsBot: false });
+			enqueue("discord/channel/held", "held-2", 20, { authorIsBot: false });
+			enqueue("discord/channel/fresh", "fresh-1", 5);
+			enqueue("discord/channel/bot", "bot-1", 30, { authorIsBot: true });
+			enqueue("discord/thread/t1/parent=c1", "muted-1", 30);
+			database.transaction((tx) => database.inbox.muteThread(tx, "discord/thread/t1/parent=c1"));
+			enqueue("work/task/lane", "lane-1", 30);
+			enqueue("discord/channel/answered", "answered-1", 30);
+			database.transaction((tx) =>
+				database.outbox.create(tx, {
+					deliveryId: "reply-1",
+					turnId: "turn",
+					originKey: "discord/channel/answered",
+					payloadJson: "{}",
+				}),
+			);
+			database.transaction((tx) =>
+				database.inbox.bindTurn(tx, {
+					messageId: "held-1",
+					originKey: "discord/channel/held",
+					epoch: 0,
+					opRef: "gw-p-held",
+					sessionId: "s-1",
+				}),
+			);
 
-	test("multiple origins with silent messages reports all and gates", () => {
-		const nowMs = Date.parse(generatedAt);
-		const holdThresholdMs = 15 * 60_000;
-		const messageAge = holdThresholdMs + 1_000;
-		const messageTime = new Date(nowMs - messageAge).toISOString();
-		const result = projectRuntimeCycle(
-			sources({
-				originSilence: new Map([
-					[
-						"discord/dm/c1/peer=p1",
-						{
-							oldestPendingMs: messageAge,
-							messageId: "msg-1",
-							receivedAt: messageTime,
-							turnOpRef: "op-1",
-						},
-					],
-					[
-						"slack/dm/u123/ch456",
-						{
-							oldestPendingMs: messageAge * 2,
-							messageId: "msg-2",
-							receivedAt: new Date(nowMs - messageAge * 2).toISOString(),
-							turnOpRef: null,
-						},
-					],
-				]),
-			}),
-			generatedAt,
-		);
-		expect(result.gates).toContain("origin_silent");
-		expect(result.phase).toBe("degraded");
+			const result = new RuntimeCycleProjector(database, { queueDepth: 0 }).project(new Date(now));
+			expect(result.gates).toContain("origin_silent");
+			expect(result.silentOrigins).toEqual([
+				{
+					originKey: "discord/channel/held",
+					messageId: "held-1",
+					oldestPendingMs: 30 * 60_000,
+					turnOpRef: "gw-p-held",
+					holdReason: "operation_state_unknown",
+				},
+			]);
+		} finally {
+			database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 });

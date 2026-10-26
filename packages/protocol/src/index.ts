@@ -13,6 +13,7 @@ export {
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
+	type CycleSilentOrigin,
 	containsSilenceToken,
 	type DeliveryConfirmParams,
 	type DeliveryErrorCode,

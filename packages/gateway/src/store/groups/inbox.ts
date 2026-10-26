@@ -141,6 +141,46 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Origins whose oldest unanswered human message arrived before `cutoff`
+	 * (#688). Counted are pending platform rows from non-bot authors on chat
+	 * origins (never work/monitor/agent-run), outside muted threads, with no
+	 * delivery to that origin created since the message arrived (silence alerts,
+	 * `gw-s-`, are not answers). Rows skipped
+	 * by the engagement policy are recorded as context, never enqueued, so
+	 * they cannot appear here.
+	 */
+	silentOrigins(cutoff: string): Array<{
+		readonly originKey: string;
+		readonly messageId: string;
+		readonly receivedAt: string;
+		readonly turnOpRef: string | null;
+		readonly turnState: string | null;
+	}> {
+		const rows = this.#db
+			.prepare(
+				`SELECT m.origin_key AS originKey, m.message_id AS messageId, m.received_at AS receivedAt, m.turn_op_ref AS turnOpRef, m.turn_state AS turnState
+				FROM inbound_messages m
+				WHERE m.source = 'platform' AND m.state = 'pending' AND m.received_at < ?
+				AND m.origin_key NOT LIKE 'work/%' AND m.origin_key NOT LIKE 'monitor/%' AND m.origin_key NOT LIKE 'agent-run/%'
+				AND COALESCE(json_extract(m.engagement_json, '$.authorIsBot'), 0) <> 1
+				AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.thread_origin_key = m.origin_key)
+				AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.origin_key = m.origin_key AND d.created_at >= m.received_at AND d.delivery_id NOT LIKE 'gw-s-%')
+				AND ${REPLAYABLE_INBOUND.replaceAll("inbound_messages.", "m.")}
+				ORDER BY m.received_at, m.rowid`,
+			)
+			.all(cutoff) as Array<{
+			originKey: string;
+			messageId: string;
+			receivedAt: string;
+			turnOpRef: string | null;
+			turnState: string | null;
+		}>;
+		const oldest = new Map<string, (typeof rows)[number]>();
+		for (const row of rows) if (!oldest.has(row.originKey)) oldest.set(row.originKey, row);
+		return [...oldest.values()];
+	}
+
 	isThreadMuted(threadOriginKey: string): boolean {
 		return (
 			this.#db.prepare("SELECT 1 AS n FROM thread_mutes WHERE thread_origin_key = ? LIMIT 1").get(threadOriginKey) !==

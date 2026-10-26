@@ -6,6 +6,7 @@ import {
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
+	type CycleSilentOrigin,
 	LOOPBACK_ORIGIN,
 	type MonitorFailureDiagnostic,
 	monitorSessionOrigin,
@@ -204,15 +205,7 @@ export interface RuntimeCycleSources {
 	 * and not in muted threads. Per origin: oldest pending age, message id,
 	 * received timestamp, and blocking turn op-ref if part of a turn.
 	 */
-	readonly originSilence: ReadonlyMap<
-		string,
-		{
-			readonly oldestPendingMs: number;
-			readonly messageId: string;
-			readonly receivedAt: string;
-			readonly turnOpRef: string | null;
-		}
-	>;
+	readonly silentOrigins: readonly CycleSilentOrigin[];
 }
 
 export class RuntimeCycleProjector {
@@ -224,6 +217,7 @@ export class RuntimeCycleProjector {
 	readonly #gjcVersion: () => string | undefined;
 	readonly #brokerRespawnChurn: () => boolean;
 	readonly #home: string | undefined;
+	readonly #originSilentMs: number;
 
 	constructor(
 		database: Store,
@@ -235,6 +229,8 @@ export class RuntimeCycleProjector {
 			readonly memoryRoot?: string;
 			readonly gjcVersion?: () => string | undefined;
 			readonly brokerRespawnChurn?: () => boolean;
+			/** Age at which an unanswered human message gates `origin_silent` (#688). */
+			readonly originSilentMs?: number;
 		} = {},
 	) {
 		this.#database = database;
@@ -245,6 +241,7 @@ export class RuntimeCycleProjector {
 		this.#memoryRoot = options.memoryRoot;
 		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
 		this.#brokerRespawnChurn = options.brokerRespawnChurn ?? (() => false);
+		this.#originSilentMs = options.originSilentMs ?? ORIGIN_SILENT_THRESHOLD_MS;
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
@@ -329,7 +326,7 @@ export class RuntimeCycleProjector {
 					? null
 					: readBrokerAgentDrift({ home: this.#home, agentDir: this.#agentDir }),
 			slo: evaluateSlo(this.#database.core, DEFAULT_SLO_DAYS, new Date(nowMs)),
-			originSilence: this.#originSilence(),
+			silentOrigins: this.#silentOrigins(nowMs),
 		};
 	}
 
@@ -353,30 +350,15 @@ export class RuntimeCycleProjector {
 		return origins;
 	}
 
-	/**
-	 * Platform inbound messages from non-bot authors pending or bound older
-	 * than the threshold with no delivery on the origin since they arrived, and
-	 * not in muted threads. Issue #688.
-	 *
-	 * Currently returns an empty map as a placeholder. Full implementation requires
-	 * access to the database GroupDb interface from both inbox and outbox groups
-	 * to query across table boundaries. The gate logic is functional and tested;
-	 * the database query can be implemented by adding a method to a group class
-	 * that handles the cross-group query, or by refactoring to split the logic.
-	 */
-	#originSilence(): Map<
-		string,
-		{
-			readonly oldestPendingMs: number;
-			readonly messageId: string;
-			readonly receivedAt: string;
-			readonly turnOpRef: string | null;
-		}
-	> {
-		// TODO(#688): Implement query logic to detect silent origins
-		// Query inbound_messages for pending platform messages from non-bot authors
-		// and check for corresponding confirmed deliveries
-		return new Map();
+	/** Origins with an unanswered human message older than the threshold (#688). */
+	#silentOrigins(nowMs: number): CycleSilentOrigin[] {
+		return this.#database.inbox.silentOrigins(new Date(nowMs - this.#originSilentMs).toISOString()).map((row) => ({
+			originKey: row.originKey,
+			messageId: row.messageId,
+			oldestPendingMs: Math.max(0, nowMs - Date.parse(row.receivedAt)),
+			turnOpRef: row.turnOpRef,
+			holdReason: silentHoldReason(row.turnState),
+		}));
 	}
 }
 
@@ -508,7 +490,7 @@ export function projectRuntimeCycle(
 	// Issue #688: platform messages from non-bot authors pending or bound older
 	// than the threshold with no delivery on the origin since arrival, and not in
 	// muted threads. A silent origin suggests the message is not being processed.
-	if (sources.originSilence.size > 0) gates.add("origin_silent");
+	if (sources.silentOrigins.length > 0) gates.add("origin_silent");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);
@@ -539,6 +521,7 @@ export function projectRuntimeCycle(
 			quarantined,
 		},
 		memoryGitIndexLock: sources.memoryGitIndexLock,
+		silentOrigins: sources.silentOrigins,
 		monitorEvents: [...sources.monitorStages.entries()]
 			.map(([stage, count]) => ({ stage, count }))
 			.sort((a, b) => a.stage.localeCompare(b.stage)),
@@ -602,4 +585,15 @@ function totalUnsettled(sources: RuntimeCycleSources): number {
 	let total = 0;
 	for (const { n } of sources.unsettledByOrigin.values()) total += n;
 	return total;
+}
+
+/**
+ * Why an unanswered message is stuck: a trigger bound to a turn whose outcome
+ * the gateway is still proving holds the origin; a plain pending row waits
+ * behind whatever turn owns the epoch (or a host still busy).
+ */
+export function silentHoldReason(turnState: string | null): CycleSilentOrigin["holdReason"] {
+	if (turnState === "bound") return "operation_state_unknown";
+	if (turnState === "accepted") return "turn_in_progress";
+	return "queued_behind_turn";
 }

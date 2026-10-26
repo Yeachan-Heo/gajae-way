@@ -1081,6 +1081,16 @@ export interface OpsCycleParams {
 export const OPS_CYCLE_DEFAULT_LIMIT = 100;
 export const OPS_CYCLE_MAX_LIMIT = 500;
 
+/** One origin a human is waiting on (#688). */
+export interface CycleSilentOrigin {
+	readonly originKey: string;
+	readonly messageId: string;
+	readonly oldestPendingMs: number;
+	/** The blocking turn's op-ref when the oldest message is a bound trigger. */
+	readonly turnOpRef: string | null;
+	readonly holdReason: "operation_state_unknown" | "turn_in_progress" | "queued_behind_turn";
+}
+
 export interface OpsCycleResult {
 	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
 	readonly phase: CyclePhase;
@@ -1109,6 +1119,8 @@ export interface OpsCycleResult {
 	};
 	/** Observation-only memory git lock path and age; null when no lock is present. */
 	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
+	/** Origins with an unanswered human message older than the silence threshold (#688). */
+	readonly silentOrigins: readonly CycleSilentOrigin[];
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
 	/** Most recent monitor dispatch failure records, including their sanitized cause details. */

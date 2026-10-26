@@ -76,6 +76,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
+import { alertSilentOrigins, ORIGIN_SILENT_CHECK_INTERVAL_MS } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
@@ -1264,10 +1265,27 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	};
 	const retentionTimer = setInterval(() => void runRetention(), RETENTION_SWEEP_INTERVAL_MS);
 	const retentionBootTimer = setTimeout(() => void runRetention(), 30_000);
+	// #688: a human waiting on an origin the gateway stopped answering is an
+	// incident the owner hears about, even while every liveness check is green.
+	const silenceTimer = setInterval(() => {
+		if (retentionStopped) return;
+		try {
+			alertSilentOrigins({
+				database: options.database,
+				delivery: runtime.delivery,
+				ownerTarget: runtime.config.ownerTarget?.origin,
+				send: (payload) => broadcastDelivery(runtime, payload),
+				nowMs: Date.now(),
+			});
+		} catch (error) {
+			console.error(`origin silence check failed: ${diagnostic(error)}`);
+		}
+	}, ORIGIN_SILENT_CHECK_INTERVAL_MS);
 	const stopRetention = (): void => {
 		retentionStopped = true;
 		clearInterval(retentionTimer);
 		clearTimeout(retentionBootTimer);
+		clearInterval(silenceTimer);
 	};
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })

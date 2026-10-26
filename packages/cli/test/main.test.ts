@@ -837,6 +837,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		sessions: [],
 		memoryIntents: { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 },
 		memoryGitIndexLock: null,
+		silentOrigins: [],
 		monitorEvents: [],
 		monitorFailures: [],
 		monitorAuthoringLost: [],

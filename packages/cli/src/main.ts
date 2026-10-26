@@ -394,6 +394,13 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
 		);
+	if (cycle.silentOrigins.length > 0) {
+		lines.push(`silent origins: ${cycle.silentOrigins.length}`);
+		for (const silent of cycle.silentOrigins)
+			lines.push(
+				`  ${silent.originKey} waiting=${Math.round(silent.oldestPendingMs / 60_000)}m reason=${silent.holdReason} message=${silent.messageId}${silent.turnOpRef ? ` opRef=${silent.turnOpRef}` : ""}`,
+			);
+	}
 	if (cycle.sessionsTotal > 0 && cycle.sessions.length === 0) {
 		lines.push(`sessions: none at offset ${cycle.sessionsOffset} of ${cycle.sessionsTotal}`);
 	} else if (cycle.sessions.length > 0) {
