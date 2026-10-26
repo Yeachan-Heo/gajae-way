@@ -653,7 +653,7 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 	f.port.complete(result.opRef, "done");
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
-	expect((f.db.bindings.workLaneRows()[0]?.last_activity_at ?? 0) > (activity ?? 0)).toBe(true);
+	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at! > activity!).toBe(true);
 	expect(f.notices).toHaveLength(1);
 	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[lane a] completed: done" });
 	expect(f.db.outbox.rows()).toHaveLength(1);

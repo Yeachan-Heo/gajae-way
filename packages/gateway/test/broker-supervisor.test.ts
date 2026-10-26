@@ -6,6 +6,7 @@ import {
 	type BrokerDiscovery,
 	brokerHealthArgs,
 	GJC_ATTACH_ONLY_ENV,
+	GjcCommandQueueTimeoutError,
 	GlobalGjcClient,
 	HEALTH_PROBE_SESSION_ID,
 	isHealthySessionList,
@@ -699,6 +700,69 @@ test("bounded CLI semaphore never exceeds four children and queued commands time
 	expect(maximum).toBe(4);
 	for (const resolve of pending) resolve();
 	await Promise.all(commands);
+});
+
+test("a saturated CLI pool times out only the queued call and never marks the broker unavailable (#675)", async () => {
+	const outages: number[] = [];
+	let hold = true;
+	let active = 0;
+	const pending: Array<() => void> = [];
+	const value = client({
+		onUnavailable: (at) => outages.push(at),
+		command: async () => {
+			if (!hold) return healthy;
+			active++;
+			await new Promise<void>((resolve) => pending.push(resolve));
+			active--;
+			return healthy;
+		},
+	});
+	hold = false;
+	await value.start();
+	hold = true;
+	const commands = Array.from({ length: 4 }, () => value.cli(["sdk", "session", "list"], { timeoutMs: 500 }));
+	await eventually(() => active === 4);
+	await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toBeInstanceOf(
+		GjcCommandQueueTimeoutError,
+	);
+	expect(value.isAvailable).toBe(true);
+	expect(outages).toEqual([]);
+	hold = false;
+	for (const resolve of pending) resolve();
+	await Promise.all(commands);
+	await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 500 })).resolves.toEqual(healthy);
+});
+
+test("the CLI pool is sized from maxPoolSize within [4, 16]", async () => {
+	for (const [requested, expected] of [
+		[1, 4],
+		[8, 8],
+		[128, 16],
+	] as const) {
+		let active = 0;
+		let maximum = 0;
+		const pending: Array<() => void> = [];
+		const value = client({
+			maxPoolSize: requested,
+			command: async () => {
+				active++;
+				maximum = Math.max(maximum, active);
+				await new Promise<void>((resolve) => pending.push(resolve));
+				active--;
+				return healthy;
+			},
+		});
+		const commands = Array.from({ length: 20 }, () => value.cli(["sdk", "session", "list"], { timeoutMs: 1_000 }));
+		await eventually(() => active === expected);
+		await Promise.resolve();
+		expect(maximum).toBe(expected);
+		while (pending.length > 0 || active > 0) {
+			for (const resolve of pending.splice(0)) resolve();
+			await Promise.resolve();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		await Promise.all(commands);
+	}
 });
 
 test("stop rejects queued/future requests and closes only gateway spawned relays", async () => {

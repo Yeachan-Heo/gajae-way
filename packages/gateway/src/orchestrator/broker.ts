@@ -95,7 +95,11 @@ export interface GlobalGjcClientOptions {
 	readonly readinessDelayMs?: number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
-	/** Maximum concurrent CLI commands; defaults to sessions.maxLiveHosts if provided, otherwise 4. */
+	/**
+	 * Concurrent `gjc sdk` CLI children. Boot sizes it from sessions.maxLiveHosts
+	 * so persona hosts do not starve each other; clamped to [4, 16] because every
+	 * child costs about a second of CPU.
+	 */
 	readonly maxPoolSize?: number;
 	/**
 	 * Minimum client runtime version for this build. The independently supervised
@@ -383,6 +387,17 @@ export function parseListModelsOutput(stdout: string): string[] {
 }
 
 /** A client of the broker host's pinned GJC runtime; it does not own broker lifecycle. */
+const MIN_CLI_POOL = 4;
+const MAX_CLI_POOL = 16;
+
+/** The local CLI pool stayed full for the whole call budget; the broker was never asked. */
+export class GjcCommandQueueTimeoutError extends Error {
+	constructor(readonly timeoutMs: number) {
+		super(`gjc command queue timed out after ${timeoutMs}ms (local CLI pool saturated)`);
+		this.name = "GjcCommandQueueTimeoutError";
+	}
+}
+
 export class GlobalGjcClient {
 	readonly executable: string;
 	readonly agentDir: string;
@@ -451,7 +466,7 @@ export class GlobalGjcClient {
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
-		this.#maxPoolSize = integer(options.maxPoolSize, 4, 1);
+		this.#maxPoolSize = Math.min(MAX_CLI_POOL, Math.max(MIN_CLI_POOL, integer(options.maxPoolSize, MIN_CLI_POOL, 1)));
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) =>
@@ -848,34 +863,32 @@ export class GlobalGjcClient {
 		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
-		// Interactive waiters always have headroom. Background can max ceil(maxPoolSize/2) in flight, interactive can max ceil(maxPoolSize/2).
+		// Interactive callers may use the whole pool; background commands at most half of it.
 		const maxBackground = Math.ceil(this.#maxPoolSize / 2);
 		const canProceed = (): boolean => {
 			if (priority === "interactive") {
 				return this.#inflight < this.#maxPoolSize;
 			}
-			// Background: must be under maxPoolSize total AND under maxBackground concurrent
 			return this.#inflight < this.#maxPoolSize && this.#backgroundInFlight < maxBackground;
 		};
 		while (!canProceed()) {
-			let resolve: (() => void) | undefined;
 			const entry = { resolve: () => {}, priority };
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
-				await bounded(
-					new Promise<void>((r) => {
-						resolve = r;
-						entry.resolve = r;
-						this.#queue.push(entry);
-					}),
-					Math.max(1, deadline - Date.now()),
-				);
+				await new Promise<void>((resolve) => {
+					entry.resolve = resolve;
+					this.#queue.push(entry);
+					timer = setTimeout(resolve, Math.max(1, deadline - Date.now()));
+				});
 			} finally {
-				if (resolve) {
-					const i = this.#queue.findIndex((e) => e.resolve === resolve);
-					if (i >= 0) this.#queue.splice(i, 1);
-				}
+				clearTimeout(timer);
+				const i = this.#queue.indexOf(entry);
+				if (i >= 0) this.#queue.splice(i, 1);
 			}
-			if (Date.now() >= deadline) throw new Error("command queue timed out");
+			// Local pool congestion is a per-call failure, never broker evidence:
+			// reporting it as an outage failed every other caller while the broker
+			// itself was healthy (#675).
+			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(timeout);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
