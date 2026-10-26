@@ -21,6 +21,50 @@ for (const mode of ["permissive", "restricted"] as const) {
 	});
 }
 
+test("gjc direct spawn floor is detected in both modes", () => {
+	const guard = new ActionGuard({ mode: "permissive", home: "/home/owner", gajaewayHome: "/home/owner/.gajaeway" });
+
+	// Blocked patterns
+	const blockedPatterns = [
+		"gjc -p",
+		"gjc sdk session create",
+		"gjc version",
+		"nohup gjc -p",
+		"setsid gjc sdk session create",
+		"tmux new-session -d -c /tmp \"gjc -p\"",
+		"tmux send-keys -t session 'gjc version'",
+		"exec gjc -p",
+		"screen -S mysession gjc -p",
+		"setsid gjc version 2>&1",
+	];
+
+	for (const pattern of blockedPatterns) {
+		const result = guard.checkCommand(pattern);
+		expect(result).toMatchObject({ refused: true, floor: "gjc-direct-spawn" }, `Failed for: ${pattern}`);
+	}
+});
+
+test("gjc direct spawn floor allows legitimate commands", () => {
+	const guard = new ActionGuard({ mode: "permissive", home: "/home/owner", gajaewayHome: "/home/owner/.gajaeway" });
+
+	// Allowed patterns
+	const allowedPatterns = [
+		"gajaeway work.start mywork 'gjc -p'",
+		"gajaeway work.start 'exec-task' --cwd /tmp 'gjc sdk session create'",
+		"git config core.hooksPath",
+		"echo 'gjc' | cat",
+		"ls -la /usr/bin/gjc",
+		"# gjc is great",
+		"GJCFOO=bar npm test",
+		"my-gjc-wrapper -p",
+	];
+
+	for (const pattern of allowedPatterns) {
+		const result = guard.checkCommand(pattern);
+		expect(result).toMatchObject({ allowed: true }, `Should allow: ${pattern}`);
+	}
+});
+
 test("system notice preserves safety floors and routes delegated work through owned lanes", () => {
 	expect(ACTION_GUARD_SYSTEM_NOTICE).toStartWith(
 		"Never execute unrecoverable commands or recursively delete $HOME itself or absolute paths outside $HOME and $GAJAEWAY_HOME. These safety floors are unoverridable.",
