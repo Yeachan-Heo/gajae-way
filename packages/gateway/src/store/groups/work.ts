@@ -41,7 +41,7 @@ export function workAttemptEndState(
 			? "terminal_missing_receipt"
 			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
 				? "terminal_uncertain"
-				: ["sdk_failed", "send_rejected"].includes(reason)
+				: ["sdk_failed", "send_rejected", "provider_transport"].includes(reason)
 					? "failed"
 					: "attempt_ended";
 }
@@ -105,26 +105,69 @@ export interface WorkAttemptTerminalEvidence {
 	readonly status?: PromptStatusBody;
 }
 
+/** Classified SDK tokens only: never persist provider messages or diagnostics. */
+export const WORK_OUTCOME_TOKENS = {
+	kind: ["stopped", "success", "failure", "failed", "cancelled", "completed"],
+	provenance: ["client_cancel", "runtime", "broker", "receipt", "agent", "agent_end", "agent_failed", "deadline"],
+	code: ["prompt_failed", "prompt_deadline_exceeded"],
+	providerCode: [
+		"provider_down",
+		"provider_unavailable",
+		"upstream_stream_interrupted",
+		"upstream_error",
+		"transport_reset",
+		"stream_first_event_timeout",
+		"empty_response",
+		"server_is_overloaded",
+		"provider_rejected",
+		"agent_failed",
+		"internal",
+		"local_snapshot_failure",
+		"local_buffer_overflow",
+		"argument_validation",
+		"execution",
+		"io_error",
+		"skill_runtime",
+		"escaped_arguments_discarded",
+		"prompt_failed",
+		"aborted",
+		...Array.from({ length: 200 }, (_, index) => `provider_http_${400 + index}`),
+	],
+	phase: ["submission", "post_start"],
+	category: ["provider_transport", "provider_rejected", "agent_runtime", "deadline", "unknown"],
+} as const;
+
+/** Receipt availability is not an execution-end verdict or a failure cause. */
+export function unresolvedTerminalReceipt(terminal: WorkAttemptTerminalEvidence | null | undefined): boolean {
+	return (
+		terminal?.kind === "broker" &&
+		(terminal.status?.status === "failed"
+			? terminal.status.receiptState !== "present"
+			: ["missing", "unknown", "absent"].includes(terminal.status?.receiptState ?? ""))
+	);
+}
+
 /** The caller must first validate and sanitize the correlated status. */
 export function terminalEvidence(
 	status: PromptStatusBody,
 	observedAt: string,
 ): WorkAttemptTerminalEvidence | undefined {
 	if (status.status !== "terminal_ok" && status.status !== "failed") return undefined;
-	const reasonCode =
-		status.receiptState === "missing"
-			? "terminal_missing_receipt"
-			: status.receiptState === "unknown"
-				? "terminal_uncertain"
-				: status.status === "failed"
-					? status.error?.code === "prompt_deadline_exceeded"
-						? "prompt_deadline_exceeded"
-						: "sdk_failed"
-					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
-						? "end_turn"
-						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
-							? status.outcome!.reason!
-							: "stopped_incomplete";
+	let reasonCode: string;
+	if (status.status === "failed") {
+		reasonCode =
+			status.error?.code === "prompt_deadline_exceeded" || status.outcome?.code === "prompt_deadline_exceeded"
+				? "prompt_deadline_exceeded"
+				: status.outcome?.category === "provider_transport"
+					? "provider_transport"
+					: "sdk_failed";
+	} else if (status.receiptState === "missing") reasonCode = "terminal_missing_receipt";
+	else if (status.receiptState === "unknown") reasonCode = "terminal_uncertain";
+	else if (status.receiptState === "present" && status.outcome?.reason === "end_turn") reasonCode = "end_turn";
+	else
+		reasonCode = ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
+			? status.outcome!.reason!
+			: "stopped_incomplete";
 	return { kind: "broker", observedAt, reasonCode, status };
 }
 
@@ -259,6 +302,7 @@ export function workAccepted(runtime: WorkAttemptRuntime): boolean {
 const WORK_REASON_CODES = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
+	"provider_transport",
 	"cancelled",
 	"max_tokens",
 	"max_turn_requests",
@@ -346,7 +390,8 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 			const status = terminal.status;
 			workAssert(["terminal_ok", "failed"].includes(status.status));
 			for (const id of [status.turnId, status.commandId, status.clientRef])
-				workAssert(id === undefined || workString(id));
+				workAssert(id === undefined || (typeof id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(id)));
+			workAssert(status.clientRef === undefined || status.clientRef === value.opRef);
 			for (const at of [status.acceptedAt, status.startedAt, status.terminalAt])
 				workAssert(at === undefined || Number.isFinite(at));
 			workAssert(
@@ -354,12 +399,18 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 			);
 			workAssert(
 				status.error === undefined ||
-					(status.error.message === undefined && WORK_REASON_CODES.has(status.error.code ?? "")),
+					(Object.keys(status.error).every((key) => key === "code") &&
+						(status.error.code === "agent_error" || WORK_REASON_CODES.has(status.error.code ?? ""))),
 			);
 			if (status.outcome) {
 				workAssert(status.outcome.reason === undefined || WORK_REASON_CODES.has(status.outcome.reason));
-				workAssert(status.outcome.kind === undefined || workString(status.outcome.kind, 64));
-				workAssert(status.outcome.provenance === undefined || workString(status.outcome.provenance, 64));
+				workAssert(
+					Object.keys(status.outcome).every((key) => key === "reason" || Object.hasOwn(WORK_OUTCOME_TOKENS, key)),
+				);
+				for (const key of Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>) {
+					const token = status.outcome[key];
+					workAssert(token === undefined || (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(token));
+				}
 			}
 		}
 	}

@@ -11,6 +11,7 @@ import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
+	terminalEvidence,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -239,6 +240,86 @@ function seedLinkedWakeReport(
 }
 
 describe("work attempt durable transactions", () => {
+	for (const cause of ["provider", "deadline", "rejected", "runtime"] as const) {
+		test(`#696 ${cause} cause and missing receipt survive durable round-trip`, async () => {
+			const f = await fixture();
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			const status = {
+				status: "failed" as const,
+				receiptState: "missing" as const,
+				clientRef: f.runtime.opRef,
+				error: { code: cause === "deadline" ? "prompt_deadline_exceeded" : "agent_error" },
+				outcome: {
+					kind: "failed",
+					code: cause === "deadline" ? "prompt_deadline_exceeded" : "prompt_failed",
+					phase: "post_start",
+					provenance: cause === "deadline" ? "deadline" : "agent_failed",
+					category:
+						cause === "provider"
+							? "provider_transport"
+							: cause === "rejected"
+								? "provider_rejected"
+								: cause === "runtime"
+									? "agent_runtime"
+									: "deadline",
+					...(cause === "provider" ? { providerCode: "server_is_overloaded" } : {}),
+				},
+			};
+			const terminal = terminalEvidence(status, END)!;
+			f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }));
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)?.terminal).toEqual(terminal);
+			expect(terminal.reasonCode).toBe(
+				cause === "provider" ? "provider_transport" : cause === "deadline" ? "prompt_deadline_exceeded" : "sdk_failed",
+			);
+		});
+	}
+	for (const [field, token] of [
+		["kind", "arbitrary"],
+		["code", "private-token"],
+		["providerCode", "PRIVATE_SECRET"],
+		["phase", "arbitrary"],
+		["category", "arbitrary"],
+		["provenance", "arbitrary"],
+		["message", "private text"],
+		["failureCauseDiagnostic", "private diagnostic"],
+		["toString", "private token"],
+	] as const) {
+		test(`#696 durable outcome rejects unsafe ${field}`, async () => {
+			const f = await fixture();
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			expect(() =>
+				f.database.transaction((tx) =>
+					updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+						terminal: {
+							kind: "broker",
+							observedAt: END,
+							reasonCode: "sdk_failed",
+							status: { status: "failed", receiptState: "missing", outcome: { [field]: token } },
+						},
+					}),
+				),
+			).toThrow();
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)?.terminal).toBeNull();
+		});
+	}
+	test("#696 durable terminal identity must belong to the operation", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		for (const identity of [{ clientRef: "gw-foreign" }, { turnId: "private arbitrary identity" }]) {
+			expect(() =>
+				f.database.transaction((tx) =>
+					updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+						terminal: {
+							kind: "broker",
+							observedAt: END,
+							reasonCode: "sdk_failed",
+							status: { status: "failed", receiptState: "missing", ...identity },
+						},
+					}),
+				),
+			).toThrow();
+		}
+	});
 	for (const mode of ["start", "run"] as const) {
 		test(`${mode} publishes worker metadata and activity atomically at prepare and settlement`, async () => {
 			const f = await fixture();
