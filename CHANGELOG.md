@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.0] - 2026-10-26
+
+### Features
+- **gateway**: Support the GJC 0.19.0 runtime contracts and lifecycle fences; the pinned GJC is now 0.19.0 (#663)
+- **gateway**: Announce stack restarts to active conversations ("restarting", then "back online" or "restart cancelled"), configurable via `restartNotice` (#662)
+- **gateway**: Default daily memory de-bloat cron for Markdown memory files over 100KB (#651)
+- **gateway**: Suggest gjc-listed models in `/model set` autocomplete (#647)
+- **telegram**: Upload `MEDIA:` file deliveries with `sendPhoto`/`sendDocument` (#639)
+
+### Fixes
+- **gateway**: Preserve native operation authority across recovery and persist confirmed stalled-host exits (#652)
+- **gateway**: Preserve a busy refusal across restart without replay (#644)
+- **gateway**: Fence observer settlement and drain relay teardown (#640)
+- **gateway**: Skip journaling no-op attempt updates, compact superseded `attempt_updated` rows, and report journal size in census (#648, #649, #650)
+- **gateway**: Bound journal retention sweeps to O(batch) so compacting a multi-million-row journal never blocks the gateway (#671)
+- **gateway**: Include the top-level error message in failure details (#657, #660)
+- **memory**: Bound memory git by a deadline and never wait on Bun reporting its exit (#656)
+- **telegram**: Key inbound messages by chat-scoped Telegram ids so reactions resolve (#655)
+- **adapter-slack**: Answer an @mention that invited the bot into the channel (#645)
+- **adapter-slack**: Do not open an empty thread for a root-message status line (#658)
+
 ## [0.3.4] - 2026-10-21
 
 ### Fixes
