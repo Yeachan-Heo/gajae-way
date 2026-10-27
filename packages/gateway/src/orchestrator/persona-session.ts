@@ -1738,14 +1738,31 @@ class OriginActor {
 		// prompt may have carried (trigger, claimed context, steers) so the fresh
 		// session never sees the possibly accepted request as unread. Messages
 		// that arrived after the send keep their unread context.
-		const nextEpoch = database.transaction((tx) => {
+		const { nextEpoch, closedInputs } = database.transaction((tx) => {
 			const epoch = database.bindings.rotateEpoch(tx, this.originKey);
 			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
 			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
-			database.inbox.contextConsume(tx, database.inbox.sentContextIds(turn.opRef));
-			return epoch;
+			const claimed = database.inbox.sentContextIds(turn.opRef);
+			database.inbox.contextConsume(tx, claimed);
+			// A queued message the held prompt already carried is that op's input,
+			// never a fresh trigger: resending it could repeat its action.
+			const closed = database.inbox.closeClaimedPending(tx, {
+				originKey: this.originKey,
+				epoch: turn.epoch,
+				opRef: turn.opRef,
+				messageIds: claimed,
+			});
+			return { nextEpoch: epoch, closedInputs: closed };
 		});
 		this.#holdSweeps.delete(turn.opRef);
+		for (const row of closedInputs) {
+			// Whether the model read it is unknown: release its ownership without a 👀.
+			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
+			this.#manager.log(
+				`escalation_claimed_input_closed origin=${this.originKey} opRef=${turn.opRef} message=${row.message_id}`,
+				"warn",
+			);
+		}
 		this.#manager.log(
 			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
 			"warn",

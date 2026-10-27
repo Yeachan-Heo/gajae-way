@@ -326,3 +326,65 @@ test("a late answer settled after a restart commits only the context its prompt 
 	expect(unread).not.toContain("m-held");
 	expect(f.port.sendAttempts.filter((send) => send.opRef === heldOpRef)).toHaveLength(1);
 }, 60_000);
+
+test("a queued message the held prompt carried as context is closed as its input, never resent as a trigger (#686, #698 review)", async () => {
+	const f = await fixture("claimed-queued");
+	const db = await Store.open(f.config.dbPath);
+	const held = await f.port.bind({ originKey: f.originKey, epoch: 0, repo: f.workspace });
+	expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, f.originKey, held.sessionId, 0))).toBe(true);
+	const sentAt = new Date(Date.now() - 11 * MINUTE).toISOString();
+	const queuedAt = new Date(Date.now() - 11 * MINUTE + 1_000).toISOString();
+	const heldOpRef = "gw-p-held-claimed-queued";
+	const enqueue = (messageId: string, body: string, receivedAt: string) =>
+		db.transaction((tx) =>
+			db.inbox.enqueue(tx, {
+				messageId,
+				originKey: f.originKey,
+				originRefJson: f.originRefJson,
+				body,
+				engagementJson: f.engagementJson,
+				receivedAt,
+			}),
+		);
+	record(db, f.originKey, "m-held", "HELD-REQUEST", sentAt);
+	record(db, f.originKey, "m-queued", "QUEUED-REQUEST deploy staging too", queuedAt);
+	enqueue("m-held", "HELD-REQUEST", sentAt);
+	// Queued behind the held turn, and rendered into its prompt's unread window.
+	enqueue("m-queued", "QUEUED-REQUEST deploy staging too", queuedAt);
+	db.transaction((tx) => {
+		db.inbox.bindTurn(tx, {
+			messageId: "m-held",
+			originKey: f.originKey,
+			epoch: 0,
+			opRef: heldOpRef,
+			sessionId: held.sessionId,
+			dispatchedAt: sentAt,
+		});
+		db.inbox.markSendAttempted(tx, heldOpRef, ["m-held", "m-queued"], sentAt);
+	});
+	f.port.seedAcceptedSend({ sessionId: held.sessionId, repo: f.workspace, text: "HELD-REQUEST", opRef: heldOpRef });
+	f.port.unknownOps.add(heldOpRef);
+	f.port.setSessionState(held.sessionId, { live: false });
+	const nextAt = new Date().toISOString();
+	record(db, f.originKey, "m-next", "NEXT-QUESTION", nextAt);
+	enqueue("m-next", "NEXT-QUESTION", nextAt);
+
+	server = await startUnixServer({
+		config: f.config,
+		database: db,
+		sessionPort: f.port,
+		workspace: f.workspace,
+		onStop: () => db.close(),
+	});
+	await until(() => f.port.sends.some((send) => send.sessionId === "session-1"));
+	const fresh = f.port.sends.filter((send) => send.sessionId === "session-1");
+	expect(fresh).toHaveLength(1);
+	expect(fresh[0]!.text).toContain("NEXT-QUESTION");
+	expect(fresh[0]!.text).toContain("msg:m-next)]");
+	// It may appear only as answered history, never as the trigger or unread input.
+	const actionable = fresh[0]!.text.slice(fresh[0]!.text.indexOf("\n\n") + 2);
+	expect(actionable).not.toContain("QUEUED-REQUEST");
+	const queued = db.inbox.turnRows(heldOpRef).find((row) => row.message_id === "m-queued");
+	expect(queued).toMatchObject({ state: "done", turn_role: "steer", turn_state: "done" });
+	expect(f.port.sendAttempts.filter((send) => send.opRef === heldOpRef)).toHaveLength(1);
+}, 30_000);

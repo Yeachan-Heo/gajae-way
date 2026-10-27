@@ -614,6 +614,40 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Closes the origin's pending, unbound inbound rows whose exact message a
+	 * held op's prompt carried as context: they may already have been acted on
+	 * by that op, so they become its done input instead of a fresh trigger
+	 * (#686, #698 review). An edit row carries new text and stays pending.
+	 */
+	closeClaimedPending(
+		tx: WriteTx,
+		input: {
+			readonly originKey: string;
+			readonly epoch: number;
+			readonly opRef: string;
+			readonly messageIds: readonly string[];
+		},
+	): InboundMessageRow[] {
+		const closed: InboundMessageRow[] = [];
+		for (const messageId of new Set(input.messageIds)) {
+			const row = this.#db
+				.prepare(
+					`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL`,
+				)
+				.get(messageId, input.originKey) as InboundMessageRow | null;
+			if (!row) continue;
+			this.#assertNotQuarantined(messageId);
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND turn_state IS NULL",
+				)
+				.run(tx, input.epoch, input.opRef, messageId);
+			closed.push(row);
+		}
+		return closed;
+	}
+
 	steerAccepted(
 		tx: WriteTx,
 		input: {

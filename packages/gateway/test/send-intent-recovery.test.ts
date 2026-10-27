@@ -516,3 +516,32 @@ test("lost broker authority while ending a busy-stalled host fails closed: nothi
 		await manager.stop();
 	}
 });
+
+test("an accepted turn is never released, even with a stale busy refusal on record (#685 review)", async () => {
+	const f = await fixture("accepted-with-refusal");
+	const opRef = "gw-p-accepted-refused";
+	f.db.transaction((tx) => {
+		f.db.inbox.bindTurn(tx, {
+			messageId: "m-1",
+			originKey: f.originKey,
+			epoch: 0,
+			opRef,
+			sessionId: f.binding.sessionId,
+		});
+		f.db.inbox.markSendAttempted(tx, opRef);
+		f.db.inbox.turnAccept(tx, opRef);
+	});
+	// The host took the prompt on a later attempt; an earlier busy refusal is still journaled.
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "answer me exactly once", opRef });
+	Object.assign(f.port, { promptRefusal: () => "busy" as const });
+	const manager = f.startManager();
+	try {
+		await manager.recover();
+		await manager.tick();
+		expect(f.db.inbox.turnRow(opRef)?.turn_state).toBe("accepted");
+		expect(f.logs.some((line) => line.startsWith("recovery_requeue_unsent"))).toBe(false);
+		expect(f.port.sendAttempts.map((send) => send.opRef)).toEqual([opRef]);
+	} finally {
+		await manager.stop();
+	}
+});
