@@ -47,7 +47,13 @@ import {
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
+import {
+	type ConfigOverrides,
+	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	type GatewayConfig,
+	type ReloadResult,
+	reloadConfig,
+} from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { type KevShadowInput, kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
@@ -76,6 +82,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
+import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
@@ -92,6 +99,7 @@ import {
 	type PersonaTurnLifecycle,
 	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
+	UNRESOLVED_HOLD_ESCALATED,
 } from "../orchestrator/persona-session";
 import {
 	formatFailureChatNotice,
@@ -110,7 +118,12 @@ import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } fro
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
-import { type InboundMessageRow, type TerminalUnlinkedReason, terminalDeliveryIds } from "../store/groups/inbox";
+import {
+	editedOriginalId,
+	type InboundMessageRow,
+	type TerminalUnlinkedReason,
+	terminalDeliveryIds,
+} from "../store/groups/inbox";
 import type { MonitorEventStage } from "../store/groups/monitors";
 import type { ExpiredDeliveryRow } from "../store/groups/outbox";
 import { deriveActivity } from "./activity";
@@ -346,6 +359,7 @@ async function applyConfigReload(
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
+	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -999,11 +1013,13 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
+		busyStallMs: options.config.sessions?.busyStallMs,
+		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
-		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
+		onBindHold: ({ originKey, trigger, notice, reason }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {
 				origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
@@ -1016,7 +1032,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
-			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id);
+			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, reason);
 			const payload = runtime.delivery.prepare(
 				context?.turnId ?? crypto.randomUUID(),
 				origin,
@@ -1035,7 +1051,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				? undefined
 				: (JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
 					? undefined
-					: (editedMessageId(row.message_id) ?? row.message_id),
+					: (editedOriginalId(row.message_id) ?? row.message_id),
 		onHeldSteerAccepted: ({ row, abandoned }) => {
 			const turnId = runtime.inbound.get(row.message_id)?.turnId;
 			runtime.inbound.delete(row.message_id);
@@ -1170,7 +1186,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
 	});
+	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
+		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
 		void personaSessions
 			.recover()
@@ -2962,12 +2980,6 @@ export function messageEditId(messageId: string, text: string): string {
 	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
 }
 
-/** The platform message an edit row points at, or undefined for an ordinary inbound row. */
-export function editedMessageId(inboundMessageId: string): string | undefined {
-	const match = /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId);
-	return match?.[1];
-}
-
 async function editChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -3138,17 +3150,26 @@ async function createInboundTurnLifecycle(
 	const agentsMdChanged = hasAgentsMdBaseline
 		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
 		: legacyBootstrappedSession;
-	if (!hasAgentsMdBaseline || agentsMdChanged)
-		options.database.transaction((tx) =>
-			options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest),
-		);
+	// The baseline advances only when a turn carrying this AGENTS.md state
+	// succeeds (with the bootstrap, below). Recording it here, before the send,
+	// let a pre-send retry in the same epoch see the update as already delivered
+	// and drop it for good (#676 review).
+	// A recovered settlement cannot know which AGENTS.md state its prompt
+	// carried, so it never advances the baseline; a later turn resends a change.
+	const agentsMdBaselinePending = input.sentContextIds === undefined && (!hasAgentsMdBaseline || agentsMdChanged);
 	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	const internalTriggerText = () =>
 		row.message_id.startsWith("agent-run/") ? userText : laneReportTriggerText(userText);
 	let turnText = laneReport ? internalTriggerText() : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
-	if (nonLoopback) {
+	if (nonLoopback && input.sentContextIds !== undefined) {
+		// Settling a turn that was already sent: it owns exactly what its prompt
+		// claimed. Preparing a window now would expire/truncate rows and hand it
+		// unread context it never saw (#686). No omission revision is committed.
+		contextMessageIds = [...input.sentContextIds];
+		contextOmissionRevision = -1;
+	} else if (nonLoopback) {
 		const prepared = options.database.transaction((tx) =>
 			options.database.inbox.contextWindow(tx, key, row.message_id),
 		);
@@ -3156,7 +3177,7 @@ async function createInboundTurnLifecycle(
 		// lives there); commit that id, not the synthetic edit row.
 		contextMessageIds = laneReport
 			? [...prepared.selectedMessageIds]
-			: [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
+			: [...prepared.selectedMessageIds, editedOriginalId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
@@ -3300,7 +3321,7 @@ async function createInboundTurnLifecycle(
 		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey);
 		return hop.ok ? { ...resolved, chain: hop.chain } : hop;
 	};
-	const relaySourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+	const relaySourceMessageId = editedOriginalId(row.message_id) ?? row.message_id;
 	const relayProvenance = (chain: readonly string[]): HandoffProvenance => ({
 		chain,
 		sourceOriginKey: key,
@@ -3694,8 +3715,8 @@ async function createInboundTurnLifecycle(
 				? undefined
 				: origin.kind === "channel" &&
 						nonLoopback &&
-						isSlackMessageId(editedMessageId(row.message_id) ?? row.message_id)
-					? (editedMessageId(row.message_id) ?? row.message_id)
+						isSlackMessageId(editedOriginalId(row.message_id) ?? row.message_id)
+					? (editedOriginalId(row.message_id) ?? row.message_id)
 					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
 						? engagement.replyTo.messageId
 						: undefined;
@@ -3999,7 +4020,7 @@ async function createInboundTurnLifecycle(
 		steered.source === "lane_report"
 			? undefined
 			: nonLoopback
-				? (editedMessageId(steered.message_id) ?? steered.message_id)
+				? (editedOriginalId(steered.message_id) ?? steered.message_id)
 				: undefined;
 	// A Slack channel session carries several bot-rooted threads, so [SHUTUP]
 	// mutes the thread of the latest chat message this turn took in, not the
@@ -4025,6 +4046,8 @@ async function createInboundTurnLifecycle(
 			options.database.transaction((tx) => {
 				if (nonLoopback)
 					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision);
+				if (agentsMdBaselinePending)
+					options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest);
 				if (bootstrap)
 					options.database.bindings.markSessionBootstrapped(tx, key, input.epoch, {
 						includedSections: bootstrap.includedSections,
@@ -4382,7 +4405,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		const origin = validateOriginRef(JSON.parse(steered.origin_ref_json) as OriginRef);
 		if (!isChatPlatform(origin.platform)) return;
 		if (!steerAddressedPersona(steered)) return;
-		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
+		const targetMessageId = editedOriginalId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");
 		if (!eyes || eyes.isCustom === true || !platformSupportsReaction(origin.platform, eyes.name)) return;
@@ -4417,6 +4440,23 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): void {
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
+}
+
+/** Owner DM per `origin_silent` incident and when it clears (#688); each DM is queued with its incident transition. */
+function alertSilentOrigins(runtime: Runtime, alerter: OriginSilentAlerter): void {
+	let transitions: ReturnType<OriginSilentAlerter["sweep"]>;
+	try {
+		transitions = alerter.sweep(Date.now());
+	} catch (error) {
+		console.error(`origin silent sweep failed: ${diagnostic(error)}`);
+		return;
+	}
+	for (const transition of transitions) {
+		console.warn(
+			`origin_silent_${transition.kind} origin=${transition.originKey} delivery=${transition.deliveryId}${transition.payload ? "" : " owner=unconfigured"}`,
+		);
+		if (transition.payload) broadcastDelivery(runtime, transition.payload);
+	}
 }
 
 function reportDeliveryExpired(
@@ -4498,8 +4538,10 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 	return `gw-x-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 32)}`;
 }
 
-function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {
-	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
+/** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
+function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }
 
 /** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */

@@ -231,6 +231,13 @@ test("sessions host limits parse, omit absent fields, and reload live", async ()
 		idleResetMs: 2_592_000_000,
 	});
 	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("sessions");
+	// #686/#687 recovery bounds, at both ends of their range.
+	expect(
+		parseConfigFile({ schemaVersion: 1, sessions: { busyStallMs: 60_000, unresolvedHoldMs: 86_400_000 } }).sessions,
+	).toEqual({ busyStallMs: 60_000, unresolvedHoldMs: 86_400_000 });
+	expect(
+		parseConfigFile({ schemaVersion: 1, sessions: { busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 } }).sessions,
+	).toEqual({ busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 });
 	const path = await home();
 	await Bun.write(
 		join(path, "config.json"),
@@ -239,11 +246,20 @@ test("sessions host limits parse, omit absent fields, and reload live", async ()
 	const current = await loadConfig({ home: path });
 	await Bun.write(
 		join(path, "config.json"),
-		JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 2, idleResetMs: 240_000 } }),
+		JSON.stringify({
+			schemaVersion: 1,
+			sessions: { maxLiveHosts: 2, idleResetMs: 240_000, busyStallMs: 900_000, unresolvedHoldMs: 300_000 },
+		}),
 	);
 	const result = await reloadConfig(current);
 	expect(result).toMatchObject({ ok: true, changed: ["sessions"], restartRequired: [] });
-	if (result.ok) expect(result.config.sessions).toEqual({ maxLiveHosts: 2, idleResetMs: 240_000 });
+	if (result.ok)
+		expect(result.config.sessions).toEqual({
+			maxLiveHosts: 2,
+			idleResetMs: 240_000,
+			busyStallMs: 900_000,
+			unresolvedHoldMs: 300_000,
+		});
 });
 
 for (const [sessions, field] of [
@@ -257,7 +273,14 @@ for (const [sessions, field] of [
 	[{ idleResetMs: 2_592_000_001 }, "sessions.idleResetMs"],
 	[{ idleResetMs: 60_000.5 }, "sessions.idleResetMs"],
 	[{ idleResetMs: "60000" }, "sessions.idleResetMs"],
-	[{ maxHosts: 1 }, "sessions"],
+	[{ busyStallMs: 59_999 }, "sessions.busyStallMs"],
+	[{ busyStallMs: 86_400_001 }, "sessions.busyStallMs"],
+	[{ busyStallMs: "300000" }, "sessions.busyStallMs"],
+	[{ unresolvedHoldMs: 59_999 }, "sessions.unresolvedHoldMs"],
+	[{ unresolvedHoldMs: 600_000.5 }, "sessions.unresolvedHoldMs"],
+	[{ unresolvedHoldMs: 86_400_001 }, "sessions.unresolvedHoldMs"],
+	[{ unresolvedHoldMs: null }, "sessions.unresolvedHoldMs"],
+	[{ maxHosts: 1 }, "sessions may only contain maxLiveHosts, idleRetireMs, idleResetMs, busyStallMs, unresolvedHoldMs"],
 ] as const) {
 	test(`rejects invalid sessions configuration ${JSON.stringify(sessions)}`, () => {
 		const parse = () => parseConfigFile({ schemaVersion: 1, sessions });

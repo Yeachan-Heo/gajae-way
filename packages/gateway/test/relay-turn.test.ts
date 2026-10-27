@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "../src/orchestrator/broker";
 import {
 	decodeStreamLine,
 	RelayClosedError,
@@ -49,7 +49,7 @@ class FakeRelay implements SessionRelayStream {
 	}
 
 	write(line: string): void {
-		if (this.closed) throw new Error("relay closed");
+		if (this.closed) throw new RelayStreamUnwrittenError("relay closed");
 		const frame = JSON.parse(line) as Record<string, unknown>;
 		this.written.push(frame);
 		if (frame.type === "hello" && this.options.hello !== false)

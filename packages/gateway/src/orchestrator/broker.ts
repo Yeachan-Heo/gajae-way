@@ -96,6 +96,12 @@ export interface GlobalGjcClientOptions {
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
+	 * Concurrent `gjc sdk` CLI children. Boot sizes it from sessions.maxLiveHosts
+	 * so persona hosts do not starve each other; clamped to [4, 16] because every
+	 * child costs about a second of CPU.
+	 */
+	readonly maxPoolSize?: number;
+	/**
 	 * Minimum client runtime version for this build. The independently supervised
 	 * production broker host enforces the package pin exactly before spawning.
 	 */
@@ -120,9 +126,21 @@ export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 /** A resident bidirectional JSONL relay to one SDK session host. */
 export interface SessionRelayStream {
 	readonly lines: AsyncIterable<string>;
-	/** Writes one JSONL frame to the host; throws once the relay is closed. */
+	/**
+	 * Writes one JSONL frame to the host. Throws RelayStreamUnwrittenError only
+	 * when no byte of the frame reached the pipe; any other throw may follow a
+	 * partial or complete write and proves nothing about delivery.
+	 */
 	write(line: string): void;
 	close(): void;
+}
+
+/** The relay refused a frame before handing any of it to the host's pipe. */
+export class RelayStreamUnwrittenError extends Error {
+	constructor(detail: string) {
+		super(detail);
+		this.name = "RelayStreamUnwrittenError";
+	}
 }
 export class GjcCliUnavailableError extends Error {
 	readonly code = "broker_unavailable";
@@ -381,6 +399,17 @@ export function parseListModelsOutput(stdout: string): string[] {
 }
 
 /** A client of the broker host's pinned GJC runtime; it does not own broker lifecycle. */
+const MIN_CLI_POOL = 4;
+const MAX_CLI_POOL = 16;
+
+/** The local CLI pool stayed full for the whole call budget; the broker was never asked. */
+export class GjcCommandQueueTimeoutError extends Error {
+	constructor(readonly timeoutMs: number) {
+		super(`gjc command queue timed out after ${timeoutMs}ms (local CLI pool saturated)`);
+		this.name = "GjcCommandQueueTimeoutError";
+	}
+}
+
 export class GlobalGjcClient {
 	readonly executable: string;
 	readonly agentDir: string;
@@ -420,6 +449,7 @@ export class GlobalGjcClient {
 	/** Start of the current run of failures against a broker discovery calls live. */
 	#liveOutageSince: number | undefined;
 	readonly #liveOutageLimit: number;
+	#maxPoolSize: number;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
@@ -448,6 +478,7 @@ export class GlobalGjcClient {
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
+		this.#maxPoolSize = clampPoolSize(options.maxPoolSize);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) =>
@@ -844,33 +875,32 @@ export class GlobalGjcClient {
 		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
-		// Interactive waiters always have headroom. Background can max 2 in flight, interactive can max 2.
+		// Interactive callers may use the whole pool; background commands at most half of it.
+		const maxBackground = Math.ceil(this.#maxPoolSize / 2);
 		const canProceed = (): boolean => {
 			if (priority === "interactive") {
-				return this.#inflight < 4;
+				return this.#inflight < this.#maxPoolSize;
 			}
-			// Background: must be under 4 total AND under 2 background concurrent
-			return this.#inflight < 4 && this.#backgroundInFlight < 2;
+			return this.#inflight < this.#maxPoolSize && this.#backgroundInFlight < maxBackground;
 		};
 		while (!canProceed()) {
-			let resolve: (() => void) | undefined;
 			const entry = { resolve: () => {}, priority };
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
-				await bounded(
-					new Promise<void>((r) => {
-						resolve = r;
-						entry.resolve = r;
-						this.#queue.push(entry);
-					}),
-					Math.max(1, deadline - Date.now()),
-				);
+				await new Promise<void>((resolve) => {
+					entry.resolve = resolve;
+					this.#queue.push(entry);
+					timer = setTimeout(resolve, Math.max(1, deadline - Date.now()));
+				});
 			} finally {
-				if (resolve) {
-					const i = this.#queue.findIndex((e) => e.resolve === resolve);
-					if (i >= 0) this.#queue.splice(i, 1);
-				}
+				clearTimeout(timer);
+				const i = this.#queue.indexOf(entry);
+				if (i >= 0) this.#queue.splice(i, 1);
 			}
-			if (Date.now() >= deadline) this.#unavailable("command queue timed out");
+			// Local pool congestion is a per-call failure, never broker evidence:
+			// reporting it as an outage failed every other caller while the broker
+			// itself was healthy (#675).
+			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(timeout);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
@@ -894,6 +924,17 @@ export class GlobalGjcClient {
 			}
 		}
 	}
+	/** Live `sessions.maxLiveHosts` reload: a larger pool admits queued commands now; a smaller one drains naturally. */
+	setMaxPoolSize(maxPoolSize: number | undefined): void {
+		this.#maxPoolSize = clampPoolSize(maxPoolSize);
+		// Waiters re-check capacity when woken and re-queue if still over the limit.
+		for (const waiter of this.#queue.splice(0)) waiter.resolve();
+	}
+
+	get maxPoolSize(): number {
+		return this.#maxPoolSize;
+	}
+
 	#checkUnavailable(result: CliResult): CliResult {
 		const detail = extractRuntimeError(`${result.stdout}\n${result.stderr}`);
 		if (detail?.code === "broker_unavailable")
@@ -1015,9 +1056,9 @@ export class GlobalGjcClient {
 			}
 		})();
 		const write = (line: string): void => {
-			if (closed) throw new Error("relay closed");
+			if (closed) throw new RelayStreamUnwrittenError("relay closed");
 			const stdin = child.stdin;
-			if (!stdin || typeof stdin === "number") throw new Error("relay stdin unavailable");
+			if (!stdin || typeof stdin === "number") throw new RelayStreamUnwrittenError("relay stdin unavailable");
 			stdin.write(`${line}\n`);
 			// FileSink.flush is synchronous unless the pipe is backpressured, in
 			// which case it returns a promise that rejects on EPIPE once the child
@@ -1029,6 +1070,10 @@ export class GlobalGjcClient {
 		return { lines, write, close };
 	}
 }
+function clampPoolSize(requested: number | undefined): number {
+	return Math.min(MAX_CLI_POOL, Math.max(MIN_CLI_POOL, integer(requested, MIN_CLI_POOL, 1)));
+}
+
 function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {
 	if (args[0] !== "sdk") throw new Error("Global GJC client accepts only sdk commands");
 	if (args.some((arg) => /^(--agent-dir|--cwd|--config-dir|--executable)(=|$)/.test(arg))) {

@@ -2,7 +2,7 @@ import { chmod, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 
-import { type ConfigOverrides, loadConfig } from "./config";
+import { type ConfigOverrides, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, loadConfig } from "./config";
 import { DeliveryService } from "./delivery/delivery";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
@@ -131,6 +131,9 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			cwd: personaWorkspace,
 			agentDir: config.gjc.agentDir,
 			pinnedVersion,
+			// The effective host cap (persona default when unset), so the CLI pool
+			// is never smaller than the session hosts it serves.
+			maxPoolSize: config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
 			onUnavailable: (at) => {
 				sloRecorder?.note("broker_unavailable", at);
 				options.broker?.onUnavailable?.(at);

@@ -14,6 +14,7 @@ import {
 	type OpsCycleResult,
 	type OpsSloResult,
 	originKey,
+	type SilentOriginView,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { type BrokerAgentDrift, readBrokerAgentDrift } from "../broker-agent/drift";
@@ -25,6 +26,7 @@ import { sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import type { Store } from "../store";
 import type { ConversationContextDiagnostics } from "../store/groups/inbox";
 import type { MonitorsGroup } from "../store/groups/monitors";
+import { findSilentOrigins } from "./origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo } from "./slo";
 
 /**
@@ -154,6 +156,8 @@ export interface RuntimeCycleSources {
 	readonly monitorFailures: readonly MonitorFailureDiagnostic[];
 	/** Event types whose latest terminal slots in the loss window were lost before authoring. */
 	readonly monitorAuthoringLost: ReturnType<MonitorsGroup["authoringLossStreaks"]>;
+	/** Origins whose user messages went unanswered past ORIGIN_SILENT_MS (#688). */
+	readonly silentOrigins: readonly SilentOriginView[];
 	readonly memoryClosing: boolean;
 	readonly instanceId: string;
 	/** Bound `work.run` lanes and the configured admission cap. */
@@ -282,6 +286,7 @@ export class RuntimeCycleProjector {
 			monitorAuthoringLost: this.#database.monitors.authoringLossStreaks(
 				new Date(nowMs - MONITOR_AUTHORING_LOSS_WINDOW_MS).toISOString(),
 			),
+			silentOrigins: findSilentOrigins(this.#database, nowMs),
 			inboundPendingByOrigin: pendingByOrigin,
 			oldestStarvedPendingMs,
 			contextByOrigin,
@@ -457,6 +462,9 @@ export function projectRuntimeCycle(
 	if (sources.monitorTerminalStreak >= MONITOR_TERMINAL_STREAK_THRESHOLD) gates.add("monitor_dispatch_failing");
 	if (sources.brokerRespawnChurn) gates.add("broker_respawn_churn");
 	if (isBrokerIndexLockBlocked(sources.brokerExitRecord)) gates.add("broker_index_lock_blocked");
+	// Issue #688: process liveness stayed green for 2+ hours while two channels
+	// went unanswered. An origin's silence is its own health signal.
+	if (sources.silentOrigins.length > 0) gates.add("origin_silent");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);
@@ -492,6 +500,7 @@ export function projectRuntimeCycle(
 			.sort((a, b) => a.stage.localeCompare(b.stage)),
 		monitorFailures: sources.monitorFailures,
 		monitorAuthoringLost: sources.monitorAuthoringLost,
+		silentOrigins: sources.silentOrigins,
 		deliveries: {
 			pending: sources.deliveryCounts.get("pending") ?? 0,
 			inflight: sources.deliveryCounts.get("inflight") ?? 0,

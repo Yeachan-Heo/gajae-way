@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 38;
+export const LATEST_SCHEMA_VERSION = 39;
 
 export interface MigrationHost {
 	readonly database: {
@@ -843,6 +843,47 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(38, new Date().toISOString());
+		});
+	}
+	if (current < 39) {
+		// Issue #685: durable send intent on a bound trigger. A bound row without
+		// it never reached `turn.prompt` and is requeued by recovery. Rows bound
+		// before this column existed have unknown send history, so they are
+		// stamped conservatively and keep the reconcile path (never resent).
+		// send_context_json (#686): the conversation-context ids the prompt
+		// rendered, claimed with the intent so a held or settled operation's
+		// inputs are never re-rendered as unread into a later prompt.
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+					.all()
+					.map((row) => row.name),
+			);
+			for (const name of ["send_attempted_at", "send_context_json"])
+				if (!columns.has(name)) host.database.execute(`ALTER TABLE inbound_messages ADD COLUMN ${name} TEXT`);
+			// The legacy prompt's rendered context is unknown, and the backfilled
+			// stamp is only a lower bound on when it rendered. The defensible upper
+			// bound is this migration: no pre-upgrade prompt can have rendered a row
+			// that did not exist yet. Claim every unread row of the origin now, so a
+			// legacy hold never re-renders its inputs and later rows stay unread.
+			// Quarantined rows belong to a retired broker authority: they are never
+			// replayed, and their quarantine trigger aborts any UPDATE, so they keep
+			// their pre-upgrade shape.
+			host.database.execute(`
+				UPDATE inbound_messages SET send_attempted_at = COALESCE(dispatched_at, received_at)
+					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_attempted_at IS NULL
+					AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id);
+				UPDATE inbound_messages SET send_context_json = (
+						SELECT json_group_array(c.message_id) FROM conversation_context c
+						WHERE c.origin_key = inbound_messages.origin_key AND c.consumed_at IS NULL
+					)
+					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_context_json IS NULL
+					AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(39, new Date().toISOString());
 		});
 	}
 }

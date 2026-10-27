@@ -390,6 +390,14 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 				`  ${failure.failedAt} ${failure.code} event=${failure.eventId} monitor=${failure.monitorId} type=${failure.eventType} stage=${failure.stage} detail=${failure.detail}`,
 			);
 	}
+	// A gateway that predates #688 omits the field; say so instead of implying no silence.
+	if ((cycle as Partial<OpsCycleResult>).silentOrigins === undefined)
+		lines.push("origin silence: not reported by the running gateway");
+	else if (cycle.silentOrigins.length === 0) lines.push("origin silence: none");
+	for (const silent of cycle.silentOrigins ?? [])
+		lines.push(
+			`origin silent: ${silent.originKey} unanswered=${silent.unanswered} oldest=${Math.floor(silent.oldestPendingAgeMs / 60_000)}m reason=${silent.holdReason}${silent.blockingOpRef ? ` op=${silent.blockingOpRef}` : ""}`,
+		);
 	if (cycle.monitorAuthoringLost.length > 0)
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1] - 2026-10-27
+
+### Fixes
+- **gateway**: Requeue bound turns that never reached `turn.prompt` under a fresh op-ref; a CLI queue timeout is no longer treated as a broker outage (#675, #685)
+- **gateway**: Bound unresolved recovery holds, fence escalated holds' inputs, and keep their late answers and escalation notices durable (#686)
+- **gateway**: Detect busy-wait stalls and preserve a busy refusal only when the retry provably never reached the host (#687, #689)
+- **gateway**: Alert the owner when an origin goes silent (#688)
+- **gateway**: Keep an AGENTS.md update pending until a turn carrying it succeeds, and size the CLI pool from the effective host cap (#676)
+- **gateway**: The schema 39 migration skips turns quarantined by a broker-authority cutover instead of failing boot
+
 ## [0.4.0] - 2026-10-26
 
 ### Features

@@ -7,7 +7,7 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "../src/orchestrator/broker";
 import type { FailedTurnEvidence } from "../src/orchestrator/failed-turn-evidence";
 import type {
 	RunningHostJob,
@@ -806,6 +806,11 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	/** The host lost the operation (killed, or its record gone): status reads `unknown` from now on. */
+	forgetOperation(opRef: string): void {
+		this.#operations.delete(opRef);
+	}
+
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
 		this.sends.push(input);
@@ -1016,11 +1021,11 @@ export class ScriptedTailHandle implements TailHandle {
 		_input: Record<string, unknown>,
 		_options?: RelayRequestOptions,
 	): Promise<RelayResponse> {
-		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods");
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods", false);
 	}
 
 	async query(_name: string, _input: Record<string, unknown>, _options?: RelayRequestOptions): Promise<RelayResponse> {
-		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods");
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods", false);
 	}
 
 	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
@@ -1138,7 +1143,7 @@ export class ScriptedTailHandle implements TailHandle {
 		result?: unknown;
 		error?: { code: string; message: string };
 	}): Promise<void> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		// Scripted handles do not send reverse responses
 	}
 
@@ -1225,7 +1230,7 @@ export class ScriptedRelayStream implements SessionRelayStream {
 	}
 
 	write(line: string): void {
-		if (this.closed) throw new Error("relay closed");
+		if (this.closed) throw new RelayStreamUnwrittenError("relay closed");
 		const frame = JSON.parse(line) as Record<string, unknown>;
 		this.written.push(frame);
 		if (frame.type === "hello") {
