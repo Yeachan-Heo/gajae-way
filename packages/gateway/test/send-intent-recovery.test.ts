@@ -406,7 +406,8 @@ test("upgrading to schema 39 leaves a quarantined legacy turn untouched instead 
 
 	database = await Store.open(path);
 	expect(database.schemaVersion).toBe(39);
-	expect(database.inbox.sendAttemptedAt(liveOpRef)).toBe(database.inbox.turnRow(liveOpRef)!.received_at);
+	expect(database.inbox.sendAttemptedAt(liveOpRef)).toBe(database.inbox.turnRow(liveOpRef)?.dispatched_at ?? undefined);
+	expect(database.inbox.sendAttemptedAt(liveOpRef)).toBeDefined();
 	expect(database.inbox.sendAttemptedAt(quarantinedOpRef)).toBeUndefined();
 	expect(database.inbox.turnRow(quarantinedOpRef)?.turn_state).toBe("accepted");
 });
