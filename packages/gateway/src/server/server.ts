@@ -3154,7 +3154,9 @@ async function createInboundTurnLifecycle(
 	// succeeds (with the bootstrap, below). Recording it here, before the send,
 	// let a pre-send retry in the same epoch see the update as already delivered
 	// and drop it for good (#676 review).
-	const agentsMdBaselinePending = !hasAgentsMdBaseline || agentsMdChanged;
+	// A recovered settlement cannot know which AGENTS.md state its prompt
+	// carried, so it never advances the baseline; a later turn resends a change.
+	const agentsMdBaselinePending = input.sentContextIds === undefined && (!hasAgentsMdBaseline || agentsMdChanged);
 	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	const internalTriggerText = () =>
 		row.message_id.startsWith("agent-run/") ? userText : laneReportTriggerText(userText);
