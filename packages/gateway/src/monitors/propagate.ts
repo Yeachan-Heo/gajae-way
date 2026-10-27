@@ -691,17 +691,21 @@ export class MonitorPropagator {
 						// Exhausting dispatch attempts does not settle the turn they may have started.
 						const disposition = await this.#exhaustedTurnDisposition(row);
 						if (disposition.kind === "hold") {
-							// Bound the hold: an exhausted event with an authoring-turn pointer that is older than
-							// MONITOR_EVENT_MAX_OPEN_AGE_MS is settled to failed_no_retry. The turn may have finished
-							// or reported an unresolvable status (sessionPort.status threw, returned unknown, etc.),
-							// so never redispatch or resend the op (#702).
+							// Bound the hold (#702). The authoring-turn pointer exempts this event from
+							// supersession and from the stale reaper, and overlap=skip counts it in flight,
+							// so an unresolvable status (unknown, or a throwing read) would silence the
+							// monitor forever. Past MONITOR_EVENT_MAX_OPEN_AGE_MS it is given up: settled
+							// failed_no_retry with evidence, never redispatched or resent. The pointer is
+							// kept, so a late authored output for that op is still recognisable.
 							if (this.#now() - Date.parse(row.updated_at) > MONITOR_EVENT_MAX_OPEN_AGE_MS) {
 								const settled = this.#database.transaction((tx) => {
 									const current = this.#database.monitors.eventGet(row.event_id);
 									if (
 										!current ||
-										current.stage !== "failed" ||
+										(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
 										current.dispatch_attempts !== row.dispatch_attempts ||
+										current.updated_at !== row.updated_at ||
+										this.#database.monitors.authoredOutput(row.event_id) !== undefined ||
 										this.#database.core.metaGet(authoringTurnKey(row.event_id)) === undefined ||
 										this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
 									)
@@ -2208,7 +2212,7 @@ function monitorReadinessOriginKey(monitorId: string): string {
 }
 
 /** Extract a bounded, sanitized lower-level diagnosis without persisting raw error payloads. */
-function failureDetail(error: unknown): string {
+export function failureDetail(error: unknown): string {
 	const object = (value: unknown): Record<string, unknown> =>
 		value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
 	const fields = object(error);
@@ -2278,9 +2282,14 @@ function failureDetail(error: unknown): string {
 	]);
 	const rawName = error instanceof Error ? error.constructor.name : typeof error;
 	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
+	// An unlisted Error subclass (for example a launcher's policy refusal) is still
+	// named, as a bare identifier: without it the row says only `Error` (#702).
+	const foreignClass =
+		name === "Error" && rawName !== "Error" && /^[A-Z][A-Za-z0-9]{0,63}$/.test(rawName) ? rawName : undefined;
 	// Codes and classifiers the SDK itself produced (envelope error code, terminal
-	// error code, outcome classifiers) are bounded machine tokens. Top-level
-	// `code` fields on foreign errors stay on the explicit allowlist; nested cause
+	// error code, outcome classifiers) are bounded machine tokens. A top-level
+	// `code` on a listed class stays on the explicit allowlist; an unlisted
+	// subclass keeps its code only as a sanitized snake_case token. Nested cause
 	// codes and their redacted, length-bounded message are surfaced separately.
 	const sdkToken = (value: unknown): string | undefined =>
 		typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : undefined;
@@ -2332,6 +2341,7 @@ function failureDetail(error: unknown): string {
 	// only facts that tell a deadline kill from a provider refusal.
 	const code =
 		(typeof fields.code === "string" && allowedCodes.has(fields.code) ? fields.code : undefined) ??
+		(foreignClass ? safeCode(fields.code) : undefined) ??
 		sdkToken(terminalError.code) ??
 		sdkToken(outcomeBody.code) ??
 		(error instanceof GjcCliError ? sdkToken(envelopeErrorCode(error.details)) : undefined);
@@ -2370,6 +2380,7 @@ function failureDetail(error: unknown): string {
 	const step = sessionRequestStep(error);
 	return JSON.stringify({
 		class: name,
+		...(foreignClass ? { foreignClass } : {}),
 		...(step ? { step } : {}),
 		...(code ? { code } : {}),
 		...(transport ? { transport } : {}),
