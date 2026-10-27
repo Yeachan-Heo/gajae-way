@@ -27,6 +27,8 @@ export type Control = {
 	unknown?: boolean;
 	refuseSteer?: boolean;
 	unavailable?: boolean;
+	missingReceipt?: boolean;
+	statusUnavailable?: boolean;
 };
 export type Call = { method: string; input: Record<string, unknown> };
 export type Barrier =
@@ -129,17 +131,36 @@ class PersistentPort extends ScriptedSessionPort {
 	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]): Promise<StatusReport> {
 		this.record("status", input);
 		const control = this.sync(input.opRef);
+		if (control.statusUnavailable) throw new Error("fixture status transport unavailable");
 		if (control.unknown) return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
 		const report = await super.status(input);
 		const saved = json<{ startedAt: number } | null>(join(this.home, `${input.opRef}.send.json`), null);
 		if (!saved) return report;
 		const status = { ...report.status, startedAt: saved.startedAt };
+		if (control.missingReceipt)
+			return {
+				operationRef: input.opRef,
+				status: {
+					status: "failed",
+					clientRef: input.opRef,
+					commandId: `fixture-command-${input.opRef}`,
+					turnId: `fixture-turn-${input.opRef}`,
+					startedAt: saved.startedAt,
+					terminalAt: saved.startedAt + 1,
+					receiptState: "missing",
+					error: { code: "prompt_deadline_exceeded" },
+				},
+				summaryCompleted: true,
+			};
 		return control.terminal
 			? {
 					...report,
 					status: { ...status, status: "terminal_ok", receiptState: "present", outcome: { reason: "end_turn" } },
 				}
 			: { ...report, status };
+	}
+	async turnRunning() {
+		return true;
 	}
 	override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
 		this.record("liveness", input);
@@ -307,7 +328,10 @@ async function serve(home: string, barrier?: Barrier) {
 		if (settling) hit("settle-ledger");
 		return result;
 	};
-	const storedConfig = json<{ readonly work?: { readonly allowNested?: boolean } }>(join(home, "config.json"), {});
+	const storedConfig = json<{
+		readonly work?: { readonly allowNested?: boolean };
+		readonly rootless?: boolean;
+	}>(join(home, "config.json"), {});
 	const config = {
 		schemaVersion: 1 as const,
 		home,
@@ -315,7 +339,7 @@ async function serve(home: string, barrier?: Barrier) {
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
-		ownerTarget: { origin: noticeOrigin },
+		...(storedConfig.rootless ? {} : { ownerTarget: { origin: noticeOrigin } }),
 		channels: { fixture: { engagement: "open" as const, audience: "all" as const } },
 		work: { maxLanes: 2, ...storedConfig.work },
 	};
@@ -390,13 +414,14 @@ export class WorkFixture {
 	get socket() {
 		return join(this.home, "gateway.sock");
 	}
-	static async create(options: { readonly allowNested?: boolean } = {}) {
+	static async create(options: { readonly allowNested?: boolean; readonly rootless?: boolean } = {}) {
 		const fixture = new WorkFixture(await mkdtemp(join(tmpdir(), "work-crash-")));
 		await Bun.write(
 			join(fixture.home, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
 				ownerTarget: { origin: noticeOrigin },
+				...(options.rootless ? { rootless: true } : {}),
 				...(options.allowNested === undefined ? {} : { work: { allowNested: options.allowNested } }),
 			}),
 		);

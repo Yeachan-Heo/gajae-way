@@ -11,6 +11,7 @@ import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
+	validateWorkRuntime,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -278,7 +279,227 @@ function successorAttempt(f: Awaited<ReturnType<typeof fixture>>, name = "succes
 	return { runtime, record };
 }
 
+function holdParent(f: Awaited<ReturnType<typeof fixture>>, record = f.record): void {
+	const held = { ...record, state: "awaiting_operator" as const, updatedAt: END };
+	f.database.transaction((tx) =>
+		f.database.work.putLaneJob(tx, { ...held, laneKey: f.runtime.laneKey, json: JSON.stringify(held) }),
+	);
+}
+
+function prepareRootlessChild(f: Awaited<ReturnType<typeof fixture>>) {
+	const name = "child";
+	const jobId = `lanejob-${Buffer.from(name, "utf8").toString("hex")}`;
+	const opRef = "gw-work-child";
+	const record = appendAttempt(
+		createLaneJobRecord({
+			jobId,
+			branch: "main",
+			worktreePath: "/child",
+			sessionId: PARENT_SESSION,
+			now: () => new Date(START),
+		}),
+		{ opRef, sessionId: PARENT_SESSION, startedAt: START },
+	);
+	const runtime: WorkAttemptRuntime = {
+		...f.runtime,
+		opRef,
+		jobId,
+		laneKey: "work-child",
+		sessionKey: "work/task/child",
+		sessionId: PARENT_SESSION,
+		cwd: "/child",
+		parent: { kind: "lane", name: "a", root: null },
+		reportId: workAttemptReportId(f.database.instanceId, jobId, opRef),
+		deliveryId: workAttemptDeliveryId(f.database.instanceId, jobId, opRef),
+	};
+	const admission: WorkAttemptAdmission = {
+		kind: "lane",
+		report: {
+			reportId: runtime.reportId,
+			parentName: "a",
+			childName: name,
+			childOpRef: opRef,
+			body: "child result",
+			root: null,
+		},
+		fallbackPayload: null,
+	};
+	f.database.transaction((tx) => {
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority: f.authority,
+			sessionId: PARENT_SESSION,
+			originKey: runtime.sessionKey,
+			epoch: 0,
+			repo: runtime.cwd,
+		});
+		prepareAttempt(f.database, tx, runtime, record);
+	});
+	const closed = closeAttempt({ record, opRef, endState: "completed", endedAt: END });
+	return { runtime, admission, closed };
+}
+
 describe("work attempt durable transactions", () => {
+	test("authorization owner identities are canonical, optional, and immutable", async () => {
+		const f = await fixture();
+		const persona = { kind: "persona" as const, originKey: originKey(LOOPBACK_ORIGIN) };
+		const valid = [
+			undefined,
+			null,
+			persona,
+			{ kind: "lane" as const, name: "parent", rootOriginKey: null },
+			{ kind: "lane" as const, name: "parent", rootOriginKey: persona.originKey },
+		];
+		for (const authorizationOwner of valid)
+			expect(() =>
+				validateWorkRuntime({ ...f.runtime, parent: null, mode: "run", authorizationOwner }, f.database.instanceId),
+			).not.toThrow();
+		for (const authorizationOwner of [
+			{ kind: "persona", originKey: "loopback/loopback/loopback/extra" },
+			{ kind: "persona", originKey: "work/task/parent" },
+			{ kind: "persona", originKey: persona.originKey, extra: true },
+			{ kind: "lane", name: "bad/name", rootOriginKey: null },
+			{ kind: "lane", name: "parent", rootOriginKey: "monitor/eventtype/child" },
+			{ kind: "lane", name: "parent" },
+			{ kind: "unknown" },
+		]) {
+			expect(() =>
+				validateWorkRuntime({ ...f.runtime, authorizationOwner } as WorkAttemptRuntime, f.database.instanceId),
+			).toThrow();
+		}
+		const runtime: WorkAttemptRuntime = { ...f.runtime, mode: "run", parent: null, authorizationOwner: persona };
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+		expect(f.database.work.workAttemptGet(runtime.opRef)?.authorizationOwner).toEqual(persona);
+		expect(() =>
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, runtime.opRef, 0, {
+					authorizationOwner: null,
+				} as WorkAttemptPatch),
+			),
+		).toThrow(WorkAttemptStateError);
+		expect(f.database.work.workAttemptGet(runtime.opRef)).toEqual(runtime);
+	});
+
+	test("rootless child settlement still reports to an ordinary running parent", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		const child = prepareRootlessChild(f);
+		const result = f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, child.runtime.opRef, 0, child.closed, f.settlement, child.admission),
+		);
+		expect(result?.runtime.decision).toBe("reported");
+		expect(f.database.work.laneReportGet(child.runtime.reportId)).toMatchObject({
+			parent_name: "a",
+			root_json: null,
+			state: "pending",
+		});
+		expect(f.database.outbox.rows()).toHaveLength(0);
+	});
+
+	test("rootless child settlement retains a durable report for an accepted open held parent", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => {
+			prepareAttempt(f.database, tx, f.runtime, f.record);
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			});
+		});
+		holdParent(f);
+		const child = prepareRootlessChild(f);
+		const before = f.database.work.workAttemptGet(f.runtime.opRef);
+		const result = f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, child.runtime.opRef, 0, child.closed, f.settlement, child.admission),
+		);
+		expect(result?.runtime.decision).toBe("reported");
+		expect(f.database.work.laneReportGet(child.runtime.reportId)).toMatchObject({
+			parent_name: "a",
+			child_name: "child",
+			child_op_ref: child.runtime.opRef,
+			body: "child result",
+			root_json: null,
+			state: "pending",
+		});
+		expect(f.database.outbox.rows()).toHaveLength(0);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(before);
+		expect(before).toMatchObject({ settledAt: null, terminal: null, decision: "undecided" });
+		expect(before?.turnEndObservedAt).toBeUndefined();
+		expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
+	});
+
+	test("held parent admission requires accepted unresolved execution and current binding", async () => {
+		for (const scenario of ["prepared", "settled", "turn_end", "terminal", "wrong_session", "wrong_epoch"] as const) {
+			const f = await fixture();
+			f.database.transaction((tx) => {
+				prepareAttempt(f.database, tx, f.runtime, f.record);
+				if (scenario !== "prepared")
+					updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+						sendPhase: "accepted",
+						sendEvidence: { source: "receipt", observedAt: START },
+					});
+			});
+			if (scenario === "settled") {
+				f.database.transaction((tx) =>
+					settleAttempt(f.database, tx, f.runtime.opRef, 1, f.closed, {
+						...f.settlement,
+						decision: "no_target",
+					}),
+				);
+				holdParent(f, f.closed);
+			} else {
+				if (scenario === "turn_end")
+					f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 1, { turnEndObservedAt: END }));
+				if (scenario === "terminal")
+					f.database.transaction((tx) =>
+						updateAttempt(f.database, tx, f.runtime.opRef, 1, {
+							terminal: { kind: "local", observedAt: END, reasonCode: "session_dead" },
+						}),
+					);
+				holdParent(f);
+			}
+			if (scenario === "wrong_session")
+				f.raw
+					.query("UPDATE sessions SET gjc_session_id = ? WHERE origin_key = ?")
+					.run(PARENT_SESSION, f.runtime.sessionKey);
+			if (scenario === "wrong_epoch")
+				f.raw.query("UPDATE sessions SET epoch = epoch + 1 WHERE origin_key = ?").run(f.runtime.sessionKey);
+			const child = prepareRootlessChild(f);
+			const result = f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, child.runtime.opRef, 0, child.closed, f.settlement, child.admission),
+			);
+			expect(result?.runtime.decision).toBe("no_target");
+			expect(f.database.work.laneReportGet(child.runtime.reportId)).toBeUndefined();
+			expect(f.database.outbox.rows()).toHaveLength(0);
+		}
+	});
+
+	test("rootless child admission cannot substitute a different owner or disclosure root", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => {
+			prepareAttempt(f.database, tx, f.runtime, f.record);
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			});
+		});
+		holdParent(f);
+		const child = prepareRootlessChild(f);
+		const admission = child.admission;
+		if (admission.kind !== "lane") throw new Error("expected lane admission");
+		for (const report of [
+			{ ...admission.report, parentName: "other" },
+			{ ...admission.report, root: { originKey: originKey(LOOPBACK_ORIGIN), origin: LOOPBACK_ORIGIN } },
+		]) {
+			expect(() =>
+				f.database.transaction((tx) =>
+					settleAttempt(f.database, tx, child.runtime.opRef, 0, child.closed, f.settlement, { ...admission, report }),
+				),
+			).toThrow(WorkAttemptStateError);
+		}
+		expect(f.database.work.workAttemptGet(child.runtime.opRef)?.settledAt).toBeNull();
+		expect(f.database.work.laneReportGet(child.runtime.reportId)).toBeUndefined();
+		expect(f.database.outbox.rows()).toHaveLength(0);
+	});
+
 	test("successor prepare links both directions, preserves open execution and refuses a second successor", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => {

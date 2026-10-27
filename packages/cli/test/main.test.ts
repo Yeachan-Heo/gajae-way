@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import { type OpsCycleResult, type OpsSloResult, ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -1344,6 +1344,115 @@ describe("work operator commands", () => {
 		expect(output.lines).toEqual(["already started: work/task/replacement session=session-new job=job-new op=op-new"]);
 		expect(output.requests).toHaveLength(1);
 	});
+
+	for (const reasonCode of [
+		"successor_name_already_bound",
+		"successor_source_changed",
+		"successor_already_authorized",
+		"successor_repository_mismatch",
+		"successor_report_owner_mismatch",
+		"successor_requires_missing_execution_end",
+	]) {
+		test(`work successor displays the safe refusal reason ${reasonCode} without private detail`, async () => {
+			const output = await run(
+				["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+				new ProtocolError("invalid_params", "isolated successor refused", {
+					reasonCode,
+					diagnostic: "private diagnostic /secret/checkout",
+					successor: { name: "private-target", sessionId: "private-session" },
+				}),
+			);
+			expect(output.errors.join("\n")).toContain(reasonCode);
+			expect(output.errors.join("\n")).not.toContain("private");
+			expect(output.errors.join("\n")).not.toContain("/secret/checkout");
+			expect(output.lines).toEqual([]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("work successor displays the designated successor refusal without leaking the linked target", async () => {
+		const message = "successor already designated; inspect the original linked lane";
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", message, {
+				reasonCode: "successor_already_authorized",
+				successor: { name: "private-target", opRef: "private-op", sessionId: "private-session" },
+			}),
+		);
+		expect(output.errors.join("\n")).toContain(message);
+		expect(output.errors.join("\n")).toContain("successor_already_authorized");
+		expect(output.errors.join("\n")).not.toContain("private");
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work successor displays the reviewed base mismatch without private detail", async () => {
+		const message = "successor checkout does not match the reviewed commit";
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", message, {
+				reasonCode: "successor_base_mismatch",
+				diagnostic: "private diagnostic /secret/checkout",
+			}),
+		);
+		expect(output.errors.join("\n")).toContain(message);
+		expect(output.errors.join("\n")).toContain("successor_base_mismatch");
+		expect(output.errors.join("\n")).not.toContain("private");
+		expect(output.errors.join("\n")).not.toContain("/secret/checkout");
+		expect(output.lines).toEqual([]);
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	for (const [label, detail] of [
+		["unknown reason", { reasonCode: "private-unknown-reason", diagnostic: "private diagnostic" }],
+		["obsolete reason", { reasonCode: "successor_checkout_not_isolated", diagnostic: "private diagnostic" }],
+		["missing reason", { diagnostic: "private diagnostic" }],
+		["non-string reason", { reasonCode: { code: "successor_source_changed", secret: "private" } }],
+		["array detail", [{ reasonCode: "successor_source_changed" }, "private"]],
+		["null detail", null],
+	] as const) {
+		test(`work successor leaves ${label} opaque`, async () => {
+			const output = await run(
+				["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+				new ProtocolError("invalid_params", "isolated successor refused", detail),
+			);
+			expect(output.errors).toEqual(["isolated successor refused"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const [label, args, error] of [
+		[
+			"ordinary start",
+			["start", "fix", "task"],
+			new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"work run",
+			["run", "fix", "task"],
+			new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"different error message",
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", "ordinary failure", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"different error code",
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("verb_failed", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+	] as const) {
+		test(`work successor reason rendering preserves unrelated ${label} errors`, async () => {
+			const output = await run([...args], error);
+			expect(output.errors).toEqual([error.message]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
 
 	for (let mask = 1; mask < 15; mask++) {
 		test(`work start rejects incomplete successor authorization ${mask} before connecting`, async () => {

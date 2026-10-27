@@ -48,6 +48,7 @@ import {
 	type WorkAttemptSettlement,
 	type WorkAttemptSettleResult,
 	type WorkAttemptTerminalEvidence,
+	type WorkAuthorizationOwner,
 	type WorkParent,
 	type WorkReportRoot,
 	workAssert,
@@ -135,11 +136,22 @@ const pendingOutput = () => ({
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
-/** Authorization follows the stable owner, not whichever message is active now. */
-function sameReportOwner(left: WorkParent | null, right: WorkParent | null): boolean {
-	if (left === null || right === null) return left === right;
+/** Authorization follows the stable owner, independently of the report destination. */
+function authorizationOwner(parent: WorkParent | null): WorkAuthorizationOwner | null {
+	if (!parent) return null;
+	if (parent.kind === "persona") return { kind: "persona", originKey: parent.originKey };
+	return { kind: "lane", name: parent.name, rootOriginKey: parent.root?.originKey ?? null };
+}
+function runtimeAuthorizationOwner(runtime: WorkAttemptRuntime): WorkAuthorizationOwner | null {
+	return runtime.authorizationOwner === undefined ? authorizationOwner(runtime.parent) : runtime.authorizationOwner;
+}
+function sameAuthorizationOwner(
+	left: WorkAuthorizationOwner | null | undefined,
+	right: WorkAuthorizationOwner | null,
+): boolean {
+	if (!left || !right) return false;
 	if (left.kind === "persona") return right.kind === "persona" && left.originKey === right.originKey;
-	return right.kind === "lane" && left.name === right.name && left.root?.originKey === right.root?.originKey;
+	return right.kind === "lane" && left.name === right.name && left.rootOriginKey === right.rootOriginKey;
 }
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
@@ -245,6 +257,7 @@ interface WorkInput {
 }
 interface StartContext {
 	readonly parent: WorkParent | null;
+	readonly authorizationOwner?: WorkAuthorizationOwner | null;
 	readonly runCall?: RunCall;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
@@ -683,6 +696,13 @@ export class WorkLaneManager {
 		const opRef = this.#job(name)?.attempts.at(-1)?.opRef;
 		return opRef ? this.#db.work.workAttemptGet(opRef) : undefined;
 	}
+	#successorProvenance(job: LaneJobRecord): WorkAttemptRuntime["successorOf"] {
+		for (const attempt of job.attempts) {
+			const link = this.#db.work.workAttemptGet(attempt.opRef)?.successorOf;
+			if (link) return link;
+		}
+		return undefined;
+	}
 	#rootForLane(name: string): WorkReportRoot | null {
 		const parent = this.#latestRuntime(name)?.parent;
 		if (parent?.kind === "persona") return { originKey: parent.originKey, origin: parent.origin };
@@ -753,15 +773,10 @@ export class WorkLaneManager {
 			}
 			if (mode === "start") this.#assertNoNestedCycle(input.name, callerLane);
 			const parent: WorkParent = { kind: "lane", name: callerLane, root: this.#rootForLane(callerLane) };
-			const resolved = mode === "start" ? parent : null;
 			console.error(
 				`work_parent_resolved verb=${mode} name=${input.name} source=session kind=${mode === "start" ? "lane" : "none"}`,
 			);
-			return resolved;
-		}
-		if (mode === "run") {
-			console.error(`work_parent_resolved verb=run name=${input.name} source=none kind=none`);
-			return null;
+			return parent;
 		}
 		if (callerPersona) {
 			const parent: WorkParent = {
@@ -770,7 +785,9 @@ export class WorkLaneManager {
 				origin: callerPersona,
 				...(triggerMessageId ? { triggerMessageId } : {}),
 			};
-			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
+			console.error(
+				`work_parent_resolved verb=${mode} name=${input.name} source=session kind=${mode === "start" ? "persona" : "none"}`,
+			);
 			return parent;
 		}
 		const owner = this.#options.ownerTarget?.();
@@ -791,14 +808,16 @@ export class WorkLaneManager {
 						origin: structuredClone(owner),
 						...(ownerTriggerMessageId ? { triggerMessageId: ownerTriggerMessageId } : {}),
 					};
-					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona`);
+					console.error(
+						`work_parent_resolved verb=${mode} name=${input.name} source=owner kind=${mode === "start" ? "persona" : "none"}`,
+					);
 					return parent;
 				}
 			} catch {
 				/* Invalid owner origins cannot become report targets. */
 			}
 		}
-		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none`);
+		console.error(`work_parent_resolved verb=${mode} name=${input.name} source=none kind=none`);
 		return null;
 	}
 	#laneNotice(
@@ -863,17 +882,21 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		if (input.successorOf && mode !== "start") invalid("successorOf");
-		const parent = this.#resolveCaller(input, mode);
+		const caller = this.#resolveCaller(input, mode);
+		const parent = mode === "start" ? caller : null;
+		const owner = authorizationOwner(caller);
 		this.#job(input.name);
 		await this.recover();
 		this.#live();
 		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent, runCall }));
+		return this.#port.runExclusive(sessionKey, () =>
+			this.#startLocked(input, mode, { parent, authorizationOwner: owner, runCall }),
+		);
 	}
 	/** New authorized work, never execution settlement, prompt replay, or writer transfer. */
 	async #successorSource(
 		input: WorkInput,
-		parent: WorkParent | null,
+		owner: WorkAuthorizationOwner | null | undefined,
 		prepared = false,
 	): Promise<WorkAttemptRuntime | undefined> {
 		const expected = input.successorOf;
@@ -902,9 +925,8 @@ export class WorkLaneManager {
 		if (runtime.successor) refuse("successor_already_authorized");
 		if (source.lane.repository === undefined || source.lane.repository !== input.repo)
 			refuse("successor_repository_mismatch");
-		if (!sameReportOwner(runtime.parent, parent)) refuse("successor_report_owner_mismatch");
-		if (prepared && input.cwd && realpathSync(input.cwd) === realpathSync(runtime.cwd))
-			refuse("successor_checkout_not_isolated");
+		if (!sameAuthorizationOwner(runtimeAuthorizationOwner(runtime), owner ?? null))
+			refuse("successor_report_owner_mismatch");
 		const status = await this.#query(runtime);
 		if (
 			status.status !== "failed" ||
@@ -938,7 +960,7 @@ export class WorkLaneManager {
 			if (
 				source?.sessionKey === workSessionKey(expected.name) &&
 				source.sessionId === expected.sessionId &&
-				sameReportOwner(source.parent, context.parent) &&
+				sameAuthorizationOwner(runtimeAuthorizationOwner(source), context.authorizationOwner ?? null) &&
 				source.successor
 			) {
 				const link = source.successor;
@@ -971,7 +993,7 @@ export class WorkLaneManager {
 				};
 			}
 		}
-		const recoverySource = await this.#successorSource(input, context.parent);
+		const recoverySource = await this.#successorSource(input, context.authorizationOwner);
 		if (recoverySource) context = { ...context, parent: recoverySource.parent };
 		if (input.cwd !== undefined) assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
@@ -1150,7 +1172,7 @@ export class WorkLaneManager {
 		}
 		this.#live();
 		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-		const predecessor = await this.#successorSource(input, context.parent, true);
+		const predecessor = await this.#successorSource(input, context.authorizationOwner, true);
 		const successorOf = predecessor
 			? {
 					name: input.successorOf!.name,
@@ -1160,8 +1182,9 @@ export class WorkLaneManager {
 					authorizedAt: this.#at(),
 				}
 			: undefined;
+		const provenance = successorOf ?? this.#successorProvenance(initialJob);
 		const notice =
-			mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch, successorOf) : undefined;
+			mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch, provenance) : undefined;
 		const runtime: WorkAttemptRuntime = {
 			...makeRuntime(
 				this.#db,
@@ -1176,6 +1199,7 @@ export class WorkLaneManager {
 				context.wakeReportId ?? null,
 				notice?.hash ?? null,
 			),
+			authorizationOwner: context.authorizationOwner ?? null,
 			...(successorOf ? { successorOf } : {}),
 		};
 		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
@@ -1277,6 +1301,7 @@ export class WorkLaneManager {
 		const binding = this.#db.bindings.getSessionRecord(key);
 		const attempt = job.attempts.at(-1);
 		const runtime = attempt && this.#db.work.workAttemptGet(attempt.opRef);
+		const provenance = this.#successorProvenance(job);
 		let opUnavailable = false;
 		let op: PromptStatusBody | null = null;
 		if (attempt && binding?.sessionId === attempt.sessionId) {
@@ -1295,11 +1320,7 @@ export class WorkLaneManager {
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
 				// A settled attempt whose host is gone has no live op to report.
-				if (
-					runtime?.successor ||
-					runtime?.successorOf ||
-					(job.state === "awaiting_operator" && attempt.endedAt === undefined)
-				)
+				if (runtime?.successor || provenance || (job.state === "awaiting_operator" && attempt.endedAt === undefined))
 					opUnavailable = true;
 				else if (attempt.endedAt === undefined || !isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
@@ -1322,7 +1343,7 @@ export class WorkLaneManager {
 				: null,
 			op,
 			...(opUnavailable ? { opUnavailable: true as const } : {}),
-			...(runtime?.successorOf ? { successorOf: runtime.successorOf } : {}),
+			...(provenance ? { successorOf: provenance } : {}),
 			...(runtime?.successor ? { successor: runtime.successor } : {}),
 			...(!attempt?.endedAt &&
 			!runtime?.turnEndObservedAt &&
@@ -2327,10 +2348,11 @@ export class WorkLaneManager {
 		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 3_200)}` : "";
 		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
 		const last = job.attempts.at(-1);
-		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const previous = last ? this.#attemptByOpRef(last.opRef) : undefined;
 		try {
 			await this.#startLocked({ name, text, cwd: job.lane.worktreePath, resume: false }, "start", {
-				parent,
+				parent: previous?.parent ?? null,
+				authorizationOwner: previous?.authorizationOwner ?? null,
 				checksRetry: true,
 			});
 			console.error(`awaiting_checks_resteered jobId=${job.jobId} pr=${cycle.prNumber} retry=${retries}`);
@@ -2675,7 +2697,7 @@ export class WorkLaneManager {
 		}
 		if (!opRef || claimed.claim_kind !== "wake" || claimed.claim_ref !== opRef) return;
 		const last = job.attempts.at(-1);
-		const inheritedParent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const previous = last ? this.#attemptByOpRef(last.opRef) : undefined;
 		try {
 			const outcome = await this.#startLocked(
 				{
@@ -2685,7 +2707,12 @@ export class WorkLaneManager {
 					resume: false,
 				},
 				"start",
-				{ parent: inheritedParent, opRef, wakeReportId: row.report_id },
+				{
+					parent: previous?.parent ?? null,
+					authorizationOwner: previous?.authorizationOwner ?? null,
+					opRef,
+					wakeReportId: row.report_id,
+				},
 			);
 			if (outcome.started) return;
 		} catch {
@@ -2857,7 +2884,7 @@ export class WorkLaneManager {
 				}
 				if (
 					this.#binding(runtime) &&
-					(runtime.successorOf ||
+					(this.#successorProvenance(this.#job(runtime.sessionKey.slice("work/task/".length), true)!) ||
 						runtime.successor ||
 						(live.live === undefined && !live.disowned && hasAcceptanceEvidence(runtime)))
 				) {

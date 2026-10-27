@@ -23,7 +23,13 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import {
+	LOOPBACK_ORIGIN,
+	OPS_CYCLE_MAX_LIMIT,
+	originKey,
+	ProtocolError,
+	WORK_JOBS_MAX_LIMIT,
+} from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -58,6 +64,33 @@ async function connectGatewaySocket(
 	options: { readonly requestTimeoutMs?: number } = {},
 ): Promise<GajaewayClient> {
 	return GajaewayClient.connectSocketWithBackoff(path, { ...options, deadlineMs: 30_000 });
+}
+
+function successorRefusalMessage(error: unknown): string | undefined {
+	if (!(error instanceof ProtocolError) || error.code !== "invalid_params") return undefined;
+	const detail = error.detail;
+	if (typeof detail !== "object" || detail === null || Array.isArray(detail) || !("reasonCode" in detail))
+		return undefined;
+	const reason = detail.reasonCode;
+	if (error.message === "isolated successor refused") {
+		switch (reason) {
+			case "successor_name_already_bound":
+			case "successor_source_changed":
+			case "successor_already_authorized":
+			case "successor_repository_mismatch":
+			case "successor_report_owner_mismatch":
+			case "successor_requires_missing_execution_end":
+				return `${error.message}: ${reason}`;
+		}
+	}
+	if (
+		error.message === "successor already designated; inspect the original linked lane" &&
+		reason === "successor_already_authorized"
+	)
+		return `${error.message}: successor_already_authorized`;
+	if (error.message === "successor checkout does not match the reviewed commit" && reason === "successor_base_mismatch")
+		return `${error.message}: successor_base_mismatch`;
+	return undefined;
 }
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
@@ -1199,7 +1232,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						...(callerSessionId ? { callerSessionId } : {}),
 					};
 					if (command === "start") {
-						const result = await client.request<WorkStartResult>("work.start", params);
+						let result: WorkStartResult;
+						try {
+							result = await client.request<WorkStartResult>("work.start", params);
+						} catch (error) {
+							const message = successorOf === undefined ? undefined : successorRefusalMessage(error);
+							if (message !== undefined) throw new Error(message);
+							throw error;
+						}
 						if (result.started) {
 							console.log(
 								`${result.alreadyStarted ? "already started" : "started"}: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,

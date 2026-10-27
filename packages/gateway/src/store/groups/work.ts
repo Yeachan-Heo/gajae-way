@@ -4,6 +4,7 @@ import {
 	isSilentOutput,
 	type OriginRef,
 	originKey,
+	parseOriginKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import {
@@ -60,6 +61,10 @@ export type WorkParent =
 			readonly triggerMessageId?: string;
 	  }
 	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
+
+export type WorkAuthorizationOwner =
+	| { readonly kind: "persona"; readonly originKey: string }
+	| { readonly kind: "lane"; readonly name: string; readonly rootOriginKey: string | null };
 
 export interface WorkAttemptOutputProof {
 	readonly opRef: string;
@@ -153,6 +158,7 @@ export interface WorkAttemptRuntime {
 	readonly terminal: WorkAttemptTerminalEvidence | null;
 	readonly output: WorkAttemptOutput;
 	readonly parent: WorkParent | null;
+	readonly authorizationOwner?: WorkAuthorizationOwner | null;
 	readonly reportId: string;
 	readonly wakeReportId: string | null;
 	readonly noticeHash: string | null;
@@ -318,6 +324,17 @@ export function validateWorkParent(parent: WorkParent, mode: WorkAttemptMode): v
 	if (parent.root !== null) validateWorkRoot(parent.root);
 }
 
+function validateAuthorizationOrigin(key: unknown): void {
+	workAssert(typeof key === "string");
+	let origin: OriginRef;
+	try {
+		origin = parseOriginKey(key);
+	} catch {
+		throw new WorkAttemptStateError(undefined, "authorization origin key is canonical");
+	}
+	workAssert(["discord", "slack", "telegram", "loopback"].includes(origin.platform));
+}
+
 export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): void {
 	workAssert(value && typeof value === "object");
 	workAssert(workString(value.opRef));
@@ -352,6 +369,18 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 	workAssert(!Object.hasOwn(value, "target"));
 	workAssert(value.parent === null || (value.parent && typeof value.parent === "object"));
 	if (value.parent !== null) validateWorkParent(value.parent, value.mode);
+	const owner = value.authorizationOwner;
+	if (owner !== undefined && owner !== null) {
+		workAssert(typeof owner === "object");
+		if (owner.kind === "persona") {
+			workAssert(Object.keys(owner).length === 2);
+			validateAuthorizationOrigin(owner.originKey);
+		} else {
+			workAssert(owner.kind === "lane" && Object.keys(owner).length === 3);
+			workAssert(typeof owner.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(owner.name));
+			if (owner.rootOriginKey !== null) validateAuthorizationOrigin(owner.rootOriginKey);
+		}
+	}
 	workAssert(value.mode !== "run" || value.parent === null);
 	workAssert(value.reportId === workAttemptReportId(instanceId, value.jobId, value.opRef));
 	workAssert(value.wakeReportId === null || /^lane-report-[0-9a-f]{64}$/.test(value.wakeReportId));
@@ -922,11 +951,25 @@ export class WorkGroup {
 		if (json === undefined) return false;
 		try {
 			const parent = parseLaneJobRecord(json);
+			if (parent.jobId !== jobId) return false;
+			if (parent.state === "awaiting_operator") {
+				const runtime = this.workAttemptOpenByLane(`work-${name}`);
+				if (
+					!runtime ||
+					runtime.jobId !== jobId ||
+					runtime.sendPhase !== "accepted" ||
+					runtime.terminal !== null ||
+					runtime.turnEndObservedAt !== undefined
+				)
+					return false;
+				const binding = this.#db
+					.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?")
+					.get(runtime.sessionKey) as { gjc_session_id: string; epoch: number } | null;
+				return binding?.gjc_session_id === runtime.sessionId && binding.epoch === runtime.epoch;
+			}
 			return (
-				parent.jobId === jobId &&
 				parent.state !== "aborted" &&
 				parent.state !== "awaiting_checks" &&
-				parent.state !== "awaiting_operator" &&
 				parent.state !== "stalled" &&
 				parent.state !== "done"
 			);
