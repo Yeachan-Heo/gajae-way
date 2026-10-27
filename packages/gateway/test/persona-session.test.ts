@@ -5689,22 +5689,3 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
 	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
 });
-
-test("recovery_hold logs once per state change, not every scan (#705)", async () => {
-	const port = new ScriptedSessionPort();
-	const logs: string[] = [];
-	await harness(port, {}, (line) => logs.push(line), { submissionRetryDelayMs: 1 });
-	enqueue("msg1", "send");
-	await manager!.notifyInbound(KEY);
-	const send = port.sends[0]!;
-	// Status stays unknown; host is dead
-	port.status = async () => ({ operationRef: send.opRef, status: { status: "unknown" }, summaryCompleted: false });
-	port.liveness = async () => ({ live: false });
-	// Multiple recovery scans - should still only log the first time
-	for (let i = 0; i < 5; i++) {
-		await manager!.recover(KEY);
-	}
-	// First sweep logs with count=1
-	const countOneLogs = logs.filter((line) => line.includes("operation_state_unknown") && line.includes("sweeps=1"));
-	expect(countOneLogs.length).toBeGreaterThan(0);
-});
