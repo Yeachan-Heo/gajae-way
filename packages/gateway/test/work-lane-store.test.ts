@@ -238,7 +238,141 @@ function seedLinkedWakeReport(
 	return reportId;
 }
 
+function successorAttempt(f: Awaited<ReturnType<typeof fixture>>, name = "successor") {
+	const sessionId = name === "successor" ? PARENT_SESSION : "c7360739-d04c-4177-a379-ab6b98f73a40";
+	const opRef = `gw-work-${name}`;
+	const jobId = `lanejob-${Buffer.from(name, "utf8").toString("hex")}`;
+	const cwd = `/work-${name}`;
+	const record = appendAttempt(
+		createLaneJobRecord({ jobId, branch: "main", worktreePath: cwd, sessionId, now: () => new Date(END) }),
+		{ opRef, sessionId, startedAt: END },
+	);
+	const runtime: WorkAttemptRuntime = {
+		...f.runtime,
+		opRef,
+		jobId,
+		laneKey: `work-${name}`,
+		sessionKey: `work/task/${name}`,
+		sessionId,
+		cwd,
+		startedAt: END,
+		reportId: workAttemptReportId(f.database.instanceId, jobId, opRef),
+		deliveryId: workAttemptDeliveryId(f.database.instanceId, jobId, opRef),
+		successorOf: {
+			name: "a",
+			opRef: f.runtime.opRef,
+			sessionId: SESSION,
+			baseSha: "a".repeat(40),
+			authorizedAt: END,
+		},
+	};
+	f.database.transaction((tx) =>
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority: f.authority,
+			sessionId,
+			originKey: runtime.sessionKey,
+			epoch: 0,
+			repo: cwd,
+		}),
+	);
+	return { runtime, record };
+}
+
 describe("work attempt durable transactions", () => {
+	test("successor prepare links both directions, preserves open execution and refuses a second successor", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => {
+			prepareAttempt(f.database, tx, f.runtime, f.record);
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			});
+		});
+		const successor = successorAttempt(f);
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, successor.runtime, successor.record));
+		const link = { name: "successor", opRef: successor.runtime.opRef, sessionId: successor.runtime.sessionId };
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
+			successor: link,
+			settledAt: null,
+			terminal: null,
+			version: 2,
+		});
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.turnEndObservedAt).toBeUndefined();
+		expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
+		expect(f.database.work.workAttemptGet(successor.runtime.opRef)?.successorOf).toEqual(successor.runtime.successorOf);
+		f.database.transaction((tx) => {
+			updateAttempt(f.database, tx, f.runtime.opRef, 2, { output: { ...f.runtime.output, nextReadAt: END } });
+			updateAttempt(f.database, tx, successor.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: END },
+			});
+		});
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.successor).toEqual(link);
+		expect(f.database.work.workAttemptGet(successor.runtime.opRef)?.successorOf).toEqual(successor.runtime.successorOf);
+		expect(
+			f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 3, { successor: link }))?.version,
+		).toBe(3);
+		for (const replacement of [undefined, { ...link, name: "other" }]) {
+			expect(() =>
+				f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 3, { successor: replacement })),
+			).toThrow(WorkAttemptStateError);
+		}
+		const duplicate = successorAttempt(f, "duplicate");
+		expect(() =>
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, duplicate.runtime, duplicate.record)),
+		).toThrow(WorkAttemptStateError);
+		expect(f.database.work.workAttemptGet(duplicate.runtime.opRef)).toBeUndefined();
+		expect(f.database.work.laneJobJson(duplicate.runtime.jobId)).toBeUndefined();
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.successor).toEqual(link);
+		expect(() =>
+			f.database.transaction((tx) =>
+				updateAttempt(f.database, tx, successor.runtime.opRef, 1, {
+					output: successor.runtime.output,
+					successorOf: { ...successor.runtime.successorOf!, baseSha: "b".repeat(40) },
+				} as WorkAttemptPatch),
+			),
+		).toThrow(WorkAttemptStateError);
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, f.runtime.opRef, 3, f.closed, f.settlement, f.admission),
+		);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.successor).toEqual(link);
+	});
+
+	test("successor prepare rejects mismatched predecessor identity and rolls back link on insert failure", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => {
+			prepareAttempt(f.database, tx, f.runtime, f.record);
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			});
+		});
+		const successor = successorAttempt(f);
+		for (const source of [
+			{ ...successor.runtime.successorOf!, name: "wrong" },
+			{ ...successor.runtime.successorOf!, name: "bad/name" },
+			{ ...successor.runtime.successorOf!, sessionId: "c7360739-d04c-4177-a379-ab6b98f73a40" },
+			{ ...successor.runtime.successorOf!, sessionId: "not-a-uuid" },
+			{ ...successor.runtime.successorOf!, opRef: "gw-missing-source" },
+			{ ...successor.runtime.successorOf!, baseSha: "not-a-sha" },
+			{ ...successor.runtime.successorOf!, authorizedAt: "not-a-timestamp" },
+		]) {
+			expect(() =>
+				f.database.transaction((tx) =>
+					prepareAttempt(f.database, tx, { ...successor.runtime, successorOf: source }, successor.record),
+				),
+			).toThrow(WorkAttemptStateError);
+		}
+		f.raw.exec("CREATE TRIGGER fault BEFORE INSERT ON work_attempt_runtime BEGIN SELECT RAISE(ABORT, 'fault'); END");
+		expect(() =>
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, successor.runtime, successor.record)),
+		).toThrow();
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.successor).toBeUndefined();
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.version).toBe(1);
+		expect(f.database.work.workAttemptGet(successor.runtime.opRef)).toBeUndefined();
+		expect(f.database.work.laneJobJson(successor.runtime.jobId)).toBeUndefined();
+	});
+
 	for (const mode of ["start", "run"] as const) {
 		test(`${mode} publishes worker metadata and activity atomically at prepare and settlement`, async () => {
 			const f = await fixture();

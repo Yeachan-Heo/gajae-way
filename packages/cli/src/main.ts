@@ -87,7 +87,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] [--successor-of NAME --source-op REF --source-session ID --acknowledge-unresolved (start only; requires --repo and --base FULL_SHA; no --cwd/--resume)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -994,7 +994,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--successor-of NAME --source-op REF --source-session ID --acknowledge-unresolved (start only; requires --repo and --base FULL_SHA; no --cwd/--resume)] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
@@ -1105,6 +1105,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				let repo: string | undefined;
 				let base: string | undefined;
 				let model: string | { preset: string } | undefined;
+				let sourceName: string | undefined;
+				let sourceOpRef: string | undefined;
+				let sourceSessionId: string | undefined;
+				let acknowledgeUnresolved = false;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
@@ -1124,6 +1128,22 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
 						}
+					} else if (arg === "--successor-of" || arg === "--source-op" || arg === "--source-session") {
+						const value = args[++i];
+						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
+						if (arg === "--successor-of") {
+							if (sourceName !== undefined) throw new Error(usage);
+							sourceName = value;
+						} else if (arg === "--source-op") {
+							if (sourceOpRef !== undefined) throw new Error(usage);
+							sourceOpRef = value;
+						} else {
+							if (sourceSessionId !== undefined) throw new Error(usage);
+							sourceSessionId = value;
+						}
+					} else if (arg === "--acknowledge-unresolved") {
+						if (acknowledgeUnresolved) throw new Error(usage);
+						acknowledgeUnresolved = true;
 					} else if (arg === "--resume") resume = true;
 					else if (arg?.startsWith("--")) throw new Error(usage);
 					else textParts.push(arg as string);
@@ -1131,6 +1151,35 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const text = textParts.join(" ").trim();
 				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
 				if (base !== undefined && repo === undefined) throw new Error(usage);
+				let successorOf: WorkStartParams["successorOf"];
+				if (
+					sourceName !== undefined ||
+					sourceOpRef !== undefined ||
+					sourceSessionId !== undefined ||
+					acknowledgeUnresolved
+				) {
+					if (
+						command !== "start" ||
+						!sourceName ||
+						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sourceName) ||
+						sourceName === name ||
+						!sourceOpRef ||
+						!sourceSessionId ||
+						!acknowledgeUnresolved ||
+						repo === undefined ||
+						base === undefined ||
+						!/^[a-f0-9]{40}$/.test(base) ||
+						cwd !== undefined ||
+						resume
+					)
+						throw new Error(usage);
+					successorOf = {
+						name: sourceName,
+						opRef: sourceOpRef,
+						sessionId: sourceSessionId,
+						acknowledgeUnresolved: true,
+					};
+				}
 				// This is a caller response-wait budget, never an attempt deadline.
 				// Timeout/disconnect leaves the attempt observable via work.status.
 				const client = await connectGatewaySocket(parsed.socket, {
@@ -1145,6 +1194,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						...(repo ? { repo } : {}),
 						...(base ? { base } : {}),
 						...(resume ? { resume: true } : {}),
+						...(successorOf === undefined ? {} : { successorOf }),
 						...(model === undefined ? {} : { model }),
 						...(callerSessionId ? { callerSessionId } : {}),
 					};
@@ -1152,7 +1202,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						const result = await client.request<WorkStartResult>("work.start", params);
 						if (result.started) {
 							console.log(
-								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
+								`${result.alreadyStarted ? "already started" : "started"}: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
 							);
 						} else {
 							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);

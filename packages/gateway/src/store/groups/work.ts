@@ -138,6 +138,14 @@ export interface WorkAttemptRuntime {
 	readonly cwd: string;
 	readonly startedAt: string;
 	readonly mode: WorkAttemptMode;
+	readonly successorOf?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+		readonly baseSha: string;
+		readonly authorizedAt: string;
+	};
+	readonly successor?: { readonly name: string; readonly opRef: string; readonly sessionId: string };
 	readonly sendPhase: "prepared" | "accepted" | "uncertain";
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
 	/** Turn-end proof from lifecycle or live idle reconciliation; a missing receipt alone is not proof. */
@@ -155,7 +163,7 @@ export interface WorkAttemptRuntime {
 }
 
 export type WorkAttemptPatch = Partial<
-	Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "turnEndObservedAt" | "terminal" | "output">
+	Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "turnEndObservedAt" | "terminal" | "output" | "successor">
 >;
 export interface WorkAttemptSettlement extends WorkAttemptPatch {
 	readonly decision: WorkAttemptRequestedDecision;
@@ -321,6 +329,23 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 	workAssert(Number.isSafeInteger(value.epoch) && value.epoch >= 0);
 	workAssert(workString(value.cwd, 4096) && value.cwd.startsWith("/") && workTime(value.startedAt));
 	workAssert(["start", "run", "historical"].includes(value.mode));
+	for (const link of [value.successorOf, value.successor]) {
+		if (link === undefined) continue;
+		workAssert(link && typeof link === "object");
+		workAssert(typeof link.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(link.name));
+		workAssert(workString(link.opRef));
+		assertValidOpRef(link.opRef);
+		workAssert(
+			typeof link.sessionId === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(link.sessionId),
+		);
+		workAssert(link.opRef !== value.opRef && link.sessionId !== value.sessionId);
+		workAssert(link.name !== value.sessionKey.slice("work/task/".length));
+	}
+	if (value.successorOf !== undefined) {
+		workAssert(value.mode === "start");
+		workAssert(typeof value.successorOf.baseSha === "string" && /^[0-9a-f]{40}$/.test(value.successorOf.baseSha));
+		workAssert(workTime(value.successorOf.authorizedAt));
+	}
 	workAssert(["prepared", "accepted", "uncertain"].includes(value.sendPhase));
 	workAssert(Number.isSafeInteger(value.version) && value.version >= 0);
 	workAssert(value.deliveryId === workAttemptDeliveryId(instanceId, value.jobId, value.opRef));
@@ -651,6 +676,7 @@ export class WorkGroup {
 				runtime.output.nextReadAt === null,
 		);
 		workAssert(runtime.sendEvidence === null);
+		workAssert(runtime.successor === undefined, "successor is assigned only after prepare");
 		workAssert(runtime.sendPhase === (runtime.mode === "historical" ? "uncertain" : "prepared"));
 		this.#workValidateHistory(runtime, record);
 		if (runtime.wakeReportId !== null) {
@@ -666,6 +692,39 @@ export class WorkGroup {
 			workAssert(!previous?.attempts.some((attempt) => attempt.endedAt === undefined));
 			workAssert(record.attempts.length === (previous?.attempts.length ?? 0) + 1);
 			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous?.attempts ?? []));
+		}
+		if (runtime.successorOf !== undefined) {
+			const source = this.workAttemptGet(runtime.successorOf.opRef);
+			workAssert(
+				source &&
+					source.sessionKey === `work/task/${runtime.successorOf.name}` &&
+					source.sessionId === runtime.successorOf.sessionId &&
+					source.opRef === runtime.successorOf.opRef,
+				"successor predecessor identity matches runtime",
+			);
+			workAssert(
+				source.settledAt === null &&
+					source.turnEndObservedAt === undefined &&
+					source.successor === undefined &&
+					workAccepted(source),
+				"successor predecessor is accepted and execution remains open",
+			);
+			workAssert(
+				source.cwd !== runtime.cwd &&
+					source.jobId !== runtime.jobId &&
+					JSON.stringify(source.parent) === JSON.stringify(runtime.parent),
+				"successor uses a distinct checkout and job with the same parent report route",
+			);
+			workAssert(
+				this.workAttemptUpdate(tx, source.opRef, source.version, {
+					successor: {
+						name: runtime.sessionKey.slice("work/task/".length),
+						opRef: runtime.opRef,
+						sessionId: runtime.sessionId,
+					},
+				}) !== undefined,
+				"successor predecessor link is assigned atomically",
+			);
 		}
 		this.#workPutHistory(tx, runtime, record);
 		this.#db
@@ -696,7 +755,15 @@ export class WorkGroup {
 		if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 		this.#assertNotQuarantined(current.jobId);
 		// Skip no-op updates where patch contains no actual field changes (only version bumps).
-		const patchedFields = ["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output"] as const;
+		const patchedFields = [
+			"sendPhase",
+			"sendEvidence",
+			"turnEndObservedAt",
+			"terminal",
+			"output",
+			"successor",
+		] as const;
+		workAssert(Object.keys(patch).every((key) => (patchedFields as readonly string[]).includes(key)));
 		const changed = patchedFields.some((field) => {
 			if (!Object.hasOwn(patch, field)) return false;
 			return JSON.stringify(current[field]) !== JSON.stringify(patch[field as keyof typeof patch]);
@@ -949,10 +1016,18 @@ export class WorkGroup {
 	}
 
 	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch): WorkAttemptRuntime {
-		const allowed = new Set(["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output"]);
+		const allowed = new Set(["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output", "successor"]);
 		workAssert(Object.keys(patch).every((key) => allowed.has(key)));
 		const next = { ...current, ...patch, version: current.version + 1 };
 		validateWorkRuntime(next, this.instanceId);
+		workAssert(
+			current.successor === undefined ||
+				(next.successor !== undefined &&
+					current.successor.name === next.successor.name &&
+					current.successor.opRef === next.successor.opRef &&
+					current.successor.sessionId === next.successor.sessionId),
+			"successor link is immutable once assigned",
+		);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
 		workAssert(current.turnEndObservedAt === undefined || next.turnEndObservedAt === current.turnEndObservedAt);
