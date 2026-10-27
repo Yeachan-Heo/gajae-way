@@ -1710,12 +1710,14 @@ class OriginActor {
 	 * operation state has stayed unknown past `unresolvedHoldMs` since the send
 	 * and its host is provably not live, the turn moves to a retired hold - the
 	 * same hold `/new` leaves behind: it keeps reconciling, a late result is still
-	 * delivered, and the op is never resent - the epoch rotates so pending
-	 * messages continue on a fresh session, and the origin gets one notice.
+	 * delivered, and the op is never resent. When rotateEpoch is true, the epoch
+	 * rotates so pending messages continue on a fresh session, and the origin gets
+	 * one notice. When false (retired epoch case), only the claimed inputs are
+	 * closed and the escalation notice is marked for emission.
 	 * Pending messages are kept; nothing is discarded.
 	 */
-	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
-		if (this.#stopped || this.#manager.stopped || bound?.retired || turn.epoch !== this.#epoch()) return false;
+	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined, rotateEpoch = true): Promise<boolean> {
+		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
 		const database = this.#manager.database;
 		const since = database.inbox.sendAttemptedAt(turn.opRef) ?? database.inbox.turnDispatchedAt(turn.opRef);
@@ -1733,13 +1735,11 @@ class OriginActor {
 		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;
-		// One transaction: the fresh epoch, the held op's answer-wanted
-		// disposition, its replayable notice, and a fence over every input its
-		// prompt may have carried (trigger, claimed context, steers) so the fresh
-		// session never sees the possibly accepted request as unread. Messages
-		// that arrived after the send keep their unread context.
+		// One transaction: close claimed inputs, mark escalation notice, and optionally rotate epoch.
+		// For active epochs, the epoch rotates so pending messages continue on a fresh session.
+		// For retired epochs, the origin already moved on so no rotation is needed.
 		const { nextEpoch, closedInputs } = database.transaction((tx) => {
-			const epoch = database.bindings.rotateEpoch(tx, this.originKey);
+			const epoch = rotateEpoch ? database.bindings.rotateEpoch(tx, this.originKey) : turn.epoch;
 			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
 			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
 			const claimed = database.inbox.sentContextIds(turn.opRef);
@@ -1767,31 +1767,33 @@ class OriginActor {
 			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
 			"warn",
 		);
-		if (bound) {
-			bound.retired = true;
-			bound.answerWanted = true;
-			this.#clearStallReconciliation(bound);
-			bound.tail?.setTurnRunning(false);
-			await bound.tail?.close();
-			bound.detached = true;
-			this.#retired.set(retiredKey(bound), bound);
-			this.#current = undefined;
-			this.#state = "idle";
-			await bound.lifecycle.onRetired?.(bound);
-			this.#scheduleRetiredReattach(bound);
-		} else {
-			try {
-				// Adopted without a relay: the host is gone. Periodic reconcile reads
-				// its status; a reattach is tried on the bounded retired schedule.
-				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
-				adopted.detached = true;
-				this.#scheduleRetiredReattach(adopted);
-			} catch (error) {
-				// Still durable: the next recovery scan treats it as a retired-epoch turn.
-				this.#manager.log(
-					`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
-					"warn",
-				);
+		if (rotateEpoch) {
+			if (bound) {
+				bound.retired = true;
+				bound.answerWanted = true;
+				this.#clearStallReconciliation(bound);
+				bound.tail?.setTurnRunning(false);
+				await bound.tail?.close();
+				bound.detached = true;
+				this.#retired.set(retiredKey(bound), bound);
+				this.#current = undefined;
+				this.#state = "idle";
+				await bound.lifecycle.onRetired?.(bound);
+				this.#scheduleRetiredReattach(bound);
+			} else {
+				try {
+					// Adopted without a relay: the host is gone. Periodic reconcile reads
+					// its status; a reattach is tried on the bounded retired schedule.
+					const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+					adopted.detached = true;
+					this.#scheduleRetiredReattach(adopted);
+				} catch (error) {
+					// Still durable: the next recovery scan treats it as a retired-epoch turn.
+					this.#manager.log(
+						`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+						"warn",
+					);
+				}
 			}
 		}
 		this.#manager.log(
@@ -1873,7 +1875,7 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
-			if (!retired && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+			if (await this.#escalateUnresolvedHold(turn, undefined, !retired)) return;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=operation_state_unknown`,
 				"warn",
