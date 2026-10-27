@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
+import { ProtocolError, type WorkStartResult, type WorkStatusResult } from "@gajae-gateway/protocol";
+import { GajaewayClient } from "../../sdk/src/client";
 import { eventually, repository, WorkFixture } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];
@@ -173,4 +175,152 @@ test("killing only the CLI waiter leaves its run observable and notification-fre
 	expect(f.calls("send")).toHaveLength(1);
 	expect(f.calls("bind")).toHaveLength(1);
 	expect(f.calls("resume")).toHaveLength(0);
+}, 40_000);
+
+test("a caller timeout during bind can precede admission and a same-name start queues behind it", async () => {
+	const f = await fixture();
+	const gate = f.armBindGate();
+	const first = launch(f, ["start", "delayed", "--cwd", f.home, "first private prompt"]);
+	const arrival = await f.bindGateArrival(gate);
+	expect(arrival.originKey).toBe("work/task/delayed");
+	first.child.kill("SIGKILL");
+	const timedOut = await first.result;
+	expect(timedOut.stdout).toBe("");
+	expect(timedOut.code).not.toBe(0);
+
+	const unknown = await cli(f, ["status", "delayed"]);
+	expect(unknown.code).toBe(1);
+	expect(unknown.stdout).toBe("");
+	expect(unknown.stderr).toContain("unknown work lane");
+	expect(unknown.stderr).toContain("Do not blindly retry, even with the same name");
+	expect(f.snapshot().jobs).toHaveLength(0);
+	expect(f.snapshot().runtimes).toHaveLength(0);
+	expect(f.calls("bind")).toHaveLength(0);
+	expect(f.calls("send")).toHaveLength(0);
+
+	const second = launch(f, ["start", "delayed", "--cwd", f.home, "second private prompt"]);
+	expect((await f.bindGateContender(gate)).originKey).toBe(arrival.originKey);
+	expect(second.done()).toBe(false);
+	expect(f.calls("bind")).toHaveLength(0);
+	expect(f.calls("send")).toHaveLength(0);
+	f.releaseBindGate();
+	const refused = await second.result;
+	expect(refused.code).toBe(1);
+	expect(refused.stdout).toBe("");
+	expect(refused.stderr).toContain("attempt already open; use work.steer or wait");
+	const pending = await status(f, "delayed");
+	expect(pending.attempt.endedAt).toBeUndefined();
+	expect(pending.op.status).toBe("in_flight");
+	expect(f.calls("bind")).toHaveLength(1);
+	expect(f.calls("send")).toHaveLength(1);
+	expect(f.calls("send")[0]?.input).toMatchObject({ opRef: pending.attempt.opRef, text: "first private prompt" });
+
+	await f.kill();
+	await f.start();
+	expect((await status(f, "delayed")).attempt.opRef).toBe(pending.attempt.opRef);
+	await f.control(pending.attempt.opRef, { terminal: true, text: "late answer" });
+	const settled = await eventually(
+		() => f.snapshot(),
+		(snapshot) => snapshot.runtimes[0]?.settledAt != null,
+		"delayed start settlement after restart",
+	);
+	expect(settled.runtimes).toHaveLength(1);
+	expect(settled.runtimes[0].output.excerpt).toBe("late answer");
+	const final = await status(f, "delayed");
+	expect(final.attempt).toMatchObject({ opRef: pending.attempt.opRef, endState: "completed" });
+	expect(f.calls("bind")).toHaveLength(1);
+	expect(f.calls("send")).toHaveLength(1);
+	expect(f.calls("resume")).toHaveLength(0);
+	expect(`${timedOut.stderr}${unknown.stderr}${refused.stderr}${JSON.stringify(final)}`).not.toContain(
+		"private prompt",
+	);
+	expect(JSON.stringify(f.snapshot().deliveries)).not.toContain("private prompt");
+	expect(JSON.stringify(f.calls("send"))).not.toContain("second private prompt");
+}, 40_000);
+
+test("SDK request timeout does not cancel a gated start over the real socket", async () => {
+	const f = await fixture();
+	const client = await GajaewayClient.connectSocket(f.socket, { requestTimeoutMs: 1_000 });
+	try {
+		const gate = f.armBindGate();
+		const request = client
+			.request<WorkStartResult>("work.start", {
+				name: "sdk-timeout",
+				cwd: f.home,
+				text: "delayed SDK work",
+			})
+			.then(
+				(result) => ({ result }),
+				(error: unknown) => ({ error }),
+			);
+		expect((await f.bindGateArrival(gate)).originKey).toBe("work/task/sdk-timeout");
+		const outcome = await request;
+		expect(outcome).toHaveProperty("error");
+		const error = "error" in outcome ? outcome.error : undefined;
+		expect(error).toBeInstanceOf(ProtocolError);
+		expect(error).toMatchObject({ code: "verb_failed", message: "request timed out after 1000ms" });
+
+		const unknown = await client.request<WorkStatusResult>("work.status", { name: "sdk-timeout" }).then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		expect(unknown).toHaveProperty("error");
+		const statusError = "error" in unknown ? unknown.error : undefined;
+		expect(statusError).toBeInstanceOf(ProtocolError);
+		expect(statusError).toMatchObject({
+			code: "invalid_params",
+			message: "unknown work lane",
+			detail: { reasonCode: "unknown_work_lane", name: "sdk-timeout" },
+		});
+		expect(f.snapshot().jobs).toHaveLength(0);
+		expect(f.calls("send")).toHaveLength(0);
+		f.releaseBindGate();
+		await eventually(
+			() => f.calls("send"),
+			(calls) => calls.length === 1,
+			"timed-out SDK start acceptance",
+		);
+		const pending = await eventually(
+			() => client.request<WorkStatusResult>("work.status", { name: "sdk-timeout" }),
+			(value) => value.op?.status === "in_flight",
+			"timed-out SDK start in flight",
+		);
+		expect(pending.attempt?.endedAt).toBeUndefined();
+		expect(pending.op?.status).toBe("in_flight");
+		expect(f.calls("bind")).toHaveLength(1);
+		expect(f.calls("send")).toHaveLength(1);
+		expect(f.calls("send")[0]?.input).toMatchObject({ opRef: pending.attempt?.opRef, text: "delayed SDK work" });
+	} finally {
+		f.releaseBindGate();
+		await client.close();
+	}
+}, 40_000);
+
+test("a same-name start after terminal settlement creates a distinct operation", async () => {
+	const f = await fixture();
+	const client = await GajaewayClient.connectSocket(f.socket, { requestTimeoutMs: 5_000 });
+	try {
+		const params = { name: "settled-retry", cwd: f.home, text: "fixture work" };
+		const first = await client.request<WorkStartResult>("work.start", params);
+		expect(first.started).toBe(true);
+		if (!first.started) throw new Error("first fixture start was held");
+		await f.control(first.opRef, { terminal: true, text: "first completed" });
+		await eventually(
+			() => f.snapshot(),
+			(snapshot) => snapshot.runtimes[0]?.settledAt != null,
+			"first same-name start settlement",
+		);
+		const settled = await client.request<WorkStatusResult>("work.status", { name: params.name });
+		expect(settled.attempt).toMatchObject({ opRef: first.opRef, endState: "completed" });
+		// This replay is deliberate test-only evidence: a name is not an idempotency key.
+		const second = await client.request<WorkStartResult>("work.start", params);
+		expect(second.started).toBe(true);
+		if (!second.started) throw new Error(`second fixture start was held: ${second.state}`);
+		expect(second.opRef).not.toBe(first.opRef);
+		expect(second.jobId).toBe(first.jobId);
+		expect(f.calls("send")).toHaveLength(2);
+		expect(f.calls("send").map((call) => call.input.opRef)).toEqual([first.opRef, second.opRef]);
+	} finally {
+		await client.close();
+	}
 }, 40_000);

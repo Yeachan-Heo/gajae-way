@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -1338,6 +1339,27 @@ describe("work operator commands", () => {
 			expect(output.closed).toBe(true);
 		});
 	}
+
+	test("unknown work status warns that a disconnected start may still be admitted", async () => {
+		const output = await run(
+			["status", "fix"],
+			new ProtocolError("invalid_params", "unknown work lane", { reasonCode: "unknown_work_lane", name: "fix" }),
+		);
+		expect(output.errors).toEqual([
+			"unknown work lane; a previous start or run may still be admitted after a timeout or disconnect. Do not blindly retry, even with the same name; continue observing and reconcile the original request.",
+		]);
+		expect(output.requests).toHaveLength(1);
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	test("unrelated work status errors are not rewritten as unknown admission", async () => {
+		const output = await run(
+			["status", "fix"],
+			new ProtocolError("invalid_params", "other failure", { reasonCode: "other" }),
+		);
+		expect(output.errors).toEqual(["other failure"]);
+	});
 
 	for (const closed of [true, false]) {
 		test(`work retire prints a successful retirement with closed=${closed}`, async () => {
