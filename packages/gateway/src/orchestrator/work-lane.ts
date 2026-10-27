@@ -913,32 +913,66 @@ export class WorkLaneManager {
 		}
 		let createdWorktree: CreatedRepoWorktree | undefined;
 		if (!job) {
-			let worktreePath = input.cwd;
+			// Resolve worktree path before creating job.
+			let worktreePath: string;
 			let repositoryPath: string | undefined;
 			if (input.repo !== undefined) {
-				createdWorktree = await createWorktreeFromRepo(
-					laneRoot,
-					this.#options.serviceDirectory,
-					input.name,
-					input.repo,
-					input.base,
-					this.#gitTimeouts(),
-				);
-				worktreePath = createdWorktree.worktreePath;
-				repositoryPath = createdWorktree.repositoryPath;
+				worktreePath = managedLaneWorktreePath(laneRoot, input.name);
+				repositoryPath = managedLaneRepositoryPath(laneRoot, input.name);
+			} else {
+				worktreePath = input.cwd!;
 			}
 			if (worktreePath === undefined) throw new Error("work lane path was not resolved");
-			const facts = await collectRepoFacts(worktreePath, this.#gitTimeouts(), undefined, false);
+			// Create and persist initial job BEFORE slow steps (worktree creation, facts).
+			// Job with no attempts is shown by work.status as "admitting".
 			job = createLaneJobRecord({
 				jobId,
-				branch: facts?.branch ?? managedLaneBranchName(input.name),
+				branch: managedLaneBranchName(input.name),
 				worktreePath,
-				baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
-			// Persist job AFTER slow steps but BEFORE binding so it's visible during admission.
 			this.#putJob(input.name, job);
+
+			// Now perform slow steps: worktree creation and facts collection.
+			try {
+				if (input.repo !== undefined) {
+					createdWorktree = await createWorktreeFromRepo(
+						laneRoot,
+						this.#options.serviceDirectory,
+						input.name,
+						input.repo,
+						input.base,
+						this.#gitTimeouts(),
+					);
+					worktreePath = createdWorktree.worktreePath;
+					repositoryPath = createdWorktree.repositoryPath;
+				}
+				if (worktreePath === undefined) throw new Error("work lane path was not resolved");
+				const facts = await collectRepoFacts(worktreePath, this.#gitTimeouts(), undefined, false);
+				// Update job with actual facts collected from the repository.
+				job = createLaneJobRecord({
+					jobId,
+					branch: facts?.branch ?? managedLaneBranchName(input.name),
+					worktreePath,
+					baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
+					...(input.repo !== undefined ? { repository: input.repo } : {}),
+					...(repositoryPath !== undefined ? { repositoryPath } : {}),
+				});
+				this.#putJob(input.name, job);
+			} catch (error) {
+				// Slow steps failed. Job remains persisted as "admitting" so operator can see and retire it.
+				if (createdWorktree) {
+					try {
+						await discardCreatedWorktree(input.name, createdWorktree, this.#gitTimeouts());
+					} catch (cleanupError) {
+						console.error(
+							`worktree_creation_cleanup_failed name=${input.name} reason=${sanitizeDiagnostic(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))}`,
+						);
+					}
+				}
+				throw error;
+			}
 		}
 		const initialJob = job;
 		if (!initialJob) throw new Error("work lane record was not initialized");
@@ -1137,7 +1171,7 @@ export class WorkLaneManager {
 		}
 		return {
 			jobId: job.jobId,
-			state: job.state,
+			state: attempt ? job.state : "admitting",
 			sessionId: this.#db.bindings.getSessionRecord(key)?.sessionId ?? "",
 			lastActivityAt: this.#db.bindings.workLaneRows().find((row) => row.origin_key === key)?.last_activity_at ?? null,
 			attempt: attempt

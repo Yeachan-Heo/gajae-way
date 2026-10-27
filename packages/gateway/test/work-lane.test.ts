@@ -2784,7 +2784,8 @@ test("#615: a remote clone whose helper never answers fails typed, releases the 
 			detail: { reasonCode: "git_command_timeout", command: "clone", timeoutMs: 400 },
 		});
 		expect(Date.now() - startedAt).toBeLessThan(5_000);
-		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeUndefined();
+		// Job is persisted in admitting state since clone failed during slow steps.
+		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeDefined();
 		expect(f.port.binds).toHaveLength(0);
 		await expect(lstat(managedLaneWorktreePath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(lstat(managedLaneRepositoryPath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
@@ -6989,9 +6990,9 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 		},
 	});
 
-	// Verify no worktree was created
+	// Job is persisted but in admitting state since slow steps failed before completion.
 	const job = f.db.work.laneJobJson(laneJobIdentity("bad-repo").jobId);
-	expect(job).toBeUndefined();
+	expect(job).toBeDefined();
 });
 
 test("work.start with special characters in lane name uses hex-encoded branch name", async () => {
