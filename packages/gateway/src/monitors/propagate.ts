@@ -749,33 +749,6 @@ export class MonitorPropagator {
 						!BACKOFF_EXEMPT_FAILURES.has(this.#database.monitors.failure(row.event_id)?.code ?? "")
 					)
 						continue;
-					// Safety net: reap events that have exhausted their dispatch budget (#702).
-					// A failed event whose last attempt is older than the maximum backoff window is no
-					// longer counted in-flight for overlap=skip, or is reaped to failed_no_retry.
-					if (row.stage === "failed" && row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
-						const reaped = this.#database.transaction((tx) => {
-							const current = this.#database.monitors.eventGet(row.event_id);
-							if (
-								!current ||
-								current?.stage !== "failed" ||
-								current.dispatch_attempts !== row.dispatch_attempts ||
-								this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
-							)
-								return undefined;
-							if (
-								!this.#database.monitors.eventTerminalFail(
-									tx,
-									row.event_id,
-									"dispatch_attempts_exhausted",
-									`dispatch budget exhausted after ${row.dispatch_attempts} attempts (#702)`,
-								)
-							)
-								return undefined;
-							return current;
-						});
-						if (reaped) this.#emitStage(reaped, "failed_no_retry");
-						continue;
-					}
 					this.#database.transaction((tx) => this.#database.monitors.eventIncrementAttempts(tx, row.event_id));
 					await this.#dispatch([row.event_id]);
 				}
