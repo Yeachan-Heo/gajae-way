@@ -984,6 +984,97 @@ test("check repair derives a missing legacy authorization owner from its report 
 	expect(f.db.work.workAttemptGet(f.first.opRef)?.settledAt).toBeNull();
 });
 
+test("automatic successor check repair preserves a response-only replacement null route", async () => {
+	const { f, successor, initial, setRed } = await successorAwaitingChecks();
+	f.port.setSessionState(successor.sessionId, { live: false });
+	expect(await f.lanes.forceRetire("authorized-successor")).toMatchObject({ retired: true });
+	const notices = [...f.notices];
+	const outbox = f.db.outbox.rows();
+	const abort = new AbortController();
+	const run = f.manager.run(
+		{ name: "authorized-successor", text: "private follow-up", resume: true },
+		{},
+		abort.signal,
+	);
+	try {
+		await until(() => f.port.sends.length === 3);
+		const replacement = f.port.sends[2]!;
+		f.port.complete(replacement.opRef, "private response-only output");
+		expect(await run).toMatchObject({ text: "private response-only output" });
+		await until(() => f.job("authorized-successor").state === "awaiting_checks");
+		setRed();
+		for (let i = 0; i < 200 && f.port.sends.length < 4; i++) {
+			await f.manager.recover();
+			await Bun.sleep(5);
+		}
+		expect(f.port.sends).toHaveLength(4);
+		const repair = f.db.work.workAttemptGet(f.port.sends[3]!.opRef)!;
+		expect(repair.parent).toBeNull();
+		expect(repair.authorizationOwner).toEqual(initial.authorizationOwner);
+		expect(repair.successorOf).toBeUndefined();
+		f.port.complete(repair.opRef, "private repair output");
+		await until(() => f.db.work.workAttemptGet(repair.opRef)?.settledAt != null);
+		expect(f.notices).toEqual(notices);
+		expect(f.db.inbox.messageExists(repair.reportId)).toBe(false);
+		expect(f.db.outbox.rows()).toEqual(outbox);
+		expect(f.db.work.workAttemptGet(successor.opRef)?.parent).toEqual(initial.parent);
+		expect(f.db.work.workAttemptGet(f.first.opRef)?.settledAt).toBeNull();
+	} finally {
+		abort.abort();
+		await run.catch(() => undefined);
+	}
+});
+
+test("automatic successor child-report wake preserves a response-only replacement null route", async () => {
+	const f = await fixture(8, undefined, { allowNested: true });
+	const successor = await f.manager.start(f.request());
+	if (!successor.started) throw new Error("successor held");
+	const initial = f.db.work.workAttemptGet(successor.opRef)!;
+	f.port.complete(successor.opRef, "first routed output");
+	await until(() => f.db.work.workAttemptGet(successor.opRef)?.settledAt != null);
+	f.port.setSessionState(successor.sessionId, { live: false });
+	expect(await f.lanes.forceRetire("authorized-successor")).toMatchObject({ retired: true });
+	const notices = [...f.notices];
+	const outbox = f.db.outbox.rows();
+	const abort = new AbortController();
+	const run = f.manager.run(
+		{ name: "authorized-successor", text: "private follow-up", resume: true },
+		{},
+		abort.signal,
+	);
+	try {
+		await until(() => f.port.sends.length === 3);
+		const replacement = f.port.sends[2]!;
+		f.port.complete(replacement.opRef, "private response-only output");
+		await run;
+		const child = await f.manager.start({
+			name: "private-child",
+			text: "child task",
+			cwd: f.dir,
+			callerSessionId: replacement.sessionId,
+		});
+		if (!child.started) throw new Error("child held");
+		f.port.complete(child.opRef, "private child report");
+		await until(() => f.db.work.laneReportsByParent("authorized-successor")[0]?.state === "consumed");
+		const report = f.db.work.laneReportsByParent("authorized-successor")[0]!;
+		const wake = f.db.work.workAttemptGet(report.consumed_op_ref!)!;
+		expect(report.claim_kind).toBe("wake");
+		expect(wake.parent).toBeNull();
+		expect(wake.authorizationOwner).toEqual(initial.authorizationOwner);
+		expect(wake.successorOf).toBeUndefined();
+		f.port.complete(wake.opRef, "private wake output");
+		await until(() => f.db.work.workAttemptGet(wake.opRef)?.settledAt != null);
+		expect(f.notices).toEqual(notices);
+		expect(f.db.inbox.messageExists(wake.reportId)).toBe(false);
+		expect(f.db.outbox.rows()).toEqual(outbox);
+		expect(f.db.work.workAttemptGet(successor.opRef)?.parent).toEqual(initial.parent);
+		expect(f.db.work.workAttemptGet(f.first.opRef)?.settledAt).toBeNull();
+	} finally {
+		abort.abort();
+		await run.catch(() => undefined);
+	}
+});
+
 test("child report wake derives a missing legacy authorization owner from its report parent", async () => {
 	const f = await fixture(8, undefined, { allowNested: true });
 	const parent = await f.manager.start({ name: "wake-parent", text: "parent task", cwd: f.dir });

@@ -1017,7 +1017,10 @@ export class WorkLaneManager {
 				throw new ProtocolError("invalid_params", "isolated successor refused", {
 					reasonCode: "successor_report_owner_mismatch",
 				});
-			context = { ...context, parent: mode === "start" ? linked.parent : null, authorizationOwner: owner };
+			let parent = context.parent;
+			if (mode === "run") parent = null;
+			else if (!context.checksRetry && context.wakeReportId === undefined) parent = linked.parent;
+			context = { ...context, parent, authorizationOwner: owner };
 		}
 		// A supplied repository identifies a repo-backed lane; otherwise an explicit
 		// cwd must match the durable worktree path. Omitting both resumes by lane name.
