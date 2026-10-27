@@ -845,6 +845,13 @@ export class WorkLaneManager {
 		const { jobId } = laneJobIdentity(input.name);
 		// A supplied repository identifies a repo-backed lane; otherwise an explicit
 		// cwd must match the durable worktree path. Omitting both resumes by lane name.
+		// For a fresh start (not resume) on an existing lane that is NOT being resumed,
+		// clear the old history to prevent state pollution. This prevents the new lane
+		// from inheriting corrupted state from previous attempts after a lane death/retirement.
+		// We only do this if the lane exists in the database but we're not resuming it.
+		// This must happen AFTER validation but BEFORE we use the job for new attempts.
+		const shouldClearHistory = job !== undefined && input.resume !== true;
+
 		if (job && input.repo !== undefined && job.lane.repository !== input.repo)
 			throw new ProtocolError("invalid_params", "work lane repository mismatch", {
 				reasonCode: "lane_repository_mismatch",
@@ -938,8 +945,19 @@ export class WorkLaneManager {
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
 		}
-		const initialJob = job;
+		let initialJob = job;
 		if (!initialJob) throw new Error("work lane record was not initialized");
+
+		// If this is a fresh start (not resume) on an existing lane, clear old attempt history
+		// to prevent state pollution from previous lane deaths/retirements.
+		if (shouldClearHistory && initialJob.attempts.length > 0) {
+			// Clear from database
+			this.#db.transaction((tx) => {
+				this.#db.work.clearLaneHistory(tx, jobId, `work-${input.name}`);
+			});
+			// Also clear from memory so new attempt doesn't inherit old ones
+			initialJob = { ...initialJob, attempts: [] };
+		}
 		const worktreePath = initialJob.lane.worktreePath;
 		input = { ...input, cwd: worktreePath };
 		let bindAttemptStarted = false;
