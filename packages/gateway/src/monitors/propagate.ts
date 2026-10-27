@@ -690,7 +690,37 @@ export class MonitorPropagator {
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
 						// Exhausting dispatch attempts does not settle the turn they may have started.
 						const disposition = await this.#exhaustedTurnDisposition(row);
-						if (disposition.kind === "hold") continue;
+						if (disposition.kind === "hold") {
+							// Bound the hold: an exhausted event with an authoring-turn pointer that is older than
+							// MONITOR_EVENT_MAX_OPEN_AGE_MS is settled to failed_no_retry. The turn may have finished
+							// or reported an unresolvable status (sessionPort.status threw, returned unknown, etc.),
+							// so never redispatch or resend the op (#702).
+							if (this.#now() - Date.parse(row.updated_at) > MONITOR_EVENT_MAX_OPEN_AGE_MS) {
+								const settled = this.#database.transaction((tx) => {
+									const current = this.#database.monitors.eventGet(row.event_id);
+									if (
+										!current ||
+										current.stage !== "failed" ||
+										current.dispatch_attempts !== row.dispatch_attempts ||
+										this.#database.core.metaGet(authoringTurnKey(row.event_id)) === undefined ||
+										this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
+									)
+										return undefined;
+									if (
+										!this.#database.monitors.eventTerminalFail(
+											tx,
+											row.event_id,
+											"authoring_turn_unresolved",
+											`authoring turn unresolved after ${Math.round((this.#now() - Date.parse(row.updated_at)) / 1000)}s (#702)`,
+										)
+									)
+										return undefined;
+									return current;
+								});
+								if (settled) this.#emitStage(settled, "failed_no_retry");
+							}
+							continue;
+						}
 						if (disposition.kind === "resume") {
 							for (const eventId of disposition.turn.eventIds) resumedAuthoringEvents.add(eventId);
 							await this.#dispatch([...disposition.turn.eventIds], disposition.turn);
