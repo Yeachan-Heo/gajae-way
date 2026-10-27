@@ -187,7 +187,7 @@ Outbound secret redaction is always on and is configured only through the gatewa
 
 `socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, `stallTimeoutMs`, `sessions`, and `sqlite` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`.
 
-`sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. The `sessions` object is reloadable.
+`sessions.idleResetMs` is an optional 60000–2592000000 ms idle window. When set, the 60-second sweep rotates a quiet non-loopback, non-monitor persona session like `/new`; it skips running turns and sessions already unbound after a previous rotation. Unlike `sessions.idleRetireMs`, which ends an idle host but preserves its session history, this deliberately starts the conversation's next turn with fresh context. `sessions.busyStallMs` (60000–86400000 ms, default 300000) bounds a pre-send busy wait on a host whose inspect activity stamp and saved transcript stop moving; past it the host is ended and the session resumed on a new host (#687). `sessions.unresolvedHoldMs` (60000–86400000 ms, default 600000) bounds how long one turn with unknown operation state on a dead host may hold its origin before it moves to a retired hold and newer messages continue on a fresh session (#686). The `sessions` object is reloadable.
 
 `restartNotice` controls the chat notices around a stack restart. They are on when unset; `{ "enabled": false }` turns them off and writes no restart record. `personaName` (1–80 characters) is the name filled into `{name}`; unset means `Gajaeway`. `workspace/SOUL.md` is never read for the name. The default texts are neutral third person:
 
@@ -521,7 +521,7 @@ If a service command times out with an indeterminate outcome, the restart receip
 
 An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 
-`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply. The current schema is 37; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
+`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply, and `origin_silent` when a user message has gone unanswered for 15 minutes (see the runbook). The current schema is 39; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
 
 ## Speech gate
 

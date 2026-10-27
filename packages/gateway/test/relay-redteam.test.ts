@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpRefRejectedError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
@@ -65,7 +65,7 @@ class Host implements SessionRelayStream {
 		this.raw(JSON.stringify(frame));
 	}
 	write(line: string) {
-		if (this.closed) throw new Error("closed");
+		if (this.closed) throw new RelayStreamUnwrittenError("closed");
 		const frame = JSON.parse(line) as Record<string, unknown>;
 		this.written.push(frame);
 		if (frame.type === "hello" && this.hello) this.host({ type: "hello", connectionId: this.connectionId });
@@ -238,7 +238,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 		port.send = async (input) => {
 			port.sendAttempts.push(input);
 			sequence.push("send");
-			throw new RelayClosedError(input.sessionId, "before receipt");
+			throw new RelayClosedError(input.sessionId, "before receipt", true);
 		};
 		port.status = async (input) => {
 			sequence.push("status");
@@ -301,7 +301,7 @@ test("RT04 unknown bound operation survives repeated live-idle sweeps until its 
 		if (firstOp) return send(input);
 		firstOp = input.opRef;
 		port.sendAttempts.push(input);
-		throw new RelayClosedError(input.sessionId, "before receipt");
+		throw new RelayClosedError(input.sessionId, "before receipt", true);
 	};
 	const status = port.status.bind(port);
 	port.status = async (input) => {
@@ -432,7 +432,7 @@ test("RT09 steer uses owned connection and held steer replay retains clientRef w
 	let accept = false;
 	const port = new ScriptedSessionPort({
 		onSteer: () => {
-			if (!accept) throw new RelayClosedError("s", "torn");
+			if (!accept) throw new RelayClosedError("s", "torn", true);
 		},
 	});
 	const f = await actor(port);

@@ -126,9 +126,21 @@ export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 /** A resident bidirectional JSONL relay to one SDK session host. */
 export interface SessionRelayStream {
 	readonly lines: AsyncIterable<string>;
-	/** Writes one JSONL frame to the host; throws once the relay is closed. */
+	/**
+	 * Writes one JSONL frame to the host. Throws RelayStreamUnwrittenError only
+	 * when no byte of the frame reached the pipe; any other throw may follow a
+	 * partial or complete write and proves nothing about delivery.
+	 */
 	write(line: string): void;
 	close(): void;
+}
+
+/** The relay refused a frame before handing any of it to the host's pipe. */
+export class RelayStreamUnwrittenError extends Error {
+	constructor(detail: string) {
+		super(detail);
+		this.name = "RelayStreamUnwrittenError";
+	}
 }
 export class GjcCliUnavailableError extends Error {
 	readonly code = "broker_unavailable";
@@ -1044,9 +1056,9 @@ export class GlobalGjcClient {
 			}
 		})();
 		const write = (line: string): void => {
-			if (closed) throw new Error("relay closed");
+			if (closed) throw new RelayStreamUnwrittenError("relay closed");
 			const stdin = child.stdin;
-			if (!stdin || typeof stdin === "number") throw new Error("relay stdin unavailable");
+			if (!stdin || typeof stdin === "number") throw new RelayStreamUnwrittenError("relay stdin unavailable");
 			stdin.write(`${line}\n`);
 			// FileSink.flush is synchronous unless the pipe is backpressured, in
 			// which case it returns a promise that rejects on EPIPE once the child

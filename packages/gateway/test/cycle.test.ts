@@ -42,6 +42,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		monitorStages: new Map(),
 		monitorFailures: [],
 		monitorAuthoringLost: [],
+		silentOrigins: [],
 		memoryClosing: false,
 		instanceId: "test-instance",
 		activeLanes: 0,

@@ -14,8 +14,10 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import {
+	DEFAULT_SESSIONS_BUSY_STALL_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 	type GjcModelSelection,
 	type GjcServiceTier,
 	type SessionHostConfig,
@@ -35,6 +37,7 @@ import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import {
 	ModelNotSelectedError,
 	type SessionBinding,
+	SessionBusyStalledError,
 	type SessionContextUsage,
 	type SessionPort,
 	type TerminateHostOutcome,
@@ -126,6 +129,28 @@ function providerTransportRetryAttempt(
 		10,
 	);
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
+function escalatedHoldKey(opRef: string): string {
+	return `escalated-hold:${opRef}`;
+}
+
+const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
+
+/**
+ * Durable intent to post an escalation notice, deleted once the delivery ledger
+ * owns it. Inbox retention keeps the trigger row while this key exists.
+ */
+function escalationNoticeKey(originKey: string, opRef: string): string {
+	return `${ESCALATION_NOTICE_PREFIX}${originKey}#${opRef}`;
+}
+
+/** Origins holding an undelivered escalation notice; op-refs never contain `#`, origin keys may. */
+function escalationNoticeOrigins(store: Store): string[] {
+	return store.core
+		.metaKeysInRange(ESCALATION_NOTICE_PREFIX, `${ESCALATION_NOTICE_PREFIX}\uffff`)
+		.map((key) => key.slice(ESCALATION_NOTICE_PREFIX.length, key.lastIndexOf("#")));
 }
 
 function stalledExitProofKey(opRef: string): string {
@@ -241,6 +266,7 @@ function completeInboundTurn(
 	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
 	return changed;
 }
 
@@ -452,6 +478,12 @@ export interface PersonaTurnIdentity {
 export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 	/** The trigger row; the one prompt body of this turn. */
 	readonly trigger: InboundMessageRow;
+	/**
+	 * Present only for a settlement lifecycle of an already sent turn (adopted
+	 * after a restart or escalation): the context its prompt durably claimed.
+	 * No new context window is prepared or committed for it (#686).
+	 */
+	readonly sentContextIds?: readonly string[];
 }
 
 export interface PersonaTailFrameInput extends PersonaTurnIdentity {
@@ -497,6 +529,11 @@ export interface PersonaBindHoldInput {
 	readonly notice: string;
 	readonly verdict: BrokerLivenessVerdict | undefined;
 }
+
+/** Bind-hold reason for a turn whose unresolved hold was escalated to a retired hold (#686). */
+export const UNRESOLVED_HOLD_ESCALATED = "unresolved_hold_escalated";
+const UNRESOLVED_HOLD_NOTICE =
+	"[turn held] I could not confirm whether my answer to an earlier message finished, so I will not run it again. Newer messages continue in a fresh session; if that earlier answer still arrives, it will be posted here.";
 
 export const AGENT_RUN_GRACE_MS = 120_000;
 export const AGENT_RUN_MAX_MS = 6 * 60 * 60_000;
@@ -604,6 +641,10 @@ export interface PersonaSessionManagerOptions {
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
 	readonly hostIdleRetireMs?: number;
+	/** Busy host without progress for this long is ended and rebound; default DEFAULT_SESSIONS_BUSY_STALL_MS (#687). */
+	readonly busyStallMs?: number;
+	/** Unknown-state turn on a dead host holds its origin at most this long; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS (#686). */
+	readonly unresolvedHoldMs?: number;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -665,6 +706,8 @@ export class PersonaSessionManager {
 	#hostReplacementAdmissionOwner: OriginActor | undefined;
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
+	#busyStallMs: number;
+	#unresolvedHoldMs: number;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -698,6 +741,12 @@ export class PersonaSessionManager {
 			options.hostIdleRetireMs,
 			DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 			"hostIdleRetireMs",
+		);
+		this.#busyStallMs = positiveInteger(options.busyStallMs, DEFAULT_SESSIONS_BUSY_STALL_MS, "busyStallMs");
+		this.#unresolvedHoldMs = positiveInteger(
+			options.unresolvedHoldMs,
+			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+			"unresolvedHoldMs",
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
@@ -774,6 +823,20 @@ export class PersonaSessionManager {
 		if (this.#stopped) return;
 		this.#maxLiveHosts = positiveInteger(config?.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
 		this.#hostIdleRetireMs = positiveInteger(config?.idleRetireMs, DEFAULT_SESSIONS_IDLE_RETIRE_MS, "hostIdleRetireMs");
+		this.#busyStallMs = positiveInteger(config?.busyStallMs, DEFAULT_SESSIONS_BUSY_STALL_MS, "busyStallMs");
+		this.#unresolvedHoldMs = positiveInteger(
+			config?.unresolvedHoldMs,
+			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+			"unresolvedHoldMs",
+		);
+	}
+
+	get busyStallMs(): number {
+		return this.#busyStallMs;
+	}
+
+	get unresolvedHoldMs(): number {
+		return this.#unresolvedHoldMs;
 	}
 
 	get maxLiveHosts(): number {
@@ -894,10 +957,16 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
 	}
 
-	/** Recovers nonterminal turns, pending inputs, and terminal turns' unresolved held steers after restart. */
+	/**
+	 * Recovers nonterminal turns, pending inputs, terminal turns' unresolved held
+	 * steers and undelivered escalation notices after restart. A notice intent is
+	 * its own discovery source: its turn may have settled and its binding been
+	 * cleared, leaving nothing else that would ever visit the origin.
+	 */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
+			...escalationNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
@@ -1180,11 +1249,14 @@ export class PersonaSessionManager {
 		await this.#onHeldSteerAccepted?.(input);
 	}
 
-	async emitBindHold(input: PersonaBindHoldInput): Promise<void> {
+	/** False when the notice hook failed; a durable notice intent is then retried. */
+	async emitBindHold(input: PersonaBindHoldInput): Promise<boolean> {
 		try {
 			await this.#onBindHold?.(input);
+			return true;
 		} catch (error) {
 			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`, "error");
+			return false;
 		}
 	}
 
@@ -1560,6 +1632,7 @@ class OriginActor {
 
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
+		await this.#emitEscalationNotices();
 		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
@@ -1588,10 +1661,179 @@ class OriginActor {
 		return true;
 	}
 
+	/**
+	 * Why a bound trigger provably never reached the host (#685): no durable send
+	 * intent was stamped before `port.send`, or the port holds an authenticated
+	 * `busy` refusal for its op-ref. Undefined means the prompt may have landed.
+	 */
+	#unadmittedReason(opRef: string, sessionId: string | null): "send_not_attempted" | "prompt_busy_refused" | undefined {
+		if (!this.#manager.database.inbox.sendAttempted(opRef)) return "send_not_attempted";
+		if (!sessionId || !this.#manager.port.promptRefusal) return undefined;
+		try {
+			return this.#manager.port.promptRefusal({ sessionId, repo: this.#manager.repo, opRef }) === "busy"
+				? "prompt_busy_refused"
+				: undefined;
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			// No refusal evidence is readable: the turn keeps the conservative hold.
+			this.#manager.log(
+				`send_unadmitted_probe_failed origin=${this.originKey} session=${sessionId} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Returns a bound trigger that was provably never admitted to pending so it is
+	 * answered by a fresh op-ref. A retired epoch's trigger is closed instead: the
+	 * origin was reset after it, so it must not resurface in the new conversation.
+	 * A turn whose prompt may have landed is left for reconcile; it is never resent.
+	 */
+	#releaseUnadmittedTurn(turn: InboundTurn, retired: boolean, source: "recovery" | "dispatch"): boolean {
+		const reason = this.#unadmittedReason(turn.opRef, turn.sessionId);
+		if (!reason) return false;
+		const attempt = this.#manager.database.transaction((tx) => {
+			if (!retired) return retryInboundTurn(this.#manager.database, tx, turn.opRef);
+			completeInboundTurn(this.#manager.database, tx, turn.opRef, "retired");
+			return undefined;
+		});
+		this.#manager.log(
+			`recovery_requeue_unsent origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason} source=${source} action=${retired ? "close_retired" : `requeue attempt=${attempt}`}`,
+			"warn",
+		);
+		return true;
+	}
+
+	/**
+	 * Bounds how long one unresolved turn may silence its origin (#686). Once its
+	 * operation state has stayed unknown past `unresolvedHoldMs` since the send
+	 * and its host is provably not live, the turn moves to a retired hold - the
+	 * same hold `/new` leaves behind: it keeps reconciling, a late result is still
+	 * delivered, and the op is never resent - the epoch rotates so pending
+	 * messages continue on a fresh session, and the origin gets one notice.
+	 * Pending messages are kept; nothing is discarded.
+	 */
+	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
+		if (this.#stopped || this.#manager.stopped || bound?.retired || turn.epoch !== this.#epoch()) return false;
+		if (bound && this.#current !== bound) return false;
+		const database = this.#manager.database;
+		const since = database.inbox.sendAttemptedAt(turn.opRef) ?? database.inbox.turnDispatchedAt(turn.opRef);
+		const sinceMs = since === undefined ? Number.NaN : Date.parse(since);
+		if (!Number.isFinite(sinceMs)) return false;
+		const heldMs = this.#manager.now() - sinceMs;
+		if (heldMs < this.#manager.unresolvedHoldMs) return false;
+		const sessionId = bound?.sessionId ?? turn.sessionId;
+		if (!sessionId) return false;
+		// Only a dead host is evidence the op will not settle by itself; an
+		// unanswerable probe is not.
+		const host = await this.#bindingState(sessionId);
+		if (host.live !== false && host.disowned !== true) return false;
+		// A turn recovery never adopted carries no status verdict yet.
+		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
+		const trigger = database.inbox.turnRow(turn.opRef);
+		if (!trigger) return false;
+		// One transaction: the fresh epoch, the held op's answer-wanted
+		// disposition, its replayable notice, and a fence over every input its
+		// prompt may have carried (trigger, claimed context, steers) so the fresh
+		// session never sees the possibly accepted request as unread. Messages
+		// that arrived after the send keep their unread context.
+		const { nextEpoch, closedInputs } = database.transaction((tx) => {
+			const epoch = database.bindings.rotateEpoch(tx, this.originKey);
+			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
+			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
+			const claimed = database.inbox.sentContextIds(turn.opRef);
+			database.inbox.contextConsume(tx, claimed);
+			// A queued message the held prompt already carried is that op's input,
+			// never a fresh trigger: resending it could repeat its action.
+			const closed = database.inbox.closeClaimedPending(tx, {
+				originKey: this.originKey,
+				epoch: turn.epoch,
+				opRef: turn.opRef,
+				messageIds: claimed,
+			});
+			return { nextEpoch: epoch, closedInputs: closed };
+		});
+		this.#holdSweeps.delete(turn.opRef);
+		for (const row of closedInputs) {
+			// Whether the model read it is unknown: release its ownership without a 👀.
+			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
+			this.#manager.log(
+				`escalation_claimed_input_closed origin=${this.originKey} opRef=${turn.opRef} message=${row.message_id}`,
+				"warn",
+			);
+		}
+		this.#manager.log(
+			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
+			"warn",
+		);
+		if (bound) {
+			bound.retired = true;
+			bound.answerWanted = true;
+			this.#clearStallReconciliation(bound);
+			bound.tail?.setTurnRunning(false);
+			await bound.tail?.close();
+			bound.detached = true;
+			this.#retired.set(retiredKey(bound), bound);
+			this.#current = undefined;
+			this.#state = "idle";
+			await bound.lifecycle.onRetired?.(bound);
+			this.#scheduleRetiredReattach(bound);
+		} else {
+			try {
+				// Adopted without a relay: the host is gone. Periodic reconcile reads
+				// its status; a reattach is tried on the bounded retired schedule.
+				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+				adopted.detached = true;
+				this.#scheduleRetiredReattach(adopted);
+			} catch (error) {
+				// Still durable: the next recovery scan treats it as a retired-epoch turn.
+				this.#manager.log(
+					`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+			}
+		}
+		this.#manager.log(
+			`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_escalated`,
+			"warn",
+		);
+		await this.#emitEscalationNotices();
+		return true;
+	}
+
+	/**
+	 * Posts every escalation notice whose intent is durable but not yet handed to
+	 * the delivery ledger. Delivery ids are deterministic per trigger, so a notice
+	 * replayed after a crash or a failed hook is posted once.
+	 */
+	async #emitEscalationNotices(): Promise<void> {
+		const database = this.#manager.database;
+		const prefix = escalationNoticeKey(this.originKey, "");
+		for (const key of database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+			const opRef = key.slice(prefix.length);
+			const trigger = database.inbox.turnRow(opRef);
+			if (!trigger) {
+				// Kept as evidence: without its trigger the notice has no origin to post to.
+				this.#manager.log(`escalation_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "error");
+				continue;
+			}
+			const delivered = await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: UNRESOLVED_HOLD_ESCALATED,
+				notice: UNRESOLVED_HOLD_NOTICE,
+				verdict: undefined,
+			});
+			if (delivered) database.core.metaDelete(key);
+		}
+	}
+
 	async #recoverTurn(turn: InboundTurn): Promise<void> {
 		if (this.#quarantinedTurn(turn.opRef)) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
+		if (turn.state === "bound" && this.#releaseUnadmittedTurn(turn, retired, "recovery")) return;
 		const sessionId = turn.sessionId;
 		if (!sessionId) {
 			// A turn is bound with its session in one statement; a null session
@@ -1631,6 +1873,7 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
+			if (!retired && (await this.#escalateUnresolvedHold(turn, undefined))) return;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=operation_state_unknown`,
 				"warn",
@@ -1728,6 +1971,8 @@ class OriginActor {
 				return;
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
+				if (!retired && status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined)))
+					return;
 				this.#manager.log(
 					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason}`,
 					"warn",
@@ -1752,6 +1997,7 @@ class OriginActor {
 			sessionId,
 			turn,
 			trigger,
+			sentContextIds: this.#manager.database.inbox.sentContextIds(turn.opRef),
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;
@@ -1791,7 +2037,7 @@ class OriginActor {
 			hadToolActivity: true,
 			permissionRequestObserved: false,
 			agentErrorRetryScheduled: false,
-			answerWanted: false,
+			answerWanted: this.#manager.database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined,
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
@@ -1988,6 +2234,86 @@ class OriginActor {
 		);
 	}
 
+	/**
+	 * `port.send` failed with positive proof the prompt was never admitted (a
+	 * durable `busy` refusal), so the trigger returns to pending under a fresh
+	 * op-ref. A busy wait that saw no host progress (#687) first ends the wedged
+	 * host; the next dispatch then resumes the stored binding on a new host.
+	 */
+	async #releaseUnadmittedSend(current: BoundTurn, error: unknown, reason: string): Promise<void> {
+		const { opRef } = current.turn;
+		const attempt = this.#manager.database.transaction((tx) => retryInboundTurn(this.#manager.database, tx, opRef));
+		this.#current = undefined;
+		this.#state = "idle";
+		try {
+			await current.tail?.close();
+		} catch (closeError) {
+			this.#manager.log(
+				`send_pre_send_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+				"warn",
+			);
+		}
+		await this.#notifyReleased(current);
+		if (error instanceof SessionBusyStalledError) {
+			this.#manager.log(
+				`session_busy_stalled origin=${this.originKey} epoch=${current.epoch} session=${current.sessionId} opRef=${opRef} attempt=${attempt} silentMs=${error.silentMs} evidence="${error.evidence}"`,
+				"warn",
+			);
+			if (await this.#endBusyStalledHost(current.sessionId)) {
+				await this.#dispatchNext();
+				return;
+			}
+		} else
+			this.#manager.log(
+				`send_unadmitted_requeue origin=${this.originKey} epoch=${current.epoch} session=${current.sessionId} opRef=${opRef} attempt=${attempt} reason=${reason} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+		this.#preSendFailures += 1;
+		this.#scheduleDispatchRetry(
+			Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(this.#preSendFailures - 1, 10)),
+		);
+	}
+
+	/**
+	 * Ends a host that refused prompts as busy without progress. No operation of
+	 * this origin is admitted on it (the refusal is durable), so there is no
+	 * accepted op whose exit must be proven; the stored binding is kept and the
+	 * next dispatch takes the `session.resume` branch with history intact.
+	 */
+	async #endBusyStalledHost(sessionId: string): Promise<boolean> {
+		const port = this.#manager.port;
+		if (!port.terminateHost) return false;
+		let result: TerminateHostOutcome;
+		try {
+			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			this.#manager.log(
+				`session_busy_host_terminate_failed origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+				"error",
+			);
+			return false;
+		}
+		const ended = result.outcome === "terminated" || result.outcome === "already_gone";
+		this.#manager.log(
+			`session_busy_host_terminated origin=${this.originKey} session=${sessionId} outcome=${result.outcome}${
+				"pid" in result ? ` pid=${result.pid}` : ""
+			}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}`,
+			ended ? "warn" : "error",
+		);
+		if (!ended) {
+			if (result.outcome === "terminating") {
+				this.#hostTerminatingSessionId = sessionId;
+				this.#scheduleHostTerminationRecheck(sessionId);
+			}
+			return false;
+		}
+		if (this.#observer?.sessionId === sessionId) await this.#closeObserver("host_terminated");
+		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
+		this.#manager.hostFreed();
+		return true;
+	}
+
 	async #dispatchNext(): Promise<void> {
 		if (
 			this.#manager.draining ||
@@ -2010,9 +2336,21 @@ class OriginActor {
 		const unresolved = this.#manager.database.inbox
 			.nonterminalTurns(this.originKey)
 			.find((turn) => turn.epoch === epoch);
-		if (unresolved) {
+		if (
+			unresolved &&
+			!(
+				unresolved.state === "bound" &&
+				!this.#quarantinedTurn(unresolved.opRef) &&
+				this.#releaseUnadmittedTurn(unresolved, false, "dispatch")
+			)
+		) {
 			// Recovery may hold without adopting an actor-local current turn. Its
-			// durable ownership still fences new admission and session mutation.
+			// durable ownership still fences new admission and session mutation,
+			// but only up to the unresolved-hold bound (#686).
+			if (await this.#escalateUnresolvedHold(unresolved, undefined)) {
+				await this.#dispatchNext();
+				return;
+			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${unresolved.opRef} reason=nonterminal_turn_owns_epoch`,
 				"warn",
@@ -2226,6 +2564,22 @@ class OriginActor {
 			return;
 		}
 		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
+		// Durable send intent (#685) and the context rows this prompt rendered
+		// (#686): from here on the prompt may land, so recovery must reconcile
+		// this turn instead of requeueing it, and its inputs belong to it.
+		if (
+			!this.#manager.database.transaction((tx) =>
+				this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
+			)
+		) {
+			// The row left `bound` underneath this actor; nothing was sent for it.
+			this.#current = undefined;
+			this.#state = "idle";
+			await tail.close();
+			await this.#notifyReleased(current);
+			this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
+			return;
+		}
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
@@ -2233,6 +2587,7 @@ class OriginActor {
 				text: lifecycle.text,
 				opRef,
 				relay: tail,
+				busyStallMs: this.#manager.busyStallMs,
 				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 			});
@@ -2272,6 +2627,11 @@ class OriginActor {
 					`persona_send_refused origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} opRef=${opRef} message=${trigger.message_id} attempt=${attempt} reason=model_not_selected`,
 				);
 				if (cleanupFailure) throw cleanupFailure;
+				return;
+			}
+			const unadmitted = this.#unadmittedReason(opRef, binding.sessionId);
+			if (unadmitted || error instanceof SessionBusyStalledError) {
+				await this.#releaseUnadmittedSend(current, error, unadmitted ?? "prompt_busy_refused");
 				return;
 			}
 			// A command failure can occur after broker acceptance. Reconcile its exact
@@ -3640,6 +4000,10 @@ class OriginActor {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
+			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+				await this.#dispatchNext();
+				return;
+			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
 				"warn",
@@ -3668,6 +4032,10 @@ class OriginActor {
 			}
 			// Neither a missing acknowledgement nor queue/session observations
 			// establish non-admission or authorize a new operation identity.
+			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+				await this.#dispatchNext();
+				return;
+			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
 				"warn",

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
@@ -9,6 +9,7 @@ import {
 	BrokerSessionPort,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
+	SessionBusyStalledError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
 import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
@@ -1841,6 +1842,214 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 	// Attempts at 0s, 2s, 4s, 6s; the 6s refusal lands past the 5s deadline and surfaces.
 	expect(sends).toBe(4);
 });
+
+async function busyHostFixture(originKey: string) {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey, epoch: 0 });
+	const bucket = join(agentDir, "sessions", "bucket");
+	await mkdir(bucket, { recursive: true });
+	const transcript = join(bucket, "2026-10-26T00-00-00_sdk-1.jsonl");
+	await writeFile(transcript, '{"type":"session"}\n');
+	return { repo, transcript, authority };
+}
+
+/** `session inspect` for a host that reports `active` with an activity stamp that never moves. */
+const wedgedInspect: CliRunner = async (args) => {
+	if (args.join(" ") !== "sdk session inspect sdk-1") throw new Error(`unexpected command ${args.join(" ")}`);
+	return {
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { session: { live: true, activity: { state: "active", at: 1_000 } } } }),
+		stderr: "",
+	};
+};
+
+test("a busy host whose activity stamp and transcript never move is reported stalled, never having sent (#687)", async () => {
+	const { repo, authority } = await busyHostFixture("busy-stalled");
+	let clock = 0;
+	let sends = 0;
+	const relay = scriptedRelay(() => {
+		sends++;
+		return { ok: false, error: { code: "busy", message: "busy" } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: wedgedInspect,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const error = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-stall1", busyStallMs: 60_000 })
+		.catch((caught: unknown) => caught);
+	expect(error).toBeInstanceOf(SessionBusyStalledError);
+	expect((error as SessionBusyStalledError).silentMs).toBe(60_000);
+	expect((error as SessionBusyStalledError).evidence).toContain("activity=active@1000");
+	// The busy refusal is durable: the prompt was provably never accepted.
+	expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef: "gw-p-stall1" })).toBe("busy");
+	// Sampled at 0s, 30s and 60s; it gave up at 60s, long before the 10-minute busy deadline.
+	expect(clock).toBe(60_000);
+	expect(sends).toBe(31);
+});
+
+test("a busy host whose transcript keeps growing is waited out, not reported stalled (#687)", async () => {
+	const { repo, transcript, authority } = await busyHostFixture("busy-progress");
+	let clock = 0;
+	let sends = 0;
+	const relay = scriptedRelay(() => {
+		sends++;
+		if (sends < 100) return { ok: false, error: { code: "busy", message: "busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: wedgedInspect,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+			// The running turn keeps writing its transcript.
+			await appendFile(transcript, `{"type":"message","n":${clock}}\n`);
+		},
+	});
+	const receipt = await port.send({
+		sessionId: "sdk-1",
+		repo,
+		text: "hi",
+		opRef: "gw-p-progress1",
+		busyStallMs: 60_000,
+	});
+	expect(receipt.operationRef).toBe("gw-p-progress1");
+	// 99 busy refusals spanned 198s, more than three stall windows, without a stall.
+	expect(clock).toBe(198_000);
+});
+
+async function busyRefusalOutcome(
+	options: { readonly cli: CliRunner; readonly writeTranscript: boolean; readonly busyStallMs: number },
+	opRef: string,
+): Promise<{ readonly error: unknown; readonly clock: number }> {
+	const { repo, transcript, authority } = await busyHostFixture(opRef);
+	if (!options.writeTranscript) await rm(transcript);
+	let clock = 0;
+	const relay = scriptedRelay(() => ({ ok: false, error: { code: "busy", message: "busy" } }));
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: options.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const error = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef, busyStallMs: options.busyStallMs })
+		.catch((caught: unknown) => caught);
+	return { error, clock };
+}
+
+test("an unreadable inspect beside a static transcript is not stall evidence (#687)", async () => {
+	const failingInspect: CliRunner = async () => {
+		throw new Error("inspect timed out");
+	};
+	const { error, clock } = await busyRefusalOutcome(
+		{ cli: failingInspect, writeTranscript: true, busyStallMs: 60_000 },
+		"gw-p-partial1",
+	);
+	expect(error).not.toBeInstanceOf(SessionBusyStalledError);
+	expect(String(error)).toMatch(/busy/);
+	// The wait ran to its deadline (stall bound + one sample), never concluding a stall.
+	expect(clock).toBeGreaterThanOrEqual(90_000);
+});
+
+test("a static activity stamp without a readable transcript is not stall evidence (#687)", async () => {
+	const { error } = await busyRefusalOutcome(
+		{ cli: wedgedInspect, writeTranscript: false, busyStallMs: 60_000 },
+		"gw-p-partial2",
+	);
+	expect(error).not.toBeInstanceOf(SessionBusyStalledError);
+	expect(String(error)).toMatch(/busy/);
+});
+
+test("a stall bound longer than the default busy wait is still reached, not requeued at ten minutes (#687)", async () => {
+	const { error, clock } = await busyRefusalOutcome(
+		{ cli: wedgedInspect, writeTranscript: true, busyStallMs: 15 * 60_000 },
+		"gw-p-long-stall",
+	);
+	expect(error).toBeInstanceOf(SessionBusyStalledError);
+	expect((error as SessionBusyStalledError).silentMs).toBe(15 * 60_000);
+	expect(clock).toBe(15 * 60_000);
+});
+
+for (const when of ["before", "flush", "after"] as const) {
+	test(`a busy retry whose relay dies ${when === "flush" ? "flushing" : `${when} writing`} the prompt ${when === "before" ? "keeps the busy refusal" : "stays ambiguous"} (#689)`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		await createOwnedSessionFixture(database, authority, {
+			sessionId: "sdk-1",
+			repo,
+			originKey: `busy-${when}`,
+			epoch: 0,
+		});
+		let prompts = 0;
+		let relay!: ReturnType<typeof scriptedRelay>;
+		relay = scriptedRelay((request) => {
+			if (request.operation !== "turn.prompt") throw new Error(`unexpected request ${request.operation}`);
+			prompts++;
+			if (prompts === 1) return { ok: false, error: { code: "busy", message: "busy" } };
+			// The frame reached the host, which then died before answering.
+			relay.streams.at(-1)?.close();
+			return new Promise<never>(() => {});
+		});
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: async () => {
+				throw new Error("unexpected command");
+			},
+			tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+			sleep: async () => {
+				const stream = relay.streams.at(-1);
+				if (when === "before") stream?.close();
+				if (when === "flush" && stream) {
+					// Production writes to the pipe and then flushes; a flush failure
+					// follows a frame that may already be on its way to the host.
+					const write = stream.write.bind(stream);
+					stream.write = (line: string) => {
+						write(line);
+						if (line.includes('"turn.prompt"')) throw new Error("EPIPE: broken pipe on flush");
+					};
+				}
+			},
+		});
+		const opRef = `gw-p-busy-${when}`;
+		await expect(port.send({ sessionId: "sdk-1", repo, text: "hi", opRef })).rejects.toThrow(/closed/);
+		const intent = database.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify(["sdk-1", opRef]));
+		if (when === "before") {
+			expect(prompts).toBe(1);
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBe("busy");
+		} else if (when === "flush") {
+			expect(
+				relay.streams.flatMap((stream) => stream.written).filter((frame) => frame.operation === "turn.prompt"),
+			).toHaveLength(2);
+			expect(intent?.state).toBe("pending");
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBeUndefined();
+		} else {
+			expect(prompts).toBe(2);
+			expect(intent?.state).toBe("pending");
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBeUndefined();
+		}
+	});
+}
 
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));

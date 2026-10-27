@@ -60,7 +60,7 @@ test("cutover backs up, exports open work, then quarantines under one lease", as
 	const backupDb = await Store.openReadonly(backup);
 	try {
 		expect(backupDb.core.quickCheckDetail()).toBe("ok");
-		expect(backupDb.schemaVersion).toBe(38);
+		expect(backupDb.schemaVersion).toBe(39);
 	} finally {
 		backupDb.close();
 	}
@@ -163,14 +163,14 @@ test("a corrupt record is exported as invalid before settlement refuses it", asy
 test("administrative cutover refuses a non-latest schema without migrating it", async () => {
 	const f = await fixture();
 	const raw = new Database(f.layout.db);
-	raw.exec("DELETE FROM schema_migrations WHERE version = 38");
+	raw.exec("DELETE FROM schema_migrations WHERE version = 39");
 	raw.close();
 	const before = await readSnapshot(f.layout.db);
 	expect(await runCutover({ config: f.config, agentDir: f.targetAgent })).toBe(1);
 	expect(await readSnapshot(f.layout.db)).toEqual(before);
 	const readonly = await Store.openReadonly(f.layout.db);
 	try {
-		expect(readonly.schemaVersion).toBe(37);
+		expect(readonly.schemaVersion).toBe(38);
 	} finally {
 		readonly.close();
 	}

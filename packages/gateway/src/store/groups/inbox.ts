@@ -26,6 +26,11 @@ export interface InboundMessageRow {
 	readonly terminal_delivery_id: string | null;
 }
 
+/** The original platform message an edit row (`edit:<id>:<hash>`) carries new text for. */
+export function editedOriginalId(inboundMessageId: string): string | undefined {
+	return /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId)?.[1];
+}
+
 export interface CrossSessionWatchRow {
 	readonly watch_id: string;
 	readonly watcher_origin_key: string;
@@ -112,6 +117,13 @@ export interface ConversationContextWindow {
 
 const REPLAYABLE_INBOUND =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)";
+/**
+ * A trigger whose escalation notice (#686) is still undelivered keeps its row:
+ * the notice is posted from it. Mirrors persona-session's
+ * `escalation-notice:<originKey>#<opRef>` intent key.
+ */
+const ESCALATION_NOTICE_KEY_SQL =
+	"'escalation-notice:' || inbound_messages.origin_key || '#' || inbound_messages.turn_op_ref";
 const INBOUND_COLUMNS =
 	"message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
 
@@ -408,7 +420,7 @@ export class InboxGroup {
 		if ((existing?.n ?? 0) > 0) throw new InboundTurnConflictError(input.originKey, input.epoch);
 		const changes = this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = 'trigger', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ?, bound_session_id = ?, dispatched_at = ?, terminal_delivery_id = NULL WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL",
+				"UPDATE inbound_messages SET turn_role = 'trigger', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ?, bound_session_id = ?, dispatched_at = ?, send_attempted_at = NULL, send_context_json = NULL, terminal_delivery_id = NULL WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL",
 			)
 			.run(
 				tx,
@@ -421,6 +433,73 @@ export class InboxGroup {
 			).changes;
 		if (changes !== 1) throw new Error(`inbound ${input.messageId} is not a pending unbound row`);
 		return this.turnRow(input.opRef) as InboundMessageRow;
+	}
+
+	/**
+	 * Durable send intent (#685): stamped immediately before the prompt is
+	 * handed to the broker. A bound trigger without it provably never reached
+	 * `turn.prompt` and is requeued; with it, only reconcile may settle it.
+	 * `contextMessageIds` claims the conversation-context rows the prompt
+	 * rendered (#686): once the prompt may have landed they belong to this op.
+	 */
+	markSendAttempted(
+		tx: WriteTx,
+		opRef: string,
+		contextMessageIds: readonly string[] = [],
+		at: string = new Date().toISOString(),
+	): boolean {
+		return (
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET send_attempted_at = COALESCE(send_attempted_at, ?), send_context_json = COALESCE(send_context_json, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
+				)
+				.run(tx, at, JSON.stringify([...new Set(contextMessageIds)]), opRef).changes === 1
+		);
+	}
+
+	/**
+	 * Conversation-context ids a sent op owns: those its prompt claimed, its
+	 * trigger, and every steer attributed to it (with the original id of an edit).
+	 */
+	sentContextIds(opRef: string): string[] {
+		const trigger = this.#db
+			.prepare(
+				"SELECT message_id, send_context_json FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+			)
+			.get(opRef) as { message_id: string; send_context_json: string | null } | null;
+		if (!trigger) throw new Error(`turn ${opRef} has no trigger`);
+		// Every stamped trigger carries an explicit claim (schema 39 claims legacy
+		// ones at upgrade); a missing or malformed claim is corruption.
+		if (trigger.send_context_json === null) throw new Error(`turn ${opRef} has no send context claim`);
+		const claimed: unknown = JSON.parse(trigger.send_context_json);
+		if (!Array.isArray(claimed) || !claimed.every((id) => typeof id === "string"))
+			throw new Error(`turn ${opRef} has a malformed send context claim`);
+		const ids = new Set<string>([trigger.message_id, ...claimed]);
+		const editedTrigger = editedOriginalId(trigger.message_id);
+		if (editedTrigger) ids.add(editedTrigger);
+		const steers = this.#db
+			.prepare("SELECT message_id FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'steer'")
+			.all(opRef) as Array<{ message_id: string }>;
+		for (const steer of steers) {
+			ids.add(steer.message_id);
+			const original = editedOriginalId(steer.message_id);
+			if (original) ids.add(original);
+		}
+		return [...ids];
+	}
+
+	sendAttemptedAt(opRef: string): string | undefined {
+		return (
+			(
+				this.#db
+					.prepare("SELECT send_attempted_at FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'")
+					.get(opRef) as { send_attempted_at: string | null } | null
+			)?.send_attempted_at ?? undefined
+		);
+	}
+
+	sendAttempted(opRef: string): boolean {
+		return this.sendAttemptedAt(opRef) !== undefined;
 	}
 
 	turnAccept(tx: WriteTx, opRef: string): boolean {
@@ -515,7 +594,7 @@ export class InboxGroup {
 	turnRequeue(tx: WriteTx, opRef: string): number {
 		return this.#db
 			.prepare(
-				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
+				"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, send_attempted_at = NULL, send_context_json = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
 			)
 			.run(tx, opRef).changes;
 	}
@@ -533,6 +612,40 @@ export class InboxGroup {
 				)
 				.run(tx, input.epoch, input.opRef, input.messageId, input.opRef).changes === 1
 		);
+	}
+
+	/**
+	 * Closes the origin's pending, unbound inbound rows whose exact message a
+	 * held op's prompt carried as context: they may already have been acted on
+	 * by that op, so they become its done input instead of a fresh trigger
+	 * (#686, #698 review). An edit row carries new text and stays pending.
+	 */
+	closeClaimedPending(
+		tx: WriteTx,
+		input: {
+			readonly originKey: string;
+			readonly epoch: number;
+			readonly opRef: string;
+			readonly messageIds: readonly string[];
+		},
+	): InboundMessageRow[] {
+		const closed: InboundMessageRow[] = [];
+		for (const messageId of new Set(input.messageIds)) {
+			const row = this.#db
+				.prepare(
+					`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'pending' AND turn_state IS NULL`,
+				)
+				.get(messageId, input.originKey) as InboundMessageRow | null;
+			if (!row) continue;
+			this.#assertNotQuarantined(messageId);
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND turn_state IS NULL",
+				)
+				.run(tx, input.epoch, input.opRef, messageId);
+			closed.push(row);
+		}
+		return closed;
 	}
 
 	steerAccepted(
@@ -673,6 +786,44 @@ export class InboxGroup {
 				`SELECT origin_key, origin_ref_json, MAX(rowid) AS last_row FROM inbound_messages WHERE source = 'platform' AND (turn_state IN ('bound', 'accepted') OR (received_at >= ? AND COALESCE(json_extract(engagement_json, '$.authorIsBot'), 0) <> 1)) AND ${REPLAYABLE_INBOUND} GROUP BY origin_key ORDER BY origin_key`,
 			)
 			.all(since) as Array<{ origin_key: string; origin_ref_json: string }>;
+	}
+
+	/**
+	 * Platform messages from non-bot authors still pending since `cutoff` or
+	 * earlier with no confirmed reply on their origin since they arrived (#688).
+	 * Gateway hold notices (gw-h-) and silence alerts (gw-s-) are not replies.
+	 * Declined (policy-ignored) messages never enter the queue; thread mutes are
+	 * judged by the caller with the intake's own per-message mute key.
+	 */
+	unansweredMessages(cutoff: string): Array<{
+		readonly origin_key: string;
+		readonly origin_ref_json: string;
+		readonly message_id: string;
+		readonly received_at: string;
+		readonly engagement_json: string | null;
+	}> {
+		return this.#db
+			.prepare(
+				`SELECT origin_key, origin_ref_json, message_id, received_at, engagement_json
+				FROM inbound_messages
+				WHERE source = 'platform' AND state = 'pending' AND received_at <= ?
+					AND COALESCE(json_extract(engagement_json, '$.authorIsBot'), 0) <> 1
+					AND ${REPLAYABLE_INBOUND}
+					AND NOT EXISTS (
+						SELECT 1 FROM deliveries d
+						WHERE d.origin_key = inbound_messages.origin_key AND d.state = 'confirmed'
+							AND d.created_at >= inbound_messages.received_at
+							AND d.delivery_id NOT LIKE 'gw-h-%' AND d.delivery_id NOT LIKE 'gw-s-%'
+					)
+				ORDER BY origin_key, received_at, rowid`,
+			)
+			.all(cutoff) as Array<{
+			origin_key: string;
+			origin_ref_json: string;
+			message_id: string;
+			received_at: string;
+			engagement_json: string | null;
+		}>;
 	}
 
 	nonterminalOrigins(): readonly string[] {
@@ -1129,7 +1280,7 @@ export class InboxGroup {
 	sweep(tx: WriteTx, cutoffs: { historyCutoff: string; batch: number }): number {
 		return this.#db
 			.prepare(
-				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') LIMIT ?)`,
+				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ${ESCALATION_NOTICE_KEY_SQL}) LIMIT ?)`,
 			)
 			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
 	}
