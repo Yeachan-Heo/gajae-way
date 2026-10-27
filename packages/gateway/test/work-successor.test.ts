@@ -26,7 +26,7 @@ function git(cwd: string, ...args: string[]) {
 	if (result.exitCode !== 0) throw new Error(result.stderr.toString());
 	return result.stdout.toString().trim();
 }
-async function fixture(maxLanes = 8) {
+async function fixture(maxLanes = 8, initialTrigger?: string) {
 	const dir = await realpath(await mkdtemp(join(tmpdir(), "gw-isolated-successor-")));
 	const home = join(dir, "home");
 	const repo = join(dir, "repo");
@@ -40,6 +40,30 @@ async function fixture(maxLanes = 8) {
 	git(repo, "commit", "-m", "reviewed input");
 	const base = git(repo, "rev-parse", "HEAD");
 	const db = await Store.open(join(dir, "nonproduction.db"));
+	const reportOrigin = { platform: "discord", kind: "channel", conversationId: "recovery-owner" } as const;
+	let ownerTarget: { platform: "discord"; kind: "channel"; conversationId: string } = reportOrigin;
+	let activeOwnerOp: string | undefined;
+	const setOwnerTrigger = (messageId?: string) =>
+		db.transaction((tx) => {
+			if (activeOwnerOp) db.inbox.turnComplete(tx, activeOwnerOp);
+			activeOwnerOp = messageId ? `owner-${messageId}` : undefined;
+			if (messageId && activeOwnerOp) {
+				db.inbox.enqueue(tx, {
+					messageId,
+					originKey: "discord/channel/recovery-owner",
+					originRefJson: JSON.stringify(reportOrigin),
+					body: "operator instruction",
+				});
+				db.inbox.bindTurn(tx, {
+					messageId,
+					originKey: "discord/channel/recovery-owner",
+					epoch: 0,
+					opRef: activeOwnerOp,
+					sessionId: crypto.randomUUID(),
+				});
+			}
+		});
+	setOwnerTrigger(initialTrigger);
 	const port = new ScriptedSessionPort({
 		onBind: (input) => {
 			const id = db.bindings.getSessionRecord(input.originKey)?.sessionId ?? crypto.randomUUID();
@@ -65,7 +89,7 @@ async function fixture(maxLanes = 8) {
 			serviceDirectory: service,
 			pollMs: 5,
 			brokerWait: { deadlineMs: 0 },
-			ownerTarget: () => ({ platform: "discord", kind: "channel", conversationId: "recovery-owner" }),
+			ownerTarget: () => ownerTarget,
 			deliverFallback: (payload) => notices.push(payload.text),
 		});
 	let manager = make();
@@ -115,6 +139,10 @@ async function fixture(maxLanes = 8) {
 		notices,
 		job,
 		request,
+		setOwnerTrigger,
+		setOwner: (conversationId: string) => {
+			ownerTarget = { ...reportOrigin, conversationId };
+		},
 		get manager() {
 			return manager;
 		},
@@ -238,8 +266,63 @@ test("linked recovery remains inspectable during a transport gap and never repla
 	});
 	expect(f.port.sends).toHaveLength(2);
 	// Reconstruction is safe even when source and successor observation are unavailable.
+	f.port.liveness = async () => {
+		throw new Error("inspect unavailable");
+	};
 	await f.restart();
+	for (const opRef of [f.first.opRef, op]) {
+		expect(f.db.work.workAttemptGet(opRef)).toMatchObject({
+			terminal: null,
+			settledAt: null,
+			decision: "undecided",
+			output: { reads: 0 },
+		});
+	}
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.job("authorized-successor").attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(2);
+});
+
+test("a prepared linked successor stays open when submission and both reconstruction probes are unavailable", async () => {
+	const f = await fixture();
+	let successorOp: string | undefined;
+	f.port.send = async (input) => {
+		successorOp = input.opRef;
+		throw new Error("submission outcome unavailable");
+	};
+	const originalStatus = f.port.status.bind(f.port);
+	f.port.status = async (input) =>
+		input.opRef === successorOp
+			? { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false }
+			: originalStatus(input);
+	await expect(f.manager.start(f.request())).rejects.toMatchObject({
+		detail: { reasonCode: "send_acceptance_uncertain" },
+	});
+	expect(successorOp).toBeDefined();
+	f.port.status = async () => {
+		throw new Error("status unavailable");
+	};
+	f.port.liveness = async () => {
+		throw new Error("inspect unavailable");
+	};
+	await f.restart();
+	for (const opRef of [f.first.opRef, successorOp!]) {
+		expect(f.db.work.workAttemptGet(opRef)).toMatchObject({
+			terminal: null,
+			settledAt: null,
+			decision: "undecided",
+			output: { reads: 0 },
+		});
+	}
+	await expect(f.manager.start(f.request())).rejects.toMatchObject({
+		detail: { reasonCode: "send_acceptance_uncertain", opRef: successorOp },
+	});
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.job("authorized-successor").attempts[0]?.endedAt).toBeUndefined();
+	expect(f.notices).toHaveLength(0);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.closes).toHaveLength(0);
 });
 
 test("isolated successor refuses stale identity, mutable base, wrong repository, and non-explicit acknowledgement before sending", async () => {
@@ -305,4 +388,44 @@ test("a no-longer-missing source cannot authorize a fresh successor", async () =
 	});
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.sends).toHaveLength(1);
+});
+
+test("later operator messages authorize and retry recovery while retaining the original captured report target", async () => {
+	const f = await fixture(8, "M1");
+	expect(f.runtime.parent).toMatchObject({ kind: "persona", triggerMessageId: "M1" });
+	f.setOwnerTrigger("M2");
+	const successor = await f.manager.start(f.request());
+	if (!successor.started) throw new Error("unexpected successor hold");
+	expect(f.db.work.workAttemptGet(successor.opRef)?.parent).toEqual(f.runtime.parent);
+	f.setOwnerTrigger("M3");
+	expect(await f.manager.start(f.request())).toMatchObject({
+		started: true,
+		alreadyStarted: true,
+		opRef: successor.opRef,
+	});
+	f.setOwnerTrigger();
+	await f.restart();
+	expect(await f.manager.start(f.request())).toMatchObject({
+		started: true,
+		alreadyStarted: true,
+		opRef: successor.opRef,
+	});
+	expect(f.db.work.workAttemptGet(successor.opRef)?.parent).toEqual(f.runtime.parent);
+	expect(f.port.sends).toHaveLength(2);
+});
+
+test("a different report owner cannot authorize or reuse a linked successor", async () => {
+	const f = await fixture(8, "M1");
+	f.setOwner("different-owner");
+	await expect(f.manager.start(f.request())).rejects.toMatchObject({
+		detail: { reasonCode: "successor_report_owner_mismatch" },
+	});
+	expect(f.port.binds).toHaveLength(1);
+	f.setOwner("recovery-owner");
+	const successor = await f.manager.start(f.request());
+	expect(successor.started).toBe(true);
+	f.setOwner("different-owner");
+	await expect(f.manager.start(f.request())).rejects.toBeDefined();
+	expect(f.port.sends).toHaveLength(2);
+	expect(f.db.work.workAttemptGet(f.first.opRef)?.successor).toBeDefined();
 });

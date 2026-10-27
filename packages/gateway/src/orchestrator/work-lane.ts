@@ -135,6 +135,12 @@ const pendingOutput = () => ({
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
+/** Authorization follows the stable owner, not whichever message is active now. */
+function sameReportOwner(left: WorkParent | null, right: WorkParent | null): boolean {
+	if (left === null || right === null) return left === right;
+	if (left.kind === "persona") return right.kind === "persona" && left.originKey === right.originKey;
+	return right.kind === "lane" && left.name === right.name && left.root?.originKey === right.root?.originKey;
+}
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
 	readonly generation: number;
@@ -896,7 +902,7 @@ export class WorkLaneManager {
 		if (runtime.successor) refuse("successor_already_authorized");
 		if (source.lane.repository === undefined || source.lane.repository !== input.repo)
 			refuse("successor_repository_mismatch");
-		if (JSON.stringify(runtime.parent) !== JSON.stringify(parent)) refuse("successor_report_owner_mismatch");
+		if (!sameReportOwner(runtime.parent, parent)) refuse("successor_report_owner_mismatch");
 		if (prepared && input.cwd && realpathSync(input.cwd) === realpathSync(runtime.cwd))
 			refuse("successor_checkout_not_isolated");
 		const status = await this.#query(runtime);
@@ -932,7 +938,7 @@ export class WorkLaneManager {
 			if (
 				source?.sessionKey === workSessionKey(expected.name) &&
 				source.sessionId === expected.sessionId &&
-				JSON.stringify(source.parent) === JSON.stringify(context.parent) &&
+				sameReportOwner(source.parent, context.parent) &&
 				source.successor
 			) {
 				const link = source.successor;
@@ -965,7 +971,8 @@ export class WorkLaneManager {
 				};
 			}
 		}
-		await this.#successorSource(input, context.parent);
+		const recoverySource = await this.#successorSource(input, context.parent);
+		if (recoverySource) context = { ...context, parent: recoverySource.parent };
 		if (input.cwd !== undefined) assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
@@ -1288,7 +1295,12 @@ export class WorkLaneManager {
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
 				// A settled attempt whose host is gone has no live op to report.
-				if (runtime?.successor || runtime?.successorOf) opUnavailable = true;
+				if (
+					runtime?.successor ||
+					runtime?.successorOf ||
+					(job.state === "awaiting_operator" && attempt.endedAt === undefined)
+				)
+					opUnavailable = true;
 				else if (attempt.endedAt === undefined || !isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
@@ -1312,7 +1324,9 @@ export class WorkLaneManager {
 			...(opUnavailable ? { opUnavailable: true as const } : {}),
 			...(runtime?.successorOf ? { successorOf: runtime.successorOf } : {}),
 			...(runtime?.successor ? { successor: runtime.successor } : {}),
-			...(!attempt?.endedAt && !runtime?.turnEndObservedAt && (runtime?.successor || op?.receiptState === "missing")
+			...(!attempt?.endedAt &&
+			!runtime?.turnEndObservedAt &&
+			(runtime?.successor || op?.receiptState === "missing" || job.state === "awaiting_operator")
 				? { recoveryHold: "execution_end_unproven" as const }
 				: {}),
 			// Add repository binding info if present (issue #480)
@@ -1736,6 +1750,21 @@ export class WorkLaneManager {
 		}
 		return true;
 	}
+	#holdOpenExecution(observer: Observer): void {
+		if (!this.#writeCurrent(observer)) return;
+		const name = observer.runtime.sessionKey.slice("work/task/".length);
+		const source = this.#job(name, true)!;
+		if (source.state !== "running") return;
+		this.#putJob(name, {
+			...source,
+			state: "awaiting_operator",
+			updatedAt: this.#at(),
+			escalations: [
+				...source.escalations,
+				`${this.#at()} execution end unproven; no replay or same-checkout takeover`,
+			].slice(-32),
+		});
+	}
 	async #tick(observer: Observer): Promise<void> {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
@@ -1801,18 +1830,7 @@ export class WorkLaneManager {
 			) {
 				// Hold admission without pretending that the native execution ended.
 				// Observation continues, including late receipts and correlated lifecycle end.
-				const source = this.#job(runtime.sessionKey.slice("work/task/".length), true)!;
-				if (source.state === "running" && this.#writeCurrent(observer)) {
-					this.#putJob(runtime.sessionKey.slice("work/task/".length), {
-						...source,
-						state: "awaiting_operator",
-						updatedAt: this.#at(),
-						escalations: [
-							...source.escalations,
-							`${this.#at()} execution end unproven; no replay or same-checkout takeover`,
-						].slice(-32),
-					});
-				}
+				this.#holdOpenExecution(observer);
 				const activityVersion = observer.activityVersion;
 				const proofTail = observer.tail;
 				const proofConnectionEpoch = proofTail?.connectionEpoch;
@@ -2833,6 +2851,21 @@ export class WorkLaneManager {
 				}
 				if (!this.#current(observer)) continue;
 				if (live.live === true && !live.disowned && this.#binding(runtime)) {
+					this.#attach(observer);
+					this.#schedule(observer, 0);
+					continue;
+				}
+				if (
+					this.#binding(runtime) &&
+					(runtime.successorOf ||
+						runtime.successor ||
+						(live.live === undefined && !live.disowned && hasAcceptanceEvidence(runtime)))
+				) {
+					// A reconstruction gap is not an execution end. Accepted work and
+					// prepared linked successors remain non-replayable even if BOTH
+					// status and inspect are unavailable. The normal observer supplies
+					// correlated lifecycle/idle proof or continuously fenced host death.
+					this.#holdOpenExecution(observer);
 					this.#attach(observer);
 					this.#schedule(observer, 0);
 					continue;
