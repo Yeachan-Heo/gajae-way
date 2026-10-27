@@ -1014,7 +1014,7 @@ export class WorkLaneManager {
 		if (open)
 			throw new ProtocolError(
 				"invalid_params",
-				"attempt still open; observe it, or explicitly authorize an isolated successor with work.start successorOf after reviewing external effects; --resume cannot prove execution ended",
+				"attempt still open; observe it, or explicitly authorize an isolated successor with work.start successorOf after reviewing external effects; resuming cannot prove execution ended",
 				{
 					reasonCode: "attempt_open",
 					jobId,

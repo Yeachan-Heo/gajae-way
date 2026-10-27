@@ -72,7 +72,8 @@ test("live CLI start/status/steer/jobs/retire: early receipt, open refusal, exac
 	const overlap = await cli(f, ["start", "cli", "--cwd", f.home, "--resume", "duplicate"]);
 	expect(overlap.code).toBe(1);
 	expect(overlap.stdout).toBe("");
-	expect(overlap.stderr).toContain("attempt already open; use work.steer or wait");
+	expect(overlap.stderr).toContain("attempt still open; observe it, or explicitly authorize an isolated successor");
+	expect(overlap.stderr).toContain("resuming cannot prove execution ended");
 	const retirement = await cli(f, ["retire", "cli"]);
 	expect(retirement.stdout).toContain("not retired:");
 	const steered = await cli(f, ["steer", "cli", "focus", "tests"]);
