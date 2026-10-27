@@ -745,6 +745,17 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/**
+	 * A fresh lane whose start is still being admitted (clone, worktree, bind,
+	 * send) has no durable record yet: state `admitting`. If that admission
+	 * failed, state `admission_failed` carries the bounded reason until the next
+	 * start of the name (#707).
+	 */
+	readonly admission?: {
+		readonly startedAt: string;
+		readonly failedAt?: string;
+		readonly reason?: string;
+	};
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
 		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */

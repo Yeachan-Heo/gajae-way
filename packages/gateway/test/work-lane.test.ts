@@ -2784,8 +2784,7 @@ test("#615: a remote clone whose helper never answers fails typed, releases the 
 			detail: { reasonCode: "git_command_timeout", command: "clone", timeoutMs: 400 },
 		});
 		expect(Date.now() - startedAt).toBeLessThan(5_000);
-		// Job is persisted in admitting state since clone failed during slow steps.
-		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeDefined();
+		expect(f.db.work.laneJobJson(laneJobIdentity(name).jobId)).toBeUndefined();
 		expect(f.port.binds).toHaveLength(0);
 		await expect(lstat(managedLaneWorktreePath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(lstat(managedLaneRepositoryPath(f.gajaewayHome, name))).rejects.toMatchObject({ code: "ENOENT" });
@@ -6990,9 +6989,9 @@ test("work.start with invalid repo throws invalid_params with git stderr", async
 		},
 	});
 
-	// Job is persisted but in admitting state since slow steps failed before completion.
+	// Verify no worktree was created
 	const job = f.db.work.laneJobJson(laneJobIdentity("bad-repo").jobId);
-	expect(job).toBeDefined();
+	expect(job).toBeUndefined();
 });
 
 test("work.start with special characters in lane name uses hex-encoded branch name", async () => {
@@ -8095,3 +8094,71 @@ test("issue #579: a compiled binary resolves the service directory from its own 
 		await rm(dir, { recursive: true, force: true });
 	}
 }, 60_000);
+
+/** The next bind waits until released, as a slow clone, broker wait or bind does; later binds pass through. */
+function gateBind(f: Awaited<ReturnType<typeof fixture>>) {
+	const original = f.port.bind.bind(f.port);
+	let release!: () => void;
+	let fail: ((error: Error) => void) | undefined;
+	const gate = new Promise<void>((resolve, reject) => {
+		release = resolve;
+		fail = reject;
+	});
+	let entered = false;
+	f.port.bind = async (input: SessionBindInput) => {
+		if (entered) return original(input);
+		entered = true;
+		await gate;
+		return original(input);
+	};
+	return { release, fail: (error: Error) => fail?.(error), entered: () => entered };
+}
+
+test("#707: a fresh lane start is visible as admitting before its record exists, and a same-name retry does not start it twice", async () => {
+	const f = await fixture();
+	const gate = gateBind(f);
+	const first = f.manager.start({ name: "slow", text: "work", cwd: f.directory });
+	await pollUntil(f, gate.entered);
+	// The caller timed out here; the start was accepted and is still being admitted.
+	const admitting = await f.manager.status({ name: "slow" });
+	expect(admitting).toMatchObject({
+		jobId: laneJobIdentity("slow").jobId,
+		state: "admitting",
+		attempt: null,
+		op: null,
+	});
+	expect(admitting.admission?.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+	expect(await f.manager.start({ name: "slow", text: "work", cwd: f.directory })).toMatchObject({
+		started: false,
+		held: true,
+		state: "admitting",
+	});
+	gate.release();
+	expect(await first).toMatchObject({ started: true, jobId: laneJobIdentity("slow").jobId });
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	const admitted = await f.manager.status({ name: "slow" });
+	expect(admitted.state).toBe("running");
+	expect(admitted.admission).toBeUndefined();
+});
+
+test("#707: a failed fresh admission is reported by status until the name is started again", async () => {
+	const f = await fixture();
+	const gate = gateBind(f);
+	const first = f.manager.start({ name: "doomed", text: "work", cwd: f.directory });
+	await pollUntil(f, gate.entered);
+	gate.fail(new Error("bind exploded"));
+	await expect(first).rejects.toMatchObject({ detail: { reasonCode: "bind_failed" } });
+	expect(f.db.work.laneJobJson(laneJobIdentity("doomed").jobId)).toBeUndefined();
+	const failed = await f.manager.status({ name: "doomed" });
+	expect(failed).toMatchObject({ state: "admission_failed", attempt: null, op: null });
+	expect(failed.admission?.failedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+	expect(failed.admission?.reason).toContain("work lane bind failed");
+	// A failed admission does not hold the name: a new start admits it normally.
+	const retried = await f.manager.start({ name: "doomed", text: "work", cwd: f.directory });
+	expect(retried.started).toBe(true);
+	expect((await f.manager.status({ name: "doomed" })).admission).toBeUndefined();
+	await expect(f.manager.status({ name: "never-started" })).rejects.toMatchObject({
+		detail: { reasonCode: "unknown_work_lane" },
+	});
+});

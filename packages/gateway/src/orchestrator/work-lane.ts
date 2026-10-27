@@ -300,6 +300,12 @@ export class WorkLaneManager {
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
 	readonly #runCalls = new Map<string, RunCall>();
+	/**
+	 * Fresh-lane starts between request acceptance and their durable lane record,
+	 * plus the last failed one per name, so `work.status` never reports an
+	 * accepted start as an unknown lane (#707).
+	 */
+	readonly #admissions = new Map<string, { startedAt: string; failedAt?: string; reason?: string }>();
 	readonly #detachedOwners = new WeakSet<object>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
@@ -831,11 +837,36 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		this.#job(input.name);
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		const admitting = this.#admissions.get(input.name);
+		// A same-name retry (for example after a caller timeout) must not queue a
+		// second clone, bind or send behind the admission still in progress.
+		if (admitting && admitting.failedAt === undefined)
+			return {
+				started: false,
+				held: true,
+				jobId: laneJobIdentity(input.name).jobId,
+				state: "admitting",
+				reason: "the lane start is still being admitted; check work.status",
+			};
+		const admission = { startedAt: this.#at() };
+		this.#admissions.set(input.name, admission);
+		try {
+			const result = await this.#startAdmitted(input, mode, { parent, runCall });
+			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
+			return result;
+		} catch (error) {
+			if (this.#admissions.get(input.name) === admission) {
+				if (this.#job(input.name)) this.#admissions.delete(input.name);
+				else this.#admissions.set(input.name, { ...admission, failedAt: this.#at(), reason: failureReason(error) });
+			}
+			throw error;
+		}
+	}
+	async #startAdmitted(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		await this.recover();
 		this.#live();
-		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent, runCall }));
+		return this.#port.runExclusive(workSessionKey(input.name), () => this.#startLocked(input, mode, context));
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
@@ -913,72 +944,37 @@ export class WorkLaneManager {
 		}
 		let createdWorktree: CreatedRepoWorktree | undefined;
 		if (!job) {
-			// Resolve worktree path before creating job.
-			let worktreePath: string;
+			let worktreePath = input.cwd;
 			let repositoryPath: string | undefined;
 			if (input.repo !== undefined) {
-				worktreePath = managedLaneWorktreePath(laneRoot, input.name);
-				repositoryPath = managedLaneRepositoryPath(laneRoot, input.name);
-			} else {
-				worktreePath = input.cwd!;
+				createdWorktree = await createWorktreeFromRepo(
+					laneRoot,
+					this.#options.serviceDirectory,
+					input.name,
+					input.repo,
+					input.base,
+					this.#gitTimeouts(),
+				);
+				worktreePath = createdWorktree.worktreePath;
+				repositoryPath = createdWorktree.repositoryPath;
 			}
 			if (worktreePath === undefined) throw new Error("work lane path was not resolved");
-			// Create and persist initial job BEFORE slow steps (worktree creation, facts).
-			// Job with no attempts is shown by work.status as "admitting".
+			const facts = await collectRepoFacts(worktreePath, this.#gitTimeouts(), undefined, false);
 			job = createLaneJobRecord({
 				jobId,
-				branch: managedLaneBranchName(input.name),
+				branch: facts?.branch ?? managedLaneBranchName(input.name),
 				worktreePath,
+				baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
-			this.#putJob(input.name, job);
-
-			// Now perform slow steps: worktree creation and facts collection.
-			try {
-				if (input.repo !== undefined) {
-					createdWorktree = await createWorktreeFromRepo(
-						laneRoot,
-						this.#options.serviceDirectory,
-						input.name,
-						input.repo,
-						input.base,
-						this.#gitTimeouts(),
-					);
-					worktreePath = createdWorktree.worktreePath;
-					repositoryPath = createdWorktree.repositoryPath;
-				}
-				if (worktreePath === undefined) throw new Error("work lane path was not resolved");
-				const facts = await collectRepoFacts(worktreePath, this.#gitTimeouts(), undefined, false);
-				// Update job with actual facts collected from the repository.
-				job = createLaneJobRecord({
-					jobId,
-					branch: facts?.branch ?? managedLaneBranchName(input.name),
-					worktreePath,
-					baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
-					...(input.repo !== undefined ? { repository: input.repo } : {}),
-					...(repositoryPath !== undefined ? { repositoryPath } : {}),
-				});
-				this.#putJob(input.name, job);
-			} catch (error) {
-				// Slow steps failed. Job remains persisted as "admitting" so operator can see and retire it.
-				if (createdWorktree) {
-					try {
-						await discardCreatedWorktree(input.name, createdWorktree, this.#gitTimeouts());
-					} catch (cleanupError) {
-						console.error(
-							`worktree_creation_cleanup_failed name=${input.name} reason=${sanitizeDiagnostic(cleanupError instanceof Error ? cleanupError.message : String(cleanupError))}`,
-						);
-					}
-				}
-				throw error;
-			}
 		}
 		const initialJob = job;
 		if (!initialJob) throw new Error("work lane record was not initialized");
 		const worktreePath = initialJob.lane.worktreePath;
 		input = { ...input, cwd: worktreePath };
 		let bindAttemptStarted = false;
+		let worktreePersisted = false;
 		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 		try {
 			// Each try re-takes the admission lock and re-checks capacity, so a
@@ -1001,7 +997,10 @@ export class WorkLaneManager {
 					this.#port.runExclusive("work/admission", async () => {
 						this.#live();
 						this.#options.lanes.assertAdmission(input.name);
-						// Job is already persisted before slow steps, so no need to persist again here.
+						if (createdWorktree && !worktreePersisted) {
+							this.#putJob(input.name, initialJob);
+							worktreePersisted = true;
+						}
 						bindAttemptStarted = true;
 						try {
 							return await this.#port.bind({
@@ -1143,6 +1142,17 @@ export class WorkLaneManager {
 	}
 	async status(params: unknown): Promise<WorkStatusResult> {
 		const name = parseName(params);
+		const admission = this.#job(name) ? undefined : this.#admissions.get(name);
+		if (admission)
+			return {
+				jobId: laneJobIdentity(name).jobId,
+				state: admission.failedAt === undefined ? "admitting" : "admission_failed",
+				sessionId: "",
+				lastActivityAt: null,
+				attempt: null,
+				op: null,
+				admission: { ...admission },
+			};
 		const job = this.#job(name, true)!;
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
@@ -1171,7 +1181,7 @@ export class WorkLaneManager {
 		}
 		return {
 			jobId: job.jobId,
-			state: attempt ? job.state : "admitting",
+			state: job.state,
 			sessionId: this.#db.bindings.getSessionRecord(key)?.sessionId ?? "",
 			lastActivityAt: this.#db.bindings.workLaneRows().find((row) => row.origin_key === key)?.last_activity_at ?? null,
 			attempt: attempt
