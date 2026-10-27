@@ -47,7 +47,13 @@ import {
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
+import {
+	type ConfigOverrides,
+	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	type GatewayConfig,
+	type ReloadResult,
+	reloadConfig,
+} from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { type KevShadowInput, kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
@@ -353,6 +359,7 @@ async function applyConfigReload(
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
+	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -3143,10 +3150,11 @@ async function createInboundTurnLifecycle(
 	const agentsMdChanged = hasAgentsMdBaseline
 		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
 		: legacyBootstrappedSession;
-	if (!hasAgentsMdBaseline || agentsMdChanged)
-		options.database.transaction((tx) =>
-			options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest),
-		);
+	// The baseline advances only when a turn carrying this AGENTS.md state
+	// succeeds (with the bootstrap, below). Recording it here, before the send,
+	// let a pre-send retry in the same epoch see the update as already delivered
+	// and drop it for good (#676 review).
+	const agentsMdBaselinePending = !hasAgentsMdBaseline || agentsMdChanged;
 	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	const internalTriggerText = () =>
 		row.message_id.startsWith("agent-run/") ? userText : laneReportTriggerText(userText);
@@ -4036,6 +4044,8 @@ async function createInboundTurnLifecycle(
 			options.database.transaction((tx) => {
 				if (nonLoopback)
 					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision);
+				if (agentsMdBaselinePending)
+					options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest);
 				if (bootstrap)
 					options.database.bindings.markSessionBootstrapped(tx, key, input.epoch, {
 						includedSections: bootstrap.includedSections,

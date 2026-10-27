@@ -449,7 +449,7 @@ export class GlobalGjcClient {
 	/** Start of the current run of failures against a broker discovery calls live. */
 	#liveOutageSince: number | undefined;
 	readonly #liveOutageLimit: number;
-	readonly #maxPoolSize: number;
+	#maxPoolSize: number;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
@@ -478,7 +478,7 @@ export class GlobalGjcClient {
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
-		this.#maxPoolSize = Math.min(MAX_CLI_POOL, Math.max(MIN_CLI_POOL, integer(options.maxPoolSize, MIN_CLI_POOL, 1)));
+		this.#maxPoolSize = clampPoolSize(options.maxPoolSize);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) =>
@@ -924,6 +924,17 @@ export class GlobalGjcClient {
 			}
 		}
 	}
+	/** Live `sessions.maxLiveHosts` reload: a larger pool admits queued commands now; a smaller one drains naturally. */
+	setMaxPoolSize(maxPoolSize: number | undefined): void {
+		this.#maxPoolSize = clampPoolSize(maxPoolSize);
+		// Waiters re-check capacity when woken and re-queue if still over the limit.
+		for (const waiter of this.#queue.splice(0)) waiter.resolve();
+	}
+
+	get maxPoolSize(): number {
+		return this.#maxPoolSize;
+	}
+
 	#checkUnavailable(result: CliResult): CliResult {
 		const detail = extractRuntimeError(`${result.stdout}\n${result.stderr}`);
 		if (detail?.code === "broker_unavailable")
@@ -1059,6 +1070,10 @@ export class GlobalGjcClient {
 		return { lines, write, close };
 	}
 }
+function clampPoolSize(requested: number | undefined): number {
+	return Math.min(MAX_CLI_POOL, Math.max(MIN_CLI_POOL, integer(requested, MIN_CLI_POOL, 1)));
+}
+
 function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {
 	if (args[0] !== "sdk") throw new Error("Global GJC client accepts only sdk commands");
 	if (args.some((arg) => /^(--agent-dir|--cwd|--config-dir|--executable)(=|$)/.test(arg))) {

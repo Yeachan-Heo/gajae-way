@@ -765,6 +765,33 @@ test("the CLI pool is sized from maxPoolSize within [4, 16]", async () => {
 	}
 });
 
+test("a live sessions reload grows the CLI pool and admits queued commands at once", async () => {
+	let active = 0;
+	const pending: Array<() => void> = [];
+	const value = client({
+		maxPoolSize: 4,
+		command: async () => {
+			active++;
+			await new Promise<void>((resolve) => pending.push(resolve));
+			active--;
+			return healthy;
+		},
+	});
+	const commands = Array.from({ length: 8 }, () => value.cli(["sdk", "session", "list"], { timeoutMs: 2_000 }));
+	await eventually(() => active === 4);
+	value.setMaxPoolSize(8);
+	expect(value.maxPoolSize).toBe(8);
+	// The four queued commands start without waiting for a running one to finish.
+	await eventually(() => active === 8);
+	value.setMaxPoolSize(1);
+	expect(value.maxPoolSize).toBe(4);
+	while (pending.length > 0 || active > 0) {
+		for (const resolve of pending.splice(0)) resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+	await Promise.all(commands);
+});
+
 test("stop rejects queued/future requests and closes only gateway spawned relays", async () => {
 	let kills = 0;
 	const spawn = (() => {
