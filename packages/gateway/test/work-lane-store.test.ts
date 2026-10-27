@@ -439,10 +439,7 @@ describe("work attempt durable transactions", () => {
 			});
 			if (scenario === "settled") {
 				f.database.transaction((tx) =>
-					settleAttempt(f.database, tx, f.runtime.opRef, 1, f.closed, {
-						...f.settlement,
-						decision: "no_target",
-					}),
+					settleAttempt(f.database, tx, f.runtime.opRef, 1, f.closed, f.settlement, f.admission),
 				);
 				holdParent(f, f.closed);
 			} else {
@@ -462,13 +459,14 @@ describe("work attempt durable transactions", () => {
 					.run(PARENT_SESSION, f.runtime.sessionKey);
 			if (scenario === "wrong_epoch")
 				f.raw.query("UPDATE sessions SET epoch = epoch + 1 WHERE origin_key = ?").run(f.runtime.sessionKey);
+			const outboxBeforeChild = f.database.outbox.rows();
 			const child = prepareRootlessChild(f);
 			const result = f.database.transaction((tx) =>
 				settleAttempt(f.database, tx, child.runtime.opRef, 0, child.closed, f.settlement, child.admission),
 			);
 			expect(result?.runtime.decision).toBe("no_target");
 			expect(f.database.work.laneReportGet(child.runtime.reportId)).toBeUndefined();
-			expect(f.database.outbox.rows()).toHaveLength(0);
+			expect(f.database.outbox.rows()).toEqual(outboxBeforeChild);
 		}
 	});
 
