@@ -2208,7 +2208,7 @@ describe("monitor overlap policy (issue #83)", () => {
 });
 
 describe("#702: an exhausted event held on an unresolvable authoring turn", () => {
-	async function heldSkipMonitor(status: "unknown" | "throws") {
+	async function heldSkipMonitor(status: "unknown" | "throws" | "accepted" | "in_flight", batchSize = 1) {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-702-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
@@ -2227,14 +2227,26 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 			firedAt: new Date().toISOString(),
 			overlap: "skip",
 		});
-		for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
-			updateEvent(db, eventId, "failed");
-			db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+		// Coalesced batch members fire behind the first; queue keeps them admitted.
+		const eventIds = [eventId];
+		for (let i = 1; i < batchSize; i++) {
+			const member = crypto.randomUUID();
+			createEvent(db, {
+				eventId: member,
+				monitorId: monitor.monitorId,
+				eventType: "proactive.tick",
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			eventIds.push(member);
 		}
-		db.core.metaSet(
-			`monitor_authoring_turn:${eventId}`,
-			JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] }),
-		);
+		for (const id of eventIds)
+			for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
+				updateEvent(db, id, "failed");
+				db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, id));
+			}
+		const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds });
+		for (const id of eventIds) db.core.metaSet(`monitor_authoring_turn:${id}`, pointer);
 		let prompts = 0;
 		const sessionPort = fakeSessionPort(async () => {
 			prompts++;
@@ -2244,6 +2256,14 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 			sessionPort.status = async () => {
 				throw new Error("broker_unavailable");
 			};
+		if (status === "in_flight") sessionPort.seedOperation(opRef, "s1", "in_flight");
+		if (status === "accepted") {
+			const scripted = sessionPort.status.bind(sessionPort);
+			sessionPort.status = async (input) =>
+				input.opRef === opRef
+					? { operationRef: opRef, status: { status: "accepted" }, summaryCompleted: false }
+					: await scripted(input);
+		}
 		let clock = Date.now();
 		const propagator = new MonitorPropagator({
 			database: db,
@@ -2270,6 +2290,9 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 		return {
 			db,
 			eventId,
+			eventIds,
+			opRef,
+			sessionPort,
 			propagator,
 			fire,
 			prompts: () => prompts,
@@ -2309,6 +2332,95 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 		await reconciling;
 		expect(stage(db, eventId)).toBe("authored");
 		expect(db.monitors.failure(eventId)).toBeUndefined();
+	});
+	for (const status of ["accepted", "in_flight"] as const) {
+		test(`status ${status}: a turn reported running is never aged out and keeps overlap protection`, async () => {
+			const { db, eventId, propagator, fire, prompts, advance } = await heldSkipMonitor(status);
+			advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+			await propagator.reconcile();
+			expect(stage(db, eventId)).toBe("failed");
+			advance(10 * MONITOR_EVENT_MAX_OPEN_AGE_MS);
+			await propagator.reconcile();
+			expect(stage(db, eventId)).toBe("failed");
+			expect(db.monitors.failure(eventId)?.code).not.toBe("authoring_turn_unresolved");
+			expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeDefined();
+			expect(stage(db, fire())).toBe("skipped");
+			expect(prompts()).toBe(0);
+		});
+	}
+
+	test("a late result reopens the whole given-up batch and is harvested from its own op, never resent", async () => {
+		const { db, eventIds, opRef, sessionPort, propagator, prompts, advance } = await heldSkipMonitor("unknown", 2);
+		advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+		await propagator.reconcile();
+		for (const id of eventIds) {
+			expect(stage(db, id)).toBe("failed_no_retry");
+			expect(db.monitors.failure(id)?.code).toBe("authoring_turn_unresolved");
+		}
+		// Still unknown: the record stays given up and its pointer kept.
+		await propagator.reconcile();
+		for (const id of eventIds) expect(stage(db, id)).toBe("failed_no_retry");
+
+		// The original operation finishes, then a later turn in the same session
+		// replaces the session's latest assistant message.
+		sessionPort.seedOperation(
+			opRef,
+			"s1",
+			"terminal_ok",
+			JSON.stringify(eventIds.map((eventId) => ({ eventId, note: `original ${eventId}` }))),
+		);
+		sessionPort.seedOperation("gw-m-successor", "s1", "terminal_ok", "successor answer");
+		await propagator.reconcile();
+		for (const id of eventIds) {
+			expect(stage(db, id)).toBe("authored_no_delivery");
+			expect(db.monitors.authoredOutput(id)).toBe(`original ${id}`);
+			expect(db.core.metaGet(`monitor_authoring_turn:${id}`)).toBeUndefined();
+		}
+		expect(sessionPort.sendAttempts).toHaveLength(0);
+		expect(prompts()).toBe(0);
+	});
+
+	test("a given-up batch whose operation later failed drops its pointer and stays settled", async () => {
+		const { db, eventId, opRef, sessionPort, propagator, prompts, advance } = await heldSkipMonitor("unknown");
+		advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		sessionPort.seedOperation(opRef, "s1", "failed");
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeUndefined();
+		expect(prompts()).toBe(0);
+	});
+
+	test("operator retry of one event of a coalesced batch retries the batch and reuses the saved op", async () => {
+		const { db, eventIds, opRef, sessionPort, propagator, prompts, advance } = await heldSkipMonitor("unknown", 2);
+		advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+		await propagator.reconcile();
+		for (const id of eventIds) expect(stage(db, id)).toBe("failed_no_retry");
+		sessionPort.seedOperation(
+			opRef,
+			"s1",
+			"terminal_ok",
+			JSON.stringify(eventIds.map((eventId) => ({ eventId, note: `original ${eventId}` }))),
+		);
+		sessionPort.seedOperation("gw-m-successor", "s1", "terminal_ok", "successor answer");
+		expect(propagator.retry(eventIds[0] as string).done).toBe(true);
+		for (let i = 0; i < 200 && eventIds.some((id) => stage(db, id) !== "authored_no_delivery"); i++) await Bun.sleep(5);
+		for (const id of eventIds) expect(db.monitors.authoredOutput(id)).toBe(`original ${id}`);
+		expect(sessionPort.sendAttempts).toHaveLength(0);
+		expect(prompts()).toBe(0);
+	});
+
+	test("the terminal-history sweep removes a given-up event's pointer with it", async () => {
+		const { db, eventId, propagator, advance } = await heldSkipMonitor("unknown");
+		advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+		await propagator.reconcile();
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeDefined();
+		db.transaction((tx) =>
+			db.monitors.sweep(tx, { historyCutoff: new Date(Date.now() + 365 * 86_400_000).toISOString(), batch: 100 }),
+		);
+		expect(db.monitors.eventGet(eventId)).toBeUndefined();
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeUndefined();
 	});
 });
 

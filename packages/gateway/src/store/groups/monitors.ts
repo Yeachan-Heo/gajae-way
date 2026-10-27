@@ -701,6 +701,22 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return { retried: true, previousStage: row.stage };
 	}
 
+	/**
+	 * Reopen a given-up event for late-result recovery: back to `failed` with its
+	 * exhausted reclaim budget kept, so reconcile can only resume the saved turn,
+	 * never send a fresh prompt.
+	 */
+	eventReopenGivenUp(tx: WriteTx, eventId: string, now = Date.now()): boolean {
+		const nowIso = new Date(now).toISOString();
+		return (
+			this.#db
+				.prepare(
+					"UPDATE monitor_events SET stage = 'failed', updated_at = ? WHERE event_id = ? AND stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id) AND NOT EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?)",
+				)
+				.run(tx, nowIso, eventId, nowIso).changes > 0
+		);
+	}
+
 	eventsFailExpiredDelivery(
 		tx: WriteTx,
 		turnId: string,
@@ -788,6 +804,18 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`SELECT * FROM monitor_events WHERE batch_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
 			)
 			.all(batchId) as MonitorEventDbRow[];
+	}
+
+	/** Terminal events whose latest failure is `code` and whose saved authoring-turn pointer is still kept. */
+	eventsGivenUp(code: string): MonitorEventDbRow[] {
+		return this.#db
+			.prepare(
+				`SELECT * FROM monitor_events WHERE stage = 'failed_no_retry' AND ${REPLAYABLE_MONITOR}
+				AND (SELECT f.code FROM monitor_failures f WHERE f.event_id = monitor_events.event_id ORDER BY f.rowid DESC LIMIT 1) = ?
+				AND EXISTS (SELECT 1 FROM meta m WHERE m.key = 'monitor_authoring_turn:' || monitor_events.event_id)
+				ORDER BY fired_at, rowid`,
+			)
+			.all(code) as MonitorEventDbRow[];
 	}
 
 	eventsOpen(): MonitorEventDbRow[] {
@@ -1060,6 +1088,8 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			this.#db.prepare("DELETE FROM monitor_failures WHERE event_id = ?").run(tx, event_id);
 			this.#db.prepare("DELETE FROM dispatch_leases WHERE event_id = ?").run(tx, event_id);
 			this.#db.prepare("DELETE FROM monitor_events WHERE event_id = ?").run(tx, event_id);
+			// A pointer outliving its event can never be recovered or matched again.
+			this.#core.metaDelete(`monitor_authoring_turn:${event_id}`);
 		}
 		const slots = this.#db
 			.prepare(
