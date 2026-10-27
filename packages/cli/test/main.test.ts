@@ -1350,6 +1350,7 @@ describe("work operator commands", () => {
 		"successor_source_changed",
 		"successor_already_authorized",
 		"successor_repository_mismatch",
+		"successor_request_mismatch",
 		"successor_report_owner_mismatch",
 		"successor_requires_missing_execution_end",
 	]) {

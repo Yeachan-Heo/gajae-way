@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -590,6 +590,194 @@ describe("work attempt durable transactions", () => {
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.version).toBe(1);
 		expect(f.database.work.workAttemptGet(successor.runtime.opRef)).toBeUndefined();
 		expect(f.database.work.laneJobJson(successor.runtime.jobId)).toBeUndefined();
+	});
+
+	test("successor prepare fences definitive terminal evidence but permits an unresolved missing receipt", async () => {
+		for (const evidence of [
+			{ status: "terminal_ok", receiptState: "present", reasonCode: "end_turn" },
+			{ status: "failed", receiptState: "present", reasonCode: "sdk_failed" },
+			{ status: "terminal_ok", receiptState: "missing", reasonCode: "terminal_missing_receipt" },
+		] as const) {
+			const f = await fixture();
+			f.database.transaction((tx) => {
+				prepareAttempt(f.database, tx, f.runtime, f.record);
+				updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+					sendPhase: "accepted",
+					sendEvidence: { source: "receipt", observedAt: START },
+					terminal: {
+						kind: "broker",
+						observedAt: END,
+						reasonCode: evidence.reasonCode,
+						status: { status: evidence.status, receiptState: evidence.receiptState, outcome: { reason: "end_turn" } },
+					},
+				});
+			});
+			const successor = successorAttempt(f);
+			const before = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			expect(before).toMatchObject({ sendPhase: "accepted", settledAt: null, decision: "undecided" });
+			expect(before.turnEndObservedAt).toBeUndefined();
+			const prepare = () =>
+				f.database.transaction((tx) => prepareAttempt(f.database, tx, successor.runtime, successor.record));
+			if (evidence.receiptState === "present") {
+				expect(prepare).toThrow(WorkAttemptStateError);
+				expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(before);
+				expect(f.database.work.workAttemptGet(successor.runtime.opRef)).toBeUndefined();
+				expect(f.database.work.laneJobJson(successor.runtime.jobId)).toBeUndefined();
+			} else {
+				prepare();
+				expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
+					terminal: before.terminal,
+					settledAt: null,
+					decision: "undecided",
+					successor: { opRef: successor.runtime.opRef },
+				});
+				expect(f.database.work.workAttemptGet(successor.runtime.opRef)?.parent).toEqual(before.parent);
+			}
+			expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
+			expect(f.database.outbox.rows()).toHaveLength(0);
+		}
+	});
+
+	test("successor request fingerprint is optional, canonical, linked, private and immutable", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => {
+			prepareAttempt(f.database, tx, f.runtime, f.record);
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			});
+		});
+		const successor = successorAttempt(f);
+		const fingerprint = "a1".repeat(32);
+		expect(() => validateWorkRuntime(successor.runtime, f.database.instanceId)).not.toThrow();
+		expect(() =>
+			validateWorkRuntime({ ...successor.runtime, successorRequestFingerprint: fingerprint }, f.database.instanceId),
+		).not.toThrow();
+		for (const value of [null, 42, {}, "", "a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64)]) {
+			expect(() =>
+				validateWorkRuntime(
+					{ ...successor.runtime, successorRequestFingerprint: value } as WorkAttemptRuntime,
+					f.database.instanceId,
+				),
+			).toThrow(WorkAttemptStateError);
+		}
+		expect(() =>
+			validateWorkRuntime({ ...f.runtime, successorRequestFingerprint: fingerprint }, f.database.instanceId),
+		).toThrow(WorkAttemptStateError);
+		const runtime = { ...successor.runtime, successorRequestFingerprint: fingerprint };
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, successor.record));
+		expect(f.database.work.workAttemptGet(runtime.opRef)).toMatchObject({ successorRequestFingerprint: fingerprint });
+		const stored = f.raw.query("SELECT record_json FROM work_attempt_runtime WHERE op_ref = ?").get(runtime.opRef) as {
+			record_json: string;
+		};
+		expect(stored.record_json).not.toContain('"task"');
+		expect(stored.record_json).not.toContain('"model"');
+		for (const replacement of [undefined, "b".repeat(64)]) {
+			expect(() =>
+				f.database.transaction((tx) =>
+					updateAttempt(f.database, tx, runtime.opRef, 0, {
+						successorRequestFingerprint: replacement,
+					} as WorkAttemptPatch),
+				),
+			).toThrow(WorkAttemptStateError);
+		}
+		expect(f.database.work.workAttemptGet(runtime.opRef)).toEqual(runtime);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.settledAt).toBeNull();
+	});
+
+	test("linked lane lookup is bounded and projects the newest forward link without rewriting old links", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => {
+			prepareAttempt(f.database, tx, f.runtime, f.record);
+			updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: START },
+			});
+		});
+		const first = successorAttempt(f);
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, first.runtime, first.record));
+		const reportAdmission = (runtime: WorkAttemptRuntime): WorkAttemptAdmission => {
+			const payload = buildDeliveryPayload(runtime.opRef, LOOPBACK_ORIGIN, "completed", runtime.deliveryId)!;
+			return {
+				kind: "persona",
+				row: {
+					messageId: runtime.reportId,
+					originKey: originKey(LOOPBACK_ORIGIN),
+					originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+					body: payload.text,
+					receivedAt: END,
+				},
+				fallbackPayload: payload,
+			};
+		};
+		const firstClosed = closeAttempt({
+			record: first.record,
+			opRef: first.runtime.opRef,
+			endState: "completed",
+			endedAt: END,
+		});
+		f.database.transaction((tx) =>
+			settleAttempt(f.database, tx, first.runtime.opRef, 0, firstClosed, f.settlement, reportAdmission(first.runtime)),
+		);
+		const nextOpRef = "gw-work-successor-continuation";
+		const nextRecord = appendAttempt(firstClosed, { opRef: nextOpRef, sessionId: PARENT_SESSION, startedAt: END });
+		const nextSuccessor = {
+			...first.runtime,
+			opRef: nextOpRef,
+			startedAt: END,
+			successorOf: undefined,
+			reportId: workAttemptReportId(f.database.instanceId, first.runtime.jobId, nextOpRef),
+			deliveryId: workAttemptDeliveryId(f.database.instanceId, first.runtime.jobId, nextOpRef),
+		};
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, nextSuccessor, nextRecord));
+		let record = f.record;
+		let current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+		for (let i = 1; i <= 24; i++) {
+			const closed = closeAttempt({ record, opRef: current.opRef, endState: "completed", endedAt: END });
+			f.database.transaction((tx) =>
+				settleAttempt(f.database, tx, current.opRef, current.version, closed, f.settlement, reportAdmission(current)),
+			);
+			const opRef = `gw-work-history-${i}`;
+			record = appendAttempt(closed, { opRef, sessionId: SESSION, startedAt: END });
+			current = {
+				...f.runtime,
+				opRef,
+				startedAt: END,
+				reportId: workAttemptReportId(f.database.instanceId, f.runtime.jobId, opRef),
+				deliveryId: workAttemptDeliveryId(f.database.instanceId, f.runtime.jobId, opRef),
+			};
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, current, record));
+		}
+		const get = spyOn(f.database.work, "workAttemptGet");
+		try {
+			expect(f.database.work.workAttemptLinkedByLane(f.runtime.laneKey, "successor")?.opRef).toBe(f.runtime.opRef);
+			expect(get.mock.calls.length).toBeLessThanOrEqual(1);
+			get.mockClear();
+			expect(f.database.work.workAttemptLinkedByLane(first.runtime.laneKey, "successorOf")?.opRef).toBe(
+				first.runtime.opRef,
+			);
+			expect(get.mock.calls.length).toBeLessThanOrEqual(1);
+			get.mockClear();
+			expect(f.database.work.workAttemptLinkedByLane(f.runtime.laneKey, "successorOf")).toBeUndefined();
+			expect(get.mock.calls.length).toBeLessThanOrEqual(1);
+		} finally {
+			get.mockRestore();
+		}
+		f.database.transaction((tx) =>
+			updateAttempt(f.database, tx, current.opRef, 0, {
+				sendPhase: "accepted",
+				sendEvidence: { source: "receipt", observedAt: END },
+			}),
+		);
+		const second = successorAttempt({ ...f, runtime: current }, "duplicate");
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, second.runtime, second.record));
+		expect(f.database.work.workAttemptLinkedByLane(f.runtime.laneKey, "successor")?.opRef).toBe(current.opRef);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.successor?.opRef).toBe(first.runtime.opRef);
+		expect(f.database.work.workAttemptGet(current.opRef)?.successor?.opRef).toBe(second.runtime.opRef);
+		f.raw.query("UPDATE work_attempt_runtime SET version = 99 WHERE op_ref = ?").run(current.opRef);
+		expect(() => f.database.work.workAttemptLinkedByLane(f.runtime.laneKey, "successor")).toThrow(
+			WorkAttemptStateError,
+		);
 	});
 
 	for (const mode of ["start", "run"] as const) {

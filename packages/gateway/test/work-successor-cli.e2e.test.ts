@@ -173,6 +173,14 @@ test("PR701 SDK rootless child report remains inspectable for accepted open held
 	expect(settled.runtimes.find((r) => r.opRef === child.opRef)?.decision).toBe("reported");
 	expect(settled.laneReports).toHaveLength(1);
 	expect(settled.laneReports[0]).toMatchObject({ parent_name: "rootless-parent", child_op_ref: child.opRef });
+	const delivered = await eventually(
+		() => f.snapshot().laneReports[0],
+		(row) => row?.state === "consumed",
+		"actual parent steer accepted",
+	);
+	expect(delivered.body).toContain("durable private child result");
+	expect(delivered.root_json).toBeNull();
+	expect(f.calls("steerAccepted")).toHaveLength(1);
 	expect(settled.deliveries).toHaveLength(0);
 	await client.close();
 	await f.kill();
@@ -188,5 +196,75 @@ test("PR701 SDK rootless child report remains inspectable for accepted open held
 		settledAt: null,
 	});
 	expect(f.calls("send").filter((c) => c.input.codingRegister === true)).toHaveLength(2);
+	expect(f.snapshot().deliveries).toHaveLength(0);
+}, 60_000);
+
+test("PR701 SDK undelivered rootless report survives SIGKILL with content and no fallback", async () => {
+	const f = await fixture({ allowNested: true, rootless: true });
+	const client = await sdk(f);
+	const parent = await client.request<any>("work.start", {
+		name: "pending-parent",
+		cwd: f.home,
+		text: "original parent",
+	});
+	const child = await client.request<any>("work.start", {
+		name: "pending-child",
+		cwd: f.home,
+		callerSessionId: parent.sessionId,
+		text: "child task",
+	});
+	await f.control(parent.opRef, { missingReceipt: true, live: "live", refuseSteer: true });
+	await eventually(
+		() => f.snapshot(),
+		(s) => s.jobs.some((j) => j.jobId === parent.jobId && j.state === "awaiting_operator"),
+		"parent held before child completes",
+	);
+	await f.control(child.opRef, { terminal: true, text: "private undelivered child body" });
+	const pending = await eventually(
+		() => f.snapshot(),
+		(s) => s.laneReports[0]?.state === "pending" && f.calls("steer").length > 0,
+		"refused report retained pending",
+	);
+	const row = pending.laneReports[0]!;
+	expect(row.body).toContain("private undelivered child body");
+	expect(row.root_json).toBeNull();
+	expect(pending.deliveries).toHaveLength(0);
+	expect(f.calls("steerAccepted")).toHaveLength(0);
+	await client.close();
+	await f.kill();
+	const steerCount = f.calls("steer").length;
+	await f.control(parent.opRef, { statusUnavailable: true, live: "indeterminate" });
+	await f.start();
+	const recovered = await eventually(
+		() => f.snapshot(),
+		(s) => s.laneReports[0]?.state === "pending" && f.calls("steer").length > steerCount,
+		"undelivered report preserved and retry refused after restart",
+	);
+	expect(recovered.laneReports[0]).toMatchObject({
+		report_id: row.report_id,
+		body: row.body,
+		root_json: null,
+		state: "pending",
+		parent_name: "pending-parent",
+		child_op_ref: child.opRef,
+	});
+	expect(recovered.runtimes.find((r) => r.opRef === parent.opRef)).toMatchObject({
+		terminal: null,
+		settledAt: null,
+	});
+	expect(recovered.jobs.find((j) => j.jobId === parent.jobId)?.attempts).toHaveLength(1);
+	expect(recovered.deliveries).toHaveLength(0);
+	expect(f.calls("steerAccepted")).toHaveLength(0);
+	expect(f.calls("send").filter((c) => c.input.codingRegister === true)).toHaveLength(2);
+	await f.control(parent.opRef, { refuseSteer: false });
+	await f.kill();
+	await f.start();
+	await eventually(
+		() => f.snapshot().laneReports[0],
+		(report) => report?.state === "consumed",
+		"same durable report accepted by recovery after refusal clears",
+	);
+	expect(f.calls("steerAccepted")).toHaveLength(1);
+	expect(f.calls("steerAccepted")[0]?.input.text).toContain(row.body);
 	expect(f.snapshot().deliveries).toHaveLength(0);
 }, 60_000);

@@ -150,6 +150,8 @@ export interface WorkAttemptRuntime {
 		readonly baseSha: string;
 		readonly authorizedAt: string;
 	};
+	/** Privacy-safe identity of the original successor request; immutable with its link. */
+	readonly successorRequestFingerprint?: string;
 	readonly successor?: { readonly name: string; readonly opRef: string; readonly sessionId: string };
 	readonly sendPhase: "prepared" | "accepted" | "uncertain";
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
@@ -362,6 +364,12 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 		workAssert(value.mode === "start");
 		workAssert(typeof value.successorOf.baseSha === "string" && /^[0-9a-f]{40}$/.test(value.successorOf.baseSha));
 		workAssert(workTime(value.successorOf.authorizedAt));
+	}
+	if (value.successorRequestFingerprint !== undefined) {
+		workAssert(value.successorOf !== undefined);
+		workAssert(
+			typeof value.successorRequestFingerprint === "string" && /^[0-9a-f]{64}$/.test(value.successorRequestFingerprint),
+		);
 	}
 	workAssert(["prepared", "accepted", "uncertain"].includes(value.sendPhase));
 	workAssert(Number.isSafeInteger(value.version) && value.version >= 0);
@@ -678,6 +686,37 @@ export class WorkGroup {
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
 	}
 
+	/** Traverse history once via primary-key lookups, then strictly validate only the selected link. */
+	workAttemptLinkedByLane(laneKey: string, direction: "successorOf" | "successor"): WorkAttemptRuntime | undefined {
+		workAssert(direction === "successorOf" || direction === "successor");
+		const json = this.laneJobJsonByLaneKey(laneKey);
+		if (json === undefined) return undefined;
+		let record: LaneJobRecord;
+		try {
+			record = parseLaneJobRecord(json);
+		} catch {
+			throw new WorkAttemptStateError(undefined, "lane history parsing");
+		}
+		const order = direction === "successorOf" ? "ASC" : "DESC";
+		let row: { op_ref: string } | null;
+		try {
+			row = this.#db
+				.prepare(
+					`SELECT runtime.op_ref FROM json_each(?) AS history CROSS JOIN work_attempt_runtime AS runtime ON runtime.op_ref = json_extract(history.value, '$.opRef') WHERE json_type(runtime.record_json, ?) IS NOT NULL ORDER BY CAST(history.key AS INTEGER) ${order} LIMIT 1`,
+				)
+				.get(JSON.stringify(record.attempts), `$.${direction}`) as { op_ref: string } | null;
+		} catch {
+			throw new WorkAttemptStateError(undefined, "linked runtime record parsing");
+		}
+		if (!row) return undefined;
+		const runtime = this.workAttemptGet(row.op_ref);
+		workAssert(
+			runtime && runtime.laneKey === laneKey && runtime.jobId === record.jobId,
+			"linked runtime matches lane history",
+		);
+		return runtime;
+	}
+
 	workAttemptJobId(opRef: string): string | undefined {
 		return (
 			this.#db.prepare("SELECT job_id FROM work_attempt_runtime WHERE op_ref = ?").get(opRef) as {
@@ -734,6 +773,7 @@ export class WorkGroup {
 			workAssert(
 				source.settledAt === null &&
 					source.turnEndObservedAt === undefined &&
+					(source.terminal === null || source.terminal.reasonCode === "terminal_missing_receipt") &&
 					source.successor === undefined &&
 					workAccepted(source),
 				"successor predecessor is accepted and execution remains open",

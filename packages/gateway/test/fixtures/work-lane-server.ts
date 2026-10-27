@@ -179,7 +179,9 @@ class PersistentPort extends ScriptedSessionPort {
 		this.record("steer", input);
 		const refused = Object.values(this.controls()).some((control) => control.refuseSteer);
 		if (refused) throw steerRefused();
-		return super.steer(input);
+		const receipt = await super.steer(input);
+		this.record("steerAccepted", input);
+		return receipt;
 	}
 	override async attachTail(input: TailAttachInput) {
 		this.record("attach", { sessionId: input.sessionId, brokerGeneration: input.brokerGeneration });
@@ -573,6 +575,8 @@ export class WorkFixture {
 							report_id: string;
 							parent_name: string;
 							child_op_ref: string;
+							body: string;
+							root_json: string | null;
 							state: string;
 							claim_ref: string | null;
 							consumed_op_ref: string | null;
@@ -580,7 +584,7 @@ export class WorkFixture {
 						},
 						[]
 					>(
-						"SELECT report_id, parent_name, child_op_ref, state, claim_ref, consumed_op_ref, hold_reason FROM lane_reports ORDER BY created_at",
+						"SELECT report_id, parent_name, child_op_ref, body, root_json, state, claim_ref, consumed_op_ref, hold_reason FROM lane_reports ORDER BY created_at",
 					)
 					.all(),
 			};

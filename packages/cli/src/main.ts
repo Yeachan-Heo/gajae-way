@@ -78,6 +78,7 @@ function successorRefusalMessage(error: unknown): string | undefined {
 			case "successor_source_changed":
 			case "successor_already_authorized":
 			case "successor_repository_mismatch":
+			case "successor_request_mismatch":
 			case "successor_report_owner_mismatch":
 			case "successor_requires_missing_execution_end":
 				return `${error.message}: ${reason}`;

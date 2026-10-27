@@ -37,6 +37,7 @@ async function fixture(
 		callerOriginKey?: string;
 		noOwner?: boolean;
 		checkStatusClient?: CheckStatusClient;
+		allowNested?: boolean;
 	} = {},
 ) {
 	const dir = await realpath(await mkdtemp(join(tmpdir(), "gw-isolated-successor-")));
@@ -104,6 +105,7 @@ async function fixture(
 			pollMs: 5,
 			brokerWait: { deadlineMs: 0 },
 			checkStatusClient: options.checkStatusClient,
+			allowNested: () => options.allowNested === true,
 			ownerTarget: () => ownerTarget,
 			deliverFallback: (payload) => notices.push(payload.text),
 		});
@@ -174,6 +176,7 @@ async function fixture(
 		db,
 		dir,
 		port,
+		liveStatus: status,
 		home,
 		repo,
 		base,
@@ -436,6 +439,63 @@ test("a no-longer-missing source cannot authorize a fresh successor", async () =
 	expect(f.port.sends).toHaveLength(1);
 });
 
+test("new definitive terminal evidence fences a stale missing-status successor query", async () => {
+	const f = await fixture();
+	const missingStatus = f.port.status.bind(f.port);
+	const output = f.port.fetchWorkerOutput.bind(f.port);
+	let queryHeld = false;
+	let outputHeld = false;
+	let releaseQuery!: () => void;
+	let releaseOutput!: () => void;
+	const queryBarrier = new Promise<void>((resolve) => {
+		releaseQuery = resolve;
+	});
+	const outputBarrier = new Promise<void>((resolve) => {
+		releaseOutput = resolve;
+	});
+	f.port.status = async (input) => {
+		if (input.opRef !== f.first.opRef) return missingStatus(input);
+		if (!input.relay && !queryHeld) {
+			const stale = await missingStatus(input);
+			queryHeld = true;
+			await queryBarrier;
+			return stale;
+		}
+		if (queryHeld)
+			return {
+				operationRef: input.opRef,
+				status: { status: "terminal_ok", clientRef: input.opRef, receiptState: "present" },
+				summaryCompleted: true,
+			};
+		return missingStatus(input);
+	};
+	f.port.fetchWorkerOutput = async (input) => {
+		if (input.opRef === f.first.opRef) {
+			outputHeld = true;
+			await outputBarrier;
+		}
+		return output(input);
+	};
+	const request = f.manager.start(f.request());
+	try {
+		await until(() => queryHeld);
+		await until(() => outputHeld);
+		const staged = f.db.work.workAttemptGet(f.first.opRef)!;
+		expect(staged.terminal).not.toBeNull();
+		expect(staged.settledAt).toBeNull();
+		expect(staged.turnEndObservedAt).toBeUndefined();
+		releaseQuery();
+		await expect(request).rejects.toMatchObject({ detail: { reasonCode: "successor_source_changed" } });
+		expect(f.db.work.workAttemptGet(f.first.opRef)?.successor).toBeUndefined();
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.port.binds).toHaveLength(1);
+	} finally {
+		releaseQuery();
+		releaseOutput();
+		await request.catch(() => undefined);
+	}
+});
+
 test("later operator messages authorize and retry recovery while retaining the original captured report target", async () => {
 	const f = await fixture(8, "M1");
 	expect(f.runtime.parent).toMatchObject({ kind: "persona", triggerMessageId: "M1" });
@@ -535,6 +595,86 @@ test("response-only caller session owns successor authorization independently of
 	expect(f.port.sends).toHaveLength(2);
 	expect(f.notices).toEqual([]);
 });
+
+test("response-only successor replacement preserves its original owner and null route", async () => {
+	const checks: CheckStatusClient = {
+		async getCheckStatus(headSha) {
+			return { prNumber: 701, headSha, status: "pending", failingChecks: [] };
+		},
+	};
+	const f = await fixture(8, undefined, {
+		runPredecessor: true,
+		callerOriginKey: "discord/channel/caller-owner",
+		checkStatusClient: checks,
+	});
+	const other = crypto.randomUUID();
+	f.db.transaction((tx) => f.db.bindings.bind(tx, "discord/channel/other-caller", other));
+	const successor = await f.manager.start({ ...f.request(), callerSessionId: f.callerSessionId });
+	if (!successor.started) throw new Error("successor held");
+	const initial = f.db.work.workAttemptGet(successor.opRef)!;
+	git(initial.cwd, "push", "-u", "origin", git(initial.cwd, "branch", "--show-current"));
+	f.port.complete(successor.opRef, "first response-only answer");
+	await until(() => f.job("authorized-successor").state === "awaiting_checks");
+	f.port.setSessionState(successor.sessionId, { live: false });
+	expect(await f.lanes.forceRetire("authorized-successor")).toMatchObject({ retired: true });
+	const followup = { name: "authorized-successor", text: "continue privately", resume: true };
+	await expect(f.manager.start({ ...followup, callerSessionId: other })).rejects.toMatchObject({
+		detail: { reasonCode: "successor_report_owner_mismatch" },
+	});
+	const replacement = await f.manager.start({ ...followup, callerSessionId: f.callerSessionId });
+	if (!replacement.started) throw new Error("replacement held");
+	expect(f.db.work.workAttemptGet(replacement.opRef)).toMatchObject({
+		parent: null,
+		authorizationOwner: initial.authorizationOwner,
+	});
+	f.port.complete(replacement.opRef, "private replacement answer");
+	await until(() => f.db.work.workAttemptGet(replacement.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(replacement.opRef)?.decision).toBe("no_target");
+	expect(f.db.outbox.rows()).toHaveLength(0);
+	expect(f.db.inbox.pendingCount("discord/channel/caller-owner")).toBe(0);
+	expect(f.db.inbox.pendingCount("discord/channel/recovery-owner")).toBe(0);
+	expect(f.notices).toEqual([]);
+	expect(f.db.work.workAttemptGet(f.first.opRef)).toMatchObject({
+		successor: { opRef: successor.opRef },
+		settledAt: null,
+	});
+	expect(f.db.work.workAttemptGet(successor.opRef)?.successorOf).toEqual(initial.successorOf);
+	expect(f.port.sends).toHaveLength(3);
+});
+
+for (const changedField of ["text", "model", "omitted model"] as const) {
+	test(`successor exact retries survive restart but changed ${changedField} is refused without replay`, async () => {
+		const f = await fixture();
+		const request = { ...f.request(), model: { preset: "review-model" } };
+		const successor = await f.manager.start(request);
+		if (!successor.started) throw new Error("successor held");
+		const runtime = f.db.work.workAttemptGet(successor.opRef)!;
+		const changed =
+			changedField === "text"
+				? { ...request, text: `${request.text} changed` }
+				: changedField === "model"
+					? { ...request, model: { preset: "other-model" } }
+					: { ...request, model: undefined };
+		for (const restart of [false, true]) {
+			if (restart) await f.restart();
+			await expect(f.manager.start(request)).resolves.toMatchObject({ alreadyStarted: true, opRef: successor.opRef });
+			await expect(f.manager.start(changed)).rejects.toMatchObject({
+				code: "invalid_params",
+				message: "isolated successor refused",
+				detail: { reasonCode: "successor_request_mismatch" },
+			});
+		}
+		expect((runtime as typeof runtime & { successorRequestFingerprint?: string }).successorRequestFingerprint).toMatch(
+			/^[0-9a-f]{64}$/,
+		);
+		expect(f.port.sends).toHaveLength(2);
+		expect(f.db.work.workAttemptGet(f.first.opRef)).toMatchObject({
+			successor: { opRef: successor.opRef },
+			settledAt: null,
+		});
+		expect(f.db.work.workAttemptGet(successor.opRef)?.successorOf).toEqual(runtime.successorOf);
+	});
+}
 
 test("response-only work with no captured owner cannot infer authorization from a later target", async () => {
 	const f = await fixture(8, undefined, { runPredecessor: true, noOwner: true });
@@ -782,6 +922,135 @@ for (const restart of [false, true]) {
 	});
 }
 
+test("source forward link survives definitive completion, check repair, restart and unavailable status", async () => {
+	let red = false;
+	const checks: CheckStatusClient = {
+		async getCheckStatus(headSha) {
+			return { prNumber: 701, headSha, status: red ? "red" : "pending", failingChecks: red ? ["unit"] : [] };
+		},
+	};
+	const f = await fixture(8, undefined, { checkStatusClient: checks });
+	const successor = await f.manager.start(f.request());
+	if (!successor.started) throw new Error("successor held");
+	const link = f.db.work.workAttemptGet(f.first.opRef)!.successor;
+	git(f.runtime.cwd, "push", "-u", "origin", git(f.runtime.cwd, "branch", "--show-current"));
+	f.port.status = f.liveStatus;
+	f.port.complete(f.first.opRef, "source actually finished");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(await f.manager.status({ name: "predecessor" })).toMatchObject({ successor: link });
+	red = true;
+	for (let i = 0; i < 200 && f.port.sends.length < 3; i++) {
+		await f.manager.recover();
+		await Bun.sleep(5);
+	}
+	expect(f.port.sends).toHaveLength(3);
+	const continuation = f.port.sends[2]!;
+	expect(continuation.text).toContain("checks failed");
+	expect(f.db.work.workAttemptGet(continuation.opRef)?.successor).toBeUndefined();
+	const live = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		if (input.opRef === continuation.opRef) throw new Error("status unavailable");
+		return live(input);
+	};
+	for (const restart of [false, true]) {
+		if (restart) await f.restart();
+		expect(await f.manager.status({ name: "predecessor" })).toMatchObject({
+			op: null,
+			opUnavailable: true,
+			attempt: { opRef: continuation.opRef },
+			successor: link,
+		});
+	}
+	expect(f.db.work.workAttemptGet(f.first.opRef)?.successor).toEqual(link);
+	expect(f.db.work.workAttemptGet(successor.opRef)?.successorOf?.opRef).toBe(f.first.opRef);
+	expect(f.db.work.workAttemptGet(continuation.opRef)?.settledAt).toBeNull();
+	expect(f.port.sends).toHaveLength(3);
+});
+
+test("check repair derives a missing legacy authorization owner from its report parent", async () => {
+	const { f, successor, initial, setRed } = await successorAwaitingChecks();
+	setStoredAuthorizationOwner(f.dir, successor.opRef, "missing");
+	setRed();
+	for (let i = 0; i < 200 && f.port.sends.length < 3; i++) {
+		await f.manager.recover();
+		await Bun.sleep(5);
+	}
+	expect(f.port.sends).toHaveLength(3);
+	const repair = f.db.work.workAttemptGet(f.port.sends[2]!.opRef)!;
+	expect(repair.parent).toEqual(initial.parent);
+	expect(repair.authorizationOwner).toEqual(initial.authorizationOwner);
+	expect(repair.authorizationOwner).not.toBeNull();
+	expect(repair.settledAt).toBeNull();
+	expect(f.db.work.workAttemptGet(f.first.opRef)?.settledAt).toBeNull();
+});
+
+test("child report wake derives a missing legacy authorization owner from its report parent", async () => {
+	const f = await fixture(8, undefined, { allowNested: true });
+	const parent = await f.manager.start({ name: "wake-parent", text: "parent task", cwd: f.dir });
+	if (!parent.started) throw new Error("parent held");
+	const initial = f.db.work.workAttemptGet(parent.opRef)!;
+	f.port.complete(parent.opRef, "parent first answer");
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt != null);
+	setStoredAuthorizationOwner(f.dir, parent.opRef, "missing");
+	const child = await f.manager.start({
+		name: "wake-child",
+		text: "child task",
+		cwd: f.dir,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child held");
+	f.port.complete(child.opRef, "child report");
+	await until(() => f.db.work.laneReportsByParent("wake-parent")[0]?.state === "consumed");
+	const report = f.db.work.laneReportsByParent("wake-parent")[0]!;
+	const wake = f.db.work.workAttemptGet(report.consumed_op_ref!)!;
+	expect(report.claim_kind).toBe("wake");
+	expect(wake.parent).toEqual(initial.parent);
+	expect(wake.authorizationOwner).toEqual(initial.authorizationOwner);
+	expect(wake.authorizationOwner).not.toBeNull();
+	expect(wake.settledAt).toBeNull();
+	expect(f.db.work.workAttemptGet(f.first.opRef)?.settledAt).toBeNull();
+});
+
+test("ordinary long histories use bounded provenance reads for status and continuation", async () => {
+	const f = await fixture();
+	const history = new Set<string>();
+	for (let i = 0; i < 24; i++) {
+		const attempt = await f.manager.start({
+			name: "ordinary-history",
+			text: `ordinary task ${i}`,
+			cwd: f.dir,
+			resume: true,
+		});
+		if (!attempt.started) throw new Error(`ordinary attempt ${i} held`);
+		history.add(attempt.opRef);
+		f.port.complete(attempt.opRef, `ordinary result ${i}`);
+		await until(() => f.db.work.workAttemptGet(attempt.opRef)?.settledAt != null);
+	}
+	expect(f.job("ordinary-history").attempts).toHaveLength(24);
+	const get = f.db.work.workAttemptGet.bind(f.db.work);
+	let historyReads = 0;
+	f.db.work.workAttemptGet = (opRef) => {
+		if (history.has(opRef)) historyReads++;
+		return get(opRef);
+	};
+	try {
+		const status = await f.manager.status({ name: "ordinary-history" });
+		expect(status.successorOf).toBeUndefined();
+		expect(status.successor).toBeUndefined();
+		expect(historyReads).toBeLessThan(12);
+		historyReads = 0;
+		const next = await f.manager.start({ name: "ordinary-history", text: "one more", resume: true });
+		if (!next.started) throw new Error("ordinary continuation held");
+		expect(historyReads).toBeLessThan(12);
+		f.port.complete(next.opRef, "one more result");
+		await until(() => get(next.opRef)?.settledAt != null);
+	} finally {
+		f.db.work.workAttemptGet = get;
+	}
+	expect(f.db.work.workAttemptGet(f.first.opRef)?.settledAt).toBeNull();
+	expect(f.port.sends).toHaveLength(26);
+});
+
 test("replacement session receives the original successor warning without relinking", async () => {
 	const { f, successor, initial } = await successorAwaitingChecks();
 	f.port.setSessionState(successor.sessionId, { live: false });
@@ -800,4 +1069,41 @@ test("replacement session receives the original successor warning without relink
 	expect(f.db.work.workAttemptGet(f.first.opRef)?.successor?.opRef).toBe(successor.opRef);
 	expect(await f.manager.status({ name: "authorized-successor" })).toMatchObject({ successorOf: initial.successorOf });
 	expect(f.port.sends).toHaveLength(3);
+});
+
+test("response-only replacement session receives successor safety warning without parent-report routing", async () => {
+	const { f, successor, initial } = await successorAwaitingChecks();
+	f.port.setSessionState(successor.sessionId, { live: false });
+	expect(await f.lanes.forceRetire("authorized-successor")).toMatchObject({ retired: true });
+	const noticesBefore = [...f.notices];
+	const abort = new AbortController();
+	const run = f.manager.run(
+		{ name: "authorized-successor", text: "response-only follow-up", resume: true },
+		{},
+		abort.signal,
+	);
+	try {
+		await until(() => f.port.sends.length === 3);
+		const replacement = f.port.sends[2]!;
+		expect(replacement.sessionId).not.toBe(successor.sessionId);
+		expect(replacement.systemPreamble).toContain(f.first.opRef);
+		expect(replacement.systemPreamble).toContain("execution end is UNPROVEN");
+		expect(replacement.systemPreamble).not.toContain("Your final answer goes to your parent");
+		expect(f.db.work.workAttemptGet(replacement.opRef)).toMatchObject({ mode: "run", parent: null });
+		expect(f.db.work.workAttemptGet(replacement.opRef)?.successorOf).toBeUndefined();
+		expect(f.db.work.workAttemptGet(successor.opRef)?.successorOf).toEqual(initial.successorOf);
+		expect(f.db.work.workAttemptGet(f.first.opRef)).toMatchObject({
+			successor: { opRef: successor.opRef },
+			settledAt: null,
+			terminal: null,
+		});
+		f.port.complete(replacement.opRef, "response-only replacement answer");
+		expect(await run).toMatchObject({ text: "response-only replacement answer" });
+		expect(f.notices).toEqual(noticesBefore);
+		expect(f.port.sends).toHaveLength(3);
+		expect(f.port.resumes).toHaveLength(0);
+	} finally {
+		abort.abort();
+		await run.catch(() => undefined);
+	}
 });

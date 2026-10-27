@@ -713,7 +713,7 @@ export type WorkStartResult =
 			readonly opRef: string;
 			readonly sessionKey: string;
 			readonly sessionId: string;
-			/** Idempotent successor retry: the original accepted operation, never a new send. */
+			/** Exact task/model successor retry: the original accepted operation, never a new send. */
 			readonly alreadyStarted?: true;
 	  }
 	| {
