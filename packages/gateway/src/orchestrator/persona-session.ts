@@ -1936,6 +1936,58 @@ class OriginActor {
 	 * is armed, new admissions wait for it instead of hammering the broker. The
 	 * row stays pending throughout and is never expired.
 	 */
+	/**
+	 * A bound trigger failed after `bindTurn` but before `port.send` journaled a
+	 * `turn.prompt` intent, so no prompt can have landed. Leaving it bound would
+	 * fence the origin forever (recovery only proves state for issued prompts), so
+	 * it always returns to pending. Positive proof that the session is gone
+	 * rotates the epoch and rebinds inline; any other failure (a transient
+	 * broker_unavailable, a queue timeout) keeps the session and retries with
+	 * backoff, because a generic failure is no authority to replace it.
+	 */
+	async #requeuePreSend(
+		stage: "start_turn" | "attach" | "prepare_context",
+		sessionId: string,
+		epoch: number,
+		opRef: string,
+		error: unknown,
+	): Promise<void> {
+		const sessionGone = await this.#sessionProvablyGone(sessionId, error);
+		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => ({
+			attempt: retryInboundTurn(this.#manager.database, tx, opRef),
+			nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
+		}));
+		if (sessionGone) {
+			this.#bindFailures += 1;
+			const attempts = this.#bindFailures;
+			this.#manager.log(
+				`send_session_disowned action=inline_rebind stage=${stage} origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			await this.#terminateRetiredSession(sessionId, "session_gone");
+			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
+			else {
+				this.#scheduleDispatchRetry(
+					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
+				);
+				this.#manager.releaseHostAdmission(this);
+			}
+			return;
+		}
+		this.#manager.releaseHostAdmission(this);
+		this.#preSendFailures += 1;
+		const failures = this.#preSendFailures;
+		// The attach caller already degraded session-create readiness.
+		if (stage !== "attach") this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+		this.#manager.log(
+			`send_pre_send_requeue stage=${stage} origin=${this.originKey} epoch=${epoch} opRef=${opRef} session=${sessionId} attempt=${attempt} failures=${failures} detail=${safeDiagnostic(error)}`,
+			"warn",
+		);
+		this.#scheduleDispatchRetry(
+			Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(failures - 1, 10)),
+		);
+	}
+
 	async #dispatchNext(): Promise<void> {
 		if (
 			this.#manager.draining ||
@@ -2039,47 +2091,21 @@ class OriginActor {
 				trigger: bound,
 			});
 		} catch (error) {
-			this.#manager.releaseHostAdmission(this);
-			throw error;
+			await this.#requeuePreSend("start_turn", binding.sessionId, epoch, opRef, error);
+			return;
 		}
 		let tail: TailHandle;
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
 		} catch (error) {
-			// No prompt was sent, so this lifecycle can never reach a terminal: the
-			// trigger is re-dispatched under a new one (below, or by recovery).
 			await this.#releaseLifecycle(lifecycle, {
 				originKey: this.originKey,
 				epoch,
 				sessionId: binding.sessionId,
 				turn,
 			});
-			// No send was attempted. A broker disown code or positive liveness
-			// proof can therefore release this row without replaying accepted work.
-			// A generic failure alone is not authority to replace the session.
 			this.#manager.recordSessionCreateFailure(this.originKey, "session_attach_failed", safeDiagnostic(error));
-			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) {
-				this.#manager.releaseHostAdmission(this);
-				throw error;
-			}
-			const nextEpoch = this.#manager.database.transaction((tx) => {
-				retryInboundTurn(this.#manager.database, tx, opRef);
-				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-			});
-			this.#bindFailures += 1;
-			const attempts = this.#bindFailures;
-			this.#manager.log(
-				`send_session_disowned action=inline_rebind stage=attach origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
-				"warn",
-			);
-			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
-			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
-			else {
-				this.#scheduleDispatchRetry(
-					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
-				);
-				this.#manager.releaseHostAdmission(this);
-			}
+			await this.#requeuePreSend("attach", binding.sessionId, epoch, opRef, error);
 			return;
 		}
 		// Before the turn starts: the stall clock is not running yet and the
@@ -2088,8 +2114,22 @@ class OriginActor {
 		try {
 			context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
 		} catch (error) {
-			this.#manager.releaseHostAdmission(this);
-			throw error;
+			try {
+				await tail.close();
+			} catch (closeError) {
+				this.#manager.log(
+					`send_pre_send_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+					"warn",
+				);
+			}
+			await this.#releaseLifecycle(lifecycle, {
+				originKey: this.originKey,
+				epoch,
+				sessionId: binding.sessionId,
+				turn,
+			});
+			await this.#requeuePreSend("prepare_context", binding.sessionId, epoch, opRef, error);
+			return;
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {

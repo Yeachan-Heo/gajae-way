@@ -1797,7 +1797,15 @@ for (const behavior of ["no_probe", "live", "unknown", "failed_probe", "attach_a
 
 		if (behavior === "attach_authority" || behavior === "probe_authority")
 			expect(failure).toBeInstanceOf(BrokerAuthorityError);
-		else expect(failure).toMatchObject({ message: "host hello did not arrive" });
+		else {
+			// No prompt was sent (#675): the trigger returns to pending for a backoff retry.
+			expect(failure).toBeUndefined();
+			expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
+				message_id: `unproven-retry-${behavior}`,
+				turn_state: null,
+			});
+			expect(logs.some((line) => line.startsWith("send_pre_send_requeue stage=attach"))).toBe(true);
+		}
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
 		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
@@ -4438,7 +4446,9 @@ test("a tail attach that fails before any send releases the lifecycle it created
 	expect(port.failures).toBe(1);
 	expect(port.sends).toEqual([]);
 	expect(released).toEqual([latestOpRef]);
-	expect(database?.inbox.turnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+	// Nothing was sent (#675): the trigger is plain pending again, not stranded bound.
+	expect(database?.inbox.turnRow(latestOpRef)).toBeUndefined();
+	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "hello-lost", turn_state: null });
 });
 
 /**
@@ -4523,33 +4533,29 @@ test("가8: the first message after the host closed itself resumes the same sess
 	expect(terminal).toEqual(["earlier answer", "이어서 답"]);
 });
 
-test("가8: ambiguous bound recovery after a closed host preserves identity rather than resending", async () => {
+test("가8: an attach failure after a closed host requeues the trigger without resending or resuming", async () => {
 	const { port, logs, terminal, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	enqueue("after-idle", "작업다됨?");
 	await manager!.notifyInbound(KEY).catch(() => undefined);
 	expect(port.sends).toHaveLength(1);
 	const opRef = latestOpRef;
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
 
 	await manager!.recover();
 	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(terminal).toEqual(["earlier answer"]);
 	expect(database!.inbox.pendingCount(KEY)).toBe(1);
 });
 
-test("가8: a failed resume cannot authorize replay of an ambiguous bound prompt", async () => {
+test("가8: a failed resume cannot authorize a resend or a resume", async () => {
 	const { port, logs, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	port.failResume(sessionId);
@@ -4562,13 +4568,9 @@ test("가8: a failed resume cannot authorize replay of an ambiguous bound prompt
 	expect(port.resumeCalls).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 });
 
 test("가8: a deleted saved session is never resumed", async () => {
@@ -4583,13 +4585,9 @@ test("가8: a deleted saved session is never resumed", async () => {
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 });
 
 test("가8: a deleted closed binding is not resumed before the send either", async () => {

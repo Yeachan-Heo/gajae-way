@@ -123,6 +123,11 @@ test("the chat notice says nothing was answered and what to do, keeping the reda
 	);
 	expect(leaky).not.toContain(secret);
 });
+async function until(check: () => boolean): Promise<void> {
+	for (let i = 0; i < 200 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+	expect(check()).toBe(true);
+}
+
 test("missing recovery evidence holds a bound turn instead of replaying it", async () => {
 	const db = await openDatabase();
 	const port = new ScriptedSessionPort();
@@ -165,3 +170,76 @@ test("missing recovery evidence holds a bound turn instead of replaying it", asy
 		await manager.stop();
 	}
 });
+
+for (const stage of ["start_turn", "attach"] as const) {
+	test(`a ${stage} failure after bindTurn returns the trigger to pending and a later retry answers it (#675)`, async () => {
+		const db = await openDatabase();
+		let failures = 1;
+		const port = new (class extends ScriptedSessionPort {
+			override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+				if (stage === "attach" && failures > 0) {
+					failures--;
+					throw new Error("broker_unavailable (client stopped or broker unavailable)");
+				}
+				return await super.attachTail(input);
+			}
+		})();
+		const originKey = `loopback/loopback/pre-send-${stage}`;
+		const origin = { platform: "loopback", kind: "loopback", conversationId: `pre-send-${stage}` } as const;
+		const repo = join(home, "workspace");
+		const binding = await port.bind({ originKey, epoch: 0, repo });
+		expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, originKey, binding.sessionId, 0))).toBe(true);
+		expect(
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, {
+					messageId: "m-1",
+					originKey,
+					originRefJson: JSON.stringify(origin),
+					body: "still answer me",
+					receivedAt: new Date().toISOString(),
+				}),
+			),
+		).toBe(true);
+		const timers: Array<{ work: () => void; delay: number }> = [];
+		const logs: string[] = [];
+		const manager = new PersonaSessionManager({
+			database: db,
+			port,
+			instanceId: "bind-test",
+			repo,
+			log: (line: string) => logs.push(line),
+			setTimeout: (work: () => void, delay: number) => {
+				const timer = { work, delay };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: (timer: unknown) => {
+				const i = timers.indexOf(timer as { work: () => void; delay: number });
+				if (i >= 0) timers.splice(i, 1);
+			},
+			onTurnStart: ({ trigger }) => {
+				if (stage === "start_turn" && failures > 0) {
+					failures--;
+					throw new Error("lifecycle setup failed");
+				}
+				return { text: trigger.body };
+			},
+		});
+		try {
+			await manager.recover();
+			expect(port.sendAttempts).toEqual([]);
+			expect(db.inbox.pendingOldest(originKey)?.message_id).toBe("m-1");
+			expect(logs.some((line) => line.includes(`send_pre_send_requeue stage=${stage}`))).toBe(true);
+			// A generic failure never rotates the epoch (no authority to replace the session).
+			expect(db.bindings.getSession(originKey)).toBe(binding.sessionId);
+			const retry = timers.find((timer) => timer.delay > 0);
+			expect(retry).toBeDefined();
+			timers.splice(timers.indexOf(retry!), 1);
+			retry!.work();
+			await until(() => port.sendAttempts.length === 1);
+			expect(port.sendAttempts[0]?.text).toContain("still answer me");
+		} finally {
+			await manager.stop();
+		}
+	});
+}
