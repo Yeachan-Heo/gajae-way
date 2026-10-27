@@ -867,14 +867,19 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			// bound is this migration: no pre-upgrade prompt can have rendered a row
 			// that did not exist yet. Claim every unread row of the origin now, so a
 			// legacy hold never re-renders its inputs and later rows stay unread.
+			// Quarantined rows belong to a retired broker authority: they are never
+			// replayed, and their quarantine trigger aborts any UPDATE, so they keep
+			// their pre-upgrade shape.
 			host.database.execute(`
 				UPDATE inbound_messages SET send_attempted_at = COALESCE(dispatched_at, received_at)
-					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_attempted_at IS NULL;
+					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_attempted_at IS NULL
+					AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id);
 				UPDATE inbound_messages SET send_context_json = (
 						SELECT json_group_array(c.message_id) FROM conversation_context c
 						WHERE c.origin_key = inbound_messages.origin_key AND c.consumed_at IS NULL
 					)
-					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_context_json IS NULL;
+					WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND send_context_json IS NULL
+					AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id);
 			`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")

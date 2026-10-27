@@ -358,6 +358,59 @@ test("upgrading to schema 39 stamps legacy bound/accepted turns so recovery reco
 	}
 });
 
+test("upgrading to schema 39 leaves a quarantined legacy turn untouched instead of failing boot", async () => {
+	const f = await fixture("legacy-quarantined");
+	const db = f.db;
+	const liveOpRef = "gw-p-legacy-live";
+	const quarantinedOpRef = "gw-p-legacy-quarantined";
+	const retiredOrigin = `${f.originKey}-retired`;
+	expect(db.transaction((tx) => db.bindings.bindAtEpoch(tx, retiredOrigin, f.binding.sessionId, 0))).toBe(true);
+	db.transaction((tx) => {
+		db.inbox.enqueue(tx, {
+			messageId: "m-retired",
+			originKey: retiredOrigin,
+			originRefJson: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "legacy-retired" }),
+			body: "accepted under the retired authority",
+			receivedAt: "2026-10-26T06:00:00.000Z",
+		});
+		db.inbox.bindTurn(tx, {
+			messageId: "m-1",
+			originKey: f.originKey,
+			epoch: 0,
+			opRef: liveOpRef,
+			sessionId: f.binding.sessionId,
+		});
+		db.inbox.bindTurn(tx, {
+			messageId: "m-retired",
+			originKey: retiredOrigin,
+			epoch: 0,
+			opRef: quarantinedOpRef,
+			sessionId: f.binding.sessionId,
+			dispatchedAt: "2026-10-26T06:00:05.000Z",
+		});
+		db.inbox.turnAccept(tx, quarantinedOpRef);
+	});
+	const path = join(home, "gateway.db");
+	db.close();
+	database = undefined;
+	// Schema-38 shape with the accepted row quarantined by an earlier authority cutover.
+	const raw = new Database(path);
+	raw.exec(
+		"ALTER TABLE inbound_messages DROP COLUMN send_attempted_at; ALTER TABLE inbound_messages DROP COLUMN send_context_json",
+	);
+	raw.exec("DELETE FROM schema_migrations WHERE version >= 39");
+	raw.exec(
+		"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('inbound', 'm-retired', 'cutover-old')",
+	);
+	raw.close();
+
+	database = await Store.open(path);
+	expect(database.schemaVersion).toBe(39);
+	expect(database.inbox.sendAttemptedAt(liveOpRef)).toBe(database.inbox.turnRow(liveOpRef)!.received_at);
+	expect(database.inbox.sendAttemptedAt(quarantinedOpRef)).toBeUndefined();
+	expect(database.inbox.turnRow(quarantinedOpRef)?.turn_state).toBe("accepted");
+});
+
 for (const outcome of ["refused", "thrown", "terminating"] as const) {
 	test(`a busy-stalled host whose termination is ${outcome} keeps the trigger pending for a later retry, never resending (#687)`, async () => {
 		const f = await fixture(`busy-${outcome}`);
