@@ -937,13 +937,14 @@ export class WorkLaneManager {
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
+			// Persist job AFTER slow steps but BEFORE binding so it's visible during admission.
+			this.#putJob(input.name, job);
 		}
 		const initialJob = job;
 		if (!initialJob) throw new Error("work lane record was not initialized");
 		const worktreePath = initialJob.lane.worktreePath;
 		input = { ...input, cwd: worktreePath };
 		let bindAttemptStarted = false;
-		let worktreePersisted = false;
 		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 		try {
 			// Each try re-takes the admission lock and re-checks capacity, so a
@@ -966,10 +967,7 @@ export class WorkLaneManager {
 					this.#port.runExclusive("work/admission", async () => {
 						this.#live();
 						this.#options.lanes.assertAdmission(input.name);
-						if (createdWorktree && !worktreePersisted) {
-							this.#putJob(input.name, initialJob);
-							worktreePersisted = true;
-						}
+						// Job is already persisted before slow steps, so no need to persist again here.
 						bindAttemptStarted = true;
 						try {
 							return await this.#port.bind({
