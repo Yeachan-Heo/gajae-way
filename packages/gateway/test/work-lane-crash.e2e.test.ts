@@ -389,11 +389,12 @@ for (const point of ["prepared", "accepted-before-save", "report-consume"] as co
 		const child = await start(f, "child", parent.receipt.sessionId);
 		await f.armBarrier(point);
 		await f.control(child.receipt.opRef, { terminal: true, text: "child report" });
-		await f.barrier(point);
+		const barrier = await f.barrier(point);
 		const before = f.snapshot();
 		const childReport = before.laneReports.find((row) => row.parent_name === "parent");
 		if (!childReport?.claim_ref) throw new Error("child lane report claim was not persisted");
 		const wakeOpRef = childReport.claim_ref;
+		if (point === "accepted-before-save") expect(barrier.opRef).toBe(wakeOpRef);
 		expect(childReport.state).toBe("claimed");
 		const beforeWakeCalls = f.calls("send").filter((call) => call.input.opRef === wakeOpRef).length;
 		expect(beforeWakeCalls).toBe(point === "prepared" ? 0 : 1);

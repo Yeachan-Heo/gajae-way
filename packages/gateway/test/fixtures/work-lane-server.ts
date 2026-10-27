@@ -71,7 +71,7 @@ export function writeFixtureJson(
 class PersistentPort extends ScriptedSessionPort {
 	constructor(
 		readonly home: string,
-		readonly hit: (point: Barrier) => void,
+		readonly hit: (point: Barrier, opRef?: string) => void,
 		readonly database: Store,
 		readonly authority: BrokerAuthority,
 	) {
@@ -121,7 +121,9 @@ class PersistentPort extends ScriptedSessionPort {
 		if (existsSync(join(this.home, `${input.opRef}.send.json`))) throw new Error("fixture detected duplicate send");
 		const receipt = await super.send(input);
 		writeFixtureJson(join(this.home, `${input.opRef}.send.json`), { ...input, startedAt: Date.now() });
-		this.hit("accepted-before-save");
+		// Persona report delivery can send concurrently with a worker wake. A
+		// worker crash barrier must never stop that unrelated persona prompt.
+		if (input.codingRegister === true) this.hit("accepted-before-save", input.opRef);
 		return receipt;
 	}
 	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]): Promise<StatusReport> {
@@ -199,10 +201,10 @@ export function readCalls(home: string): Call[] {
 }
 
 async function serve(home: string, barrier?: Barrier) {
-	const hit = (point: Barrier) => {
+	const hit = (point: Barrier, opRef?: string) => {
 		const armed = json<{ readonly point?: Barrier | null }>(join(home, "barrier-arm.json"), {}).point;
 		if (barrier !== point && armed !== point) return;
-		writeFixtureJson(join(home, "barrier-hit.json"), { point, pid: process.pid });
+		writeFixtureJson(join(home, "barrier-hit.json"), { point, pid: process.pid, opRef });
 		if (armed === point) writeFixtureJson(join(home, "barrier-arm.json"), { point: null });
 		// A synchronous fixture-only barrier can stop inside a real SQLite transaction.
 		// The parent SIGKILLs precisely this child; no production fault flag exists.
@@ -494,7 +496,7 @@ export class WorkFixture {
 	}
 	async barrier(point: Barrier) {
 		return eventually(
-			() => json<{ point?: string; pid?: number }>(join(this.home, "barrier-hit.json"), {}),
+			() => json<{ point?: string; pid?: number; opRef?: string }>(join(this.home, "barrier-hit.json"), {}),
 			(value) => value.point === point && value.pid === this.child?.pid,
 			point,
 		);
