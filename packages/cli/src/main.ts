@@ -14,6 +14,7 @@ import type {
 	OpsDeliveriesResult,
 	OpsSloParams,
 	OpsSloResult,
+	WorkDirectiveResult,
 	WorkJobsParams,
 	WorkJobsResult,
 	WorkRetireResult,
@@ -994,7 +995,38 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs|directive add "<text>"|directive list|directive remove <id>';
+				if (command === "directive") {
+					const [action, ...rest] = args;
+					const text = rest.join(" ").trim();
+					if (
+						!(action === "add" && text && !rest.some((arg) => arg.startsWith("--"))) &&
+						!(action === "list" && rest.length === 0) &&
+						!(action === "remove" && rest.length === 1)
+					)
+						throw new Error(usage);
+					const client = await connectGatewaySocket(parsed.socket);
+					try {
+						const callerSessionId = process.env.GJC_SESSION_ID?.trim();
+						const result = await client.request<WorkDirectiveResult>("work.directive", {
+							action,
+							...(action === "add" ? { text } : {}),
+							...(action === "remove" ? { id: rest[0] } : {}),
+							...(callerSessionId ? { callerSessionId } : {}),
+						});
+						for (const lane of result.propagated ?? [])
+							console.log(
+								lane.steered ? `steered: ${lane.name}` : `not steered: ${lane.name} (${lane.reason ?? "unknown"})`,
+							);
+						for (const directive of result.directives)
+							console.log(
+								`${directive.id} scope=${directive.scope} at=${directive.createdAt} ${JSON.stringify(directive.text)}`,
+							);
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();

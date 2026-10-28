@@ -626,7 +626,7 @@ function authoredEvidenceMarkers(text: string): string[] {
 		...text.matchAll(/\b[A-Za-z][\w .-]*\s*[:=]\s*(\d+(?:,\d{3})*(?:\.\d+)?%?)\b/g),
 	].flatMap(([, value]) => (value ? [value] : []));
 	const markers = [
-		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'`]+/gi) ?? []),
+		...(text.match(/(?:https?:\/\/|www\.)[^\s<>()[\]{}"'`]+/gi) ?? []),
 		...(text.match(/#\d+/g) ?? []),
 		...(text.match(/\b[0-9a-f]{7,40}\b/gi) ?? []),
 		...(text.match(/\b(?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]{1,12}\b/g) ?? []),

@@ -769,6 +769,36 @@ export interface WorkStatusResult {
 	};
 }
 
+/**
+ * Standing operator directives (#604): constraints added mid-conversation that
+ * every matching lane must follow. A directive added from a persona session
+ * applies to the lanes that conversation started; one added outside any
+ * conversation (the host operator) applies to every lane.
+ */
+export interface WorkDirectiveParams {
+	readonly action: "add" | "list" | "remove";
+	/** The directive text (add). */
+	readonly text?: string;
+	/** The directive to remove (remove). */
+	readonly id?: string;
+	readonly callerSessionId?: string;
+}
+
+export interface WorkDirective {
+	readonly id: string;
+	/** `owner` for every lane, otherwise the persona origin key whose lanes it binds. */
+	readonly scope: string;
+	readonly text: string;
+	readonly createdAt: string;
+}
+
+export interface WorkDirectiveResult {
+	/** Directives visible to the caller after the action. */
+	readonly directives: readonly WorkDirective[];
+	/** Add only: the open lanes the new directive was steered into. */
+	readonly propagated?: readonly { readonly name: string; readonly steered: boolean; readonly reason?: string }[];
+}
+
 export interface WorkSteerParams {
 	readonly name: string;
 	readonly text: string;
@@ -1295,6 +1325,7 @@ export interface VerbCatalogV01 {
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
+	"work.directive": { params: WorkDirectiveParams; result: WorkDirectiveResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
@@ -1346,6 +1377,7 @@ export const VERBS_V01 = [
 	"work.steer",
 	"work.jobs",
 	"work.retire",
+	"work.directive",
 	"chat.react",
 	"engagement.reaction",
 	"engagement.panel_response",

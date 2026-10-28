@@ -8498,3 +8498,62 @@ test("#707: a failed fresh admission is reported by status until the name is sta
 		detail: { reasonCode: "unknown_work_lane" },
 	});
 });
+
+test("#604: an operator directive reaches a running lane before its next step and every later lane start", async () => {
+	const f = await fixture();
+	await started(f, "running");
+	const added = await f.manager.directive({ action: "add", text: "Do not render video or run TTS on this host." });
+	expect(added.propagated).toEqual([{ name: "running", steered: true }]);
+	expect(added.directives).toHaveLength(1);
+	const [directive] = added.directives;
+	expect(directive).toMatchObject({ scope: "owner", text: "Do not render video or run TTS on this host." });
+	expect(directive!.id).toMatch(/^wd-[0-9a-f]{8}$/);
+	expect(f.port.steers).toHaveLength(1);
+	expect(f.port.steers[0]!.text).toContain("New standing directive from your operator");
+	expect(f.port.steers[0]!.text).toContain(`- (${directive!.id}) Do not render video or run TTS on this host.`);
+	// A lane started afterwards carries it ahead of its task.
+	await started(f, "later");
+	const laterSend = f.port.sends.at(-1)!;
+	expect(laterSend.text.startsWith("[Standing directives from your operator.")).toBe(true);
+	expect(laterSend.text).toContain(`- (${directive!.id}) Do not render video or run TTS on this host.`);
+	expect(laterSend.text.endsWith("\n\nwork")).toBe(true);
+	// Removed directives stop applying.
+	expect((await f.manager.directive({ action: "remove", id: directive!.id })).directives).toEqual([]);
+	const g = await fixture();
+	const removed = await g.manager.directive({ action: "add", text: "temporary" });
+	expect(removed.propagated).toEqual([]);
+	await g.manager.directive({ action: "remove", id: removed.directives[0]!.id });
+	await started(g, "after-removal");
+	expect(g.port.sends.at(-1)!.text).toBe("work");
+});
+
+test("#604: a conversation's directive binds only the lanes that conversation started, and lanes cannot set one", async () => {
+	const f = await fixture();
+	const personaKey = originKey(origin);
+	f.db.transaction((tx) => f.db.bindings.bindAtEpoch(tx, personaKey, "persona-session", 0));
+	const own = await f.manager.start({
+		name: "own",
+		text: "work",
+		cwd: f.directory,
+		callerSessionId: "persona-session",
+	});
+	if (!own.started) throw new Error("unexpected hold");
+	await started(f, "other");
+	const added = await f.manager.directive({
+		action: "add",
+		text: "gajae-way work stops at issues; no fix lanes.",
+		callerSessionId: "persona-session",
+	});
+	expect(added.propagated).toEqual([{ name: "own", steered: true }]);
+	expect(added.directives.map((directive) => directive.scope)).toEqual([personaKey]);
+	expect(f.port.steers.map((steer) => steer.sessionId)).toEqual([own.sessionId]);
+	// The host operator sees every directive; the other conversation's lane got none.
+	expect((await f.manager.directive({ action: "list" })).directives).toHaveLength(1);
+	const laneSession = f.db.bindings.getSessionRecord(workSessionKey("other"))!.sessionId;
+	await expect(
+		f.manager.directive({ action: "add", text: "lanes cannot widen or narrow this", callerSessionId: laneSession }),
+	).rejects.toMatchObject({ detail: { reasonCode: "directive_from_lane" } });
+	await expect(f.manager.directive({ action: "remove", id: "wd-00000000" })).rejects.toMatchObject({
+		detail: { reasonCode: "unknown_directive" },
+	});
+});
