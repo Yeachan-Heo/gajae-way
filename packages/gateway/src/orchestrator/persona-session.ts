@@ -63,7 +63,6 @@ export const STALLED_TURN_TERMINAL_TIMEOUT_MS = 10 * 60_000;
 const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
-
 /**
  * Grace before a decidable-terminal status may complete a turn whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
@@ -1329,8 +1328,6 @@ type BoundTurn = PersonaTurnIdentity & {
 	providerRetryAttempt: number;
 	/** A bounded provider retry is already scheduled for this failed turn. */
 	agentErrorRetryScheduled: boolean;
-	/** Consecutive session-gone status reads while this turn is an escalated hold (#715). */
-	sessionGoneReads: number;
 };
 
 class OriginActor {
@@ -1906,13 +1903,6 @@ class OriginActor {
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
 			if (await this.#escalateUnresolvedHold(turn, undefined)) return;
-			// An already-escalated bound row must be adopted into retired reconciliation
-			// to be reconciled by the periodic sweep, without re-sending the escalation (#715).
-			if (this.#manager.database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) {
-				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, false);
-				await this.#reconcileBound(bound, status);
-				return;
-			}
 			this.#logRecoveryHoldOnce(turn, "operation_state_unknown");
 			return;
 		}
@@ -2087,7 +2077,6 @@ class OriginActor {
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
-			sessionGoneReads: 0,
 			statusRecheckAfterStall: false,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
@@ -2537,7 +2526,6 @@ class OriginActor {
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
-			sessionGoneReads: 0,
 			statusRecheckAfterStall: false,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
@@ -4054,8 +4042,6 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			// Broker unavailability (session_unavailable) does not prove operation completion;
-			// keep the escalated hold open until confirmed terminal status or stalled exit (#715).
 			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -4071,8 +4057,6 @@ class OriginActor {
 		if (report.status.status === "unknown") {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
-			// A successful status read (even "unknown") resets the session-gone streak (#715).
-			bound.sessionGoneReads = 0;
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
 			if ((state === "accepted" || state === "bound") && bound.stallHostTerminated) {
 				await this.#closeTerminatedStalledTurn(bound);
@@ -4092,8 +4076,6 @@ class OriginActor {
 		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
-			// A successful nonterminal status read resets any accumulated session-gone reads (#715).
-			bound.sessionGoneReads = 0;
 			if (bound.stallHostTerminated) {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
@@ -4616,8 +4598,6 @@ class OriginActor {
 		await this.#notifySettled(bound);
 		await this.#settleAfterTerminal(bound);
 	}
-
-
 
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
