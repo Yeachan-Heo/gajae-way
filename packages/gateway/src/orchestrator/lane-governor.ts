@@ -85,7 +85,7 @@ export interface SweepNomination {
 	readonly now: number;
 }
 
-export type LaneForceRetireReason = "session_dead" | "session_disowned";
+export type LaneForceRetireReason = "session_dead" | "session_disowned" | "operator_retired";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
 export interface LaneGovernorOptions {
@@ -311,6 +311,19 @@ export class LaneGovernor {
 					`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=session_gone`,
 					"error",
 				);
+			}
+			// A settled attempt can still own an open checks cycle. Left open, the checks
+			// poller keeps re-steering red checks into a fresh session after retirement.
+			// Settle it only once the session is closed or proven gone: a retained lane
+			// must keep its checks monitoring.
+			const lastAttempt = record?.attempts.at(-1);
+			if (record?.state === "awaiting_checks" && lastAttempt) {
+				const endedAt = new Date(this.#now()).toISOString();
+				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, "operator_retired", endedAt)) {
+					const detail = "awaiting_checks cycle could not be settled";
+					this.#log(`lane_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+					return { retired: false, sessionKey, reason: detail };
+				}
 			}
 			// Only a non-forced operator retirement (no sweep nomination) deletes the
 			// runtime-created worktree and branch. Unattended sweep/force retirement keeps
