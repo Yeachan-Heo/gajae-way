@@ -1565,3 +1565,104 @@ test("#710: service_alive reports socket state, last envelope age and a deaf-eve
 		"socket=disconnected connections=1 last_envelope_age=never events_possibly_disabled_since=2026-10-27T07:16:00.000Z",
 	);
 });
+
+test("#710: slash-command envelope after missed message still counts as a gap (Events API tracked separately)", async () => {
+	let clock = 1_700_000_000_000;
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
+	try {
+		// Socket connects and receives hello
+		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		expect(f.mode.connected).toBe(true);
+
+		// One message arrives live via events_api
+		f.sockets[0]!.onmessage?.({
+			data: JSON.stringify({
+				envelope_id: "env-live",
+				type: "events_api",
+				payload: { event_id: "ev-live", event: { ...inbound({ ts: "1700000010.000001", text: "live" }) } },
+			}),
+		});
+		await f.ingress.drain();
+		await flush();
+
+		// Advance time past grace period
+		clock = 1_700_000_600_000;
+
+		// Another message arrives but we never receive its events_api envelope
+		// Instead, we receive a slash_command envelope (which should NOT update lastEnvelopeAt for deaf-socket detection)
+		f.sockets[0]!.onmessage?.({
+			data: JSON.stringify({
+				envelope_id: "env-slash",
+				type: "slash_commands",
+				payload: { response_url: "https://hooks.slack.com/test", trigger_id: "test" },
+			}),
+		});
+		await flush();
+
+		// Set up history with a message that arrived after the socket connected but never via events_api
+		f.api.history.C1 = [
+			{ type: "message", user: "U1", ts: "1700000200.000001", text: "missed" },
+			{ type: "message", user: "U1", ts: "1700000010.000001", text: "live" },
+		];
+
+		// Recovery should detect that the socket never delivered the message
+		// even though a slash_command came in (which shouldn't count as proof of delivery)
+		expect(f.eventsSuspect()).toBeUndefined();
+		expect(await f.recoverMissedMessages()).toBe(true);
+
+		const sends = () =>
+			f.client.requests
+				.filter((request) => request.verb === "chat.send")
+				.map((request) => (request.params as { text: string }).text);
+
+		expect(sends()).toEqual(["live", "missed"]);
+
+		const warnings = () => f.logs.filter((line) => line.startsWith("slack_events_possibly_disabled"));
+		expect(warnings()).toHaveLength(1);
+		expect(warnings()[0]).toContain("missed=1");
+		expect(f.eventsSuspect()).toBeDefined();
+		expect(f.eventsSuspect()?.missed).toBe(1);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("#710: messages within grace period are not blamed on deaf socket", async () => {
+	let clock = 1_700_000_000_000;
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
+	try {
+		// Socket connects but says hello (proves it's connected)
+		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		expect(f.mode.connected).toBe(true);
+
+		// Advance time to within grace period
+		clock = 1_700_000_130_000;
+
+		// A message is posted but never reaches the socket (within grace period, 60 seconds after posting)
+		f.api.history.C1 = [
+			{ type: "message", user: "U1", ts: "1700000070.000001", text: "fresh" },
+		];
+
+		// Recovery attempt within grace period should succeed but NOT flag as deaf
+		expect(f.eventsSuspect()).toBeUndefined();
+		const pass1 = await f.recoverMissedMessages();
+		expect(pass1).toBe(true);
+
+		const sends1 = () =>
+			f.client.requests
+				.filter((request) => request.verb === "chat.send")
+				.map((request) => (request.params as { text: string }).text);
+
+		// Message should be recovered
+		expect(sends1()).toContain("fresh");
+
+		// Should NOT flag as deaf (within grace period)
+		const warnings1 = () => f.logs.filter((line) => line.startsWith("slack_events_possibly_disabled"));
+		expect(warnings1()).toHaveLength(0);
+		expect(f.eventsSuspect()).toBeUndefined();
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});

@@ -1136,15 +1136,18 @@ export async function startSlackAdapter(
 			);
 			if (sent.verdict !== "unavailable") {
 				const postedAt = Number(message.ts) * 1000;
+				const isWithinGrace = nowMs - postedAt < LIVE_DELIVERY_GRACE_MS;
 				if (
 					sent.verdict === "acked" &&
 					connectedSince !== undefined &&
 					postedAt >= connectedSince &&
 					postedAt > lastEnvelopeAt &&
-					nowMs - postedAt >= LIVE_DELIVERY_GRACE_MS
+					!isWithinGrace
 				)
 					missedWhileConnected++;
-				await mutate((state) => clearAttempt(state, messageId));
+				// Keep the attempt record for messages within the grace period so we can re-evaluate
+				// after the grace period expires. Only clear once the grace period has passed.
+				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) await rememberThread(admitted.origin);
 				return sent.verdict;
 			}
@@ -1371,7 +1374,7 @@ export async function startSlackAdapter(
 	gateway.onDisconnected = () => noteDisconnected("gateway");
 	await (ports.connectGateway ?? ((current) => current.connectInitial()))(gateway);
 	const socket = new SlackSocketMode(
-		() => api.connectionsOpen(config.appToken),
+		(signal) => api.connectionsOpen(config.appToken, signal),
 		{
 			onEvent: handleEvent,
 			onSlashCommand: handleSlashCommand,

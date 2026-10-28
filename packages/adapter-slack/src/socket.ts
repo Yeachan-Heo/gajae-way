@@ -93,6 +93,7 @@ export class SlackSocketMode {
 	private opened = 0;
 	private connectedAt: number | undefined;
 	private lastEnvelope: number | undefined;
+	private lastEventAt: number | undefined;
 	private readonly seen = new Map<string, string | undefined>();
 	private retryTimer?: ReturnType<typeof setTimeout>;
 	private readonly factory: (url: string) => WebSocketLike;
@@ -108,7 +109,7 @@ export class SlackSocketMode {
 	private readonly clearTimer: (timer: unknown) => void;
 
 	constructor(
-		private readonly openConnection: () => Promise<{ readonly url: string }>,
+		private readonly openConnection: (signal?: AbortSignal) => Promise<{ readonly url: string }>,
 		private readonly handlers: SocketModeHandlers,
 		options: SocketModeOptions = {},
 	) {
@@ -142,9 +143,9 @@ export class SlackSocketMode {
 	get connectedSince(): number | undefined {
 		return this.isConnected ? this.connectedAt : undefined;
 	}
-	/** When the last event or slash-command envelope arrived (pings and hello excluded). */
+	/** When the last events_api envelope arrived (pings, hello, and slash_commands excluded; the deaf-socket detector uses this to track message delivery). */
 	get lastEnvelopeAt(): number | undefined {
-		return this.lastEnvelope;
+		return this.lastEventAt ?? this.lastEnvelope;
 	}
 
 	/** Replace the current connection through the ordinary reconnect path. */
@@ -180,11 +181,15 @@ export class SlackSocketMode {
 		while (generation === this.generation) {
 			try {
 				let openTimer: unknown;
+				const openAbort = new AbortController();
 				const connection = await Promise.race([
-					this.openConnection(),
+					this.openConnection(openAbort.signal),
 					cancelled,
 					new Promise<never>((_, reject) => {
-						openTimer = this.setTimer(() => reject(new SocketOpenTimeoutError(this.openTimeoutMs)), this.openTimeoutMs);
+						openTimer = this.setTimer(() => {
+							openAbort.abort();
+							reject(new SocketOpenTimeoutError(this.openTimeoutMs));
+						}, this.openTimeoutMs);
 					}),
 				]).finally(() => this.clearTimer(openTimer));
 				if (!connection || generation !== this.generation) break;
@@ -347,10 +352,12 @@ export class SlackSocketMode {
 			while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
 			if (typeof frame.retry_attempt === "number" && frame.retry_attempt > 0 && duplicate) return;
 			const envelope = frame as unknown as SlackEnvelope;
-			this.lastEnvelope = this.now();
 			if (frame.type === "events_api" && isObject(payload?.event)) {
+				this.lastEventAt = this.now();
+				this.lastEnvelope = this.now();
 				await this.handlers.onEvent(payload.event, envelope);
 			} else if (frame.type === "slash_commands" && payload) {
+				this.lastEnvelope = this.now();
 				await this.handlers.onSlashCommand(payload as unknown as SlackSlashCommand, envelope);
 			} else {
 				this.log.log(`Slack socket ignored envelope type ${String(frame.type)}`);
