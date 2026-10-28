@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -4800,3 +4800,73 @@ test("status reports each connected client's generation and flags an adapter old
 	fresh.close();
 	anonymous.close();
 });
+
+for (const state of ["running", "indeterminate"] as const) {
+	test(`#713: an inherited ${state} restart drain stays held and is reported until it is recovered`, async () => {
+		directory = await mkdtemp(join(tmpdir(), "gajaeway-server-inherited-drain-"));
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home: directory,
+			gjc: { agentDir: join(directory, "agent") },
+			configPath: join(directory, "config.json"),
+			socketPath: join(directory, "gateway.sock"),
+			dbPath: join(directory, "gateway.db"),
+			logVerbosity: "info",
+			dmPolicy: "open" as const,
+		};
+		const stackPath = join(directory, "restart-stack.json");
+		// The supervisor that wrote this receipt is gone; that alone never releases the fence.
+		await writeFile(stackPath, JSON.stringify({ id: "inherited-drain", state, drainPrepared: true }), {
+			mode: 0o600,
+		});
+		const database = await Store.open(config.dbPath);
+		const sessionPort = sessionPortFromResponder({
+			bind: (key, epoch) => bindWorkFixture(key, epoch),
+			respond: async () => "reply",
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+			client = await connect(config.socketPath);
+			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			await waitFor(client.frames, 1);
+			client.send({ v: "0.1", type: "request", id: "held", verb: "gateway.status" });
+			await client.waitForFrame("held");
+			const held = client.frames.find((frame) => frame.id === "held")?.result.readiness;
+			expect(held.ready).toBe(false);
+			expect(held.failure).toMatchObject({ code: "restart_drain_held", consecutiveFailures: 1 });
+			expect(held.failure.detail).toContain("id=inherited-drain");
+			expect(typeof held.failure.at).toBe("string");
+			expect(typeof held.windowMs).toBe("number");
+			expect(typeof held.failureThreshold).toBe("number");
+			expect((JSON.parse(await readFile(stackPath, "utf8")) as { id?: string }).id).toBe("inherited-drain");
+
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "reattach",
+				verb: "gateway.restart.prepare",
+				params: { restartId: "inherited-drain", waitMs: 0 },
+			});
+			await client.waitForFrame("reattach");
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "recover",
+				verb: "gateway.restart.cancel",
+				params: { restartId: "inherited-drain" },
+			});
+			await client.waitForFrame("recover");
+			expect(client.frames.find((frame) => frame.id === "recover")?.result).toEqual({ cancelled: true });
+			client.send({ v: "0.1", type: "request", id: "released", verb: "gateway.status" });
+			await client.waitForFrame("released");
+			const released = client.frames.find((frame) => frame.id === "released")?.result.readiness;
+			expect(released.failure?.code).not.toBe("restart_drain_held");
+		} finally {
+			client?.close();
+			await server?.stop();
+			server = undefined;
+		}
+	});
+}

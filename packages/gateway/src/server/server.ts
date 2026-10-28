@@ -67,7 +67,11 @@ import {
 	threadMuteKey,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
-import { FunctionalReadiness } from "../functional-readiness";
+import {
+	FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
+	FUNCTIONAL_READINESS_WINDOW_MS,
+	FunctionalReadiness,
+} from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
@@ -173,6 +177,8 @@ const RESTART_HARD_EXIT_MS = 35_000;
 const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
 /** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
 const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
+/** How long boot waits for in-flight persona turns under an inherited restart drain; the fence itself stays held. */
+const PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS = 30_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -1102,8 +1108,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
 	if (restartDrainId !== undefined) {
+		// An inherited drain is never released at boot: a dead supervisor does not prove the service-manager
+		// operation settled. The restart supervisor reattaches and releases it, or the operator runs
+		// `ops restart-stack --recover`; until then readiness reports `restart_drain_held`.
+		console.warn(`persisted restart drain inherited on boot; persona dispatch held id=${restartDrainId}`);
 		void personaSessions
-			.drainForRestart(restartDrainId, 0)
+			.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS)
 			.catch((error: unknown) =>
 				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
 			);
@@ -1531,7 +1541,26 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
-					readiness: runtime.readiness.snapshot(),
+					readiness: (() => {
+						const drainId = runtime.personaSessions.restartDrainId;
+						if (drainId !== undefined) {
+							return {
+								ready: false,
+								state: "degraded" as const,
+								windowMs: FUNCTIONAL_READINESS_WINDOW_MS,
+								failureThreshold: FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
+								reason: `gateway: restart_drain_held (restarts fenced, active personas blocked)`,
+								failure: {
+									category: "session_create" as const,
+									code: "restart_drain_held",
+									detail: `restart drain held id=${drainId}; new persona dispatches are blocked`,
+									at: new Date().toISOString(),
+									consecutiveFailures: 1,
+								},
+							};
+						}
+						return runtime.readiness.snapshot();
+					})(),
 					sessions: { active: options.database.bindings.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.inbox.contextDiagnostics(),
