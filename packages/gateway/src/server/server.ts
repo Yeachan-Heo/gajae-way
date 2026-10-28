@@ -84,7 +84,7 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
-import type { GlobalGjcClient } from "../orchestrator/broker";
+import { defaultPidAlive, type GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
@@ -173,8 +173,10 @@ const RESTART_HARD_EXIT_MS = 35_000;
 const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
 /** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
 const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
-/** Bounded grace for a persisted restart drain on boot; after this timeout or when the drain completes, the drain is released and cleared to prevent indefinite blocking. */
+/** Bounded grace for a persisted restart drain on boot; once it settles or times out and its supervisor has exited, a non-indeterminate drain is released and cleared. */
 const PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS = 30_000;
+/** How often boot re-checks whether the restart-stack supervisor that owns an inherited drain is still alive. */
+const PERSISTED_RESTART_SUPERVISOR_POLL_MS = 1_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -1103,44 +1105,47 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onRestartDrainCancelled: (restartId) => restartNotices.released(restartId),
 		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
-	const persistedDrainWasIndeterminate = (() => {
-		try {
-			const receipt = JSON.parse(readFileSync(join(options.config.home, "restart-stack.json"), "utf8")) as {
-				id?: unknown;
-				state?: unknown;
-				drainPrepared?: unknown;
-			};
-			return receipt.state === "indeterminate";
-		} catch {
-			return false;
-		}
-	})();
 	if (restartDrainId !== undefined) {
-		if (persistedDrainWasIndeterminate) {
+		const stackPath = join(options.config.home, "restart-stack.json");
+		const readStack = (): { id?: unknown; state?: unknown; supervisorPid?: unknown } | undefined => {
+			try {
+				return JSON.parse(readFileSync(stackPath, "utf8")) as {
+					id?: unknown;
+					state?: unknown;
+					supervisorPid?: unknown;
+				};
+			} catch {
+				return undefined;
+			}
+		};
+		if (readStack()?.state === "indeterminate")
 			console.warn(`persisted restart drain in indeterminate state on boot id=${restartDrainId}`);
-		}
 		void (async () => {
 			try {
 				const outcome = await personaSessions.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS);
-				// An indeterminate drain stays held indefinitely for operator recovery (`ops restart-stack --recover`)
-				// and is surfaced as `restart_drain_held` readiness until the operator explicitly clears it.
-				// A non-indeterminate inherited drain has no active supervisor left to finish it: release the dispatch fence,
-				// then forget the persisted id only after the in-memory fence is fully released.
-				if ((outcome === "timed_out" || outcome === "drained") && !persistedDrainWasIndeterminate) {
-					const released = await personaSessions.cancelRestartDrain(restartDrainId);
-					if (released) {
-						try {
-							const stackPath = join(options.config.home, "restart-stack.json");
-							const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
-							delete receipt.id;
-							const temporary = `${stackPath}.${process.pid}.tmp`;
-							await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
-							await rename(temporary, stackPath);
-							console.info(`persisted restart drain cleared on boot outcome=${outcome} id=${restartDrainId}`);
-						} catch (error) {
-							console.error(`persisted restart drain clear failed id=${restartDrainId} detail=${diagnostic(error)}`);
-						}
-					}
+				if (outcome !== "timed_out" && outcome !== "drained") return;
+				// During a normal restart-stack the detached supervisor is still restarting dependent services
+				// and releases this drain itself once the sequence finishes. Only a drain whose supervisor
+				// exited without releasing it is orphaned.
+				for (;;) {
+					const stack = readStack();
+					if (stack?.id !== restartDrainId || personaSessions.restartDrainId !== restartDrainId) return;
+					if (typeof stack.supervisorPid !== "number" || !defaultPidAlive(stack.supervisorPid)) break;
+					await Bun.sleep(PERSISTED_RESTART_SUPERVISOR_POLL_MS);
+				}
+				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
+				// and is reported as `restart_drain_held` readiness.
+				if (readStack()?.state === "indeterminate") return;
+				if (!(await personaSessions.cancelRestartDrain(restartDrainId))) return;
+				try {
+					const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
+					delete receipt.id;
+					const temporary = `${stackPath}.${process.pid}.tmp`;
+					await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+					await rename(temporary, stackPath);
+					console.info(`orphaned persisted restart drain released on boot outcome=${outcome} id=${restartDrainId}`);
+				} catch (error) {
+					console.error(`persisted restart drain clear failed id=${restartDrainId} detail=${diagnostic(error)}`);
 				}
 			} catch (error: unknown) {
 				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`);

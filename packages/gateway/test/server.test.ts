@@ -4801,11 +4801,12 @@ test("status reports each connected client's generation and flags an adapter old
 	anonymous.close();
 });
 
-for (const [state, held] of [
-	["running", false],
-	["indeterminate", true],
+for (const [state, supervisor, held] of [
+	["running", "exited", false],
+	["running", "alive", true],
+	["indeterminate", "exited", true],
 ] as const)
-	test(`#713: an inherited ${state} restart drain is ${held ? "held and reported" : "released"} on boot`, async () => {
+	test(`#713: an inherited ${state} restart drain with an ${supervisor} supervisor is ${held ? "held and reported" : "released"} on boot`, async () => {
 		directory = await mkdtemp(join(tmpdir(), "gajaeway-server-persisted-drain-timeout-"));
 		const config: GatewayConfig = {
 			schemaVersion: 1,
@@ -4818,9 +4819,18 @@ for (const [state, held] of [
 			dmPolicy: "open" as const,
 		};
 		const stackPath = join(directory, "restart-stack.json");
-		await writeFile(stackPath, JSON.stringify({ id: "boot-drain-timeout", state, drainPrepared: true }), {
-			mode: 0o600,
-		});
+		await writeFile(
+			stackPath,
+			JSON.stringify({
+				id: "boot-drain-timeout",
+				state,
+				drainPrepared: true,
+				...(supervisor === "alive" ? { supervisorPid: process.pid } : {}),
+			}),
+			{
+				mode: 0o600,
+			},
+		);
 		const database = await Store.open(config.dbPath);
 		const sessionPort = sessionPortFromResponder({
 			bind: (key, epoch) => bindWorkFixture(key, epoch),
