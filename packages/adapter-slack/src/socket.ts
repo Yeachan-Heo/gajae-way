@@ -59,8 +59,10 @@ export interface SocketModeOptions {
 	readonly now?: () => number;
 	readonly setInterval?: (work: () => void, ms: number) => unknown;
 	readonly clearInterval?: (timer: unknown) => void;
-	/** Test seam and escalation: called when socket has been unresponsive for too long. */
-	readonly onUnresponsiveSocket?: (reason: string) => void | Promise<void>;
+	/** Bound on `apps.connections.open`; a hung call must not stall the reconnect loop. */
+	readonly openTimeoutMs?: number;
+	readonly setTimeout?: (work: () => void, ms: number) => unknown;
+	readonly clearTimeout?: (timer: unknown) => void;
 }
 
 /**
@@ -73,6 +75,13 @@ export interface SocketModeOptions {
 export const DEFAULT_SOCKET_LIVENESS_TIMEOUT_MS = 15 * 60_000;
 export const MIN_SOCKET_LIVENESS_TIMEOUT_MS = 30_000;
 const LIVENESS_CHECK_MAX_MS = 60_000;
+/**
+ * `apps.connections.open` answers in well under a second. Without a bound, one
+ * request hung on a dead keep-alive connection after a network drop parked the
+ * reconnect loop forever: no socket, so no liveness watchdog, and no retry
+ * (#710: "closed unexpectedly", then 18 hours of nothing).
+ */
+export const DEFAULT_SOCKET_OPEN_TIMEOUT_MS = 30_000;
 
 export class SlackSocketMode {
 	private ready?: Promise<void>;
@@ -82,8 +91,8 @@ export class SlackSocketMode {
 	private failures = 0;
 	private isConnected = false;
 	private opened = 0;
-	private lastSocketOpenedAt = 0; // Track when socket was last successfully opened
-	private lastEnvelopeAt = -1; // Track when last envelope was received (-1 = never)
+	private connectedAt: number | undefined;
+	private lastEnvelope: number | undefined;
 	private readonly seen = new Map<string, string | undefined>();
 	private retryTimer?: ReturnType<typeof setTimeout>;
 	private readonly factory: (url: string) => WebSocketLike;
@@ -94,7 +103,9 @@ export class SlackSocketMode {
 	private readonly now: () => number;
 	private readonly setInterval: (work: () => void, ms: number) => unknown;
 	private readonly clearInterval: (timer: unknown) => void;
-	private readonly onUnresponsiveSocket?: (reason: string) => void | Promise<void>;
+	private readonly openTimeoutMs: number;
+	private readonly setTimer: (work: () => void, ms: number) => unknown;
+	private readonly clearTimer: (timer: unknown) => void;
 
 	constructor(
 		private readonly openConnection: () => Promise<{ readonly url: string }>,
@@ -116,7 +127,9 @@ export class SlackSocketMode {
 		this.now = options.now ?? Date.now;
 		this.setInterval = options.setInterval ?? ((work, ms) => setInterval(work, ms));
 		this.clearInterval = options.clearInterval ?? ((timer) => clearInterval(timer as ReturnType<typeof setInterval>));
-		this.onUnresponsiveSocket = options.onUnresponsiveSocket;
+		this.openTimeoutMs = options.openTimeoutMs ?? DEFAULT_SOCKET_OPEN_TIMEOUT_MS;
+		this.setTimer = options.setTimeout ?? ((work, ms) => setTimeout(work, ms));
+		this.clearTimer = options.clearTimeout ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
 	}
 
 	get connected(): boolean {
@@ -125,13 +138,18 @@ export class SlackSocketMode {
 	get connections(): number {
 		return this.opened;
 	}
-	get lastActivityMs(): number {
-		return this.lastEnvelopeAt >= 0 ? this.now() - this.lastEnvelopeAt : -1;
+	/** When the current connection said hello; undefined while disconnected. */
+	get connectedSince(): number | undefined {
+		return this.isConnected ? this.connectedAt : undefined;
 	}
-	get socketState(): "connected" | "reconnecting" | "idle" {
-		if (this.isConnected) return "connected";
-		if (this.lastSocketOpenedAt > 0) return "reconnecting";
-		return "idle";
+	/** When the last event or slash-command envelope arrived (pings and hello excluded). */
+	get lastEnvelopeAt(): number | undefined {
+		return this.lastEnvelope;
+	}
+
+	/** Replace the current connection through the ordinary reconnect path. */
+	restart(reason: string): void {
+		this.retire?.(reason);
 	}
 
 	start(): Promise<void> {
@@ -161,14 +179,22 @@ export class SlackSocketMode {
 	private async run(generation: number, ready: () => void, cancelled: Promise<void>): Promise<void> {
 		while (generation === this.generation) {
 			try {
-				const connection = await Promise.race([this.openConnection(), cancelled]);
+				let openTimer: unknown;
+				const connection = await Promise.race([
+					this.openConnection(),
+					cancelled,
+					new Promise<never>((_, reject) => {
+						openTimer = this.setTimer(() => reject(new SocketOpenTimeoutError(this.openTimeoutMs)), this.openTimeoutMs);
+					}),
+				]).finally(() => this.clearTimer(openTimer));
 				if (!connection || generation !== this.generation) break;
 				const socket = this.factory(connection.url);
 				await Promise.race([
 					new Promise<void>((resolve) => {
 						let retired = false;
 						let opened = false;
-						let lastActivityAt = this.now();
+						const createdAt = this.now();
+						let lastActivityAt = createdAt;
 						let probed = false;
 						const touch = () => {
 							lastActivityAt = this.now();
@@ -176,6 +202,15 @@ export class SlackSocketMode {
 						};
 						const watchdog = this.setInterval(
 							() => {
+								// Pings can keep a socket that never said hello "active"; it still delivers nothing.
+								const unannounced = this.now() - createdAt;
+								if (!this.isConnected && unannounced >= this.livenessTimeoutMs) {
+									this.log.log(
+										`Slack socket never connected: no hello after ${Math.round(unannounced / 1000)}s; forcing reconnect.`,
+									);
+									retire("Slack socket never connected");
+									return;
+								}
 								const quiet = this.now() - lastActivityAt;
 								if (quiet >= this.livenessTimeoutMs) {
 									this.log.log(
@@ -183,19 +218,6 @@ export class SlackSocketMode {
 									);
 									retire("Slack socket stale");
 									return;
-								}
-								// Check if socket has been closed and waiting for reconnect too long
-								if (!this.isConnected && this.lastSocketOpenedAt > 0) {
-									const timeSinceOpen = this.now() - this.lastSocketOpenedAt;
-									if (timeSinceOpen >= this.livenessTimeoutMs) {
-										const reason = `Slack socket not reconnected for ${Math.round(timeSinceOpen / 1000)}s; escalating`;
-										this.log.error(`${reason}.`);
-										if (this.onUnresponsiveSocket) {
-											void this.onUnresponsiveSocket(reason);
-										}
-										retire(reason);
-										return;
-									}
 								}
 								// A quiet workspace is not a dead link: ask before concluding anything.
 								if (quiet >= this.livenessTimeoutMs / 2 && !probed && typeof socket.ping === "function") {
@@ -234,7 +256,6 @@ export class SlackSocketMode {
 							if (!opened) {
 								opened = true;
 								++this.opened;
-								this.lastSocketOpenedAt = this.now();
 							}
 							ready();
 						};
@@ -242,7 +263,6 @@ export class SlackSocketMode {
 						socket.onerror = () => retire("Slack socket error");
 						socket.onmessage = (event) => {
 							touch();
-							this.lastEnvelopeAt = this.now();
 							void this.receive(socket, event.data, retire);
 						};
 						if (typeof socket.addEventListener === "function") {
@@ -252,8 +272,10 @@ export class SlackSocketMode {
 					}),
 					cancelled,
 				]);
-			} catch {
-				this.log.error("Slack socket connection failed");
+			} catch (error) {
+				this.log.error(
+					`Slack socket connection failed${error instanceof SocketOpenTimeoutError ? `: ${error.message}` : ""}`,
+				);
 			}
 			if (generation !== this.generation) break;
 			const delay = Math.min(30_000, 500 * 2 ** Math.min(this.failures++, 6)) * (0.5 + this.random() * 0.5);
@@ -293,6 +315,7 @@ export class SlackSocketMode {
 				this.failures = 0;
 				if (!this.isConnected) {
 					this.isConnected = true;
+					this.connectedAt = this.now();
 					this.handlers.onConnected?.();
 				}
 				return;
@@ -324,6 +347,7 @@ export class SlackSocketMode {
 			while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
 			if (typeof frame.retry_attempt === "number" && frame.retry_attempt > 0 && duplicate) return;
 			const envelope = frame as unknown as SlackEnvelope;
+			this.lastEnvelope = this.now();
 			if (frame.type === "events_api" && isObject(payload?.event)) {
 				await this.handlers.onEvent(payload.event, envelope);
 			} else if (frame.type === "slash_commands" && payload) {
@@ -334,6 +358,13 @@ export class SlackSocketMode {
 		} catch {
 			this.log.error("Slack socket envelope handling failed");
 		}
+	}
+}
+
+class SocketOpenTimeoutError extends Error {
+	constructor(ms: number) {
+		super(`connections.open timed out after ${ms}ms`);
+		this.name = "SocketOpenTimeoutError";
 	}
 }
 
