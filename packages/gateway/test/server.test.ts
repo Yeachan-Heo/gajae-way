@@ -3,6 +3,7 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireLease as acquireHomeLease } from "@gajae-gateway/home";
 import {
 	type GatewayReadinessResult,
 	type MemoryOperationStatusResult,
@@ -10,7 +11,6 @@ import {
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
-import { acquireLease as acquireHomeLease } from "@gajae-gateway/home";
 import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { leaseHeld } from "@gajae-gateway/home";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -68,13 +69,12 @@ import {
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
 import {
-	FunctionalReadiness,
 	FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
 	FUNCTIONAL_READINESS_WINDOW_MS,
+	FunctionalReadiness,
 } from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
-import { leaseHeld } from "@gajae-gateway/home";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { DEFAULT_DEBLOAT_BYTE_THRESHOLD } from "../memory/debloat";
