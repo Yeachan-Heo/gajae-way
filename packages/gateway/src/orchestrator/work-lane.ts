@@ -42,6 +42,8 @@ import {
 	type LaneReportRow,
 	resolveLaneReportOrigin,
 	terminalEvidence,
+	unresolvedTerminalReceipt,
+	WORK_OUTCOME_TOKENS,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -90,6 +92,7 @@ const GIT_TIMEOUTS: GitTimeouts = { local: GIT_COMMAND_TIMEOUT_MS, clone: 30_000
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
+	"provider_transport",
 	"cancelled",
 	"max_tokens",
 	"max_turn_requests",
@@ -574,7 +577,7 @@ export class WorkLaneManager {
 						: {}),
 				}
 			: undefined;
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts, terminal.status);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -1618,8 +1621,7 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		const unresolvedReceipt =
-			runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+		const unresolvedReceipt = unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined;
 		if (!runtime.terminal || unresolvedReceipt) this.#attach(observer);
 		// A saved SDK terminal is still incomplete without execution-end proof.
 		// Recovery must refresh it through the same fenced path as a fresh status.
@@ -1656,6 +1658,7 @@ export class WorkLaneManager {
 			let terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			let hostDeathProved = false;
 			if (unresolvedReceipt && !terminal) {
 				observer.receiptDeadSince = undefined;
 				return;
@@ -1667,13 +1670,13 @@ export class WorkLaneManager {
 					(["commandId", "turnId"] as const).some(
 						(key) => runtime.terminal?.status?.[key] !== undefined && runtime.terminal.status[key] !== status[key],
 					) ||
-					(terminal?.reasonCode !== "terminal_missing_receipt" && status.receiptState !== "present"))
+					(!unresolvedTerminalReceipt(terminal) && status.receiptState !== "present"))
 			) {
 				observer.receiptDeadSince = undefined;
 				return;
 			}
 			if (
-				terminal?.reasonCode === "terminal_missing_receipt" &&
+				unresolvedTerminalReceipt(terminal) &&
 				runtime.turnEndObservedAt === undefined &&
 				observer.turnEndObservedAt === undefined
 			) {
@@ -1688,12 +1691,16 @@ export class WorkLaneManager {
 				if (idle === false) return;
 				if (idle === undefined) {
 					if (!(await this.#missingReceiptHostDead(observer, runtime, status!))) return;
-					terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
+					hostDeathProved = true;
+					// Host death proves execution ended; it cannot replace an SDK failure cause.
+					if (status?.status !== "failed")
+						terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
 				}
 				if (observer.activityVersion !== activityVersion) {
 					observer.receiptDeadSince = undefined;
 					return;
 				}
+				if (hostDeathProved && terminal?.kind === "broker") observer.turnEndObservedAt ??= this.#at();
 				if (idle === true) {
 					if (
 						!proofTail ||
@@ -1711,10 +1718,11 @@ export class WorkLaneManager {
 			// Keep saved terminal evidence immutable until output proves a late
 			// receipt. A refreshed terminal receipt or confirmed host death can
 			// release retrieval, but cannot rewrite the original outcome by itself.
-			if (unresolvedReceipt && terminal?.reasonCode !== "terminal_missing_receipt")
-				observer.turnEndObservedAt ??= this.#at();
+			if (unresolvedReceipt && !unresolvedTerminalReceipt(terminal)) observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			const patchParts: Array<Partial<WorkAttemptPatch>> = [];
+			if (hostDeathProved && terminal?.kind === "broker" && !runtime.terminal)
+				patchParts.push({ output: { ...runtime.output, disposition: "unavailable", nextReadAt: null } });
 			if (runtime.sendPhase !== "accepted" && status && provesAcceptance(status)) {
 				patchParts.push({
 					sendPhase: "accepted" as const,
@@ -1733,7 +1741,7 @@ export class WorkLaneManager {
 				runtime;
 			if (!runtime.terminal) return;
 		}
-		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
+		if (unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined) {
 			const turnEndObservedAt = observer.turnEndObservedAt;
 			if (!turnEndObservedAt) return;
 			runtime =
@@ -1789,11 +1797,10 @@ export class WorkLaneManager {
 					};
 					const silent = isSilentOutput(result.text);
 					const terminal = runtime.terminal!;
-					// A terminal first observed with receiptState=missing whose same-op
-					// final body then proves present is a late receipt, not a missing one
-					// (#248): re-derive the end state from the reconciled receipt.
+					// A proven original same-op body resolves receipt uncertainty, not
+					// execution by inference. Re-derive its actual terminal outcome.
 					const reconciled =
-						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
+						terminal.kind === "broker" && terminal.status !== undefined && unresolvedTerminalReceipt(terminal)
 							? terminalEvidence(
 									safeStatus({
 										...terminal.status,
@@ -1842,10 +1849,11 @@ export class WorkLaneManager {
 			const name = runtime.sessionKey.slice("work/task/".length);
 			const at = this.#at();
 			const reason = runtime.terminal?.reasonCode ?? "unknown";
-			// Extract transport cause for sdk_failed/terminal_missing_receipt failures
+			// Preserve bounded transport diagnostics independently of the classified cause.
 			let output = runtime.output;
 			if (
-				(reason === "sdk_failed" || reason === "terminal_missing_receipt") &&
+				(["sdk_failed", "provider_transport", "prompt_deadline_exceeded"].includes(reason) ||
+					unresolvedTerminalReceipt(runtime.terminal)) &&
 				output.disposition === "unavailable" &&
 				!output.transportCause
 			) {
@@ -1938,7 +1946,7 @@ export class WorkLaneManager {
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
-			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
+			const text = reportText(name, endState, reason, runtime.opRef, output, facts, runtime.terminal?.status);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -2667,8 +2675,7 @@ export class WorkLaneManager {
 					if (!this.#current(observer)) continue;
 				}
 				const terminal = status && terminalEvidence(status, this.#at());
-				const terminalStillRunning =
-					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+				const terminalStillRunning = unresolvedTerminalReceipt(terminal) && runtime.turnEndObservedAt === undefined;
 				if (terminal && !terminalStillRunning && this.#writeCurrent(observer)) {
 					this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(provesAcceptance(status!)
@@ -3128,14 +3135,17 @@ function safeStatus(status: PromptStatusBody): PromptStatusBody {
 			...(status.outcome.reason
 				? { reason: reasons.has(status.outcome.reason) ? status.outcome.reason : "stopped_incomplete" }
 				: {}),
-			...(["stopped", "success", "failure", "cancelled", "completed"].includes(status.outcome.kind ?? "")
-				? { kind: status.outcome.kind }
-				: {}),
-			...(["client_cancel", "runtime", "broker", "receipt"].includes(status.outcome.provenance ?? "")
-				? { provenance: status.outcome.provenance }
-				: {}),
+			...Object.fromEntries(
+				(Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>)
+					.filter((key) => (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(status.outcome![key] ?? ""))
+					.map((key) => [key, status.outcome![key]]),
+			),
 		};
-	if (status.error) result.error = { code: reasons.has(status.error.code ?? "") ? status.error.code : "sdk_failed" };
+	if (status.error)
+		result.error = {
+			code:
+				status.error.code === "agent_error" || reasons.has(status.error.code ?? "") ? status.error.code : "sdk_failed",
+		};
 	return result;
 }
 /** Called only after #query has validated the operation and client reference. */
@@ -3209,6 +3219,7 @@ export function reportText(
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
+	status?: PromptStatusBody,
 ): string {
 	const checks = facts?.checkStatus;
 	const checksVerified =
@@ -3224,12 +3235,12 @@ export function reportText(
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
 		output.disposition === "unavailable"
-			? reason === "terminal_missing_receipt"
+			? reason === "terminal_missing_receipt" || status?.receiptState === "missing"
 				? `final_response_missing opRef=${opRef}`
 				: "output_unavailable"
 			: (output.excerpt ?? "");
 	// Include transport cause details if present
-	if (reason === "terminal_missing_receipt" && output.transportCause) {
+	if ((reason === "terminal_missing_receipt" || status?.receiptState === "missing") && output.transportCause) {
 		const transport = output.transportCause;
 		const parts: string[] = [body, `cause=transport`];
 		if (transport.nativeErrorCode) parts.push(transport.nativeErrorCode);
@@ -3243,6 +3254,15 @@ export function reportText(
 
 	// Reserve the suffix for repository facts so large output excerpts cannot hide check evidence.
 	const factsLines: string[] = [];
+	if (status?.status === "failed") {
+		if (status.receiptState) factsLines.push(`receiptState=${status.receiptState}`);
+		if (status.error?.code === "agent_error" || reasons.has(status.error?.code ?? ""))
+			factsLines.push(`errorCode=${status.error!.code}`);
+		for (const key of Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>) {
+			const token = status.outcome?.[key];
+			if (token && (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(token)) factsLines.push(`${key}=${token}`);
+		}
+	}
 	if (facts?.headSha) {
 		factsLines.push(`head=${facts.headSha.slice(0, 12)}`);
 	}

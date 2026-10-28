@@ -722,6 +722,10 @@ export interface PromptStatusBody {
 		readonly kind?: string;
 		readonly reason?: string;
 		readonly provenance?: string;
+		readonly code?: string;
+		readonly providerCode?: string;
+		readonly phase?: string;
+		readonly category?: string;
 		readonly failureCauseDiagnostic?: string;
 	};
 	/** Gateway-filtered safe failure codes/messages, never raw SDK exceptions. */

@@ -2857,6 +2857,328 @@ for (const [receiptState, reasonCode, endState] of [["unknown", "terminal_uncert
 	});
 }
 
+for (const failure of ["provider", "deadline"] as const) {
+	for (const receiptState of ["missing", "unknown", undefined] as const) {
+		test(`#696 authenticated ${failure} status retains cause with ${receiptState} receipt without treating it as execution end`, async () => {
+			let now = Date.now();
+			const f = await fixture({ now: () => now });
+			const terminate = spyOn(f.port, "terminateHost");
+			const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+			f.port.bind = async (input) => {
+				const binding = { ...input, sessionId: crypto.randomUUID() };
+				f.port.binds.push(input);
+				expect(f.db.transaction((tx) => f.db.bindings.recordOwnedBinding(tx, { ...binding, authority }))).toBe(true);
+				f.port.setSessionState(binding.sessionId, { repo: input.repo, live: true });
+				return binding;
+			};
+			const result = await started(f, "a", origin);
+			const runtime = f.db.work.workAttemptGet(result.opRef)!;
+			await createOwnedSessionFixture(f.db, authority, {
+				sessionId: result.sessionId,
+				originKey: runtime.sessionKey,
+				epoch: runtime.epoch,
+				repo: runtime.cwd,
+			});
+			let active = true;
+			let running = true;
+			let foreign = false;
+			let queries = 0;
+			let outputReads = 0;
+			const outcome =
+				failure === "provider"
+					? {
+							kind: "failed",
+							code: "prompt_failed",
+							providerCode: "server_is_overloaded",
+							phase: "post_start",
+							category: "provider_transport",
+							provenance: "agent_failed",
+						}
+					: {
+							kind: "failed",
+							code: "prompt_deadline_exceeded",
+							phase: "post_start",
+							category: "deadline",
+							provenance: "deadline",
+						};
+			const relay = scriptedRelay((request) => {
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: ["transcript says finished"], complete: true } };
+				if (request.operation !== "turn.result") return { ok: false, error: { code: "unsupported_operation" } };
+				queries++;
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						status: active ? "in_flight" : "failed",
+						receiptState,
+						clientRef: foreign ? "gw-foreign" : request.input.clientRef,
+						commandId: `command-${result.opRef}`,
+						turnId: `turn-${result.opRef}`,
+						startedAt: Date.parse(runtime.startedAt),
+						terminalAt: Date.parse(runtime.startedAt) + 1,
+						outcome: { ...outcome, message: "PRIVATE provider text", failureCauseDiagnostic: "PRIVATE diagnostic" },
+						error: {
+							code: failure === "provider" ? "agent_error" : "prompt_deadline_exceeded",
+							message: "PRIVATE exception",
+						},
+					},
+				};
+			});
+			const broker = new BrokerSessionPort({
+				database: f.db,
+				authority,
+				cli: async () => {
+					throw new Error("unexpected CLI fallback");
+				},
+				tailRunner: new TailRunner({ stream: relay.spawn, repo: runtime.cwd }),
+			});
+			const tail = await broker.attachTail({ sessionId: result.sessionId, repo: runtime.cwd, brokerGeneration: 0 });
+			cleanups.push(async () => {
+				await f.manager.stop();
+				await tail.close();
+			});
+			expect(
+				(await broker.fetchLastAssistant({ sessionId: result.sessionId, repo: runtime.cwd, relay: tail })).text,
+			).toBe("transcript says finished");
+			f.port.status = (input) => broker.status({ ...input, relay: tail });
+			Object.assign(f.port, { turnRunning: async () => running });
+			f.port.fetchLastAssistant = async () => {
+				throw new Error("transcript must not substitute for a receipt");
+			};
+			f.port.fetchWorkerOutput = async () => {
+				outputReads++;
+				return { status: "unavailable", code: "output_unavailable" };
+			};
+			await until(() => queries > 1);
+			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+			expect(outputReads).toBe(0);
+			active = false;
+			now += 60 * 60_000;
+			let before = queries;
+			await until(() => queries > before + 1);
+			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+			expect(outputReads).toBe(0);
+			foreign = true;
+			running = false;
+			before = queries;
+			await until(() => queries > before + 1);
+			expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+			expect(outputReads).toBe(0);
+			foreign = false;
+			await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+			const saved = f.db.work.workAttemptGet(result.opRef)!;
+			const reason = failure === "provider" ? "provider_transport" : "prompt_deadline_exceeded";
+			expect(saved.terminal).toMatchObject({
+				reasonCode: reason,
+				status: { ...(receiptState ? { receiptState } : {}), outcome },
+			});
+			expect(saved.terminal?.status?.receiptState).toBe(receiptState);
+			expect(saved.turnEndObservedAt).toBeDefined();
+			expect(JSON.stringify(saved)).not.toContain("PRIVATE");
+			expect(f.job().attempts[0]?.endState).toBe(failure === "provider" ? "failed" : "attempt_ended");
+			expect(f.notices).toHaveLength(1);
+			expect(f.notices[0]!.text).toContain(reason);
+			if (receiptState) expect(f.notices[0]!.text).toContain(`receiptState=${receiptState}`);
+			expect(f.notices[0]!.text).toContain(`code=${outcome.code}`);
+			expect(f.notices[0]!.text).not.toContain("PRIVATE");
+			if (failure === "provider") expect(f.notices[0]!.text).toContain("providerCode=server_is_overloaded");
+			await f.restart();
+			expect(f.notices).toHaveLength(1);
+			expect(f.port.sends).toHaveLength(1);
+			expect(terminate).not.toHaveBeenCalled();
+			expect(f.port.resumes).toHaveLength(0);
+		});
+	}
+}
+
+test("#696 safe report keeps bounded causal fields for present receipts and rejects raw diagnostics", () => {
+	const text = reportText(
+		"a",
+		"failed",
+		"sdk_failed",
+		"gw-report",
+		{
+			disposition: "unavailable",
+			reads: 0,
+			nextReadAt: null,
+			excerpt: null,
+			proof: null,
+			knownSilence: null,
+		},
+		undefined,
+		{
+			status: "failed",
+			receiptState: "present",
+			error: { code: "agent_error", message: "PRIVATE error" },
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				providerCode: "PRIVATE_CODE",
+				phase: "post_start",
+				category: "provider_rejected",
+				provenance: "agent_failed",
+				failureCauseDiagnostic: "PRIVATE diagnostic",
+			},
+		},
+	);
+	expect(text).toContain("receiptState=present");
+	expect(text).toContain("code=prompt_failed");
+	expect(text).toContain("category=provider_rejected");
+	expect(text).not.toContain("PRIVATE");
+});
+
+test("#696 confirmed host death ends execution without replacing an observed provider failure", async () => {
+	const now = Date.now();
+	const f = await fixture({ now: () => now, hostLostGraceMs: 0 });
+	const result = await started(f, "a", origin);
+	const runtime = f.db.work.workAttemptGet(result.opRef)!;
+	let running: boolean | undefined = true;
+	let probes = 0;
+	Object.assign(f.port, {
+		turnRunning: async () => {
+			probes++;
+			return running;
+		},
+	});
+	f.port.liveness = async () => ({ live: false, disowned: false });
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		summaryCompleted: true,
+		status: {
+			status: "failed",
+			receiptState: "missing",
+			clientRef: input.opRef,
+			commandId: `command-${input.opRef}`,
+			turnId: `turn-${input.opRef}`,
+			startedAt: Date.parse(runtime.startedAt),
+			terminalAt: Date.parse(runtime.startedAt) + 1,
+			error: { code: "agent_error" },
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				providerCode: "server_is_overloaded",
+				phase: "post_start",
+				category: "provider_transport",
+				provenance: "agent_failed",
+			},
+		},
+	});
+	f.port.fetchWorkerOutput = async () => {
+		throw new Error("dead host must not trigger output retrieval");
+	};
+	await until(() => probes > 1);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({ terminal: null, settledAt: null });
+	running = undefined;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		terminal: { kind: "broker", reasonCode: "provider_transport", status: { receiptState: "missing" } },
+		turnEndObservedAt: expect.any(String),
+		output: { disposition: "unavailable", reads: 0 },
+	});
+	expect(f.notices).toHaveLength(1);
+	expect(f.notices[0]!.text).toContain("providerCode=server_is_overloaded");
+	expect(f.notices[0]!.text).toContain("receiptState=missing");
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+});
+
+for (const receiptState of ["missing", "unknown", "absent", undefined] as const) {
+	for (const reason of ["end_turn", undefined] as const) {
+		test(`#696 failed ${receiptState} receipt reconciles a proven late ${reason} body across recovery`, async () => {
+			let now = Date.now();
+			const f = await fixture({ now: () => now });
+			const result = await started(f, "a", origin);
+			f.port.complete(result.opRef, "original operation output");
+			const completed = await f.port.status({ sessionId: result.sessionId, repo: f.directory, opRef: result.opRef });
+			let queries = 0;
+			f.port.status = async () => {
+				queries++;
+				return {
+					...completed,
+					status: {
+						...completed.status,
+						status: "failed",
+						receiptState,
+						clientRef: result.opRef,
+						outcome: {
+							kind: "failed",
+							code: "prompt_failed",
+							phase: "post_start",
+							category: "provider_transport",
+							provenance: "agent_failed",
+							providerCode: "server_is_overloaded",
+						},
+						error: { code: "agent_error" },
+					},
+				};
+			};
+			let reads = 0;
+			f.port.fetchWorkerOutput = async (input) => {
+				if (++reads === 1) {
+					const initial = await f.port.status(input);
+					return parseWorkerOutputResponse(
+						input,
+						{
+							exitCode: 0,
+							stdout: JSON.stringify({ ok: true, result: { kind: "prompt", ...initial.status } }),
+							stderr: "",
+						},
+						now,
+					);
+				}
+				const text = "original operation output";
+				return parseWorkerOutputResponse(
+					input,
+					{
+						exitCode: 0,
+						stdout: JSON.stringify({
+							ok: true,
+							result: {
+								kind: "prompt",
+								...completed.status,
+								clientRef: result.opRef,
+								status: "terminal_ok",
+								receiptState: "present",
+								outcome: reason ? { reason } : undefined,
+								content: { version: 1, type: "text", text, byteLength: Buffer.byteLength(text), truncated: false },
+							},
+						}),
+						stderr: "",
+					},
+					now,
+				);
+			};
+			await until(() => queries > 0);
+			f.port.emitTurnEnd(result.sessionId, result.opRef, "agent_failed");
+			await until(() => reads === 1);
+			const before = f.db.work.workAttemptGet(result.opRef)!;
+			expect(before.terminal?.reasonCode).toBe("provider_transport");
+			expect(before.terminal?.status?.receiptState).toBe(receiptState);
+			expect(before.settledAt).toBeNull();
+			await f.restart();
+			now += 1000;
+			await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
+			const after = f.db.work.workAttemptGet(result.opRef)!;
+			expect(after.terminal?.status?.receiptState).toBe("present");
+			expect(after.terminal?.observedAt).toBe(before.terminal?.observedAt);
+			expect(after.terminal?.status?.commandId).toBe(before.terminal?.status?.commandId);
+			expect(after.terminal?.status?.turnId).toBe(before.terminal?.status?.turnId);
+			expect(after.terminal?.reasonCode).toBe(reason ?? "stopped_incomplete");
+			expect(f.job().attempts[0]?.endState).toBe(reason ? "completed" : "attempt_ended");
+			expect(after.output.proof?.opRef).toBe(result.opRef);
+			expect(reads).toBe(2);
+			expect(f.notices).toHaveLength(1);
+			await f.restart();
+			expect(f.notices).toHaveLength(1);
+			expect(f.port.sends).toHaveLength(1);
+			expect(f.port.resumes).toHaveLength(0);
+		});
+	}
+}
+
 test("late receipt after a missing-receipt terminal is reconciled once, without resend (#248)", async () => {
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
@@ -2993,7 +3315,7 @@ for (const endEvidence of ["idle", "dead", "receipt", "cancelled"] as const) {
 				terminal: {
 					kind: "broker",
 					observedAt: new Date(now).toISOString(),
-					reasonCode: "terminal_missing_receipt",
+					reasonCode: "prompt_deadline_exceeded",
 					status,
 				},
 			}),
@@ -3107,7 +3429,7 @@ for (const endEvidence of ["idle", "dead", "receipt", "cancelled"] as const) {
 		}
 		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 		expect(f.job().attempts[0]?.endState).toBe(
-			receipt ? (endEvidence === "cancelled" ? "attempt_ended" : "completed") : "terminal_missing_receipt",
+			receipt ? (endEvidence === "cancelled" ? "attempt_ended" : "completed") : "attempt_ended",
 		);
 		await f.restart();
 		expect(f.notices).toHaveLength(1);
@@ -3188,7 +3510,7 @@ test("an idle runtime reconciles a missing receipt after lost lifecycle, includi
 	await until(() => reads === 1);
 	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
 		turnEndObservedAt: expect.any(String),
-		terminal: { reasonCode: "terminal_missing_receipt" },
+		terminal: { reasonCode: "prompt_deadline_exceeded" },
 		settledAt: null,
 	});
 	// The positive execution-end observation survives a gateway restart.
@@ -3198,9 +3520,9 @@ test("an idle runtime reconciles a missing receipt after lost lifecycle, includi
 	now += 5000;
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	expect(reads).toBe(3);
-	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
+	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.notices.map((notice) => notice.text)).toEqual([
-		`[lane a] attempt_ended: terminal_missing_receipt: final_response_missing opRef=${result.opRef}`,
+		`[lane a] attempt_ended: prompt_deadline_exceeded: final_response_missing opRef=${result.opRef} receiptState=missing errorCode=prompt_deadline_exceeded`,
 	]);
 	await f.restart();
 	expect(f.notices).toHaveLength(1);
@@ -3296,9 +3618,15 @@ test("a cached missing receipt reconciles positive host death, not live or trans
 	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
 	now += 1;
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toMatchObject({ kind: "local", reasonCode: "session_dead" });
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toMatchObject({
+		kind: "broker",
+		reasonCode: "prompt_deadline_exceeded",
+	});
+	expect(f.db.work.workAttemptGet(result.opRef)?.turnEndObservedAt).toBeDefined();
 	expect(f.port.workerOutputReads).toEqual([]);
-	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] attempt_ended: session_dead: output_unavailable"]);
+	expect(f.notices.map((notice) => notice.text)).toEqual([
+		`[lane a] attempt_ended: prompt_deadline_exceeded: final_response_missing opRef=${result.opRef} receiptState=missing errorCode=prompt_deadline_exceeded`,
+	]);
 	await f.restart();
 	expect(f.notices).toHaveLength(1);
 	expect(f.port.sends).toHaveLength(1);
@@ -3374,7 +3702,7 @@ test("execution frames interrupt death grace during inspect and terminal revalid
 	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
 	now += 1;
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("prompt_deadline_exceeded");
 	expect(f.notices).toHaveLength(1);
 });
 
@@ -3709,7 +4037,7 @@ test("a dead activity observer is readopted without replay before idle reconcili
 	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
 	running = false;
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
+	expect(f.job().attempts[0]?.endState).toBe("failed");
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
 	expect(f.notices).toHaveLength(1);
@@ -3785,7 +4113,7 @@ test("real failed inspect envelopes cannot establish missing-receipt host death"
 	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
 	now += 1;
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("prompt_deadline_exceeded");
 	expect(f.notices).toHaveLength(1);
 });
 
@@ -3985,7 +4313,7 @@ for (const receiptReason of ["end_turn", undefined] as const) {
 		};
 		await until(() => reads === 1);
 		expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
-			terminal: { reasonCode: "terminal_missing_receipt" },
+			terminal: { reasonCode: "prompt_deadline_exceeded" },
 			settledAt: null,
 		});
 		await f.restart();
@@ -4054,19 +4382,27 @@ test("a receipt still missing after the output budget stays held with a non-loss
 	expect(f.port.sends).toHaveLength(1);
 });
 
-test("broker deadline ends the attempt but caller timeout never does", async () => {
+test("broker deadline without receipt requires execution-end proof; caller timeout never supplies it", async () => {
 	const f = await fixture();
 	const result = await started(f, "a", origin);
-	f.port.status = async (input) => ({
-		operationRef: input.opRef,
-		status: { status: "failed", error: { code: "prompt_deadline_exceeded", message: "secret" } },
-		summaryCompleted: true,
-	});
+	let queries = 0;
+	f.port.status = async (input) => {
+		queries++;
+		return {
+			operationRef: input.opRef,
+			status: { status: "failed", error: { code: "prompt_deadline_exceeded", message: "secret" } },
+			summaryCompleted: true,
+		};
+	};
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	await until(() => queries > 1);
+	expect(f.db.work.workAttemptOpen()).toHaveLength(1);
+	f.port.emitTurnEnd(result.sessionId, result.opRef, "agent_failed");
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.status?.error).toEqual({ code: "prompt_deadline_exceeded" });
-	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: prompt_deadline_exceeded: output_unavailable");
+	expect(f.notices[0]?.text).toContain("[lane a] attempt_ended: prompt_deadline_exceeded: output_unavailable");
+	expect(f.notices[0]?.text).toContain("errorCode=prompt_deadline_exceeded");
 });
 
 test("torn send accepts only same-op status evidence; unknown remains open with no resend", async () => {
@@ -4246,7 +4582,7 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
 				const opRef = f.job().attempts[0]!.opRef;
-				if (receiptState === "missing")
+				if (receiptState === "missing" || (status === "failed" && receiptState !== "present"))
 					f.port.emitTurnEnd(f.job().attempts[0]!.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
 				const runtime = f.db.work.workAttemptGet(opRef)!;
@@ -5087,7 +5423,7 @@ for (const stage of ["status", "inspect"] as const) {
 			const terminal = {
 				kind: "broker" as const,
 				observedAt: new Date(now).toISOString(),
-				reasonCode: "terminal_missing_receipt",
+				reasonCode: "prompt_deadline_exceeded",
 				status: {
 					status: "failed" as const,
 					clientRef: result.opRef,
@@ -5228,7 +5564,7 @@ test("transport failure ECONNRESET without errorStatus yields transport cause in
 	});
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	const attempt = f.db.work.workAttemptGet(result.opRef);
-	expect(attempt?.terminal?.reasonCode).toBe("terminal_missing_receipt");
+	expect(attempt?.terminal?.reasonCode).toBe("sdk_failed");
 	expect(attempt?.output?.transportCause).toEqual({
 		kind: "transport",
 		nativeErrorCode: "ECONNRESET",

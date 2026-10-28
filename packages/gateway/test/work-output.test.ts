@@ -210,6 +210,26 @@ test("exact current clientRef is supported without fabricating optional command 
 	});
 });
 
+for (const receiptState of ["missing", "unknown", "absent", undefined] as const) {
+	test(`#696 validated failed ${receiptState} receipt remains pending without admitting unproven content`, () => {
+		const failure = terminal("", { status: "failed", receiptState, content: undefined });
+		expect(parse(failure)).toEqual({ status: "absent", code: "output_pending" });
+		for (const malformed of [
+			{ ...failure, receiptState: "PRIVATE" },
+			{ ...failure, receiptState: "present" },
+			{ ...failure, content: terminal("unproven").content },
+			{ ...failure, textSummary: "unproven" },
+			{ ...failure, terminalAt: floor - 1 },
+		])
+			expect(parse(malformed)).toEqual({ status: "unavailable", code: "invalid_evidence" });
+		expect(parse({ ...failure, clientRef: "foreign-operation" })).toEqual({
+			status: "unavailable",
+			code: "identity_mismatch",
+		});
+		expect(parse({ ...failure, turnId: "foreign-turn" })).toEqual({ status: "unavailable", code: "identity_mismatch" });
+	});
+}
+
 test("absence is retryable, affirmative missing authority is unavailable, and transport diagnostics stay private", async () => {
 	expect(parse({ status: "unknown" })).toEqual({ status: "absent", code: "output_pending" });
 	expect(parse(terminal("", { status: "in_flight", content: undefined }))).toEqual({
