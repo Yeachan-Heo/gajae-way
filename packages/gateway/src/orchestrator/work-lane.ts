@@ -40,6 +40,7 @@ import { buildDeliveryPayload } from "../delivery/delivery";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
 	type LaneReportRow,
+	WORK_REFUSAL_CODES as refusalCodes,
 	resolveLaneReportOrigin,
 	terminalEvidence,
 	type WorkAttemptAdmission,
@@ -115,15 +116,6 @@ const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
 /** Bound concurrent GitHub/remote probes so one slow lane does not serialize recovery. */
 const AWAITING_CHECKS_POLL_CONCURRENCY = 16;
 
-const refusalCodes = new Set([
-	"busy",
-	"steer_refused",
-	"invalid_params",
-	"not_running",
-	"no_active_turn",
-	"client_ref_conflict",
-	"session_not_found",
-]);
 const pendingOutput = () => ({
 	disposition: "pending" as const,
 	reads: 0,
@@ -568,7 +560,7 @@ export class WorkLaneManager {
 						: {}),
 				}
 			: undefined;
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts, terminal.refusalCode);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -1043,6 +1035,7 @@ export class WorkLaneManager {
 		}
 		let accepted = false;
 		let rejected = false;
+		let refusalCode: string | undefined;
 		let source: "receipt" | "status" = "receipt";
 		try {
 			const receipt = await this.#port.send({
@@ -1060,6 +1053,7 @@ export class WorkLaneManager {
 			accepted = receipt.operationRef === opRef && receipt.sessionId === runtime.sessionId;
 		} catch (error) {
 			rejected = definitiveRefusal(error);
+			if (rejected) refusalCode = safeRefusal(error);
 			const code =
 				typeof error === "object" && error !== null && "details" in error
 					? (error.details as { code?: unknown } | undefined)?.code
@@ -1100,7 +1094,14 @@ export class WorkLaneManager {
 					: {
 							sendPhase: "uncertain",
 							...(rejected
-								? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" } as const }
+								? {
+										terminal: {
+											kind: "local",
+											observedAt: this.#at(),
+											reasonCode: "send_rejected",
+											refusalCode,
+										} as const,
+									}
 								: {}),
 						},
 			) ?? latest;
@@ -1896,7 +1897,7 @@ export class WorkLaneManager {
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
-			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
+			const text = reportText(name, endState, reason, runtime.opRef, output, facts, runtime.terminal?.refusalCode);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -2614,7 +2615,7 @@ export class WorkLaneManager {
 						}
 						return (
 							this.#updateAttempt(latest.opRef, latest.version, {
-								terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+								terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected", refusalCode: "busy" },
 							}) !== undefined
 						);
 					});
@@ -2950,7 +2951,7 @@ function parseInput(params: unknown): WorkInput {
 function workError(
 	message: string,
 	reasonCode: string,
-	runtime: { jobId: string; opRef: string; sessionId: string },
+	runtime: { jobId: string; opRef: string; sessionId: string; terminal?: WorkAttemptTerminalEvidence | null },
 	clientRef?: string,
 ): ProtocolError {
 	return new ProtocolError("verb_failed", message, {
@@ -2958,6 +2959,7 @@ function workError(
 		jobId: runtime.jobId,
 		opRef: runtime.opRef,
 		sessionId: runtime.sessionId,
+		...(reasonCode === "send_rejected" && runtime.terminal?.refusalCode ? { cause: runtime.terminal.refusalCode } : {}),
 		...(clientRef ? { clientRef } : {}),
 	});
 }
@@ -3167,6 +3169,7 @@ export function reportText(
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
+	refusalCode?: string,
 ): string {
 	const checks = facts?.checkStatus;
 	const checksVerified =
@@ -3180,12 +3183,20 @@ export function reportText(
 		endState === "completed" && checksVerified ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
+	const safeRefusalCode =
+		reason === "send_rejected" && refusalCode && (refusalCodes.has(refusalCode) || refusalCode === "sdk_refused")
+			? refusalCode
+			: undefined;
 	let body =
 		output.disposition === "unavailable"
-			? reason === "terminal_missing_receipt"
-				? `final_response_missing opRef=${opRef}`
-				: "output_unavailable"
+			? safeRefusalCode === "busy"
+				? "prompt_not_accepted"
+				: reason === "terminal_missing_receipt"
+					? `final_response_missing opRef=${opRef}`
+					: "output_unavailable"
 			: (output.excerpt ?? "");
+	// A client-ref conflict can name already-admitted work; only busy proves non-admission here.
+	if (output.disposition === "unavailable" && safeRefusalCode) body += ` cause=${safeRefusalCode}`;
 	// Include transport cause details if present
 	if (reason === "terminal_missing_receipt" && output.transportCause) {
 		const transport = output.transportCause;

@@ -12,6 +12,7 @@ import {
 	closeAttempt,
 	createLaneJobRecord,
 	GjcCliError,
+	OpRefRejectedError,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
@@ -1143,7 +1144,7 @@ test("live unknown restart observes without replay or false acceptance", async (
 });
 
 /** Real owned prompt journal and relay; no SDK process or host is launched. */
-async function interruptedBusyWorkFixture() {
+async function interruptedBusyWorkFixture(exhaustWait = false) {
 	const f = await fixture();
 	const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
 	const sessionId = "7d1f2c3a-0b4e-4c5d-8e6f-9a0b1c2d3e4f";
@@ -1180,13 +1181,19 @@ async function interruptedBusyWorkFixture() {
 		throw new Error(`unexpected relay operation ${request.operation}`);
 	});
 	let sleeps = 0;
+	let now = Date.now();
 	const realPort = new BrokerSessionPort({
 		database: f.db,
 		authority,
 		cli,
 		tailRunner: new TailRunner({ stream: relay.spawn, repo: f.directory }),
-		sleep: async () => {
+		now: () => now,
+		sleep: async (ms) => {
 			sleeps++;
+			if (exhaustWait) {
+				now += ms;
+				return;
+			}
 			throw new Error("interrupted after durable busy refusal");
 		},
 	});
@@ -1194,6 +1201,7 @@ async function interruptedBusyWorkFixture() {
 	let sendInput: SessionSendInput | undefined;
 	let refusalReads = 0;
 	let terminateCalls = 0;
+	let outputReads = 0;
 	port.bind = (input) => realPort.bind(input);
 	port.attachTail = (input) => realPort.attachTail(input);
 	port.status = (input) => realPort.status({ ...input, relay: input.relay as TailHandle | undefined });
@@ -1207,27 +1215,30 @@ async function interruptedBusyWorkFixture() {
 		sendInput = saved;
 		return realPort.send(input);
 	};
-	port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
+	port.fetchWorkerOutput = async () => {
+		outputReads++;
+		return { status: "unavailable", code: "output_unavailable" };
+	};
 	port.terminateHost = async () => {
 		terminateCalls++;
 		throw new Error("busy refusal must not terminate the occupied host");
 	};
 	f.setOwnerTarget(origin);
 	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
-		detail: { reasonCode: "send_acceptance_uncertain" },
+		detail: exhaustWait ? { reasonCode: "send_rejected", cause: "busy" } : { reasonCode: "send_acceptance_uncertain" },
 	});
 	await f.manager.stop();
 	if (!sendInput) throw new Error("missing real prompt submission");
 	const input = sendInput;
 	const scope = JSON.stringify([sessionId, input.opRef]);
 	const journal = () => f.db.bindings.brokerOperation(authority, "turn.prompt", scope);
-	expect(sleeps).toBe(1);
+	expect(sleeps).toBe(exhaustWait ? 300 : 1);
 	expect(journal()).toMatchObject({ state: "complete" });
 	expect(realPort.promptRefusal(input)).toBe("busy");
 	expect(f.db.work.workAttemptGet(input.opRef)).toMatchObject({
 		sendPhase: "uncertain",
 		sendEvidence: null,
-		terminal: null,
+		terminal: exhaustWait ? { kind: "local", reasonCode: "send_rejected", refusalCode: "busy" } : null,
 		settledAt: null,
 	});
 	return {
@@ -1242,6 +1253,7 @@ async function interruptedBusyWorkFixture() {
 		input,
 		journal,
 		refusalReads: () => refusalReads,
+		outputReads: () => outputReads,
 		assertNoHostMutation: () => {
 			expect(port.steers).toHaveLength(0);
 			expect(port.closes).toHaveLength(0);
@@ -1254,6 +1266,25 @@ async function interruptedBusyWorkFixture() {
 	};
 }
 
+test("exhausted busy wait proves non-admission, not missing output, without executing or terminating a host", async () => {
+	const f = await interruptedBusyWorkFixture(true);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(301);
+	expect((await f.realPort.status(f.input)).status.status).toBe("unknown");
+	await f.restart();
+	await until(() => f.db.work.workAttemptGet(f.input.opRef)?.settledAt != null);
+	expect(f.notices.map((notice) => notice.text)).toEqual([
+		"[lane a] failed: send_rejected: prompt_not_accepted cause=busy",
+	]);
+	expect(f.outputReads()).toBe(0);
+	expect(f.db.work.workAttemptGet(f.input.opRef)?.output.reads).toBe(0);
+	expect(f.job().attempts[0]).toMatchObject({ endState: "failed", errorCode: "send_rejected" });
+	expect(f.job().state).toBe("awaiting_operator");
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(f.relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(301);
+	f.assertNoHostMutation();
+});
+
 test("restart settles a journaled busy refusal locally once without replay or native terminal proof", async () => {
 	const f = await interruptedBusyWorkFixture();
 	const opRef = f.input.opRef;
@@ -1262,12 +1293,14 @@ test("restart settles a journaled busy refusal locally once without replay or na
 	expect(f.db.work.workAttemptGet(opRef)).toMatchObject({
 		sendPhase: "uncertain",
 		sendEvidence: null,
-		terminal: { kind: "local", reasonCode: "send_rejected" },
+		terminal: { kind: "local", reasonCode: "send_rejected", refusalCode: "busy" },
 	});
 	expect(f.db.work.workAttemptGet(opRef)?.terminal?.status).toBeUndefined();
 	expect(f.job().attempts[0]?.endState).toBe("failed");
 	expect(f.job().state).toBe("awaiting_operator");
-	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] failed: send_rejected: output_unavailable"]);
+	expect(f.notices.map((notice) => notice.text)).toEqual([
+		"[lane a] failed: send_rejected: prompt_not_accepted cause=busy",
+	]);
 	expect(f.db.outbox.rows()).toHaveLength(1);
 	for (let i = 0; i < 2; i++) {
 		manager = await f.restart();
@@ -1311,6 +1344,7 @@ async function settleBusyWork(f: Awaited<ReturnType<typeof interruptedBusyWorkFi
 	expect(f.db.work.workAttemptGet(f.input.opRef)?.terminal).toMatchObject({
 		kind: "local",
 		reasonCode: "send_rejected",
+		refusalCode: "busy",
 	});
 	expect(f.notices).toHaveLength(1);
 }
@@ -4099,13 +4133,74 @@ test("definitive send rejection atomically holds and enqueues one safe start-onl
 	};
 	f.setOwnerTarget(origin);
 	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
-		detail: { reasonCode: "send_rejected" },
+		detail: { reasonCode: "send_rejected", cause: "busy" },
 	});
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("failed");
 	expect(f.job().state).toBe("awaiting_operator");
-	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: prompt_not_accepted cause=busy");
 	expect(f.db.outbox.rows()).toHaveLength(1);
+});
+
+test("unknown SDK rejection codes are redacted in durable evidence, errors and reports", async () => {
+	const f = await fixture();
+	f.port.send = async (input) => {
+		throw new OpRefRejectedError(input.opRef, "private-code-secret", { message: "private details" });
+	};
+	f.setOwnerTarget(origin);
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		detail: { reasonCode: "send_rejected", cause: "sdk_refused" },
+	});
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	const attempt = f.job().attempts[0]!;
+	expect(f.db.work.workAttemptGet(attempt.opRef)?.terminal).toMatchObject({ refusalCode: "sdk_refused" });
+	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable cause=sdk_refused");
+});
+
+test("client-ref conflict retains its safe cause without asserting that logical work was never admitted", async () => {
+	const f = await fixture();
+	let submissions = 0;
+	let outputReads = 0;
+	f.port.send = async (input) => {
+		submissions++;
+		throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { message: "already used reference" });
+	};
+	f.port.fetchWorkerOutput = async () => {
+		outputReads++;
+		throw new Error("local rejection must not query output");
+	};
+	f.setOwnerTarget(origin);
+	await expect(f.manager.start({ name: "a", text: "work", cwd: f.directory })).rejects.toMatchObject({
+		detail: { reasonCode: "send_rejected", cause: "client_ref_conflict" },
+	});
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	const attempt = f.job().attempts[0]!;
+	expect(f.db.work.workAttemptGet(attempt.opRef)?.terminal).toMatchObject({ refusalCode: "client_ref_conflict" });
+	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable cause=client_ref_conflict");
+	expect(f.job().state).toBe("awaiting_operator");
+	await f.restart();
+	expect(f.notices).toHaveLength(1);
+	expect(submissions).toBe(1);
+	expect(outputReads).toBe(0);
+	expect(f.port.steers).toHaveLength(0);
+	expect(f.port.closes).toHaveLength(0);
+});
+
+test("rejection report never exposes unvalidated cause and preserves unavailable completed output", () => {
+	const output = {
+		disposition: "unavailable" as const,
+		reads: 0,
+		nextReadAt: null,
+		excerpt: null,
+		proof: null,
+		knownSilence: null,
+	};
+	expect(reportText("a", "failed", "send_rejected", "op-ref", output, undefined, "private secret")).toBe(
+		"[lane a] failed: send_rejected: output_unavailable",
+	);
+	expect(reportText("a", "completed", "end_turn", "op-ref", output, undefined, "busy")).toBe(
+		"[lane a] completed: output_unavailable",
+	);
 });
 
 test("CAS loss does not fan out or perform a separate history/activity update", async () => {
