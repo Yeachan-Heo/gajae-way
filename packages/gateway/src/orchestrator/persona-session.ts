@@ -63,11 +63,7 @@ export const STALLED_TURN_TERMINAL_TIMEOUT_MS = 10 * 60_000;
 const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
-/**
- * Consecutive status reads answering "the broker no longer serves this session"
- * (`endpoint_stale`) after which an escalated hold is closed as abandoned (#715).
- */
-const ESCALATED_HOLD_SESSION_GONE_READS = 3;
+
 /**
  * Grace before a decidable-terminal status may complete a turn whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
@@ -1910,6 +1906,13 @@ class OriginActor {
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
 			if (await this.#escalateUnresolvedHold(turn, undefined)) return;
+			// An already-escalated bound row must be adopted into retired reconciliation
+			// to be reconciled by the periodic sweep, without re-sending the escalation (#715).
+			if (this.#manager.database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) {
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, false);
+				await this.#reconcileBound(bound, status);
+				return;
+			}
 			this.#logRecoveryHoldOnce(turn, "operation_state_unknown");
 			return;
 		}
@@ -4051,15 +4054,8 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			// An escalated hold already told the user; once the broker keeps saying it
-			// no longer serves the session, nothing can answer it: close it (#715).
-			const escalated = this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined;
-			bound.sessionGoneReads =
-				escalated && sdkStatusErrorCode(error) === "session_unavailable" ? bound.sessionGoneReads + 1 : 0;
-			if (bound.sessionGoneReads >= ESCALATED_HOLD_SESSION_GONE_READS) {
-				await this.#closeAbandonedEscalatedHold(bound, error);
-				return;
-			}
+			// Broker unavailability (session_unavailable) does not prove operation completion;
+			// keep the escalated hold open until confirmed terminal status or stalled exit (#715).
 			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -4075,6 +4071,8 @@ class OriginActor {
 		if (report.status.status === "unknown") {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
+			// A successful status read (even "unknown") resets the session-gone streak (#715).
+			bound.sessionGoneReads = 0;
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
 			if ((state === "accepted" || state === "bound") && bound.stallHostTerminated) {
 				await this.#closeTerminatedStalledTurn(bound);
@@ -4619,27 +4617,7 @@ class OriginActor {
 		await this.#settleAfterTerminal(bound);
 	}
 
-	/**
-	 * Closes an escalated hold whose session the broker keeps reporting gone.
-	 * The user already got the hold notice and the request is never resent, so
-	 * the trigger closes as `retired`; only this turn's own row is touched (#715).
-	 */
-	async #closeAbandonedEscalatedHold(bound: BoundTurn, error: unknown): Promise<void> {
-		const database = this.#manager.database;
-		const completed = database.transaction((tx) => completeInboundTurn(database, tx, bound.turn.opRef, "retired"));
-		for (const held of database.inbox.steersHeld(bound.turn.opRef))
-			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
-		this.#manager.log(
-			`retired_turn_closed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=escalated_hold_session_gone reads=${bound.sessionGoneReads} detail=${safeDiagnostic(error)}`,
-			"warn",
-		);
-		if (completed === 0) {
-			await this.#forgetClosed(bound);
-			return;
-		}
-		await this.#notifySettled(bound);
-		await this.#settleAfterTerminal(bound);
-	}
+
 
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {

@@ -5678,6 +5678,161 @@ test("external epoch rotation fences the observer before it can enqueue a notice
 	expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
 });
 
+test("P2-2: escalated hold with interleaved successful status reads does not close on endpoint_stale", async () => {
+	class InterleavedSuccessPort extends WedgedSessionPort {
+		readCount = 0;
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			this.readCount++;
+			// Pattern: stale (1) -> success (2) -> stale (3) -> success (4) -> stale (5) -> should NOT close
+			const mod = this.readCount % 2;
+			if (mod === 1) throw endpointStale();
+			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
+		}
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			return { live: false, disowned: false }; // Dead host to trigger escalation
+		}
+	}
+	const port = new InterleavedSuccessPort();
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line), { unresolvedHoldMs: 50 });
+
+	enqueue("m-1", "question");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "send did not occur");
+	const send = port.sends[0]!;
+
+	// Advance time to trigger escalation
+	await Bun.sleep(60);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes("unresolved_hold_escalated")),
+		"escalation did not occur",
+	);
+
+	// Now perform multiple status reads with interleaved success
+	// Reads 1,3,5 are stale, 2,4 are success -> after 3 stale with successes between, should NOT close
+	for (let i = 0; i < 5; i++) {
+		await manager!.tick(KEY);
+		await Bun.sleep(5);
+	}
+
+	// The turn should still be held, not closed as 'retired'
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).not.toBe("done");
+	const closedLogs = logs.filter((line) => line.includes("retired_turn_closed"));
+	expect(closedLogs.length).toBe(0);
+});
+
+test("P2-3: restart with already-escalated bound turn adopts it into retired reconciliation", async () => {
+	class DropOnDemandPort extends DroppedSessionPort {
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			if (this.dropped.has(input.sessionId)) return { live: false, disowned: false };
+			return await super.liveness(input);
+		}
+	}
+	const port = new DropOnDemandPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line), { unresolvedHoldMs: 50 });
+
+	enqueue("m-1", "question");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "send did not occur");
+	const send = port.sends[0]!;
+
+	// Make broker unavailable to cause status reads to fail
+	port.dropped.add(send.sessionId);
+
+	// Trigger hold escalation by waiting and advancing time
+	await Bun.sleep(60);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes("unresolved_hold_escalated")),
+		"escalation did not occur",
+	);
+
+	// Verify escalation marker was persisted
+	const escalatedKey = `escalated-hold:${send.opRef}`;
+	const hasMarker = database!.core.metaGet(escalatedKey) !== undefined;
+	expect(hasMarker).toBe(true);
+
+	// Now restart the manager (simulating process restart)
+	const oldManager = manager;
+	await oldManager!.stop();
+	const oldDatabase = database;
+	const oldHome = home;
+
+	// Reopen database with same storage
+	database = await Store.open(join(oldHome, "gateway.db"));
+	registerFixtureBindings(port);
+	const newLogs: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(oldHome, "workspace"),
+		log: (line) => newLogs.push(line),
+		unresolvedHoldMs: 50,
+	});
+
+	// Run recovery which should adopt the bound escalated turn
+	await manager!.recover();
+	await manager!.tick(KEY);
+
+	// The escalation marker should still exist (not re-sent)
+	expect(database!.core.metaGet(escalatedKey)).not.toBeUndefined();
+
+	// The turn should still be tracked and not abandoned
+	const turnRow = database!.inbox.turnRow(send.opRef);
+	expect(turnRow).toBeDefined();
+	expect(turnRow!.turn_state).not.toBe("done");
+
+	// Logs should show recovery adopted it, not that it was lost
+	const recoveryHoldLogs = newLogs.filter(
+		(line) => line.includes("recovery_hold") && line.includes(send.opRef),
+	);
+	expect(recoveryHoldLogs.length).toBeGreaterThan(0);
+});
+
+test("P2-1: endpoint_stale errors alone do not close an escalated hold without terminal evidence", async () => {
+	class OnlyStalePort extends DroppedSessionPort {
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			if (this.dropped.has(input.sessionId)) throw endpointStale();
+			return await super.status(input);
+		}
+	}
+	const port = new OnlyStalePort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line), { unresolvedHoldMs: 50 });
+
+	enqueue("m-1", "question");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "send did not occur");
+	const send = port.sends[0]!;
+
+	// Drop session to get endpoint_stale
+	port.dropped.add(send.sessionId);
+
+	// Trigger escalation
+	await Bun.sleep(60);
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes("unresolved_hold_escalated")),
+		"escalation did not occur",
+	);
+
+	// Perform multiple ticks to read status repeatedly - should hit stale errors
+	for (let i = 0; i < 10; i++) {
+		await manager!.tick(KEY);
+		await Bun.sleep(5);
+	}
+
+	// The turn should remain held, not closed as 'retired' on stale errors alone
+	const turnRow = database!.inbox.turnRow(send.opRef);
+	expect(turnRow?.turn_state).not.toBe("done");
+
+	const closedLogs = logs.filter((line) => line.includes("retired_turn_closed"));
+	expect(closedLogs.length).toBe(0);
+});
+
 test("a notice during a gateway turn steers its gateway framing without lane-report wording", async () => {
 	const f = await agentObserverFixture();
 	enqueue("platform-successor", "current user question");
