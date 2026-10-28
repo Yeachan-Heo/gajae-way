@@ -1129,24 +1129,21 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			try {
 				const outcome = await personaSessions.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS);
 				if (outcome !== "timed_out" && outcome !== "drained") return;
-				// During a normal restart-stack the detached supervisor is still restarting dependent services
+				// During a normal restart-stack or update, the supervisor is still restarting dependent services
 				// and releases this drain itself once the sequence finishes. Only a drain whose supervisor
-				// exited without releasing it is orphaned.
+				// exited without releasing it, with no update lease left, is orphaned.
 				for (;;) {
 					const stack = readStack();
 					if (stack?.id !== restartDrainId || personaSessions.restartDrainId !== restartDrainId) return;
-					if (typeof stack.supervisorPid !== "number" || !defaultPidAlive(stack.supervisorPid)) break;
+					const supervisorAlive = typeof stack.supervisorPid === "number" && defaultPidAlive(stack.supervisorPid);
+					// An `update` holds its lease across the whole stack restart, including after a supervisor
+					// handoff; the lease is a flock, so it also clears when its holder dies.
+					if (!supervisorAlive && !(await leaseHeld(options.config.home, "update"))) break;
 					await Bun.sleep(PERSISTED_RESTART_SUPERVISOR_POLL_MS);
 				}
 				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
 				// and is reported as `restart_drain_held` readiness.
 				if (readStack()?.state === "indeterminate") return;
-				// Release the inherited fence only when the restart-stack update lease is gone
-				// AND the receipt still names the same drain id. Otherwise keep it held.
-				if (await leaseHeld(options.config.home, "update")) {
-					console.info(`persisted restart drain held on boot: update lease still active id=${restartDrainId}`);
-					return;
-				}
 				if (!(await personaSessions.cancelRestartDrain(restartDrainId))) return;
 				try {
 					const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;

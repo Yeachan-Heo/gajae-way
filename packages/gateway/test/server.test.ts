@@ -4875,7 +4875,7 @@ for (const [state, supervisor, held] of [
 		}
 	});
 
-test("#713: supervisor dead but update lease held keeps drain fenced on boot", async () => {
+test("#713: an update lease keeps an inherited drain fenced until it is released", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-lease-held-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -4902,6 +4902,7 @@ test("#713: supervisor dead but update lease held keeps drain fenced on boot", a
 	);
 	// Hold the update lease to prevent fence release
 	const updateLease = await acquireHomeLease(directory, "update");
+	let leaseReleased = false;
 	try {
 		const database = await Store.open(config.dbPath);
 		const sessionPort = sessionPortFromResponder({
@@ -4939,12 +4940,27 @@ test("#713: supervisor dead but update lease held keeps drain fenced on boot", a
 			expect(readiness.failureThreshold).toBeDefined();
 			expect(readiness.failure?.at).toBeDefined();
 			expect(readiness.failure?.consecutiveFailures).toBe(1);
+
+			// Once the update finishes (or dies) without releasing the drain, it is orphaned and released.
+			await updateLease.release();
+			leaseReleased = true;
+			const releaseDeadline = Date.now() + 5_000;
+			while (Date.now() < releaseDeadline) {
+				const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+				if (stackContent.id === undefined) break;
+				await Bun.sleep(50);
+			}
+			expect((JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>).id).toBeUndefined();
+			client.send({ v: "0.1", type: "request", id: "status-released", verb: "gateway.status" });
+			await client.waitForFrame("status-released");
+			const released = client.frames.find((frame) => frame.id === "status-released")?.result.readiness;
+			expect(released?.failure?.code).not.toBe("restart_drain_held");
 			client.close();
 		} finally {
 			await server?.stop();
 			server = undefined;
 		}
 	} finally {
-		await updateLease.release();
+		if (!leaseReleased) await updateLease.release();
 	}
 });
