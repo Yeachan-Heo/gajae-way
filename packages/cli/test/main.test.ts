@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import { type OpsCycleResult, type OpsSloResult, ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -1272,6 +1272,284 @@ describe("work operator commands", () => {
 		expect(output.connections).toBe(0);
 		expect(output.errors.join(" ")).toContain("--repo");
 	});
+
+	const successorBase = "1234567890abcdef1234567890abcdef12345678";
+	const successorOptions = [
+		["--successor-of", "original"],
+		["--source-op", "op-original"],
+		["--source-session", "session-original"],
+		["--acknowledge-unresolved"],
+	];
+
+	test("work start forwards explicit successor authorization with repository, immutable base, model and caller", async () => {
+		const output = await run(
+			[
+				"start",
+				"replacement",
+				"--repo",
+				".",
+				"--base",
+				successorBase,
+				...successorOptions.flat(),
+				"--preset",
+				"reliable",
+				"review",
+				"and recover",
+			],
+			{
+				started: true,
+				jobId: "job-new",
+				opRef: "op-new",
+				sessionKey: "work/task/replacement",
+				sessionId: "session-new",
+			},
+			"caller-session",
+		);
+		expect(output.requests).toEqual([
+			{
+				verb: "work.start",
+				params: {
+					name: "replacement",
+					text: "review and recover",
+					repo: resolve("."),
+					base: successorBase,
+					model: { preset: "reliable" },
+					callerSessionId: "caller-session",
+					successorOf: {
+						name: "original",
+						opRef: "op-original",
+						sessionId: "session-original",
+						acknowledgeUnresolved: true,
+					},
+				},
+			},
+		]);
+		expect(output.errors).toEqual([]);
+		expect(output.lines).toEqual(["started: work/task/replacement session=session-new job=job-new op=op-new"]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work start identifies an idempotent successor receipt as already started", async () => {
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			{
+				started: true,
+				alreadyStarted: true,
+				jobId: "job-new",
+				opRef: "op-new",
+				sessionKey: "work/task/replacement",
+				sessionId: "session-new",
+			},
+		);
+		expect(output.lines).toEqual(["already started: work/task/replacement session=session-new job=job-new op=op-new"]);
+		expect(output.requests).toHaveLength(1);
+	});
+
+	for (const reasonCode of [
+		"successor_name_already_bound",
+		"successor_source_changed",
+		"successor_already_authorized",
+		"successor_repository_mismatch",
+		"successor_request_mismatch",
+		"successor_report_owner_mismatch",
+		"successor_requires_missing_execution_end",
+	]) {
+		test(`work successor displays the safe refusal reason ${reasonCode} without private detail`, async () => {
+			const output = await run(
+				["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+				new ProtocolError("invalid_params", "isolated successor refused", {
+					reasonCode,
+					diagnostic: "private diagnostic /secret/checkout",
+					successor: { name: "private-target", sessionId: "private-session" },
+				}),
+			);
+			expect(output.errors.join("\n")).toContain(reasonCode);
+			expect(output.errors.join("\n")).not.toContain("private");
+			expect(output.errors.join("\n")).not.toContain("/secret/checkout");
+			expect(output.lines).toEqual([]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("work successor displays the designated successor refusal without leaking the linked target", async () => {
+		const message = "successor already designated; inspect the original linked lane";
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", message, {
+				reasonCode: "successor_already_authorized",
+				successor: { name: "private-target", opRef: "private-op", sessionId: "private-session" },
+			}),
+		);
+		expect(output.errors.join("\n")).toContain(message);
+		expect(output.errors.join("\n")).toContain("successor_already_authorized");
+		expect(output.errors.join("\n")).not.toContain("private");
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work successor displays the reviewed base mismatch without private detail", async () => {
+		const message = "successor checkout does not match the reviewed commit";
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", message, {
+				reasonCode: "successor_base_mismatch",
+				diagnostic: "private diagnostic /secret/checkout",
+			}),
+		);
+		expect(output.errors.join("\n")).toContain(message);
+		expect(output.errors.join("\n")).toContain("successor_base_mismatch");
+		expect(output.errors.join("\n")).not.toContain("private");
+		expect(output.errors.join("\n")).not.toContain("/secret/checkout");
+		expect(output.lines).toEqual([]);
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	for (const [label, detail] of [
+		["unknown reason", { reasonCode: "private-unknown-reason", diagnostic: "private diagnostic" }],
+		["obsolete reason", { reasonCode: "successor_checkout_not_isolated", diagnostic: "private diagnostic" }],
+		["missing reason", { diagnostic: "private diagnostic" }],
+		["non-string reason", { reasonCode: { code: "successor_source_changed", secret: "private" } }],
+		["array detail", [{ reasonCode: "successor_source_changed" }, "private"]],
+		["null detail", null],
+	] as const) {
+		test(`work successor leaves ${label} opaque`, async () => {
+			const output = await run(
+				["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+				new ProtocolError("invalid_params", "isolated successor refused", detail),
+			);
+			expect(output.errors).toEqual(["isolated successor refused"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const [label, args, error] of [
+		[
+			"ordinary start",
+			["start", "fix", "task"],
+			new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"work run",
+			["run", "fix", "task"],
+			new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"different error message",
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", "ordinary failure", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"different error code",
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("verb_failed", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+	] as const) {
+		test(`work successor reason rendering preserves unrelated ${label} errors`, async () => {
+			const output = await run([...args], error);
+			expect(output.errors).toEqual([error.message]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (let mask = 1; mask < 15; mask++) {
+		test(`work start rejects incomplete successor authorization ${mask} before connecting`, async () => {
+			const flags = successorOptions.filter((_, index) => mask & (1 << index)).flat();
+			const output = await run(["start", "replacement", "--repo", ".", "--base", successorBase, ...flags, "task"], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+			expect(output.errors.join(" ")).toContain("--successor-of");
+		});
+	}
+
+	for (const option of successorOptions) {
+		test(`work run rejects ${option[0]} alone before connecting`, async () => {
+			const output = await run(["run", "replacement", "--repo", ".", "--base", successorBase, ...option, "task"], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+		});
+	}
+
+	for (const option of successorOptions.slice(0, 3)) {
+		test(`work start rejects missing ${option[0]} value before connecting`, async () => {
+			const output = await run(["start", "replacement", "task", option[0]!], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+		});
+	}
+
+	for (const [label, command, name, repositoryFlags, recoveryFlags, extraFlags] of [
+		["run", "run", "replacement", ["--repo", ".", "--base", successorBase], successorOptions.flat(), []],
+		["missing repo", "start", "replacement", ["--base", successorBase], successorOptions.flat(), []],
+		["missing base", "start", "replacement", ["--repo", "."], successorOptions.flat(), []],
+		["branch base", "start", "replacement", ["--repo", ".", "--base", "dev"], successorOptions.flat(), []],
+		["abbreviated base", "start", "replacement", ["--repo", ".", "--base", "1234567"], successorOptions.flat(), []],
+		["non-hex base", "start", "replacement", ["--repo", ".", "--base", "g".repeat(40)], successorOptions.flat(), []],
+		[
+			"uppercase base",
+			"start",
+			"replacement",
+			["--repo", ".", "--base", successorBase.toUpperCase()],
+			successorOptions.flat(),
+			[],
+		],
+		[
+			"cwd",
+			"start",
+			"replacement",
+			["--repo", ".", "--base", successorBase],
+			successorOptions.flat(),
+			["--cwd", "/repo"],
+		],
+		["resume", "start", "replacement", ["--repo", ".", "--base", successorBase], successorOptions.flat(), ["--resume"]],
+		["same name", "start", "original", ["--repo", ".", "--base", successorBase], successorOptions.flat(), []],
+		[
+			"invalid source name",
+			"start",
+			"replacement",
+			["--repo", ".", "--base", successorBase],
+			["--successor-of", "bad/name", ...successorOptions.slice(1).flat()],
+			[],
+		],
+		...successorOptions.map(
+			(option) =>
+				[
+					"duplicate " + option[0],
+					"start",
+					"replacement",
+					["--repo", ".", "--base", successorBase],
+					successorOptions.flat(),
+					option,
+				] as const,
+		),
+		...successorOptions
+			.slice(0, 3)
+			.map(
+				(option, index) =>
+					[
+						"blank " + option[0],
+						"start",
+						"replacement",
+						["--repo", ".", "--base", successorBase],
+						successorOptions.flatMap((entry, entryIndex) => (entryIndex === index ? [entry[0]!, " "] : entry)),
+						[],
+					] as const,
+			),
+	] as const) {
+		test(`work successor rejects ${label} before connecting`, async () => {
+			const output = await run([command, name, ...repositoryFlags, ...recoveryFlags, ...extraFlags, "task"], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+			expect(output.errors.join(" ")).toContain("--successor-of");
+		});
+	}
 
 	for (const command of ["run", "start"]) {
 		test(`work ${command} prints held without claiming acceptance`, async () => {

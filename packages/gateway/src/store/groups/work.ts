@@ -4,6 +4,7 @@ import {
 	isSilentOutput,
 	type OriginRef,
 	originKey,
+	parseOriginKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import {
@@ -60,6 +61,10 @@ export type WorkParent =
 			readonly triggerMessageId?: string;
 	  }
 	| { readonly kind: "lane"; readonly name: string; readonly root: WorkReportRoot | null };
+
+export type WorkAuthorizationOwner =
+	| { readonly kind: "persona"; readonly originKey: string }
+	| { readonly kind: "lane"; readonly name: string; readonly rootOriginKey: string | null };
 
 export interface WorkAttemptOutputProof {
 	readonly opRef: string;
@@ -138,6 +143,16 @@ export interface WorkAttemptRuntime {
 	readonly cwd: string;
 	readonly startedAt: string;
 	readonly mode: WorkAttemptMode;
+	readonly successorOf?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+		readonly baseSha: string;
+		readonly authorizedAt: string;
+	};
+	/** Privacy-safe identity of the original successor request; immutable with its link. */
+	readonly successorRequestFingerprint?: string;
+	readonly successor?: { readonly name: string; readonly opRef: string; readonly sessionId: string };
 	readonly sendPhase: "prepared" | "accepted" | "uncertain";
 	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
 	/** Turn-end proof from lifecycle or live idle reconciliation; a missing receipt alone is not proof. */
@@ -145,6 +160,7 @@ export interface WorkAttemptRuntime {
 	readonly terminal: WorkAttemptTerminalEvidence | null;
 	readonly output: WorkAttemptOutput;
 	readonly parent: WorkParent | null;
+	readonly authorizationOwner?: WorkAuthorizationOwner | null;
 	readonly reportId: string;
 	readonly wakeReportId: string | null;
 	readonly noticeHash: string | null;
@@ -155,7 +171,7 @@ export interface WorkAttemptRuntime {
 }
 
 export type WorkAttemptPatch = Partial<
-	Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "turnEndObservedAt" | "terminal" | "output">
+	Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "turnEndObservedAt" | "terminal" | "output" | "successor">
 >;
 export interface WorkAttemptSettlement extends WorkAttemptPatch {
 	readonly decision: WorkAttemptRequestedDecision;
@@ -310,6 +326,17 @@ export function validateWorkParent(parent: WorkParent, mode: WorkAttemptMode): v
 	if (parent.root !== null) validateWorkRoot(parent.root);
 }
 
+function validateAuthorizationOrigin(key: unknown): void {
+	workAssert(typeof key === "string");
+	let origin: OriginRef;
+	try {
+		origin = parseOriginKey(key);
+	} catch {
+		throw new WorkAttemptStateError(undefined, "authorization origin key is canonical");
+	}
+	workAssert(["discord", "slack", "telegram", "loopback"].includes(origin.platform));
+}
+
 export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): void {
 	workAssert(value && typeof value === "object");
 	workAssert(workString(value.opRef));
@@ -321,12 +348,47 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 	workAssert(Number.isSafeInteger(value.epoch) && value.epoch >= 0);
 	workAssert(workString(value.cwd, 4096) && value.cwd.startsWith("/") && workTime(value.startedAt));
 	workAssert(["start", "run", "historical"].includes(value.mode));
+	for (const link of [value.successorOf, value.successor]) {
+		if (link === undefined) continue;
+		workAssert(link && typeof link === "object");
+		workAssert(typeof link.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(link.name));
+		workAssert(workString(link.opRef));
+		assertValidOpRef(link.opRef);
+		workAssert(
+			typeof link.sessionId === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(link.sessionId),
+		);
+		workAssert(link.opRef !== value.opRef && link.sessionId !== value.sessionId);
+		workAssert(link.name !== value.sessionKey.slice("work/task/".length));
+	}
+	if (value.successorOf !== undefined) {
+		workAssert(value.mode === "start");
+		workAssert(typeof value.successorOf.baseSha === "string" && /^[0-9a-f]{40}$/.test(value.successorOf.baseSha));
+		workAssert(workTime(value.successorOf.authorizedAt));
+	}
+	if (value.successorRequestFingerprint !== undefined) {
+		workAssert(value.successorOf !== undefined);
+		workAssert(
+			typeof value.successorRequestFingerprint === "string" && /^[0-9a-f]{64}$/.test(value.successorRequestFingerprint),
+		);
+	}
 	workAssert(["prepared", "accepted", "uncertain"].includes(value.sendPhase));
 	workAssert(Number.isSafeInteger(value.version) && value.version >= 0);
 	workAssert(value.deliveryId === workAttemptDeliveryId(instanceId, value.jobId, value.opRef));
 	workAssert(!Object.hasOwn(value, "target"));
 	workAssert(value.parent === null || (value.parent && typeof value.parent === "object"));
 	if (value.parent !== null) validateWorkParent(value.parent, value.mode);
+	const owner = value.authorizationOwner;
+	if (owner !== undefined && owner !== null) {
+		workAssert(typeof owner === "object");
+		if (owner.kind === "persona") {
+			workAssert(Object.keys(owner).length === 2);
+			validateAuthorizationOrigin(owner.originKey);
+		} else {
+			workAssert(owner.kind === "lane" && Object.keys(owner).length === 3);
+			workAssert(typeof owner.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(owner.name));
+			if (owner.rootOriginKey !== null) validateAuthorizationOrigin(owner.rootOriginKey);
+		}
+	}
 	workAssert(value.mode !== "run" || value.parent === null);
 	workAssert(value.reportId === workAttemptReportId(instanceId, value.jobId, value.opRef));
 	workAssert(value.wakeReportId === null || /^lane-report-[0-9a-f]{64}$/.test(value.wakeReportId));
@@ -624,6 +686,37 @@ export class WorkGroup {
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
 	}
 
+	/** Traverse history once via primary-key lookups, then strictly validate only the selected link. */
+	workAttemptLinkedByLane(laneKey: string, direction: "successorOf" | "successor"): WorkAttemptRuntime | undefined {
+		workAssert(direction === "successorOf" || direction === "successor");
+		const json = this.laneJobJsonByLaneKey(laneKey);
+		if (json === undefined) return undefined;
+		let record: LaneJobRecord;
+		try {
+			record = parseLaneJobRecord(json);
+		} catch {
+			throw new WorkAttemptStateError(undefined, "lane history parsing");
+		}
+		const order = direction === "successorOf" ? "ASC" : "DESC";
+		let row: { op_ref: string } | null;
+		try {
+			row = this.#db
+				.prepare(
+					`SELECT runtime.op_ref FROM json_each(?) AS history CROSS JOIN work_attempt_runtime AS runtime ON runtime.op_ref = json_extract(history.value, '$.opRef') WHERE json_type(runtime.record_json, ?) IS NOT NULL ORDER BY CAST(history.key AS INTEGER) ${order} LIMIT 1`,
+				)
+				.get(JSON.stringify(record.attempts), `$.${direction}`) as { op_ref: string } | null;
+		} catch {
+			throw new WorkAttemptStateError(undefined, "linked runtime record parsing");
+		}
+		if (!row) return undefined;
+		const runtime = this.workAttemptGet(row.op_ref);
+		workAssert(
+			runtime && runtime.laneKey === laneKey && runtime.jobId === record.jobId,
+			"linked runtime matches lane history",
+		);
+		return runtime;
+	}
+
 	workAttemptJobId(opRef: string): string | undefined {
 		return (
 			this.#db.prepare("SELECT job_id FROM work_attempt_runtime WHERE op_ref = ?").get(opRef) as {
@@ -651,6 +744,7 @@ export class WorkGroup {
 				runtime.output.nextReadAt === null,
 		);
 		workAssert(runtime.sendEvidence === null);
+		workAssert(runtime.successor === undefined, "successor is assigned only after prepare");
 		workAssert(runtime.sendPhase === (runtime.mode === "historical" ? "uncertain" : "prepared"));
 		this.#workValidateHistory(runtime, record);
 		if (runtime.wakeReportId !== null) {
@@ -666,6 +760,40 @@ export class WorkGroup {
 			workAssert(!previous?.attempts.some((attempt) => attempt.endedAt === undefined));
 			workAssert(record.attempts.length === (previous?.attempts.length ?? 0) + 1);
 			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous?.attempts ?? []));
+		}
+		if (runtime.successorOf !== undefined) {
+			const source = this.workAttemptGet(runtime.successorOf.opRef);
+			workAssert(
+				source &&
+					source.sessionKey === `work/task/${runtime.successorOf.name}` &&
+					source.sessionId === runtime.successorOf.sessionId &&
+					source.opRef === runtime.successorOf.opRef,
+				"successor predecessor identity matches runtime",
+			);
+			workAssert(
+				source.settledAt === null &&
+					source.turnEndObservedAt === undefined &&
+					(source.terminal === null || source.terminal.reasonCode === "terminal_missing_receipt") &&
+					source.successor === undefined &&
+					workAccepted(source),
+				"successor predecessor is accepted and execution remains open",
+			);
+			workAssert(
+				source.cwd !== runtime.cwd &&
+					source.jobId !== runtime.jobId &&
+					JSON.stringify(source.parent) === JSON.stringify(runtime.parent),
+				"successor uses a distinct checkout and job with the same parent report route",
+			);
+			workAssert(
+				this.workAttemptUpdate(tx, source.opRef, source.version, {
+					successor: {
+						name: runtime.sessionKey.slice("work/task/".length),
+						opRef: runtime.opRef,
+						sessionId: runtime.sessionId,
+					},
+				}) !== undefined,
+				"successor predecessor link is assigned atomically",
+			);
 		}
 		this.#workPutHistory(tx, runtime, record);
 		this.#db
@@ -696,7 +824,15 @@ export class WorkGroup {
 		if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 		this.#assertNotQuarantined(current.jobId);
 		// Skip no-op updates where patch contains no actual field changes (only version bumps).
-		const patchedFields = ["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output"] as const;
+		const patchedFields = [
+			"sendPhase",
+			"sendEvidence",
+			"turnEndObservedAt",
+			"terminal",
+			"output",
+			"successor",
+		] as const;
+		workAssert(Object.keys(patch).every((key) => (patchedFields as readonly string[]).includes(key)));
 		const changed = patchedFields.some((field) => {
 			if (!Object.hasOwn(patch, field)) return false;
 			return JSON.stringify(current[field]) !== JSON.stringify(patch[field as keyof typeof patch]);
@@ -855,11 +991,25 @@ export class WorkGroup {
 		if (json === undefined) return false;
 		try {
 			const parent = parseLaneJobRecord(json);
+			if (parent.jobId !== jobId) return false;
+			if (parent.state === "awaiting_operator") {
+				const runtime = this.workAttemptOpenByLane(`work-${name}`);
+				if (
+					!runtime ||
+					runtime.jobId !== jobId ||
+					runtime.sendPhase !== "accepted" ||
+					runtime.terminal !== null ||
+					runtime.turnEndObservedAt !== undefined
+				)
+					return false;
+				const binding = this.#db
+					.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?")
+					.get(runtime.sessionKey) as { gjc_session_id: string; epoch: number } | null;
+				return binding?.gjc_session_id === runtime.sessionId && binding.epoch === runtime.epoch;
+			}
 			return (
-				parent.jobId === jobId &&
 				parent.state !== "aborted" &&
 				parent.state !== "awaiting_checks" &&
-				parent.state !== "awaiting_operator" &&
 				parent.state !== "stalled" &&
 				parent.state !== "done"
 			);
@@ -949,10 +1099,18 @@ export class WorkGroup {
 	}
 
 	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch): WorkAttemptRuntime {
-		const allowed = new Set(["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output"]);
+		const allowed = new Set(["sendPhase", "sendEvidence", "turnEndObservedAt", "terminal", "output", "successor"]);
 		workAssert(Object.keys(patch).every((key) => allowed.has(key)));
 		const next = { ...current, ...patch, version: current.version + 1 };
 		validateWorkRuntime(next, this.instanceId);
+		workAssert(
+			current.successor === undefined ||
+				(next.successor !== undefined &&
+					current.successor.name === next.successor.name &&
+					current.successor.opRef === next.successor.opRef &&
+					current.successor.sessionId === next.successor.sessionId),
+			"successor link is immutable once assigned",
+		);
 		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
 		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
 		workAssert(current.turnEndObservedAt === undefined || next.turnEndObservedAt === current.turnEndObservedAt);

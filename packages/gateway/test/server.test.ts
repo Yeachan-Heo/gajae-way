@@ -3405,6 +3405,12 @@ test("a backlog left pending across an outage is answered on boot, never expired
 		const client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await waitFor(client.frames, 1);
+		// Hello acknowledges the socket, not completion of the boot backlog.
+		// Fresh input during its turn can correctly steer rather than start the
+		// separate second turn this sequential recovery scenario exercises.
+		for (let attempt = 0; attempt < 400 && database.inbox.pendingCount(key) !== 0; attempt++) await Bun.sleep(10);
+		expect(database.inbox.pendingCount(key)).toBe(0);
+		expect(turns).toEqual([expect.stringContaining("from before the outage")]);
 		client.send({
 			v: "0.1",
 			type: "request",
@@ -3416,7 +3422,8 @@ test("a backlog left pending across an outage is answered on boot, never expired
 				engagement: { mentioned: false, group: false, authorId: "owner" },
 			},
 		});
-		for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 400 && (turns.length < 2 || database.inbox.pendingCount(key) !== 0); attempt++)
+			await Bun.sleep(10);
 		expect(turns).toEqual([
 			expect.stringContaining("from before the outage"),
 			expect.stringContaining("fresh after the outage"),

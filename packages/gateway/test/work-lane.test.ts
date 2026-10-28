@@ -1089,7 +1089,7 @@ test("a rebound lane stops the observer and settles the attempt as session_disow
 	expect(f.port.resumes).toHaveLength(0);
 });
 
-test("persistently failing status without liveness proof settles instead of polling forever (#262)", async () => {
+test("persistently failing status without liveness proof holds accepted execution open instead of inventing an end (#262)", async () => {
 	const f = await fixture({ pollMs: 1 });
 	const result = await started(f, "a", origin);
 	let queries = 0;
@@ -1100,13 +1100,24 @@ test("persistently failing status without liveness proof settles instead of poll
 	f.port.liveness = async () => {
 		throw new Error("offline");
 	};
-	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
-	expect(queries).toBeLessThanOrEqual(10);
-	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("recovery_indeterminate");
-	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
-	const settledQueries = queries;
-	await Bun.sleep(50);
-	expect(queries).toBe(settledQueries);
+	await until(() => f.job().state === "awaiting_operator");
+	expect(f.db.work.workAttemptGet(result.opRef)).toMatchObject({
+		terminal: null,
+		settledAt: null,
+		output: { reads: 0 },
+	});
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	const priorQueries = queries;
+	await until(() => queries > priorQueries);
+	await expect(f.manager.start({ name: "a", text: "no replay", resume: true })).rejects.toMatchObject({
+		detail: { reasonCode: "attempt_open" },
+	});
+	expect(await f.manager.status({ name: "a" })).toMatchObject({
+		op: null,
+		opUnavailable: true,
+		recoveryHold: "execution_end_unproven",
+	});
+	expect(f.notices).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(1);
 });
 

@@ -683,6 +683,20 @@ export interface WorkRunParams {
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
 	 */
 	readonly resume?: boolean;
+	/**
+	 * Explicit operator-authorized successor in a distinct checkout; valid only
+	 * for work.start, with repo and an immutable full SHA base, and without cwd
+	 * or resume. The original unresolved execution is NOT stopped. The operator
+	 * must review and isolate external effects before authorizing this recovery.
+	 * A response-only predecessor retains its null report route; its captured
+	 * authorization owner is checked independently of the delivery destination.
+	 */
+	readonly successorOf?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+		readonly acknowledgeUnresolved: true;
+	};
 	/** Startup model: an explicit model id or a model profile preset; applied at session create and on every send. */
 	readonly model?: string | { readonly preset: string };
 	/** Untrusted routing hint linking this request to the calling GJC session. */
@@ -699,6 +713,8 @@ export type WorkStartResult =
 			readonly opRef: string;
 			readonly sessionKey: string;
 			readonly sessionId: string;
+			/** Exact task/model successor retry: the original accepted operation, never a new send. */
+			readonly alreadyStarted?: true;
 	  }
 	| {
 			readonly started: false;
@@ -745,6 +761,22 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/** Linked recovery remains inspectable when its live operation query is unavailable. */
+	readonly opUnavailable?: true;
+	readonly recoveryHold?: "execution_end_unproven";
+	/** Original lane provenance, retained across later check-repair attempts and session replacement. */
+	readonly successorOf?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+		readonly baseSha: string;
+		readonly authorizedAt: string;
+	};
+	readonly successor?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+	};
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
 		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */

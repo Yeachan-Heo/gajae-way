@@ -27,6 +27,8 @@ export type Control = {
 	unknown?: boolean;
 	refuseSteer?: boolean;
 	unavailable?: boolean;
+	missingReceipt?: boolean;
+	statusUnavailable?: boolean;
 };
 export type Call = { method: string; input: Record<string, unknown> };
 export type Barrier =
@@ -71,7 +73,7 @@ export function writeFixtureJson(
 class PersistentPort extends ScriptedSessionPort {
 	constructor(
 		readonly home: string,
-		readonly hit: (point: Barrier) => void,
+		readonly hit: (point: Barrier, opRef?: string) => void,
 		readonly database: Store,
 		readonly authority: BrokerAuthority,
 	) {
@@ -121,23 +123,44 @@ class PersistentPort extends ScriptedSessionPort {
 		if (existsSync(join(this.home, `${input.opRef}.send.json`))) throw new Error("fixture detected duplicate send");
 		const receipt = await super.send(input);
 		writeFixtureJson(join(this.home, `${input.opRef}.send.json`), { ...input, startedAt: Date.now() });
-		this.hit("accepted-before-save");
+		// Persona report delivery can send concurrently with a worker wake. A
+		// worker crash barrier must never stop that unrelated persona prompt.
+		if (input.codingRegister === true) this.hit("accepted-before-save", input.opRef);
 		return receipt;
 	}
 	override async status(input: Parameters<ScriptedSessionPort["status"]>[0]): Promise<StatusReport> {
 		this.record("status", input);
 		const control = this.sync(input.opRef);
+		if (control.statusUnavailable) throw new Error("fixture status transport unavailable");
 		if (control.unknown) return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
 		const report = await super.status(input);
 		const saved = json<{ startedAt: number } | null>(join(this.home, `${input.opRef}.send.json`), null);
 		if (!saved) return report;
 		const status = { ...report.status, startedAt: saved.startedAt };
+		if (control.missingReceipt)
+			return {
+				operationRef: input.opRef,
+				status: {
+					status: "failed",
+					clientRef: input.opRef,
+					commandId: `fixture-command-${input.opRef}`,
+					turnId: `fixture-turn-${input.opRef}`,
+					startedAt: saved.startedAt,
+					terminalAt: saved.startedAt + 1,
+					receiptState: "missing",
+					error: { code: "prompt_deadline_exceeded" },
+				},
+				summaryCompleted: true,
+			};
 		return control.terminal
 			? {
 					...report,
 					status: { ...status, status: "terminal_ok", receiptState: "present", outcome: { reason: "end_turn" } },
 				}
 			: { ...report, status };
+	}
+	async turnRunning() {
+		return true;
 	}
 	override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
 		this.record("liveness", input);
@@ -156,7 +179,9 @@ class PersistentPort extends ScriptedSessionPort {
 		this.record("steer", input);
 		const refused = Object.values(this.controls()).some((control) => control.refuseSteer);
 		if (refused) throw steerRefused();
-		return super.steer(input);
+		const receipt = await super.steer(input);
+		this.record("steerAccepted", input);
+		return receipt;
 	}
 	override async attachTail(input: TailAttachInput) {
 		this.record("attach", { sessionId: input.sessionId, brokerGeneration: input.brokerGeneration });
@@ -199,10 +224,10 @@ export function readCalls(home: string): Call[] {
 }
 
 async function serve(home: string, barrier?: Barrier) {
-	const hit = (point: Barrier) => {
+	const hit = (point: Barrier, opRef?: string) => {
 		const armed = json<{ readonly point?: Barrier | null }>(join(home, "barrier-arm.json"), {}).point;
 		if (barrier !== point && armed !== point) return;
-		writeFixtureJson(join(home, "barrier-hit.json"), { point, pid: process.pid });
+		writeFixtureJson(join(home, "barrier-hit.json"), { point, pid: process.pid, opRef });
 		if (armed === point) writeFixtureJson(join(home, "barrier-arm.json"), { point: null });
 		// A synchronous fixture-only barrier can stop inside a real SQLite transaction.
 		// The parent SIGKILLs precisely this child; no production fault flag exists.
@@ -305,7 +330,10 @@ async function serve(home: string, barrier?: Barrier) {
 		if (settling) hit("settle-ledger");
 		return result;
 	};
-	const storedConfig = json<{ readonly work?: { readonly allowNested?: boolean } }>(join(home, "config.json"), {});
+	const storedConfig = json<{
+		readonly work?: { readonly allowNested?: boolean };
+		readonly rootless?: boolean;
+	}>(join(home, "config.json"), {});
 	const config = {
 		schemaVersion: 1 as const,
 		home,
@@ -313,7 +341,7 @@ async function serve(home: string, barrier?: Barrier) {
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
-		ownerTarget: { origin: noticeOrigin },
+		...(storedConfig.rootless ? {} : { ownerTarget: { origin: noticeOrigin } }),
 		channels: { fixture: { engagement: "open" as const, audience: "all" as const } },
 		work: { maxLanes: 2, ...storedConfig.work },
 	};
@@ -388,13 +416,14 @@ export class WorkFixture {
 	get socket() {
 		return join(this.home, "gateway.sock");
 	}
-	static async create(options: { readonly allowNested?: boolean } = {}) {
+	static async create(options: { readonly allowNested?: boolean; readonly rootless?: boolean } = {}) {
 		const fixture = new WorkFixture(await mkdtemp(join(tmpdir(), "work-crash-")));
 		await Bun.write(
 			join(fixture.home, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
 				ownerTarget: { origin: noticeOrigin },
+				...(options.rootless ? { rootless: true } : {}),
 				...(options.allowNested === undefined ? {} : { work: { allowNested: options.allowNested } }),
 			}),
 		);
@@ -494,7 +523,7 @@ export class WorkFixture {
 	}
 	async barrier(point: Barrier) {
 		return eventually(
-			() => json<{ point?: string; pid?: number }>(join(this.home, "barrier-hit.json"), {}),
+			() => json<{ point?: string; pid?: number; opRef?: string }>(join(this.home, "barrier-hit.json"), {}),
 			(value) => value.point === point && value.pid === this.child?.pid,
 			point,
 		);
@@ -546,6 +575,8 @@ export class WorkFixture {
 							report_id: string;
 							parent_name: string;
 							child_op_ref: string;
+							body: string;
+							root_json: string | null;
 							state: string;
 							claim_ref: string | null;
 							consumed_op_ref: string | null;
@@ -553,7 +584,7 @@ export class WorkFixture {
 						},
 						[]
 					>(
-						"SELECT report_id, parent_name, child_op_ref, state, claim_ref, consumed_op_ref, hold_reason FROM lane_reports ORDER BY created_at",
+						"SELECT report_id, parent_name, child_op_ref, body, root_json, state, claim_ref, consumed_op_ref, hold_reason FROM lane_reports ORDER BY created_at",
 					)
 					.all(),
 			};
