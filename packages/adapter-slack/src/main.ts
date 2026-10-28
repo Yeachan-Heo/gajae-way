@@ -893,6 +893,10 @@ export async function startSlackAdapter(
 	readonly handleSlashCommand: (command: SlackSlashCommand) => Promise<void>;
 	/** One bounded catch-up pass over configured channels and known DMs; true when it finished cleanly. */
 	readonly recoverMissedMessages: () => Promise<boolean>;
+	/** Schedule a recovery pass that also checks whether live event delivery has gone deaf (#710). */
+	readonly checkInboundGap: () => void;
+	/** Set while recovery keeps finding messages the connected socket never delivered (#710). */
+	readonly eventsSuspect: () => EventsSuspect | undefined;
 	/** Resets quarantine strike counts so the next pass probes unreadable channels again. */
 	readonly reprobeQuarantined: () => Promise<void>;
 	readonly recovery: RecoveryScheduler;
@@ -1087,6 +1091,9 @@ export async function startSlackAdapter(
 	// so a long socket outage is not erased by a quick gateway reconnect.
 	const disconnectedAt: { socket?: number; gateway?: number } = {};
 	let longOutageSeen = false;
+	// Assigned once the socket exists; recovery can run earlier, on the gateway connect.
+	let liveSocket: SlackSocketMode | undefined;
+	let eventsSuspect: EventsSuspect | undefined;
 	const recoverMissedMessages = async (): Promise<boolean> => {
 		if (!gateway.connected) return false;
 		const loaded = await ensureCursors();
@@ -1096,6 +1103,12 @@ export async function startSlackAdapter(
 		await mutate((state) => pruneParticipatedThreads(pruneKnownDms(state, nowMs), nowMs));
 		const channels = [...new Set([...Object.keys(config.channels ?? {}), ...Object.keys(current().knownDms)])];
 		let completed = true;
+		// Messages the gateway first heard of through history although the socket said
+		// hello before they were posted and carried no envelope since: Slack is not
+		// delivering events to this app (#710).
+		let missedWhileConnected = 0;
+		const connectedSince = liveSocket?.connectedSince;
+		const lastEnvelopeAt = liveSocket?.lastEnvelopeAt ?? 0;
 		const port = {
 			history: (channel: string, options: { oldest: string; latest?: string; cursor?: string; limit: number }) =>
 				api.conversationsHistory(channel, options),
@@ -1122,7 +1135,19 @@ export async function startSlackAdapter(
 				timestamp(message.ts),
 			);
 			if (sent.verdict !== "unavailable") {
-				await mutate((state) => clearAttempt(state, messageId));
+				const postedAt = Number(message.ts) * 1000;
+				const isWithinGrace = nowMs - postedAt < LIVE_DELIVERY_GRACE_MS;
+				if (
+					sent.verdict === "acked" &&
+					connectedSince !== undefined &&
+					postedAt >= connectedSince &&
+					postedAt > lastEnvelopeAt &&
+					!isWithinGrace
+				)
+					missedWhileConnected++;
+				// Keep the attempt record for messages within the grace period so we can re-evaluate
+				// after the grace period expires. Only clear once the grace period has passed.
+				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) await rememberThread(admitted.origin);
 				return sent.verdict;
 			}
@@ -1280,6 +1305,15 @@ export async function startSlackAdapter(
 			if (outcome.truncated) completed = false;
 		}
 		await cursorSaves;
+		if (missedWhileConnected > 0 && liveSocket?.connectedSince === connectedSince) {
+			eventsSuspect = { since: eventsSuspect?.since ?? nowMs, missed: missedWhileConnected };
+			log.error(
+				`slack_events_possibly_disabled missed=${missedWhileConnected}: recovery found messages the connected socket never delivered; check that the Slack app's Event Subscriptions (Enable Events) are on. Restarting the socket.`,
+			);
+			liveSocket?.restart("Slack events possibly disabled");
+		} else if (eventsSuspect && lastEnvelopeAt > eventsSuspect.since) {
+			eventsSuspect = undefined;
+		}
 		// Progress that is not on disk is not progress: keep retrying until it is.
 		const clean = completed && !dirty;
 		if (clean) {
@@ -1342,7 +1376,7 @@ export async function startSlackAdapter(
 	gateway.onDisconnected = () => noteDisconnected("gateway");
 	await (ports.connectGateway ?? ((current) => current.connectInitial()))(gateway);
 	const socket = new SlackSocketMode(
-		() => api.connectionsOpen(config.appToken),
+		(signal) => api.connectionsOpen(config.appToken, signal),
 		{
 			onEvent: handleEvent,
 			onSlashCommand: handleSlashCommand,
@@ -1358,9 +1392,12 @@ export async function startSlackAdapter(
 		{
 			factory: ports.socketFactory,
 			log,
+			// One clock for socket and recovery: the events-disabled check compares them (#710).
+			now,
 			...(config.socketLivenessTimeoutMs === undefined ? {} : { livenessTimeoutMs: config.socketLivenessTimeoutMs }),
 		},
 	);
+	liveSocket = socket;
 	log.log("Slack adapter starting.");
 	await socket.start();
 	return {
@@ -1372,6 +1409,8 @@ export async function startSlackAdapter(
 		handleEvent,
 		handleSlashCommand,
 		recoverMissedMessages,
+		checkInboundGap: () => recovery.trigger(),
+		eventsSuspect: () => eventsSuspect,
 		reprobeQuarantined,
 		recovery,
 		links: { disconnected: noteDisconnected, reconnected },
@@ -1414,6 +1453,34 @@ const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart
 export const RECOVERY_RECENT_PASS_MS = 60_000;
 /** An outage at least this long always earns a fresh recovery pass. */
 export const RECOVERY_OUTAGE_GATE_MS = 5_000;
+/**
+ * A connected adapter re-checks history this often, so a socket that stopped
+ * receiving events is caught and replaced well inside Slack's 60-minute window
+ * for auto-disabling an app's event delivery (#710).
+ */
+export const INBOUND_GAP_CHECK_INTERVAL_MS = 10 * 60_000;
+/** A message younger than this may still be on its way over the socket. */
+export const LIVE_DELIVERY_GRACE_MS = 2 * 60_000;
+
+export interface EventsSuspect {
+	/** When recovery first found live delivery missing. */
+	readonly since: number;
+	/** Messages the last detecting pass recovered. */
+	readonly missed: number;
+}
+
+/** The `service_alive` detail: inbound health, not just process uptime (#710). */
+export function slackHeartbeatDetails(
+	socket: Pick<SlackSocketMode, "connected" | "lastEnvelopeAt" | "connections">,
+	suspect: EventsSuspect | undefined,
+	nowMs: number,
+): string {
+	const parts = [`socket=${socket.connected ? "connected" : "disconnected"}`, `connections=${socket.connections}`];
+	const last = socket.lastEnvelopeAt;
+	parts.push(`last_envelope_age=${last === undefined ? "never" : `${Math.round((nowMs - last) / 1000)}s`}`);
+	if (suspect) parts.push(`events_possibly_disabled_since=${new Date(suspect.since).toISOString()}`);
+	return parts.join(" ");
+}
 
 /**
  * What the invoking user is told. Wording follows what the gateway actually did:
@@ -1460,7 +1527,12 @@ if (import.meta.main) {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);
 	} else {
-		const disposeLogging = installStructuredLogging({ path: join(adapterHome(), "adapter-slack.log") });
+		let running: Awaited<ReturnType<typeof startSlackAdapter>> | undefined;
+		const disposeLogging = installStructuredLogging({
+			path: join(adapterHome(), "adapter-slack.log"),
+			heartbeatDetails: () =>
+				running ? slackHeartbeatDetails(running.socket, running.eventsSuspect(), Date.now()) : "",
+		});
 		void runSlackAdapterWithLease(adapterHome(), async (lease) => {
 			const shutdown = (): void => {
 				void lease.release().then(
@@ -1477,7 +1549,11 @@ if (import.meta.main) {
 			};
 			process.once("SIGINT", shutdown);
 			process.once("SIGTERM", shutdown);
-			await startSlackAdapter(await loadSlackAdapterConfig());
+			running = await startSlackAdapter(await loadSlackAdapterConfig());
+			const adapter = running;
+			setInterval(() => {
+				if (adapter.socket.connected) adapter.checkInboundGap();
+			}, INBOUND_GAP_CHECK_INTERVAL_MS).unref();
 			await new Promise<void>(() => {});
 		}).catch((error) => {
 			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
