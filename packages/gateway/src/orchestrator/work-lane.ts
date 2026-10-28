@@ -300,6 +300,12 @@ export class WorkLaneManager {
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
 	readonly #runCalls = new Map<string, RunCall>();
+	/**
+	 * Fresh-lane starts between request acceptance and their durable lane record,
+	 * plus the last failed one per name, so `work.status` never reports an
+	 * accepted start as an unknown lane (#707).
+	 */
+	readonly #admissions = new Map<string, { startedAt: string; failedAt?: string; reason?: string }>();
 	readonly #detachedOwners = new WeakSet<object>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
@@ -831,11 +837,36 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		this.#job(input.name);
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		const admitting = this.#admissions.get(input.name);
+		// A same-name retry (for example after a caller timeout) must not queue a
+		// second clone, bind or send behind the admission still in progress.
+		if (admitting && admitting.failedAt === undefined)
+			return {
+				started: false,
+				held: true,
+				jobId: laneJobIdentity(input.name).jobId,
+				state: "admitting",
+				reason: "the lane start is still being admitted; check work.status",
+			};
+		const admission = { startedAt: this.#at() };
+		this.#admissions.set(input.name, admission);
+		try {
+			const result = await this.#startAdmitted(input, mode, { parent, runCall });
+			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
+			return result;
+		} catch (error) {
+			if (this.#admissions.get(input.name) === admission) {
+				if (this.#job(input.name)) this.#admissions.delete(input.name);
+				else this.#admissions.set(input.name, { ...admission, failedAt: this.#at(), reason: failureReason(error) });
+			}
+			throw error;
+		}
+	}
+	async #startAdmitted(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		await this.recover();
 		this.#live();
-		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent, runCall }));
+		return this.#port.runExclusive(workSessionKey(input.name), () => this.#startLocked(input, mode, context));
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
@@ -1111,6 +1142,17 @@ export class WorkLaneManager {
 	}
 	async status(params: unknown): Promise<WorkStatusResult> {
 		const name = parseName(params);
+		const admission = this.#job(name) ? undefined : this.#admissions.get(name);
+		if (admission)
+			return {
+				jobId: laneJobIdentity(name).jobId,
+				state: admission.failedAt === undefined ? "admitting" : "admission_failed",
+				sessionId: "",
+				lastActivityAt: null,
+				attempt: null,
+				op: null,
+				admission: { ...admission },
+			};
 		const job = this.#job(name, true)!;
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
