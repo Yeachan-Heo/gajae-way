@@ -4626,12 +4626,7 @@ class OriginActor {
 	 */
 	async #closeAbandonedEscalatedHold(bound: BoundTurn, error: unknown): Promise<void> {
 		const database = this.#manager.database;
-		const completed = database.transaction((tx) => {
-			const changed = completeInboundTurn(database, tx, bound.turn.opRef, "retired");
-			// If the turn row was not found in the inbox, clean up the escalatedHoldKey anyway (#715).
-			if (changed === 0) database.core.metaDelete(escalatedHoldKey(bound.turn.opRef));
-			return changed;
-		});
+		const completed = database.transaction((tx) => completeInboundTurn(database, tx, bound.turn.opRef, "retired"));
 		for (const held of database.inbox.steersHeld(bound.turn.opRef))
 			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
 		this.#manager.log(
