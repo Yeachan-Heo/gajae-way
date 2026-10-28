@@ -4057,6 +4057,8 @@ class OriginActor {
 						`recovery_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} endpoint_stale_count=${bound.endpointStaleCount} detail=${safeDiagnostic(error)}`,
 						"warn",
 					);
+					// Close the trigger row terminally in the same transaction that abandons the hold (#715)
+					this.#manager.database.transaction((tx) => completeInboundTurn(this.#manager.database, tx, bound.turn.opRef, "retired"));
 					await this.#forgetClosed(bound);
 					return;
 				}

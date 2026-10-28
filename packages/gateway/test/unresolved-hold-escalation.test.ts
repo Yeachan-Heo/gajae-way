@@ -429,7 +429,10 @@ test("an escalated hold makes bounded status calls per hour and closes terminall
 		await until(() => f.port.sends.length === 1);
 		expect(f.port.sends[0]!.text).toContain("a newer message");
 		// After escalation, the trigger row stays bound so late answers can be delivered
-		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("bound");
+		const triggerBefore = f.db.inbox.turnRow(f.heldOpRef);
+		expect(triggerBefore?.turn_state).toBe("bound");
+		expect(triggerBefore?.state).toBe("pending");
+
 		// Now make status recheck return endpoint_stale repeatedly
 		const errorWithCode = new Error("endpoint_stale: session 123 is not live") as any;
 		errorWithCode.code = "endpoint_stale";
@@ -442,23 +445,46 @@ test("an escalated hold makes bounded status calls per hour and closes terminall
 			}
 			return originalStatus(input);
 		};
-		// Simulate an hour of status polling at a high frequency
-		// The hold should close after 3 consecutive endpoint_stale errors
-		for (let i = 0; i < 60; i++) {
-			await f.manager.reconcile(f.originKey);
+
+		// Drive the manager's scheduled timers for a simulated hour
+		// Status checks back off: 250ms, 500ms, 1s, ..., up to 5s (5000ms)
+		// After 3 consecutive endpoint_stale errors, the hold is abandoned
+		const startTime = Date.now();
+		while (Date.now() - startTime < 60_000) {
+			// Process any pending timers
+			await new Promise((resolve) => setTimeout(resolve, 10));
 			// Check if the hold has been abandoned
 			const abandoned = f.logs.find((line) => line.includes("recovery_hold_abandoned") && line.includes(`opRef=${f.heldOpRef}`));
 			if (abandoned) break;
 		}
+
 		// Verify that the held turn is eventually closed as abandoned
 		const abandoned = f.logs.find((line) => line.includes("recovery_hold_abandoned") && line.includes(`opRef=${f.heldOpRef}`));
 		expect(abandoned).toBeDefined();
-		expect(statusCalls).toBeLessThanOrEqual(60); // Bounded number of status calls per simulated hour
-		// Verify status_unavailable is logged only once with detail
+		expect(statusCalls).toBeLessThanOrEqual(10); // Bounded number of status calls (well under 60)
+
+		// After abandonment, the trigger row should be marked as done
+		const triggerAfter = f.db.inbox.turnRow(f.heldOpRef);
+		expect(triggerAfter?.turn_state).toBe("done");
+		expect(triggerAfter?.state).toBe("done");
+
+		// Verify the hold is not re-adopted after a restart
+		const recoveryLogs = f.logs.filter((line) => line.startsWith("recovery_scan") && line.includes(f.heldOpRef));
+		const adoptLogs = f.logs.filter((line) => line.includes("adopt") && line.includes(f.heldOpRef));
+		// Should not attempt to re-adopt after abandonment
+		const adoptAfterAbandon = adoptLogs.filter((line) => {
+			const logIdx = f.logs.indexOf(line);
+			const abandonIdx = f.logs.findIndex((l) => l.includes("recovery_hold_abandoned") && l.includes(f.heldOpRef));
+			return logIdx > abandonIdx;
+		});
+		expect(adoptAfterAbandon.length).toBe(0);
+
+		// Verify status_unavailable is logged at most once
 		const statusLogs = f.logs.filter((line) => line.includes("recovery_hold") && line.includes("reason=status_unavailable") && line.includes(`opRef=${f.heldOpRef}`));
-		expect(statusLogs.length).toBeLessThanOrEqual(1); // Logged at most once due to #logRecoveryHoldOnce
+		expect(statusLogs.length).toBeLessThanOrEqual(1);
 	} finally {
 		await f.manager.stop();
 	}
 });
+
 
