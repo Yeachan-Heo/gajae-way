@@ -41,9 +41,48 @@ class HoldPort extends ScriptedSessionPort {
 
 const MINUTE = 60_000;
 
+/** Timers the manager schedules, fired only when the test advances virtual time. */
+class VirtualClock {
+	#now = Date.now();
+	#timers = new Set<{ at: number; work: () => void }>();
+
+	managerOptions() {
+		return {
+			now: () => this.#now,
+			setTimeout: (work: () => void, delayMs: number) => {
+				const timer = { at: this.#now + delayMs, work };
+				this.#timers.add(timer);
+				return timer;
+			},
+			clearTimeout: (timer: unknown) => {
+				this.#timers.delete(timer as { at: number; work: () => void });
+			},
+		};
+	}
+
+	/** Advances to `untilMs`, firing every due timer in order and letting its async work run. */
+	async advance(byMs: number): Promise<void> {
+		const until = this.#now + byMs;
+		for (;;) {
+			const due = [...this.#timers].filter((timer) => timer.at <= until).sort((a, b) => a.at - b.at)[0];
+			if (!due) break;
+			this.#timers.delete(due);
+			this.#now = Math.max(this.#now, due.at);
+			due.work();
+			for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		this.#now = until;
+	}
+}
+
+/** The broker's answer for a session id it no longer serves. */
+function endpointStale(): Error {
+	return Object.assign(new Error("endpoint_stale: session is not live"), { code: "endpoint_stale" });
+}
+
 async function heldOrigin(
 	name: string,
-	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean },
+	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean; clock?: VirtualClock },
 ) {
 	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -88,6 +127,7 @@ async function heldOrigin(
 			instanceId: "hold-test",
 			repo,
 			unresolvedHoldMs: 10 * MINUTE,
+			...(options.clock ? options.clock.managerOptions() : {}),
 			log: (line: string) => logs.push(line),
 			onBindHold: (input) => {
 				if (noticeFailures > 0) {
@@ -422,69 +462,81 @@ test("an unchanged recovery hold is logged once across sweeps, not on every scan
 	}
 });
 
-test("an escalated hold makes bounded status calls per hour and closes terminally when endpoint_stale persists (#715)", async () => {
-	const f = await heldOrigin("endpoint-stale", { heldForMs: 11 * MINUTE, live: false });
+test("an escalated hold whose session stays endpoint_stale is closed terminally within bounded status reads, also across a restart (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("endpoint-stale", { heldForMs: 11 * MINUTE, live: false, clock });
 	try {
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
-		expect(f.port.sends[0]!.text).toContain("a newer message");
-		// After escalation, the trigger row stays bound so late answers can be delivered
-		const triggerBefore = f.db.inbox.turnRow(f.heldOpRef);
-		expect(triggerBefore?.turn_state).toBe("bound");
-		expect(triggerBefore?.state).toBe("pending");
-
-		// Now make status recheck return endpoint_stale repeatedly
-		const errorWithCode = new Error("endpoint_stale: session 123 is not live") as any;
-		errorWithCode.code = "endpoint_stale";
-		let statusCalls = 0;
-		const originalStatus = f.port.status.bind(f.port);
+		expect(f.notices).toHaveLength(1);
+		let statusReads = 0;
+		const status = f.port.status.bind(f.port);
 		f.port.status = async (input) => {
-			if (input.opRef === f.heldOpRef) {
-				statusCalls++;
-				throw errorWithCode;
-			}
-			return originalStatus(input);
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			throw endpointStale();
 		};
-
-		// Drive the manager's scheduled timers for a simulated hour
-		// Status checks back off: 250ms, 500ms, 1s, ..., up to 5s (5000ms)
-		// After 3 consecutive endpoint_stale errors, the hold is abandoned
-		const startTime = Date.now();
-		while (Date.now() - startTime < 60_000) {
-			// Process any pending timers
-			await new Promise((resolve) => setTimeout(resolve, 10));
-			// Check if the hold has been abandoned
-			const abandoned = f.logs.find((line) => line.includes("recovery_hold_abandoned") && line.includes(`opRef=${f.heldOpRef}`));
-			if (abandoned) break;
+		// One simulated hour: the gateway sweep reconciles every minute and the
+		// manager's own recheck/reattach timers fire as virtual time passes.
+		for (let minute = 0; minute < 60; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
 		}
+		expect(statusReads).toBeGreaterThan(0);
+		expect(statusReads).toBeLessThanOrEqual(5);
+		const row = f.db.inbox.turnRow(f.heldOpRef);
+		expect(row?.turn_state).toBe("done");
+		expect(row?.state).toBe("done");
+		expect(
+			f.logs.some((line) => line.includes("reason=escalated_hold_session_gone") && line.includes(f.heldOpRef)),
+		).toBe(true);
+		// The held request is never resent and the user is not told twice.
+		expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+		expect(f.notices).toHaveLength(1);
+		// The newer message's own turn is untouched.
+		expect(f.answers.map((answer) => answer.text).join("\n")).toContain("answer to");
 
-		// Verify that the held turn is eventually closed as abandoned
-		const abandoned = f.logs.find((line) => line.includes("recovery_hold_abandoned") && line.includes(`opRef=${f.heldOpRef}`));
-		expect(abandoned).toBeDefined();
-		expect(statusCalls).toBeLessThanOrEqual(10); // Bounded number of status calls (well under 60)
-
-		// After abandonment, the trigger row should be marked as done
-		const triggerAfter = f.db.inbox.turnRow(f.heldOpRef);
-		expect(triggerAfter?.turn_state).toBe("done");
-		expect(triggerAfter?.state).toBe("done");
-
-		// Verify the hold is not re-adopted after a restart
-		const recoveryLogs = f.logs.filter((line) => line.startsWith("recovery_scan") && line.includes(f.heldOpRef));
-		const adoptLogs = f.logs.filter((line) => line.includes("adopt") && line.includes(f.heldOpRef));
-		// Should not attempt to re-adopt after abandonment
-		const adoptAfterAbandon = adoptLogs.filter((line) => {
-			const logIdx = f.logs.indexOf(line);
-			const abandonIdx = f.logs.findIndex((l) => l.includes("recovery_hold_abandoned") && l.includes(f.heldOpRef));
-			return logIdx > abandonIdx;
-		});
-		expect(adoptAfterAbandon.length).toBe(0);
-
-		// Verify status_unavailable is logged at most once
-		const statusLogs = f.logs.filter((line) => line.includes("recovery_hold") && line.includes("reason=status_unavailable") && line.includes(`opRef=${f.heldOpRef}`));
-		expect(statusLogs.length).toBeLessThanOrEqual(1);
+		await f.manager.stop();
+		const readsBeforeRestart = statusReads;
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			for (let minute = 0; minute < 10; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads).toBe(readsBeforeRestart);
+		} finally {
+			await restarted.stop();
+		}
 	} finally {
 		await f.manager.stop();
 	}
 });
 
-
+test("an escalated hold whose status is only transiently unreadable keeps holding (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("transient-stale", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let reads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			reads++;
+			// Every other read is a different failure: no run of session-gone reads.
+			throw reads % 2 === 0 ? new Error("broker_unavailable: socket closed") : endpointStale();
+		};
+		for (let minute = 0; minute < 60; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		// Only the per-minute sweep (plus the bounded reattach tries) reads it.
+		expect(reads).toBeGreaterThanOrEqual(60);
+		expect(reads).toBeLessThanOrEqual(64);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});

@@ -63,8 +63,11 @@ export const STALLED_TURN_TERMINAL_TIMEOUT_MS = 10 * 60_000;
 const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
-/** Maximum consecutive endpoint_stale errors before closing an escalated hold as abandoned (#715). */
-const ESCALATED_HOLD_ENDPOINT_STALE_MAX = 3;
+/**
+ * Consecutive status reads answering "the broker no longer serves this session"
+ * (`endpoint_stale`) after which an escalated hold is closed as abandoned (#715).
+ */
+const ESCALATED_HOLD_SESSION_GONE_READS = 3;
 /**
  * Grace before a decidable-terminal status may complete a turn whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
@@ -1330,10 +1333,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	providerRetryAttempt: number;
 	/** A bounded provider retry is already scheduled for this failed turn. */
 	agentErrorRetryScheduled: boolean;
-	/** This turn is an escalated unresolved hold; clear tailEvidenceUnavailable after escalation (#715). */
-	escalatedHold?: boolean;
-	/** Consecutive endpoint_stale errors on this escalated hold; close when threshold is reached (#715). */
-	endpointStaleCount?: number;
+	/** Consecutive session-gone status reads while this turn is an escalated hold (#715). */
+	sessionGoneReads: number;
 };
 
 class OriginActor {
@@ -1798,8 +1799,8 @@ class OriginActor {
 		if (bound) {
 			bound.retired = true;
 			bound.answerWanted = true;
-			bound.escalatedHold = true;
-			// Clear active recheck targets; use only bounded retired-reattach schedule (#715)
+			// The user was told; only the bounded retired-reattach schedule and the
+			// periodic sweep read its status from here on (#715).
 			bound.tailEvidenceUnavailable = false;
 			bound.statusRecheckAfterStall = false;
 			this.#clearStallReconciliation(bound);
@@ -1816,8 +1817,7 @@ class OriginActor {
 				// Adopted without a relay: the host is gone. Periodic reconcile reads
 				// its status; a reattach is tried on the bounded retired schedule.
 				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
-				adopted.escalatedHold = true;
-				// Clear active recheck targets; use only bounded retired-reattach schedule (#715)
+				// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
 				adopted.tailEvidenceUnavailable = false;
 				this.#clearStallReconciliation(adopted);
 				adopted.detached = true;
@@ -2015,11 +2015,12 @@ class OriginActor {
 	 * Recovery scans run every minute; an unchanged hold is logged once per
 	 * (op-ref, reason) and again only when its reason changes (#705).
 	 */
-	#logRecoveryHoldOnce(turn: InboundTurn, reason: string): void {
+	/** Logs a hold once per reason change; `extra` (e.g. `detail=…`) describes the first occurrence. */
+	#logRecoveryHoldOnce(turn: InboundTurn, reason: string, extra?: string): void {
 		if (this.#recoveryHoldReasons.get(turn.opRef) === reason) return;
 		this.#recoveryHoldReasons.set(turn.opRef, reason);
 		this.#manager.log(
-			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}`,
+			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}${extra ? ` ${extra}` : ""}`,
 			"warn",
 		);
 	}
@@ -2083,6 +2084,7 @@ class OriginActor {
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
+			sessionGoneReads: 0,
 			statusRecheckAfterStall: false,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
@@ -2532,6 +2534,7 @@ class OriginActor {
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
+			sessionGoneReads: 0,
 			statusRecheckAfterStall: false,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
@@ -4048,32 +4051,16 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			// Track consecutive endpoint_stale errors on escalated holds; close after threshold (#715)
-			if (bound.escalatedHold && sdkStatusErrorCode(error) === "session_unavailable") {
-				bound.endpointStaleCount = (bound.endpointStaleCount ?? 0) + 1;
-				if (bound.endpointStaleCount >= ESCALATED_HOLD_ENDPOINT_STALE_MAX) {
-					// Close the hold as abandoned after too many endpoint_stale errors
-					this.#manager.log(
-						`recovery_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} endpoint_stale_count=${bound.endpointStaleCount} detail=${safeDiagnostic(error)}`,
-						"warn",
-					);
-					// Close the trigger row terminally in the same transaction that abandons the hold (#715)
-					this.#manager.database.transaction((tx) => completeInboundTurn(this.#manager.database, tx, bound.turn.opRef, "retired"));
-					await this.#forgetClosed(bound);
-					return;
-				}
-			} else {
-				// Reset count if the error is not endpoint_stale
-				bound.endpointStaleCount = 0;
+			// An escalated hold already told the user; once the broker keeps saying it
+			// no longer serves the session, nothing can answer it: close it (#715).
+			const escalated = this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined;
+			bound.sessionGoneReads =
+				escalated && sdkStatusErrorCode(error) === "session_unavailable" ? bound.sessionGoneReads + 1 : 0;
+			if (bound.sessionGoneReads >= ESCALATED_HOLD_SESSION_GONE_READS) {
+				await this.#closeAbandonedEscalatedHold(bound, error);
+				return;
 			}
-			// Log with detail only on first occurrence of this reason
-			if (this.#recoveryHoldReasons.get(bound.turn.opRef) !== "status_unavailable") {
-				this.#manager.log(
-					`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
-					"warn",
-				);
-				this.#recoveryHoldReasons.set(bound.turn.opRef, "status_unavailable");
-			}
+			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
@@ -4099,7 +4086,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown");
+			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown", `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -4217,7 +4204,10 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					this.#logRecoveryHoldOnce(bound.turn, notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal");
+					this.#logRecoveryHoldOnce(
+						bound.turn,
+						notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
+					);
 					if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 					return;
 				}
@@ -4627,6 +4617,28 @@ class OriginActor {
 		await this.#settleAfterTerminal(bound);
 	}
 
+	/**
+	 * Closes an escalated hold whose session the broker keeps reporting gone.
+	 * The user already got the hold notice and the request is never resent, so
+	 * the trigger closes as `retired`; only this turn's own row is touched (#715).
+	 */
+	async #closeAbandonedEscalatedHold(bound: BoundTurn, error: unknown): Promise<void> {
+		const database = this.#manager.database;
+		const completed = database.transaction((tx) => completeInboundTurn(database, tx, bound.turn.opRef, "retired"));
+		for (const held of database.inbox.steersHeld(bound.turn.opRef))
+			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
+		this.#manager.log(
+			`retired_turn_closed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=escalated_hold_session_gone reads=${bound.sessionGoneReads} detail=${safeDiagnostic(error)}`,
+			"warn",
+		);
+		if (completed === 0) {
+			await this.#forgetClosed(bound);
+			return;
+		}
+		await this.#notifySettled(bound);
+		await this.#settleAfterTerminal(bound);
+	}
+
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
@@ -4706,7 +4718,7 @@ class OriginActor {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
 						return;
 					}
-					this.#logRecoveryHoldOnce(bound.turn, "retired_tail_reattach_failed");
+					this.#logRecoveryHoldOnce(bound.turn, "retired_tail_reattach_failed", `detail=${safeDiagnostic(error)}`);
 					return;
 				}
 				// A reopened relay never carries the retired turn's content; its
@@ -4811,10 +4823,15 @@ class OriginActor {
 		if (bound) await this.#reconcileBound(bound);
 	}
 
-	/** Bounded status poll for a lost or stalled tail; one timer per turn, backing off. */
+	/**
+	 * Bounded status poll for a lost or stalled tail; one timer per turn, backing off.
+	 * An escalated retired hold is never polled this way: its user was already
+	 * told, so the periodic sweep alone reads it (#715: 5 s polls ran for hours).
+	 */
 	#scheduleStatusRecheck(bound: BoundTurn): void {
 		const key = `status:${retiredKey(bound)}`;
 		if (this.#retiredReattachTimers.has(key)) return;
+		if (bound.retired && this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined) return;
 		const delay = Math.min(STATUS_RECHECK_MAX_MS, STATUS_RECHECK_MIN_MS * 2 ** bound.statusRechecks);
 		bound.statusRechecks += 1;
 		const timer = this.#manager.schedule(() => {
