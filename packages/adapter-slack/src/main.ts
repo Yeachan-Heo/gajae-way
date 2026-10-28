@@ -1365,11 +1365,11 @@ export async function startSlackAdapter(
 	);
 	log.log("Slack adapter starting.");
 	await socket.start();
-	
+
 	// Track gap detection state
 	let lastGapDetectionAt: number | undefined;
 	let gapCheckTimer: ReturnType<typeof setInterval> | undefined;
-	
+
 	// Periodic check for inbound gaps (Event Subscriptions disabled detection)
 	const scheduleGapCheck = () => {
 		if (gapCheckTimer) clearInterval(gapCheckTimer);
@@ -1385,7 +1385,7 @@ export async function startSlackAdapter(
 						lastGapDetectionAt = now_ms;
 						log.error(
 							`Slack: slack_events_possibly_disabled; recovered messages while socket reports connected. ` +
-							`Check app Event Subscriptions are enabled. Restarting socket.`,
+								`Check app Event Subscriptions are enabled. Restarting socket.`,
 						);
 						// Restart the socket
 						socket.stop();
@@ -1404,7 +1404,7 @@ export async function startSlackAdapter(
 		}
 	};
 	scheduleGapCheck();
-	
+
 	return {
 		socket,
 		gateway,
