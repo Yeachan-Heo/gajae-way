@@ -1664,3 +1664,56 @@ test("#710: messages within grace period are not blamed on deaf socket", async (
 		f.recovery.stop();
 	}
 });
+
+test("#710: Event Subscriptions stay off after forced reconnect; suspect flag clears only when events_api arrives", async () => {
+	let clock = 1_700_000_000_000;
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
+	try {
+		// Socket connects and receives hello
+		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		expect(f.mode.connected).toBe(true);
+
+		// One message arrives live via events_api to set initial lastEnvelopeAt
+		clock = 1_700_000_010_000;
+		f.sockets[0]!.onmessage?.({
+			data: JSON.stringify({
+				envelope_id: "env-live-1",
+				type: "events_api",
+				payload: { event_id: "ev-live-1", event: { ...inbound({ ts: "1700000010.000001", text: "live" }) } },
+			}),
+		});
+		await f.ingress.drain();
+		await flush();
+
+		// Advance time past grace period
+		clock = 1_700_000_600_000;
+
+		// Set up history with a message that arrived after the socket connected but never via events_api
+		f.api.history.C1 = [
+			{ type: "message", user: "U1", ts: "1700000200.000001", text: "missed" },
+			{ type: "message", user: "U1", ts: "1700000010.000001", text: "live" },
+		];
+
+		// Recovery detects that the socket never delivered the message
+		expect(f.eventsSuspect()).toBeUndefined();
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(f.eventsSuspect()).toBeDefined();
+		const suspectSince = f.eventsSuspect()!.since;
+		// Verify suspect was set due to missed message
+		expect(suspectSince).toBe(1_700_000_600_000);
+
+		// Socket is disconnected and will reconnect asynchronously
+		expect(f.mode.connected).toBe(false);
+
+		// Set up history: next pass is empty (message was already sent in recovery)
+		f.api.history.C1 = [];
+
+		// An empty recovery pass should NOT clear the suspect flag
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(f.eventsSuspect()).toBeDefined();
+		expect(f.eventsSuspect()!.since).toBe(suspectSince);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});

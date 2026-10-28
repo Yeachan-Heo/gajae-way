@@ -320,6 +320,7 @@ export class SlackSocketMode {
 				if (!this.isConnected) {
 					this.isConnected = true;
 					this.connectedAt = this.now();
+					this.lastEventAt = undefined;
 					this.handlers.onConnected?.();
 				}
 				return;

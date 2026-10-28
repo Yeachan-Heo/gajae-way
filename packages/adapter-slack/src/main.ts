@@ -1311,7 +1311,9 @@ export async function startSlackAdapter(
 				`slack_events_possibly_disabled missed=${missedWhileConnected}: recovery found messages the connected socket never delivered; check that the Slack app's Event Subscriptions (Enable Events) are on. Restarting the socket.`,
 			);
 			liveSocket?.restart("Slack events possibly disabled");
-		} else if (completed && connectedSince !== undefined) eventsSuspect = undefined;
+		} else if (eventsSuspect && lastEnvelopeAt > eventsSuspect.since) {
+			eventsSuspect = undefined;
+		}
 		// Progress that is not on disk is not progress: keep retrying until it is.
 		const clean = completed && !dirty;
 		if (clean) {
