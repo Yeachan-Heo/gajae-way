@@ -63,6 +63,8 @@ export const STALLED_TURN_TERMINAL_TIMEOUT_MS = 10 * 60_000;
 const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
+/** Maximum consecutive endpoint_stale errors before closing an escalated hold as abandoned (#715). */
+const ESCALATED_HOLD_ENDPOINT_STALE_MAX = 3;
 /**
  * Grace before a decidable-terminal status may complete a turn whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
@@ -1328,6 +1330,10 @@ type BoundTurn = PersonaTurnIdentity & {
 	providerRetryAttempt: number;
 	/** A bounded provider retry is already scheduled for this failed turn. */
 	agentErrorRetryScheduled: boolean;
+	/** This turn is an escalated unresolved hold; clear tailEvidenceUnavailable after escalation (#715). */
+	escalatedHold?: boolean;
+	/** Consecutive endpoint_stale errors on this escalated hold; close when threshold is reached (#715). */
+	endpointStaleCount?: number;
 };
 
 class OriginActor {
@@ -1792,6 +1798,10 @@ class OriginActor {
 		if (bound) {
 			bound.retired = true;
 			bound.answerWanted = true;
+			bound.escalatedHold = true;
+			// Clear active recheck targets; use only bounded retired-reattach schedule (#715)
+			bound.tailEvidenceUnavailable = false;
+			bound.statusRecheckAfterStall = false;
 			this.#clearStallReconciliation(bound);
 			bound.tail?.setTurnRunning(false);
 			await bound.tail?.close();
@@ -1806,6 +1816,10 @@ class OriginActor {
 				// Adopted without a relay: the host is gone. Periodic reconcile reads
 				// its status; a reattach is tried on the bounded retired schedule.
 				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+				adopted.escalatedHold = true;
+				// Clear active recheck targets; use only bounded retired-reattach schedule (#715)
+				adopted.tailEvidenceUnavailable = false;
+				this.#clearStallReconciliation(adopted);
 				adopted.detached = true;
 				this.#scheduleRetiredReattach(adopted);
 			} catch (error) {
@@ -4034,10 +4048,30 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
-				"warn",
-			);
+			// Track consecutive endpoint_stale errors on escalated holds; close after threshold (#715)
+			if (bound.escalatedHold && sdkStatusErrorCode(error) === "session_unavailable") {
+				bound.endpointStaleCount = (bound.endpointStaleCount ?? 0) + 1;
+				if (bound.endpointStaleCount >= ESCALATED_HOLD_ENDPOINT_STALE_MAX) {
+					// Close the hold as abandoned after too many endpoint_stale errors
+					this.#manager.log(
+						`recovery_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} endpoint_stale_count=${bound.endpointStaleCount} detail=${safeDiagnostic(error)}`,
+						"warn",
+					);
+					await this.#forgetClosed(bound);
+					return;
+				}
+			} else {
+				// Reset count if the error is not endpoint_stale
+				bound.endpointStaleCount = 0;
+			}
+			// Log with detail only on first occurrence of this reason
+			if (this.#recoveryHoldReasons.get(bound.turn.opRef) !== "status_unavailable") {
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
+					"warn",
+				);
+				this.#recoveryHoldReasons.set(bound.turn.opRef, "status_unavailable");
+			}
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
@@ -4045,10 +4079,7 @@ class OriginActor {
 		}
 		if (this.#stopped || this.#manager.stopped) return;
 		if (bound.stallHostTerminated && report.operationRef !== bound.turn.opRef) {
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_ref_mismatch`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "operation_ref_mismatch");
 			this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -4066,10 +4097,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown");
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -4111,10 +4139,7 @@ class OriginActor {
 			// reconcile authority — completes the turn below, corroborated by an
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "tail_terminal_evidence_unavailable");
 			const timer = this.#manager.schedule(() => {
 				this.#graceTimers.delete(timer);
 				if (this.#stopped || this.#manager.stopped) return;
@@ -4190,10 +4215,7 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
-						"warn",
-					);
+					this.#logRecoveryHoldOnce(bound.turn, notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal");
 					if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 					return;
 				}
@@ -4682,10 +4704,7 @@ class OriginActor {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
 						return;
 					}
-					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
-						"warn",
-					);
+					this.#logRecoveryHoldOnce(bound.turn, "retired_tail_reattach_failed");
 					return;
 				}
 				// A reopened relay never carries the retired turn's content; its

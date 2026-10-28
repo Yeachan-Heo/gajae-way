@@ -421,3 +421,44 @@ test("an unchanged recovery hold is logged once across sweeps, not on every scan
 		await f.manager.stop();
 	}
 });
+
+test("an escalated hold makes bounded status calls per hour and closes terminally when endpoint_stale persists (#715)", async () => {
+	const f = await heldOrigin("endpoint-stale", { heldForMs: 11 * MINUTE, live: false });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.port.sends[0]!.text).toContain("a newer message");
+		// After escalation, the trigger row stays bound so late answers can be delivered
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("bound");
+		// Now make status recheck return endpoint_stale repeatedly
+		const errorWithCode = new Error("endpoint_stale: session 123 is not live") as any;
+		errorWithCode.code = "endpoint_stale";
+		let statusCalls = 0;
+		const originalStatus = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef === f.heldOpRef) {
+				statusCalls++;
+				throw errorWithCode;
+			}
+			return originalStatus(input);
+		};
+		// Simulate an hour of status polling at a high frequency
+		// The hold should close after 3 consecutive endpoint_stale errors
+		for (let i = 0; i < 60; i++) {
+			await f.manager.reconcile(f.originKey);
+			// Check if the hold has been abandoned
+			const abandoned = f.logs.find((line) => line.includes("recovery_hold_abandoned") && line.includes(`opRef=${f.heldOpRef}`));
+			if (abandoned) break;
+		}
+		// Verify that the held turn is eventually closed as abandoned
+		const abandoned = f.logs.find((line) => line.includes("recovery_hold_abandoned") && line.includes(`opRef=${f.heldOpRef}`));
+		expect(abandoned).toBeDefined();
+		expect(statusCalls).toBeLessThanOrEqual(60); // Bounded number of status calls per simulated hour
+		// Verify status_unavailable is logged only once with detail
+		const statusLogs = f.logs.filter((line) => line.includes("recovery_hold") && line.includes("reason=status_unavailable") && line.includes(`opRef=${f.heldOpRef}`));
+		expect(statusLogs.length).toBeLessThanOrEqual(1); // Logged at most once due to #logRecoveryHoldOnce
+	} finally {
+		await f.manager.stop();
+	}
+});
+
