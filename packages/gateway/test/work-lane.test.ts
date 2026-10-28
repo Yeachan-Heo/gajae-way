@@ -6632,6 +6632,21 @@ test("#481 force-retiring a dead red-check retry clears its old checks cycle", a
 	expect(checksNotice(f, "[lane a] attempt_ended")).toContain("pr=498 checks=pending");
 });
 
+test("retiring a lane awaiting checks ends its checks cycle so red checks cannot re-steer it", async () => {
+	const checks = scriptedChecks({ prNumber: 7385, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await awaitingLane(f, "fix/retire-awaiting-red");
+	expect(f.job().state).toBe("awaiting_checks");
+	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true });
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	await until(() => f.notices.length === 2);
+	expect(f.notices[1]?.text).toContain("awaiting_checks lane retired before checks settled");
+	checks.set({ prNumber: 7385, status: "red", failingChecks: ["unit-test"] });
+	await pollTimes(f, 3);
+	expect(f.port.sends).toHaveLength(1);
+});
+
 test("#595 force-retiring a lane awaiting checks clears the hold and allows resume", async () => {
 	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });

@@ -523,7 +523,10 @@ export class WorkLaneManager {
 				const effects = this.#settleChecks(
 					name,
 					record,
-					{ kind: "ended", reason: "lane force-retired before checks settled" },
+					{
+						kind: "ended",
+						reason: `lane ${reason === "operator_retired" ? "retired" : "force-retired"} before checks settled`,
+					},
 					undefined,
 					endedAt,
 				);

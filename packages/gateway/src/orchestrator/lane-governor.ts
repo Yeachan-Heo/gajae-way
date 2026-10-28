@@ -85,7 +85,7 @@ export interface SweepNomination {
 	readonly now: number;
 }
 
-export type LaneForceRetireReason = "session_dead" | "session_disowned";
+export type LaneForceRetireReason = "session_dead" | "session_disowned" | "operator_retired";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
 export interface LaneGovernorOptions {
@@ -285,6 +285,17 @@ export class LaneGovernor {
 			// or a crash-left attempt may still be running.
 			const runtime = await this.#runtimeSettled(record, lane.sessionId, repo);
 			if (!runtime.settled) return { retired: false, sessionKey, reason: runtime.reason };
+			// A settled attempt can still own an open checks cycle. Left open, the checks
+			// poller keeps re-steering red checks into a fresh session after retirement.
+			const lastAttempt = record?.attempts.at(-1);
+			if (record?.state === "awaiting_checks" && lastAttempt) {
+				const endedAt = new Date(this.#now()).toISOString();
+				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, "operator_retired", endedAt)) {
+					const detail = "awaiting_checks cycle could not be settled";
+					this.#log(`lane_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+					return { retired: false, sessionKey, reason: detail };
+				}
+			}
 			let closed = false;
 			try {
 				await this.#port.close({ sessionId: lane.sessionId, repo });
