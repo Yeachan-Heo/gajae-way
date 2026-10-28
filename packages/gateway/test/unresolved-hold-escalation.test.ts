@@ -41,9 +41,48 @@ class HoldPort extends ScriptedSessionPort {
 
 const MINUTE = 60_000;
 
+/** Timers the manager schedules, fired only when the test advances virtual time. */
+class VirtualClock {
+	#now = Date.now();
+	#timers = new Set<{ at: number; work: () => void }>();
+
+	managerOptions() {
+		return {
+			now: () => this.#now,
+			setTimeout: (work: () => void, delayMs: number) => {
+				const timer = { at: this.#now + delayMs, work };
+				this.#timers.add(timer);
+				return timer;
+			},
+			clearTimeout: (timer: unknown) => {
+				this.#timers.delete(timer as { at: number; work: () => void });
+			},
+		};
+	}
+
+	/** Advances to `untilMs`, firing every due timer in order and letting its async work run. */
+	async advance(byMs: number): Promise<void> {
+		const until = this.#now + byMs;
+		for (;;) {
+			const due = [...this.#timers].filter((timer) => timer.at <= until).sort((a, b) => a.at - b.at)[0];
+			if (!due) break;
+			this.#timers.delete(due);
+			this.#now = Math.max(this.#now, due.at);
+			due.work();
+			for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		this.#now = until;
+	}
+}
+
+/** The broker's answer for a session id it no longer serves. */
+function endpointStale(): Error {
+	return Object.assign(new Error("endpoint_stale: session is not live"), { code: "endpoint_stale" });
+}
+
 async function heldOrigin(
 	name: string,
-	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean },
+	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean; clock?: VirtualClock },
 ) {
 	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -88,6 +127,7 @@ async function heldOrigin(
 			instanceId: "hold-test",
 			repo,
 			unresolvedHoldMs: 10 * MINUTE,
+			...(options.clock ? options.clock.managerOptions() : {}),
 			log: (line: string) => logs.push(line),
 			onBindHold: (input) => {
 				if (noticeFailures > 0) {
@@ -417,6 +457,87 @@ test("an unchanged recovery hold is logged once across sweeps, not on every scan
 		const holds = f.logs.filter((line) => line.startsWith("recovery_hold ") && line.includes(`opRef=${f.heldOpRef}`));
 		expect(holds).toHaveLength(1);
 		expect(holds[0]).toContain("reason=operation_state_unknown");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold whose session stays endpoint_stale keeps holding, read only by the per-minute sweep, also across a restart (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("endpoint-stale", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(1);
+		let statusReads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			throw endpointStale();
+		};
+		// One simulated hour: the gateway sweep reconciles every minute and the
+		// manager's own recheck/reattach timers fire as virtual time passes.
+		for (let minute = 0; minute < 60; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		// Broker absence is not terminal evidence: the hold stays open and durable,
+		// read about once a minute rather than by the 5 s status recheck (~9/min in #715).
+		expect(statusReads).toBeGreaterThanOrEqual(60);
+		expect(statusReads).toBeLessThanOrEqual(64);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+		const holds = f.logs.filter((line) => line.startsWith("recovery_hold ") && line.includes(f.heldOpRef));
+		expect(holds.filter((line) => line.includes("reason=status_unavailable"))).toHaveLength(1);
+		// The held request is never resent and the user is not told twice.
+		expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+		expect(f.notices).toHaveLength(1);
+		// The newer message's own turn is untouched.
+		expect(f.answers.map((answer) => answer.text).join("\n")).toContain("answer to");
+
+		await f.manager.stop();
+		const readsBeforeRestart = statusReads;
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			for (let minute = 0; minute < 10; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads - readsBeforeRestart).toBeLessThanOrEqual(14);
+			expect(f.notices).toHaveLength(1);
+			expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold whose status is only transiently unreadable keeps holding (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("transient-stale", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let reads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			reads++;
+			// Every other read is a different failure: no run of session-gone reads.
+			throw reads % 2 === 0 ? new Error("broker_unavailable: socket closed") : endpointStale();
+		};
+		for (let minute = 0; minute < 60; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		// Only the per-minute sweep (plus the bounded reattach tries) reads it.
+		expect(reads).toBeGreaterThanOrEqual(60);
+		expect(reads).toBeLessThanOrEqual(64);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
 	} finally {
 		await f.manager.stop();
 	}
