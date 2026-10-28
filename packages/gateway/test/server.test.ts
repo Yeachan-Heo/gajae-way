@@ -10,6 +10,7 @@ import {
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
+import { acquireLease as acquireHomeLease } from "@gajae-gateway/home";
 import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
@@ -4858,11 +4859,92 @@ for (const [state, supervisor, held] of [
 			client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 			await waitFor(client.frames, 2);
 			const readiness = client.frames[1].result.readiness;
-			expect(readiness.ready).toBe(!held && readiness.ready);
+			expect(readiness.ready).toBe(!held);
 			expect(readiness.failure?.code === "restart_drain_held").toBe(held);
+			if (held) {
+				// Verify complete GatewayReadinessResult when drain is held
+				expect(readiness.windowMs).toBeDefined();
+				expect(readiness.failureThreshold).toBeDefined();
+				expect(readiness.failure?.at).toBeDefined();
+				expect(readiness.failure?.consecutiveFailures).toBeDefined();
+			}
 			client.close();
 		} finally {
 			await server?.stop();
 			server = undefined;
 		}
 	});
+
+test("#713: supervisor dead but update lease held keeps drain fenced on boot", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-lease-held-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const stackPath = join(directory, "restart-stack.json");
+	// Create a persisted running drain with dead supervisor
+	await writeFile(
+		stackPath,
+		JSON.stringify({
+			id: "test-drain-lease-held",
+			state: "running",
+			drainPrepared: true,
+		}),
+		{
+			mode: 0o600,
+		},
+	);
+	// Hold the update lease to prevent fence release
+	const updateLease = await acquireHomeLease(directory, "update");
+	try {
+		const database = await Store.open(config.dbPath);
+		const sessionPort = sessionPortFromResponder({
+			bind: (key, epoch) => bindWorkFixture(key, epoch),
+			respond: async () => "reply",
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		try {
+			server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+			// The drain should remain held because the update lease is still active
+			const deadline = Date.now() + 2_500;
+			while (Date.now() < deadline) {
+				const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+				// ID should still be present because lease prevents release
+				if (stackContent.id === undefined) break;
+				await Bun.sleep(25);
+			}
+			const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+			// Drain should still be held
+			expect(finalStack.id).toBe("test-drain-lease-held");
+			expect(finalStack.state).toBe("running");
+
+			// Readiness should report drain held
+			const client = await connect(config.socketPath);
+			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			await waitFor(client.frames, 1);
+			client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+			await waitFor(client.frames, 2);
+			const readiness = client.frames[1].result.readiness;
+			expect(readiness.ready).toBe(false);
+			expect(readiness.failure?.code).toBe("restart_drain_held");
+			// Verify complete result fields
+			expect(readiness.windowMs).toBeDefined();
+			expect(readiness.failureThreshold).toBeDefined();
+			expect(readiness.failure?.at).toBeDefined();
+			expect(readiness.failure?.consecutiveFailures).toBe(1);
+			client.close();
+		} finally {
+			await server?.stop();
+			server = undefined;
+		}
+	} finally {
+		await updateLease.release();
+	}
+});

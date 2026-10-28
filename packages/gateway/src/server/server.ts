@@ -67,9 +67,14 @@ import {
 	threadMuteKey,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
-import { FunctionalReadiness } from "../functional-readiness";
+import {
+	FunctionalReadiness,
+	FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
+	FUNCTIONAL_READINESS_WINDOW_MS,
+} from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
+import { leaseHeld } from "@gajae-gateway/home";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { DEFAULT_DEBLOAT_BYTE_THRESHOLD } from "../memory/debloat";
@@ -1136,6 +1141,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
 				// and is reported as `restart_drain_held` readiness.
 				if (readStack()?.state === "indeterminate") return;
+				// Release the inherited fence only when the restart-stack update lease is gone
+				// AND the receipt still names the same drain id. Otherwise keep it held.
+				if (await leaseHeld(options.config.home, "update")) {
+					console.info(`persisted restart drain held on boot: update lease still active id=${restartDrainId}`);
+					return;
+				}
 				if (!(await personaSessions.cancelRestartDrain(restartDrainId))) return;
 				try {
 					const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
@@ -1143,7 +1154,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					const temporary = `${stackPath}.${process.pid}.tmp`;
 					await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
 					await rename(temporary, stackPath);
-					console.info(`orphaned persisted restart drain released on boot outcome=${outcome} id=${restartDrainId}`);
+					console.info(
+						`orphaned persisted restart drain released on boot outcome=${outcome} id=${restartDrainId} supervisorPid=dead updateLease=released`,
+					);
 				} catch (error) {
 					console.error(`persisted restart drain clear failed id=${restartDrainId} detail=${diagnostic(error)}`);
 				}
@@ -1581,11 +1594,15 @@ async function handleRequest(
 							return {
 								ready: false,
 								state: "degraded" as const,
+								windowMs: FUNCTIONAL_READINESS_WINDOW_MS,
+								failureThreshold: FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
 								reason: `gateway: restart_drain_held (restarts fenced, active personas blocked)`,
 								failure: {
 									category: "session_create" as const,
 									code: "restart_drain_held",
 									detail: `restart drain held id=${drainId}; new persona dispatches are blocked`,
+									at: new Date().toISOString(),
+									consecutiveFailures: 1,
 								},
 							};
 						}
