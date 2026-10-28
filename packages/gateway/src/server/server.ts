@@ -1143,10 +1143,20 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				}
 				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
 				// and is reported as `restart_drain_held` readiness.
-				if (readStack()?.state === "indeterminate") return;
+				const finalStack = readStack();
+				if (finalStack?.state === "indeterminate") return;
+				// P1: Release only after service-manager settlement. Check that the receipt no longer claims
+				// the service-manager operation is running. A running state means the supervisor is still
+				// executing its command; if it died while still running, keep the drain held for recovery.
+				if (finalStack?.state === "running") return;
 				if (!(await personaSessions.cancelRestartDrain(restartDrainId))) return;
 				try {
+					// P2: Serialize orphan cleanup with receipt writers. Re-read before deleting to ensure
+					// we never delete an id from a newer receipt written by a concurrent stack restart.
 					const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
+					// Only delete the id if it still matches our drain id; a concurrent stack operation
+					// may have written a newer receipt with a different id.
+					if (receipt.id !== restartDrainId) return;
 					delete receipt.id;
 					const temporary = `${stackPath}.${process.pid}.tmp`;
 					await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });

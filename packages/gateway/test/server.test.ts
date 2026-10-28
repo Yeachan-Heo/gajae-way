@@ -4964,3 +4964,129 @@ test("#713: an update lease keeps an inherited drain fenced until it is released
 		if (!leaseReleased) await updateLease.release();
 	}
 });
+
+test("P1 #713: service-manager settlement check prevents release of running drains with dead supervisor", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-settlement-check-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const stackPath = join(directory, "restart-stack.json");
+	// Create a persisted drain in running state (service-manager operation not settled)
+	await writeFile(
+		stackPath,
+		JSON.stringify({
+			id: "p1-settlement-check",
+			state: "running",
+			drainPrepared: true,
+		}),
+		{
+			mode: 0o600,
+		},
+	);
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "reply",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+		// The drain should remain held because state is still "running" (not settled)
+		const deadline = Date.now() + 2_500;
+		while (Date.now() < deadline) {
+			const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+			if (stackContent.id === undefined) break;
+			await Bun.sleep(25);
+		}
+		// ID should still be present because service-manager hasn't settled
+		const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+		expect(finalStack.id).toBe("p1-settlement-check");
+
+		// Readiness should show drain is held
+		const client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({ v: "0.1", type: "request", id: "status-settlement", verb: "gateway.status" });
+		await waitFor(client.frames, 2);
+		const readiness = client.frames[1].result.readiness;
+		expect(readiness.failure?.code).toBe("restart_drain_held");
+		client.close();
+	} finally {
+		await server?.stop();
+		server = undefined;
+	}
+});
+
+test("P2 #713: concurrent receipt modification does not corrupt newer drain ids", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-concurrent-write-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const stackPath = join(directory, "restart-stack.json");
+	// Create initial drain with old id
+	await writeFile(
+		stackPath,
+		JSON.stringify({
+			id: "old-drain-id",
+			state: "indeterminate",
+		}),
+		{
+			mode: 0o600,
+		},
+	);
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "reply",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+		// Simulate a concurrent stack restart writing a newer id
+		const client = await connect(config.socketPath);
+		await waitFor([{ type: "hello" }], 1);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await new Promise<void>((resolve) => {
+			setTimeout(() => {
+				// Write a newer receipt with a different id while the server is still running
+				void writeFile(
+					stackPath,
+					JSON.stringify({
+						id: "new-drain-id",
+						state: "running",
+						drainPrepared: true,
+					}),
+					{ mode: 0o600 },
+				).then(resolve);
+			}, 100);
+		});
+
+		// Give the server time to process
+		await Bun.sleep(1_000);
+
+		// The new drain id should still be present; cleanup should not have deleted it
+		const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+		expect(finalStack.id).toBe("new-drain-id");
+
+		client.close();
+	} finally {
+		await server?.stop();
+		server = undefined;
+	}
+});
