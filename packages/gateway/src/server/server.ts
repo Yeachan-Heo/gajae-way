@@ -1122,7 +1122,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		void (async () => {
 			try {
 				const outcome = await personaSessions.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS);
+				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
+				// and is surfaced as `restart_drain_held` readiness. Any other inherited drain has no
+				// supervisor left to finish it: release the dispatch fence, then forget the persisted id.
 				if ((outcome === "timed_out" || outcome === "drained") && !persistedDrainWasIndeterminate) {
+					await personaSessions.cancelRestartDrain(restartDrainId);
 					try {
 						const stackPath = join(options.config.home, "restart-stack.json");
 						const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
