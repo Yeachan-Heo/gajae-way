@@ -1137,7 +1137,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					if (stack?.id !== restartDrainId || personaSessions.restartDrainId !== restartDrainId) return;
 					const supervisorAlive = typeof stack.supervisorPid === "number" && defaultPidAlive(stack.supervisorPid);
 					// An `update` holds its lease across the whole stack restart, including after a supervisor
-					// handoff; the lease is a flock, so it also clears when its holder dies.
+					// handoff; the lease uses kernel-level locking, so it clears when its holder dies.
 					if (!supervisorAlive && !(await leaseHeld(options.config.home, "update"))) break;
 					await Bun.sleep(PERSISTED_RESTART_SUPERVISOR_POLL_MS);
 				}
