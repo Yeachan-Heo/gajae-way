@@ -1640,9 +1640,7 @@ test("#710: messages within grace period are not blamed on deaf socket", async (
 		clock = 1_700_000_130_000;
 
 		// A message is posted but never reaches the socket (within grace period, 60 seconds after posting)
-		f.api.history.C1 = [
-			{ type: "message", user: "U1", ts: "1700000070.000001", text: "fresh" },
-		];
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000070.000001", text: "fresh" }];
 
 		// Recovery attempt within grace period should succeed but NOT flag as deaf
 		expect(f.eventsSuspect()).toBeUndefined();

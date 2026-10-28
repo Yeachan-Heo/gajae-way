@@ -506,6 +506,24 @@ test("#710: a socket kept busy by pings but never greeted with hello is replaced
 	}
 });
 
+test("#710: slash_commands envelopes never count as Events API delivery", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		socket.message({ type: "hello" });
+		socket.message({
+			envelope_id: "s1",
+			type: "slash_commands",
+			payload: { command: "/status", text: "", user_id: "U1", channel_id: "C1" },
+		});
+		await flush();
+		expect(f.mode.lastEnvelopeAt).toBeUndefined();
+	} finally {
+		f.mode.stop();
+	}
+});
+
 test("#710: the socket reports when it said hello and when the last envelope arrived, and restart reconnects", async () => {
 	const f = livenessFixture();
 	try {

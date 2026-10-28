@@ -92,7 +92,6 @@ export class SlackSocketMode {
 	private isConnected = false;
 	private opened = 0;
 	private connectedAt: number | undefined;
-	private lastEnvelope: number | undefined;
 	private lastEventAt: number | undefined;
 	private readonly seen = new Map<string, string | undefined>();
 	private retryTimer?: ReturnType<typeof setTimeout>;
@@ -145,7 +144,7 @@ export class SlackSocketMode {
 	}
 	/** When the last events_api envelope arrived (pings, hello, and slash_commands excluded; the deaf-socket detector uses this to track message delivery). */
 	get lastEnvelopeAt(): number | undefined {
-		return this.lastEventAt ?? this.lastEnvelope;
+		return this.lastEventAt;
 	}
 
 	/** Replace the current connection through the ordinary reconnect path. */
@@ -354,10 +353,8 @@ export class SlackSocketMode {
 			const envelope = frame as unknown as SlackEnvelope;
 			if (frame.type === "events_api" && isObject(payload?.event)) {
 				this.lastEventAt = this.now();
-				this.lastEnvelope = this.now();
 				await this.handlers.onEvent(payload.event, envelope);
 			} else if (frame.type === "slash_commands" && payload) {
-				this.lastEnvelope = this.now();
 				await this.handlers.onSlashCommand(payload as unknown as SlackSlashCommand, envelope);
 			} else {
 				this.log.log(`Slack socket ignored envelope type ${String(frame.type)}`);
