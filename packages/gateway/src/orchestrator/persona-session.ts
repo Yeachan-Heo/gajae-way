@@ -4094,6 +4094,8 @@ class OriginActor {
 		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
+			// A successful nonterminal status read resets any accumulated session-gone reads (#715).
+			bound.sessionGoneReads = 0;
 			if (bound.stallHostTerminated) {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
@@ -4624,7 +4626,12 @@ class OriginActor {
 	 */
 	async #closeAbandonedEscalatedHold(bound: BoundTurn, error: unknown): Promise<void> {
 		const database = this.#manager.database;
-		const completed = database.transaction((tx) => completeInboundTurn(database, tx, bound.turn.opRef, "retired"));
+		const completed = database.transaction((tx) => {
+			const changed = completeInboundTurn(database, tx, bound.turn.opRef, "retired");
+			// If the turn row was not found in the inbox, clean up the escalatedHoldKey anyway (#715).
+			if (changed === 0) database.core.metaDelete(escalatedHoldKey(bound.turn.opRef));
+			return changed;
+		});
 		for (const held of database.inbox.steersHeld(bound.turn.opRef))
 			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
 		this.#manager.log(

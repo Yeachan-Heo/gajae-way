@@ -540,3 +540,112 @@ test("an escalated hold whose status is only transiently unreadable keeps holdin
 		await f.manager.stop();
 	}
 });
+
+test("a successful nonterminal status read resets the escalated hold session-gone counter (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("reset-counter", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let statusReads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			// First 2 reads return endpoint_stale to increment the counter
+			if (statusReads <= 2) {
+				throw endpointStale();
+			}
+			// 3rd read returns a successful nonterminal status (should reset counter to 0)
+			if (statusReads === 3) {
+				return { operationRef: input.opRef, status: { status: "in_flight" }, summaryCompleted: false };
+			}
+			// Subsequent reads return endpoint_stale again
+			throw endpointStale();
+		};
+		// Advance time to trigger status reads
+		// Without the fix: turns would close after 3 stale reads (reads 1, 2, 4, 5, 6 would close)
+		// With the fix: turn should stay open through reads 1, 2, 3 (success), 4, 5, 6, and close on read 7
+		for (let minute = 0; minute < 30; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		// With the fix, we should have read status 6+ times before closing
+		// Reads 1-2 give stale errors, read 3 succeeds and resets, reads 4-6 give stale errors, close after read 6
+		const row = f.db.inbox.turnRow(f.heldOpRef);
+		expect(row?.turn_state).toBe("done");
+		expect(statusReads).toBeGreaterThanOrEqual(6);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("escalated hold abandonment is persisted before forgetClosed (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("persist-abandon", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		// Advance enough to close the abandoned hold
+		for (let minute = 0; minute < 5; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		// The turn should be closed
+		const row = f.db.inbox.turnRow(f.heldOpRef);
+		expect(row?.turn_state).toBe("done");
+		// Crucially, the escalatedHoldKey should also be cleaned up
+		const escalatedKey = `escalated-hold:${f.heldOpRef}`;
+		const hasEscalatedMarker = f.db.core.metaGet(escalatedKey) !== undefined;
+		expect(hasEscalatedMarker).toBe(false);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("escalated hold abandonment tracking is rebuilt from durable marker after restart (#715)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("rebuild-after-restart", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let statusReads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			throw endpointStale();
+		};
+		// Advance a bit - some status reads will happen
+		for (let minute = 0; minute < 2; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		const readsBeforeRestart = statusReads;
+		// Restart the manager
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			// After restart, status reads should not re-open the counter
+			for (let minute = 0; minute < 5; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			// Turn should be closed now
+			const row = f.db.inbox.turnRow(f.heldOpRef);
+			expect(row?.turn_state).toBe("done");
+			// Only 3 reads per the initial run + 3 after restart = within ESCALATED_HOLD_SESSION_GONE_READS bound
+			expect(statusReads).toBeLessThanOrEqual(6);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
