@@ -1125,6 +1125,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
 				// and is surfaced as `restart_drain_held` readiness. Any other inherited drain has no
 				// supervisor left to finish it: release the dispatch fence, then forget the persisted id.
+				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
+				// and is surfaced as `restart_drain_held` readiness. Any other inherited drain has no
+				// supervisor left to finish it: release the dispatch fence, then forget the persisted id.
 				if ((outcome === "timed_out" || outcome === "drained") && !persistedDrainWasIndeterminate) {
 					await personaSessions.cancelRestartDrain(restartDrainId);
 					try {
