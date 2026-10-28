@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -331,4 +332,92 @@ test("retention keeps an old trigger until its escalation notice is posted, then
 	sweep();
 	expect(f.db.inbox.turnRow(f.heldOpRef)).toBeUndefined();
 	await f.manager.stop();
+});
+
+/** The gateway restarted (or `/new` ran) while the turn was unresolved: its epoch is retired. */
+function retireHeldEpoch(f: Awaited<ReturnType<typeof heldOrigin>>): void {
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, f.originKey));
+	expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(1);
+}
+
+test("a retired-epoch unresolved turn past the bound is escalated once, without another rotation (#705)", async () => {
+	const f = await heldOrigin("retired-escalated", { heldForMs: 11 * MINUTE, live: false });
+	retireHeldEpoch(f);
+	try {
+		await f.manager.recover();
+		await until(() => f.notices.length === 1);
+		expect(f.notices[0]).toMatchObject({ originKey: f.originKey, reason: UNRESOLVED_HOLD_ESCALATED });
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
+		const escalated = f.logs.filter((line) => line.startsWith("recovery_hold_escalated"));
+		expect(escalated).toHaveLength(1);
+		expect(escalated[0]).toContain(`opRef=${f.heldOpRef}`);
+		expect(escalated[0]).toContain("epoch=0 nextEpoch=1");
+		expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(1);
+		// The origin already moved on: the newer message is answered there.
+		await until(() => f.port.sends.length === 1);
+		expect(f.port.sends[0]!.text).toContain("a newer message");
+		expect(f.port.sends.some((send) => send.opRef === f.heldOpRef)).toBe(false);
+		// Further sweeps and a restart never post a second notice or resend the op.
+		await f.manager.recover();
+		await f.manager.recover();
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			await restarted.recover();
+			expect(f.notices).toHaveLength(1);
+			expect(f.logs.filter((line) => line.startsWith("recovery_hold_escalated"))).toHaveLength(1);
+			expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a retired-epoch unresolved turn under the bound keeps holding, with no notice (#705)", async () => {
+	const f = await heldOrigin("retired-under-bound", { heldForMs: 2 * MINUTE, live: false });
+	retireHeldEpoch(f);
+	try {
+		await f.manager.recover();
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(0);
+		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(false);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("bound");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a backfilled send marker does not exempt a retired unresolved turn from the bound (#705)", async () => {
+	const f = await heldOrigin("retired-backfilled", { heldForMs: 11 * MINUTE, live: false });
+	// Schema 39 stamps pre-upgrade rows with a non-timestamp marker.
+	const raw = new Database(join(home, "gateway.db"));
+	raw.exec("PRAGMA busy_timeout = 5000");
+	raw.exec("UPDATE inbound_messages SET send_attempted_at = 'pre-migration-39' WHERE message_id = 'm-held'");
+	raw.close();
+	expect(f.db.inbox.sendAttemptedAt(f.heldOpRef)).toBe("pre-migration-39");
+	retireHeldEpoch(f);
+	try {
+		await f.manager.recover();
+		await until(() => f.notices.length === 1);
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
+		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an unchanged recovery hold is logged once across sweeps, not on every scan (#705)", async () => {
+	const f = await heldOrigin("hold-log-once", { heldForMs: 2 * MINUTE, live: false });
+	retireHeldEpoch(f);
+	try {
+		for (let sweep = 0; sweep < 5; sweep++) await f.manager.recover();
+		const holds = f.logs.filter((line) => line.startsWith("recovery_hold ") && line.includes(`opRef=${f.heldOpRef}`));
+		expect(holds).toHaveLength(1);
+		expect(holds[0]).toContain("reason=operation_state_unknown");
+	} finally {
+		await f.manager.stop();
+	}
 });

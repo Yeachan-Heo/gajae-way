@@ -1633,7 +1633,10 @@ class OriginActor {
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
 		await this.#emitEscalationNotices();
-		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
+		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
+		const open = new Set(turns.map((turn) => turn.opRef));
+		for (const opRef of this.#recoveryHoldReasons.keys()) if (!open.has(opRef)) this.#recoveryHoldReasons.delete(opRef);
+		for (const turn of turns) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
 			try {
@@ -1713,14 +1716,32 @@ class OriginActor {
 	 * delivered, and the op is never resent - the epoch rotates so pending
 	 * messages continue on a fresh session, and the origin gets one notice.
 	 * Pending messages are kept; nothing is discarded.
+	 *
+	 * A turn whose epoch was already retired (a restart or `/new` moved the origin
+	 * on while it was unresolved) is bounded the same way (#705): it gets the same
+	 * input fence, retired hold and one notice, without rotating an epoch the
+	 * origin has already left. The escalation marker makes it exactly once.
 	 */
 	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
-		if (this.#stopped || this.#manager.stopped || bound?.retired || turn.epoch !== this.#epoch()) return false;
+		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
+		const retiredEpoch = turn.epoch !== this.#epoch();
+		// A live BoundTurn is always on the current epoch; only a recovered row can be retired.
+		if (retiredEpoch && bound) return false;
 		const database = this.#manager.database;
-		const since = database.inbox.sendAttemptedAt(turn.opRef) ?? database.inbox.turnDispatchedAt(turn.opRef);
-		const sinceMs = since === undefined ? Number.NaN : Date.parse(since);
-		if (!Number.isFinite(sinceMs)) return false;
+		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) return false;
+		// The hold starts at the send. A row stamped by the schema 39 backfill
+		// ('pre-migration-39') or bound before dispatch was recorded falls back to
+		// its bind and then its arrival, so an old stranded row is still bounded (#705).
+		const sinceMs = [
+			database.inbox.sendAttemptedAt(turn.opRef),
+			database.inbox.turnDispatchedAt(turn.opRef),
+			database.inbox.turnRow(turn.opRef)?.received_at,
+		]
+			// Only an ISO timestamp counts: Date.parse reads the marker as the year 2039.
+			.map((at) => (typeof at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(at) ? Date.parse(at) : Number.NaN))
+			.find((ms) => Number.isFinite(ms));
+		if (sinceMs === undefined) return false;
 		const heldMs = this.#manager.now() - sinceMs;
 		if (heldMs < this.#manager.unresolvedHoldMs) return false;
 		const sessionId = bound?.sessionId ?? turn.sessionId;
@@ -1739,7 +1760,7 @@ class OriginActor {
 		// session never sees the possibly accepted request as unread. Messages
 		// that arrived after the send keep their unread context.
 		const { nextEpoch, closedInputs } = database.transaction((tx) => {
-			const epoch = database.bindings.rotateEpoch(tx, this.originKey);
+			const epoch = retiredEpoch ? this.#epoch() : database.bindings.rotateEpoch(tx, this.originKey);
 			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
 			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
 			const claimed = database.inbox.sentContextIds(turn.opRef);
@@ -1755,6 +1776,7 @@ class OriginActor {
 			return { nextEpoch: epoch, closedInputs: closed };
 		});
 		this.#holdSweeps.delete(turn.opRef);
+		this.#recoveryHoldReasons.delete(turn.opRef);
 		for (const row of closedInputs) {
 			// Whether the model read it is unknown: release its ownership without a 👀.
 			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
@@ -1873,11 +1895,8 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
-			if (!retired && (await this.#escalateUnresolvedHold(turn, undefined))) return;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=operation_state_unknown`,
-				"warn",
-			);
+			if (await this.#escalateUnresolvedHold(turn, undefined)) return;
+			this.#logRecoveryHoldOnce(turn, "operation_state_unknown");
 			return;
 		}
 		const authorityShifted =
@@ -1971,15 +1990,24 @@ class OriginActor {
 				return;
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
-				if (!retired && status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined)))
-					return;
-				this.#manager.log(
-					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason}`,
-					"warn",
-				);
+				if (status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
 		}
+	}
+
+	/**
+	 * Recovery scans run every minute; an unchanged hold is logged once per
+	 * (op-ref, reason) and again only when its reason changes (#705).
+	 */
+	#logRecoveryHoldOnce(turn: InboundTurn, reason: string): void {
+		if (this.#recoveryHoldReasons.get(turn.opRef) === reason) return;
+		this.#recoveryHoldReasons.set(turn.opRef, reason);
+		this.#manager.log(
+			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}`,
+			"warn",
+		);
 	}
 
 	async #adoptRecoveredTurn(
@@ -2078,6 +2106,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
+	/** Last logged recovery-scan hold reason per op-ref (#705). */
+	readonly #recoveryHoldReasons = new Map<string, string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
