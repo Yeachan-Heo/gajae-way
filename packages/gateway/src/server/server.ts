@@ -1770,6 +1770,11 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
+		case "work.directive": {
+			const result = await runtime.work.directive(request.params);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "work.jobs": {
 			// Operator projection over durable lane jobs (issue #10): survives the
 			// gateway restart that would otherwise erase in-flight work knowledge.

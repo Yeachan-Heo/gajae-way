@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
@@ -11,6 +11,8 @@ import {
 	ProtocolError,
 	parseOriginKey,
 	validateOriginRef,
+	type WorkDirective,
+	type WorkDirectiveResult,
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
@@ -1083,7 +1085,7 @@ export class WorkLaneManager {
 				sessionId: runtime.sessionId,
 				repo: runtime.cwd,
 				opRef,
-				text: input.text,
+				text: this.#withDirectives(input.text, context.parent),
 				...(observer.tail ? { relay: observer.tail } : {}),
 				...(notice ? { systemPreamble: notice.text } : {}),
 				codingRegister: true,
@@ -1207,6 +1209,100 @@ export class WorkLaneManager {
 					}
 				: {}),
 		};
+	}
+	/**
+	 * Standing operator directives (#604). They are stored durably, prepended to
+	 * every later attempt of a matching lane, and steered into matching lanes that
+	 * are running when one is added, so a mid-conversation prohibition reaches
+	 * work already under way instead of living only in the conversation's memory.
+	 */
+	async directive(params: unknown): Promise<WorkDirectiveResult> {
+		if (!params || typeof params !== "object" || Array.isArray(params)) invalid("params");
+		const { action, text, id, callerSessionId } = params as Record<string, unknown>;
+		if (callerSessionId !== undefined && typeof callerSessionId !== "string") invalid("callerSessionId");
+		this.#live();
+		const scope = this.#directiveScope(callerSessionId);
+		const visible = () =>
+			this.#directives().filter(
+				(directive) =>
+					scope === OWNER_DIRECTIVE_SCOPE || directive.scope === scope || directive.scope === OWNER_DIRECTIVE_SCOPE,
+			);
+		if (action === "list") return { directives: visible() };
+		if (action === "remove") {
+			if (typeof id !== "string" || !DIRECTIVE_ID.test(id)) invalid("id");
+			const target = this.#directives().find((directive) => directive.id === id);
+			if (!target || (scope !== OWNER_DIRECTIVE_SCOPE && target.scope !== scope))
+				throw new ProtocolError("invalid_params", "unknown work directive", { reasonCode: "unknown_directive", id });
+			this.#db.core.metaDelete(`${DIRECTIVE_KEY_PREFIX}${id}`);
+			return { directives: visible() };
+		}
+		if (action !== "add") invalid("action");
+		if (typeof text !== "string" || !text.trim() || text.length > MAX_DIRECTIVE_CHARS) invalid("text");
+		if (this.#directives().filter((directive) => directive.scope === scope).length >= MAX_DIRECTIVES_PER_SCOPE)
+			throw new ProtocolError(
+				"invalid_params",
+				`at most ${MAX_DIRECTIVES_PER_SCOPE} directives per scope; remove one first`,
+				{
+					reasonCode: "directive_limit",
+				},
+			);
+		const directive: WorkDirective = {
+			id: `wd-${randomUUID().slice(0, 8)}`,
+			scope,
+			text: text.trim(),
+			createdAt: this.#at(),
+		};
+		this.#db.core.metaSet(`${DIRECTIVE_KEY_PREFIX}${directive.id}`, JSON.stringify(directive));
+		const names = new Set<string>();
+		for (const runtime of this.#db.work.workAttemptOpen(1000)) {
+			if (!runtime.sessionKey.startsWith(WORK_SESSION_PREFIX)) continue;
+			if (directiveApplies(directive, laneDirectiveScope(runtime.parent)))
+				names.add(runtime.sessionKey.slice(WORK_SESSION_PREFIX.length));
+		}
+		const propagated: { name: string; steered: boolean; reason?: string }[] = [];
+		for (const name of names) {
+			try {
+				const result = await this.steer({ name, text: directiveText([directive], "new") });
+				propagated.push(result.steered ? { name, steered: true } : { name, steered: false, reason: result.reason });
+			} catch (error) {
+				const reason =
+					error instanceof ProtocolError
+						? String((error.detail as { reasonCode?: unknown } | undefined)?.reasonCode ?? error.code)
+						: "steer_failed";
+				propagated.push({ name, steered: false, reason });
+			}
+		}
+		console.error(
+			`work_directive_added id=${directive.id} scope=${scope} lanes=${propagated.length} steered=${propagated.filter((lane) => lane.steered).length}`,
+		);
+		return { directives: visible(), propagated };
+	}
+	#directiveScope(callerSessionId: string | undefined): string {
+		const callerOrigin = callerSessionId ? this.#db.bindings.originForSessionId(callerSessionId) : undefined;
+		if (callerOrigin === undefined) return OWNER_DIRECTIVE_SCOPE;
+		if (callerOrigin.startsWith(WORK_SESSION_PREFIX))
+			throw new ProtocolError("unauthorized", "a work lane cannot set operator directives", {
+				reasonCode: "directive_from_lane",
+			});
+		return callerOrigin;
+	}
+	#directives(): WorkDirective[] {
+		const directives: WorkDirective[] = [];
+		for (const key of this.#db.core.metaKeysInRange(DIRECTIVE_KEY_PREFIX, `${DIRECTIVE_KEY_PREFIX}\uffff`)) {
+			try {
+				const value = JSON.parse(this.#db.core.metaGet(key) ?? "") as WorkDirective;
+				if (typeof value.text === "string" && typeof value.scope === "string" && typeof value.id === "string")
+					directives.push(value);
+			} catch {
+				console.error(`work_directive_unreadable key=${key}`);
+			}
+		}
+		return directives.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+	}
+	#withDirectives(text: string, parent: WorkParent | null): string {
+		const scope = laneDirectiveScope(parent);
+		const active = this.#directives().filter((directive) => directiveApplies(directive, scope));
+		return active.length === 0 ? text : `${directiveText(active, "standing")}\n\n${text}`;
 	}
 	async steer(params: unknown): Promise<WorkSteerResult> {
 		const name = parseName(params);
@@ -2905,6 +3001,32 @@ function makeRuntime(
 		version: 0,
 	};
 }
+const WORK_SESSION_PREFIX = "work/task/";
+const OWNER_DIRECTIVE_SCOPE = "owner";
+const DIRECTIVE_KEY_PREFIX = "work_directive:";
+const DIRECTIVE_ID = /^wd-[0-9a-f]{8}$/;
+const MAX_DIRECTIVE_CHARS = 2_000;
+const MAX_DIRECTIVES_PER_SCOPE = 50;
+
+/** The persona conversation a lane answers to, or `owner` for lanes started outside one. */
+function laneDirectiveScope(parent: WorkParent | null): string {
+	if (parent?.kind === "persona") return parent.originKey;
+	if (parent?.kind === "lane" && parent.root) return parent.root.originKey;
+	return OWNER_DIRECTIVE_SCOPE;
+}
+
+function directiveApplies(directive: WorkDirective, laneScope: string): boolean {
+	return directive.scope === OWNER_DIRECTIVE_SCOPE || directive.scope === laneScope;
+}
+
+function directiveText(directives: readonly WorkDirective[], kind: "standing" | "new"): string {
+	const lead =
+		kind === "new"
+			? "[New standing directive from your operator. It overrides your task from now on: follow it before your next tool call, and stop any step that violates it.]"
+			: "[Standing directives from your operator. They override anything in the task below; follow them for the whole lane.]";
+	return [lead, ...directives.map((directive) => `- (${directive.id}) ${directive.text}`)].join("\n");
+}
+
 function invalid(field: string): never {
 	throw new ProtocolError("invalid_params", "invalid work parameters", { reasonCode: "invalid_work_params", field });
 }
