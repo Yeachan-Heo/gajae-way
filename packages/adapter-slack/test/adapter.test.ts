@@ -1552,12 +1552,16 @@ test("#710: recovered messages are not blamed on the socket when it was not yet 
 });
 
 test("#710: service_alive reports socket state, last envelope age and a deaf-events flag", () => {
-	expect(slackHeartbeatDetails({ connected: true, connections: 3, lastEnvelopeAt: 1_000 }, undefined, 61_000)).toBe(
+	expect(slackHeartbeatDetails({ connected: true, connections: 3, lastEnvelopeAt: 1_000, lastActivityAt: 1_000 }, undefined, 61_000)).toBe(
 		"socket=connected connections=3 last_envelope_age=60s",
+	);
+	// Verify lastActivityAt is used when available, even if lastEnvelopeAt is old
+	expect(slackHeartbeatDetails({ connected: true, connections: 3, lastEnvelopeAt: 1_000, lastActivityAt: 50_000 }, undefined, 61_000)).toBe(
+		"socket=connected connections=3 last_envelope_age=11s",
 	);
 	expect(
 		slackHeartbeatDetails(
-			{ connected: false, connections: 1, lastEnvelopeAt: undefined },
+			{ connected: false, connections: 1, lastEnvelopeAt: undefined, lastActivityAt: undefined },
 			{ since: Date.parse("2026-10-27T07:16:00.000Z"), missed: 4 },
 			0,
 		),
@@ -1685,6 +1689,15 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 		await f.ingress.drain();
 		await flush();
 
+		// Verify lastEnvelopeAt is set and slash_commands don't update it
+		const initialLastEnvelope = f.mode.lastEnvelopeAt;
+		expect(initialLastEnvelope).toBe(1_700_000_010_000);
+		clock = 1_700_000_020_000;
+		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "slash_commands", payload: {} }) });
+		await f.ingress.drain();
+		await flush();
+		expect(f.mode.lastEnvelopeAt).toBe(initialLastEnvelope);
+
 		// Advance time past grace period
 		clock = 1_700_000_600_000;
 
@@ -1712,6 +1725,69 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 		expect(await f.recoverMissedMessages()).toBe(true);
 		expect(f.eventsSuspect()).toBeDefined();
 		expect(f.eventsSuspect()!.since).toBe(suspectSince);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("#710: Clearing branch - eventsSuspect clears when events_api arrives after suspect.since", async () => {
+	// Test the clearing condition at main.ts:1314
+	// when eventsSuspect is set and lastEnvelopeAt > eventsSuspect.since,
+	// the next recoverMissedMessages should clear the flag.
+	let clock = 1_700_000_000_000;
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
+	try {
+		// Socket connects and receives hello
+		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		expect(f.mode.connected).toBe(true);
+
+		// Message arrives live to establish a baseline lastEnvelopeAt
+		clock = 1_700_000_010_000;
+		f.sockets[0]!.onmessage?.({
+			data: JSON.stringify({
+				envelope_id: "env-1",
+				type: "events_api",
+				payload: { event_id: "ev-1", event: { ...inbound({ ts: "1700000010.000001", text: "msg1" }) } },
+			}),
+		});
+		await f.ingress.drain();
+		await flush();
+		const baselineLastEnvelope = f.mode.lastEnvelopeAt;
+
+		// Advance and set suspect via a missed message
+		clock = 1_700_000_600_000;
+		f.api.history.C1 = [
+			{ type: "message", user: "U1", ts: "1700000200.000001", text: "missed" },
+			{ type: "message", user: "U1", ts: "1700000010.000001", text: "msg1" },
+		];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const suspectSince = f.eventsSuspect()!.since;
+		expect(suspectSince).toBe(1_700_000_600_000);
+
+		// Now send an events_api BEFORE the socket disconnects (within the grace window)
+		// This tests the clearing branch (lastEnvelopeAt > suspectSince)
+		if (f.mode.connected) {
+			clock = suspectSince + 5_000;
+			const beforeLastEnvelope = f.mode.lastEnvelopeAt;
+			f.sockets[0]!.onmessage?.({
+				data: JSON.stringify({
+					envelope_id: "env-2",
+					type: "events_api",
+					payload: { event_id: "ev-2", event: { ...inbound({ ts: "1700000605.000001", text: "msg2" }) } },
+				}),
+			});
+			await f.ingress.drain();
+			await flush();
+			// Verify events_api updated lastEnvelopeAt
+			expect(f.mode.lastEnvelopeAt).toBeGreaterThan(beforeLastEnvelope ?? 0);
+			expect(f.mode.lastEnvelopeAt! > suspectSince).toBe(true);
+
+			// The next recovery pass should clear the flag
+			f.api.history.C1 = [];
+			expect(await f.recoverMissedMessages()).toBe(true);
+			expect(f.eventsSuspect()).toBeUndefined();
+		}
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

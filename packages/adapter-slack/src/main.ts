@@ -1471,13 +1471,14 @@ export interface EventsSuspect {
 
 /** The `service_alive` detail: inbound health, not just process uptime (#710). */
 export function slackHeartbeatDetails(
-	socket: Pick<SlackSocketMode, "connected" | "lastEnvelopeAt" | "connections">,
+	socket: Pick<SlackSocketMode, "connected" | "lastEnvelopeAt" | "connections" | "lastActivityAt">,
 	suspect: EventsSuspect | undefined,
 	nowMs: number,
 ): string {
 	const parts = [`socket=${socket.connected ? "connected" : "disconnected"}`, `connections=${socket.connections}`];
-	const last = socket.lastEnvelopeAt;
-	parts.push(`last_envelope_age=${last === undefined ? "never" : `${Math.round((nowMs - last) / 1000)}s`}`);
+	// Use lastActivityAt for heartbeat to preserve activity across reconnects; lastEnvelopeAt is for deaf-socket detection.
+	const lastActivity = socket.lastActivityAt ?? socket.lastEnvelopeAt;
+	parts.push(`last_envelope_age=${lastActivity === undefined ? "never" : `${Math.round((nowMs - lastActivity) / 1000)}s`}`);
 	if (suspect) parts.push(`events_possibly_disabled_since=${new Date(suspect.since).toISOString()}`);
 	return parts.join(" ");
 }
