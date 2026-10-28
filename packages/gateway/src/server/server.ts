@@ -173,6 +173,8 @@ const RESTART_HARD_EXIT_MS = 35_000;
 const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
 /** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
 const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
+/** Bounded grace for an indeterminate persisted restart drain on boot; after this, the drain is released to prevent indefinite blocking. */
+const PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS = 30_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -1103,7 +1105,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	if (restartDrainId !== undefined) {
 		void personaSessions
-			.drainForRestart(restartDrainId, 0)
+			.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS)
 			.catch((error: unknown) =>
 				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
 			);
@@ -1531,7 +1533,21 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
-					readiness: runtime.readiness.snapshot(),
+					readiness: (() => {
+						if (runtime.personaSessions.restartDrainActive) {
+							return {
+								ready: false,
+								state: "degraded" as const,
+								reason: `gateway: restart_drain_held (restarts fenced, active personas blocked)`,
+								failure: {
+									category: "session_create" as const,
+									code: "restart_drain_held",
+									detail: "restart drain active; new persona dispatches are blocked",
+								},
+							};
+						}
+						return runtime.readiness.snapshot();
+					})(),
 					sessions: { active: options.database.bindings.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.inbox.contextDiagnostics(),
