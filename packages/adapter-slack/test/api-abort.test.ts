@@ -9,7 +9,7 @@ test("Slack call with AbortSignal passes the signal to fetch and respects abort"
 		return new Promise((_resolve, reject) => {
 			if (init?.signal) {
 				init.signal.addEventListener("abort", () => {
-					reject(new Error("Request aborted"));
+					reject(new DOMException("Aborted", "AbortError"));
 				});
 			}
 		});
