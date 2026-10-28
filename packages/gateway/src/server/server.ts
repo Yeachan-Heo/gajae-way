@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { leaseHeld } from "@gajae-gateway/home";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -89,7 +88,7 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
-import { defaultPidAlive, type GlobalGjcClient } from "../orchestrator/broker";
+import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
@@ -178,10 +177,8 @@ const RESTART_HARD_EXIT_MS = 35_000;
 const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
 /** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
 const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
-/** Bounded grace for a persisted restart drain on boot; once it settles or times out and its supervisor has exited, a non-indeterminate drain is released and cleared. */
+/** How long boot waits for in-flight persona turns under an inherited restart drain; the fence itself stays held. */
 const PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS = 30_000;
-/** How often boot re-checks whether the restart-stack supervisor that owns an inherited drain is still alive. */
-const PERSISTED_RESTART_SUPERVISOR_POLL_MS = 1_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -1111,66 +1108,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
 	if (restartDrainId !== undefined) {
-		const stackPath = join(options.config.home, "restart-stack.json");
-		const readStack = (): { id?: unknown; state?: unknown; supervisorPid?: unknown } | undefined => {
-			try {
-				return JSON.parse(readFileSync(stackPath, "utf8")) as {
-					id?: unknown;
-					state?: unknown;
-					supervisorPid?: unknown;
-				};
-			} catch {
-				return undefined;
-			}
-		};
-		if (readStack()?.state === "indeterminate")
-			console.warn(`persisted restart drain in indeterminate state on boot id=${restartDrainId}`);
-		void (async () => {
-			try {
-				const outcome = await personaSessions.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS);
-				if (outcome !== "timed_out" && outcome !== "drained") return;
-				// During a normal restart-stack or update, the supervisor is still restarting dependent services
-				// and releases this drain itself once the sequence finishes. Only a drain whose supervisor
-				// exited without releasing it, with no update lease left, is orphaned.
-				for (;;) {
-					const stack = readStack();
-					if (stack?.id !== restartDrainId || personaSessions.restartDrainId !== restartDrainId) return;
-					const supervisorAlive = typeof stack.supervisorPid === "number" && defaultPidAlive(stack.supervisorPid);
-					// An `update` holds its lease across the whole stack restart, including after a supervisor
-					// handoff; the lease uses kernel-level locking, so it clears when its holder dies.
-					if (!supervisorAlive && !(await leaseHeld(options.config.home, "update"))) break;
-					await Bun.sleep(PERSISTED_RESTART_SUPERVISOR_POLL_MS);
-				}
-				// An indeterminate drain stays held for operator recovery (`ops restart-stack --recover`)
-				// and is reported as `restart_drain_held` readiness.
-				const finalStack = readStack();
-				if (finalStack?.state === "indeterminate") return;
-				// P1: Release only after service-manager settlement. Check that the receipt no longer claims
-				// the service-manager operation is running. A running state means the supervisor is still
-				// executing its command; if it died while still running, keep the drain held for recovery.
-				if (finalStack?.state === "running") return;
-				if (!(await personaSessions.cancelRestartDrain(restartDrainId))) return;
-				try {
-					// P2: Serialize orphan cleanup with receipt writers. Re-read before deleting to ensure
-					// we never delete an id from a newer receipt written by a concurrent stack restart.
-					const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
-					// Only delete the id if it still matches our drain id; a concurrent stack operation
-					// may have written a newer receipt with a different id.
-					if (receipt.id !== restartDrainId) return;
-					delete receipt.id;
-					const temporary = `${stackPath}.${process.pid}.tmp`;
-					await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
-					await rename(temporary, stackPath);
-					console.info(
-						`orphaned persisted restart drain released on boot outcome=${outcome} id=${restartDrainId} supervisorPid=dead updateLease=released`,
-					);
-				} catch (error) {
-					console.error(`persisted restart drain clear failed id=${restartDrainId} detail=${diagnostic(error)}`);
-				}
-			} catch (error: unknown) {
-				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`);
-			}
-		})();
+		// An inherited drain is never released at boot: a dead supervisor does not prove the service-manager
+		// operation settled. The restart supervisor reattaches and releases it, or the operator runs
+		// `ops restart-stack --recover`; until then readiness reports `restart_drain_held`.
+		console.warn(`persisted restart drain inherited on boot; persona dispatch held id=${restartDrainId}`);
+		void personaSessions
+			.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS)
+			.catch((error: unknown) =>
+				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
+			);
 	}
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {

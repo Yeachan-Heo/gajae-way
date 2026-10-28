@@ -1,9 +1,8 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireLease as acquireHomeLease } from "@gajae-gateway/home";
 import {
 	type GatewayReadinessResult,
 	type MemoryOperationStatusResult,
@@ -4802,13 +4801,9 @@ test("status reports each connected client's generation and flags an adapter old
 	anonymous.close();
 });
 
-for (const [state, supervisor, held] of [
-	["running", "exited", false],
-	["running", "alive", true],
-	["indeterminate", "exited", true],
-] as const)
-	test(`#713: an inherited ${state} restart drain with an ${supervisor} supervisor is ${held ? "held and reported" : "released"} on boot`, async () => {
-		directory = await mkdtemp(join(tmpdir(), "gajaeway-server-persisted-drain-timeout-"));
+for (const state of ["running", "indeterminate"] as const) {
+	test(`#713: an inherited ${state} restart drain stays held and is reported until it is recovered`, async () => {
+		directory = await mkdtemp(join(tmpdir(), "gajaeway-server-inherited-drain-"));
 		const config: GatewayConfig = {
 			schemaVersion: 1,
 			home: directory,
@@ -4820,273 +4815,58 @@ for (const [state, supervisor, held] of [
 			dmPolicy: "open" as const,
 		};
 		const stackPath = join(directory, "restart-stack.json");
-		await writeFile(
-			stackPath,
-			JSON.stringify({
-				id: "boot-drain-timeout",
-				state,
-				drainPrepared: true,
-				...(supervisor === "alive" ? { supervisorPid: process.pid } : {}),
-			}),
-			{
-				mode: 0o600,
-			},
-		);
+		// The supervisor that wrote this receipt is gone; that alone never releases the fence.
+		await writeFile(stackPath, JSON.stringify({ id: "inherited-drain", state, drainPrepared: true }), {
+			mode: 0o600,
+		});
 		const database = await Store.open(config.dbPath);
 		const sessionPort = sessionPortFromResponder({
 			bind: (key, epoch) => bindWorkFixture(key, epoch),
 			respond: async () => "reply",
 		});
 		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
 		try {
 			server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
-
-			// A running drain is released once the boot drain settles; an indeterminate one is kept.
-			const deadline = Date.now() + 2_500;
-			while (Date.now() < deadline) {
-				const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-				if (stackContent.id === undefined) break;
-				await Bun.sleep(25);
-			}
-			const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-			expect(finalStack.id).toBe(held ? "boot-drain-timeout" : undefined);
-			expect(finalStack.state).toBe(state);
-
-			// Readiness reflects the in-memory dispatch fence, not just the persisted receipt.
-			const client = await connect(config.socketPath);
+			client = await connect(config.socketPath);
 			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 			await waitFor(client.frames, 1);
-			client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
-			await waitFor(client.frames, 2);
-			const readiness = client.frames[1].result.readiness;
-			expect(readiness.ready).toBe(!held);
-			expect(readiness.failure?.code === "restart_drain_held").toBe(held);
-			if (held) {
-				// Verify complete GatewayReadinessResult when drain is held
-				expect(readiness.windowMs).toBeDefined();
-				expect(readiness.failureThreshold).toBeDefined();
-				expect(readiness.failure?.at).toBeDefined();
-				expect(readiness.failure?.consecutiveFailures).toBeDefined();
-			}
-			client.close();
+			client.send({ v: "0.1", type: "request", id: "held", verb: "gateway.status" });
+			await client.waitForFrame("held");
+			const held = client.frames.find((frame) => frame.id === "held")?.result.readiness;
+			expect(held.ready).toBe(false);
+			expect(held.failure).toMatchObject({ code: "restart_drain_held", consecutiveFailures: 1 });
+			expect(held.failure.detail).toContain("id=inherited-drain");
+			expect(typeof held.failure.at).toBe("string");
+			expect(typeof held.windowMs).toBe("number");
+			expect(typeof held.failureThreshold).toBe("number");
+			expect((JSON.parse(await readFile(stackPath, "utf8")) as { id?: string }).id).toBe("inherited-drain");
+
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "reattach",
+				verb: "gateway.restart.prepare",
+				params: { restartId: "inherited-drain", waitMs: 0 },
+			});
+			await client.waitForFrame("reattach");
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "recover",
+				verb: "gateway.restart.cancel",
+				params: { restartId: "inherited-drain" },
+			});
+			await client.waitForFrame("recover");
+			expect(client.frames.find((frame) => frame.id === "recover")?.result).toEqual({ cancelled: true });
+			client.send({ v: "0.1", type: "request", id: "released", verb: "gateway.status" });
+			await client.waitForFrame("released");
+			const released = client.frames.find((frame) => frame.id === "released")?.result.readiness;
+			expect(released.failure?.code).not.toBe("restart_drain_held");
 		} finally {
+			client?.close();
 			await server?.stop();
 			server = undefined;
 		}
 	});
-
-test("#713: an update lease keeps an inherited drain fenced until it is released", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-lease-held-"));
-	const config: GatewayConfig = {
-		schemaVersion: 1,
-		home: directory,
-		gjc: { agentDir: join(directory, "agent") },
-		configPath: join(directory, "config.json"),
-		socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"),
-		logVerbosity: "info",
-		dmPolicy: "open" as const,
-	};
-	const stackPath = join(directory, "restart-stack.json");
-	// Create a persisted running drain with dead supervisor
-	await writeFile(
-		stackPath,
-		JSON.stringify({
-			id: "test-drain-lease-held",
-			state: "running",
-			drainPrepared: true,
-		}),
-		{
-			mode: 0o600,
-		},
-	);
-	// Hold the update lease to prevent fence release
-	const updateLease = await acquireHomeLease(directory, "update");
-	let leaseReleased = false;
-	try {
-		const database = await Store.open(config.dbPath);
-		const sessionPort = sessionPortFromResponder({
-			bind: (key, epoch) => bindWorkFixture(key, epoch),
-			respond: async () => "reply",
-		});
-		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
-		try {
-			server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
-
-			// The drain should remain held because the update lease is still active
-			const deadline = Date.now() + 2_500;
-			while (Date.now() < deadline) {
-				const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-				// ID should still be present because lease prevents release
-				if (stackContent.id === undefined) break;
-				await Bun.sleep(25);
-			}
-			const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-			// Drain should still be held
-			expect(finalStack.id).toBe("test-drain-lease-held");
-			expect(finalStack.state).toBe("running");
-
-			// Readiness should report drain held
-			const client = await connect(config.socketPath);
-			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-			await waitFor(client.frames, 1);
-			client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
-			await waitFor(client.frames, 2);
-			const readiness = client.frames[1].result.readiness;
-			expect(readiness.ready).toBe(false);
-			expect(readiness.failure?.code).toBe("restart_drain_held");
-			// Verify complete result fields
-			expect(readiness.windowMs).toBeDefined();
-			expect(readiness.failureThreshold).toBeDefined();
-			expect(readiness.failure?.at).toBeDefined();
-			expect(readiness.failure?.consecutiveFailures).toBe(1);
-
-			// Once the update finishes (or dies) without releasing the drain, it is orphaned and released.
-			await updateLease.release();
-			leaseReleased = true;
-			const releaseDeadline = Date.now() + 5_000;
-			while (Date.now() < releaseDeadline) {
-				const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-				if (stackContent.id === undefined) break;
-				await Bun.sleep(50);
-			}
-			expect((JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>).id).toBeUndefined();
-			client.send({ v: "0.1", type: "request", id: "status-released", verb: "gateway.status" });
-			await client.waitForFrame("status-released");
-			const released = client.frames.find((frame) => frame.id === "status-released")?.result.readiness;
-			expect(released?.failure?.code).not.toBe("restart_drain_held");
-			client.close();
-		} finally {
-			await server?.stop();
-			server = undefined;
-		}
-	} finally {
-		if (!leaseReleased) await updateLease.release();
-	}
-});
-
-test("P1 #713: service-manager settlement check prevents release of running drains with dead supervisor", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-settlement-check-"));
-	const config: GatewayConfig = {
-		schemaVersion: 1,
-		home: directory,
-		gjc: { agentDir: join(directory, "agent") },
-		configPath: join(directory, "config.json"),
-		socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"),
-		logVerbosity: "info",
-		dmPolicy: "open" as const,
-	};
-	const stackPath = join(directory, "restart-stack.json");
-	// Create a persisted drain in running state (service-manager operation not settled)
-	await writeFile(
-		stackPath,
-		JSON.stringify({
-			id: "p1-settlement-check",
-			state: "running",
-			drainPrepared: true,
-		}),
-		{
-			mode: 0o600,
-		},
-	);
-	const database = await Store.open(config.dbPath);
-	const sessionPort = sessionPortFromResponder({
-		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "reply",
-	});
-	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
-	try {
-		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
-
-		// The drain should remain held because state is still "running" (not settled)
-		const deadline = Date.now() + 2_500;
-		while (Date.now() < deadline) {
-			const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-			if (stackContent.id === undefined) break;
-			await Bun.sleep(25);
-		}
-		// ID should still be present because service-manager hasn't settled
-		const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-		expect(finalStack.id).toBe("p1-settlement-check");
-
-		// Readiness should show drain is held
-		const client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-		await waitFor(client.frames, 1);
-		client.send({ v: "0.1", type: "request", id: "status-settlement", verb: "gateway.status" });
-		await waitFor(client.frames, 2);
-		const readiness = client.frames[1].result.readiness;
-		expect(readiness.failure?.code).toBe("restart_drain_held");
-		client.close();
-	} finally {
-		await server?.stop();
-		server = undefined;
-	}
-});
-
-test("P2 #713: concurrent receipt modification does not corrupt newer drain ids", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-drain-concurrent-write-"));
-	const config: GatewayConfig = {
-		schemaVersion: 1,
-		home: directory,
-		gjc: { agentDir: join(directory, "agent") },
-		configPath: join(directory, "config.json"),
-		socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"),
-		logVerbosity: "info",
-		dmPolicy: "open" as const,
-	};
-	const stackPath = join(directory, "restart-stack.json");
-	// Create initial drain with old id
-	await writeFile(
-		stackPath,
-		JSON.stringify({
-			id: "old-drain-id",
-			state: "indeterminate",
-		}),
-		{
-			mode: 0o600,
-		},
-	);
-	const database = await Store.open(config.dbPath);
-	const sessionPort = sessionPortFromResponder({
-		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "reply",
-	});
-	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
-	try {
-		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
-
-		// Simulate a concurrent stack restart writing a newer id
-		const client = await connect(config.socketPath);
-		await waitFor([{ type: "hello" }], 1);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-		await new Promise<void>((resolve) => {
-			setTimeout(() => {
-				// Write a newer receipt with a different id while the server is still running
-				void writeFile(
-					stackPath,
-					JSON.stringify({
-						id: "new-drain-id",
-						state: "running",
-						drainPrepared: true,
-					}),
-					{ mode: 0o600 },
-				).then(resolve);
-			}, 100);
-		});
-
-		// Give the server time to process
-		await Bun.sleep(1_000);
-
-		// The new drain id should still be present; cleanup should not have deleted it
-		const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
-		expect(finalStack.id).toBe("new-drain-id");
-
-		client.close();
-	} finally {
-		await server?.stop();
-		server = undefined;
-	}
-});
+}
