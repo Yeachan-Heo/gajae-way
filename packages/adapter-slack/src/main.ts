@@ -882,6 +882,7 @@ export async function startSlackAdapter(
 		recoveryCursorPath?: string;
 		now?: () => number;
 		connectGateway?: (gateway: ReconnectingGateway) => Promise<void>;
+		onUnresponsiveSocket?: (reason: string) => void | Promise<void>;
 	} = {},
 ): Promise<{
 	readonly socket: SlackSocketMode;
@@ -1359,10 +1360,51 @@ export async function startSlackAdapter(
 			factory: ports.socketFactory,
 			log,
 			...(config.socketLivenessTimeoutMs === undefined ? {} : { livenessTimeoutMs: config.socketLivenessTimeoutMs }),
+			...(ports.onUnresponsiveSocket ? { onUnresponsiveSocket: ports.onUnresponsiveSocket } : {}),
 		},
 	);
 	log.log("Slack adapter starting.");
 	await socket.start();
+	
+	// Track gap detection state
+	let lastGapDetectionAt: number | undefined;
+	let gapCheckTimer: ReturnType<typeof setInterval> | undefined;
+	
+	// Periodic check for inbound gaps (Event Subscriptions disabled detection)
+	const scheduleGapCheck = () => {
+		if (gapCheckTimer) clearInterval(gapCheckTimer);
+		gapCheckTimer = setInterval(async () => {
+			if (!socket.connected) return; // Only check when connected
+			try {
+				const complete = await recoverMissedMessages();
+				// If recovery found messages while socket reports connected, the socket is likely deaf
+				if (!complete && socket.connected) {
+					const now_ms = now();
+					// Log warning at most once per gap detection window to avoid spam
+					if (!lastGapDetectionAt || now_ms - lastGapDetectionAt >= 60_000) {
+						lastGapDetectionAt = now_ms;
+						log.error(
+							`Slack: slack_events_possibly_disabled; recovered messages while socket reports connected. ` +
+							`Check app Event Subscriptions are enabled. Restarting socket.`,
+						);
+						// Restart the socket
+						socket.stop();
+						setTimeout(() => {
+							log.log("Restarting Slack socket after gap detection.");
+							void socket.start();
+						}, 1000);
+					}
+				}
+			} catch (error) {
+				log.error(`Slack gap check failed: ${errorText(error)}`);
+			}
+		}, INBOUND_GAP_CHECK_INTERVAL_MS);
+		if (typeof gapCheckTimer === "object" && gapCheckTimer !== null && "unref" in gapCheckTimer) {
+			(gapCheckTimer as { unref?: () => void }).unref?.();
+		}
+	};
+	scheduleGapCheck();
+	
 	return {
 		socket,
 		gateway,
@@ -1414,6 +1456,8 @@ const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart
 export const RECOVERY_RECENT_PASS_MS = 60_000;
 /** An outage at least this long always earns a fresh recovery pass. */
 export const RECOVERY_OUTAGE_GATE_MS = 5_000;
+/** Periodic check for missed messages while socket reports connected; detects Event Subscriptions being disabled. */
+export const INBOUND_GAP_CHECK_INTERVAL_MS = 10 * 60_000; // 10 minutes
 
 /**
  * What the invoking user is told. Wording follows what the gateway actually did:
@@ -1460,7 +1504,19 @@ if (import.meta.main) {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);
 	} else {
-		const disposeLogging = installStructuredLogging({ path: join(adapterHome(), "adapter-slack.log") });
+		let socket: SlackSocketMode | undefined;
+		const disposeLogging = installStructuredLogging({
+			path: join(adapterHome(), "adapter-slack.log"),
+			heartbeatDetails: () => {
+				if (!socket) return "";
+				const parts = [];
+				const lastActivityMs = socket.lastActivityMs;
+				if (lastActivityMs >= 0) parts.push(`last_envelope=${Math.round(lastActivityMs / 1000)}s`);
+				parts.push(`socket_state=${socket.socketState}`);
+				parts.push(`connections=${socket.connections}`);
+				return parts.join(" ");
+			},
+		});
 		void runSlackAdapterWithLease(adapterHome(), async (lease) => {
 			const shutdown = (): void => {
 				void lease.release().then(
@@ -1477,7 +1533,13 @@ if (import.meta.main) {
 			};
 			process.once("SIGINT", shutdown);
 			process.once("SIGTERM", shutdown);
-			await startSlackAdapter(await loadSlackAdapterConfig());
+			const adapter = await startSlackAdapter(await loadSlackAdapterConfig(), {
+				onUnresponsiveSocket: (reason) => {
+					console.error(`Slack adapter unresponsive, initiating shutdown: ${reason}`);
+					shutdown();
+				},
+			});
+			socket = adapter.socket;
 			await new Promise<void>(() => {});
 		}).catch((error) => {
 			if (error instanceof LeaseHeldError) exitOnLeaseHeld(error);
