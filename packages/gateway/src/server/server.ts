@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
 	CAPABILITIES,
@@ -173,7 +173,7 @@ const RESTART_HARD_EXIT_MS = 35_000;
 const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
 /** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
 const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
-/** Bounded grace for an indeterminate persisted restart drain on boot; after this, the drain is released to prevent indefinite blocking. */
+/** Bounded grace for a persisted restart drain on boot; after this timeout or when the drain completes, the drain is released and cleared to prevent indefinite blocking. */
 const PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS = 30_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
@@ -1103,12 +1103,42 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onRestartDrainCancelled: (restartId) => restartNotices.released(restartId),
 		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
+	const persistedDrainWasIndeterminate = (() => {
+		try {
+			const receipt = JSON.parse(readFileSync(join(options.config.home, "restart-stack.json"), "utf8")) as {
+				id?: unknown;
+				state?: unknown;
+				drainPrepared?: unknown;
+			};
+			return receipt.state === "indeterminate";
+		} catch {
+			return false;
+		}
+	})();
 	if (restartDrainId !== undefined) {
-		void personaSessions
-			.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS)
-			.catch((error: unknown) =>
-				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
-			);
+		if (persistedDrainWasIndeterminate) {
+			console.warn(`persisted restart drain in indeterminate state on boot id=${restartDrainId}`);
+		}
+		void (async () => {
+			try {
+				const outcome = await personaSessions.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS);
+				if ((outcome === "timed_out" || outcome === "drained") && !persistedDrainWasIndeterminate) {
+					try {
+						const stackPath = join(options.config.home, "restart-stack.json");
+						const receipt = JSON.parse(readFileSync(stackPath, "utf8")) as Record<string, unknown>;
+						delete receipt.id;
+						const temporary = `${stackPath}.${process.pid}.tmp`;
+						await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+						await rename(temporary, stackPath);
+						console.info(`persisted restart drain cleared on boot outcome=${outcome} id=${restartDrainId}`);
+					} catch (error) {
+						console.error(`persisted restart drain clear failed id=${restartDrainId} detail=${diagnostic(error)}`);
+					}
+				}
+			} catch (error: unknown) {
+				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`);
+			}
+		})();
 	}
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {

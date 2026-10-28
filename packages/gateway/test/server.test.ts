@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -4799,4 +4799,49 @@ test("status reports each connected client's generation and flags an adapter old
 	stale.close();
 	fresh.close();
 	anonymous.close();
+});
+
+test("persisted running drain clears after boot timeout", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-persisted-drain-timeout-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const stackPath = join(directory, "restart-stack.json");
+	await writeFile(
+		stackPath,
+		JSON.stringify({ id: "boot-drain-timeout", state: "running", drainPrepared: true }),
+		{ mode: 0o600 },
+	);
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "reply",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+		// Boot completes and the persisted drain runs to completion
+		// Wait for the drain to complete and the ID to be cleared
+		for (let attempt = 0; attempt < 100; attempt++) {
+			const stackContent = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+			if (stackContent.id === undefined) break;
+			await Bun.sleep(25);
+		}
+
+		// Verify the restart-stack.json ID was cleared after the drain completed
+		const finalStack = JSON.parse(await readFile(stackPath, "utf8")) as Record<string, unknown>;
+		expect(finalStack.id).toBeUndefined();
+		expect(finalStack.state).toBeDefined(); // state remains, only id is cleared
+	} finally {
+		await server?.stop();
+		server = undefined;
+	}
 });
