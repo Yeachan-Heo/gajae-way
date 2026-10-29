@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonitorRegistry } from "../src/monitors/registry";
@@ -202,4 +202,136 @@ test("invalid stored monitors are reported without leaking placeholder records",
 	expect(database.monitors.rows().find((row) => row.monitor_id === "corrupt")?.trigger_json).toBe("{");
 	expect(registry.remove("corrupt")).toBe(true);
 	expect(registry.invalid()).toEqual([]);
+});
+
+test("webhook monitor with unreadable credentialFile is skipped; valid webhook siblings serve", async () => {
+	const { registry } = await open();
+	// Create a temporary directory for credentials.
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-webhook-cred-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+
+	// Write a valid credential file.
+	const validCredFile = join(home, "valid-secret.txt");
+	await writeFile(validCredFile, "valid-secret-value", "utf8");
+
+	// Create webhook monitor with valid credential file.
+	const validWebhook = registry.add({
+		name: "valid-webhook",
+		trigger: {
+			kind: "webhook" as const,
+			route: "valid-route",
+			auth: { kind: "bearer" as const, credentialFile: validCredFile },
+		},
+		eventTypes: ["webhook.fire"],
+	});
+
+	// Create webhook monitor with non-existent credential file.
+	const invalidCredFile = join(home, "nonexistent-secret.txt");
+	const invalidWebhook = registry.add({
+		name: "invalid-webhook",
+		trigger: {
+			kind: "webhook" as const,
+			route: "invalid-route",
+			auth: { kind: "bearer" as const, credentialFile: invalidCredFile },
+		},
+		eventTypes: ["webhook.fire"],
+	});
+
+	const propagator = {
+		submit: () => crypto.randomUUID(),
+	};
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+
+	// Create runtime with webhook config.
+	const runtime = new MonitorRuntime(
+		{ webhook: { bind: "127.0.0.1", port: 0, exposeNonLoopback: false } } as never,
+		registry,
+		propagator as never,
+	);
+
+	// Start the runtime. Valid webhook should serve, invalid should be logged.
+	await runtime.start();
+	await runtime.stop();
+
+	// The invalid webhook should be logged as monitor_invalid.
+	const invalidLogs = errors.mock.calls
+		.map((call) => String(call[0]))
+		.filter((msg) => msg.includes("monitor_invalid") && msg.includes(invalidWebhook.monitorId));
+	expect(invalidLogs.length).toBe(1);
+	expect(invalidLogs[0]).toMatch(/^monitor_invalid id=[^ ]+ kind=webhook reason=ENOENT.*nonexistent-secret/);
+
+	// The valid webhook should not be in the error logs.
+	const validLogs = errors.mock.calls
+		.map((call) => String(call[0]))
+		.filter((msg) => msg.includes("monitor_invalid") && msg.includes(validWebhook.monitorId));
+	expect(validLogs.length).toBe(0);
+});
+
+test("monitor.list includes invalid array with failed monitors", async () => {
+	const { database, registry } = await open();
+	// Store a cron monitor with invalid schedule.
+	storeUnchecked(database, "legacy-six", SIX_FIELDS);
+	// Store a webhook trigger with unreadable credential.
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-list-invalid-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const invalidCredFile = join(home, "nonexistent.txt");
+	database.transaction((tx) =>
+		database.monitors.create(tx, {
+			id: "webhook-bad",
+			name: "webhook-with-bad-cred",
+			triggerJson: JSON.stringify({
+				kind: "webhook",
+				route: "bad-route",
+				auth: { kind: "bearer", credentialFile: invalidCredFile },
+			}),
+			eventTypesJson: JSON.stringify(["webhook.fire"]),
+			burstPolicy: "coalesce",
+			overlap: "queue",
+			channelTargetJson: null,
+			enabled: true,
+			instruction: null,
+			modelJson: null,
+			serviceTier: null,
+			procedureFilesJson: null,
+		}),
+	);
+	// Add a valid monitor.
+	const valid = registry.add({ name: "daily", trigger: { kind: "cron", schedule: "0 0 * * *" }, eventTypes: ["tick"] });
+
+	// Get the list of monitors and check invalid array.
+	const list = registry.list();
+	const invalid = registry.invalid();
+
+	// The list should contain all monitors (valid, invalid cron, and invalid webhook).
+	expect(list.map((m) => m.monitorId).sort()).toEqual(["legacy-six", "webhook-bad", valid.monitorId].sort());
+	// Registry.invalid() only detects monitors that cannot be loaded/parsed, not runtime credential failures.
+	// The cron with six fields is detected as invalid by the registry.
+	expect(invalid.length).toBe(1);
+	const invalidIds = invalid.map((m) => m.monitorId);
+	expect(invalidIds).toEqual(["legacy-six"]);
+
+	// The invalid monitor should have a reason.
+	const legacyInvalid = invalid.find((m) => m.monitorId === "legacy-six");
+	expect(legacyInvalid?.reason).toContain("five fields");
+
+	// The webhook with bad credential is detected as invalid during runtime.start().
+	// Create a runtime and verify the webhook is marked invalid.
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+	const propagator = { submit: () => crypto.randomUUID() };
+	const runtime = new MonitorRuntime(
+		{ webhook: { bind: "127.0.0.1", port: 0, exposeNonLoopback: false } } as never,
+		registry,
+		propagator as never,
+	);
+	await runtime.start();
+	await runtime.stop();
+
+	// The webhook with bad credential should be logged as invalid.
+	const invalidWebhookLogs = errors.mock.calls
+		.map((call) => String(call[0]))
+		.filter((msg) => msg.includes("monitor_invalid") && msg.includes("webhook-bad"));
+	expect(invalidWebhookLogs.length).toBe(1);
+	expect(invalidWebhookLogs[0]).toMatch(/^monitor_invalid id=webhook-bad kind=webhook reason=ENOENT/);
 });

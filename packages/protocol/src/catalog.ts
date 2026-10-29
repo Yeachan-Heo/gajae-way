@@ -500,7 +500,11 @@ export interface MemorySearchResult {
  */
 export type TriggerSpec =
 	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
-	| { readonly kind: "webhook"; readonly route: string }
+	| {
+			readonly kind: "webhook";
+			readonly route: string;
+			readonly auth?: { readonly kind: "hmac" | "bearer"; readonly credentialFile: string };
+	  }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
 
@@ -1299,7 +1303,7 @@ export interface VerbCatalogV01 {
 			readonly monitors: readonly MonitorRecord[];
 			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
 			/** Stored monitors that do not run; see MonitorInvalidRecord. */
-			readonly invalid: readonly MonitorInvalidRecord[];
+			readonly invalid?: readonly MonitorInvalidRecord[];
 		};
 	};
 	"monitor.inspect": {

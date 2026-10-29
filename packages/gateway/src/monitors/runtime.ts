@@ -36,25 +36,32 @@ export class MonitorRuntime {
 		await this.stop();
 		const monitors = this.#registry.list().filter((monitor) => monitor.enabled);
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
-		// Try to start the webhook group once; if it fails, skip all affected webhook monitors.
-		let webhookStartupError: Error | null = null;
+		// Start webhook group, tracking per-monitor failures. A shared config or bind error
+		// aborts all webhooks; per-monitor credential/preparation errors are isolated.
+		const webhookFailures = new Map<string, string>();
 		if (webhooks.length) {
 			try {
-				await this.#startWebhook(webhooks);
+				await this.#startWebhook(webhooks, webhookFailures);
 			} catch (error) {
-				webhookStartupError = error instanceof Error ? error : new Error(String(error));
+				// Global webhook config or listen failure: skip all webhooks.
+				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+				for (const webhook of webhooks) {
+					webhookFailures.set(webhook.monitorId, reason);
+				}
 			}
 		}
 		// One stored monitor that cannot start (a schedule saved before write validation, a trigger the
 		// gateway config cannot serve) is skipped and logged; it never takes the gateway down with it.
 		for (const monitor of monitors) {
 			try {
-				// If webhook group startup failed, skip all webhook monitors.
-				if (monitor.trigger.kind === "webhook" && webhookStartupError) {
-					throw webhookStartupError;
+				// Skip webhook monitors (they're handled by #startWebhook, failures tracked above).
+				if (monitor.trigger.kind === "webhook") {
+					if (webhookFailures.has(monitor.monitorId)) {
+						const reason = webhookFailures.get(monitor.monitorId) ?? "unknown error";
+						console.error(`monitor_invalid id=${monitor.monitorId} kind=webhook reason=${reason}`);
+					}
+					continue;
 				}
-				// Skip webhook monitors (they're handled by #startWebhook).
-				if (monitor.trigger.kind === "webhook") continue;
 				await this.#startOne(monitor);
 			} catch (error) {
 				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
@@ -123,28 +130,37 @@ export class MonitorRuntime {
 	async stop(): Promise<void> {
 		for (const stop of this.#stops.splice(0)) stop();
 	}
-	async #startWebhook(monitors: ReturnType<MonitorRegistry["list"]>): Promise<void> {
+	async #startWebhook(monitors: ReturnType<MonitorRegistry["list"]>, failures: Map<string, string>): Promise<void> {
 		const config = this.#config.webhook;
 		if (!config) throw new MonitorRuntimeError("webhook configuration is required");
 		const bind = config.bind ?? "127.0.0.1";
 		const nonLoopback = bind !== "127.0.0.1" && bind !== "::1";
 		const records: WebhookMonitor[] = [];
+		// Per-monitor preparation: credential files, event type validation.
+		// Shared preparation (config/bind) above will throw if invalid, aborting all.
 		for (const monitor of monitors) {
-			const trigger = monitor.trigger as WebhookTrigger;
-			const eventType = monitor.eventTypes[0];
-			if (eventType === undefined) throw new MonitorRuntimeError("monitor must declare at least one event type");
-			if (nonLoopback && (!config.exposeNonLoopback || !trigger.auth))
-				throw new MonitorRuntimeError(
-					"non-loopback webhook binding requires exposeNonLoopback and auth on every webhook monitor",
-				);
-			const secret = trigger.auth ? (await readFile(trigger.auth.credentialFile, "utf8")).trim() : undefined;
-			records.push({
-				monitorId: monitor.monitorId,
-				route: trigger.route,
-				eventType,
-				...(trigger.auth && secret ? { auth: { kind: trigger.auth.kind, secret } } : {}),
-			});
+			try {
+				const trigger = monitor.trigger as WebhookTrigger;
+				const eventType = monitor.eventTypes[0];
+				if (eventType === undefined) throw new MonitorRuntimeError("monitor must declare at least one event type");
+				if (nonLoopback && (!config.exposeNonLoopback || !trigger.auth))
+					throw new MonitorRuntimeError(
+						"non-loopback webhook binding requires exposeNonLoopback and auth on every webhook monitor",
+					);
+				const secret = trigger.auth ? (await readFile(trigger.auth.credentialFile, "utf8")).trim() : undefined;
+				records.push({
+					monitorId: monitor.monitorId,
+					route: trigger.route,
+					eventType,
+					...(trigger.auth && secret ? { auth: { kind: trigger.auth.kind, secret } } : {}),
+				});
+			} catch (error) {
+				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+				failures.set(monitor.monitorId, reason);
+			}
 		}
+		// Only start webhook server if there are valid records.
+		if (records.length === 0) return;
 		const server = startWebhook({
 			bind,
 			port: config.port,
