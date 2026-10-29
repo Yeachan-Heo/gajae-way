@@ -287,6 +287,7 @@ export interface GatewayServerOptions {
 	readonly config: GatewayConfig;
 	readonly database: Store;
 	/** Production and tests both inject the sole broker-backed turn transport. */
+	readonly lanePort: SessionPort;
 	readonly sessionPort: SessionPort;
 	/** Canonical persona workspace (symlinks resolved); defaults to `<home>/workspace`. */
 	readonly workspace?: string;
@@ -1182,7 +1183,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	const work = new WorkLaneManager({
 		database: options.database,
-		port: sessionPort,
+		port: options.lanePort,
 		lanes,
 		gajaewayHome: options.config.home,
 		serviceDirectory: getServiceDirectory(),
