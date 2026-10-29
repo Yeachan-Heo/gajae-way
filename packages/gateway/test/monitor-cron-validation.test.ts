@@ -109,3 +109,95 @@ test("a stored invalid schedule is skipped at start; the gateway's other monitor
 		trigger: { schedule: "0 12 30 10 *" },
 	});
 });
+
+test("webhook startup failure is isolated; only affected webhook monitors are logged invalid", async () => {
+	const { registry } = await open();
+	// Create a webhook monitor (enabled).
+	const webhook = registry.add({
+		name: "webhook-monitor",
+		trigger: { kind: "webhook", route: "webhook-route" },
+		eventTypes: ["webhook.fire"],
+	});
+	// Create a cron monitor (enabled).
+	const cron = registry.add({
+		name: "cron-monitor",
+		trigger: { kind: "cron", schedule: "* * * * *" },
+		eventTypes: ["cron.fire"],
+	});
+	const fired: string[] = [];
+	const propagator = {
+		submitSlot: (monitorId: string) => {
+			fired.push(monitorId);
+			return crypto.randomUUID();
+		},
+		submit: () => crypto.randomUUID(),
+	};
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+	// Create runtime with no webhook config (missing configuration).
+	const runtime = new MonitorRuntime(
+		{} as never,
+		registry,
+		propagator as never,
+		{
+			now: () => new Date(Date.parse(cron.createdAt) + 3 * 60_000),
+		},
+	);
+	// Start the runtime. The webhook startup should fail, but the cron monitor should still fire.
+	await runtime.start();
+	await runtime.stop();
+	// The cron monitor should have fired (it doesn't depend on webhook config).
+	expect(fired.length).toBeGreaterThan(0);
+	expect(new Set(fired)).toEqual(new Set([cron.monitorId]));
+	// The webhook monitor should be logged as invalid.
+	const invalidLogs = errors.mock.calls
+		.map((call) => String(call[0]))
+		.filter((msg) => msg.includes("monitor_invalid") && msg.includes(webhook.monitorId));
+	expect(invalidLogs.length).toBe(1);
+	expect(invalidLogs[0]).toMatch(
+		/^monitor_invalid id=[^ ]+ kind=webhook reason=webhook configuration is required/,
+	);
+});
+
+test("invalid monitors are listed with an invalid flag; can be disabled or fixed", async () => {
+	const { database, registry } = await open();
+	// Store an invalid monitor (corrupted JSON).
+	database.transaction((tx) =>
+		database.monitors.create(tx, {
+			id: "invalid-monitor",
+			name: "corrupted",
+			triggerJson: "{",
+			eventTypesJson: JSON.stringify(["event.type"]),
+			burstPolicy: "coalesce",
+			overlap: "queue",
+			channelTargetJson: null,
+			enabled: true,
+			instruction: null,
+			modelJson: null,
+			serviceTier: null,
+			procedureFilesJson: null,
+		}),
+	);
+	// Create a valid monitor.
+	const valid = registry.add({
+		name: "valid-monitor",
+		trigger: { kind: "cron", schedule: "0 0 * * *" },
+		eventTypes: ["tick"],
+	});
+	// List monitors; both should appear.
+	const monitors = registry.list();
+	expect(monitors).toHaveLength(2);
+	const invalid = monitors.find((m) => m.monitorId === "invalid-monitor");
+	const validMonitor = monitors.find((m) => m.monitorId === valid.monitorId);
+	expect(invalid).toBeDefined();
+	expect(validMonitor).toBeDefined();
+	// The invalid monitor should have an invalid flag.
+	expect(invalid?.invalid).toBeDefined();
+	expect(invalid?.invalid?.reason).toContain("JSON Parse error");
+	// The valid monitor should not have an invalid flag.
+	expect(validMonitor?.invalid).toBeUndefined();
+	// The invalid monitor should be disableable.
+	const updated = registry.update({ monitorId: "invalid-monitor", enabled: false });
+	expect(updated?.enabled).toBe(false);
+	expect(updated?.invalid).toBeDefined();
+});

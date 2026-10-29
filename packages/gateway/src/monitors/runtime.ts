@@ -36,11 +36,25 @@ export class MonitorRuntime {
 		await this.stop();
 		const monitors = this.#registry.list().filter((monitor) => monitor.enabled);
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
-		if (webhooks.length) await this.#startWebhook(webhooks);
+		// Try to start the webhook group once; if it fails, skip all affected webhook monitors.
+		let webhookStartupError: Error | null = null;
+		if (webhooks.length) {
+			try {
+				await this.#startWebhook(webhooks);
+			} catch (error) {
+				webhookStartupError = error instanceof Error ? error : new Error(String(error));
+			}
+		}
 		// One stored monitor that cannot start (a schedule saved before write validation, a trigger the
 		// gateway config cannot serve) is skipped and logged; it never takes the gateway down with it.
 		for (const monitor of monitors) {
 			try {
+				// If webhook group startup failed, skip all webhook monitors.
+				if (monitor.trigger.kind === "webhook" && webhookStartupError) {
+					throw webhookStartupError;
+				}
+				// Skip webhook monitors (they're handled by #startWebhook).
+				if (monitor.trigger.kind === "webhook") continue;
 				await this.#startOne(monitor);
 			} catch (error) {
 				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);

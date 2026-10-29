@@ -88,8 +88,21 @@ export class MonitorRegistry {
 		for (const row of this.#database.monitors.rows()) {
 			try {
 				records.push(rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id))));
-			} catch {
-				console.warn(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
+			} catch (error) {
+				const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+				// Include invalid monitors in the list so operators can disable or fix them.
+				const invalidRecord: MonitorRecord = {
+					monitorId: row.monitor_id,
+					name: row.name ?? `<corrupted monitor ${row.monitor_id}>`,
+					trigger: { kind: "cron" } as TriggerSpec,
+					eventTypes: ["<invalid>"],
+					burstPolicy: "coalesce",
+					overlap: "queue",
+					enabled: Boolean(row.enabled),
+					createdAt: row.created_at,
+					invalid: { reason },
+				};
+				records.push(invalidRecord);
 			}
 		}
 		return records;
@@ -138,11 +151,16 @@ export class MonitorRegistry {
 				: current.procedureFiles;
 			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
-			validateSpec(updated);
-			// A changed schedule is checked like a new one; an unchanged stored one is left as it is
-			// (so an operator can still disable or rename a monitor saved before this check).
-			if (updated.trigger.kind === "cron" && (schedule !== undefined || patch.trigger !== undefined))
-				validateCronSchedule(updated.trigger.schedule, updated.trigger.timezone);
+			// Skip full spec validation for invalid monitors unless they're being fixed (new trigger or eventTypes).
+			const isInvalid = current.invalid !== undefined;
+			const isBeingFixed = patch.trigger !== undefined || patch.eventTypes !== undefined;
+			if (!isInvalid || isBeingFixed) {
+				validateSpec(updated);
+				// A changed schedule is checked like a new one; an unchanged stored one is left as it is
+				// (so an operator can still disable or rename a monitor saved before this check).
+				if (updated.trigger.kind === "cron" && (schedule !== undefined || patch.trigger !== undefined))
+					validateCronSchedule(updated.trigger.schedule, updated.trigger.timezone);
+			}
 			const persisted = this.#database.monitors.update(tx, {
 				id: current.monitorId,
 				name: updated.name,

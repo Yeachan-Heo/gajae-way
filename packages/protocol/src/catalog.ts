@@ -577,6 +577,8 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly burstPolicy: BurstPolicyKind;
 	readonly overlap: MonitorOverlapPolicy;
 	readonly enabled: boolean;
+	/** Set when the monitor is persisted but could not be loaded or validated at runtime. */
+	readonly invalid?: { readonly reason: string };
 }
 
 export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
