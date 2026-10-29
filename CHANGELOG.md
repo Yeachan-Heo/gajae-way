@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.2] - 2026-10-29
+
+### Features
+- **work**: Standing operator directives reach running and later lanes (`gajaeway work directive`) (#604)
+
+### Fixes
+- **gateway**: A held restart drain reports not-ready with its restart id; an inherited drain is held and reported at boot instead of silently fencing dispatch (#713)
+- **gateway**: Escalate an unresolved hold on a retired epoch too, and bound status polling on escalated retired holds (#705, #715)
+- **gateway**: Make `work.start` admission visible and idempotent across a caller timeout (#707)
+- **gateway**: Settle `awaiting_checks` on `work.retire` so retired lanes cannot respawn (#716)
+- **work**: Preserve SDK failure causes independently of receipts (#696)
+- **monitors**: A failed event can no longer wedge an `overlap=skip` monitor; a running authoring turn is never aged out (#702)
+- **adapter-slack**: Recover a closed socket and detect deaf event delivery (#710)
+
 ## [0.4.1] - 2026-10-27
 
 ### Fixes
