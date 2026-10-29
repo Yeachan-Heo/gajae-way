@@ -22,6 +22,7 @@ export class MonitorRuntime {
 	#stops: Stop[] = [];
 	readonly #clock?: () => Date;
 	readonly #catchUp?: CronCatchUpPolicy;
+	#startInProgress: Promise<void> | null = null;
 	constructor(
 		config: GatewayConfig,
 		registry: MonitorRegistry,
@@ -56,9 +57,11 @@ export class MonitorRuntime {
 				}
 			}
 		}
-		// Report invalid monitors that were loaded (e.g., cron schedules that fail validation).
+		// Report invalid monitors that were loaded (e.g., cron schedules that fail validation)
+		// and monitors that cannot be deserialized (loadable:false). The latter are skipped
+		// and cannot be started, so log a warning at startup.
 		for (const record of invalid) {
-			if (invalidIds.has(record.monitorId) && record.loadable) {
+			if (invalidIds.has(record.monitorId)) {
 				const reason = stripControlCharacters(record.reason);
 				const monitor = this.#registry.get(record.monitorId);
 				const kind = monitor?.trigger.kind ?? "unknown";
@@ -144,7 +147,24 @@ export class MonitorRuntime {
 		}
 	}
 	async refresh(): Promise<void> {
-		await this.start();
+		// Serialize refresh calls: ensure only one start/refresh is in-flight at a time.
+		// Concurrent refresh() calls from monitor mutations are coalesced to prevent
+		// overlapping credential preparation and webhook binding, which can cause
+		// duplicate script monitor launches.
+		if (this.#startInProgress) {
+			await this.#startInProgress;
+			return;
+		}
+		let resolveStart: (() => void) | undefined;
+		this.#startInProgress = new Promise<void>((resolve) => {
+			resolveStart = resolve;
+		});
+		try {
+			await this.start();
+		} finally {
+			this.#startInProgress = null;
+			resolveStart?.();
+		}
 	}
 	async stop(): Promise<void> {
 		for (const stop of this.#stops.splice(0)) stop();

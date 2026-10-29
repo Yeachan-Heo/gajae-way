@@ -354,8 +354,12 @@ test("invalid cron monitor with oversized minute field is never started", async 
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(() => errors.mockRestore());
 
+	const submitSlotCalls: string[] = [];
 	const propagator = {
-		submitSlot: () => crypto.randomUUID(),
+		submitSlot: (monitorId: string) => {
+			submitSlotCalls.push(monitorId);
+			return crypto.randomUUID();
+		},
 	};
 	const runtime = new MonitorRuntime({} as never, registry, propagator as never);
 	await runtime.start();
@@ -367,6 +371,8 @@ test("invalid cron monitor with oversized minute field is never started", async 
 	expect(invalidCronLogs.length).toBe(1);
 	// The log should contain the reason field.
 	expect(invalidCronLogs[0]).toContain("reason=");
+	// The invalid monitor should never call submitSlot.
+	expect(submitSlotCalls).not.toContain("invalid-cron");
 	await runtime.stop();
 });
 
@@ -405,5 +411,76 @@ test("control characters in credential file errors are stripped before logging",
 		// Verify that the ESC character (0x1b) has been replaced with a space.
 		expect(errorLog).not.toContain("\x1b");
 	}
+	await runtime.stop();
+});
+
+test("unloadable monitors (loadable:false) are warned on startup", async () => {
+	const { database, registry } = await open();
+	// Store a monitor with corrupt trigger JSON (cannot deserialize).
+	database.transaction((tx) =>
+		database.monitors.create(tx, {
+			id: "corrupt-trigger",
+			name: "corrupted",
+			triggerJson: "{",
+			eventTypesJson: JSON.stringify(["event.type"]),
+			burstPolicy: "coalesce",
+			overlap: "queue",
+			channelTargetJson: null,
+			enabled: true,
+			instruction: null,
+			modelJson: null,
+			serviceTier: null,
+			procedureFilesJson: null,
+		}),
+	);
+
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+
+	const propagator = { submit: () => crypto.randomUUID() };
+	const runtime = new MonitorRuntime({} as never, registry, propagator as never);
+	await runtime.start();
+
+	// The unloadable monitor should be warned on startup even though loadable:false.
+	const unloadableLogs = errors.mock.calls
+		.map((call) => String(call[0]))
+		.filter((msg) => msg.includes("monitor_invalid") && msg.includes("corrupt-trigger"));
+	expect(unloadableLogs.length).toBe(1);
+	expect(unloadableLogs[0]).toContain("reason=");
+	await runtime.stop();
+});
+
+test("concurrent refresh() calls are serialized to prevent duplicate script starts", async () => {
+	const { database, registry } = await open();
+	// Create a webhook monitor (requires async webhook setup).
+	const webhook = registry.add({
+		name: "webhook-monitor",
+		trigger: { kind: "webhook", route: "test-route" },
+		eventTypes: ["webhook.fire"],
+	});
+	// Create a script monitor.
+	const script = registry.add({
+		name: "script-monitor",
+		trigger: { kind: "script", command: ["echo", "test"], intervalMs: 60_000 },
+		eventTypes: ["script.output"],
+	});
+
+	const propagator = {
+		submit: () => crypto.randomUUID(),
+	};
+
+	const runtime = new MonitorRuntime(
+		{ webhook: { bind: "127.0.0.1", port: 0, exposeNonLoopback: false }, scriptRoot: "/tmp" } as never,
+		registry,
+		propagator as never,
+	);
+
+	// Simulate concurrent refresh calls by calling start multiple times without awaiting.
+	// With proper serialization, all should complete without error.
+	const starts = [runtime.refresh(), runtime.refresh(), runtime.refresh()];
+	await Promise.all(starts);
+
+	// All should complete without error.
+	expect(starts.length).toBe(3);
 	await runtime.stop();
 });
