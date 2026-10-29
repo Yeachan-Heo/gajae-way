@@ -335,3 +335,75 @@ test("monitor.list includes invalid array with failed monitors", async () => {
 	expect(invalidWebhookLogs.length).toBe(1);
 	expect(invalidWebhookLogs[0]).toMatch(/^monitor_invalid id=webhook-bad kind=webhook reason=ENOENT/);
 });
+
+test("invalid cron monitor with oversized minute field is never started", async () => {
+	const { database, registry } = await open();
+	// Store a monitor with an invalid cron schedule (minute range 0-99 is not valid).
+	storeUnchecked(database, "invalid-cron", "0-99 * * * *");
+
+	// The invalid cron should be in the invalid list.
+	const invalid = registry.invalid();
+	const invalidIds = invalid.map((m) => m.monitorId);
+	expect(invalidIds).toContain("invalid-cron");
+
+	// The invalid cron should still be in list() since it's loadable (repairable).
+	const listedMonitors = registry.list().map((m) => m.monitorId);
+	expect(listedMonitors).toContain("invalid-cron");
+
+	// At runtime, the invalid cron should be logged as invalid and not started.
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+
+	const propagator = {
+		submitSlot: () => crypto.randomUUID(),
+	};
+	const runtime = new MonitorRuntime({} as never, registry, propagator as never);
+	await runtime.start();
+
+	// Check that the invalid cron was logged as invalid.
+	const invalidCronLogs = errors.mock.calls
+		.map((call) => String(call[0]))
+		.filter((msg) => msg.includes("monitor_invalid") && msg.includes("invalid-cron"));
+	expect(invalidCronLogs.length).toBe(1);
+	// The log should contain the reason field.
+	expect(invalidCronLogs[0]).toContain("reason=");
+	await runtime.stop();
+});
+
+test("control characters in credential file errors are stripped before logging", async () => {
+	const { registry } = await open();
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-webhook-control-chars-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+
+	// Create a webhook monitor with a path containing a control character (ESC = 0x1b).
+	const webhookWithEsc = registry.add({
+		name: "webhook-with-esc",
+		trigger: {
+			kind: "webhook" as const,
+			route: "webhook-route",
+			auth: { kind: "bearer" as const, credentialFile: join(home, "secret\x1b.txt") },
+		},
+		eventTypes: ["event"],
+	});
+
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+
+	const propagator = { submit: () => crypto.randomUUID() };
+	const runtime = new MonitorRuntime(
+		{ webhook: { bind: "127.0.0.1", port: 0, exposeNonLoopback: false } } as never,
+		registry,
+		propagator as never,
+	);
+	await runtime.start();
+
+	// The error message should not contain the ESC character (0x1b).
+	const logs = errors.mock.calls.map((call) => String(call[0]));
+	const errorLog = logs.find((msg) => msg.includes("monitor_invalid") && msg.includes(webhookWithEsc.monitorId));
+	expect(errorLog).toBeDefined();
+	if (errorLog) {
+		// Verify that the ESC character (0x1b) has been replaced with a space.
+		expect(errorLog).not.toContain("\x1b");
+	}
+	await runtime.stop();
+});

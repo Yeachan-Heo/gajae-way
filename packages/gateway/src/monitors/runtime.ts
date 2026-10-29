@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { stripControlCharacters } from "@gajae-gateway/log";
 import type { GatewayConfig } from "../config";
 import type { MonitorPropagator } from "./propagate";
 import type { MonitorRegistry } from "./registry";
@@ -13,6 +14,7 @@ type WebhookTrigger = { kind: "webhook"; route: string; auth?: { kind: "hmac" | 
 export class MonitorRuntimeError extends Error {
 	readonly code = "monitor_runtime_invalid";
 }
+
 export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
@@ -35,6 +37,8 @@ export class MonitorRuntime {
 	async start(): Promise<void> {
 		await this.stop();
 		const monitors = this.#registry.list().filter((monitor) => monitor.enabled);
+		const invalid = this.#registry.invalid();
+		const invalidIds = new Set(invalid.map((record) => record.monitorId));
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
 		// Start webhook group, tracking per-monitor failures. A shared config or bind error
 		// aborts all webhooks; per-monitor credential/preparation errors are isolated.
@@ -44,27 +48,42 @@ export class MonitorRuntime {
 				await this.#startWebhook(webhooks, webhookFailures);
 			} catch (error) {
 				// Global webhook config or listen failure: skip all webhooks.
-				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+				const reason = stripControlCharacters(
+					(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300),
+				);
 				for (const webhook of webhooks) {
 					webhookFailures.set(webhook.monitorId, reason);
 				}
+			}
+		}
+		// Report invalid monitors that were loaded (e.g., cron schedules that fail validation).
+		for (const record of invalid) {
+			if (invalidIds.has(record.monitorId) && record.loadable) {
+				const reason = stripControlCharacters(record.reason);
+				const monitor = this.#registry.get(record.monitorId);
+				const kind = monitor?.trigger.kind ?? "unknown";
+				console.error(`monitor_invalid id=${record.monitorId} kind=${kind} reason=${reason}`);
 			}
 		}
 		// One stored monitor that cannot start (a schedule saved before write validation, a trigger the
 		// gateway config cannot serve) is skipped and logged; it never takes the gateway down with it.
 		for (const monitor of monitors) {
 			try {
+				// Skip monitors with invalid schedules that are marked as loadable but not startable.
+				if (invalidIds.has(monitor.monitorId)) continue;
 				// Skip webhook monitors (they're handled by #startWebhook, failures tracked above).
 				if (monitor.trigger.kind === "webhook") {
 					if (webhookFailures.has(monitor.monitorId)) {
-						const reason = webhookFailures.get(monitor.monitorId) ?? "unknown error";
+						const reason = stripControlCharacters(webhookFailures.get(monitor.monitorId) ?? "unknown error");
 						console.error(`monitor_invalid id=${monitor.monitorId} kind=webhook reason=${reason}`);
 					}
 					continue;
 				}
 				await this.#startOne(monitor);
 			} catch (error) {
-				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+				const reason = stripControlCharacters(
+					(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300),
+				);
 				console.error(`monitor_invalid id=${monitor.monitorId} kind=${monitor.trigger.kind} reason=${reason}`);
 			}
 		}
@@ -155,7 +174,9 @@ export class MonitorRuntime {
 					...(trigger.auth && secret ? { auth: { kind: trigger.auth.kind, secret } } : {}),
 				});
 			} catch (error) {
-				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+				const reason = stripControlCharacters(
+					(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300),
+				);
 				failures.set(monitor.monitorId, reason);
 			}
 		}
