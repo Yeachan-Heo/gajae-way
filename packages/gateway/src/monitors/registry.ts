@@ -88,9 +88,10 @@ export class MonitorRegistry {
 		return this.#scan().records;
 	}
 	/**
-	 * Stored monitors that do not run: rows that no longer load (they are left out of `list()`
-	 * and can only be removed) and loadable cron monitors whose schedule fails write-time
-	 * validation (still in `list()`, repairable with `update --schedule`).
+	 * Stored monitors that need repair: rows that no longer load (they are left out of `list()`,
+	 * never run, and can only be removed) and loadable cron monitors whose schedule fails write-time
+	 * validation (still in `list()`, repairable with `update --schedule`; they keep running unless
+	 * `notStartable()` also reports them).
 	 */
 	invalid(): MonitorInvalidRecord[] {
 		return this.#scan({ cron: "write" }).invalid;

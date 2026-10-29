@@ -81,12 +81,9 @@ export class MonitorRuntime {
 		// and monitors that cannot be deserialized (loadable:false). The latter are skipped
 		// and cannot be started, so log a warning at startup.
 		for (const record of notStartable) {
-			if (notStartableIds.has(record.monitorId)) {
-				const reason = stripControlCharacters(record.reason);
-				const monitor = this.#registry.get(record.monitorId);
-				const kind = monitor?.trigger.kind ?? "unknown";
-				console.error(`monitor_invalid id=${record.monitorId} kind=${kind} reason=${reason}`);
-			}
+			const reason = stripControlCharacters(record.reason);
+			const kind = this.#registry.get(record.monitorId)?.trigger.kind ?? "unknown";
+			console.error(`monitor_invalid id=${record.monitorId} kind=${kind} reason=${reason}`);
 		}
 		// One stored monitor that cannot start (a schedule saved before write validation, a trigger the
 		// gateway config cannot serve) is skipped and logged; it never takes the gateway down with it.

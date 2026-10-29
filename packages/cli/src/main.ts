@@ -975,7 +975,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							const escapedName = stripControlCharacters(bad.name);
 							const escapedReason = stripControlCharacters(bad.reason);
 							console.error(
-								`invalid monitor ${escapedId} (${escapedName}) does not run: ${escapedReason}. ${
+								`invalid monitor ${escapedId} (${escapedName})${bad.loadable ? "" : " does not run"}: ${escapedReason}. ${
 									bad.loadable
 										? `Fix it with: gajaeway monitors update ${escapedId} --schedule "<five-field cron>"`
 										: `Remove it with: gajaeway monitors remove ${escapedId}`
