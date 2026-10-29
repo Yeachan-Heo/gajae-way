@@ -311,6 +311,9 @@ function validateMentionUserIds(target: MonitorChannelTarget): void {
 function validateTrigger(trigger: TriggerSpec): void {
 	if (!trigger || typeof trigger !== "object") throw new Error("monitor trigger is required");
 	if (trigger.kind === "cron" && typeof trigger.schedule === "string") {
+		const fields = trigger.schedule.trim().split(/\s+/);
+		if (fields.length !== 5)
+			throw new Error("monitor cron schedule must have five fields: minute hour day month weekday");
 		if (trigger.timezone !== undefined) {
 			if (typeof trigger.timezone !== "string" || !trigger.timezone.trim())
 				throw new Error("monitor cron timezone must be a non-empty IANA timezone");
