@@ -58,8 +58,8 @@ export class MonitorRuntime {
 	async #restart(): Promise<void> {
 		await this.stop();
 		const monitors = this.#registry.list().filter((monitor) => monitor.enabled);
-		const invalid = this.#registry.invalid();
-		const invalidIds = new Set(invalid.map((record) => record.monitorId));
+		const notStartable = this.#registry.notStartable();
+		const notStartableIds = new Set(notStartable.map((record) => record.monitorId));
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
 		// Start webhook group, tracking per-monitor failures. A shared config or bind error
 		// aborts all webhooks; per-monitor credential/preparation errors are isolated.
@@ -80,8 +80,8 @@ export class MonitorRuntime {
 		// Report invalid monitors that were loaded (e.g., cron schedules that fail validation)
 		// and monitors that cannot be deserialized (loadable:false). The latter are skipped
 		// and cannot be started, so log a warning at startup.
-		for (const record of invalid) {
-			if (invalidIds.has(record.monitorId)) {
+		for (const record of notStartable) {
+			if (notStartableIds.has(record.monitorId)) {
 				const reason = stripControlCharacters(record.reason);
 				const monitor = this.#registry.get(record.monitorId);
 				const kind = monitor?.trigger.kind ?? "unknown";
@@ -92,8 +92,8 @@ export class MonitorRuntime {
 		// gateway config cannot serve) is skipped and logged; it never takes the gateway down with it.
 		for (const monitor of monitors) {
 			try {
-				// Skip monitors with invalid schedules that are marked as loadable but not startable.
-				if (invalidIds.has(monitor.monitorId)) continue;
+				// Skip monitors that genuinely cannot be started (cannot compile or never fire).
+				if (notStartableIds.has(monitor.monitorId)) continue;
 				// Skip webhook monitors (they're handled by #startWebhook, failures tracked above).
 				if (monitor.trigger.kind === "webhook") {
 					if (webhookFailures.has(monitor.monitorId)) {

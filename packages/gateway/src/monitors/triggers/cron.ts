@@ -77,6 +77,29 @@ export function validateCronSchedule(schedule: string, timezone?: string): void 
 		);
 }
 
+/**
+ * Matcher-compatibility check: can this schedule be compiled and will it ever match?
+ * Looser than validateCronSchedule for write-time policy (allows '5/1' style steps),
+ * but still rejects schedules that cannot compile or never fire. Used at runtime
+ * to distinguish 'not startable' (genuinely cannot run) from 'stricter-policy rejected'
+ * (rejected at write-time but the matcher can handle it, e.g., a monitor saved before
+ * the write-time validation was added).
+ */
+export function isCronScheduleRunnable(schedule: string, timezone?: string): boolean {
+	const fields = schedule.trim().split(/\s+/).filter(Boolean);
+	if (fields.length !== 5) return false;
+	try {
+		// Try to compile it with the matcher
+		compileCron(schedule, timezone);
+		// Check if it will ever fire
+		if (nextCronFire(schedule, new Date(), timezone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone) === null)
+			return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export function cronMatches(schedule: string, date: Date, timezone?: string): boolean {
 	const fields = schedule.trim().split(/\s+/);
 	if (fields.length !== 5) throw new Error("cron schedule must have five fields");

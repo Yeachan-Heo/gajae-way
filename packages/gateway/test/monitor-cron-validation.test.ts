@@ -532,3 +532,30 @@ test("get() and list() skip cron validation; invalid() still validates for disco
 	const validInvalid = invalid.filter((m) => m.monitorId === valid.monitorId);
 	expect(validInvalid.length).toBe(0);
 });
+
+test("legacy '5/1' schedule is skipped at write-time but runs at startup; the matcher handles numeric-base steps", async () => {
+	const { database, registry } = await open();
+	// Reject '5/1' at write-time: it requires a range or * for steps.
+	expect(() =>
+		registry.add({
+			name: "numeric-step",
+			trigger: { kind: "cron", schedule: "5/1 * * * *" },
+			eventTypes: ["tick"],
+		}),
+	).toThrow(/a step needs \* or a range/);
+	// But a legacy monitor with '5/1' stored before validation should still be runnable.
+	storeUnchecked(database, "legacy-five-slash-one", "5/1 * * * *");
+	const legacy = registry.get("legacy-five-slash-one");
+	expect(legacy).toBeDefined();
+	expect(legacy?.trigger).toMatchObject({ kind: "cron", schedule: "5/1 * * * *" });
+	// Verify the legacy schedule is not in invalid() for strict policy, but is in notStartable()?
+	// Actually, since '5/1' is compilable by cronFieldMatches, it should NOT be in notStartable().
+	const invalid = registry.invalid();
+	const invalidLegacy = invalid.find((r) => r.monitorId === "legacy-five-slash-one");
+	expect(invalidLegacy).toBeDefined();
+	expect(invalidLegacy?.loadable).toBe(true);
+	// Verify it's NOT in notStartable() since isCronScheduleRunnable returns true for it.
+	const notStartable = registry.notStartable();
+	const notStartableLegacy = notStartable.find((r) => r.monitorId === "legacy-five-slash-one");
+	expect(notStartableLegacy).toBeUndefined();
+});

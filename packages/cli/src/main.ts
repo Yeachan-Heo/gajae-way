@@ -1,7 +1,22 @@
 #!/usr/bin/env bun
 
 import { isAbsolute, resolve } from "node:path";
-
+/**
+ * Replaces C0 control characters (0x00–0x1f) and DEL (0x7f) with a space.
+ * Use this to sanitize untrusted error messages before logging to prevent control-character smuggling.
+ */
+function stripControlCharacters(value: string): string {
+	let stripped = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		if ((code >= 0 && code <= 0x1f) || code === 0x7f) {
+			stripped += " ";
+		} else {
+			stripped += character;
+		}
+	}
+	return stripped;
+}
 import type {
 	MonitorEventOperatorResult,
 	MonitorEventRecord,
@@ -26,7 +41,6 @@ import type {
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
-
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -954,14 +968,18 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							schedules: Record<string, MonitorScheduleProjection>;
 							invalid?: MonitorInvalidRecord[];
 						}>("monitor.list");
-						for (const bad of result.invalid ?? [])
+						for (const bad of result.invalid ?? []) {
+							const escapedId = stripControlCharacters(bad.monitorId);
+							const escapedName = stripControlCharacters(bad.name);
+							const escapedReason = stripControlCharacters(bad.reason);
 							console.error(
-								`invalid monitor ${bad.monitorId} (${bad.name}) does not run: ${bad.reason}. ${
+								`invalid monitor ${escapedId} (${escapedName}) does not run: ${escapedReason}. ${
 									bad.loadable
-										? `Fix it with: gajaeway monitors update ${bad.monitorId} --schedule "<five-field cron>"`
-										: `Remove it with: gajaeway monitors remove ${bad.monitorId}`
+										? `Fix it with: gajaeway monitors update ${escapedId} --schedule "<five-field cron>"`
+										: `Remove it with: gajaeway monitors remove ${escapedId}`
 								}`,
 							);
+						}
 						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
 							monitor,
 							schedule: result.schedules[monitor.monitorId] ?? null,
