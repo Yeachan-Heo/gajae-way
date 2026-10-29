@@ -1,22 +1,7 @@
 #!/usr/bin/env bun
 
 import { isAbsolute, resolve } from "node:path";
-/**
- * Replaces C0 control characters (0x00–0x1f) and DEL (0x7f) with a space.
- * Use this to sanitize untrusted error messages before logging to prevent control-character smuggling.
- */
-function stripControlCharacters(value: string): string {
-	let stripped = "";
-	for (const character of value) {
-		const code = character.codePointAt(0) ?? 0;
-		if ((code >= 0 && code <= 0x1f) || code === 0x7f) {
-			stripped += " ";
-		} else {
-			stripped += character;
-		}
-	}
-	return stripped;
-}
+
 import type {
 	MonitorEventOperatorResult,
 	MonitorEventRecord,
@@ -68,6 +53,23 @@ import {
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
+
+/**
+ * Replaces C0 control characters (0x00–0x1f) and DEL (0x7f) with a space.
+ * Use this to sanitize untrusted error messages before logging to prevent control-character smuggling.
+ */
+function stripControlCharacters(value: string): string {
+	let stripped = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		if ((code >= 0 && code <= 0x1f) || code === 0x7f) {
+			stripped += " ";
+		} else {
+			stripped += character;
+		}
+	}
+	return stripped;
+}
 
 async function connectGatewaySocket(
 	path: string,
