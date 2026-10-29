@@ -1,0 +1,57 @@
+name: Dev CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ format('dev-ci-{0}', github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bunx biome ci packages/
+      - run: bunx tsc --noEmit -p tsconfig.json
+      - run: bun test packages/
+      # Frozen-corpus retrieval benchmark gate (separate from unit tests).
+      - run: GAJAEWAY_BENCH=1 bun test packages/gateway/bench
+
+  docker-image:
+    name: docker-image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose --profile setup config --quiet
+      - name: Build setup image
+        run: docker compose build setup
+      - name: Exercise documented setup command
+        run: docker compose --profile setup run --rm --no-deps -T setup gajaeway setup --status
