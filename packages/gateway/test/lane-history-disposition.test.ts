@@ -337,6 +337,26 @@ test("a different origin's unresolved create does not prevent disposition", asyn
 	expect((await f.governor.retire("a", "operator")).retired).toBe(true);
 });
 
+test("pruning retains unreconciled completed creates that fence disposition", async () => {
+	const f = await fixture();
+	const scope = JSON.stringify([f.sessionKey, 0]);
+	f.database.transaction((tx) => {
+		f.database.bindings.beginBrokerOperation(tx, f.authority, {
+			operation: "session.create",
+			scope,
+			operationRef: "gw-create-complete",
+			requestJson: "{}",
+		});
+		f.database.bindings.completeBrokerOperation(tx, f.authority, "session.create", scope, "gw-create-complete", "{}");
+		f.database.bindings.pruneBrokerOperations(tx, {
+			completedBefore: "9999-01-01T00:00:00.000Z",
+			pendingBefore: "9999-01-01T00:00:00.000Z",
+		});
+	});
+	expect(f.database.bindings.brokerOperation(f.authority, "session.create", scope)?.state).toBe("complete");
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+});
+
 for (const schemaVersion of [2, 3]) {
 	test(`disposition preserves the original validated history payload (schema ${schemaVersion})`, async () => {
 		const f = await fixture();
@@ -707,6 +727,29 @@ test("disposition refuses a create intent recorded during the death probe", asyn
 			}),
 		);
 	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.history().state).toBe("awaiting_operator");
+});
+
+test("pruning cannot hide a completed create recorded during the death probe", async () => {
+	const port = new ProbePort();
+	const f = await fixture(port);
+	const scope = JSON.stringify([f.sessionKey, 0]);
+	port.onProbe = () =>
+		f.database.transaction((tx) => {
+			f.database.bindings.beginBrokerOperation(tx, f.authority, {
+				operation: "session.create",
+				scope,
+				operationRef: "gw-create-race",
+				requestJson: "{}",
+			});
+			f.database.bindings.completeBrokerOperation(tx, f.authority, "session.create", scope, "gw-create-race", "{}");
+			f.database.bindings.pruneBrokerOperations(tx, {
+				completedBefore: "9999-01-01T00:00:00.000Z",
+				pendingBefore: "9999-01-01T00:00:00.000Z",
+			});
+		});
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.database.bindings.brokerOperation(f.authority, "session.create", scope)?.state).toBe("complete");
 	expect(f.history().state).toBe("awaiting_operator");
 });
 

@@ -1023,7 +1023,7 @@ export class BindingsGroup {
 
 	/**
 	 * Bounds the journal: completed operations older than `completedBefore` and
-	 * old pending close intents. Pending creates and prompts are never age-pruned:
+	 * old pending close intents. Create intents and pending prompts are never age-pruned:
 	 * a create may have applied before its binding was recorded, and an unknown
 	 * prompt status never authorizes resending its non-idempotent clientRef.
 	 * Busy refusals retain their fingerprint while retry/recovery is unresolved.
@@ -1037,7 +1037,7 @@ export class BindingsGroup {
 		return this.#db
 			.prepare(
 				`DELETE FROM broker_operations
-				WHERE (state = 'complete' AND completed_at < ? AND (
+				WHERE (state = 'complete' AND operation != 'session.create' AND completed_at < ? AND (
 					operation != 'turn.prompt' OR COALESCE(result_json, '') != ? OR EXISTS (
 						SELECT 1 FROM work_attempt_runtime runtime
 						JOIN lane_jobs job ON job.job_id = runtime.job_id AND job.lane_key = runtime.lane_key
