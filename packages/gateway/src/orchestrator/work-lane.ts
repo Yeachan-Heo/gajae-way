@@ -3325,18 +3325,14 @@ export async function laneLastCommits(
 ): Promise<Map<string, LaneCommit | null>> {
 	const unique = [...new Set(worktreePaths)];
 	const result = new Map<string, LaneCommit | null>();
-
-	// Process in batches to limit concurrency without shared mutable counter.
-	const batchSize = Math.max(1, Math.ceil(unique.length / Math.min(concurrency, unique.length)));
-	for (let i = 0; i < unique.length; i += batchSize) {
-		const batch = unique.slice(i, i + batchSize);
-		await Promise.all(
-			batch.map(async (path) => {
-				result.set(path, await laneLastCommit(path));
-			}),
-		);
-	}
-
+	let next = 0;
+	const worker = async () => {
+		while (next < unique.length) {
+			const path = unique[next++]!;
+			result.set(path, await laneLastCommit(path));
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, worker));
 	return result;
 }
 
