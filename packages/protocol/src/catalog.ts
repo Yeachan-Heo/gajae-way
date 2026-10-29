@@ -577,8 +577,15 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly burstPolicy: BurstPolicyKind;
 	readonly overlap: MonitorOverlapPolicy;
 	readonly enabled: boolean;
-	/** Set when the monitor is persisted but could not be loaded or validated at runtime. */
-	readonly invalid?: { readonly reason: string };
+}
+
+/** A stored monitor that does not run. */
+export interface MonitorInvalidRecord {
+	readonly monitorId: string;
+	readonly name: string;
+	readonly reason: string;
+	/** True when the row still loads (repair with `update`); false when it can only be removed. */
+	readonly loadable: boolean;
 }
 
 export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
@@ -1291,6 +1298,8 @@ export interface VerbCatalogV01 {
 		result: {
 			readonly monitors: readonly MonitorRecord[];
 			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+			/** Stored monitors that do not run; see MonitorInvalidRecord. */
+			readonly invalid: readonly MonitorInvalidRecord[];
 		};
 	};
 	"monitor.inspect": {

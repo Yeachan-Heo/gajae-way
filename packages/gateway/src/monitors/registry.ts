@@ -2,6 +2,7 @@ import {
 	eventTypeOrigin,
 	isChatPlatform,
 	type MonitorChannelTarget,
+	type MonitorInvalidRecord,
 	type MonitorRecord,
 	type MonitorSpec,
 	type MonitorUpdateParams,
@@ -84,28 +85,37 @@ export class MonitorRegistry {
 		return record;
 	}
 	list(): MonitorRecord[] {
+		return this.#scan().records;
+	}
+	/**
+	 * Stored monitors that do not run: rows that no longer load (they are left out of `list()`
+	 * and can only be removed) and loadable cron monitors whose schedule fails write-time
+	 * validation (still in `list()`, repairable with `update --schedule`).
+	 */
+	invalid(): MonitorInvalidRecord[] {
+		return this.#scan().invalid;
+	}
+	#scan(): { records: MonitorRecord[]; invalid: MonitorInvalidRecord[] } {
 		const records: MonitorRecord[] = [];
+		const invalid: MonitorInvalidRecord[] = [];
 		for (const row of this.#database.monitors.rows()) {
+			let record: MonitorRecord;
 			try {
-				records.push(rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id))));
+				record = rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id)));
 			} catch (error) {
-				const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
-				// Include invalid monitors in the list so operators can disable or fix them.
-				const invalidRecord: MonitorRecord = {
-					monitorId: row.monitor_id,
-					name: row.name ?? `<corrupted monitor ${row.monitor_id}>`,
-					trigger: { kind: "cron" } as TriggerSpec,
-					eventTypes: ["<invalid>"],
-					burstPolicy: "coalesce",
-					overlap: "queue",
-					enabled: Boolean(row.enabled),
-					createdAt: row.created_at,
-					invalid: { reason },
-				};
-				records.push(invalidRecord);
+				invalid.push({ monitorId: row.monitor_id, name: row.name, reason: errorReason(error), loadable: false });
+				continue;
+			}
+			records.push(record);
+			if (record.trigger.kind === "cron") {
+				try {
+					validateCronSchedule(record.trigger.schedule, record.trigger.timezone);
+				} catch (error) {
+					invalid.push({ monitorId: record.monitorId, name: record.name, reason: errorReason(error), loadable: true });
+				}
 			}
 		}
-		return records;
+		return { records, invalid };
 	}
 	get(monitorId: string): MonitorRecord | undefined {
 		return this.list().find((monitor) => monitor.monitorId === monitorId);
@@ -151,16 +161,11 @@ export class MonitorRegistry {
 				: current.procedureFiles;
 			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
-			// Skip full spec validation for invalid monitors unless they're being fixed (new trigger or eventTypes).
-			const isInvalid = current.invalid !== undefined;
-			const isBeingFixed = patch.trigger !== undefined || patch.eventTypes !== undefined;
-			if (!isInvalid || isBeingFixed) {
-				validateSpec(updated);
-				// A changed schedule is checked like a new one; an unchanged stored one is left as it is
-				// (so an operator can still disable or rename a monitor saved before this check).
-				if (updated.trigger.kind === "cron" && (schedule !== undefined || patch.trigger !== undefined))
-					validateCronSchedule(updated.trigger.schedule, updated.trigger.timezone);
-			}
+			validateSpec(updated);
+			// A changed schedule is checked like a new one; an unchanged stored one is left as it is
+			// (so an operator can still disable or rename a monitor saved before this check).
+			if (updated.trigger.kind === "cron" && (schedule !== undefined || patch.trigger !== undefined))
+				validateCronSchedule(updated.trigger.schedule, updated.trigger.timezone);
 			const persisted = this.#database.monitors.update(tx, {
 				id: current.monitorId,
 				name: updated.name,
@@ -364,4 +369,8 @@ function localTimezone(): string {
 	const timezone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
 	if (!timezone) throw new Error("gateway local IANA timezone is unavailable");
 	return timezone;
+}
+
+function errorReason(error: unknown): string {
+	return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
 }

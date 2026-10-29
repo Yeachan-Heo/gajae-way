@@ -5,6 +5,7 @@ import { isAbsolute, resolve } from "node:path";
 import type {
 	MonitorEventOperatorResult,
 	MonitorEventRecord,
+	MonitorInvalidRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
 	MonitorSpec,
@@ -951,7 +952,16 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						const result = await client.request<{
 							monitors: MonitorRecord[];
 							schedules: Record<string, MonitorScheduleProjection>;
+							invalid?: MonitorInvalidRecord[];
 						}>("monitor.list");
+						for (const bad of result.invalid ?? [])
+							console.error(
+								`invalid monitor ${bad.monitorId} (${bad.name}) does not run: ${bad.reason}. ${
+									bad.loadable
+										? `Fix it with: gajaeway monitors update ${bad.monitorId} --schedule "<five-field cron>"`
+										: `Remove it with: gajaeway monitors remove ${bad.monitorId}`
+								}`,
+							);
 						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
 							monitor,
 							schedule: result.schedules[monitor.monitorId] ?? null,

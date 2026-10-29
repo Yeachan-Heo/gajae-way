@@ -135,14 +135,9 @@ test("webhook startup failure is isolated; only affected webhook monitors are lo
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	cleanups.push(() => errors.mockRestore());
 	// Create runtime with no webhook config (missing configuration).
-	const runtime = new MonitorRuntime(
-		{} as never,
-		registry,
-		propagator as never,
-		{
-			now: () => new Date(Date.parse(cron.createdAt) + 3 * 60_000),
-		},
-	);
+	const runtime = new MonitorRuntime({} as never, registry, propagator as never, {
+		now: () => new Date(Date.parse(cron.createdAt) + 3 * 60_000),
+	});
 	// Start the runtime. The webhook startup should fail, but the cron monitor should still fire.
 	await runtime.start();
 	await runtime.stop();
@@ -154,17 +149,15 @@ test("webhook startup failure is isolated; only affected webhook monitors are lo
 		.map((call) => String(call[0]))
 		.filter((msg) => msg.includes("monitor_invalid") && msg.includes(webhook.monitorId));
 	expect(invalidLogs.length).toBe(1);
-	expect(invalidLogs[0]).toMatch(
-		/^monitor_invalid id=[^ ]+ kind=webhook reason=webhook configuration is required/,
-	);
+	expect(invalidLogs[0]).toMatch(/^monitor_invalid id=[^ ]+ kind=webhook reason=webhook configuration is required/);
 });
 
-test("invalid monitors are listed with an invalid flag; can be disabled or fixed", async () => {
+test("invalid stored monitors are reported without leaking placeholder records", async () => {
 	const { database, registry } = await open();
-	// Store an invalid monitor (corrupted JSON).
+	// A row that no longer loads at all (corrupt trigger JSON).
 	database.transaction((tx) =>
 		database.monitors.create(tx, {
-			id: "invalid-monitor",
+			id: "corrupt",
 			name: "corrupted",
 			triggerJson: "{",
 			eventTypesJson: JSON.stringify(["event.type"]),
@@ -178,26 +171,35 @@ test("invalid monitors are listed with an invalid flag; can be disabled or fixed
 			procedureFilesJson: null,
 		}),
 	);
-	// Create a valid monitor.
-	const valid = registry.add({
-		name: "valid-monitor",
-		trigger: { kind: "cron", schedule: "0 0 * * *" },
-		eventTypes: ["tick"],
-	});
-	// List monitors; both should appear.
-	const monitors = registry.list();
-	expect(monitors).toHaveLength(2);
-	const invalid = monitors.find((m) => m.monitorId === "invalid-monitor");
-	const validMonitor = monitors.find((m) => m.monitorId === valid.monitorId);
-	expect(invalid).toBeDefined();
-	expect(validMonitor).toBeDefined();
-	// The invalid monitor should have an invalid flag.
-	expect(invalid?.invalid).toBeDefined();
-	expect(invalid?.invalid?.reason).toContain("JSON Parse error");
-	// The valid monitor should not have an invalid flag.
-	expect(validMonitor?.invalid).toBeUndefined();
-	// The invalid monitor should be disableable.
-	const updated = registry.update({ monitorId: "invalid-monitor", enabled: false });
-	expect(updated?.enabled).toBe(false);
-	expect(updated?.invalid).toBeDefined();
+	// A row that loads but carries a schedule saved before write-time validation.
+	storeUnchecked(database, "legacy-six", SIX_FIELDS);
+	const valid = registry.add({ name: "daily", trigger: { kind: "cron", schedule: "0 0 * * *" }, eventTypes: ["tick"] });
+
+	// The unloadable row is never handed to list() consumers (runtime, schedule projection,
+	// dispatch) as a fabricated record; the legacy row stays listable so it can be repaired.
+	expect(
+		registry
+			.list()
+			.map((monitor) => monitor.monitorId)
+			.sort(),
+	).toEqual(["legacy-six", valid.monitorId].sort());
+	expect(registry.get("corrupt")).toBeUndefined();
+	const invalid = registry.invalid();
+	expect(invalid.map(({ monitorId, loadable }) => ({ monitorId, loadable }))).toEqual([
+		{ monitorId: "corrupt", loadable: false },
+		{ monitorId: "legacy-six", loadable: true },
+	]);
+	expect(invalid[0]?.reason).toContain("JSON");
+	expect(invalid[1]?.reason).toContain("five fields");
+
+	// Repairing the legacy row clears it from invalid() and keeps its other settings.
+	registry.update({ monitorId: "legacy-six", schedule: "0 12 30 10 *" });
+	expect(registry.get("legacy-six")?.trigger).toMatchObject({ schedule: "0 12 30 10 *", timezone: "Asia/Seoul" });
+	expect(registry.invalid().map((record) => record.monitorId)).toEqual(["corrupt"]);
+
+	// The unloadable row is removable, and an update cannot overwrite it with a placeholder.
+	expect(registry.update({ monitorId: "corrupt", enabled: false })).toBeUndefined();
+	expect(database.monitors.rows().find((row) => row.monitor_id === "corrupt")?.trigger_json).toBe("{");
+	expect(registry.remove("corrupt")).toBe(true);
+	expect(registry.invalid()).toEqual([]);
 });
