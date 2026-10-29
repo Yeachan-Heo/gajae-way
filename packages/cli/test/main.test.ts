@@ -1465,15 +1465,21 @@ describe("work operator commands", () => {
 		expect(output.closed).toBe(true);
 	});
 
-	test("work retire prints refusal without inventing a session", async () => {
-		const output = await run(["retire", "fix"], {
-			retired: false,
-			sessionKey: "work/task/fix",
-			reason: "active attempt",
+	for (const force of [false, true]) {
+		test(`work retire${force ? " --force" : ""} returns failure on refusal`, async () => {
+			const output = await run(["retire", "fix", ...(force ? ["--force"] : [])], {
+				retired: false,
+				sessionKey: "work/task/fix",
+				reason: "active attempt",
+			});
+			expect(output.requests).toEqual([
+				{ verb: "work.retire", params: { name: "fix", ...(force ? { force: true } : {}) } },
+			]);
+			expect(output.lines).toEqual(["not retired: active attempt"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
 		});
-		expect(output.lines).toEqual(["not retired: active attempt"]);
-		expect(output.closed).toBe(true);
-	});
+	}
 
 	test("work jobs renders bound and unbound lanes", async () => {
 		const output = await run(["jobs"], {
