@@ -583,7 +583,10 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
-/** A stored monitor that does not run. */
+/**
+ * A stored monitor that has an invalid cron schedule or does not load at all.
+ * The `loadable` flag indicates whether the monitor can be repaired (true) or must be removed (false).
+ */
 export interface MonitorInvalidRecord {
 	readonly monitorId: string;
 	readonly name: string;
@@ -1302,7 +1305,7 @@ export interface VerbCatalogV01 {
 		result: {
 			readonly monitors: readonly MonitorRecord[];
 			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
-			/** Stored monitors that do not run; see MonitorInvalidRecord. */
+			/** Stored monitors with invalid cron schedules or that fail to load; see MonitorInvalidRecord. */
 			readonly invalid?: readonly MonitorInvalidRecord[];
 		};
 	};
