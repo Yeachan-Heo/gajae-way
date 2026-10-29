@@ -2,6 +2,7 @@ import {
 	eventTypeOrigin,
 	isChatPlatform,
 	type MonitorChannelTarget,
+	type MonitorInvalidRecord,
 	type MonitorRecord,
 	type MonitorSpec,
 	type MonitorUpdateParams,
@@ -82,15 +83,29 @@ export class MonitorRegistry {
 		return record;
 	}
 	list(): MonitorRecord[] {
+		return this.#scan().records;
+	}
+	/**
+	 * Stored rows that no longer pass validation (for example a cron schedule
+	 * written before write-time validation existed). They never run; operators
+	 * see them in `monitor.list` and delete them with `monitor.remove`.
+	 */
+	invalid(): MonitorInvalidRecord[] {
+		return this.#scan().invalid;
+	}
+	#scan(): { records: MonitorRecord[]; invalid: MonitorInvalidRecord[] } {
 		const records: MonitorRecord[] = [];
+		const invalid: MonitorInvalidRecord[] = [];
 		for (const row of this.#database.monitors.rows()) {
 			try {
 				records.push(rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id))));
-			} catch {
-				console.warn(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				invalid.push({ monitorId: row.monitor_id, name: row.name, reason });
+				console.warn(`monitor_invalid id=${row.monitor_id} reason=${JSON.stringify(reason)}`);
 			}
 		}
-		return records;
+		return { records, invalid };
 	}
 	get(monitorId: string): MonitorRecord | undefined {
 		return this.list().find((monitor) => monitor.monitorId === monitorId);

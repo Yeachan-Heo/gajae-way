@@ -579,6 +579,13 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
+/** A stored monitor row that fails validation; it never runs. */
+export interface MonitorInvalidRecord {
+	readonly monitorId: string;
+	readonly name: string;
+	readonly reason: string;
+}
+
 export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
 	readonly monitorId: string;
 	/** Replace the trigger spec; use schedule to change only a cron schedule. */
@@ -1289,6 +1296,8 @@ export interface VerbCatalogV01 {
 		result: {
 			readonly monitors: readonly MonitorRecord[];
 			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+			/** Stored monitors that fail validation; they never run and can only be removed. */
+			readonly invalid: readonly MonitorInvalidRecord[];
 		};
 	};
 	"monitor.inspect": {

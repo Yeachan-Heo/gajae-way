@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CATCH_ALL_EVENT_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { MonitorRegistry } from "../src/monitors/registry";
+import { MonitorRuntime } from "../src/monitors/runtime";
 import { cronMatches, cronSlotsBetween, nextCronFire, startCron } from "../src/monitors/triggers/cron";
 import { startScript } from "../src/monitors/triggers/script";
 import { startWatcher } from "../src/monitors/triggers/watcher";
@@ -469,32 +470,33 @@ test("gateway boot skips monitors with invalid cron schedules and logs them", as
 		// Verify the invalid monitor was inserted
 		const allRows = database.monitors.rows();
 		expect(allRows.length).toBe(2);
-		// Boot the runtime; it should skip the invalid monitor and log it
-		const errorLogs: string[] = [];
-		const originalError = console.error;
-		console.error = (...args: unknown[]) => {
-			errorLogs.push(args.map(String).join(" "));
+		// Boot the real runtime: the invalid row must not throw, must not run, and
+		// must stay visible to operators until removed.
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => {
+			warnings.push(args.map(String).join(" "));
 		};
 		try {
-			const { MonitorRuntime } = await import("../src/monitors/runtime");
-			// Create a minimal runtime to test the start method
-			// Note: We'll use a mock propagator and config
-			// For now, just verify that list() still returns the valid monitor
-			const listedMonitors = registry.list();
-			// The invalid monitor should be skipped during list()
-			expect(listedMonitors.length).toBe(1);
-			expect(listedMonitors[0]).toMatchObject({
-				name: "valid-boot-test",
-				trigger: { kind: "cron", schedule: "0 12 * * *" },
+			const runtime = new MonitorRuntime({} as never, registry, { submitSlot: () => "slot" } as never, {
+				now: () => new Date(),
 			});
-			// Check if any error was logged about the invalid monitor
-			const invalidLog = errorLogs.find((log) => log.includes("invalid persisted record"));
-			if (invalidLog) {
-				expect(invalidLog).toContain("invalid-monitor-id");
-			}
+			await runtime.start();
+			await runtime.stop();
 		} finally {
-			console.error = originalError;
+			console.warn = originalWarn;
 		}
+		expect(warnings.some((line) => line.startsWith("monitor_invalid id=invalid-monitor-id reason="))).toBe(true);
+		expect(registry.list().map((monitor) => monitor.monitorId)).toEqual([valid.monitorId]);
+		expect(registry.invalid()).toEqual([
+			{
+				monitorId: "invalid-monitor-id",
+				name: "invalid-boot-test",
+				reason: "monitor cron schedule must have five fields: minute hour day month weekday",
+			},
+		]);
+		expect(registry.remove("invalid-monitor-id")).toBe(true);
+		expect(registry.invalid()).toEqual([]);
 	} finally {
 		database?.close();
 		await rm(home, { recursive: true, force: true });

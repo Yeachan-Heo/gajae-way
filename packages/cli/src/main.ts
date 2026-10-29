@@ -951,7 +951,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						const result = await client.request<{
 							monitors: MonitorRecord[];
 							schedules: Record<string, MonitorScheduleProjection>;
+							invalid?: { monitorId: string; name: string; reason: string }[];
 						}>("monitor.list");
+						for (const bad of result.invalid ?? [])
+							console.error(
+								`invalid monitor ${bad.monitorId} (${bad.name}): ${bad.reason}; it does not run. Remove it with: gajaeway monitors remove ${bad.monitorId}`,
+							);
 						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
 							monitor,
 							schedule: result.schedules[monitor.monitorId] ?? null,
