@@ -22,7 +22,8 @@ export class MonitorRuntime {
 	#stops: Stop[] = [];
 	readonly #clock?: () => Date;
 	readonly #catchUp?: CronCatchUpPolicy;
-	#startInProgress: Promise<void> | null = null;
+	#restartTail: Promise<void> = Promise.resolve();
+	#queuedRestart: Promise<void> | null = null;
 	constructor(
 		config: GatewayConfig,
 		registry: MonitorRegistry,
@@ -35,7 +36,26 @@ export class MonitorRuntime {
 		this.#clock = options.now;
 		this.#catchUp = options.catchUp;
 	}
-	async start(): Promise<void> {
+	/**
+	 * Restart every enabled monitor from the current registry. Restarts run one at a time; a call made
+	 * while one is in flight queues exactly one more restart, and calls made while that restart is still
+	 * queued share it. The queued restart reads the registry when it begins, so it sees every mutation
+	 * made before it starts.
+	 */
+	start(): Promise<void> {
+		if (this.#queuedRestart) return this.#queuedRestart;
+		const restart = this.#restartTail.then(() => {
+			this.#queuedRestart = null;
+			return this.#restart();
+		});
+		this.#queuedRestart = restart;
+		this.#restartTail = restart.catch(() => undefined);
+		return restart;
+	}
+	refresh(): Promise<void> {
+		return this.start();
+	}
+	async #restart(): Promise<void> {
 		await this.stop();
 		const monitors = this.#registry.list().filter((monitor) => monitor.enabled);
 		const invalid = this.#registry.invalid();
@@ -144,26 +164,6 @@ export class MonitorRuntime {
 					this.#propagator.submit(monitor.monitorId, eventType, { stdout }),
 				),
 			);
-		}
-	}
-	async refresh(): Promise<void> {
-		// Serialize refresh calls: ensure only one start/refresh is in-flight at a time.
-		// Concurrent refresh() calls from monitor mutations are coalesced to prevent
-		// overlapping credential preparation and webhook binding, which can cause
-		// duplicate script monitor launches.
-		if (this.#startInProgress) {
-			await this.#startInProgress;
-			return;
-		}
-		let resolveStart: (() => void) | undefined;
-		this.#startInProgress = new Promise<void>((resolve) => {
-			resolveStart = resolve;
-		});
-		try {
-			await this.start();
-		} finally {
-			this.#startInProgress = null;
-			resolveStart?.();
 		}
 	}
 	async stop(): Promise<void> {

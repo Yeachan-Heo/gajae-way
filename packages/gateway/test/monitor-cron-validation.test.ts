@@ -450,37 +450,53 @@ test("unloadable monitors (loadable:false) are warned on startup", async () => {
 	await runtime.stop();
 });
 
-test("concurrent refresh() calls are serialized to prevent duplicate script starts", async () => {
-	const { database, registry } = await open();
-	// Create a webhook monitor (requires async webhook setup).
-	const webhook = registry.add({
-		name: "webhook-monitor",
-		trigger: { kind: "webhook", route: "test-route" },
+test("restarts never overlap, coalesce while queued, and a refresh during a restart sees the later mutation", async () => {
+	const { registry } = await open();
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-refresh-serial-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const credentialFile = join(home, "secret.txt");
+	await writeFile(credentialFile, "s3cret");
+	// The credential read makes each restart yield, so a second restart could interleave without serialization.
+	registry.add({
+		name: "webhook",
+		trigger: { kind: "webhook", route: "serial-route", auth: { kind: "bearer" as const, credentialFile } },
 		eventTypes: ["webhook.fire"],
 	});
-	// Create a script monitor.
-	const script = registry.add({
-		name: "script-monitor",
-		trigger: { kind: "script", command: ["echo", "test"], intervalMs: 60_000 },
-		eventTypes: ["script.output"],
+	const events: string[] = [];
+	let active = 0;
+	const list = registry.list.bind(registry);
+	spyOn(registry, "list").mockImplementation(() => {
+		events.push(`list:${list().length}`);
+		return list();
 	});
-
-	const propagator = {
-		submit: () => crypto.randomUUID(),
+	const runtime = new MonitorRuntime(
+		{ webhook: { bind: "127.0.0.1", port: 0, exposeNonLoopback: false } } as never,
+		registry,
+		{ submit: () => crypto.randomUUID() } as never,
+	);
+	cleanups.push(() => runtime.stop());
+	const track = (restart: Promise<void>, label: string) => {
+		active += 1;
+		expect(active).toBeLessThanOrEqual(2);
+		return restart.then(() => {
+			active -= 1;
+			events.push(label);
+		});
 	};
 
-	const runtime = new MonitorRuntime(
-		{ webhook: { bind: "127.0.0.1", port: 0, exposeNonLoopback: false }, scriptRoot: "/tmp" } as never,
-		registry,
-		propagator as never,
-	);
+	// Three calls in one tick share one restart.
+	const first = runtime.refresh();
+	expect(runtime.refresh()).toBe(first);
+	expect(runtime.start()).toBe(first);
+	const firstDone = track(first, "done:first");
+	await Promise.resolve();
+	await Promise.resolve();
 
-	// Simulate concurrent refresh calls by calling start multiple times without awaiting.
-	// With proper serialization, all should complete without error.
-	const starts = [runtime.refresh(), runtime.refresh(), runtime.refresh()];
-	await Promise.all(starts);
+	// The first restart is in flight; a mutation plus refresh now must queue a second restart, not be dropped.
+	registry.add({ name: "second", trigger: { kind: "webhook", route: "second-route" }, eventTypes: ["webhook.fire"] });
+	const second = runtime.refresh();
+	expect(second).not.toBe(first);
+	await Promise.all([firstDone, track(second, "done:second")]);
 
-	// All should complete without error.
-	expect(starts.length).toBe(3);
-	await runtime.stop();
+	expect(events).toEqual(["list:1", "done:first", "list:2", "done:second"]);
 });
