@@ -1633,7 +1633,10 @@ class OriginActor {
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
 		await this.#emitEscalationNotices();
-		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
+		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
+		const open = new Set(turns.map((turn) => turn.opRef));
+		for (const opRef of this.#recoveryHoldReasons.keys()) if (!open.has(opRef)) this.#recoveryHoldReasons.delete(opRef);
+		for (const turn of turns) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
 			try {
@@ -1713,14 +1716,32 @@ class OriginActor {
 	 * delivered, and the op is never resent - the epoch rotates so pending
 	 * messages continue on a fresh session, and the origin gets one notice.
 	 * Pending messages are kept; nothing is discarded.
+	 *
+	 * A turn whose epoch was already retired (a restart or `/new` moved the origin
+	 * on while it was unresolved) is bounded the same way (#705): it gets the same
+	 * input fence, retired hold and one notice, without rotating an epoch the
+	 * origin has already left. The escalation marker makes it exactly once.
 	 */
 	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
-		if (this.#stopped || this.#manager.stopped || bound?.retired || turn.epoch !== this.#epoch()) return false;
+		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
+		const retiredEpoch = turn.epoch !== this.#epoch();
+		// A live BoundTurn is always on the current epoch; only a recovered row can be retired.
+		if (retiredEpoch && bound) return false;
 		const database = this.#manager.database;
-		const since = database.inbox.sendAttemptedAt(turn.opRef) ?? database.inbox.turnDispatchedAt(turn.opRef);
-		const sinceMs = since === undefined ? Number.NaN : Date.parse(since);
-		if (!Number.isFinite(sinceMs)) return false;
+		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) return false;
+		// The hold starts at the send. A row stamped by the schema 39 backfill
+		// ('pre-migration-39') or bound before dispatch was recorded falls back to
+		// its bind and then its arrival, so an old stranded row is still bounded (#705).
+		const sinceMs = [
+			database.inbox.sendAttemptedAt(turn.opRef),
+			database.inbox.turnDispatchedAt(turn.opRef),
+			database.inbox.turnRow(turn.opRef)?.received_at,
+		]
+			// Only an ISO timestamp counts: Date.parse reads the marker as the year 2039.
+			.map((at) => (typeof at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(at) ? Date.parse(at) : Number.NaN))
+			.find((ms) => Number.isFinite(ms));
+		if (sinceMs === undefined) return false;
 		const heldMs = this.#manager.now() - sinceMs;
 		if (heldMs < this.#manager.unresolvedHoldMs) return false;
 		const sessionId = bound?.sessionId ?? turn.sessionId;
@@ -1739,7 +1760,7 @@ class OriginActor {
 		// session never sees the possibly accepted request as unread. Messages
 		// that arrived after the send keep their unread context.
 		const { nextEpoch, closedInputs } = database.transaction((tx) => {
-			const epoch = database.bindings.rotateEpoch(tx, this.originKey);
+			const epoch = retiredEpoch ? this.#epoch() : database.bindings.rotateEpoch(tx, this.originKey);
 			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
 			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
 			const claimed = database.inbox.sentContextIds(turn.opRef);
@@ -1755,6 +1776,7 @@ class OriginActor {
 			return { nextEpoch: epoch, closedInputs: closed };
 		});
 		this.#holdSweeps.delete(turn.opRef);
+		this.#recoveryHoldReasons.delete(turn.opRef);
 		for (const row of closedInputs) {
 			// Whether the model read it is unknown: release its ownership without a 👀.
 			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
@@ -1770,6 +1792,10 @@ class OriginActor {
 		if (bound) {
 			bound.retired = true;
 			bound.answerWanted = true;
+			// The user was told; only the bounded retired-reattach schedule and the
+			// periodic sweep read its status from here on (#715).
+			bound.tailEvidenceUnavailable = false;
+			bound.statusRecheckAfterStall = false;
 			this.#clearStallReconciliation(bound);
 			bound.tail?.setTurnRunning(false);
 			await bound.tail?.close();
@@ -1784,6 +1810,9 @@ class OriginActor {
 				// Adopted without a relay: the host is gone. Periodic reconcile reads
 				// its status; a reattach is tried on the bounded retired schedule.
 				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+				// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
+				adopted.tailEvidenceUnavailable = false;
+				this.#clearStallReconciliation(adopted);
 				adopted.detached = true;
 				this.#scheduleRetiredReattach(adopted);
 			} catch (error) {
@@ -1873,11 +1902,8 @@ class OriginActor {
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
-			if (!retired && (await this.#escalateUnresolvedHold(turn, undefined))) return;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=operation_state_unknown`,
-				"warn",
-			);
+			if (await this.#escalateUnresolvedHold(turn, undefined)) return;
+			this.#logRecoveryHoldOnce(turn, "operation_state_unknown");
 			return;
 		}
 		const authorityShifted =
@@ -1971,15 +1997,25 @@ class OriginActor {
 				return;
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
-				if (!retired && status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined)))
-					return;
-				this.#manager.log(
-					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason}`,
-					"warn",
-				);
+				if (status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
 		}
+	}
+
+	/**
+	 * Recovery scans run every minute; an unchanged hold is logged once per
+	 * (op-ref, reason) and again only when its reason changes (#705).
+	 */
+	/** Logs a hold once per reason change; `extra` (e.g. `detail=…`) describes the first occurrence. */
+	#logRecoveryHoldOnce(turn: InboundTurn, reason: string, extra?: string): void {
+		if (this.#recoveryHoldReasons.get(turn.opRef) === reason) return;
+		this.#recoveryHoldReasons.set(turn.opRef, reason);
+		this.#manager.log(
+			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}${extra ? ` ${extra}` : ""}`,
+			"warn",
+		);
 	}
 
 	async #adoptRecoveredTurn(
@@ -2078,6 +2114,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
+	/** Last logged recovery-scan hold reason per op-ref (#705). */
+	readonly #recoveryHoldReasons = new Map<string, string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
@@ -4004,10 +4042,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
@@ -4015,10 +4050,7 @@ class OriginActor {
 		}
 		if (this.#stopped || this.#manager.stopped) return;
 		if (bound.stallHostTerminated && report.operationRef !== bound.turn.opRef) {
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_ref_mismatch`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "operation_ref_mismatch");
 			this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -4036,10 +4068,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown", `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -4081,10 +4110,7 @@ class OriginActor {
 			// reconcile authority — completes the turn below, corroborated by an
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "tail_terminal_evidence_unavailable");
 			const timer = this.#manager.schedule(() => {
 				this.#graceTimers.delete(timer);
 				if (this.#stopped || this.#manager.stopped) return;
@@ -4160,9 +4186,9 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
-						"warn",
+					this.#logRecoveryHoldOnce(
+						bound.turn,
+						notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
 					);
 					if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 					return;
@@ -4652,10 +4678,7 @@ class OriginActor {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
 						return;
 					}
-					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
-						"warn",
-					);
+					this.#logRecoveryHoldOnce(bound.turn, "retired_tail_reattach_failed", `detail=${safeDiagnostic(error)}`);
 					return;
 				}
 				// A reopened relay never carries the retired turn's content; its
@@ -4760,10 +4783,15 @@ class OriginActor {
 		if (bound) await this.#reconcileBound(bound);
 	}
 
-	/** Bounded status poll for a lost or stalled tail; one timer per turn, backing off. */
+	/**
+	 * Bounded status poll for a lost or stalled tail; one timer per turn, backing off.
+	 * An escalated retired hold is never polled this way: its user was already
+	 * told, so the periodic sweep alone reads it (#715: 5 s polls ran for hours).
+	 */
 	#scheduleStatusRecheck(bound: BoundTurn): void {
 		const key = `status:${retiredKey(bound)}`;
 		if (this.#retiredReattachTimers.has(key)) return;
+		if (bound.retired && this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined) return;
 		const delay = Math.min(STATUS_RECHECK_MAX_MS, STATUS_RECHECK_MIN_MS * 2 ** bound.statusRechecks);
 		bound.statusRechecks += 1;
 		const timer = this.#manager.schedule(() => {

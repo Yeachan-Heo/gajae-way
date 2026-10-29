@@ -722,6 +722,10 @@ export interface PromptStatusBody {
 		readonly kind?: string;
 		readonly reason?: string;
 		readonly provenance?: string;
+		readonly code?: string;
+		readonly providerCode?: string;
+		readonly phase?: string;
+		readonly category?: string;
 		readonly failureCauseDiagnostic?: string;
 	};
 	/** Gateway-filtered safe failure codes/messages, never raw SDK exceptions. */
@@ -745,6 +749,17 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/**
+	 * A fresh lane whose start is still being admitted (clone, worktree, bind,
+	 * send) has no durable record yet: state `admitting`. If that admission
+	 * failed, state `admission_failed` carries the bounded reason until the next
+	 * start of the name (#707).
+	 */
+	readonly admission?: {
+		readonly startedAt: string;
+		readonly failedAt?: string;
+		readonly reason?: string;
+	};
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
 		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */
@@ -752,6 +767,36 @@ export interface WorkStatusResult {
 		readonly branch: string;
 		readonly base?: string;
 	};
+}
+
+/**
+ * Standing operator directives (#604): constraints added mid-conversation that
+ * every matching lane must follow. A directive added from a persona session
+ * applies to the lanes that conversation started; one added outside any
+ * conversation (the host operator) applies to every lane.
+ */
+export interface WorkDirectiveParams {
+	readonly action: "add" | "list" | "remove";
+	/** The directive text (add). */
+	readonly text?: string;
+	/** The directive to remove (remove). */
+	readonly id?: string;
+	readonly callerSessionId?: string;
+}
+
+export interface WorkDirective {
+	readonly id: string;
+	/** `owner` for every lane, otherwise the persona origin key whose lanes it binds. */
+	readonly scope: string;
+	readonly text: string;
+	readonly createdAt: string;
+}
+
+export interface WorkDirectiveResult {
+	/** Directives visible to the caller after the action. */
+	readonly directives: readonly WorkDirective[];
+	/** Add only: the open lanes the new directive was steered into. */
+	readonly propagated?: readonly { readonly name: string; readonly steered: boolean; readonly reason?: string }[];
 }
 
 export interface WorkSteerParams {
@@ -1280,6 +1325,7 @@ export interface VerbCatalogV01 {
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
+	"work.directive": { params: WorkDirectiveParams; result: WorkDirectiveResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
@@ -1331,6 +1377,7 @@ export const VERBS_V01 = [
 	"work.steer",
 	"work.jobs",
 	"work.retire",
+	"work.directive",
 	"chat.react",
 	"engagement.reaction",
 	"engagement.panel_response",

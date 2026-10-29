@@ -424,3 +424,132 @@ test("Slack pongs and frames keep a quiet socket alive", async () => {
 		f.mode.stop();
 	}
 });
+
+test("#710: a connections.open that never answers is abandoned and the reconnect loop opens a fresh socket", async () => {
+	const timers: { work: () => void; ms: number; cleared: boolean }[] = [];
+	const delays: number[] = [];
+	const sleepers: (() => void)[] = [];
+	const logs: string[] = [];
+	const sockets: FakeSocket[] = [];
+	let opens = 0;
+	const mode = new SlackSocketMode(
+		// The first request hangs forever, as one stuck on a dead keep-alive connection does.
+		() => (++opens === 1 ? new Promise<{ url: string }>(() => {}) : Promise.resolve({ url: "wss://slack.test" })),
+		{ onEvent() {}, onSlashCommand() {} },
+		{
+			factory: () => {
+				const socket = new FakeSocket([]);
+				sockets.push(socket);
+				return socket;
+			},
+			sleep: (ms) => {
+				delays.push(ms);
+				return new Promise((resolve) => sleepers.push(resolve));
+			},
+			random: () => 1,
+			log: { log: (line) => logs.push(String(line)), error: (line) => logs.push(String(line)) },
+			openTimeoutMs: 30_000,
+			setTimeout: (work, ms) => {
+				const timer = { work, ms, cleared: false };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: (timer) => {
+				(timer as { cleared: boolean }).cleared = true;
+			},
+		},
+	);
+	try {
+		const start = mode.start();
+		await flush();
+		expect(opens).toBe(1);
+		expect(timers.map((timer) => timer.ms)).toEqual([30_000]);
+		timers[0]!.work();
+		await flush();
+		await start;
+		expect(logs).toContain("Slack socket connection failed: connections.open timed out after 30000ms");
+		expect(delays).toEqual([500]);
+		sleepers.shift()?.();
+		await flush();
+		expect(opens).toBe(2);
+		expect(sockets).toHaveLength(1);
+		// An answered request clears its own bound.
+		expect(timers).toHaveLength(2);
+		expect(timers[1]!.cleared).toBe(true);
+		sockets[0]!.open();
+		sockets[0]!.message({ type: "hello" });
+		expect(mode.connected).toBe(true);
+	} finally {
+		mode.stop();
+	}
+});
+
+test("#710: a socket kept busy by pings but never greeted with hello is replaced after the liveness window", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		expect(f.mode.connected).toBe(false);
+		// Slack pings every few seconds, so the plain quiet check never fires.
+		for (let minute = 0; minute < 14; minute++) {
+			f.elapse(60_000);
+			socket.listeners.get("ping")?.({});
+		}
+		expect(f.disconnects).toEqual([]);
+		f.elapse(60_000);
+		expect(f.disconnects).toEqual(["Slack socket never connected"]);
+		expect(f.logs.some((line) => line.startsWith("Slack socket never connected: no hello after 900s"))).toBe(true);
+		await flush();
+		expect(f.delays).toEqual([500]);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("#710: slash_commands envelopes never count as Events API delivery", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		socket.message({ type: "hello" });
+		socket.message({
+			envelope_id: "s1",
+			type: "slash_commands",
+			payload: { command: "/status", text: "", user_id: "U1", channel_id: "C1" },
+		});
+		await flush();
+		expect(f.mode.lastEnvelopeAt).toBeUndefined();
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("#710: the socket reports when it said hello and when the last envelope arrived, and restart reconnects", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		expect(f.mode.connectedSince).toBeUndefined();
+		expect(f.mode.lastEnvelopeAt).toBeUndefined();
+		socket.message({ type: "hello" });
+		expect(f.mode.connectedSince).toBe(1_000_000);
+		f.elapse(5_000);
+		socket.message(envelope("e1"));
+		await flush();
+		expect(f.mode.lastEnvelopeAt).toBe(1_005_000);
+		f.mode.restart("Slack events possibly disabled");
+		expect(f.disconnects).toEqual(["Slack events possibly disabled"]);
+		expect(f.mode.connected).toBe(false);
+		expect(f.mode.connectedSince).toBeUndefined();
+		await flush();
+		expect(f.delays).toEqual([500]);
+		f.sleepers.shift()?.();
+		await flush();
+		f.sockets[1]?.open();
+		f.sockets[1]?.message({ type: "hello" });
+		expect(f.mode.connections).toBe(2);
+		expect(f.mode.connectedSince).toBe(1_005_000);
+	} finally {
+		f.mode.stop();
+	}
+});

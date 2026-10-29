@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
@@ -11,6 +11,8 @@ import {
 	ProtocolError,
 	parseOriginKey,
 	validateOriginRef,
+	type WorkDirective,
+	type WorkDirectiveResult,
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
@@ -42,6 +44,8 @@ import {
 	type LaneReportRow,
 	resolveLaneReportOrigin,
 	terminalEvidence,
+	unresolvedTerminalReceipt,
+	WORK_OUTCOME_TOKENS,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -90,6 +94,7 @@ const GIT_TIMEOUTS: GitTimeouts = { local: GIT_COMMAND_TIMEOUT_MS, clone: 30_000
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
+	"provider_transport",
 	"cancelled",
 	"max_tokens",
 	"max_turn_requests",
@@ -300,6 +305,12 @@ export class WorkLaneManager {
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
 	readonly #runCalls = new Map<string, RunCall>();
+	/**
+	 * Fresh-lane starts between request acceptance and their durable lane record,
+	 * plus the last failed one per name, so `work.status` never reports an
+	 * accepted start as an unknown lane (#707).
+	 */
+	readonly #admissions = new Map<string, { startedAt: string; failedAt?: string; reason?: string }>();
 	readonly #detachedOwners = new WeakSet<object>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
@@ -512,7 +523,10 @@ export class WorkLaneManager {
 				const effects = this.#settleChecks(
 					name,
 					record,
-					{ kind: "ended", reason: "lane force-retired before checks settled" },
+					{
+						kind: "ended",
+						reason: `lane ${reason === "operator_retired" ? "retired" : "force-retired"} before checks settled`,
+					},
 					undefined,
 					endedAt,
 				);
@@ -568,7 +582,7 @@ export class WorkLaneManager {
 						: {}),
 				}
 			: undefined;
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts, terminal.status);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -831,11 +845,36 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		this.#job(input.name);
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		const admitting = this.#admissions.get(input.name);
+		// A same-name retry (for example after a caller timeout) must not queue a
+		// second clone, bind or send behind the admission still in progress.
+		if (admitting && admitting.failedAt === undefined)
+			return {
+				started: false,
+				held: true,
+				jobId: laneJobIdentity(input.name).jobId,
+				state: "admitting",
+				reason: "the lane start is still being admitted; check work.status",
+			};
+		const admission = { startedAt: this.#at() };
+		this.#admissions.set(input.name, admission);
+		try {
+			const result = await this.#startAdmitted(input, mode, { parent, runCall });
+			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
+			return result;
+		} catch (error) {
+			if (this.#admissions.get(input.name) === admission) {
+				if (this.#job(input.name)) this.#admissions.delete(input.name);
+				else this.#admissions.set(input.name, { ...admission, failedAt: this.#at(), reason: failureReason(error) });
+			}
+			throw error;
+		}
+	}
+	async #startAdmitted(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		await this.recover();
 		this.#live();
-		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent, runCall }));
+		return this.#port.runExclusive(workSessionKey(input.name), () => this.#startLocked(input, mode, context));
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
@@ -1049,7 +1088,7 @@ export class WorkLaneManager {
 				sessionId: runtime.sessionId,
 				repo: runtime.cwd,
 				opRef,
-				text: input.text,
+				text: this.#withDirectives(input.text, context.parent),
 				...(observer.tail ? { relay: observer.tail } : {}),
 				...(notice ? { systemPreamble: notice.text } : {}),
 				codingRegister: true,
@@ -1111,6 +1150,17 @@ export class WorkLaneManager {
 	}
 	async status(params: unknown): Promise<WorkStatusResult> {
 		const name = parseName(params);
+		const admission = this.#job(name) ? undefined : this.#admissions.get(name);
+		if (admission)
+			return {
+				jobId: laneJobIdentity(name).jobId,
+				state: admission.failedAt === undefined ? "admitting" : "admission_failed",
+				sessionId: "",
+				lastActivityAt: null,
+				attempt: null,
+				op: null,
+				admission: { ...admission },
+			};
 		const job = this.#job(name, true)!;
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
@@ -1162,6 +1212,100 @@ export class WorkLaneManager {
 					}
 				: {}),
 		};
+	}
+	/**
+	 * Standing operator directives (#604). They are stored durably, prepended to
+	 * every later attempt of a matching lane, and steered into matching lanes that
+	 * are running when one is added, so a mid-conversation prohibition reaches
+	 * work already under way instead of living only in the conversation's memory.
+	 */
+	async directive(params: unknown): Promise<WorkDirectiveResult> {
+		if (!params || typeof params !== "object" || Array.isArray(params)) invalid("params");
+		const { action, text, id, callerSessionId } = params as Record<string, unknown>;
+		if (callerSessionId !== undefined && typeof callerSessionId !== "string") invalid("callerSessionId");
+		this.#live();
+		const scope = this.#directiveScope(callerSessionId);
+		const visible = () =>
+			this.#directives().filter(
+				(directive) =>
+					scope === OWNER_DIRECTIVE_SCOPE || directive.scope === scope || directive.scope === OWNER_DIRECTIVE_SCOPE,
+			);
+		if (action === "list") return { directives: visible() };
+		if (action === "remove") {
+			if (typeof id !== "string" || !DIRECTIVE_ID.test(id)) invalid("id");
+			const target = this.#directives().find((directive) => directive.id === id);
+			if (!target || (scope !== OWNER_DIRECTIVE_SCOPE && target.scope !== scope))
+				throw new ProtocolError("invalid_params", "unknown work directive", { reasonCode: "unknown_directive", id });
+			this.#db.core.metaDelete(`${DIRECTIVE_KEY_PREFIX}${id}`);
+			return { directives: visible() };
+		}
+		if (action !== "add") invalid("action");
+		if (typeof text !== "string" || !text.trim() || text.length > MAX_DIRECTIVE_CHARS) invalid("text");
+		if (this.#directives().filter((directive) => directive.scope === scope).length >= MAX_DIRECTIVES_PER_SCOPE)
+			throw new ProtocolError(
+				"invalid_params",
+				`at most ${MAX_DIRECTIVES_PER_SCOPE} directives per scope; remove one first`,
+				{
+					reasonCode: "directive_limit",
+				},
+			);
+		const directive: WorkDirective = {
+			id: `wd-${randomUUID().slice(0, 8)}`,
+			scope,
+			text: text.trim(),
+			createdAt: this.#at(),
+		};
+		this.#db.core.metaSet(`${DIRECTIVE_KEY_PREFIX}${directive.id}`, JSON.stringify(directive));
+		const names = new Set<string>();
+		for (const runtime of this.#db.work.workAttemptOpen(1000)) {
+			if (!runtime.sessionKey.startsWith(WORK_SESSION_PREFIX)) continue;
+			if (directiveApplies(directive, laneDirectiveScope(runtime.parent)))
+				names.add(runtime.sessionKey.slice(WORK_SESSION_PREFIX.length));
+		}
+		const propagated: { name: string; steered: boolean; reason?: string }[] = [];
+		for (const name of names) {
+			try {
+				const result = await this.steer({ name, text: directiveText([directive], "new") });
+				propagated.push(result.steered ? { name, steered: true } : { name, steered: false, reason: result.reason });
+			} catch (error) {
+				const reason =
+					error instanceof ProtocolError
+						? String((error.detail as { reasonCode?: unknown } | undefined)?.reasonCode ?? error.code)
+						: "steer_failed";
+				propagated.push({ name, steered: false, reason });
+			}
+		}
+		console.error(
+			`work_directive_added id=${directive.id} scope=${scope} lanes=${propagated.length} steered=${propagated.filter((lane) => lane.steered).length}`,
+		);
+		return { directives: visible(), propagated };
+	}
+	#directiveScope(callerSessionId: string | undefined): string {
+		const callerOrigin = callerSessionId ? this.#db.bindings.originForSessionId(callerSessionId) : undefined;
+		if (callerOrigin === undefined) return OWNER_DIRECTIVE_SCOPE;
+		if (callerOrigin.startsWith(WORK_SESSION_PREFIX))
+			throw new ProtocolError("unauthorized", "a work lane cannot set operator directives", {
+				reasonCode: "directive_from_lane",
+			});
+		return callerOrigin;
+	}
+	#directives(): WorkDirective[] {
+		const directives: WorkDirective[] = [];
+		for (const key of this.#db.core.metaKeysInRange(DIRECTIVE_KEY_PREFIX, `${DIRECTIVE_KEY_PREFIX}\uffff`)) {
+			try {
+				const value = JSON.parse(this.#db.core.metaGet(key) ?? "") as WorkDirective;
+				if (typeof value.text === "string" && typeof value.scope === "string" && typeof value.id === "string")
+					directives.push(value);
+			} catch {
+				console.error(`work_directive_unreadable key=${key}`);
+			}
+		}
+		return directives.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+	}
+	#withDirectives(text: string, parent: WorkParent | null): string {
+		const scope = laneDirectiveScope(parent);
+		const active = this.#directives().filter((directive) => directiveApplies(directive, scope));
+		return active.length === 0 ? text : `${directiveText(active, "standing")}\n\n${text}`;
 	}
 	async steer(params: unknown): Promise<WorkSteerResult> {
 		const name = parseName(params);
@@ -1576,8 +1720,7 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		const unresolvedReceipt =
-			runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+		const unresolvedReceipt = unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined;
 		if (!runtime.terminal || unresolvedReceipt) this.#attach(observer);
 		// A saved SDK terminal is still incomplete without execution-end proof.
 		// Recovery must refresh it through the same fenced path as a fresh status.
@@ -1614,6 +1757,7 @@ export class WorkLaneManager {
 			let terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			let hostDeathProved = false;
 			if (unresolvedReceipt && !terminal) {
 				observer.receiptDeadSince = undefined;
 				return;
@@ -1625,13 +1769,13 @@ export class WorkLaneManager {
 					(["commandId", "turnId"] as const).some(
 						(key) => runtime.terminal?.status?.[key] !== undefined && runtime.terminal.status[key] !== status[key],
 					) ||
-					(terminal?.reasonCode !== "terminal_missing_receipt" && status.receiptState !== "present"))
+					(!unresolvedTerminalReceipt(terminal) && status.receiptState !== "present"))
 			) {
 				observer.receiptDeadSince = undefined;
 				return;
 			}
 			if (
-				terminal?.reasonCode === "terminal_missing_receipt" &&
+				unresolvedTerminalReceipt(terminal) &&
 				runtime.turnEndObservedAt === undefined &&
 				observer.turnEndObservedAt === undefined
 			) {
@@ -1646,12 +1790,16 @@ export class WorkLaneManager {
 				if (idle === false) return;
 				if (idle === undefined) {
 					if (!(await this.#missingReceiptHostDead(observer, runtime, status!))) return;
-					terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
+					hostDeathProved = true;
+					// Host death proves execution ended; it cannot replace an SDK failure cause.
+					if (status?.status !== "failed")
+						terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
 				}
 				if (observer.activityVersion !== activityVersion) {
 					observer.receiptDeadSince = undefined;
 					return;
 				}
+				if (hostDeathProved && terminal?.kind === "broker") observer.turnEndObservedAt ??= this.#at();
 				if (idle === true) {
 					if (
 						!proofTail ||
@@ -1669,10 +1817,11 @@ export class WorkLaneManager {
 			// Keep saved terminal evidence immutable until output proves a late
 			// receipt. A refreshed terminal receipt or confirmed host death can
 			// release retrieval, but cannot rewrite the original outcome by itself.
-			if (unresolvedReceipt && terminal?.reasonCode !== "terminal_missing_receipt")
-				observer.turnEndObservedAt ??= this.#at();
+			if (unresolvedReceipt && !unresolvedTerminalReceipt(terminal)) observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
 			const patchParts: Array<Partial<WorkAttemptPatch>> = [];
+			if (hostDeathProved && terminal?.kind === "broker" && !runtime.terminal)
+				patchParts.push({ output: { ...runtime.output, disposition: "unavailable", nextReadAt: null } });
 			if (runtime.sendPhase !== "accepted" && status && provesAcceptance(status)) {
 				patchParts.push({
 					sendPhase: "accepted" as const,
@@ -1691,7 +1840,7 @@ export class WorkLaneManager {
 				runtime;
 			if (!runtime.terminal) return;
 		}
-		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
+		if (unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined) {
 			const turnEndObservedAt = observer.turnEndObservedAt;
 			if (!turnEndObservedAt) return;
 			runtime =
@@ -1747,11 +1896,10 @@ export class WorkLaneManager {
 					};
 					const silent = isSilentOutput(result.text);
 					const terminal = runtime.terminal!;
-					// A terminal first observed with receiptState=missing whose same-op
-					// final body then proves present is a late receipt, not a missing one
-					// (#248): re-derive the end state from the reconciled receipt.
+					// A proven original same-op body resolves receipt uncertainty, not
+					// execution by inference. Re-derive its actual terminal outcome.
 					const reconciled =
-						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
+						terminal.kind === "broker" && terminal.status !== undefined && unresolvedTerminalReceipt(terminal)
 							? terminalEvidence(
 									safeStatus({
 										...terminal.status,
@@ -1800,10 +1948,11 @@ export class WorkLaneManager {
 			const name = runtime.sessionKey.slice("work/task/".length);
 			const at = this.#at();
 			const reason = runtime.terminal?.reasonCode ?? "unknown";
-			// Extract transport cause for sdk_failed/terminal_missing_receipt failures
+			// Preserve bounded transport diagnostics independently of the classified cause.
 			let output = runtime.output;
 			if (
-				(reason === "sdk_failed" || reason === "terminal_missing_receipt") &&
+				(["sdk_failed", "provider_transport", "prompt_deadline_exceeded"].includes(reason) ||
+					unresolvedTerminalReceipt(runtime.terminal)) &&
 				output.disposition === "unavailable" &&
 				!output.transportCause
 			) {
@@ -1896,7 +2045,7 @@ export class WorkLaneManager {
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
-			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
+			const text = reportText(name, endState, reason, runtime.opRef, output, facts, runtime.terminal?.status);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -2625,8 +2774,7 @@ export class WorkLaneManager {
 					if (!this.#current(observer)) continue;
 				}
 				const terminal = status && terminalEvidence(status, this.#at());
-				const terminalStillRunning =
-					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+				const terminalStillRunning = unresolvedTerminalReceipt(terminal) && runtime.turnEndObservedAt === undefined;
 				if (terminal && !terminalStillRunning && this.#writeCurrent(observer)) {
 					this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(provesAcceptance(status!)
@@ -2856,6 +3004,32 @@ function makeRuntime(
 		version: 0,
 	};
 }
+const WORK_SESSION_PREFIX = "work/task/";
+const OWNER_DIRECTIVE_SCOPE = "owner";
+const DIRECTIVE_KEY_PREFIX = "work_directive:";
+const DIRECTIVE_ID = /^wd-[0-9a-f]{8}$/;
+const MAX_DIRECTIVE_CHARS = 2_000;
+const MAX_DIRECTIVES_PER_SCOPE = 50;
+
+/** The persona conversation a lane answers to, or `owner` for lanes started outside one. */
+function laneDirectiveScope(parent: WorkParent | null): string {
+	if (parent?.kind === "persona") return parent.originKey;
+	if (parent?.kind === "lane" && parent.root) return parent.root.originKey;
+	return OWNER_DIRECTIVE_SCOPE;
+}
+
+function directiveApplies(directive: WorkDirective, laneScope: string): boolean {
+	return directive.scope === OWNER_DIRECTIVE_SCOPE || directive.scope === laneScope;
+}
+
+function directiveText(directives: readonly WorkDirective[], kind: "standing" | "new"): string {
+	const lead =
+		kind === "new"
+			? "[New standing directive from your operator. It overrides your task from now on: follow it before your next tool call, and stop any step that violates it.]"
+			: "[Standing directives from your operator. They override anything in the task below; follow them for the whole lane.]";
+	return [lead, ...directives.map((directive) => `- (${directive.id}) ${directive.text}`)].join("\n");
+}
+
 function invalid(field: string): never {
 	throw new ProtocolError("invalid_params", "invalid work parameters", { reasonCode: "invalid_work_params", field });
 }
@@ -3086,14 +3260,17 @@ function safeStatus(status: PromptStatusBody): PromptStatusBody {
 			...(status.outcome.reason
 				? { reason: reasons.has(status.outcome.reason) ? status.outcome.reason : "stopped_incomplete" }
 				: {}),
-			...(["stopped", "success", "failure", "cancelled", "completed"].includes(status.outcome.kind ?? "")
-				? { kind: status.outcome.kind }
-				: {}),
-			...(["client_cancel", "runtime", "broker", "receipt"].includes(status.outcome.provenance ?? "")
-				? { provenance: status.outcome.provenance }
-				: {}),
+			...Object.fromEntries(
+				(Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>)
+					.filter((key) => (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(status.outcome![key] ?? ""))
+					.map((key) => [key, status.outcome![key]]),
+			),
 		};
-	if (status.error) result.error = { code: reasons.has(status.error.code ?? "") ? status.error.code : "sdk_failed" };
+	if (status.error)
+		result.error = {
+			code:
+				status.error.code === "agent_error" || reasons.has(status.error.code ?? "") ? status.error.code : "sdk_failed",
+		};
 	return result;
 }
 /** Called only after #query has validated the operation and client reference. */
@@ -3167,6 +3344,7 @@ export function reportText(
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
+	status?: PromptStatusBody,
 ): string {
 	const checks = facts?.checkStatus;
 	const checksVerified =
@@ -3182,12 +3360,12 @@ export function reportText(
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
 		output.disposition === "unavailable"
-			? reason === "terminal_missing_receipt"
+			? reason === "terminal_missing_receipt" || status?.receiptState === "missing"
 				? `final_response_missing opRef=${opRef}`
 				: "output_unavailable"
 			: (output.excerpt ?? "");
 	// Include transport cause details if present
-	if (reason === "terminal_missing_receipt" && output.transportCause) {
+	if ((reason === "terminal_missing_receipt" || status?.receiptState === "missing") && output.transportCause) {
 		const transport = output.transportCause;
 		const parts: string[] = [body, `cause=transport`];
 		if (transport.nativeErrorCode) parts.push(transport.nativeErrorCode);
@@ -3201,6 +3379,15 @@ export function reportText(
 
 	// Reserve the suffix for repository facts so large output excerpts cannot hide check evidence.
 	const factsLines: string[] = [];
+	if (status?.status === "failed") {
+		if (status.receiptState) factsLines.push(`receiptState=${status.receiptState}`);
+		if (status.error?.code === "agent_error" || reasons.has(status.error?.code ?? ""))
+			factsLines.push(`errorCode=${status.error!.code}`);
+		for (const key of Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>) {
+			const token = status.outcome?.[key];
+			if (token && (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(token)) factsLines.push(`${key}=${token}`);
+		}
+	}
 	if (facts?.headSha) {
 		factsLines.push(`head=${facts.headSha.slice(0, 12)}`);
 	}

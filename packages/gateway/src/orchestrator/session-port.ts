@@ -2302,8 +2302,12 @@ export function parseWorkerOutputResponse(
 	}
 	if (result.status === "accepted" || result.status === "in_flight")
 		return { status: "absent", code: "output_pending" };
+	const unresolvedFailure =
+		result.status === "failed" &&
+		(result.receiptState === undefined ||
+			["missing", "unknown", "absent"].some((state) => state === result.receiptState));
 	if (
-		(result.status !== "terminal_ok" && !(result.status === "failed" && result.receiptState === "missing")) ||
+		(result.status !== "terminal_ok" && !unresolvedFailure) ||
 		typeof result.terminalAt !== "number" ||
 		!Number.isFinite(result.terminalAt) ||
 		result.terminalAt < input.notBeforeMs
@@ -2317,9 +2321,9 @@ export function parseWorkerOutputResponse(
 			result.startedAt > result.terminalAt)
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
-	// A request deadline can publish a failed/missing result before the live
-	// execution's final receipt arrives. Keep that result inside the same bounded
-	// retrieval budget as terminal_ok/missing, never an assumed final failure.
+	// A failed operation's nonpresent receipt is not definitive output loss.
+	// Keep validated, content-free responses inside the same bounded retrieval
+	// budget; malformed states and unproven content remain fail-closed.
 	if (result.status === "failed")
 		return result.content === undefined && result.textSummary === undefined
 			? { status: "absent", code: "output_pending" }

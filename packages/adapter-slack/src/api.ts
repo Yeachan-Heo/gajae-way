@@ -199,7 +199,12 @@ export class SlackWebApi {
 		this.limiter = resolved.limiter;
 	}
 
-	async call<T>(method: string, parameters: Record<string, unknown> = {}, token?: string): Promise<T> {
+	async call<T>(
+		method: string,
+		parameters: Record<string, unknown> = {},
+		token?: string,
+		signal?: AbortSignal,
+	): Promise<T> {
 		// Response URLs are already credentials: never forward the bot token to them.
 		const responseUrl = method.startsWith("https://");
 		// Slack honours a JSON body only on write methods (chat.*, reactions.add/remove,
@@ -212,14 +217,22 @@ export class SlackWebApi {
 		let response: Response | undefined;
 		let retryAfterMs = 0;
 		for (let attempt = 0; ; attempt++) {
-			response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
-				method: "POST",
-				headers: {
-					"content-type": encoding === "json" ? "application/json" : "application/x-www-form-urlencoded",
-					...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
-				},
-				body: encoding === "json" ? JSON.stringify(parameters) : formEncode(parameters),
-			});
+			try {
+				response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
+					method: "POST",
+					headers: {
+						"content-type": encoding === "json" ? "application/json" : "application/x-www-form-urlencoded",
+						...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
+					},
+					body: encoding === "json" ? JSON.stringify(parameters) : formEncode(parameters),
+					...(signal ? { signal } : {}),
+				});
+			} catch (err) {
+				// If the request was aborted, propagate the error
+				if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) throw err;
+				// Other fetch errors are treated as network failures
+				throw err;
+			}
 			// A 429, or a 200 whose body says `ratelimited`, both mean "slow down".
 			// Honour Retry-After (seconds), bounded, then give up as ambiguous. Never a
 			// definitive refusal: Slack did not judge the payload.
@@ -407,8 +420,8 @@ export class SlackWebApi {
 		return historyPage(await this.call<HistoryResponse>("conversations.replies", { channel, ts, ...options }));
 	}
 
-	connectionsOpen(appToken: string): Promise<{ readonly url: string }> {
-		return this.call("apps.connections.open", {}, appToken);
+	connectionsOpen(appToken: string, signal?: AbortSignal): Promise<{ readonly url: string }> {
+		return this.call("apps.connections.open", {}, appToken, signal);
 	}
 
 	respond(responseUrl: string, payload: Record<string, unknown>): Promise<void> {
