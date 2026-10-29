@@ -413,6 +413,10 @@ export class LaneGovernor {
 			};
 			if (reportsUnresolved()) return refused("historical job has unresolved lane reports");
 			const sessions = new Set([...job.sessions, ...job.attempts.map((attempt) => attempt.sessionId)]);
+			const authorityEvidence = this.#database.bindings.workHistoryAuthorityEvidence(authority, sessionKey);
+			if (authorityEvidence.creates.length > 0) return refused("historical job has an unresolved session create");
+			if (authorityEvidence.bindings.some((owned) => !sessions.has(owned.session_id)))
+				return refused("historical job omits an owned session");
 			for (const sessionId of sessions) {
 				const owned = this.#database.bindings.assertOwnedSession(sessionId, job.lane.worktreePath, authority);
 				if (
@@ -470,6 +474,8 @@ export class LaneGovernor {
 					this.#brokerGeneration() !== generation ||
 					this.#database.bindings.isQuarantined("work", jobId) ||
 					JSON.stringify(this.#database.bindings.getSessionRecord(sessionKey)) !== JSON.stringify(binding) ||
+					JSON.stringify(this.#database.bindings.workHistoryAuthorityEvidence(authority, sessionKey)) !==
+						JSON.stringify(authorityEvidence) ||
 					this.#database.work.laneJobJson(jobId) !== json ||
 					this.#database.work.laneJobJsonByLaneKey(laneKey) !== json ||
 					JSON.stringify(this.#database.work.laneJobRows(true).find((row) => row.job_id === jobId)) !==

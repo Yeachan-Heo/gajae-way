@@ -414,6 +414,41 @@ export class BindingsGroup {
 		)?.repo;
 	}
 
+	/** Durable ownership and unreconciled creates for every epoch of an origin. */
+	workHistoryAuthorityEvidence(
+		authority: BrokerAuthority,
+		originKey: string,
+	): {
+		readonly bindings: readonly { readonly session_id: string; readonly epoch: number; readonly repo: string }[];
+		readonly creates: readonly { readonly scope: string; readonly state: string }[];
+	} {
+		this.assertAuthority(authority);
+		const key = brokerAuthorityKey(authority);
+		const bindings = this.#db
+			.prepare(
+				"SELECT session_id, epoch, repo FROM broker_owned_bindings WHERE authority_key = ? AND origin_key = ? ORDER BY session_id",
+			)
+			.all(key, originKey) as Array<{ session_id: string; epoch: number; repo: string }>;
+		const operations = this.#db
+			.prepare(
+				"SELECT scope, state FROM broker_operations WHERE authority_key = ? AND operation = 'session.create' ORDER BY scope",
+			)
+			.all(key) as Array<{ scope: string; state: string }>;
+		const creates = operations.filter((operation) => {
+			const scope: unknown = JSON.parse(operation.scope);
+			if (
+				!Array.isArray(scope) ||
+				scope.length !== 2 ||
+				typeof scope[0] !== "string" ||
+				!Number.isSafeInteger(scope[1]) ||
+				scope[1] < 0
+			)
+				throw new Error("invalid broker create scope");
+			return scope[0] === originKey;
+		});
+		return { bindings, creates };
+	}
+
 	hasCutovers(): boolean {
 		return this.#db.prepare("SELECT 1 FROM broker_cutovers LIMIT 1").get() !== null;
 	}

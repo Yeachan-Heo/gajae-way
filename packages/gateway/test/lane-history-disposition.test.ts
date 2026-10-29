@@ -249,6 +249,94 @@ test("settled unbound attempt history is retained without disposition", async ()
 	expect(f.database.work.projectionRows()).toEqual(before);
 });
 
+for (const state of ["live", "dead", "unknown", "disowned"] as const) {
+	test(`disposition refuses a ${state} owned session missing from job history`, async () => {
+		const f = await fixture();
+		const sessionId = crypto.randomUUID();
+		f.database.transaction((tx) => {
+			f.database.bindings.recordOwnedBinding(tx, {
+				authority: f.authority,
+				sessionId,
+				originKey: f.sessionKey,
+				epoch: 1,
+				repo: f.directory,
+			});
+			f.database.bindings.rotateEpoch(tx, f.sessionKey);
+		});
+		if (state === "live" || state === "dead")
+			f.port.setSessionState(sessionId, { live: state === "live", repo: f.directory });
+		if (state === "unknown") {
+			const liveness = f.port.liveness.bind(f.port);
+			f.port.liveness = (input) =>
+				input.sessionId === sessionId ? Promise.resolve({ live: undefined, disowned: false }) : liveness(input);
+		}
+		expect(await f.governor.retire("a", "operator")).toMatchObject({
+			retired: false,
+			reason: "historical job omits an owned session",
+		});
+		expect(f.history().state).toBe("awaiting_operator");
+	});
+}
+
+test("a retired owned session missing from history still blocks disposition", async () => {
+	const f = await fixture();
+	const sessionId = crypto.randomUUID();
+	f.database.transaction((tx) => {
+		f.database.bindings.recordOwnedBinding(tx, {
+			authority: f.authority,
+			sessionId,
+			originKey: f.sessionKey,
+			epoch: 1,
+			repo: f.directory,
+		});
+		f.database.bindings.rotateEpoch(tx, f.sessionKey);
+		f.database.bindings.retire(tx, sessionId, "test-cutover");
+	});
+	expect(await f.governor.retire("a", "operator")).toMatchObject({
+		retired: false,
+		reason: "historical job omits an owned session",
+	});
+});
+
+for (const state of ["pending", "complete"] as const) {
+	test(`disposition refuses an unreconciled ${state} historical session create`, async () => {
+		const f = await fixture();
+		const scope = JSON.stringify([f.sessionKey, 0]);
+		f.database.transaction((tx) => {
+			f.database.bindings.beginBrokerOperation(tx, f.authority, {
+				operation: "session.create",
+				scope,
+				operationRef: "gw-create-unresolved",
+				requestJson: "{}",
+			});
+			if (state === "complete")
+				f.database.bindings.completeBrokerOperation(
+					tx,
+					f.authority,
+					"session.create",
+					scope,
+					"gw-create-unresolved",
+					"{}",
+				);
+		});
+		expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+		expect(f.history().state).toBe("awaiting_operator");
+	});
+}
+
+test("a different origin's unresolved create does not prevent disposition", async () => {
+	const f = await fixture();
+	f.database.transaction((tx) =>
+		f.database.bindings.beginBrokerOperation(tx, f.authority, {
+			operation: "session.create",
+			scope: JSON.stringify(["work/task/other", 0]),
+			operationRef: "gw-create-other",
+			requestJson: "{}",
+		}),
+	);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(true);
+});
+
 for (const schemaVersion of [2, 3]) {
 	test(`disposition preserves the original validated history payload (schema ${schemaVersion})`, async () => {
 		const f = await fixture();
@@ -605,6 +693,36 @@ class ProbePort extends ScriptedSessionPort {
 		return result;
 	}
 }
+
+test("disposition refuses a create intent recorded during the death probe", async () => {
+	const port = new ProbePort();
+	const f = await fixture(port);
+	port.onProbe = () =>
+		f.database.transaction((tx) =>
+			f.database.bindings.beginBrokerOperation(tx, f.authority, {
+				operation: "session.create",
+				scope: JSON.stringify([f.sessionKey, 0]),
+				operationRef: "gw-create-race",
+				requestJson: "{}",
+			}),
+		);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.history().state).toBe("awaiting_operator");
+});
+
+test("disposition refuses an owned session recorded during the death probe", async () => {
+	const port = new ProbePort();
+	const f = await fixture(port);
+	const sessionId = crypto.randomUUID();
+	port.onProbe = () =>
+		f.raw
+			.query(
+				"INSERT INTO broker_owned_bindings (authority_key, session_id, origin_key, epoch, repo, created_at) SELECT authority_key, ?, origin_key, epoch, repo, created_at FROM broker_owned_bindings WHERE session_id = ?",
+			)
+			.run(sessionId, SESSION);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.history().state).toBe("awaiting_operator");
+});
 
 function insertChecksReport(f: Fixture, state: "pending" | "claimed" | "held" | "undeliverable") {
 	const reportId = workAttemptReportId(f.database.instanceId, f.identity.jobId, "gw-checks-a");
