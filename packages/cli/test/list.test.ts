@@ -121,7 +121,7 @@ describe("monitors list rendering", () => {
 		const lines = renderList(MONITOR_COLUMNS, rows, parseListOptions([], MONITOR_COLUMNS), monitorEnvelope(rows));
 		expect(lines).toHaveLength(3);
 		expect(lines[0]).toBe(
-			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               REPORT_TO            ENABLED",
+			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               REPORT_TO            INVALID  ENABLED",
 		);
 		expect(lines[1]).toContain("mon-1234");
 		expect(lines[1]).toContain("0 3 * * *");
@@ -168,7 +168,7 @@ describe("monitors list rendering", () => {
 
 	test("empty list renders a header plus an explicit (none) marker", () => {
 		expect(renderList(MONITOR_COLUMNS, [], parseListOptions([], MONITOR_COLUMNS), monitorEnvelope([]))).toEqual([
-			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  REPORT_TO  ENABLED",
+			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  REPORT_TO  INVALID  ENABLED",
 			"(none)",
 		]);
 	});
