@@ -78,26 +78,31 @@ export function validateCronSchedule(schedule: string, timezone?: string): void 
 }
 
 /**
- * Matcher-compatibility check: can this schedule be compiled and will it ever match?
- * Looser than validateCronSchedule for write-time policy (allows '5/1' style steps),
- * but still rejects schedules that cannot compile or never fire. Used at runtime
- * to distinguish 'not startable' (genuinely cannot run) from 'stricter-policy rejected'
- * (rejected at write-time but the matcher can handle it, e.g., a monitor saved before
- * the write-time validation was added).
+ * Boot-time check for a stored cron schedule, looser than validateCronSchedule: a schedule the matcher
+ * compiles, whose numeric values and ranges are inside each field's range, and that fires again can
+ * run, even when it fails the stricter write policy (a legacy `5/1`, for example). Returns why the
+ * schedule cannot run, or null when it can.
  */
-export function isCronScheduleRunnable(schedule: string, timezone?: string): boolean {
-	const fields = schedule.trim().split(/\s+/).filter(Boolean);
-	if (fields.length !== 5) return false;
+export function cronScheduleStartProblem(schedule: string, timezone?: string): string | null {
 	try {
-		// Try to compile it with the matcher
 		compileCron(schedule, timezone);
-		// Check if it will ever fire
-		if (nextCronFire(schedule, new Date(), timezone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone) === null)
-			return false;
-		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
 	}
+	const fields = schedule.trim().split(/\s+/);
+	for (const [index, field] of fields.entries()) {
+		const [min, max] = CRON_FIELD_RANGES[index] as readonly [number, number];
+		for (const part of field.split(",")) {
+			const base = part.match(CRON_PART)?.[1];
+			if (base === undefined || base === "*") continue;
+			const [start, end = start] = base.split("-").map(Number) as [number, number?];
+			if (start < min || (end as number) > max || (end as number) < start)
+				return `cron ${CRON_FIELD_NAMES[index]} field ${JSON.stringify(field)} is invalid: ${JSON.stringify(part)} is out of range (allowed ${min}-${max})`;
+		}
+	}
+	if (nextCronFire(schedule, new Date(), timezone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone) === null)
+		return `cron schedule ${JSON.stringify(schedule)} never fires (no date matches day-of-month, month and day-of-week together)`;
+	return null;
 }
 
 export function cronMatches(schedule: string, date: Date, timezone?: string): boolean {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { MonitorRuntime } from "../src/monitors/runtime";
-import { validateCronSchedule } from "../src/monitors/triggers/cron";
+import { cronScheduleStartProblem, validateCronSchedule } from "../src/monitors/triggers/cron";
 import { Store } from "../src/store";
 
 // Issue #724: a reminder saved as "0 12 30 10 * 2026" (a year appended, six fields) made every
@@ -554,8 +554,38 @@ test("legacy '5/1' schedule is skipped at write-time but runs at startup; the ma
 	const invalidLegacy = invalid.find((r) => r.monitorId === "legacy-five-slash-one");
 	expect(invalidLegacy).toBeDefined();
 	expect(invalidLegacy?.loadable).toBe(true);
-	// Verify it's NOT in notStartable() since isCronScheduleRunnable returns true for it.
-	const notStartable = registry.notStartable();
-	const notStartableLegacy = notStartable.find((r) => r.monitorId === "legacy-five-slash-one");
-	expect(notStartableLegacy).toBeUndefined();
+	// It can still run, so it is not reported as unstartable.
+	expect(registry.notStartable().find((r) => r.monitorId === "legacy-five-slash-one")).toBeUndefined();
+
+	// And the runtime actually starts it: two hours after creation its minute-5 slots are submitted.
+	const slots: Date[] = [];
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(() => errors.mockRestore());
+	const runtime = new MonitorRuntime(
+		{} as never,
+		registry,
+		{
+			submit: () => crypto.randomUUID(),
+			submitSlot: (monitorId: string, _eventType: string, _payload: unknown, slotAt: Date) => {
+				if (monitorId === "legacy-five-slash-one") slots.push(slotAt);
+				return crypto.randomUUID();
+			},
+		} as never,
+		{ now: () => new Date(Date.now() + 2 * 60 * 60 * 1000) },
+	);
+	cleanups.push(() => runtime.stop());
+	await runtime.start();
+	expect(slots.some((slot) => slot.getMinutes() === 5)).toBe(true);
+	expect(
+		errors.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("legacy-five-slash-one")),
+	).toEqual([]);
+});
+
+test("boot startability rejects out-of-range, never-firing and malformed stored schedules only", () => {
+	expect(cronScheduleStartProblem("5/1 * * * *")).toBeNull();
+	expect(cronScheduleStartProblem("*/15 9-17 * * 1-5")).toBeNull();
+	expect(cronScheduleStartProblem("0-99 * * * *")).toContain("out of range");
+	expect(cronScheduleStartProblem("0 25 * * *")).toContain("out of range");
+	expect(cronScheduleStartProblem(SIX_FIELDS)).toContain("five fields");
+	expect(cronScheduleStartProblem("0 0 31 2 *")).toContain("never fires");
 });

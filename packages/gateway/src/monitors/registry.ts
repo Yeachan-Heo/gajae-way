@@ -13,7 +13,7 @@ import {
 import type { Store } from "../store";
 import type { MonitorCronState } from "../store/groups/monitors";
 import { validateProcedureFiles } from "./procedure";
-import { compileCron, isCronScheduleRunnable, nextCronFire, validateCronSchedule } from "./triggers/cron";
+import { cronScheduleStartProblem, validateCronSchedule } from "./triggers/cron";
 
 const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
 const monitorReportToMetaKey = (monitorId: string) => `monitor_report_to:${monitorId}`;
@@ -85,7 +85,7 @@ export class MonitorRegistry {
 		return record;
 	}
 	list(): MonitorRecord[] {
-		return this.#scan({ validateCron: false }).records;
+		return this.#scan().records;
 	}
 	/**
 	 * Stored monitors that do not run: rows that no longer load (they are left out of `list()`
@@ -93,7 +93,7 @@ export class MonitorRegistry {
 	 * validation (still in `list()`, repairable with `update --schedule`).
 	 */
 	invalid(): MonitorInvalidRecord[] {
-		return this.#scan({ validateCron: true }).invalid;
+		return this.#scan({ cron: "write" }).invalid;
 	}
 	/**
 	 * Monitors that cannot be started: rows that no longer load and cron monitors whose
@@ -103,14 +103,13 @@ export class MonitorRegistry {
 	 * Used at runtime to distinguish genuinely not-startable from stricter-policy-rejected.
 	 */
 	notStartable(): MonitorInvalidRecord[] {
-		return this.#scan({ validateCron: true, matcherCompilable: true }).invalid;
+		return this.#scan({ cron: "start" }).invalid;
 	}
-	#scan(options?: { validateCron?: boolean; matcherCompilable?: boolean }): {
+	/** `cron` picks the check that reports cron rows: the write policy, or whether the stored schedule can run. */
+	#scan(options: { cron?: "write" | "start" } = {}): {
 		records: MonitorRecord[];
 		invalid: MonitorInvalidRecord[];
 	} {
-		const validateCron = options?.validateCron ?? false;
-		const matcherCompilable = options?.matcherCompilable ?? false;
 		const records: MonitorRecord[] = [];
 		const invalid: MonitorInvalidRecord[] = [];
 		for (const row of this.#database.monitors.rows()) {
@@ -122,43 +121,11 @@ export class MonitorRegistry {
 				continue;
 			}
 			records.push(record);
-			if (validateCron && record.trigger.kind === "cron") {
+			if (options.cron && record.trigger.kind === "cron") {
 				let reason: string | null = null;
-				if (matcherCompilable) {
-					// At runtime, skip ONLY schedules that:
-					// 1. Cannot be compiled by the matcher, OR
-					// 2. Never fire, OR
-					// 3. Have out-of-range values (even if matcher handles them)
-					if (!isCronScheduleRunnable(record.trigger.schedule, record.trigger.timezone)) {
-						// Get the actual error message
-						try {
-							compileCron(record.trigger.schedule, record.trigger.timezone);
-							const nextFire = nextCronFire(
-								record.trigger.schedule,
-								new Date(),
-								record.trigger.timezone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone,
-							);
-							if (nextFire === null) {
-								reason = "cron schedule never fires (no date matches day-of-month, month and day-of-week together)";
-							}
-						} catch (error) {
-							reason = errorReason(error);
-						}
-					} else {
-						// Check for out-of-range field values. Even though the matcher might handle them,
-						// we skip schedules with out-of-range values to prevent user errors.
-						try {
-							validateCronSchedule(record.trigger.schedule, record.trigger.timezone);
-						} catch (error) {
-							const errorMsg = errorReason(error);
-							// Only skip if it's an out-of-range error. Skip step-syntax errors like '5/1'.
-							if (errorMsg.includes("out of range") || errorMsg.includes("five fields")) {
-								reason = errorMsg;
-							}
-						}
-					}
+				if (options.cron === "start") {
+					reason = cronScheduleStartProblem(record.trigger.schedule, record.trigger.timezone);
 				} else {
-					// Check strict write-time policy (for invalid() report)
 					try {
 						validateCronSchedule(record.trigger.schedule, record.trigger.timezone);
 					} catch (error) {
