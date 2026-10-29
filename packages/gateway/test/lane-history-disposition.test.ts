@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { WorkRetireResult } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { GajaewayClient } from "../../sdk/src/client";
+import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
 import { startUnixServer } from "../src/server/server";
@@ -225,6 +226,16 @@ test("work.retire RPC dispositions eligible unbound history without closing its 
 		await client?.close();
 		await server.stop();
 	}
+});
+
+test("disposition clears the held unbound lane's stale identity gate", async () => {
+	const f = await fixture();
+	const projector = new RuntimeCycleProjector(f.database, { queueDepth: 0 });
+	expect(projector.project().gates).not.toContain("stale_session_identity");
+	f.putHistory({ state: "awaiting_operator" });
+	expect(projector.project().gates).toContain("stale_session_identity");
+	expect(await f.governor.retire("a", "operator")).toMatchObject({ retired: true, disposition: "aborted" });
+	expect(projector.project().gates).not.toContain("stale_session_identity");
 });
 
 for (const schemaVersion of [2, 3]) {
