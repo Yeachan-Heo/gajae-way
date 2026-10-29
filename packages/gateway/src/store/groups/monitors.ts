@@ -280,6 +280,42 @@ export class MonitorsGroup {
 		}>;
 	}
 
+	row(monitorId: string): Array<{
+		monitor_id: string;
+		name: string;
+		trigger_json: string;
+		event_types_json: string;
+		burst_policy: string;
+		overlap: string;
+		channel_target_json: string | null;
+		enabled: number;
+		created_at: string;
+		instruction: string | null;
+		model_json: string | null;
+		service_tier: string | null;
+		procedure_files_json: string | null;
+	}>[number] | undefined {
+		return this.#db
+			.prepare(
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors WHERE monitor_id = ?",
+			)
+			.get(monitorId) as Array<{
+			monitor_id: string;
+			name: string;
+			trigger_json: string;
+			event_types_json: string;
+			burst_policy: string;
+			overlap: string;
+			channel_target_json: string | null;
+			enabled: number;
+			created_at: string;
+			instruction: string | null;
+			model_json: string | null;
+			service_tier: string | null;
+			procedure_files_json: string | null;
+		}>[number] | undefined;
+	}
+
 	update(
 		tx: WriteTx,
 		row: {

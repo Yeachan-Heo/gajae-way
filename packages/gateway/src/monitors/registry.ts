@@ -85,7 +85,7 @@ export class MonitorRegistry {
 		return record;
 	}
 	list(): MonitorRecord[] {
-		return this.#scan().records;
+		return this.#scan({ validateCron: false }).records;
 	}
 	/**
 	 * Stored monitors that do not run: rows that no longer load (they are left out of `list()`
@@ -93,9 +93,10 @@ export class MonitorRegistry {
 	 * validation (still in `list()`, repairable with `update --schedule`).
 	 */
 	invalid(): MonitorInvalidRecord[] {
-		return this.#scan().invalid;
+		return this.#scan({ validateCron: true }).invalid;
 	}
-	#scan(): { records: MonitorRecord[]; invalid: MonitorInvalidRecord[] } {
+	#scan(options?: { validateCron?: boolean }): { records: MonitorRecord[]; invalid: MonitorInvalidRecord[] } {
+		const validateCron = options?.validateCron ?? false;
 		const records: MonitorRecord[] = [];
 		const invalid: MonitorInvalidRecord[] = [];
 		for (const row of this.#database.monitors.rows()) {
@@ -107,7 +108,7 @@ export class MonitorRegistry {
 				continue;
 			}
 			records.push(record);
-			if (record.trigger.kind === "cron") {
+			if (validateCron && record.trigger.kind === "cron") {
 				try {
 					validateCronSchedule(record.trigger.schedule, record.trigger.timezone);
 				} catch (error) {
@@ -118,7 +119,13 @@ export class MonitorRegistry {
 		return { records, invalid };
 	}
 	get(monitorId: string): MonitorRecord | undefined {
-		return this.list().find((monitor) => monitor.monitorId === monitorId);
+		const row = this.#database.monitors.row(monitorId);
+		if (!row) return undefined;
+		try {
+			return rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id)));
+		} catch {
+			return undefined;
+		}
 	}
 	update(params: MonitorUpdateParams): MonitorRecord | undefined {
 		if (!params || typeof params !== "object" || typeof params.monitorId !== "string" || !params.monitorId)

@@ -500,3 +500,35 @@ test("restarts never overlap, coalesce while queued, and a refresh during a rest
 
 	expect(events).toEqual(["list:1", "done:first", "list:2", "done:second"]);
 });
+
+test("get() and list() skip cron validation; invalid() still validates for discovery", async () => {
+	const { database, registry } = await open();
+	// Store an invalid schedule directly (bypassing write-time validation).
+	storeUnchecked(database, "invalid-cron", SIX_FIELDS);
+	// Create a valid monitor.
+	const valid = registry.add({
+		name: "valid",
+		trigger: { kind: "cron", schedule: "0 12 * * *" },
+		eventTypes: ["tick"],
+	});
+	// Call get() on the invalid monitor.
+	const got = registry.get("invalid-cron");
+	// get() should return the monitor without throwing, even though the schedule is invalid.
+	expect(got).toBeDefined();
+	expect(got?.trigger).toMatchObject({ kind: "cron", schedule: SIX_FIELDS });
+	// list() should return the monitor with the invalid schedule (loadable cron monitors are included).
+	const listed = registry.list();
+	expect(listed.map((m) => m.monitorId)).toContain("invalid-cron");
+	// invalid() should report the monitor as invalid with a reason.
+	const invalid = registry.invalid();
+	const invalidRecords = invalid.filter((m) => m.monitorId === "invalid-cron");
+	expect(invalidRecords.length).toBe(1);
+	expect(invalidRecords[0]).toMatchObject({
+		monitorId: "invalid-cron",
+		loadable: true,
+		reason: expect.stringContaining("five fields"),
+	});
+	// Verify that the valid monitor is not in the invalid list.
+	const validInvalid = invalid.filter((m) => m.monitorId === valid.monitorId);
+	expect(validInvalid.length).toBe(0);
+});
