@@ -5036,6 +5036,45 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	expect(f.notices).toHaveLength(0);
 });
 
+test("unbound parent disposition preserves a running rootless child's later report", async () => {
+	const f = await fixture({ allowNested: () => true });
+	const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+	f.port.bind = async (input) => {
+		const sessionId = crypto.randomUUID();
+		const binding = await createOwnedSessionFixture(f.db, authority, {
+			sessionId,
+			originKey: input.originKey,
+			epoch: input.epoch,
+			repo: input.repo,
+		});
+		f.port.setSessionState(sessionId, { live: true, repo: input.repo });
+		return binding;
+	};
+	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+	if (!parent.started) throw new Error("parent did not start");
+	const child = await f.manager.start({
+		name: "child",
+		text: "child work",
+		cwd: f.directory,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child did not start");
+	f.port.complete(parent.opRef, "parent result");
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
+	expect(f.job("parent").state).toBe("attempt_ended");
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey("parent")));
+	f.port.setSessionState(parent.sessionId, { live: false, repo: f.directory });
+	expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+	expect(await f.lanes.retire("parent", "operator")).toMatchObject({
+		retired: false,
+		reason: "historical job has outstanding child work",
+	});
+	f.port.complete(child.opRef, "child result");
+	await until(() => f.db.work.workAttemptGet(child.opRef)?.settledAt !== null);
+	expect(f.db.work.workAttemptGet(child.opRef)?.decision).toBe("reported");
+	expect(f.db.work.laneReportsByParent("parent")).toMatchObject([{ body: "[lane child] completed: child result" }]);
+});
+
 test("child reports fall back when a nested parent is parked or done", async () => {
 	for (const parentState of ["awaiting_checks", "done"] as const) {
 		const checks = scriptedChecks({ prNumber: 510, status: "pending", failingChecks: [] });

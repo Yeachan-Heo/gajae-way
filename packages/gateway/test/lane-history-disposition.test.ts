@@ -238,6 +238,136 @@ test("disposition clears the held unbound lane's stale identity gate", async () 
 	expect(projector.project().gates).not.toContain("stale_session_identity");
 });
 
+function nestedChild(f: Awaited<ReturnType<typeof fixture>>) {
+	const identity = laneJobIdentity("child");
+	const opRef = "gw-history-child";
+	const sessionId = "2cb14dc2-ead9-49e1-bea5-a5a0d1b0fe8a";
+	const record = appendAttempt(
+		createLaneJobRecord({
+			jobId: identity.jobId,
+			branch: "work/child",
+			worktreePath: f.directory,
+			sessionId,
+			now: () => new Date(START),
+		}),
+		{ opRef, sessionId, startedAt: START },
+	);
+	const runtime: WorkAttemptRuntime = {
+		...f.runtime,
+		opRef,
+		jobId: identity.jobId,
+		laneKey: identity.laneKey,
+		sessionKey: workSessionKey("child"),
+		sessionId,
+		mode: "start",
+		parent: { kind: "lane", name: "a", root: null },
+		reportId: workAttemptReportId(f.database.instanceId, identity.jobId, opRef),
+		deliveryId: workAttemptDeliveryId(f.database.instanceId, identity.jobId, opRef),
+	};
+	return { identity, opRef, record, runtime };
+}
+
+test("disposition refuses while a nested child can still report to the parent", async () => {
+	const f = await fixture();
+	const { opRef, record, runtime } = nestedChild(f);
+	f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record));
+	expect(f.database.work.laneReportsByParent("a")).toEqual([]);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	const closed = closeAttempt({ record, opRef, endState: "completed", endedAt: END });
+	const result = f.database.transaction((tx) =>
+		f.database.work.workAttemptSettle(
+			tx,
+			opRef,
+			0,
+			closed,
+			{
+				terminal: {
+					kind: "broker",
+					observedAt: END,
+					reasonCode: "end_turn",
+					status: { status: "terminal_ok", clientRef: opRef, receiptState: "present", outcome: { reason: "end_turn" } },
+				},
+				output: { ...runtime.output, disposition: "unavailable" },
+				decision: "report",
+				settledAt: END,
+			},
+			{
+				kind: "lane",
+				report: {
+					reportId: runtime.reportId,
+					parentName: "a",
+					childName: "child",
+					childOpRef: opRef,
+					body: "child result",
+					root: null,
+				},
+				fallbackPayload: null,
+			},
+			{ laneParentAvailable: f.database.work.laneParentAvailable("a") },
+		),
+	);
+	expect(result?.runtime.decision).toBe("reported");
+	expect(f.database.work.laneReportsByParent("a")).toMatchObject([{ state: "pending", body: "child result" }]);
+});
+
+test("nested child preparation refuses an already disposed parent without writing history", async () => {
+	const f = await fixture();
+	const { identity, opRef, record, runtime } = nestedChild(f);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(true);
+	expect(() => f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record))).toThrow();
+	expect(f.database.work.workAttemptGet(opRef)).toBeUndefined();
+	expect(f.database.work.laneJobJson(identity.jobId)).toBeUndefined();
+});
+
+test("quarantined nested children remain a disposition fence", async () => {
+	const f = await fixture();
+	const { identity, record, runtime } = nestedChild(f);
+	f.database.transaction((tx) => {
+		f.database.work.workAttemptPrepare(tx, runtime, record);
+		f.database.bindings.quarantineInvalidWork(tx, identity.jobId);
+	});
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.history().state).toBe("attempt_ended");
+});
+
+test("unreadable open child evidence refuses historical disposition", async () => {
+	const f = await fixture();
+	const { opRef, record, runtime } = nestedChild(f);
+	f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record));
+	f.raw.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?").run("not-json", opRef);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.history().state).toBe("attempt_ended");
+});
+
+test("disposition refuses a nested child's pending checks report", async () => {
+	const f = await fixture();
+	const { identity, opRef, record, runtime } = nestedChild(f);
+	f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record));
+	const closed = closeAttempt({ record, opRef, endState: "completed", endedAt: END });
+	f.database.transaction((tx) => {
+		f.database.work.workAttemptSettle(tx, opRef, 0, closed, {
+			terminal: {
+				kind: "broker",
+				observedAt: END,
+				reasonCode: "end_turn",
+				status: { status: "terminal_ok", clientRef: opRef, receiptState: "present", outcome: { reason: "end_turn" } },
+			},
+			output: { ...runtime.output, disposition: "unavailable" },
+			decision: "no_target",
+			settledAt: END,
+		});
+		const checking = {
+			...closed,
+			state: "awaiting_checks" as const,
+			awaitingChecks: { prNumber: null, headSha: "a".repeat(40), since: END, retries: 0 },
+		};
+		f.database.work.putLaneJob(tx, { ...checking, laneKey: identity.laneKey, json: JSON.stringify(checking) });
+	});
+	expect(f.database.work.laneReportsByParent("a")).toEqual([]);
+	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+	expect(f.history().state).toBe("attempt_ended");
+});
+
 for (const schemaVersion of [2, 3]) {
 	test(`disposition preserves the original validated history payload (schema ${schemaVersion})`, async () => {
 		const f = await fixture();
@@ -593,6 +723,29 @@ class ProbePort extends ScriptedSessionPort {
 		this.onProbe?.();
 		return result;
 	}
+}
+
+for (const rooted of [false, true]) {
+	test(`disposition rechecks a ${rooted ? "rooted" : "rootless"} child admitted during the death probe`, async () => {
+		const port = new ProbePort();
+		const f = await fixture(port);
+		const { opRef, record, runtime } = nestedChild(f);
+		const parent = rooted
+			? {
+					kind: "lane" as const,
+					name: "a",
+					root: {
+						originKey: "discord/channel/fixture",
+						origin: { platform: "discord" as const, kind: "channel" as const, conversationId: "fixture" },
+					},
+				}
+			: runtime.parent;
+		port.onProbe = () =>
+			f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, { ...runtime, parent }, record));
+		expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+		expect(f.history().state).toBe("attempt_ended");
+		expect(f.database.work.workAttemptGet(opRef)?.settledAt).toBeNull();
+	});
 }
 
 function insertChecksReport(f: Fixture, state: "pending" | "claimed" | "held" | "undeliverable") {
