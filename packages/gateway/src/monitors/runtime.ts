@@ -37,61 +37,70 @@ export class MonitorRuntime {
 		const monitors = this.#registry.list().filter((monitor) => monitor.enabled);
 		const webhooks = monitors.filter((monitor) => monitor.trigger.kind === "webhook");
 		if (webhooks.length) await this.#startWebhook(webhooks);
+		// One stored monitor that cannot start (a schedule saved before write validation, a trigger the
+		// gateway config cannot serve) is skipped and logged; it never takes the gateway down with it.
 		for (const monitor of monitors) {
-			const eventType = monitor.eventTypes[0];
-			if (eventType === undefined) throw new MonitorRuntimeError("monitor must declare at least one event type");
-			if (monitor.trigger.kind === "cron")
-				this.#stops.push(
-					startCron(
-						monitor.trigger.schedule,
-						{
-							// The cursor cannot precede monitor creation, even if skip state or
-							// an old slot-ledger row somehow does.
-							cursor: () => {
-								const created = Date.parse(monitor.createdAt);
-								const stored = this.#registry.cronCursor(monitor.monitorId);
-								return new Date(stored === undefined ? created : Math.max(created, Date.parse(stored)));
-							},
-							// submitSlot returns an id for both admitted and overlap-skipped
-							// outcomes; only an already-claimed slot returns null.
-							fire: (slotAt) =>
-								this.#propagator.submitSlot(monitor.monitorId, eventType, { at: slotAt.toISOString() }, slotAt) !==
-								null,
-							skipped: (skip) => {
-								const oldest = skip.oldest.toISOString();
-								const newest = skip.newest.toISOString();
-								this.#registry.recordCronSkip(
-									monitor.monitorId,
-									{ count: skip.count, oldest, newest },
-									(this.#clock?.() ?? new Date()).toISOString(),
-								);
-								console.error(
-									`monitor_slots_skipped monitor=${monitor.monitorId} count=${skip.count} oldest=${oldest} newest=${newest}`,
-								);
-							},
+			try {
+				await this.#startOne(monitor);
+			} catch (error) {
+				const reason = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+				console.error(`monitor_invalid id=${monitor.monitorId} kind=${monitor.trigger.kind} reason=${reason}`);
+			}
+		}
+	}
+	async #startOne(monitor: ReturnType<MonitorRegistry["list"]>[number]): Promise<void> {
+		const eventType = monitor.eventTypes[0];
+		if (eventType === undefined) throw new MonitorRuntimeError("monitor must declare at least one event type");
+		if (monitor.trigger.kind === "cron")
+			this.#stops.push(
+				startCron(
+					monitor.trigger.schedule,
+					{
+						// The cursor cannot precede monitor creation, even if skip state or
+						// an old slot-ledger row somehow does.
+						cursor: () => {
+							const created = Date.parse(monitor.createdAt);
+							const stored = this.#registry.cronCursor(monitor.monitorId);
+							return new Date(stored === undefined ? created : Math.max(created, Date.parse(stored)));
 						},
-						{ now: this.#clock, policy: this.#catchUp, timezone: monitor.trigger.timezone },
-					),
-				);
-			if (monitor.trigger.kind === "watcher") {
-				if (!this.#config.watcherRoots?.length) throw new MonitorRuntimeError("watcherRoots must be configured");
-				this.#stops.push(
-					await startWatcher(
-						monitor.trigger.root,
-						this.#config.watcherRoots,
-						(path) => this.#propagator.submit(monitor.monitorId, eventType, { path }),
-						monitor.trigger.debounceMs,
-					),
-				);
-			}
-			if (monitor.trigger.kind === "script") {
-				if (!this.#config.scriptRoot) throw new MonitorRuntimeError("scriptRoot must be configured");
-				this.#stops.push(
-					await startScript(monitor.trigger.command, monitor.trigger.intervalMs, this.#config.scriptRoot, (stdout) =>
-						this.#propagator.submit(monitor.monitorId, eventType, { stdout }),
-					),
-				);
-			}
+						// submitSlot returns an id for both admitted and overlap-skipped
+						// outcomes; only an already-claimed slot returns null.
+						fire: (slotAt) =>
+							this.#propagator.submitSlot(monitor.monitorId, eventType, { at: slotAt.toISOString() }, slotAt) !== null,
+						skipped: (skip) => {
+							const oldest = skip.oldest.toISOString();
+							const newest = skip.newest.toISOString();
+							this.#registry.recordCronSkip(
+								monitor.monitorId,
+								{ count: skip.count, oldest, newest },
+								(this.#clock?.() ?? new Date()).toISOString(),
+							);
+							console.error(
+								`monitor_slots_skipped monitor=${monitor.monitorId} count=${skip.count} oldest=${oldest} newest=${newest}`,
+							);
+						},
+					},
+					{ now: this.#clock, policy: this.#catchUp, timezone: monitor.trigger.timezone },
+				),
+			);
+		if (monitor.trigger.kind === "watcher") {
+			if (!this.#config.watcherRoots?.length) throw new MonitorRuntimeError("watcherRoots must be configured");
+			this.#stops.push(
+				await startWatcher(
+					monitor.trigger.root,
+					this.#config.watcherRoots,
+					(path) => this.#propagator.submit(monitor.monitorId, eventType, { path }),
+					monitor.trigger.debounceMs,
+				),
+			);
+		}
+		if (monitor.trigger.kind === "script") {
+			if (!this.#config.scriptRoot) throw new MonitorRuntimeError("scriptRoot must be configured");
+			this.#stops.push(
+				await startScript(monitor.trigger.command, monitor.trigger.intervalMs, this.#config.scriptRoot, (stdout) =>
+					this.#propagator.submit(monitor.monitorId, eventType, { stdout }),
+				),
+			);
 		}
 	}
 	async refresh(): Promise<void> {

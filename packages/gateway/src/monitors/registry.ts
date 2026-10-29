@@ -12,6 +12,7 @@ import {
 import type { Store } from "../store";
 import type { MonitorCronState } from "../store/groups/monitors";
 import { validateProcedureFiles } from "./procedure";
+import { validateCronSchedule } from "./triggers/cron";
 
 const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
 const monitorReportToMetaKey = (monitorId: string) => `monitor_report_to:${monitorId}`;
@@ -42,6 +43,7 @@ export class MonitorRegistry {
 	}
 	add(spec: MonitorSpec): MonitorRecord {
 		validateSpec(spec);
+		if (spec.trigger.kind === "cron") validateCronSchedule(spec.trigger.schedule, spec.trigger.timezone);
 		const trigger: TriggerSpec =
 			spec.trigger.kind === "webhook"
 				? { ...spec.trigger, route: crypto.randomUUID() }
@@ -137,6 +139,10 @@ export class MonitorRegistry {
 			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
+			// A changed schedule is checked like a new one; an unchanged stored one is left as it is
+			// (so an operator can still disable or rename a monitor saved before this check).
+			if (updated.trigger.kind === "cron" && (schedule !== undefined || patch.trigger !== undefined))
+				validateCronSchedule(updated.trigger.schedule, updated.trigger.timezone);
 			const persisted = this.#database.monitors.update(tx, {
 				id: current.monitorId,
 				name: updated.name,
