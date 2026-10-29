@@ -1448,6 +1448,7 @@ describe("work operator commands", () => {
 			});
 			expect(output.requests).toEqual([{ verb: "work.retire", params: { name: "fix" } }]);
 			expect(output.lines).toEqual([`retired: work/task/fix session=session-1 closed=${closed}`]);
+			expect(output.exitCode ?? 0).toBe(0);
 			expect(output.closed).toBe(true);
 		});
 	}
@@ -1462,6 +1463,7 @@ describe("work operator commands", () => {
 		});
 		expect(output.requests).toEqual([{ verb: "work.retire", params: { name: "fix" } }]);
 		expect(output.lines).toEqual(["disposed: work/task/fix state=aborted (history and worktree preserved)"]);
+		expect(output.exitCode ?? 0).toBe(0);
 		expect(output.closed).toBe(true);
 	});
 

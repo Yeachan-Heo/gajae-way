@@ -1106,6 +1106,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 											: `retired: ${result.sessionKey} session=${result.sessionId} closed=${result.closed}${forced}`
 										: `not retired: ${result.reason}`,
 								);
+								if (!result.retired) process.exitCode = 1;
 							}
 						} else {
 							const result = await client.request<WorkJobsResult>("work.jobs", jobsPage);
