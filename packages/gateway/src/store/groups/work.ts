@@ -696,14 +696,6 @@ export class WorkGroup {
 	workAttemptPrepare(tx: WriteTx, runtime: WorkAttemptRuntime, record: LaneJobRecord, bindingMatches = true): void {
 		this.#assertNotQuarantined(runtime.jobId);
 		validateWorkRuntime(runtime, this.instanceId);
-		if (runtime.mode === "start" && runtime.parent?.kind === "lane") {
-			const parentId = laneJobDatabaseId(runtime.parent.name);
-			this.#assertNotQuarantined(parentId);
-			const parentJson = this.laneJobJson(parentId);
-			workAssert(parentJson !== undefined && this.laneJobJsonByLaneKey(`work-${runtime.parent.name}`) === parentJson);
-			const parent = parseLaneJobRecord(parentJson);
-			workAssert(parent.jobId === parentId && parent.state !== "aborted", "nested parent is not aborted");
-		}
 		workAssert(runtime.version === 0 && runtime.decision === "undecided" && runtime.terminal === null);
 		workAssert(runtime.output.reads === 0 && runtime.output.disposition === "pending");
 		workAssert(
@@ -1351,29 +1343,6 @@ export class WorkGroup {
 				)
 				.get(name, name) !== null
 		);
-	}
-
-	/** Open children and pending checks can create reports after the current snapshot. */
-	laneHasOutstandingChild(name: string): boolean {
-		const open = this.#db.prepare("SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL").all() as Array<{
-			op_ref: string;
-		}>;
-		for (const row of open) {
-			const runtime = this.workAttemptGet(row.op_ref);
-			workAssert(runtime !== undefined);
-			if (runtime.parent?.kind === "lane" && runtime.parent.name === name) return true;
-		}
-		for (const row of this.laneJobHistoryRows()) {
-			const job = parseLaneJobRecord(row.record_json);
-			workAssert(job.jobId === row.job_id && job.state === row.state);
-			if (job.awaitingChecks === undefined) continue;
-			const latest = job.attempts.at(-1);
-			workAssert(latest !== undefined);
-			const runtime = this.workAttemptGet(latest.opRef);
-			workAssert(runtime !== undefined && runtime.jobId === job.jobId);
-			if (runtime.parent?.kind === "lane" && runtime.parent.name === name) return true;
-		}
-		return false;
 	}
 
 	laneReportCounts(parentName: string): { pending: number; claimed: number; held: number; undeliverable: number } {

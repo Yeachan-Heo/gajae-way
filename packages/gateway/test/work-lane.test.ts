@@ -5036,44 +5036,102 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	expect(f.notices).toHaveLength(0);
 });
 
-test("unbound parent disposition preserves a running rootless child's later report", async () => {
-	const f = await fixture({ allowNested: () => true });
-	const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
-	f.port.bind = async (input) => {
-		const sessionId = crypto.randomUUID();
-		const binding = await createOwnedSessionFixture(f.db, authority, {
-			sessionId,
-			originKey: input.originKey,
-			epoch: input.epoch,
-			repo: input.repo,
+for (const rooted of [false, true]) {
+	for (const disposeBefore of [false, true]) {
+		test(`nested ${rooted ? "rooted" : "rootless"} report routes identically ${disposeBefore ? "after" : "before"} held-parent disposition`, async () => {
+			const f = await fixture({ allowNested: () => true });
+			const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+			f.port.bind = async (input) => {
+				const sessionId = crypto.randomUUID();
+				const binding = await createOwnedSessionFixture(f.db, authority, {
+					sessionId,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+				});
+				f.port.setSessionState(sessionId, { live: true, repo: input.repo });
+				return binding;
+			};
+			if (rooted) f.setOwnerTarget(origin);
+			const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+			if (!parent.started) throw new Error("parent did not start");
+			const child = await f.manager.start({
+				name: "child",
+				text: "child work",
+				cwd: f.directory,
+				callerSessionId: parent.sessionId,
+			});
+			if (!child.started) throw new Error("child did not start");
+			f.port.complete(parent.opRef, "parent result");
+			await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
+			const held = { ...f.job("parent"), state: "awaiting_operator" as const };
+			f.db.transaction((tx) => {
+				f.db.work.putLaneJob(tx, { ...held, laneKey: laneJobIdentity("parent").laneKey, json: JSON.stringify(held) });
+				f.db.bindings.rotateEpoch(tx, workSessionKey("parent"));
+			});
+			f.port.setSessionState(parent.sessionId, { live: false, repo: f.directory });
+			if (disposeBefore)
+				expect(await f.lanes.retire("parent", "operator")).toMatchObject({ retired: true, disposition: "aborted" });
+			f.port.complete(child.opRef, "child result");
+			await until(() => f.db.work.workAttemptGet(child.opRef)?.settledAt !== null);
+			expect(f.db.work.workAttemptGet(child.opRef)?.decision).toBe(rooted ? "fallback" : "no_target");
+			expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
+			if (!disposeBefore)
+				expect(await f.lanes.retire("parent", "operator")).toMatchObject({ retired: true, disposition: "aborted" });
 		});
-		f.port.setSessionState(sessionId, { live: true, repo: input.repo });
-		return binding;
-	};
-	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
-	if (!parent.started) throw new Error("parent did not start");
-	const child = await f.manager.start({
-		name: "child",
-		text: "child work",
-		cwd: f.directory,
-		callerSessionId: parent.sessionId,
+	}
+}
+
+for (const rooted of [false, true]) {
+	test(`a ${rooted ? "rooted" : "rootless"} descendant wakes its intermediate parent after held ancestor disposition`, async () => {
+		const f = await fixture({ allowNested: () => true });
+		const authority = initializeTestBrokerAuthority(f.db, join(f.directory, "agent"));
+		f.port.bind = async (input) => {
+			const sessionId = crypto.randomUUID();
+			const binding = await createOwnedSessionFixture(f.db, authority, {
+				sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+			});
+			f.port.setSessionState(sessionId, { live: true, repo: input.repo });
+			return binding;
+		};
+		if (rooted) f.setOwnerTarget(origin);
+		const ancestor = await f.manager.start({ name: "ancestor", text: "ancestor work", cwd: f.directory });
+		if (!ancestor.started) throw new Error("ancestor did not start");
+		const parent = await f.manager.start({
+			name: "parent",
+			text: "parent work",
+			cwd: f.directory,
+			callerSessionId: ancestor.sessionId,
+		});
+		if (!parent.started) throw new Error("parent did not start");
+		f.port.complete(ancestor.opRef, "ancestor result");
+		await until(() => f.db.work.workAttemptGet(ancestor.opRef)?.settledAt !== null);
+		const held = { ...f.job("ancestor"), state: "awaiting_operator" as const };
+		f.db.transaction((tx) => {
+			f.db.work.putLaneJob(tx, { ...held, laneKey: laneJobIdentity("ancestor").laneKey, json: JSON.stringify(held) });
+			f.db.bindings.rotateEpoch(tx, workSessionKey("ancestor"));
+		});
+		f.port.setSessionState(ancestor.sessionId, { live: false, repo: f.directory });
+		const child = await f.manager.start({
+			name: "child",
+			text: "child work",
+			cwd: f.directory,
+			callerSessionId: parent.sessionId,
+		});
+		if (!child.started) throw new Error("child did not start");
+		f.port.complete(parent.opRef, "parent result");
+		await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
+		expect(await f.lanes.retire("ancestor", "operator")).toMatchObject({ retired: true, disposition: "aborted" });
+		f.port.complete(child.opRef, "child result");
+		await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "consumed");
+		const wake = f.db.work.laneReportsByParent("parent")[0];
+		expect(wake?.consumed_op_ref).toBeString();
+		expect(f.db.work.workAttemptGet(wake!.consumed_op_ref!)?.parent).toMatchObject({ kind: "lane", name: "ancestor" });
 	});
-	if (!child.started) throw new Error("child did not start");
-	f.port.complete(parent.opRef, "parent result");
-	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt !== null);
-	expect(f.job("parent").state).toBe("attempt_ended");
-	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey("parent")));
-	f.port.setSessionState(parent.sessionId, { live: false, repo: f.directory });
-	expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
-	expect(await f.lanes.retire("parent", "operator")).toMatchObject({
-		retired: false,
-		reason: "historical job has outstanding child work",
-	});
-	f.port.complete(child.opRef, "child result");
-	await until(() => f.db.work.workAttemptGet(child.opRef)?.settledAt !== null);
-	expect(f.db.work.workAttemptGet(child.opRef)?.decision).toBe("reported");
-	expect(f.db.work.laneReportsByParent("parent")).toMatchObject([{ body: "[lane child] completed: child result" }]);
-});
+}
 
 test("child reports fall back when a nested parent is parked or done", async () => {
 	for (const parentState of ["awaiting_checks", "done"] as const) {

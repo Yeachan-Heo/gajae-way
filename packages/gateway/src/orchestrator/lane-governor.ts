@@ -381,13 +381,11 @@ export class LaneGovernor {
 			)
 				return refused("historical job identity mismatch");
 			if (
-				(job.state !== "attempt_ended" && job.state !== "awaiting_operator") ||
+				job.state !== "awaiting_operator" ||
 				job.awaitingChecks ||
 				job.stalledContinuations >= MAX_STALLED_CONTINUATIONS
 			)
-				return refused(
-					`historical job is ${job.state}; only unheld attempt_ended or awaiting_operator history can be disposed`,
-				);
+				return refused(`historical job is ${job.state}; only eligible awaiting_operator history can be disposed`);
 			if (!job.attempts.length || job.attempts.some((attempt) => !attempt.endedAt))
 				return refused("historical job has no settled attempt history");
 			const binding = this.#database.bindings.getSessionRecord(sessionKey);
@@ -414,8 +412,6 @@ export class LaneGovernor {
 				);
 			};
 			if (reportsUnresolved()) return refused("historical job has unresolved lane reports");
-			if (this.#database.work.laneHasOutstandingChild(name))
-				return refused("historical job has outstanding child work");
 			const sessions = new Set([...job.sessions, ...job.attempts.map((attempt) => attempt.sessionId)]);
 			for (const sessionId of sessions) {
 				const owned = this.#database.bindings.assertOwnedSession(sessionId, job.lane.worktreePath, authority);
@@ -482,7 +478,6 @@ export class LaneGovernor {
 						JSON.stringify(runtimes) ||
 					this.#database.work.workAttemptOpenByLane(laneKey) ||
 					reportsUnresolved() ||
-					this.#database.work.laneHasOutstandingChild(name) ||
 					[...runtimeSnapshots].some(
 						([opRef, snapshot]) => JSON.stringify(this.#database.work.workAttemptGet(opRef)) !== snapshot,
 					)

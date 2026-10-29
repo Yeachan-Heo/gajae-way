@@ -101,6 +101,8 @@ async function fixture(
 			decision: "no_target",
 			settledAt: END,
 		});
+		const held = { ...closed, state: "awaiting_operator" as const };
+		database.work.putLaneJob(tx, { ...held, laneKey: identity.laneKey, json: JSON.stringify(held) });
 		database.bindings.rotateEpoch(tx, sessionKey);
 	});
 	port.setSessionState(SESSION, { live: false, repo: directory });
@@ -162,7 +164,7 @@ test("operator retirement dispositions proven terminal unbound history without d
 	const binding = f.database.bindings.getSessionRecord(f.sessionKey);
 	const attempt = f.database.work.workAttemptGet(f.runtime.opRef);
 	expect(f.governor.activeLanes()).toEqual([]);
-	expect(before.state).toBe("attempt_ended");
+	expect(before.state).toBe("awaiting_operator");
 	expect(await f.governor.retire("a", "operator")).toMatchObject({
 		retired: true,
 		closed: false,
@@ -231,6 +233,7 @@ test("work.retire RPC dispositions eligible unbound history without closing its 
 test("disposition clears the held unbound lane's stale identity gate", async () => {
 	const f = await fixture();
 	const projector = new RuntimeCycleProjector(f.database, { queueDepth: 0 });
+	f.putHistory({ state: "attempt_ended" });
 	expect(projector.project().gates).not.toContain("stale_session_identity");
 	f.putHistory({ state: "awaiting_operator" });
 	expect(projector.project().gates).toContain("stale_session_identity");
@@ -238,134 +241,12 @@ test("disposition clears the held unbound lane's stale identity gate", async () 
 	expect(projector.project().gates).not.toContain("stale_session_identity");
 });
 
-function nestedChild(f: Awaited<ReturnType<typeof fixture>>) {
-	const identity = laneJobIdentity("child");
-	const opRef = "gw-history-child";
-	const sessionId = "2cb14dc2-ead9-49e1-bea5-a5a0d1b0fe8a";
-	const record = appendAttempt(
-		createLaneJobRecord({
-			jobId: identity.jobId,
-			branch: "work/child",
-			worktreePath: f.directory,
-			sessionId,
-			now: () => new Date(START),
-		}),
-		{ opRef, sessionId, startedAt: START },
-	);
-	const runtime: WorkAttemptRuntime = {
-		...f.runtime,
-		opRef,
-		jobId: identity.jobId,
-		laneKey: identity.laneKey,
-		sessionKey: workSessionKey("child"),
-		sessionId,
-		mode: "start",
-		parent: { kind: "lane", name: "a", root: null },
-		reportId: workAttemptReportId(f.database.instanceId, identity.jobId, opRef),
-		deliveryId: workAttemptDeliveryId(f.database.instanceId, identity.jobId, opRef),
-	};
-	return { identity, opRef, record, runtime };
-}
-
-test("disposition refuses while a nested child can still report to the parent", async () => {
+test("settled unbound attempt history is retained without disposition", async () => {
 	const f = await fixture();
-	const { opRef, record, runtime } = nestedChild(f);
-	f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record));
-	expect(f.database.work.laneReportsByParent("a")).toEqual([]);
-	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-	const closed = closeAttempt({ record, opRef, endState: "completed", endedAt: END });
-	const result = f.database.transaction((tx) =>
-		f.database.work.workAttemptSettle(
-			tx,
-			opRef,
-			0,
-			closed,
-			{
-				terminal: {
-					kind: "broker",
-					observedAt: END,
-					reasonCode: "end_turn",
-					status: { status: "terminal_ok", clientRef: opRef, receiptState: "present", outcome: { reason: "end_turn" } },
-				},
-				output: { ...runtime.output, disposition: "unavailable" },
-				decision: "report",
-				settledAt: END,
-			},
-			{
-				kind: "lane",
-				report: {
-					reportId: runtime.reportId,
-					parentName: "a",
-					childName: "child",
-					childOpRef: opRef,
-					body: "child result",
-					root: null,
-				},
-				fallbackPayload: null,
-			},
-			{ laneParentAvailable: f.database.work.laneParentAvailable("a") },
-		),
-	);
-	expect(result?.runtime.decision).toBe("reported");
-	expect(f.database.work.laneReportsByParent("a")).toMatchObject([{ state: "pending", body: "child result" }]);
-});
-
-test("nested child preparation refuses an already disposed parent without writing history", async () => {
-	const f = await fixture();
-	const { identity, opRef, record, runtime } = nestedChild(f);
-	expect((await f.governor.retire("a", "operator")).retired).toBe(true);
-	expect(() => f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record))).toThrow();
-	expect(f.database.work.workAttemptGet(opRef)).toBeUndefined();
-	expect(f.database.work.laneJobJson(identity.jobId)).toBeUndefined();
-});
-
-test("quarantined nested children remain a disposition fence", async () => {
-	const f = await fixture();
-	const { identity, record, runtime } = nestedChild(f);
-	f.database.transaction((tx) => {
-		f.database.work.workAttemptPrepare(tx, runtime, record);
-		f.database.bindings.quarantineInvalidWork(tx, identity.jobId);
-	});
-	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-	expect(f.history().state).toBe("attempt_ended");
-});
-
-test("unreadable open child evidence refuses historical disposition", async () => {
-	const f = await fixture();
-	const { opRef, record, runtime } = nestedChild(f);
-	f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record));
-	f.raw.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?").run("not-json", opRef);
-	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-	expect(f.history().state).toBe("attempt_ended");
-});
-
-test("disposition refuses a nested child's pending checks report", async () => {
-	const f = await fixture();
-	const { identity, opRef, record, runtime } = nestedChild(f);
-	f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, runtime, record));
-	const closed = closeAttempt({ record, opRef, endState: "completed", endedAt: END });
-	f.database.transaction((tx) => {
-		f.database.work.workAttemptSettle(tx, opRef, 0, closed, {
-			terminal: {
-				kind: "broker",
-				observedAt: END,
-				reasonCode: "end_turn",
-				status: { status: "terminal_ok", clientRef: opRef, receiptState: "present", outcome: { reason: "end_turn" } },
-			},
-			output: { ...runtime.output, disposition: "unavailable" },
-			decision: "no_target",
-			settledAt: END,
-		});
-		const checking = {
-			...closed,
-			state: "awaiting_checks" as const,
-			awaitingChecks: { prNumber: null, headSha: "a".repeat(40), since: END, retries: 0 },
-		};
-		f.database.work.putLaneJob(tx, { ...checking, laneKey: identity.laneKey, json: JSON.stringify(checking) });
-	});
-	expect(f.database.work.laneReportsByParent("a")).toEqual([]);
-	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-	expect(f.history().state).toBe("attempt_ended");
+	f.putHistory({ state: "attempt_ended" });
+	const before = f.database.work.projectionRows();
+	expect(await f.governor.retire("a", "operator")).toMatchObject({ retired: false });
+	expect(f.database.work.projectionRows()).toEqual(before);
 });
 
 for (const schemaVersion of [2, 3]) {
@@ -429,7 +310,7 @@ const terminalHistories: Array<{
 	},
 ];
 
-for (const state of ["attempt_ended", "awaiting_operator"] as const) {
+for (const state of ["awaiting_operator"] as const) {
 	for (const { name, endState, reasonCode, status } of terminalHistories) {
 		test(`operator dispositions ${state} ${name} history without promoting its outcome`, async () => {
 			const f = await fixture();
@@ -701,7 +582,7 @@ for (const receiptState of ["missing", "unknown"] as const) {
 	}
 }
 
-for (const [state, name, change] of (["attempt_ended", "awaiting_operator"] as const).flatMap((state) =>
+for (const [state, name, change] of (["awaiting_operator"] as const).flatMap((state) =>
 	refusals.map(([name, change]) => [state, name, change] as const),
 )) {
 	test(`${state} disposition refuses ${name} without mutating history`, async () => {
@@ -723,29 +604,6 @@ class ProbePort extends ScriptedSessionPort {
 		this.onProbe?.();
 		return result;
 	}
-}
-
-for (const rooted of [false, true]) {
-	test(`disposition rechecks a ${rooted ? "rooted" : "rootless"} child admitted during the death probe`, async () => {
-		const port = new ProbePort();
-		const f = await fixture(port);
-		const { opRef, record, runtime } = nestedChild(f);
-		const parent = rooted
-			? {
-					kind: "lane" as const,
-					name: "a",
-					root: {
-						originKey: "discord/channel/fixture",
-						origin: { platform: "discord" as const, kind: "channel" as const, conversationId: "fixture" },
-					},
-				}
-			: runtime.parent;
-		port.onProbe = () =>
-			f.database.transaction((tx) => f.database.work.workAttemptPrepare(tx, { ...runtime, parent }, record));
-		expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-		expect(f.history().state).toBe("attempt_ended");
-		expect(f.database.work.workAttemptGet(opRef)?.settledAt).toBeNull();
-	});
 }
 
 function insertChecksReport(f: Fixture, state: "pending" | "claimed" | "held" | "undeliverable") {
@@ -772,7 +630,7 @@ function insertChecksReport(f: Fixture, state: "pending" | "claimed" | "held" | 
 	return reportId;
 }
 
-for (const historyState of ["attempt_ended", "awaiting_operator"] as const) {
+for (const historyState of ["awaiting_operator"] as const) {
 	for (const reportState of ["pending", "claimed", "held", "undeliverable"] as const) {
 		for (const duringProbe of [false, true]) {
 			test(`${historyState} refuses fresh ${reportState} outgoing checks report ${duringProbe ? "during" : "before"} death probe`, async () => {
@@ -880,7 +738,7 @@ for (const [name, change] of [
 		const f = await fixture(port);
 		port.onProbe = () => change(f);
 		expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-		expect(f.history().state).toBe("attempt_ended");
+		expect(f.history().state).toBe("awaiting_operator");
 		expect(f.port.closes).toEqual([]);
 	});
 }
@@ -893,7 +751,7 @@ test("unavailable death probe refuses disposition without assuming session death
 	}
 	const f = await fixture(new FailingProbePort());
 	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-	expect(f.history().state).toBe("attempt_ended");
+	expect(f.history().state).toBe("awaiting_operator");
 });
 
 for (const live of [false, true]) {
@@ -934,7 +792,7 @@ test("broker generation changing during death proof refuses disposition", async 
 		generation++;
 	};
 	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-	expect(f.history().state).toBe("attempt_ended");
+	expect(f.history().state).toBe("awaiting_operator");
 });
 
 for (const liveness of [
@@ -949,7 +807,7 @@ for (const liveness of [
 		}
 		const f = await fixture(new UncertainPort());
 		expect((await f.governor.retire("a", "operator")).retired).toBe(false);
-		expect(f.history().state).toBe("attempt_ended");
+		expect(f.history().state).toBe("awaiting_operator");
 	});
 }
 

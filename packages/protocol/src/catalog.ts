@@ -847,7 +847,7 @@ export interface WorkRetireParams {
  *    and an open attempt: settle the attempt as `operator_abandoned` and close the session. This abandonment
  *    path may fail if close() errors and the session remains live (binding is preserved).
  * `allDead` retires all dead lanes at once (implies force with path 1).
- * A non-force named retirement of unbound attempt_ended or awaiting_operator
+ * A non-force named retirement of unbound awaiting_operator
  * history can disposition it as aborted after ownership, correlated terminal
  * evidence and session-death checks. Missing/unknown receipts stay unproven;
  * disposition preserves attempts/worktrees, closes nothing and reserves the name.
