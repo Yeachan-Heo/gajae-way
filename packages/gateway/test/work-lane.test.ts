@@ -4844,9 +4844,10 @@ test("child reports fall back when a nested parent is parked or done", async () 
 			ownerTarget: () => origin,
 		});
 		f.setOwnerTarget(origin);
-		await laneRepo(f.directory, `fix/parent-${parentState}`, true);
+		await laneRepo(f.directory, `fix/parent-${parentState}`, false);
 		const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 		if (!parent.started) throw new Error("parent did not start");
+		pushLaneHead(f, `fix/parent-${parentState}`, "parent");
 		const child = await f.manager.start({
 			name: "child",
 			text: "child work",
@@ -4860,6 +4861,7 @@ test("child reports fall back when a nested parent is parked or done", async () 
 			checks.set({ prNumber: 510, status: "green", failingChecks: [] });
 			await pollUntil(f, () => f.job("parent").state === "done");
 		}
+		pushLaneHead(f, `fix/parent-${parentState}`, "child");
 		f.port.complete(child.opRef, "child result after parent parked");
 		await until(() => f.notices.some((notice) => notice.text.includes("child result after parent parked")));
 		expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
@@ -4877,9 +4879,10 @@ test("#481 check-settlement reports fall back when a nested parent was aborted",
 		ownerTarget: () => origin,
 	});
 	f.setOwnerTarget(origin);
-	await laneRepo(f.directory, "fix/parent-aborted", true);
+	await laneRepo(f.directory, "fix/parent-aborted", false);
 	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
 	if (!parent.started) throw new Error("parent did not start");
+	pushLaneHead(f, "fix/parent-aborted", "parent");
 	const child = await f.manager.start({
 		name: "child",
 		text: "child work",
@@ -4889,6 +4892,7 @@ test("#481 check-settlement reports fall back when a nested parent was aborted",
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(parent.opRef, "parent result");
 	await until(() => f.job("parent").state === "awaiting_checks");
+	pushLaneHead(f, "fix/parent-aborted", "child");
 	f.port.complete(child.opRef, "child result");
 	await until(() => f.job("child").state === "awaiting_checks");
 	const { awaitingChecks: _, ...parentWithoutChecks } = f.job("parent");
@@ -5690,6 +5694,7 @@ test("#481 repo-backed bare clones detect pushed branches without remote-trackin
 		);
 		expect(trackingRef.exitCode).not.toBe(0);
 
+		laneGit(job.lane.worktreePath, "commit", "-q", "--allow-empty", "-m", "lane work");
 		const push = Bun.spawnSync(["git", "-C", job.lane.worktreePath, "push", "-u", "origin", branch], {
 			stdout: "pipe",
 			stderr: "pipe",
@@ -5737,6 +5742,7 @@ test("#481 a local checkout lane pushes to its configured origin push URL", asyn
 		const branch = managedLaneBranchName(name);
 		expect(git(job.lane.worktreePath, "remote", "get-url", "origin")).toBe(fetchUrl);
 		expect(git(job.lane.worktreePath, "remote", "get-url", "--push", "origin")).toBe(bareRepo);
+		git(job.lane.worktreePath, "commit", "-q", "--allow-empty", "-m", "lane work");
 		git(job.lane.worktreePath, "push", "-u", "origin", branch);
 		git(bareRepo, "show-ref", "--verify", `refs/heads/${branch}`);
 		const accidentalLocalPush = Bun.spawnSync(["git", "-C", repoDir, "show-ref", "--verify", `refs/heads/${branch}`], {
@@ -5849,6 +5855,7 @@ test("#481 remote push probes are asynchronous and bounded", async () => {
 		const name = "slow-remote";
 		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
 		if (!result.started) throw new Error("work did not start");
+		laneGit(f.job(name).lane.worktreePath, "commit", "-q", "--allow-empty", "-m", "lane work");
 		const setPushUrl = Bun.spawnSync(
 			[
 				"git",
@@ -5895,8 +5902,12 @@ test("#481 remote push probes are asynchronous and bounded", async () => {
 test("#481 settled report of a pushed lane with a red PR names the PR and failing checks", async () => {
 	const { client } = recordingCheckClient({ prNumber: 484, status: "red", failingChecks: ["lint", "test"] });
 	const f = await fixture({ checkStatusClient: client, ownerTarget: () => origin });
-	await laneRepo(f.directory, "fix/red", true);
-	const text = await settledReport(f, "attempt_ended");
+	await laneRepo(f.directory, "fix/red", false);
+	const result = await started(f, "a", origin);
+	pushLaneHead(f, "fix/red");
+	f.port.complete(result.opRef, "done");
+	await until(() => f.notices.some((notice) => notice.text.includes("[lane a] attempt_ended")));
+	const text = f.notices.find((notice) => notice.text.includes("[lane a] attempt_ended"))?.text ?? "";
 	expect(text).toContain("pushed=true");
 	expect(text).toContain("pr=484");
 	expect(text).toContain("checks=red(lint,test)");
@@ -6301,10 +6312,34 @@ function scriptedChecks(initial: CheckStatusAnswer | null | undefined) {
 	};
 }
 
-/** Starts lane `a` on a pushed branch and completes its attempt into awaiting_checks. */
+function laneGit(cwd: string, ...args: string[]): string {
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+	};
+	const run = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+	if (run.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${run.stderr.toString()}`);
+	return run.stdout.toString().trim();
+}
+
+/** Commits past the lane's admission head and pushes it to `branch`; returns the new head. */
+function pushLaneHead(f: Awaited<ReturnType<typeof fixture>>, branch: string, name = "a"): string {
+	const worktreePath = f.job(name).lane.worktreePath;
+	laneGit(worktreePath, "commit", "-q", "--allow-empty", "-m", "lane work");
+	laneGit(worktreePath, "push", "-q", "-u", "origin", branch);
+	return laneGit(worktreePath, "rev-parse", "HEAD");
+}
+
+/** Starts a lane, makes and pushes its own commit, and enters awaiting_checks. */
 async function awaitingLane(f: Awaited<ReturnType<typeof fixture>>, branch: string, name = "a", cwd = f.directory) {
-	const head = await laneRepo(cwd, branch, true);
-	const result = await started(f, name, origin);
+	await laneRepo(cwd, branch, false);
+	if (cwd !== f.directory) f.setOwnerTarget(origin);
+	const result = await f.manager.start({ name, text: "work", cwd });
+	if (!result.started) throw new Error("unexpected hold");
+	const head = pushLaneHead(f, branch, name);
 	f.port.complete(result.opRef, "done");
 	await until(() => f.job(name).state === "awaiting_checks");
 	return { head, sessionId: result.sessionId };
@@ -6376,8 +6411,9 @@ test("#481 multiple awaiting lanes poll GitHub concurrently", async () => {
 test("#481 a temporary initial PR lookup failure stays durable until the PR is discovered", async () => {
 	const checks = scriptedChecks(undefined);
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
-	const head = await laneRepo(f.directory, "fix/pr-appears-later", true);
+	await laneRepo(f.directory, "fix/pr-appears-later", false);
 	const result = await started(f, "a", origin);
+	const head = pushLaneHead(f, "fix/pr-appears-later");
 	f.port.complete(result.opRef, "done");
 	await until(() => f.job().state === "awaiting_checks");
 	const since = f.job().awaitingChecks?.since;
@@ -6405,8 +6441,14 @@ test("#595 an initially unknown PR is found from the lane head and terminal-gree
 test("#595 an exact PR head settles checks when its ref is not the worktree's local branch", async () => {
 	const checks = scriptedChecks({ prNumber: 599, status: "pending", failingChecks: [], prState: "open" });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
-	const head = await laneRepo(f.directory, "review/fork-head", false);
+	const baseline = await laneRepo(f.directory, "review/fork-head", false);
+	laneGit(f.directory, "commit", "-q", "--allow-empty", "-m", "pr head");
+	const head = laneGit(f.directory, "rev-parse", "HEAD");
+	laneGit(f.directory, "push", "-q", "origin", "HEAD:refs/heads/review/pr-head");
+	laneGit(f.directory, "reset", "-q", "--hard", baseline);
 	const result = await started(f, "a", origin);
+	// The review checks out the existing PR head during the attempt and commits nothing.
+	laneGit(f.directory, "reset", "-q", "--hard", head);
 	f.port.complete(result.opRef, "review-only branch");
 	await until(() => f.job().state === "awaiting_checks");
 	expect(f.job().awaitingChecks).toMatchObject({ prNumber: 599, headSha: head });
@@ -6462,8 +6504,9 @@ test("#481 awaiting_checks rejects a new external attempt while checks are pendi
 test("#481 a lane whose PR is already red at settle starts the bounded repair cycle", async () => {
 	const checks = scriptedChecks({ prNumber: 486, status: "red", failingChecks: ["test"] });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
-	await laneRepo(f.directory, "fix/red-pr", true);
+	await laneRepo(f.directory, "fix/red-pr", false);
 	const result = await started(f, "a", origin);
+	pushLaneHead(f, "fix/red-pr");
 	f.port.complete(result.opRef, "done");
 	await until(() => f.job().state === "awaiting_checks");
 	await pollUntil(f, () => f.port.sends.length === 2);
@@ -6520,8 +6563,9 @@ test("#481 a detached checkout is not parked when no PR lookup can be attempted"
 test("#595 completed lane with already-green remote-head checks settles without parking", async () => {
 	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [], prState: "open" });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
-	const head = await laneRepo(f.directory, "fix/already-green", true);
+	await laneRepo(f.directory, "fix/already-green", false);
 	const result = await started(f, "a", origin);
+	const head = pushLaneHead(f, "fix/already-green");
 	f.port.complete(result.opRef, "reviewed PR");
 	await until(() => f.job().state === "done");
 	expect(f.job().state).toBe("done");
@@ -6564,8 +6608,9 @@ test("#595 green checks on a closed, unmerged PR leave the lane resumable", asyn
 		merged: false,
 	});
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
-	await laneRepo(f.directory, "fix/closed-unmerged-green", true);
+	await laneRepo(f.directory, "fix/closed-unmerged-green", false);
 	const result = await started(f, "a", origin);
+	pushLaneHead(f, "fix/closed-unmerged-green");
 	f.port.complete(result.opRef, "closed PR must not finalize lane");
 	await until(() => f.notices.some((notice) => notice.text.includes("[lane a] completed")));
 	expect(f.job().state).toBe("awaiting_checks");
@@ -6575,6 +6620,93 @@ test("#595 green checks on a closed, unmerged PR leave the lane resumable", asyn
 	expect(f.job().escalations.at(-1)).toContain("awaiting_checks ended: pr_closed pr=598");
 	const resumed = await f.manager.start({ name: "a", text: "resume closed-PR work", cwd: f.directory });
 	expect(resumed).toMatchObject({ started: true });
+});
+
+test("a lane at its admission head does not adopt the checkout's existing PR", async () => {
+	const checks = scriptedChecks({ prNumber: 999, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const existingHead = await laneRepo(f.directory, "fix/existing-pr", true);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(checks.calls).toEqual([{ headSha: existingHead, cwd: f.directory }]);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).not.toContain("pr=999");
+});
+
+test("a lane reset back to its admission head does not adopt the checkout's existing PR", async () => {
+	const checks = scriptedChecks(null);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const baseline = await laneRepo(f.directory, "fix/reset-to-baseline", true);
+	const first = await started(f, "a", origin);
+	laneGit(f.directory, "commit", "-q", "--allow-empty", "-m", "lane work");
+	f.port.complete(first.opRef, "first");
+	await until(() => f.notices.length === 1);
+	expect(f.job().checkpoints).toHaveLength(1);
+
+	checks.set({ prNumber: 998, status: "pending", failingChecks: [], headSha: baseline });
+	laneGit(f.directory, "reset", "-q", "--hard", baseline);
+	const second = await started(f, "a", origin);
+	f.port.complete(second.opRef, "second");
+	await until(() => f.notices.length === 2);
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(f.notices[1]?.text).toStartWith("[lane a] attempt_ended");
+	expect(f.notices[1]?.text).not.toContain("pr=998");
+});
+
+test("an unpushed lane commit does not adopt the PR of the checkout's remote head", async () => {
+	const checks = scriptedChecks(null);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const ambient = await laneRepo(f.directory, "fix/unpushed", true);
+	checks.set({ prNumber: 997, status: "pending", failingChecks: [], headSha: ambient });
+	const result = await started(f, "a", origin);
+	laneGit(f.directory, "commit", "-q", "--allow-empty", "-m", "local only");
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(checksNotice(f, "[lane a] attempt_ended")).not.toContain("pr=997");
+});
+
+test("a pushed lane head with a stale PR snapshot polls for its own PR instead of adopting the stale one", async () => {
+	const checks = scriptedChecks(null);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const stale = await laneRepo(f.directory, "fix/stale-pr", true);
+	checks.set({ prNumber: 996, status: "pending", failingChecks: [], headSha: stale });
+	const result = await started(f, "a", origin);
+	const head = pushLaneHead(f, "fix/stale-pr");
+	f.port.complete(result.opRef, "done");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(f.job().awaitingChecks).toMatchObject({ prNumber: null, headSha: head });
+	expect(checksNotice(f, "[lane a]")).not.toContain("pr=996");
+	for (const staleAnswer of [
+		{ status: "pending" as const, prState: "open" as const },
+		{ status: "green" as const, prState: "open" as const },
+		{ status: "green" as const, prState: "closed" as const, merged: true },
+		{ status: "red" as const, prState: "closed" as const, merged: false },
+	]) {
+		checks.set({ prNumber: 996, failingChecks: [], headSha: stale, ...staleAnswer });
+		const polls = checks.calls.length;
+		await pollUntil(f, () => checks.calls.length >= polls + 2);
+		expect(f.job().state).toBe("awaiting_checks");
+		expect(f.job().awaitingChecks).toMatchObject({ prNumber: null, headSha: head });
+	}
+	expect(f.notices.map((notice) => notice.text).join("\n")).not.toContain("pr=996");
+
+	checks.set({ prNumber: 995, headSha: head, status: "green", failingChecks: [], prState: "open" });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed:")).toContain("pr=995");
+});
+
+test("a lane that committed and pushed past its admission head enters awaiting_checks", async () => {
+	const checks = scriptedChecks({ prNumber: 1000, status: "pending", failingChecks: [] });
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	await laneRepo(f.directory, "fix/with-commits", true);
+	const result = await started(f, "a", origin);
+	const head = pushLaneHead(f, "fix/with-commits");
+	f.port.complete(result.opRef, "done");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(f.job().awaitingChecks).toMatchObject({ prNumber: 1000, headSha: head });
 });
 
 test("#481 awaiting_checks: green checks settle the lane done and report the pass", async () => {
@@ -6756,7 +6888,7 @@ test("ended checks retirement admits a distinct report to the bound persona inbo
 test("ended checks retirement routes a distinct conclusion through the nested lane parent", async () => {
 	const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
 	const f = await fixture({ allowNested: () => true, checkStatusClient: checks.client, ownerTarget: () => origin });
-	const head = await laneRepo(f.directory, "fix/retire-checks-nested", true);
+	await laneRepo(f.directory, "fix/retire-checks-nested", false);
 	const parent = await started(f, "parent", origin);
 	const child = await f.manager.start({
 		name: "child",
@@ -6765,6 +6897,7 @@ test("ended checks retirement routes a distinct conclusion through the nested la
 		callerSessionId: parent.sessionId,
 	});
 	if (!child.started) throw new Error("child did not start");
+	const head = pushLaneHead(f, "fix/retire-checks-nested", "child");
 	f.port.complete(child.opRef, "child result");
 	await until(
 		() =>
@@ -6818,13 +6951,14 @@ for (const mode of ["run", "no-target", "silent"] as const) {
 			const checks = scriptedChecks({ prNumber: 598, status: "pending", failingChecks: [] });
 			const nudges: string[] = [];
 			const f = await fixture({ checkStatusClient: checks.client, notifyPersona: (key) => nudges.push(key) });
-			await laneRepo(f.directory, `fix/checks-${conclusion}-${mode}`, true);
+			await laneRepo(f.directory, `fix/checks-${conclusion}-${mode}`, false);
 			if (mode !== "no-target") f.setOwnerTarget(origin);
 			let run: ReturnType<typeof f.manager.run> | undefined;
 			if (mode === "run") run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 			else await f.manager.start({ name: "a", text: "work", cwd: f.directory });
 			await until(() => f.port.sends.length === 1);
 			const { opRef, sessionId } = f.port.sends[0]!;
+			pushLaneHead(f, `fix/checks-${conclusion}-${mode}`);
 			f.port.complete(opRef, mode === "silent" ? "[SILENT]" : "done");
 			if (run) await run;
 			await until(() => f.job().state === "awaiting_checks");
@@ -7070,8 +7204,9 @@ test("#481 initial settlement discovers a merged PR whose source branch was alre
 	});
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 	const branch = "fix/deleted-before-settle";
-	const head = await laneRepo(f.directory, branch, true);
+	await laneRepo(f.directory, branch, false);
 	const result = await started(f, "a", origin);
+	const head = pushLaneHead(f, branch);
 	expect(Bun.spawnSync(["git", "-C", f.directory, "push", "-q", "origin", "--delete", branch]).exitCode).toBe(0);
 	f.port.complete(result.opRef, "merged deliverable");
 	await pollUntil(f, () => f.job().state === "done");

@@ -2007,6 +2007,16 @@ export class WorkLaneManager {
 					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
 				});
 			}
+			// A new checks cycle needs observed HEAD movement past admission (not proof of authorship),
+			// and only binds a PR whose head is that same commit.
+			const headSha = facts?.headSha;
+			const laneHead =
+				headSha !== undefined &&
+				(job.baselineSha !== undefined
+					? headSha !== job.baselineSha
+					: job.checkpoints.some((checkpoint) => checkpoint.sha === headSha));
+			const laneChecks = laneHead && facts?.checkStatus?.headSha === headSha ? facts.checkStatus : undefined;
+			const continuesChecksCycle = job.awaitingChecks !== undefined;
 			if (endState === "completed") {
 				const checks = facts?.checkStatus;
 				const previousCycle = job.awaitingChecks;
@@ -2017,19 +2027,21 @@ export class WorkLaneManager {
 						prNumber: previousCycle.prNumber ?? (facts?.pushed !== false ? (checks?.prNumber ?? null) : null),
 						headSha: facts?.pushed === true && facts.headSha !== undefined ? facts.headSha : previousCycle.headSha,
 					});
-				} else if (facts?.headSha && checks) {
+				} else if (laneChecks !== undefined && headSha !== undefined) {
 					job = transitionToAwaitingChecks({
 						record: job,
 						at,
-						prNumber: checks.prNumber,
-						headSha: facts.headSha,
+						prNumber: laneChecks.prNumber,
+						headSha,
 					});
 				} else if (
+					laneHead &&
 					facts?.headSha &&
 					facts.branch &&
 					facts.branch !== "HEAD" &&
 					facts.pushed !== false &&
-					checks === undefined &&
+					// No PR lookup yet, or one that still shows another head: poll for this head's PR.
+					(checks === undefined || (checks !== null && checks.headSha !== facts.headSha)) &&
 					this.#options.checkStatusClient
 				) {
 					job = transitionToAwaitingChecks({ record: job, at, prNumber: null, headSha: facts.headSha });
@@ -2045,7 +2057,13 @@ export class WorkLaneManager {
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
-			const text = reportText(name, endState, reason, runtime.opRef, output, facts, runtime.terminal?.status);
+			// Report a PR snapshot only for an existing cycle or for this lane's own head.
+			const reportFacts =
+				facts?.checkStatus && !continuesChecksCycle && laneChecks === undefined
+					? { ...facts, checkStatus: undefined }
+					: facts;
+
+			const text = reportText(name, endState, reason, runtime.opRef, output, reportFacts, runtime.terminal?.status);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -2191,7 +2209,7 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const facts = await collectRepoFacts(
+		const observedFacts = await collectRepoFacts(
 			observed.lane.worktreePath,
 			this.#gitTimeouts(),
 			client,
@@ -2199,6 +2217,11 @@ export class WorkLaneManager {
 			cycle.headSha,
 			cycle.prNumber ?? undefined,
 		);
+		// An unbound cycle waits for a PR at its own head; a snapshot of another head is not that PR.
+		const facts =
+			cycle.prNumber === null && observedFacts?.checkStatus && observedFacts.checkStatus.headSha !== cycle.headSha
+				? { ...observedFacts, checkStatus: null }
+				: observedFacts;
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
 			let job = this.#job(name);
