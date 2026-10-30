@@ -10,6 +10,7 @@
 - **gateway**: Escalate an unresolved hold on a retired epoch too, and bound status polling on escalated retired holds (#705, #715)
 - **gateway**: Make `work.start` admission visible and idempotent across a caller timeout (#707)
 - **gateway**: Settle `awaiting_checks` on `work.retire` so retired lanes cannot respawn (#716)
+- **gateway**: Start a new `awaiting_checks` cycle only after the lane's HEAD moves past its admission head, and bind a discovered PR only when its head is that commit, so a lane on a shared checkout no longer adopts the branch's existing PR
 - **work**: Preserve SDK failure causes independently of receipts (#696)
 - **monitors**: A failed event can no longer wedge an `overlap=skip` monitor; a running authoring turn is never aged out (#702)
 - **adapter-slack**: Recover a closed socket and detect deaf event delivery (#710)
