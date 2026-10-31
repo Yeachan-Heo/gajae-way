@@ -31,6 +31,9 @@ function sourceSql(node: ts.Node): string | undefined {
 function writeOwnerViolation(file: string, sql: string): SqlWrite | undefined {
 	const fileRelative = file.replaceAll("\\", "/");
 	if (fileRelative === "store/migrations.ts") return undefined;
+	// broker-agent/agent-db.ts owns auth_credentials in the separate agent.db store, not the gateway store.
+	// This exception allows the provisioning and re-provisioning flows to manage rotating OAuth credentials.
+	if (fileRelative === "broker-agent/agent-db.ts" && sql.includes("auth_credentials")) return undefined;
 	const classification = classifySql(sql);
 	if (classification?.kind !== "write") {
 		const writePrefix =
