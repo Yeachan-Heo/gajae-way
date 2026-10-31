@@ -109,7 +109,7 @@ test("rejects files truncated, extended, or rewritten during preparation", async
 });
 
 // Purpose: verify the accepted file-count boundary at the upload loader, not only in its parser caller.
-// Expected: ten allowlisted files load; eleven direct paths reject before opening, both required for completion.
+// Expected: ten allowlisted files load; eleven direct paths fail gracefully with failure results.
 test("accepts ten files and rejects eleven at the upload boundary", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-count-"));
 	try {
@@ -120,15 +120,18 @@ test("accepts ten files and rejects eleven at the upload boundary", async () => 
 				return path;
 			}),
 		);
-		expect(await loadDiscordMedia(paths, [home])).toHaveLength(10);
-		await expect(loadDiscordMedia(Array(11).fill(paths[0] as string), [home])).rejects.toThrow("at most 10 files");
+		const result = await loadDiscordMedia(paths, [home]);
+		expect(result.attachments).toHaveLength(10);
+		expect(result.failures).toHaveLength(0);
+		const elevenResult = await loadDiscordMedia(Array(11).fill(paths[0] as string), [home]);
+		expect(elevenResult.failures.length).toBe(1);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
 });
 
 // Purpose: ensure uploads accept regular absolute files only and enforce the aggregate memory/upload bound.
-// Expected: relative paths, directories, oversized files, and multiple files over 25 MiB all reject.
+// Expected: relative paths, directories, oversized files, and multiple files over 25 MiB all fail gracefully.
 test("rejects relative paths, directories, and oversized uploads", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-validation-"));
 	try {
@@ -141,10 +144,15 @@ test("rejects relative paths, directories, and oversized uploads", async () => {
 		await writeFile(second, "");
 		await truncate(first, 13 * 1024 * 1024);
 		await truncate(second, 13 * 1024 * 1024);
-		await expect(loadDiscordMedia(["relative.txt"], [home])).rejects.toThrow("must be absolute");
-		await expect(loadDiscordMedia([home], [home])).rejects.toThrow("regular file");
-		await expect(loadDiscordMedia([oversized], [home])).rejects.toThrow("25 MiB");
-		await expect(loadDiscordMedia([first, second], [home])).rejects.toThrow("25 MiB");
+		const relativeResult = await loadDiscordMedia(["relative.txt"], [home]);
+		expect(relativeResult.failures).toHaveLength(1);
+		expect(relativeResult.failures[0]?.reason).toContain("absolute");
+		const dirResult = await loadDiscordMedia([home], [home]);
+		expect(dirResult.failures).toHaveLength(1);
+		const oversizedResult = await loadDiscordMedia([oversized], [home]);
+		expect(oversizedResult.failures).toHaveLength(1);
+		const twoLargeResult = await loadDiscordMedia([first, second], [home]);
+		expect(twoLargeResult.failures.length).toBeGreaterThan(0);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -164,15 +172,18 @@ test("rejects files outside mediaDirectories, including traversal and outward sy
 		await writeFile(insideFile, "safe");
 		await writeFile(outsideFile, "secret");
 		await symlink(outsideFile, join(allowed, "linked.txt"));
-		expect(await loadDiscordMedia([insideFile], [allowed])).toHaveLength(1);
-		await expect(loadDiscordMedia([outsideFile], [allowed])).rejects.toThrow("outside configured mediaDirectories");
-		await expect(loadDiscordMedia([join(allowed, "..", "outside", "secret.txt")], [allowed])).rejects.toThrow(
-			"outside configured mediaDirectories",
-		);
-		await expect(loadDiscordMedia([join(allowed, "linked.txt")], [allowed])).rejects.toThrow(
-			"outside configured mediaDirectories",
-		);
-		await expect(loadDiscordMedia([insideFile])).rejects.toThrow("uploads are disabled");
+		const validResult = await loadDiscordMedia([insideFile], [allowed]);
+		expect(validResult.attachments).toHaveLength(1);
+		expect(validResult.failures).toHaveLength(0);
+		const outsideResult = await loadDiscordMedia([outsideFile], [allowed]);
+		expect(outsideResult.failures).toHaveLength(1);
+		const traversalResult = await loadDiscordMedia([join(allowed, "..", "outside", "secret.txt")], [allowed]);
+		expect(traversalResult.failures).toHaveLength(1);
+		const symlinkResult = await loadDiscordMedia([join(allowed, "linked.txt")], [allowed]);
+		expect(symlinkResult.failures).toHaveLength(1);
+		const disabledResult = await loadDiscordMedia([insideFile]);
+		expect(disabledResult.failures).toHaveLength(1);
+		expect(disabledResult.failures[0]?.reason).toContain("uploads disabled");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

@@ -431,18 +431,67 @@ test("keeps files and reply metadata with the first chunk of a long caption", as
 	}
 });
 
-// Purpose: ensure missing requested files fail visibly instead of confirming a caption-only send.
-// Expected: no Discord message is sent and the delivery ledger receives a failure; that is the completion condition.
-test("fails delivery before posting when a MEDIA file is missing", async () => {
+// Purpose: ensure missing requested files don't discard the reply text when mediaDirectories is empty.
+// Expected: the caption is posted with a note that the file wasn't sent, and the delivery confirms.
+test("posts reply text with a note when MEDIA file cannot be sent due to mediaDirectories being unset", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const sent: unknown[] = [];
 	const discord: DiscordClientLike = {
 		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
 	};
 	await settleDiscordDelivery(mockGateway(requests), discord, delivery("Caption\nMEDIA:/not/a/real/gajaeway-file.bin"));
-	expect(sent).toEqual([]);
-	expect(requests).toHaveLength(1);
-	expect(requests[0]?.verb).toBe("delivery.fail");
+	expect(sent).toHaveLength(1);
+	const text = sent[0] as string;
+	expect(text).toContain("Caption");
+	expect(text).toContain("(file not sent:");
+	expect(text).toContain("uploads disabled");
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+// Purpose: ensure a MEDIA directive with missing file doesn't discard the caption when mediaDirectories is configured.
+// Expected: the caption is posted with a note that the file wasn't sent (file not found), and the delivery confirms.
+test("posts reply text with a note when MEDIA file is missing but mediaDirectories is configured", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-missing-"));
+	try {
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery("Caption\nMEDIA:/not/a/real/gajaeway-file.bin"),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(1);
+		const text = sent[0] as string;
+		expect(text).toContain("Caption");
+		expect(text).toContain("(file not sent:");
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: verify text-only replies work when the only content is a failed MEDIA directive.
+// Expected: the failed attachment note is posted and the delivery confirms.
+test("posts failed media note when message contains only a MEDIA directive with unset mediaDirectories", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("MEDIA:/not/a/real/gajaeway-file.bin"));
+	expect(sent).toHaveLength(1);
+	const text = sent[0] as string;
+	expect(text).toContain("(file not sent:");
+	expect(text).toContain("uploads disabled");
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
 test("settles a delivery after sending all chunks", async () => {

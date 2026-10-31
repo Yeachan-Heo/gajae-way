@@ -10,6 +10,11 @@ export interface ParsedDiscordMedia {
 	readonly paths: readonly string[];
 }
 
+export interface DiscordMediaResult {
+	readonly attachments: readonly AttachmentBuilder[];
+	readonly failures: ReadonlyArray<{ readonly path: string; readonly reason: string }>;
+}
+
 interface DiscordMediaFileSnapshot {
 	readonly size: bigint;
 	readonly mtimeNs: bigint;
@@ -79,46 +84,70 @@ export async function readDiscordMediaFile(file: FileHandle, snapshot: DiscordMe
 	return bytes;
 }
 
-/** Reads explicit local media directives into bounded Discord uploads. */
+/** Reads explicit local media directives into bounded Discord uploads, continuing on individual failures. */
 export async function loadDiscordMedia(
 	paths: readonly string[],
 	allowedDirectories: readonly string[] = [],
-): Promise<AttachmentBuilder[]> {
-	if (paths.length > MAX_DISCORD_FILES)
-		throw new Error(`Discord accepts at most ${MAX_DISCORD_FILES} files per message`);
-	if (paths.length > 0 && allowedDirectories.length === 0)
-		throw new Error("Discord MEDIA uploads are disabled until mediaDirectories are configured");
+): Promise<DiscordMediaResult> {
 	const realAllowedDirectories = await Promise.all(allowedDirectories.map((directory) => realpath(directory)));
 	const attachments: AttachmentBuilder[] = [];
+	const failures: Array<{ path: string; reason: string }> = [];
 	let totalBytes = 0;
 	for (const path of paths) {
-		if (!isAbsolute(path)) throw new Error("Discord MEDIA file path must be absolute");
-		const resolvedPath = resolve(path);
-		const realFilePath = await realpath(resolvedPath);
-		if (
-			!realAllowedDirectories.some((directory) => {
-				const relativePath = relative(directory, realFilePath);
-				return (
-					relativePath === "" ||
-					(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
-				);
-			})
-		)
-			throw new Error("Discord MEDIA file is outside configured mediaDirectories");
-		const file = await open(realFilePath, "r");
 		try {
-			const info = await file.stat({ bigint: true });
-			if (!info.isFile()) throw new Error("Discord MEDIA path must name a regular file");
-			const remainingBytes = MAX_UPLOAD_BYTES - totalBytes;
-			if (info.size > BigInt(remainingBytes)) throw new Error("Discord MEDIA files exceed the 25 MiB upload limit");
-			const bytes = await readDiscordMediaFile(file, info);
-			const name = basename(realFilePath);
-			if (!name) throw new Error("Discord MEDIA file must have a filename");
-			totalBytes += bytes.length;
-			attachments.push(new AttachmentBuilder(bytes, { name }));
-		} finally {
-			await file.close();
+			if (attachments.length >= MAX_DISCORD_FILES) {
+				failures.push({ path, reason: "Discord accepts at most 10 files per message" });
+				continue;
+			}
+			if (!isAbsolute(path)) {
+				failures.push({ path, reason: "path must be absolute" });
+				continue;
+			}
+			if (allowedDirectories.length === 0) {
+				failures.push({ path, reason: "uploads disabled: set mediaDirectories" });
+				continue;
+			}
+			const resolvedPath = resolve(path);
+			const realFilePath = await realpath(resolvedPath);
+			if (
+				!realAllowedDirectories.some((directory) => {
+					const relativePath = relative(directory, realFilePath);
+					return (
+						relativePath === "" ||
+						(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+					);
+				})
+			) {
+				failures.push({ path, reason: "path is outside mediaDirectories" });
+				continue;
+			}
+			const file = await open(realFilePath, "r");
+			try {
+				const info = await file.stat({ bigint: true });
+				if (!info.isFile()) {
+					failures.push({ path, reason: "path must name a regular file" });
+					continue;
+				}
+				const remainingBytes = MAX_UPLOAD_BYTES - totalBytes;
+				if (info.size > BigInt(remainingBytes)) {
+					failures.push({ path, reason: "file exceeds the 25 MiB upload limit" });
+					continue;
+				}
+				const bytes = await readDiscordMediaFile(file, info);
+				const name = basename(realFilePath);
+				if (!name) {
+					failures.push({ path, reason: "file must have a filename" });
+					continue;
+				}
+				totalBytes += bytes.length;
+				attachments.push(new AttachmentBuilder(bytes, { name }));
+			} finally {
+				await file.close();
+			}
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			failures.push({ path, reason });
 		}
 	}
-	return attachments;
+	return { attachments, failures };
 }
