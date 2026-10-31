@@ -500,7 +500,11 @@ export interface MemorySearchResult {
  */
 export type TriggerSpec =
 	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
-	| { readonly kind: "webhook"; readonly route: string }
+	| {
+			readonly kind: "webhook";
+			readonly route: string;
+			readonly auth?: { readonly kind: "hmac" | "bearer"; readonly credentialFile: string };
+	  }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
 
@@ -577,6 +581,18 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly burstPolicy: BurstPolicyKind;
 	readonly overlap: MonitorOverlapPolicy;
 	readonly enabled: boolean;
+}
+
+/**
+ * A stored monitor that has an invalid cron schedule or does not load at all.
+ * The `loadable` flag indicates whether the monitor can be repaired (true) or must be removed (false).
+ */
+export interface MonitorInvalidRecord {
+	readonly monitorId: string;
+	readonly name: string;
+	readonly reason: string;
+	/** True when the row still loads (repair with `update`); false when it can only be removed. */
+	readonly loadable: boolean;
 }
 
 export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
@@ -1289,6 +1305,8 @@ export interface VerbCatalogV01 {
 		result: {
 			readonly monitors: readonly MonitorRecord[];
 			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+			/** Stored monitors with invalid cron schedules or that fail to load; see MonitorInvalidRecord. */
+			readonly invalid?: readonly MonitorInvalidRecord[];
 		};
 	};
 	"monitor.inspect": {

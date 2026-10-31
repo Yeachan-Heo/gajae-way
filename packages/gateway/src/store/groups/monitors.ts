@@ -280,6 +280,14 @@ export class MonitorsGroup {
 		}>;
 	}
 
+	row(monitorId: string): ReturnType<MonitorsGroup["rows"]>[number] | undefined {
+		return (this.#db
+			.prepare(
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors WHERE monitor_id = ?",
+			)
+			.get(monitorId) ?? undefined) as ReturnType<MonitorsGroup["rows"]>[number] | undefined;
+	}
+
 	update(
 		tx: WriteTx,
 		row: {

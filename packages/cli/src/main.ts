@@ -5,6 +5,7 @@ import { isAbsolute, resolve } from "node:path";
 import type {
 	MonitorEventOperatorResult,
 	MonitorEventRecord,
+	MonitorInvalidRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
 	MonitorSpec,
@@ -25,7 +26,6 @@ import type {
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
-
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -53,6 +53,23 @@ import {
 import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
+
+/**
+ * Replaces C0 control characters (0x00–0x1f) and DEL (0x7f) with a space.
+ * Use this to sanitize untrusted error messages before logging to prevent control-character smuggling.
+ */
+function stripControlCharacters(value: string): string {
+	let stripped = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		if ((code >= 0 && code <= 0x1f) || code === 0x7f) {
+			stripped += " ";
+		} else {
+			stripped += character;
+		}
+	}
+	return stripped;
+}
 
 async function connectGatewaySocket(
 	path: string,
@@ -951,7 +968,20 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						const result = await client.request<{
 							monitors: MonitorRecord[];
 							schedules: Record<string, MonitorScheduleProjection>;
+							invalid?: MonitorInvalidRecord[];
 						}>("monitor.list");
+						for (const bad of result.invalid ?? []) {
+							const escapedId = stripControlCharacters(bad.monitorId);
+							const escapedName = stripControlCharacters(bad.name);
+							const escapedReason = stripControlCharacters(bad.reason);
+							console.error(
+								`invalid monitor ${escapedId} (${escapedName})${bad.loadable ? "" : " does not run"}: ${escapedReason}. ${
+									bad.loadable
+										? `Fix it with: gajaeway monitors update ${escapedId} --schedule "<five-field cron>"`
+										: `Remove it with: gajaeway monitors remove ${escapedId}`
+								}`,
+							);
+						}
 						const rows: MonitorListRow[] = result.monitors.map((monitor) => ({
 							monitor,
 							schedule: result.schedules[monitor.monitorId] ?? null,

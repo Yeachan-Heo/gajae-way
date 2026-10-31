@@ -6,6 +6,20 @@ export const DEFAULT_LOG_ROTATION_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_LOG_RETAINED_FILES = 5;
 export const DEFAULT_LOG_HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000;
 
+/**
+ * Replaces C0 control characters (0x00–0x1f) and DEL (0x7f) with a space.
+ * Use this to sanitize untrusted error messages, paths, and other diagnostic text
+ * before logging to prevent control-character smuggling and terminal manipulation.
+ */
+export function stripControlCharacters(value: string): string {
+	let stripped = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		stripped += code < 0x20 || code === 0x7f ? " " : character;
+	}
+	return stripped;
+}
+
 export type LogLevel = "error" | "warn" | "info";
 type ConsoleMethod = LogLevel | "log";
 
