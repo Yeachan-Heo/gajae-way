@@ -21,6 +21,16 @@ interface DiscordMediaFileSnapshot {
 	readonly ctimeNs: bigint;
 }
 
+function isUnderAny(directories: readonly string[], path: string): boolean {
+	return directories.some((directory) => {
+		const relativePath = relative(directory, path);
+		return (
+			relativePath === "" ||
+			(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+		);
+	});
+}
+
 /** Extracts explicit MEDIA:/absolute/path directives from standalone response lines outside fenced code. */
 export function parseDiscordMedia(text: string): ParsedDiscordMedia {
 	const lines = text.split(/\r?\n/);
@@ -91,11 +101,15 @@ export async function loadDiscordMedia(
 ): Promise<DiscordMediaResult> {
 	// Resolve allowed directories, filtering out those that don't exist.
 	// A non-existent configured directory is treated as unset.
+	// The lexical pre-check accepts both the configured spelling and its real path, so a mediaDirectory
+	// that is itself a symlink still admits paths written under its configured name.
 	const realAllowedDirectories: string[] = [];
+	const lexicalAllowedDirectories: string[] = [];
 	for (const directory of allowedDirectories) {
 		try {
 			const realPath = await realpath(directory);
 			realAllowedDirectories.push(realPath);
+			lexicalAllowedDirectories.push(resolve(directory), realPath);
 		} catch {
 			// Non-existent or inaccessible directory is silently ignored.
 		}
@@ -125,30 +139,14 @@ export async function loadDiscordMedia(
 			// Lexically check if the resolved path is under an allowed directory.
 			// This check happens before any fs call to avoid revealing path existence.
 			const resolvedPath = resolve(path);
-			const isAllowed = realAllowedDirectories.some((directory) => {
-				const relativePath = relative(directory, resolvedPath);
-				return (
-					relativePath === "" ||
-					(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
-				);
-			});
-
-			if (!isAllowed) {
+			if (!isUnderAny(lexicalAllowedDirectories, resolvedPath)) {
 				failures.push({ path, reason: "path is outside mediaDirectories" });
 				continue;
 			}
 
 			// Now resolve symlinks and verify the real path is still under an allowed directory.
 			const realFilePath = await realpath(resolvedPath);
-			const isRealAllowed = realAllowedDirectories.some((directory) => {
-				const relativePath = relative(directory, realFilePath);
-				return (
-					relativePath === "" ||
-					(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
-				);
-			});
-
-			if (!isRealAllowed) {
+			if (!isUnderAny(realAllowedDirectories, realFilePath)) {
 				failures.push({ path, reason: "path is outside mediaDirectories" });
 				continue;
 			}

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, open, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadDiscordMedia, parseDiscordMedia, readDiscordMediaFile } from "../src/outgoing-attachments";
@@ -203,7 +203,7 @@ test("uses identical reason for missing, existing, and unreadable outside paths"
 		const unreadablePath = join(outside, "unreadable.txt");
 		await writeFile(existingPath, "exists");
 		await writeFile(unreadablePath, "secret");
-		await (await open(unreadablePath, "r")).close();
+		await chmod(unreadablePath, 0o000);
 
 		const missingResult = await loadDiscordMedia([missingPath], [allowed]);
 		const existingResult = await loadDiscordMedia([existingPath], [allowed]);
@@ -221,6 +221,28 @@ test("uses identical reason for missing, existing, and unreadable outside paths"
 		expect(missingReason).toBe(existingReason);
 		expect(existingReason).toBe(unreadableReason);
 		expect(missingReason).toBe("path is outside mediaDirectories");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// Purpose: a mediaDirectory configured through a symlink must still admit files written under its configured name,
+// and a configured directory that does not exist must behave like an unset one instead of failing the reply.
+// Expected: the symlinked root uploads; the missing root reports uploads disabled.
+test("accepts files under a symlinked mediaDirectory and ignores missing mediaDirectories", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-symlink-root-"));
+	const target = join(home, "target");
+	const link = join(home, "link");
+	try {
+		await mkdir(target);
+		await symlink(target, link);
+		await writeFile(join(target, "inside.txt"), "safe");
+		const linkedResult = await loadDiscordMedia([join(link, "inside.txt")], [link]);
+		expect(linkedResult.failures).toEqual([]);
+		expect(linkedResult.attachments).toHaveLength(1);
+		const missingRootResult = await loadDiscordMedia([join(target, "inside.txt")], [join(home, "missing")]);
+		expect(missingRootResult.attachments).toHaveLength(0);
+		expect(missingRootResult.failures[0]?.reason).toContain("uploads disabled");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
