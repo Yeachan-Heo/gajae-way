@@ -19,7 +19,7 @@ import type { Lease } from "@gajae-gateway/home";
 import { homeLayout } from "@gajae-gateway/home";
 import { defaultPidAlive } from "../orchestrator/broker";
 import { judgeBrokerLiveness } from "../orchestrator/broker-liveness";
-import { assertAgentDb, snapshotAgentDb } from "./agent-db";
+import { assertAgentDb, snapshotAgentDb, snapshotAgentDbWithoutRotatingCredentials } from "./agent-db";
 import {
 	BROKER_AGENT_ALLOWLIST,
 	type BrokerAgentAllowlistEntry,
@@ -74,6 +74,8 @@ export interface ProvisionBrokerAgentOptions {
 	readonly lease: Lease;
 	/** Fault seam used by process-crash tests; production callers leave this unset. */
 	readonly fault?: (point: BrokerProvisionFault) => void | Promise<void>;
+	/** Optional callback to report filtered rotating OAuth providers. */
+	readonly onFilteredCredentials?: (providers: readonly string[]) => void;
 }
 
 export interface BrokerAgentProvisionResult {
@@ -208,13 +210,14 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 		string,
 		{ sourceFingerprint: string; copyFingerprint: string; sourceStat: ManifestEntry["sourceStat"] }
 	>();
+	const filteredCredentials: string[] = [];
 	let journalPersisted = false;
 	try {
 		for (const entry of selected) {
 			const sourceRoot = sourceEntryRootSync(entry, source, dataSource);
 			const sourcePath = brokerAgentEntryPath(entry, sourceRoot);
 			const stagePath = brokerAgentEntryPath(entry, stagedDir);
-			await stageEntry(entry, sourcePath, stagePath);
+			await stageEntry(entry, sourcePath, stagePath, filteredCredentials);
 			const copyFingerprint = await fingerprintBrokerAgentEntry(entry, stagePath);
 			const sourceFingerprint =
 				entry.form === "sqlite" ? copyFingerprint : await fingerprintBrokerAgentEntry(entry, sourcePath);
@@ -284,6 +287,14 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 		await writeJsonAtomic(layout.brokerProvisionDir, layout.brokerProvisionManifest, manifest);
 		await options.fault?.("after_manifest");
 		await finishCommit(layout.brokerProvisionDir, journal);
+		if (filteredCredentials.length > 0) {
+			const unique = [...new Set(filteredCredentials)];
+			const providers = unique.join(", ");
+			console.warn(
+				`broker_agent_skipped_credentials providers=${providers} detail="The broker agent does not support sharing rotating OAuth refresh tokens with other stores to avoid invalidating both when tokens rotate. Log the broker in independently for each provider using gjc or the SDK."`,
+			);
+			options.onFilteredCredentials?.(unique);
+		}
 		logProvisioned(
 			genId,
 			manifest.by,
@@ -301,6 +312,14 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 			const outcome = await recoverProvision(home, agentDir, options.lease);
 			const manifest = await readManifest(layout.brokerProvisionManifest);
 			if (manifest?.genId === genId || outcome === "finished") {
+				if (filteredCredentials.length > 0) {
+					const unique = [...new Set(filteredCredentials)];
+					const providers = unique.join(", ");
+					console.warn(
+						`broker_agent_skipped_credentials providers=${providers} detail="The broker agent does not support sharing rotating OAuth refresh tokens with other stores to avoid invalidating both when tokens rotate. Log the broker in independently for each provider using gjc or the SDK."`,
+					);
+					options.onFilteredCredentials?.(unique);
+				}
 				logProvisioned(
 					genId,
 					manifest?.by ?? process.env.USER ?? "gajaeway",
@@ -522,9 +541,15 @@ function pathsOverlap(left: string, right: string): boolean {
 	return a === b || a.startsWith(`${b}${sep}`) || b.startsWith(`${a}${sep}`);
 }
 
-async function stageEntry(entry: BrokerAgentAllowlistEntry, sourcePath: string, stagePath: string): Promise<void> {
+async function stageEntry(
+	entry: BrokerAgentAllowlistEntry,
+	sourcePath: string,
+	stagePath: string,
+	filtered?: string[],
+): Promise<void> {
 	if (entry.form === "sqlite") {
-		snapshotAgentDb(sourcePath, stagePath);
+		const filteredProviders = snapshotAgentDbWithoutRotatingCredentials(sourcePath, stagePath);
+		if (filtered) filtered.push(...filteredProviders);
 		await chmod(stagePath, FILE_MODE);
 		await syncFile(stagePath);
 		return;

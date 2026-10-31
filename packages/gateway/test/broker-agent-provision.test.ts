@@ -754,4 +754,56 @@ describe("broker agent allowlist provisioning", () => {
 			}
 		}
 	});
+
+	test("rotating OAuth credentials are filtered out during provision", async () => {
+		const f = await fixture();
+		// Create a source agent.db with rotating OAuth credentials
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		// Add a rotating OAuth provider credential (anthropic)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("anthropic", "anthropic-token");
+		// Add another rotating OAuth provider credential (openai-codex)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("openai-codex", "openai-codex-token");
+		// Add a non-rotating credential (should be kept)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const filtered: string[] = [];
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+				onFilteredCredentials: (providers) => filtered.push(...providers),
+			});
+		} finally {
+			await lease.release();
+		}
+
+		// Verify that rotating OAuth credentials were filtered
+		expect(filtered.sort()).toEqual(["anthropic", "openai-codex"]);
+
+		// Verify the broker agent.db does not contain the filtered credentials
+		const brokerDb = new Database(join(f.agentDir, "agent.db"), { readonly: true });
+		try {
+			const anthropic = brokerDb.query("SELECT token FROM auth_credentials WHERE provider = 'anthropic'").get() as
+				| { token: unknown }
+				| undefined;
+			const openaiCodex = brokerDb.query("SELECT token FROM auth_credentials WHERE provider = 'openai-codex'").get() as
+				| { token: unknown }
+				| undefined;
+			const github = brokerDb.query("SELECT token FROM auth_credentials WHERE provider = 'github'").get() as
+				| { token: unknown }
+				| undefined;
+
+			expect(anthropic).toBeNull();
+			expect(openaiCodex).toBeNull();
+			expect(github?.token).toBe("github-token");
+		} finally {
+			brokerDb.close();
+		}
+	});
 });

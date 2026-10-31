@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 
+/** Providers that use rotating OAuth refresh tokens and should not be copied to the broker agent. */
+const ROTATING_OAUTH_PROVIDERS = new Set(["anthropic", "openai-codex"]);
+
 export class AgentDatabaseError extends Error {
 	readonly code = "agent_database_invalid";
 	constructor(message: string) {
@@ -20,6 +23,40 @@ export function snapshotAgentDb(source: string, destination: string): void {
 		sourceDb.close();
 	}
 	assertAgentDb(destination);
+}
+
+/**
+ * Copy the agent database to the broker agent directory, filtering out OAuth credentials
+ * for providers with rotating refresh tokens to avoid sharing tokens between stores.
+ * Returns the list of filtered provider names.
+ */
+export function snapshotAgentDbWithoutRotatingCredentials(source: string, destination: string): string[] {
+	const sourceDb = new Database(source, { readonly: true });
+	try {
+		const quotedDestination = destination.replaceAll("'", "''");
+		sourceDb.exec(`VACUUM INTO '${quotedDestination}'`);
+	} finally {
+		sourceDb.close();
+	}
+
+	// Filter out rotating OAuth credentials from the destination database
+	const destDb = new Database(destination);
+	const filtered: string[] = [];
+	try {
+		const rows = destDb.query("SELECT provider FROM auth_credentials").all() as Array<{ provider: unknown }>;
+		for (const row of rows) {
+			const provider = typeof row.provider === "string" ? row.provider : "";
+			if (ROTATING_OAUTH_PROVIDERS.has(provider)) {
+				filtered.push(provider);
+				destDb.query("DELETE FROM auth_credentials WHERE provider = ?").run(provider);
+			}
+		}
+	} finally {
+		destDb.close();
+	}
+
+	assertAgentDb(destination);
+	return filtered;
 }
 
 export function assertAgentDb(path: string): void {
