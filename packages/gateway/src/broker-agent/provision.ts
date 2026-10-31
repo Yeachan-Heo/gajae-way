@@ -19,7 +19,12 @@ import type { Lease } from "@gajae-gateway/home";
 import { homeLayout } from "@gajae-gateway/home";
 import { defaultPidAlive } from "../orchestrator/broker";
 import { judgeBrokerLiveness } from "../orchestrator/broker-liveness";
-import { assertAgentDb, snapshotAgentDb, snapshotAgentDbWithoutRotatingCredentials } from "./agent-db";
+import {
+	assertAgentDb,
+	credentialFingerprintFiltered,
+	mergeRotatingOAuthCredentials,
+	snapshotAgentDbWithoutRotatingCredentials,
+} from "./agent-db";
 import {
 	BROKER_AGENT_ALLOWLIST,
 	type BrokerAgentAllowlistEntry,
@@ -217,10 +222,14 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 			const sourceRoot = sourceEntryRootSync(entry, source, dataSource);
 			const sourcePath = brokerAgentEntryPath(entry, sourceRoot);
 			const stagePath = brokerAgentEntryPath(entry, stagedDir);
-			await stageEntry(entry, sourcePath, stagePath, filteredCredentials);
+			const brokerPath = entry.name === "agent.db" ? brokerAgentEntryPath(entry, agentDir) : undefined;
+			await stageEntry(entry, sourcePath, stagePath, filteredCredentials, brokerPath);
 			const copyFingerprint = await fingerprintBrokerAgentEntry(entry, stagePath);
+			// For sqlite entries, fingerprint the source with the same filter applied (no rotating OAuth rows)
 			const sourceFingerprint =
-				entry.form === "sqlite" ? copyFingerprint : await fingerprintBrokerAgentEntry(entry, sourcePath);
+				entry.form === "sqlite"
+					? credentialFingerprintFiltered(sourcePath, true)
+					: await fingerprintBrokerAgentEntry(entry, sourcePath);
 			const sourceStat = await sourceEntryStat(entry, sourceRoot);
 			stagedMetadata.set(entry.name, { sourceFingerprint, copyFingerprint, sourceStat });
 		}
@@ -287,14 +296,7 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 		await writeJsonAtomic(layout.brokerProvisionDir, layout.brokerProvisionManifest, manifest);
 		await options.fault?.("after_manifest");
 		await finishCommit(layout.brokerProvisionDir, journal);
-		if (filteredCredentials.length > 0) {
-			const unique = [...new Set(filteredCredentials)];
-			const providers = unique.join(", ");
-			console.warn(
-				`broker_agent_skipped_credentials providers=${providers} detail="The broker agent does not support sharing rotating OAuth refresh tokens with other stores to avoid invalidating both when tokens rotate. Log the broker in independently for each provider using gjc or the SDK."`,
-			);
-			options.onFilteredCredentials?.(unique);
-		}
+		warnFilteredCredentials(filteredCredentials, options);
 		logProvisioned(
 			genId,
 			manifest.by,
@@ -312,14 +314,7 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 			const outcome = await recoverProvision(home, agentDir, options.lease);
 			const manifest = await readManifest(layout.brokerProvisionManifest);
 			if (manifest?.genId === genId || outcome === "finished") {
-				if (filteredCredentials.length > 0) {
-					const unique = [...new Set(filteredCredentials)];
-					const providers = unique.join(", ");
-					console.warn(
-						`broker_agent_skipped_credentials providers=${providers} detail="The broker agent does not support sharing rotating OAuth refresh tokens with other stores to avoid invalidating both when tokens rotate. Log the broker in independently for each provider using gjc or the SDK."`,
-					);
-					options.onFilteredCredentials?.(unique);
-				}
+				warnFilteredCredentials(filteredCredentials, options);
 				logProvisioned(
 					genId,
 					manifest?.by ?? process.env.USER ?? "gajaeway",
@@ -411,6 +406,16 @@ export async function recoverProvision(
 function logProvisioned(genId: string, by: string, copied: readonly string[], kept: number): void {
 	console.info(`broker_agent_provisioned genId=${genId} by=${by} entries=${copied.join(",")}`);
 	console.info(`broker_agent_sync copied=${copied.length} kept=${kept} exit=0`);
+}
+
+function warnFilteredCredentials(filtered: readonly string[], options: ProvisionBrokerAgentOptions): void {
+	if (filtered.length === 0) return;
+	const unique = [...new Set(filtered)];
+	const providers = unique.join(", ");
+	console.warn(
+		`broker_agent_skipped_credentials providers=${providers} detail="The broker agent does not support sharing rotating OAuth refresh tokens with other stores to avoid invalidating both when tokens rotate. Broker login via gjc or SDK is not yet supported; this is a follow-up."`,
+	);
+	options.onFilteredCredentials?.(unique);
 }
 
 export async function assertAgentDirectory(agentDir: string): Promise<void> {
@@ -546,10 +551,15 @@ async function stageEntry(
 	sourcePath: string,
 	stagePath: string,
 	filtered?: string[],
+	brokerAgentPath?: string,
 ): Promise<void> {
 	if (entry.form === "sqlite") {
 		const filteredProviders = snapshotAgentDbWithoutRotatingCredentials(sourcePath, stagePath);
 		if (filtered) filtered.push(...filteredProviders);
+		// Merge broker's existing rotating OAuth credentials if the broker agent.db exists
+		if (brokerAgentPath && (await pathExists(brokerAgentPath))) {
+			mergeRotatingOAuthCredentials(brokerAgentPath, stagePath);
+		}
 		await chmod(stagePath, FILE_MODE);
 		await syncFile(stagePath);
 		return;
@@ -611,7 +621,7 @@ async function rollbackJournal(agentDir: string, provisionDir: string, journal: 
 			const targetPath = join(agentDir, component);
 			const previousPath = join(journal.prevDir, component);
 			const targetIdentity = await identityOrNull(targetPath);
-			const oldIdentity = record.original[component] ?? null;
+			const oldIdentity = record.original?.[component] ?? null;
 			const stageIdentity = component === entry.name ? record.stagedIdentity : undefined;
 			if (targetIdentity && sameIdentity(targetIdentity, stageIdentity))
 				await rm(targetPath, { recursive: true, force: true });
@@ -633,12 +643,12 @@ async function validateRollbackJournal(agentDir: string, journal: ProvisionJourn
 	for (const name of journal.selected) {
 		const entry = entryByName(name);
 		const record = journal.entries[name];
-		if (!entry || !record || !record.original || typeof record.original !== "object")
+		if (!entry || !record || typeof record.original !== "object")
 			throw new BrokerAgentError("broker_agent_unrecoverable", `unknown journal entry=${name}`);
 		for (const component of targetComponents(entry)) {
-			if (!Object.hasOwn(record.original, component))
+			if (!Object.hasOwn(record.original ?? {}, component))
 				throw new BrokerAgentError("broker_agent_unrecoverable", `journal identity missing entry=${component}`);
-			const oldIdentity = record.original[component] ?? null;
+			const oldIdentity = record.original?.[component] ?? null;
 			const previousIdentity = await identityOrNull(join(journal.prevDir, component));
 			const targetIdentity = await identityOrNull(join(agentDir, component));
 			const stageIdentity = component === entry.name ? record.stagedIdentity : undefined;

@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
+import { credentialFingerprintFiltered } from "./agent-db";
 import {
 	BROKER_AGENT_ALLOWLIST,
 	type BrokerAgentAllowlistEntry,
@@ -138,7 +139,9 @@ function observeEntry(
 	if (!sourceExists) return { name: entry.name, kind: entry.kind, state: "missing_source" };
 	const sourcePath = brokerAgentEntryPath(entry, sourceRoot);
 	const copyPath = brokerAgentEntryPath(entry, agentDir);
-	const currentSource = currentFingerprint(entry, sourcePath);
+	// For sqlite entries, fingerprint source with filter applied to match recorded sourceFingerprint
+	const currentSource =
+		entry.form === "sqlite" ? credentialFingerprintFiltered(sourcePath, true) : currentFingerprint(entry, sourcePath);
 	const currentCopy = currentFingerprint(entry, copyPath);
 	if (currentSource === currentCopy) return { name: entry.name, kind: entry.kind, state: "in_sync" };
 	const records = manifestEntries as Record<string, ManifestEntry> | undefined;

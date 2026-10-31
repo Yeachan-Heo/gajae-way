@@ -763,7 +763,9 @@ describe("broker agent allowlist provisioning", () => {
 		// Add a rotating OAuth provider credential (anthropic)
 		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("anthropic", "anthropic-token");
 		// Add another rotating OAuth provider credential (openai-codex)
-		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("openai-codex", "openai-codex-token");
+		sourceDb
+			.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)")
+			.run("openai-codex", "openai-codex-token");
 		// Add a non-rotating credential (should be kept)
 		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
 		sourceDb.close();
@@ -804,6 +806,122 @@ describe("broker agent allowlist provisioning", () => {
 			expect(github?.token).toBe("github-token");
 		} finally {
 			brokerDb.close();
+		}
+	});
+
+	test("drift is in_sync right after filtered provision", async () => {
+		const f = await fixture();
+		// Create a source agent.db with rotating OAuth credentials
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		// Add a rotating OAuth provider credential (anthropic)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("anthropic", "anthropic-token");
+		// Add a non-rotating credential (should be kept)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			// Provision the broker
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+
+			// Check drift - should be in_sync
+			const { brokerAgentDrift } = await import("../src/broker-agent/drift");
+			const drift = await brokerAgentDrift({ home: f.home, agentDir: f.agentDir, source: f.source });
+			const agentDbEntry = drift.entries.find((e: any) => e.name === "agent.db");
+			expect(agentDbEntry?.state).toBe("in_sync");
+		} finally {
+			await lease.release();
+		}
+	});
+
+	test("update with unchanged source returns nothing_to_do", async () => {
+		const f = await fixture();
+		// Create a source agent.db
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			// First provision
+			const result1 = await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+			expect(result1.status).toBe("ok");
+
+			// Second provision with update mode, source unchanged
+			const result2 = await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "update",
+				lease,
+			});
+			expect(result2.status).toBe("nothing_to_do");
+		} finally {
+			await lease.release();
+		}
+	});
+
+	test("force re-provision keeps broker-side anthropic row", async () => {
+		const f = await fixture();
+		// Create a source agent.db with only non-rotating credential
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			// First provision
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+
+			// Manually add anthropic credential to broker agent.db (broker logs in separately)
+			const brokerDb = new Database(join(f.agentDir, "agent.db"));
+			brokerDb
+				.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)")
+				.run("anthropic", "broker-anthropic-token");
+			brokerDb.close();
+
+			// Force re-provision
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+
+			// Verify broker's anthropic row is still there
+			const brokerDb2 = new Database(join(f.agentDir, "agent.db"), { readonly: true });
+			try {
+				const anthropic = brokerDb2.query("SELECT token FROM auth_credentials WHERE provider = 'anthropic'").get() as
+					| { token: unknown }
+					| undefined;
+				expect(anthropic?.token).toBe("broker-anthropic-token");
+			} finally {
+				brokerDb2.close();
+			}
+		} finally {
+			await lease.release();
 		}
 	});
 });
