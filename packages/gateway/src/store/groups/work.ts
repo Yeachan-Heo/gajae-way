@@ -1332,6 +1332,17 @@ export class WorkGroup {
 		).map((row) => row.parent_name);
 	}
 
+	/** Includes fresh checks reports that are not linked from an attempt runtime. */
+	laneHasUnresolvedReports(name: string): boolean {
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 FROM lane_reports WHERE (parent_name = ? OR child_name = ?) AND state IN ('pending', 'claimed', 'held', 'undeliverable') LIMIT 1",
+				)
+				.get(name, name) !== null
+		);
+	}
+
 	laneReportCounts(parentName: string): { pending: number; claimed: number; held: number; undeliverable: number } {
 		const row = this.#db
 			.prepare(

@@ -822,6 +822,10 @@ export interface WorkRetireParams {
  * When `force` is true, skip attempt-state checks and require broker liveness
  * proving the session dead or disowned; if found dead, close as `host_lost` and
  * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
+ * A non-force named retirement of unbound attempt_ended or awaiting_operator
+ * history can disposition it as aborted after ownership, correlated terminal
+ * evidence and session-death checks. Missing/unknown receipts stay unproven;
+ * disposition preserves attempts/worktrees, closes nothing and reserves the name.
  */
 export type WorkRetireResult =
 	| {
@@ -830,6 +834,7 @@ export type WorkRetireResult =
 			readonly sessionId: string;
 			readonly closed: boolean;
 			readonly forced?: boolean;
+			readonly disposition?: "aborted";
 	  }
 	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
 

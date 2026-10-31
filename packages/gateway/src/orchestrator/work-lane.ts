@@ -931,13 +931,16 @@ export class WorkLaneManager {
 				state: job.state,
 				reason: "the lane is awaiting PR checks; wait for check polling to settle it",
 			};
-		if (job?.state === "done")
+		if (job?.state === "done" || job?.state === "aborted")
 			return {
 				started: false,
 				held: true,
 				jobId,
 				state: job.state,
-				reason: "the lane is complete; retire it before creating another lane with this name",
+				reason:
+					job.state === "aborted"
+						? "the lane was operator-aborted; use a new lane name"
+						: "the lane is complete; retire it before creating another lane with this name",
 			};
 		if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
 			if (!input.resume)
