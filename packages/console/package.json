@@ -1,0 +1,42 @@
+{
+	"name": "@gajae-gateway/console",
+	"version": "0.1.0",
+	"private": false,
+	"type": "module",
+	"description": "Bun-native TUI library for gajaeway setup and console commands.",
+	"license": "AGPL-3.0-only",
+	"author": "Yeachan Heo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-way.git",
+		"directory": "packages/console"
+	},
+	"homepage": "https://github.com/Yeachan-Heo/gajae-way/tree/main/packages/console#readme",
+	"bugs": "https://github.com/Yeachan-Heo/gajae-way/issues",
+	"files": [
+		"dist",
+		"src"
+	],
+	"main": "./src/index.ts",
+	"types": "./src/index.ts",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"bin": {
+		"gajaeway-console": "./dist/main.js"
+	},
+	"scripts": {
+		"build": "bun build src/main.ts --outdir dist --target bun --format esm",
+		"prepublishOnly": "bun run build"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"peerDependencies": {
+		"@gajae-gateway/sdk": "^0.4.0",
+		"@gajae-gateway/protocol": "^0.4.0"
+	},
+	"engines": {
+		"bun": ">=1.4.0"
+	}
+}
