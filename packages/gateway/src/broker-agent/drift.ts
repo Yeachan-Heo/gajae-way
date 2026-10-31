@@ -139,10 +139,12 @@ function observeEntry(
 	if (!sourceExists) return { name: entry.name, kind: entry.kind, state: "missing_source" };
 	const sourcePath = brokerAgentEntryPath(entry, sourceRoot);
 	const copyPath = brokerAgentEntryPath(entry, agentDir);
-	// For sqlite entries, fingerprint source with filter applied to match recorded sourceFingerprint
+	// For sqlite entries, rotating OAuth rows are never synced, so both sides are fingerprinted without them
+	// to match the recorded fingerprints.
 	const currentSource =
 		entry.form === "sqlite" ? credentialFingerprintFiltered(sourcePath, true) : currentFingerprint(entry, sourcePath);
-	const currentCopy = currentFingerprint(entry, copyPath);
+	const currentCopy =
+		entry.form === "sqlite" ? credentialFingerprintFiltered(copyPath, true) : currentFingerprint(entry, copyPath);
 	if (currentSource === currentCopy) return { name: entry.name, kind: entry.kind, state: "in_sync" };
 	const records = manifestEntries as Record<string, ManifestEntry> | undefined;
 	const record = records?.[entry.name];

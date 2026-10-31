@@ -101,14 +101,15 @@ export function mergeRotatingOAuthCredentials(brokerDbPath: string, stagedDbPath
 					.all() as Array<Record<string, unknown>>;
 			}
 
-			// Insert broker credentials into staged database
+			// Insert broker credentials into staged database. The rowid comes from the broker store and can
+			// collide with an unrelated operator row in the staged copy, so let SQLite assign a fresh one.
 			for (const row of brokerRows) {
-				const columnNames = Object.keys(row);
+				const columnNames = Object.keys(row).filter((name) => name !== "id");
 				const placeholders = columnNames.map(() => "?").join(", ");
 				const values = columnNames.map((name) => row[name]);
 				stagedDb
 					.query(
-						`INSERT OR REPLACE INTO auth_credentials (${columnNames.map((n) => `"${n.replaceAll('"', '""')}"`).join(", ")}) VALUES (${placeholders})`,
+						`INSERT INTO auth_credentials (${columnNames.map((n) => `"${n.replaceAll('"', '""')}"`).join(", ")}) VALUES (${placeholders})`,
 					)
 					.run(...(values as any[]));
 			}

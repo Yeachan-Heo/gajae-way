@@ -224,8 +224,12 @@ export async function provisionBrokerAgent(options: ProvisionBrokerAgentOptions)
 			const stagePath = brokerAgentEntryPath(entry, stagedDir);
 			const brokerPath = entry.name === "agent.db" ? brokerAgentEntryPath(entry, agentDir) : undefined;
 			await stageEntry(entry, sourcePath, stagePath, filteredCredentials, brokerPath);
-			const copyFingerprint = await fingerprintBrokerAgentEntry(entry, stagePath);
-			// For sqlite entries, fingerprint the source with the same filter applied (no rotating OAuth rows)
+			// For sqlite entries, fingerprint source and copy over the same row set: rotating OAuth rows are
+			// never synced (the copy holds the broker's own login), so they must not count as drift.
+			const copyFingerprint =
+				entry.form === "sqlite"
+					? credentialFingerprintFiltered(stagePath, true)
+					: await fingerprintBrokerAgentEntry(entry, stagePath);
 			const sourceFingerprint =
 				entry.form === "sqlite"
 					? credentialFingerprintFiltered(sourcePath, true)
