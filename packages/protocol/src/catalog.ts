@@ -1,3 +1,4 @@
+import { ProtocolError } from "./errors";
 import type { FileRef } from "./files";
 import type { OriginRef } from "./origin";
 import type { ReactionAction, ReactionRef } from "./reactions";
@@ -1258,6 +1259,42 @@ export interface OpsDeliveriesResult {
 	readonly rows: readonly OpsDeliveryRow[];
 }
 
+/** Operator cancellation is exact-ID and never releases the matching restart drain. */
+export interface OpsCancelInboundParams {
+	readonly restartId: string;
+	readonly messageIds: readonly string[];
+}
+
+export interface OpsCancelInboundResult {
+	readonly restartId: string;
+	/** Includes same-operation replays whose durable cancellation is already recorded. */
+	readonly cancelledMessageIds: readonly string[];
+}
+
+export const OPS_CANCEL_INBOUND_MAX_IDS = 100;
+
+export function parseOpsCancelInboundParams(value: unknown): OpsCancelInboundParams {
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new ProtocolError("invalid_params", "cancel-inbound requires restartId and messageIds");
+	const params = value as Record<string, unknown>;
+	if (Object.keys(params).some((key) => key !== "restartId" && key !== "messageIds"))
+		throw new ProtocolError("invalid_params", "cancel-inbound received an unknown parameter");
+	if (typeof params.restartId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(params.restartId))
+		throw new ProtocolError("invalid_params", "restartId must be a non-empty safe identifier");
+	if (
+		!Array.isArray(params.messageIds) ||
+		params.messageIds.length === 0 ||
+		params.messageIds.length > OPS_CANCEL_INBOUND_MAX_IDS ||
+		params.messageIds.some((id) => typeof id !== "string" || !/^[^\s\p{C}]{1,256}$/u.test(id)) ||
+		new Set(params.messageIds).size !== params.messageIds.length
+	)
+		throw new ProtocolError(
+			"invalid_params",
+			`messageIds must contain 1..${OPS_CANCEL_INBOUND_MAX_IDS} distinct, non-empty platform IDs`,
+		);
+	return { restartId: params.restartId, messageIds: params.messageIds };
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -1318,6 +1355,7 @@ export interface VerbCatalogV01 {
 	"ops.redeliver": { params: OpsRedeliverParams; result: { readonly requeued: readonly string[] } };
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"ops.deliveries": { params: OpsDeliveriesParams; result: OpsDeliveriesResult };
+	"ops.cancelInbound": { params: OpsCancelInboundParams; result: OpsCancelInboundResult };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
 
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
@@ -1371,6 +1409,7 @@ export const VERBS_V01 = [
 	"ops.redeliver",
 	"ops.integrity",
 	"ops.deliveries",
+	"ops.cancelInbound",
 	"work.run",
 	"work.start",
 	"work.status",

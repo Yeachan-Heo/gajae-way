@@ -856,6 +856,40 @@ export class InboxGroup {
 		);
 	}
 
+	/** Retains history/dedupe and a no-delivery receipt without inventing a dispatched turn. */
+	cancelPending(tx: WriteTx, restartId: string, messageIds: readonly string[]): string[] {
+		const receipt = JSON.stringify({ none: "operator_cancelled", restartId });
+		const pending: string[] = [];
+		for (const messageId of messageIds) {
+			this.#assertNotQuarantined(messageId);
+			const row = this.#db
+				.prepare(`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE message_id = ?`)
+				.get(messageId) as InboundMessageRow | null;
+			if (
+				row === null ||
+				row.source !== "platform" ||
+				row.turn_role !== null ||
+				row.turn_epoch !== null ||
+				row.turn_state !== null ||
+				row.turn_op_ref !== null ||
+				row.bound_session_id !== null ||
+				row.dispatched_at !== null
+			)
+				throw new Error(`inbound ${messageId} is not an unbound platform message`);
+			if (row.state === "done" && row.terminal_delivery_id === receipt) continue;
+			if (row.state !== "pending" || row.terminal_delivery_id !== null)
+				throw new Error(`inbound ${messageId} is not pending or was cancelled by a different operation`);
+			pending.push(messageId);
+		}
+		const update = this.#db.prepare(
+			"UPDATE inbound_messages SET state = 'done', terminal_delivery_id = ? WHERE message_id = ? AND state = 'pending' AND turn_state IS NULL AND terminal_delivery_id IS NULL",
+		);
+		for (const messageId of pending)
+			if (update.run(tx, receipt, messageId).changes !== 1)
+				throw new Error(`inbound ${messageId} changed during cancellation`);
+		return [...messageIds];
+	}
+
 	discardBefore(tx: WriteTx, originKey: string, floorAt: string): string[] {
 		const ids = this.#db
 			.prepare(
