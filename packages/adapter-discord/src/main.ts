@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
@@ -929,7 +929,7 @@ export async function settleDiscordDelivery(
 		const parsed = parseDiscordMedia(message.text);
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const mediaResult = await loadDiscordMedia(parsed.paths, mediaDirectories);
-		const fileNotes = mediaResult.failures.map((f) => `(file not sent: ${f.path} - ${f.reason})`).join("\n");
+		const fileNotes = mediaResult.failures.map((f) => `(file not sent: ${basename(f.path)} - ${f.reason})`).join("\n");
 		const fullBody = fileNotes ? (body ? `${body}\n${fileNotes}` : fileNotes) : body;
 		const text = notice ? `${notice}\n${fullBody}` : fullBody;
 		if (mediaResult.failures.length > 0) {
@@ -946,7 +946,7 @@ export async function settleDiscordDelivery(
 						? { messageReference: message.replyToMessageId, failIfNotExists: false }
 						: undefined;
 				await channel.send({
-					files: files.length > 0 ? files : undefined,
+					files,
 					content: chunks[0] ?? "",
 					...(reply ? { reply } : {}),
 				});
@@ -959,7 +959,7 @@ export async function settleDiscordDelivery(
 					if (index === 0 && files.length > 0)
 						await channel.send({
 							content: chunk,
-							files: files.length > 0 ? files : undefined,
+							files,
 							...(message.replyToMessageId && !notice
 								? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
 								: {}),

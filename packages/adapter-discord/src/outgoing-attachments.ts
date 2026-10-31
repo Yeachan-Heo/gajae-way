@@ -145,8 +145,9 @@ export async function loadDiscordMedia(
 				await file.close();
 			}
 		} catch (error) {
-			const reason = error instanceof Error ? error.message : String(error);
-			failures.push({ path, reason });
+			// A raw fs error names the host path; the note reaching chat must not.
+			const code = (error as { code?: unknown } | undefined)?.code;
+			failures.push({ path, reason: code === "ENOENT" ? "file not found" : "file could not be read" });
 		}
 	}
 	return { attachments, failures };
