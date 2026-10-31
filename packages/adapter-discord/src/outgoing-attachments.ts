@@ -89,38 +89,70 @@ export async function loadDiscordMedia(
 	paths: readonly string[],
 	allowedDirectories: readonly string[] = [],
 ): Promise<DiscordMediaResult> {
-	const realAllowedDirectories = await Promise.all(allowedDirectories.map((directory) => realpath(directory)));
+	// Resolve allowed directories, filtering out those that don't exist.
+	// A non-existent configured directory is treated as unset.
+	const realAllowedDirectories: string[] = [];
+	for (const directory of allowedDirectories) {
+		try {
+			const realPath = await realpath(directory);
+			realAllowedDirectories.push(realPath);
+		} catch {
+			// Non-existent or inaccessible directory is silently ignored.
+		}
+	}
+
 	const attachments: AttachmentBuilder[] = [];
 	const failures: Array<{ path: string; reason: string }> = [];
 	let totalBytes = 0;
+
 	for (const path of paths) {
 		try {
 			if (attachments.length >= MAX_DISCORD_FILES) {
-				failures.push({ path, reason: "Discord accepts at most 10 files per message" });
+				failures.push({ path, reason: `Discord accepts at most ${MAX_DISCORD_FILES} files per message` });
 				continue;
 			}
+
 			if (!isAbsolute(path)) {
 				failures.push({ path, reason: "path must be absolute" });
 				continue;
 			}
-			if (allowedDirectories.length === 0) {
+
+			if (realAllowedDirectories.length === 0) {
 				failures.push({ path, reason: "uploads disabled: set mediaDirectories" });
 				continue;
 			}
+
+			// Lexically check if the resolved path is under an allowed directory.
+			// This check happens before any fs call to avoid revealing path existence.
 			const resolvedPath = resolve(path);
-			const realFilePath = await realpath(resolvedPath);
-			if (
-				!realAllowedDirectories.some((directory) => {
-					const relativePath = relative(directory, realFilePath);
-					return (
-						relativePath === "" ||
-						(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
-					);
-				})
-			) {
+			const isAllowed = realAllowedDirectories.some((directory) => {
+				const relativePath = relative(directory, resolvedPath);
+				return (
+					relativePath === "" ||
+					(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+				);
+			});
+
+			if (!isAllowed) {
 				failures.push({ path, reason: "path is outside mediaDirectories" });
 				continue;
 			}
+
+			// Now resolve symlinks and verify the real path is still under an allowed directory.
+			const realFilePath = await realpath(resolvedPath);
+			const isRealAllowed = realAllowedDirectories.some((directory) => {
+				const relativePath = relative(directory, realFilePath);
+				return (
+					relativePath === "" ||
+					(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+				);
+			});
+
+			if (!isRealAllowed) {
+				failures.push({ path, reason: "path is outside mediaDirectories" });
+				continue;
+			}
+
 			const file = await open(realFilePath, "r");
 			try {
 				const info = await file.stat({ bigint: true });
@@ -150,5 +182,6 @@ export async function loadDiscordMedia(
 			failures.push({ path, reason: code === "ENOENT" ? "file not found" : "file could not be read" });
 		}
 	}
+
 	return { attachments, failures };
 }

@@ -188,3 +188,40 @@ test("rejects files outside mediaDirectories, including traversal and outward sy
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+// Purpose: ensure outside-allowlist refusals use identical notes regardless of actual file state.
+// Expected: missing, existing, and unreadable files outside the allowlist all get the same reason.
+test("uses identical reason for missing, existing, and unreadable outside paths", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-outside-state-"));
+	const allowed = join(home, "allowed");
+	const outside = join(home, "outside");
+	try {
+		await mkdir(allowed);
+		await mkdir(outside);
+		const missingPath = join(outside, "missing.txt");
+		const existingPath = join(outside, "existing.txt");
+		const unreadablePath = join(outside, "unreadable.txt");
+		await writeFile(existingPath, "exists");
+		await writeFile(unreadablePath, "secret");
+		await (await open(unreadablePath, "r")).close();
+
+		const missingResult = await loadDiscordMedia([missingPath], [allowed]);
+		const existingResult = await loadDiscordMedia([existingPath], [allowed]);
+		const unreadableResult = await loadDiscordMedia([unreadablePath], [allowed]);
+
+		expect(missingResult.failures).toHaveLength(1);
+		expect(existingResult.failures).toHaveLength(1);
+		expect(unreadableResult.failures).toHaveLength(1);
+
+		// All three cases reveal nothing about file state: identical reason.
+		const missingReason = missingResult.failures[0]?.reason;
+		const existingReason = existingResult.failures[0]?.reason;
+		const unreadableReason = unreadableResult.failures[0]?.reason;
+
+		expect(missingReason).toBe(existingReason);
+		expect(existingReason).toBe(unreadableReason);
+		expect(missingReason).toBe("path is outside mediaDirectories");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
