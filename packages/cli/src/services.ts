@@ -172,12 +172,62 @@ export async function defaultLoginPathRunner(command: readonly string[]): Promis
 	return stdout;
 }
 
+/**
+ * Get the account's default shell from passwd entry.
+ * Falls back gracefully if passwd lookup fails.
+ */
+async function getPasswdShell(runner: LoginPathRunner): Promise<string | undefined> {
+	try {
+		// Try getent passwd to get the user's default shell
+		const output = await runner(["getent", "passwd"]);
+		const lines = output.trim().split("\n");
+		if (lines.length > 0) {
+			const fields = lines[lines.length - 1].split(":");
+			if (fields.length >= 7) {
+				return fields[6]; // passwd shell is the 7th field
+			}
+		}
+	} catch {
+		// passwd lookup failed, will try fallback shells
+	}
+	return undefined;
+}
+
+/**
+ * Discover the login shell from SHELL env var, account passwd, or known fallbacks.
+ * Falls back gracefully: SHELL env → passwd shell → /bin/bash → /bin/sh.
+ * Never defaults to /bin/zsh. If no executable shell is found, returns empty string
+ * so resolvePath uses FALLBACK_PATH_DIRS.
+ */
 export async function discoverLoginPath(
 	env: NodeJS.ProcessEnv = process.env,
 	runner: LoginPathRunner = defaultLoginPathRunner,
 ): Promise<string> {
-	const shell = env.SHELL || "/bin/zsh";
-	return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+	const candidates: string[] = [];
+	
+	// Try SHELL env var first if set
+	if (env.SHELL) {
+		candidates.push(env.SHELL);
+	} else {
+		// SHELL is not set, try to get passwd shell
+		const passwdShell = await getPasswdShell(runner);
+		if (passwdShell) candidates.push(passwdShell);
+	}
+	
+	// Add known fallback shells (no /bin/zsh)
+	candidates.push("/bin/bash", "/bin/sh");
+	
+	// Try each shell candidate
+	for (const shell of candidates) {
+		try {
+			return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+		} catch {
+			// This shell didn't work, try the next one
+		}
+	}
+	
+	// No login shell could be spawned; return empty so mergePathEntries uses FALLBACK_PATH_DIRS
+	return "";
 }
 
 export async function resolvePath(options: ResolvePathOptions): Promise<string> {
@@ -187,9 +237,16 @@ export async function resolvePath(options: ResolvePathOptions): Promise<string> 
 	const userHome = options.home;
 	let loginPath = "";
 	if (runtime?.path !== undefined) loginPath = runtime.path.join(":");
-	else if (runtime?.inheritLoginPath !== false)
-		loginPath =
-			options.loginPath ?? (await discoverLoginPath(shellEnv, options.loginPathRunner ?? defaultLoginPathRunner));
+	else if (runtime?.inheritLoginPath !== false) {
+		try {
+			loginPath =
+				options.loginPath ??
+				(await discoverLoginPath(shellEnv, options.loginPathRunner ?? defaultLoginPathRunner));
+		} catch {
+			// Login path discovery failed; use empty path so FALLBACK_PATH_DIRS apply
+			loginPath = "";
+		}
+	}
 	return mergePathEntries(options.binDir, userHome, loginPath).join(":");
 }
 

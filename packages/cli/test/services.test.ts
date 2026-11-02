@@ -4,8 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	BROKER_UNIT,
+	FALLBACK_PATH_DIRS,
 	GATEWAY_UNIT,
+	discoverLoginPath,
 	installServices,
+	mergePathEntries,
+	resolvePath,
 	restartStackCommands,
 	serviceSpecs,
 	systemdUnitName,
@@ -188,4 +192,92 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 	}
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
+});
+
+test("discoverLoginPath uses SHELL env when available", async () => {
+	const runner: Parameters<typeof discoverLoginPath>[1] = (cmd) => {
+		if (cmd[0] === "/custom/shell") return Promise.resolve("/custom/bin");
+		return Promise.reject(new Error("unexpected shell"));
+	};
+	const path = await discoverLoginPath({ SHELL: "/custom/shell" }, runner);
+	expect(path).toBe("/custom/bin");
+});
+
+test("discoverLoginPath falls back to passwd shell when SHELL is unset", async () => {
+	let callCount = 0;
+	const runner: Parameters<typeof discoverLoginPath>[1] = (cmd) => {
+		callCount++;
+		// getent call returns a passwd line with /bin/bash as shell
+		if (cmd[0] === "getent") return Promise.resolve("user:x:1000:1000:User:/home/user:/bin/bash");
+		// Then /bin/bash succeeds
+		if (cmd[0] === "/bin/bash") return Promise.resolve("/usr/local/bin:/usr/bin:/bin");
+		return Promise.reject(new Error("unexpected command"));
+	};
+	const path = await discoverLoginPath({}, runner);
+	expect(path).toBe("/usr/local/bin:/usr/bin:/bin");
+	expect(callCount).toBe(2); // getent then /bin/bash
+});
+
+test("discoverLoginPath falls back to /bin/bash when passwd shell fails", async () => {
+	const runner: Parameters<typeof discoverLoginPath>[1] = (cmd) => {
+		// getent fails
+		if (cmd[0] === "getent") return Promise.reject(new Error("getent not available"));
+		// /bin/bash succeeds
+		if (cmd[0] === "/bin/bash") return Promise.resolve("/usr/bin:/bin");
+		return Promise.reject(new Error("unexpected shell"));
+	};
+	const path = await discoverLoginPath({}, runner);
+	expect(path).toBe("/usr/bin:/bin");
+});
+
+test("discoverLoginPath falls back to /bin/sh when /bin/bash fails", async () => {
+	const runner: Parameters<typeof discoverLoginPath>[1] = (cmd) => {
+		// getent fails
+		if (cmd[0] === "getent") return Promise.reject(new Error("getent not available"));
+		// /bin/bash fails
+		if (cmd[0] === "/bin/bash") return Promise.reject(new Error("/bin/bash not found"));
+		// /bin/sh succeeds
+		if (cmd[0] === "/bin/sh") return Promise.resolve("/bin");
+		return Promise.reject(new Error("unexpected shell"));
+	};
+	const path = await discoverLoginPath({}, runner);
+	expect(path).toBe("/bin");
+});
+
+test("discoverLoginPath returns empty string when no shell is available", async () => {
+	const runner: Parameters<typeof discoverLoginPath>[1] = () =>
+		Promise.reject(new Error("all shells failed"));
+	const path = await discoverLoginPath({}, runner);
+	expect(path).toBe("");
+});
+
+test("resolvePath uses FALLBACK_PATH_DIRS when login path discovery fails", async () => {
+	const home = "/home/testuser";
+	const binDir = "/opt/gajaeway/bin";
+	const runner: Parameters<typeof resolvePath>[0]["loginPathRunner"] = () =>
+		Promise.reject(new Error("discovery failed"));
+	const path = await resolvePath({
+		home,
+		binDir,
+		loginPathRunner: runner,
+		env: {},
+	});
+	// Should include binDir and FALLBACK_PATH_DIRS even though login path discovery failed
+	const entries = path.split(":");
+	expect(entries).toContain(binDir);
+	for (const dir of FALLBACK_PATH_DIRS) {
+		expect(entries).toContain(dir);
+	}
+});
+
+test("mergePathEntries uses empty login path to include FALLBACK_PATH_DIRS", () => {
+	const binDir = "/opt/gajaeway/bin";
+	const home = "/home/testuser";
+	const entries = mergePathEntries(binDir, home, "");
+	// Empty login path should still include FALLBACK_PATH_DIRS
+	expect(entries).toContain("/usr/local/bin");
+	expect(entries).toContain("/usr/bin");
+	expect(entries).toContain("/bin");
+	expect(entries).toContain("/usr/sbin");
+	expect(entries).toContain("/sbin");
 });
