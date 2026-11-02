@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	BROKER_UNIT,
+	discoverLoginPath,
 	FALLBACK_PATH_DIRS,
 	GATEWAY_UNIT,
-	discoverLoginPath,
 	installServices,
 	mergePathEntries,
 	resolvePath,
@@ -245,8 +245,7 @@ test("discoverLoginPath falls back to /bin/sh when /bin/bash fails", async () =>
 });
 
 test("discoverLoginPath returns empty string when no shell is available", async () => {
-	const runner: Parameters<typeof discoverLoginPath>[1] = () =>
-		Promise.reject(new Error("all shells failed"));
+	const runner: Parameters<typeof discoverLoginPath>[1] = () => Promise.reject(new Error("all shells failed"));
 	const path = await discoverLoginPath({}, runner);
 	expect(path).toBe("");
 });
