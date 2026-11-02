@@ -204,7 +204,7 @@ export async function discoverLoginPath(
 	runner: LoginPathRunner = defaultLoginPathRunner,
 ): Promise<string> {
 	const candidates: string[] = [];
-	
+
 	// Try SHELL env var first if set
 	if (env.SHELL) {
 		candidates.push(env.SHELL);
@@ -213,10 +213,10 @@ export async function discoverLoginPath(
 		const passwdShell = await getPasswdShell(runner);
 		if (passwdShell) candidates.push(passwdShell);
 	}
-	
+
 	// Add known fallback shells (no /bin/zsh)
 	candidates.push("/bin/bash", "/bin/sh");
-	
+
 	// Try each shell candidate
 	for (const shell of candidates) {
 		try {
@@ -225,7 +225,7 @@ export async function discoverLoginPath(
 			// This shell didn't work, try the next one
 		}
 	}
-	
+
 	// No login shell could be spawned; return empty so mergePathEntries uses FALLBACK_PATH_DIRS
 	return "";
 }
@@ -240,8 +240,7 @@ export async function resolvePath(options: ResolvePathOptions): Promise<string> 
 	else if (runtime?.inheritLoginPath !== false) {
 		try {
 			loginPath =
-				options.loginPath ??
-				(await discoverLoginPath(shellEnv, options.loginPathRunner ?? defaultLoginPathRunner));
+				options.loginPath ?? (await discoverLoginPath(shellEnv, options.loginPathRunner ?? defaultLoginPathRunner));
 		} catch {
 			// Login path discovery failed; use empty path so FALLBACK_PATH_DIRS apply
 			loginPath = "";
