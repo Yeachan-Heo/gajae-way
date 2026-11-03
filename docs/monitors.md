@@ -97,6 +97,10 @@ The gateway's job is the second line: detecting that native compaction silently 
 
 An armed size roll is persisted with its session epoch and observed token count, so it survives a gateway restart. It is restored only for the same live epoch and still revalidates the current threshold before rolling.
 
+A size roll waits for saved authoring turns on the current session while any batch member remains open for ordinary retry. Retained terminal pointers do not delay a roll; given-up turns can still recover late results from their original session and operation.
+
+An operator retry after a roll also checks the saved operation on its original session before authoring fresh: readable results are harvested, and running turns or temporarily unreadable results remain retryable without resending.
+
 With `contextRollTokens` set, an answered fresh authoring turn whose observed session context is at or above the current threshold arms `context_budget`. The next fresh dispatch rechecks the current monitor configuration against the last observed count before starting a new session epoch seeded with the monitor digest described below. Clearing the threshold or raising it above that count disarms the roll, including for a dispatch already queued behind another turn. This is not a hard limit: usage is sampled only after the turn, and a stale reading can still cause a roll immediately after native compaction reduced the actual context. Harvesting an already accepted turn does not arm a size roll; unavailable context usage leaves the answered turn successful without arming one. The safety-state projection exposes the latest observed count as `lastContextTokens`, cleared on roll. The field is unset by default, preserving native compaction and existing failure-recovery behavior. Lower carried context reduces cost per call, but loses in-session memory beyond the digest. A monitor whose procedure keeps state only in its session should persist that state on disk before opting in.
 
 For failure recovery, the gateway classifies each authoring failure onto exactly three axes:

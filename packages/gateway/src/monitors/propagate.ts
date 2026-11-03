@@ -876,7 +876,7 @@ export class MonitorPropagator {
 	 * unreadable, can be discarded; a completed operation whose result is readable
 	 * is resumed under its original op-ref.
 	 */
-	async #exhaustedTurnDisposition(row: MonitorEventDbRow): Promise<ExhaustedTurnDisposition> {
+	async #exhaustedTurnDisposition(row: MonitorEventDbRow, ownedLeaseId?: string): Promise<ExhaustedTurnDisposition> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 		if (raw === undefined) return { kind: "terminal", raw };
 		const turn = parseAuthoringTurnPointer(raw);
@@ -900,13 +900,14 @@ export class MonitorPropagator {
 		const related: MonitorEventDbRow[] = [];
 		for (const eventId of turn.eventIds) {
 			const current = this.#database.monitors.eventGet(eventId);
+			const liveLeaseId = this.#database.monitors.eventLiveLeaseOwner(eventId, this.#now());
 			if (
 				!current ||
 				current.monitor_id !== row.monitor_id ||
 				current.event_type !== row.event_type ||
 				(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
 				this.#database.core.metaGet(authoringTurnKey(eventId)) !== raw ||
-				this.#database.monitors.eventLiveLeaseOwner(eventId, this.#now())
+				(liveLeaseId !== undefined && liveLeaseId !== ownedLeaseId)
 			)
 				return { kind: "hold", reason: "unresolved" };
 			related.push(current);
@@ -1078,13 +1079,15 @@ export class MonitorPropagator {
 			(resumeTurn.eventIds.length !== eventIds.length || !resumeTurn.eventIds.every((id) => eventIds.includes(id)))
 		)
 			return;
-		const savedTurnMatches = () =>
-			!resumeTurn ||
-			resumeTurn.eventIds.every((eventId) => {
+		const savedTurnMatches = () => {
+			const turn = resumeTurn;
+			if (!turn) return true;
+			return turn.eventIds.every((eventId) => {
 				const raw = this.#database.core.metaGet(authoringTurnKey(eventId));
 				const saved = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
-				return saved !== undefined && sameAuthoringTurn(saved, resumeTurn);
+				return saved !== undefined && sameAuthoringTurn(saved, turn);
 			});
+		};
 		const resumeRowsSafe = (candidateRows: readonly MonitorEventDbRow[]) => {
 			if (!resumeTurn) return true;
 			const first = candidateRows[0];
@@ -1271,6 +1274,38 @@ export class MonitorPropagator {
 				readinessFailure = undefined;
 			};
 			try {
+				if (!resumeTurn) {
+					const liveSessionId = this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId;
+					for (const row of claimed) {
+						const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const saved = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+						// No binding row is not evidence of a superseded session (#187).
+						// An empty session ID after rotation is a real mismatch, however.
+						if (!saved || liveSessionId === undefined || saved.sessionId === liveSessionId) continue;
+						dispatchPhase = "request";
+						let report: StatusReport;
+						try {
+							report = await this.#sessionPort.status({
+								sessionId: saved.sessionId,
+								repo: this.#repo,
+								opRef: saved.opRef,
+							});
+						} catch {
+							throw new AuthoringResultUnavailableError("transport_error");
+						}
+						// A pointer written before a refused send need not name a created op.
+						if (report.status.status === "unknown") break;
+						if (
+							saved.eventIds.length !== claimed.length ||
+							!claimed.every((member) => saved.eventIds.includes(member.event_id))
+						)
+							throw new AuthoringResultUnavailableError("output_pending");
+						const disposition = await this.#exhaustedTurnDisposition(row, leaseId);
+						if (disposition.kind === "resume") resumeTurn = disposition.turn;
+						else if (disposition.kind !== "terminal") throw new AuthoringResultUnavailableError("output_pending");
+						break;
+					}
+				}
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
 				const digest = resumeTurn
@@ -2107,6 +2142,25 @@ export class MonitorPropagator {
 				state.pendingRoll = undefined;
 				console.info(
 					`monitor session size roll disarmed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${state.lastContextTokens ?? "unknown"}/${contextRollTokens ?? "unset"}`,
+				);
+				return undefined;
+			}
+			// Only open work can be redispatched through the live binding. Retained
+			// terminal pointers recover by their own session and must not block a roll.
+			const sessionId = this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId;
+			const savedTurns = new Set<string>();
+			if (sessionId) {
+				const openEventIds = new Set(this.#database.monitors.eventsOpen().map((row) => row.event_id));
+				for (const key of this.#database.core.metaKeysInRange("monitor_authoring_turn:", "monitor_authoring_turn;")) {
+					const raw = this.#database.core.metaGet(key);
+					const turn = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+					if (turn?.sessionId === sessionId && turn.eventIds.some((eventId) => openEventIds.has(eventId)))
+						savedTurns.add(turn.opRef);
+				}
+			}
+			if (savedTurns.size) {
+				console.info(
+					`monitor session size roll deferred for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget saved_turns=${savedTurns.size}`,
 				);
 				return undefined;
 			}

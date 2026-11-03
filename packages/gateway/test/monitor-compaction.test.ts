@@ -25,13 +25,20 @@ import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropaga
 import { MonitorRegistry } from "../src/monitors/registry";
 import {
 	BrokerSessionPort,
+	LastAssistantUnreadableError,
 	type SessionContextUsage,
 	SessionRequestTimeoutError,
 	SessionTerminalError,
 } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
-import { initializeTestBrokerAuthority, scriptedRelay, sessionPortFromScript } from "./session-port.fake";
+import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, MONITOR_EVENT_MAX_OPEN_AGE_MS } from "../src/store/groups/monitors";
+import {
+	attachTestBrokerOwnership,
+	initializeTestBrokerAuthority,
+	scriptedRelay,
+	sessionPortFromScript,
+} from "./session-port.fake";
 
 /**
  * Issue #68, final design: native gjc auto-compaction is the primary defence
@@ -394,6 +401,441 @@ for (const tokens of [10_000, 12_000]) {
 			expect(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)).toBeUndefined();
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			expect(turns[2]?.sessionId).toBe("event-session-e1");
+			database.close();
+		} finally {
+			log.mockRestore();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const restart of [false, true]) {
+	for (const result of ["readable", "definitively absent", "temporarily absent", "running"] as const) {
+		test(`retry of an operator-settled saved turn after a size roll uses its ${result} result${restart ? " after restart" : ""}`, async () => {
+			const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-settled-budget-"));
+			try {
+				let observeUsage = false;
+				const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+					contextUsage: () => (observeUsage ? { percent: 60, tokens: 12_000 } : undefined),
+				});
+				attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+				const monitor = registry.add({
+					name: "settled-budget",
+					trigger: { kind: "cron", schedule: "0 */6 * * *" },
+					eventTypes: ["budget.tick"],
+					burstPolicy: "serialize",
+					contextRollTokens: 10_000,
+				});
+				const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+				const fetchLastAssistant = sessionPort.fetchLastAssistant.bind(sessionPort);
+				sessionPort.fetchLastAssistant = async () => {
+					throw new LastAssistantUnreadableError("last_assistant_no_page");
+				};
+				const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+				sessionPort.fetchLastAssistant = fetchLastAssistant;
+				const pointerKey = `monitor_authoring_turn:${eventA}`;
+				const pointer = database.core.metaGet(pointerKey);
+				expect(pointer).toBeDefined();
+				expect(pipeline.settle(eventA).done).toBe(true);
+				observeUsage = true;
+				await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+				observeUsage = false;
+				let active = pipeline;
+				if (restart) {
+					pipeline.dispose();
+					active = new MonitorPropagator({
+						database,
+						registry,
+						sessionPort,
+						memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+						delivery: new DeliveryService(database),
+						emit: () => {},
+					});
+				}
+				await active.submitAwaitable(monitor.monitorId, "budget.tick", {});
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+				expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
+				expect(turns.at(-1)?.prompt).toContain("Context compaction");
+				expect(database.core.metaGet(pointerKey)).toBe(pointer);
+				expect(database.monitors.eventGet(eventA)?.stage).toBe("failed_no_retry");
+				const saved = JSON.parse(pointer!) as { sessionId: string; opRef: string };
+				const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+				expect(database.core.metaGet(handoffKey)).toBeUndefined();
+				const handoff = database.core.metaGet(handoffKey);
+				const fetchWorkerOutput = sessionPort.fetchWorkerOutput.bind(sessionPort);
+				const status = sessionPort.status.bind(sessionPort);
+				if (result === "definitively absent")
+					sessionPort.setWorkerOutputFixture(saved.opRef, {
+						exitCode: 0,
+						stdout: JSON.stringify({
+							ok: true,
+							result: { kind: "prompt", clientRef: saved.opRef, status: "terminal_ok", receiptState: "absent" },
+						}),
+						stderr: "",
+					});
+				if (result === "temporarily absent")
+					sessionPort.fetchWorkerOutput = async (input) =>
+						input.opRef === saved.opRef ? { status: "absent", code: "transport_error" } : fetchWorkerOutput(input);
+				if (result === "running")
+					sessionPort.status = async (input) =>
+						input.opRef === saved.opRef
+							? { operationRef: saved.opRef, status: { status: "in_flight" }, summaryCompleted: false }
+							: status(input);
+				const sends = sessionPort.sendAttempts.length;
+				const binds = sessionPort.binds.length;
+				const outputReads = sessionPort.workerOutputReads.length;
+				const requests = spyOn(sessionPort, "request");
+				expect(active.retry(eventA).done).toBe(true);
+				await active.reconcile();
+				if (result === "definitively absent") {
+					for (let attempt = 0; attempt < 100 && database.monitors.authoredOutput(eventA) === undefined; attempt++)
+						await Bun.sleep(1);
+					expect(requests).toHaveBeenCalledTimes(1);
+					expect(sessionPort.sendAttempts).toHaveLength(sends + 1);
+					expect(sessionPort.sendAttempts.at(-1)?.sessionId).toBe("event-session-e1");
+					expect(database.monitors.authoredOutput(eventA)).toBe(`note for ${eventA}`);
+				} else {
+					expect(requests).not.toHaveBeenCalled();
+					expect(sessionPort.sendAttempts).toHaveLength(sends);
+					expect(sessionPort.binds).toHaveLength(binds);
+					if (result !== "readable") {
+						expect(database.monitors.eventGet(eventA)?.stage).toBe("failed");
+						expect(database.monitors.failure(eventA)?.code).toBe("authoring_result_unreadable");
+						expect(database.core.metaGet(pointerKey)).toBe(pointer);
+						expect(database.monitors.authoredOutput(eventA)).toBeUndefined();
+						sessionPort.fetchWorkerOutput = fetchWorkerOutput;
+						sessionPort.status = status;
+						expect(active.retry(eventA).done).toBe(true);
+						await active.reconcile();
+					}
+					expect(database.monitors.authoredOutput(eventA)).toBe(`note for ${eventA}`);
+					expect(requests).not.toHaveBeenCalled();
+					expect(sessionPort.sendAttempts).toHaveLength(sends);
+					const reads = sessionPort.workerOutputReads.slice(outputReads);
+					expect(reads).not.toHaveLength(0);
+					expect(reads.every((input) => input.sessionId === saved.sessionId && input.opRef === saved.opRef)).toBe(true);
+				}
+				requests.mockRestore();
+				expect(database.core.metaGet(pointerKey)).toBeUndefined();
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+				expect(database.core.metaGet(handoffKey)).toBe(handoff);
+				active.dispose();
+				database.close();
+			} finally {
+				await rm(directory, { recursive: true, force: true });
+			}
+		});
+	}
+}
+
+test("a given-up saved turn does not defer a size roll and its late result is harvested on its original session", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-given-up-budget-"));
+	try {
+		let clock = Date.now();
+		let observeUsage = false;
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			now: () => clock,
+			contextUsage: () => (observeUsage ? { percent: 60, tokens: 12_000 } : undefined),
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		const monitor = registry.add({
+			name: "given-up-budget",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		const fetchLastAssistant = sessionPort.fetchLastAssistant.bind(sessionPort);
+		sessionPort.fetchLastAssistant = async () => {
+			throw new LastAssistantUnreadableError("last_assistant_no_page");
+		};
+		const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		sessionPort.fetchLastAssistant = fetchLastAssistant;
+		const pointerKey = `monitor_authoring_turn:${eventA}`;
+		const pointer = database.core.metaGet(pointerKey);
+		const saved = JSON.parse(pointer!) as { sessionId: string; opRef: string };
+		const fetchWorkerOutput = sessionPort.fetchWorkerOutput.bind(sessionPort);
+		sessionPort.fetchWorkerOutput = async (input) =>
+			input.opRef === saved.opRef ? { status: "absent", code: "transport_error" } : fetchWorkerOutput(input);
+		for (let retry = 0; retry < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; retry++) {
+			clock += 13 * 60 * 60_000;
+			await pipeline.reconcile();
+		}
+		clock += MONITOR_EVENT_MAX_OPEN_AGE_MS + 1;
+		await pipeline.reconcile();
+		expect(database.monitors.eventGet(eventA)?.stage).toBe("failed_no_retry");
+		expect(database.monitors.failure(eventA)?.code).toBe("authoring_turn_unresolved");
+		expect(database.core.metaGet(pointerKey)).toBe(pointer);
+		observeUsage = true;
+		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		observeUsage = false;
+		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(turns.at(-1)?.prompt).toContain("Context compaction");
+		expect(database.core.metaGet(pointerKey)).toBe(pointer);
+		sessionPort.fetchWorkerOutput = fetchWorkerOutput;
+		const requests = spyOn(sessionPort, "request");
+		const sends = sessionPort.sendAttempts.length;
+		const statusReads = sessionPort.statusReads.length;
+		const outputReads = sessionPort.workerOutputReads.length;
+		await pipeline.reconcile();
+		expect(requests).not.toHaveBeenCalled();
+		requests.mockRestore();
+		expect(sessionPort.sendAttempts).toHaveLength(sends);
+		expect(database.monitors.authoredOutput(eventA)).toBe(`note for ${eventA}`);
+		expect(database.core.metaGet(pointerKey)).toBeUndefined();
+		const lateStatusReads = sessionPort.statusReads.slice(statusReads).filter((input) => input.opRef === saved.opRef);
+		expect(lateStatusReads).not.toHaveLength(0);
+		expect(lateStatusReads.every((input) => input.sessionId === saved.sessionId)).toBe(true);
+		expect(sessionPort.workerOutputReads.slice(outputReads)).not.toHaveLength(0);
+		expect(
+			sessionPort.workerOutputReads
+				.slice(outputReads)
+				.every((input) => input.sessionId === saved.sessionId && input.opRef === saved.opRef),
+		).toBe(true);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("operator retry harvests its old session while a rolled epoch has no bound session after bind failure", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-unbound-retry-"));
+	try {
+		let observeUsage = false;
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			contextUsage: () => (observeUsage ? { percent: 60, tokens: 12_000 } : undefined),
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		const monitor = registry.add({
+			name: "unbound-retry",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+		const fetchLastAssistant = sessionPort.fetchLastAssistant.bind(sessionPort);
+		sessionPort.fetchLastAssistant = async () => {
+			throw new LastAssistantUnreadableError("last_assistant_no_page");
+		};
+		const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		sessionPort.fetchLastAssistant = fetchLastAssistant;
+		const pointerKey = `monitor_authoring_turn:${eventA}`;
+		const saved = JSON.parse(database.core.metaGet(pointerKey)!) as { sessionId: string; opRef: string };
+		expect(pipeline.settle(eventA).done).toBe(true);
+		observeUsage = true;
+		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		observeUsage = false;
+		const bind = sessionPort.bind.bind(sessionPort);
+		sessionPort.bind = async () => {
+			throw new Error("session bind failed after rotation");
+		};
+		const failed = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(database.monitors.failure(failed)?.code).toBe("session_bind_failed");
+		expect(database.bindings.getSessionRecord(sessionKey)).toMatchObject({ epoch: 1, sessionId: "" });
+		const handoff = database.core.metaGet(handoffKey);
+		expect(JSON.parse(handoff!)).toEqual({ epoch: 1, reason: "context_budget" });
+		expect(pipeline.settle(failed).done).toBe(true);
+		const requests = spyOn(sessionPort, "request");
+		const binds = spyOn(sessionPort, "bind");
+		const sends = sessionPort.sendAttempts.length;
+		const outputReads = sessionPort.workerOutputReads.length;
+		expect(pipeline.retry(eventA).done).toBe(true);
+		await pipeline.reconcile();
+		expect(database.monitors.authoredOutput(eventA)).toBe(`note for ${eventA}`);
+		expect(requests).not.toHaveBeenCalled();
+		expect(binds).not.toHaveBeenCalled();
+		expect(sessionPort.sendAttempts).toHaveLength(sends);
+		expect(database.bindings.getSessionRecord(sessionKey)).toMatchObject({ epoch: 1, sessionId: "" });
+		expect(database.core.metaGet(handoffKey)).toBe(handoff);
+		expect(database.core.metaGet(pointerKey)).toBeUndefined();
+		const reads = sessionPort.workerOutputReads.slice(outputReads);
+		expect(reads).not.toHaveLength(0);
+		expect(reads.every((input) => input.sessionId === saved.sessionId && input.opRef === saved.opRef)).toBe(true);
+		requests.mockRestore();
+		binds.mockRestore();
+		sessionPort.bind = bind;
+		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
+		expect(turns.at(-1)?.prompt).toContain("Context compaction");
+		expect(database.core.metaGet(handoffKey)).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const allTerminal of [false, true]) {
+	test(`a saved shared batch ${allTerminal ? "with all members terminal does not defer a size roll" : "with one open member defers until the reopened batch is harvested"}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-shared-budget-"));
+		try {
+			let observeUsage = false;
+			const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+				contextUsage: () => (observeUsage ? { percent: 60, tokens: 12_000 } : undefined),
+			});
+			attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+			const monitor = registry.add({
+				name: "shared-budget",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "coalesce",
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			const fetchLastAssistant = sessionPort.fetchLastAssistant.bind(sessionPort);
+			sessionPort.fetchLastAssistant = async () => {
+				throw new LastAssistantUnreadableError("last_assistant_no_page");
+			};
+			const first = pipeline.submit(monitor.monitorId, "budget.tick", { member: 1 });
+			const second = pipeline.submit(monitor.monitorId, "budget.tick", { member: 2 });
+			for (let attempt = 0; attempt < 100 && database.monitors.eventGet(second)?.stage !== "failed"; attempt++)
+				await Bun.sleep(10);
+			expect(database.monitors.eventGet(second)?.stage).toBe("failed");
+			sessionPort.fetchLastAssistant = fetchLastAssistant;
+			const pointer = database.core.metaGet(`monitor_authoring_turn:${first}`);
+			expect(JSON.parse(pointer!).eventIds.toSorted()).toEqual([first, second].toSorted());
+			expect(database.core.metaGet(`monitor_authoring_turn:${second}`)).toBe(pointer);
+			expect(pipeline.settle(first).done).toBe(true);
+			if (allTerminal) expect(pipeline.settle(second).done).toBe(true);
+			registry.update({ monitorId: monitor.monitorId, burstPolicy: "serialize" });
+			observeUsage = true;
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "B" });
+			observeUsage = false;
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "C" });
+			expect(database.core.metaGet(`monitor_authoring_turn:${first}`)).toBe(pointer);
+			expect(database.core.metaGet(`monitor_authoring_turn:${second}`)).toBe(pointer);
+			if (allTerminal) {
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+				expect(turns.at(-1)?.prompt).toContain("Context compaction");
+				const sends = sessionPort.sendAttempts.length;
+				const requests = spyOn(sessionPort, "request");
+				expect(pipeline.retry(first).done).toBe(true);
+				await pipeline.reconcile();
+				for (let attempt = 0; attempt < 100 && database.monitors.authoredOutput(second) === undefined; attempt++)
+					await Bun.sleep(1);
+				expect(database.monitors.authoredOutput(first)).toBe(`note for ${first}`);
+				expect(database.monitors.authoredOutput(second)).toBe(`note for ${second}`);
+				expect(requests).not.toHaveBeenCalled();
+				requests.mockRestore();
+				expect(sessionPort.sendAttempts).toHaveLength(sends);
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+			} else {
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+				expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+				expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+				const sends = sessionPort.sendAttempts.length;
+				// Reopen the settled sibling through the operator API so existing
+				// whole-batch recovery can harvest both original results together.
+				expect(pipeline.retry(first).done).toBe(true);
+				await pipeline.reconcile();
+				expect(database.monitors.authoredOutput(first)).toBe(`note for ${first}`);
+				expect(database.monitors.authoredOutput(second)).toBe(`note for ${second}`);
+				expect(sessionPort.sendAttempts).toHaveLength(sends);
+				await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+				expect(turns.at(-1)?.prompt).toContain("Context compaction");
+			}
+			database.close();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const scenario of ["retry", "fresh dispatch before retry", "restart"] as const) {
+	test(`a size roll defers until a saved terminal authoring turn is harvested: ${scenario}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-saved-turn-budget-"));
+		const log = spyOn(console, "info");
+		try {
+			let clock = Date.now();
+			let observeUsage = false;
+			const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+				now: () => clock,
+				contextUsage: () => (observeUsage ? { percent: 60, tokens: 12_000 } : undefined),
+			});
+			attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+			const monitor = registry.add({
+				name: "saved-turn-budget",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			const armKey = `monitor_context_budget_arm:${sessionKey}`;
+			const fetchLastAssistant = sessionPort.fetchLastAssistant.bind(sessionPort);
+			sessionPort.fetchLastAssistant = async () => {
+				throw new LastAssistantUnreadableError("last_assistant_no_page");
+			};
+			const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "A" });
+			const pointerKey = `monitor_authoring_turn:${eventA}`;
+			const pointer = database.core.metaGet(pointerKey);
+			expect(pointer).toBeDefined();
+			const saved = JSON.parse(pointer!) as { sessionId: string; opRef: string };
+			expect(
+				(await sessionPort.status({ sessionId: saved.sessionId, repo: "", opRef: saved.opRef })).status.status,
+			).toBe("terminal_ok");
+			expect(database.monitors.failure(eventA)?.code).toBe("authoring_result_unreadable");
+			sessionPort.fetchLastAssistant = fetchLastAssistant;
+			observeUsage = true;
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "B" });
+			observeUsage = false;
+			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+			const arm = database.core.metaGet(armKey);
+			expect(JSON.parse(arm!)).toEqual({ epoch: 0, tokens: 12_000 });
+			let active = pipeline;
+			if (scenario === "restart") {
+				pipeline.dispose();
+				active = new MonitorPropagator({
+					database,
+					registry,
+					sessionPort,
+					memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+					delivery: new DeliveryService(database),
+					emit: () => {},
+					now: () => clock,
+				});
+			}
+			if (scenario === "fresh dispatch before retry") {
+				const eventC = await active.submitAwaitable(monitor.monitorId, "budget.tick", { event: "C" });
+				expect(database.monitors.authoredOutput(eventC)).toBe(`note for ${eventC}`);
+				expect(turns.at(-1)?.sessionId).toBe("event-session-e0");
+				expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+				expect(database.core.metaGet(pointerKey)).toBe(pointer);
+				expect(database.core.metaGet(armKey)).toBe(arm);
+				expect(active.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+			}
+			const requests = spyOn(sessionPort, "request");
+			const sendsBeforeRetry = sessionPort.sendAttempts.length;
+			clock += 10 * 60_000 + 1;
+			await active.reconcile();
+			expect(requests).not.toHaveBeenCalled();
+			requests.mockRestore();
+			expect(sessionPort.sendAttempts).toHaveLength(sendsBeforeRetry);
+			expect(database.monitors.authoredOutput(eventA)).toBe(`note for ${eventA}`);
+			expect(database.core.metaGet(pointerKey)).toBeUndefined();
+			expect(database.core.metaGet(armKey)).toBe(arm);
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			expect(active.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+			expect(
+				turns.every((turn) => turn.sessionId === "event-session-e0" && !turn.prompt.includes("Context compaction")),
+			).toBe(true);
+			expect(log.mock.calls.filter(([line]) => String(line).includes("monitor session size roll deferred"))).toEqual(
+				Array.from({ length: scenario === "fresh dispatch before retry" ? 2 : 1 }, () => [
+					`monitor session size roll deferred for ${sessionKey} (monitor ${monitor.monitorId}): reason=context_budget saved_turns=1`,
+				]),
+			);
+			await active.submitAwaitable(monitor.monitorId, "budget.tick", { event: "after-harvest" });
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+			expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
+			expect(turns.at(-1)?.prompt).toContain("Context compaction");
+			expect(turns.at(-1)?.prompt).toContain(`note for ${eventA}`);
+			expect(database.core.metaGet(armKey)).toBeUndefined();
+			active.dispose();
 			database.close();
 		} finally {
 			log.mockRestore();
