@@ -254,6 +254,7 @@ async function harness(
 		/** Per-turn response. Defaults to a valid note per claimed event. */
 		respond?: (prompt: string, index: number) => string;
 		contextUsage?: (sessionId: string) => SessionContextUsage | undefined;
+		sessionIdForBind?: (originKey: string, epoch: number) => string;
 		/**
 		 * When true for a session, the runtime refuses the prompt with the exact
 		 * `busy` envelope the real port surfaces after its bounded busy wait: the
@@ -277,7 +278,9 @@ async function harness(
 	const sessionPort = sessionPortFromScript({
 		// One session id per epoch: exactly what a real bind does, so a roll is
 		// observable as a new transcript.
-		bind: async (_key: string, epoch = 0) => ({ sessionId: `event-session-e${epoch}` }),
+		bind: async (key: string, epoch = 0) => ({
+			sessionId: options.sessionIdForBind?.(key, epoch) ?? `event-session-e${epoch}`,
+		}),
 		respond: async (sessionId: string, text: string) => {
 			const index = turns.length;
 			turns.push({ sessionId, prompt: text });
@@ -310,6 +313,831 @@ async function harness(
 		...(options.now ? { now: options.now } : {}),
 	});
 	return { database, registry, pipeline, turns, sessionPort };
+}
+
+async function retirementHarness(directory: string) {
+	const origins = new Map<string, number>();
+	const f = await harness(directory, {
+		contextUsage: (sessionId) => (sessionId.endsWith("-e0") ? { percent: 60, tokens: 12_000 } : undefined),
+		sessionIdForBind: (key, epoch) => {
+			if (!origins.has(key)) origins.set(key, origins.size);
+			const index = origins.get(key)!;
+			return `event-session${index === 0 ? "" : `-${index}`}-e${epoch}`;
+		},
+	});
+	attachTestBrokerOwnership(f.database, f.sessionPort, join(directory, "agent"));
+	const monitor = f.registry.add({
+		name: "retirement",
+		trigger: { kind: "cron", schedule: "0 * * * *" },
+		eventTypes: ["budget.tick"],
+		burstPolicy: "serialize",
+		contextRollTokens: 10_000,
+	});
+	const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+	const retiredKey = `monitor_retired_session:${sessionKey}:event-session-e0`;
+	const jobs = spyOn(f.sessionPort, "runningJobs");
+	const terminate = spyOn(f.sessionPort, "terminateHost");
+	const close = spyOn(f.sessionPort, "close");
+	const dispatch = () => f.pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+	return { ...f, monitor, sessionKey, retiredKey, jobs, terminate, close, dispatch };
+}
+
+for (const restart of [false, true]) {
+	test(`a size-rolled host without saved pointers is retired on the next fresh dispatch${restart ? " after restart" : ""}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-"));
+		const f = await retirementHarness(directory);
+		let active = f.pipeline;
+		const log = spyOn(console, "info").mockImplementation(() => {});
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(f.database.bindings.getSessionRecord(f.sessionKey)).toMatchObject({
+				epoch: 1,
+				sessionId: "event-session-e1",
+			});
+			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toEqual({
+				sessionId: "event-session-e0",
+				epoch: 0,
+				retiredAt: expect.any(Number),
+			});
+			if (restart) {
+				f.pipeline.dispose();
+				active = new MonitorPropagator({
+					database: f.database,
+					registry: f.registry,
+					sessionPort: f.sessionPort,
+					memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+					delivery: new DeliveryService(f.database),
+					emit: () => {},
+				});
+			}
+			await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
+			expect(f.jobs).toHaveBeenCalledTimes(1);
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(f.close.mock.calls[0]?.[0]).toEqual({ sessionId: "event-session-e0", repo: process.cwd() });
+			expect(f.sessionPort.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+			expect(log.mock.calls).toContainEqual([
+				`monitor retired session close for ${f.sessionKey}: session=event-session-e0 outcome=closed`,
+			]);
+		} finally {
+			log.mockRestore();
+			active.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("a size-rolled host waits for its tagged pointer to be harvested before retirement", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-pointer-"));
+	const f = await retirementHarness(directory);
+	try {
+		const fetchLastAssistant = f.sessionPort.fetchLastAssistant.bind(f.sessionPort);
+		f.sessionPort.fetchLastAssistant = async () => {
+			throw new LastAssistantUnreadableError("last_assistant_no_page");
+		};
+		const savedEvent = await f.dispatch();
+		f.sessionPort.fetchLastAssistant = fetchLastAssistant;
+		expect(f.pipeline.settle(savedEvent).done).toBe(true);
+		await f.dispatch();
+		await f.dispatch();
+		const pointerKey = `monitor_authoring_turn:${savedEvent}`;
+		expect(JSON.parse(f.database.core.metaGet(pointerKey)!)).toMatchObject({
+			sessionId: "event-session-e0",
+			sizeRolled: true,
+		});
+		await f.dispatch();
+		expect(f.jobs).not.toHaveBeenCalled();
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.close).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		expect(f.pipeline.retry(savedEvent).done).toBe(true);
+		await f.pipeline.reconcile();
+		expect(f.database.monitors.authoredOutput(savedEvent)).toBe(`note for ${savedEvent}`);
+		expect(f.database.core.metaGet(pointerKey)).toBeUndefined();
+		// Harvesting is not a fresh dispatch and must not sweep even after settling.
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.close).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		await f.dispatch();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const unavailable of [false, true]) {
+	test(`a size-rolled host waits for ${unavailable ? "an unreadable job probe" : "a running background job"} and retires once jobs drain`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-jobs-"));
+		const f = await retirementHarness(directory);
+		const log = spyOn(console, "info").mockImplementation(() => {});
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			f.sessionPort.hostJobs.set(
+				"event-session-e0",
+				unavailable ? new Error("host unavailable") : [{ id: "job-1", type: "bash", label: "background" }],
+			);
+			await f.dispatch();
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+			expect(log.mock.calls).toContainEqual([
+				`monitor retired session close for ${f.sessionKey}: session=event-session-e0 outcome=held:runningJobs_${unavailable ? "unavailable" : "busy"}`,
+			]);
+			f.sessionPort.hostJobs.set("event-session-e0", []);
+			await f.dispatch();
+			expect(f.jobs).toHaveBeenCalledTimes(2);
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+		} finally {
+			log.mockRestore();
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const code of [
+	"endpoint_stale",
+	"terminal_uncertain",
+	"close_refused",
+	"transport",
+	"not_found",
+	"operation_failed",
+	"session_unavailable",
+] as const) {
+	test(`size-rolled session close failure keeps its record code=${code}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-outcome-"));
+		const f = await retirementHarness(directory);
+		const log = spyOn(console, "info").mockImplementation(() => {});
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			// parseEnvelope surfaces broker error payloads as GjcCliError.details, not error.code.
+			f.sessionPort.closeOutcomes.set("event-session-e0", [
+				code === "transport"
+					? new GjcCliError("transport lost", 1, "")
+					: new GjcCliError("gjc sdk session.close reported failure", 0, "", { code }),
+			]);
+			await f.dispatch();
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toMatchObject({
+				phase: "closing",
+				closeStartedAt: expect.any(Number),
+			});
+			expect(log.mock.calls).toContainEqual([
+				`monitor retired session close for ${f.sessionKey}: session=event-session-e0 outcome=error:${code === "transport" ? "unknown" : code}`,
+			]);
+			// A prior attempt grants no authority when its host can no longer answer.
+			f.sessionPort.hostTurnRunning.set("event-session-e0", new Error("endpoint unavailable"));
+			f.sessionPort.hostQueueEmpty.set("event-session-e0", new Error("endpoint unavailable"));
+			f.sessionPort.hostJobs.set("event-session-e0", new Error("endpoint unavailable"));
+			f.jobs.mockClear();
+			await f.dispatch();
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(f.jobs).toHaveBeenCalledTimes(1);
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		} finally {
+			log.mockRestore();
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("size-rolled host retirement drops unsupported records without probing jobs", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-unsupported-"));
+	const f = await retirementHarness(directory);
+	const log = spyOn(console, "info").mockImplementation(() => {});
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		Object.defineProperty(f.sessionPort, "close", { value: undefined });
+		await f.dispatch();
+		expect(f.jobs).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+		expect(log.mock.calls).toContainEqual([
+			`monitor retired session close for ${f.sessionKey}: session=event-session-e0 outcome=unsupported`,
+		]);
+	} finally {
+		log.mockRestore();
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("retired-session sweeping does not touch another origin's pending retirement", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-origin-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		const record = f.database.core.metaGet(f.retiredKey);
+		const otherEvent = await f.pipeline.submitAwaitable(f.monitor.monitorId, "undeclared.tick", {});
+		expect(f.database.monitors.authoredOutput(otherEvent)).toBe(`note for ${otherEvent}`);
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.jobs).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBe(record);
+		await f.dispatch();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("retired-session sweeping ignores an inconsistent retirement record for the live binding", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-live-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		expect(f.database.bindings.getSessionRecord(f.sessionKey)?.sessionId).toBe("event-session-e0");
+		// Deliberately inconsistent durable input exercises the defensive live guard.
+		f.database.core.metaSet(
+			f.retiredKey,
+			JSON.stringify({ sessionId: "event-session-e0", epoch: 0, retiredAt: Date.now() }),
+		);
+		await f.dispatch();
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.jobs).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("retired-session sweeping ignores invalid authoring pointers but holds without a job probe", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-partial-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.database.core.metaSet("monitor_authoring_turn:malformed", "{invalid");
+		f.database.core.metaSet("monitor_authoring_turn:partial", JSON.stringify({ sessionId: "event-session-e0" }));
+		Object.defineProperty(f.sessionPort, "runningJobs", { value: undefined });
+		await f.dispatch();
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		Object.defineProperty(f.sessionPort, "runningJobs", { value: f.jobs });
+		await f.dispatch();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("monitor removal deletes retired-session records for declared and catch-all origins but keeps another monitor's records", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-remove-"));
+	const f = await retirementHarness(directory);
+	try {
+		for (const eventType of ["budget.tick", "undeclared:tick"]) {
+			await f.pipeline.submitAwaitable(f.monitor.monitorId, eventType, {});
+			await f.pipeline.submitAwaitable(f.monitor.monitorId, eventType, {});
+		}
+		const other = f.registry.add({ ...f.monitor, name: "other", eventTypes: ["other:tick"] });
+		await f.pipeline.submitAwaitable(other.monitorId, "other:tick", {});
+		await f.pipeline.submitAwaitable(other.monitorId, "other:tick", {});
+		const prefix = "monitor_retired_session:";
+		expect(f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`)).toHaveLength(3);
+		const otherKey = `${prefix}${originKey(monitorSessionOrigin(other.monitorId, "other:tick"))}:event-session-2-e0`;
+		expect(f.registry.remove(f.monitor.monitorId)).toBe(true);
+		expect(f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`)).toEqual([otherKey]);
+		expect(f.terminate).not.toHaveBeenCalled();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a size roll without a persisted session ID does not create an empty retirement record", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-empty-"));
+	const f = await harness(directory, { contextUsage: () => ({ percent: 60, tokens: 12_000 }) });
+	try {
+		const monitor = f.registry.add({
+			name: "empty-binding",
+			trigger: { kind: "cron", schedule: "0 * * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		await f.pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(f.database.bindings.getSessionRecord(sessionKey)?.sessionId).toBe("");
+		await f.pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(f.database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(f.database.core.metaKeysInRange("monitor_retired_session:", "monitor_retired_session;")).toEqual([]);
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("monitor removal during the last retired-session probe relinquishes close", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-remove-probe-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.sessionPort.beforeRunningJobs = () => {
+			f.registry.remove(f.monitor.monitorId);
+		};
+		await f.dispatch();
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.close).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("size-rolled retirement waits for an autonomous turn even after jobs drain", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-autonomous-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		expect(f.database.core.metaKeysInRange("monitor_authoring_turn:", "monitor_authoring_turn;")).toEqual([]);
+		f.sessionPort.hostTurnRunning.set("event-session-e0", true);
+		await f.dispatch();
+		expect(f.jobs).toHaveBeenCalledTimes(1);
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.close).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		f.sessionPort.hostTurnRunning.set("event-session-e0", false);
+		await f.dispatch();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const evidence of ["undefined", "throws", "missing"] as const) {
+	test(`size-rolled retirement holds when turnRunning ${evidence}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-turn-"));
+		const f = await retirementHarness(directory);
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			if (evidence === "missing") Object.defineProperty(f.sessionPort, "turnRunning", { value: undefined });
+			else
+				f.sessionPort.hostTurnRunning.set(
+					"event-session-e0",
+					evidence === "throws" ? new Error("context unavailable") : undefined,
+				);
+			const event = await f.dispatch();
+			expect(f.database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(f.close).not.toHaveBeenCalled();
+			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
+		} finally {
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const evidence of [false, "throws", "missing"] as const) {
+	test(`size-rolled retirement ${evidence === "missing" ? "allows an absent queue method" : `holds when queueEmpty is ${evidence}`}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-queue-"));
+		const f = await retirementHarness(directory);
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			if (evidence === "missing") Object.defineProperty(f.sessionPort, "queueEmpty", { value: undefined });
+			else
+				f.sessionPort.hostQueueEmpty.set(
+					"event-session-e0",
+					evidence === "throws" ? new Error("queue unavailable") : false,
+				);
+			await f.dispatch();
+			expect(f.close).toHaveBeenCalledTimes(evidence === "missing" ? 1 : 0);
+			if (evidence !== "missing") {
+				expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+				f.sessionPort.hostQueueEmpty.set("event-session-e0", true);
+				await f.dispatch();
+			}
+			expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+		} finally {
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const change of ["remove", "replace_record", "saved_pointer", "live_binding"] as const) {
+	test(`size-rolled close authorization refuses ${change} during the last job probe`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-guard-"));
+		const f = await retirementHarness(directory);
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			f.sessionPort.beforeRunningJobs = () => {
+				if (change === "remove") f.registry.remove(f.monitor.monitorId);
+				if (change === "replace_record") {
+					const record = JSON.parse(f.database.core.metaGet(f.retiredKey)!);
+					f.database.core.metaSet(f.retiredKey, JSON.stringify({ ...record, retiredAt: record.retiredAt + 1 }));
+				}
+				if (change === "saved_pointer")
+					f.database.core.metaSet(
+						"monitor_authoring_turn:late",
+						JSON.stringify({
+							sessionId: "event-session-e0",
+							opRef: "late-operation",
+							eventIds: ["late"],
+						}),
+					);
+				if (change === "live_binding")
+					spyOn(f.database.bindings, "getSessionRecord").mockReturnValue({ sessionId: "event-session-e0", epoch: 0 });
+			};
+			await f.dispatch();
+			expect(f.close).not.toHaveBeenCalled();
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(f.sessionPort.closes).toEqual([]);
+			if (change === "remove") expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+			else expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
+		} finally {
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
+	for (const evidence of ["undefined", "throws", "missing"] as const) {
+		if (probe === "queueEmpty" && evidence === "missing") continue;
+		test(`a previous close attempt holds when ${probe} ${evidence}`, async () => {
+			const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-prior-probe-"));
+			const f = await retirementHarness(directory);
+			try {
+				await f.dispatch();
+				await f.dispatch();
+				f.sessionPort.closeOutcomes.set("event-session-e0", [
+					new GjcCliError("close failed", 0, "", { code: "operation_failed" }),
+				]);
+				await f.dispatch();
+				expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
+				Object.defineProperty(f.sessionPort, probe, {
+					value:
+						evidence === "missing"
+							? undefined
+							: async () => {
+									if (evidence === "throws") throw new Error("probe unavailable");
+									return undefined;
+								},
+				});
+				const event = await f.dispatch();
+				expect(f.database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
+				expect(f.close).toHaveBeenCalledTimes(1);
+				expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+			} finally {
+				f.pipeline.dispose();
+				f.database.close();
+				await rm(directory, { recursive: true, force: true });
+			}
+		});
+	}
+}
+
+test("a successful close does not delete a retirement record changed while close was awaited", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-close-changed-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		let changed: string | undefined;
+		f.close.mockImplementation(async () => {
+			await Promise.resolve();
+			const record = JSON.parse(f.database.core.metaGet(f.retiredKey)!);
+			changed = JSON.stringify({ ...record, retiredAt: record.retiredAt + 1 });
+			f.database.core.metaSet(f.retiredKey, changed);
+		});
+		await f.dispatch();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(changed).toBeDefined();
+		expect(f.database.core.metaGet(f.retiredKey)).toBe(changed);
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const busy of ["turn", "queue", "jobs", "pointer", "binding"] as const) {
+	test(`a previous close attempt still holds on positive ${busy} evidence`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-closing-"));
+		const f = await retirementHarness(directory);
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			f.sessionPort.closeOutcomes.set("event-session-e0", [
+				new GjcCliError("close refused", 0, "", { code: "endpoint_stale" }),
+			]);
+			await f.dispatch();
+			if (busy === "turn") {
+				f.sessionPort.hostTurnRunning.set("event-session-e0", true);
+				f.sessionPort.hostJobs.set("event-session-e0", new Error("endpoint unavailable"));
+			}
+			if (busy === "queue") f.sessionPort.hostQueueEmpty.set("event-session-e0", false);
+			if (busy === "jobs") {
+				f.sessionPort.hostTurnRunning.set("event-session-e0", new Error("context unavailable"));
+				f.sessionPort.hostJobs.set("event-session-e0", [{ id: "new-job", type: "bash", label: "new" }]);
+			}
+			if (busy === "pointer")
+				f.database.core.metaSet(
+					"monitor_authoring_turn:late",
+					JSON.stringify({
+						sessionId: "event-session-e0",
+						opRef: "late-op",
+						eventIds: ["late"],
+					}),
+				);
+			if (busy === "binding")
+				spyOn(f.database.bindings, "getSessionRecord").mockReturnValue({ sessionId: "event-session-e0", epoch: 0 });
+			await f.dispatch();
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
+		} finally {
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("reopened retirement requires fresh idle evidence before invoking close (propagator gate; final close success is scripted)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reopen-"));
+	const f = await retirementHarness(directory);
+	let active = f.pipeline;
+	let database = f.database;
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.sessionPort.closeOutcomes.set("event-session-e0", [
+			new GjcCliError("close uncertain", 0, "", { code: "terminal_uncertain" }),
+		]);
+		await f.dispatch();
+		expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
+		active.dispose();
+		database.close();
+		database = await Store.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const port = sessionPortFromScript({
+			bind: async (_key, epoch = 0) => ({ sessionId: `event-session-e${epoch}` }),
+			respond: async (_sessionId, text) => echoNotes(text),
+		});
+		attachTestBrokerOwnership(database, port, join(directory, "agent"));
+		port.setSessionState("event-session-e0", { live: true, repo: "" });
+		port.setSessionState("event-session-e1", { live: true, repo: "" });
+		port.hostJobs.set("event-session-e0", new Error("restarted endpoint unavailable"));
+		port.hostTurnRunning.set("event-session-e0", new Error("restarted context unavailable"));
+		port.hostQueueEmpty.set("event-session-e0", new Error("restarted queue unavailable"));
+		const jobs = spyOn(port, "runningJobs");
+		const turn = spyOn(port, "turnRunning");
+		const queue = spyOn(port, "queueEmpty");
+		const close = spyOn(port, "close");
+		active = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: port,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+		});
+		const event = await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
+		expect(database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
+		expect(jobs).toHaveBeenCalledTimes(1);
+		expect(turn).toHaveBeenCalledTimes(1);
+		expect(queue).toHaveBeenCalledTimes(1);
+		expect(close).not.toHaveBeenCalled();
+		expect(database.core.metaGet(f.retiredKey)).toBeDefined();
+		port.hostTurnRunning.set("event-session-e0", false);
+		port.hostQueueEmpty.set("event-session-e0", true);
+		port.hostJobs.set("event-session-e0", []);
+		const idleEvent = await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
+		expect(database.monitors.authoredOutput(idleEvent)).toBe(`note for ${idleEvent}`);
+		expect(jobs).toHaveBeenCalledTimes(2);
+		expect(turn).toHaveBeenCalledTimes(2);
+		expect(queue).toHaveBeenCalledTimes(2);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(port.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
+		expect(database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		active.dispose();
+		database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("an independently dead retired host holds without non-signaling process-death evidence", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-dead-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.sessionPort.setSessionState("event-session-e0", { live: false });
+		// No job fixture: the fake must fail for a dead host instead of inventing an empty list.
+		expect(f.sessionPort.hostJobs.has("event-session-e0")).toBe(false);
+		await expect(f.sessionPort.runningJobs({ sessionId: "event-session-e0", repo: "" })).rejects.toThrow(
+			"host unavailable",
+		);
+		await f.dispatch();
+		expect(f.terminate).not.toHaveBeenCalled();
+		expect(f.sessionPort.closes).toEqual([]);
+		expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("retirement sweeps at most two records fairly and still authors every dispatch", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-bound-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.database.core.metaDelete(f.retiredKey);
+		const sessions = ["old-d", "old-b", "old-e", "old-c", "old-a"];
+		const prefix = `monitor_retired_session:${f.sessionKey}:`;
+		for (const [index, sessionId] of sessions.entries()) {
+			f.sessionPort.setSessionState(sessionId, { live: true });
+			f.sessionPort.hostJobs.set(sessionId, new Error("temporarily unavailable"));
+			f.database.core.metaSet(
+				`${prefix}${sessionId}`,
+				JSON.stringify({
+					sessionId,
+					epoch: 0,
+					retiredAt: index + 1,
+				}),
+			);
+		}
+		// A frozen clock must not let the first two unavailable records starve the rest.
+		f.pipeline.dispose();
+		const now = Date.now();
+		const active = new MonitorPropagator({
+			database: f.database,
+			registry: f.registry,
+			sessionPort: f.sessionPort,
+			now: () => now,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(f.database),
+			emit: () => {},
+		});
+		try {
+			for (let sweep = 0; sweep < 3; sweep++) {
+				f.jobs.mockClear();
+				const event = await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
+				expect(f.database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
+				expect(f.jobs).toHaveBeenCalledTimes(2);
+				expect(f.jobs.mock.calls.map(([input]) => input.sessionId)).toEqual(
+					sweep === 0 ? ["old-d", "old-b"] : sweep === 1 ? ["old-e", "old-c"] : ["old-a", "old-d"],
+				);
+			}
+			expect(f.terminate).not.toHaveBeenCalled();
+			for (const sessionId of sessions) {
+				expect(JSON.parse(f.database.core.metaGet(`${prefix}${sessionId}`)!)).toHaveProperty("lastAttemptAt");
+				f.sessionPort.hostJobs.set(sessionId, []);
+			}
+			for (const count of [2, 2, 1]) {
+				f.close.mockClear();
+				const event = await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
+				expect(f.database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
+				expect(f.close).toHaveBeenCalledTimes(count);
+			}
+			expect(f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`)).toEqual([]);
+		} finally {
+			active.dispose();
+		}
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("retirement probes turn then queue then jobs, catching a job launched as the turn ends", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-probe-order-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		const order: string[] = [];
+		const turn = f.sessionPort.turnRunning.bind(f.sessionPort);
+		const queue = f.sessionPort.queueEmpty.bind(f.sessionPort);
+		f.sessionPort.turnRunning = async (input) => {
+			order.push("turn");
+			const running = await turn(input);
+			// The turn has just ended, but its background work is still running.
+			f.sessionPort.hostJobs.set(input.sessionId, [{ id: "launched-job", type: "bash", label: "background" }]);
+			return running;
+		};
+		f.sessionPort.queueEmpty = async (input) => {
+			order.push("queue");
+			return await queue(input);
+		};
+		f.sessionPort.beforeRunningJobs = () => {
+			order.push("jobs");
+		};
+		await f.dispatch();
+		expect(order).toEqual(["turn", "queue", "jobs"]);
+		expect(f.close).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		f.sessionPort.turnRunning = turn;
+		f.sessionPort.hostJobs.set("event-session-e0", []);
+		await f.dispatch();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("clearing contextRollTokens after a size roll still sweeps its retirement record", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-cleared-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		f.registry.update({ monitorId: f.monitor.monitorId, contextRollTokens: null });
+		const event = await f.dispatch();
+		expect(f.database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const lastAttemptAt of [Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGER]) {
+	test(`retirement repairs logical lastAttemptAt=${lastAttemptAt} without starving records`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-overflow-"));
+		const f = await retirementHarness(directory);
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			f.database.core.metaDelete(f.retiredKey);
+			const sessions = ["overflow-a", "overflow-b", "overflow-c"];
+			const prefix = `monitor_retired_session:${f.sessionKey}:`;
+			for (const [index, sessionId] of sessions.entries()) {
+				f.sessionPort.setSessionState(sessionId, { live: true });
+				f.sessionPort.hostJobs.set(sessionId, new Error("unavailable"));
+				f.database.core.metaSet(
+					`${prefix}${sessionId}`,
+					JSON.stringify({
+						sessionId,
+						epoch: 0,
+						retiredAt: index + 1,
+						lastAttemptAt,
+					}),
+				);
+			}
+			for (let attempt = 0; attempt < 2; attempt++) await f.dispatch();
+			expect(new Set(f.jobs.mock.calls.map(([input]) => input.sessionId))).toEqual(new Set(sessions));
+			for (const sessionId of sessions) {
+				const repaired = JSON.parse(f.database.core.metaGet(`${prefix}${sessionId}`)!).lastAttemptAt;
+				expect(Number.isSafeInteger(repaired)).toBe(true);
+				expect(repaired).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+			}
+			expect(f.close).not.toHaveBeenCalled();
+		} finally {
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
 }
 
 test("buildMonitorCompactionDigest carries the contract plus bounded recent notes", () => {
@@ -1004,9 +1832,14 @@ for (const reason of [
 			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe(reason);
 			expect(JSON.parse(database.core.metaGet(pointerKey)!)).not.toHaveProperty("sizeRolled");
 			sessionPort.request = request;
+			const terminate = spyOn(sessionPort, "terminateHost");
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 			expect(pipeline.sessionSafetyState(sessionKey).lastRoll).toBe(reason);
+			expect(terminate).toHaveBeenCalledTimes(reason === "session_host_unavailable" ? 0 : 1);
+			if (reason !== "session_host_unavailable")
+				expect(terminate.mock.calls[0]?.[0]).toMatchObject({ sessionId: "event-session-e0" });
+			expect(database.core.metaKeysInRange("monitor_retired_session:", "monitor_retired_session;")).toEqual([]);
 			expect(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)).toBeUndefined();
 			expect(database.core.metaGet(pointerKey)).toBe(pointer);
 			// Untagged failure-roll pointers keep origin/dev's fresh-authoring path.

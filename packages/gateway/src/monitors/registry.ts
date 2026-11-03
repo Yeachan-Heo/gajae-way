@@ -178,10 +178,16 @@ export class MonitorRegistry {
 			const deleted = this.#database.monitors.delete(tx, monitorId);
 			this.#database.core.metaDelete(monitorCronMetaKey(monitorId));
 			this.#database.core.metaDelete(monitorReportToMetaKey(monitorId));
-			for (const prefix of ["monitor_context_budget_arm:", "monitor_roll_handoff:"]) {
+			for (const prefix of ["monitor_context_budget_arm:", "monitor_roll_handoff:", "monitor_retired_session:"]) {
 				for (const key of this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
 					try {
-						const origin = parseOriginKey(key.slice(prefix.length));
+						let originKey = key.slice(prefix.length);
+						if (prefix === "monitor_retired_session:") {
+							const { sessionId } = JSON.parse(this.#database.core.metaGet(key) ?? "null");
+							if (typeof sessionId !== "string" || !sessionId || !originKey.endsWith(`:${sessionId}`)) continue;
+							originKey = originKey.slice(0, -sessionId.length - 1);
+						}
+						const origin = parseOriginKey(originKey);
 						if (origin.platform === "monitor" && origin.parentId === monitorId) this.#database.core.metaDelete(key);
 					} catch {
 						// Malformed keys cannot identify a monitor origin.

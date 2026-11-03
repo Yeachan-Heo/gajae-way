@@ -1310,6 +1310,7 @@ export class MonitorPropagator {
 				}
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
+				if (!resumeTurn) await this.#retireRolledSessions(monitor, sessionOriginKey);
 				const digest = resumeTurn
 					? undefined
 					: this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
@@ -2166,6 +2167,141 @@ export class MonitorPropagator {
 			return "failed";
 		}
 	}
+	/** Bound close attempts; every attempt requires fresh positive idle evidence. */
+	async #retireRolledSessions(monitor: MonitorRecord, sessionOriginKey: string): Promise<void> {
+		try {
+			if (!this.#registry.get(monitor.monitorId)) return;
+			const prefix = `monitor_retired_session:${sessionOriginKey}:`;
+			const records = this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`).flatMap((key) => {
+				const raw = this.#database.core.metaGet(key);
+				let record = raw === undefined ? undefined : parseRetiredSession(raw);
+				// Repair an invalid logical counter without granting authority to any other invalid fields.
+				if (!record && raw !== undefined) {
+					try {
+						const value = JSON.parse(raw);
+						if (value && typeof value === "object" && "lastAttemptAt" in value) {
+							delete value.lastAttemptAt;
+							record = parseRetiredSession(JSON.stringify(value));
+						}
+					} catch {}
+				}
+				return record && key === `${prefix}${record.sessionId}` ? [{ key, raw: raw!, record }] : [];
+			});
+			records.sort(
+				(a, b) =>
+					(a.record.lastAttemptAt ?? 0) - (b.record.lastAttemptAt ?? 0) || a.record.retiredAt - b.record.retiredAt,
+			);
+			// A logical millisecond keeps retries fair even if the clock stalls or moves backwards.
+			let lastAttemptAt = records.reduce((latest, { record }) => Math.max(latest, record.lastAttemptAt ?? 0), 0);
+			// Rebase at saturation so safe but extreme counters cannot starve newer records.
+			if (lastAttemptAt >= Number.MAX_SAFE_INTEGER - 2) {
+				this.#database.transaction(() => {
+					for (const [index, pending] of records.entries()) {
+						if (this.#database.core.metaGet(pending.key) !== pending.raw) continue;
+						pending.record = { ...pending.record, lastAttemptAt: index + 1 };
+						pending.raw = JSON.stringify(pending.record);
+						this.#database.core.metaSet(pending.key, pending.raw);
+					}
+				});
+				lastAttemptAt = records.length;
+			}
+			for (const pending of records.slice(0, 2)) {
+				const { key } = pending;
+				let { record, raw } = pending;
+				const { sessionId } = record;
+				let outcome = "held:authorization";
+				try {
+					if (this.#database.core.metaGet(key) !== raw || !this.#registry.get(monitor.monitorId)) continue;
+					lastAttemptAt = Math.min(Number.MAX_SAFE_INTEGER, Math.max(this.#now(), lastAttemptAt + 1));
+					record = { ...record, lastAttemptAt };
+					raw = JSON.stringify(record);
+					this.#database.transaction(() => this.#database.core.metaSet(key, raw));
+					const mayClose = () => {
+						if (
+							this.#database.core.metaGet(key) !== raw ||
+							!this.#registry.get(monitor.monitorId) ||
+							this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId === sessionId
+						)
+							return false;
+						for (const pointerKey of this.#database.core.metaKeysInRange(
+							"monitor_authoring_turn:",
+							"monitor_authoring_turn;",
+						)) {
+							const pointer = this.#database.core.metaGet(pointerKey);
+							if (pointer !== undefined && parseAuthoringTurnPointer(pointer)?.sessionId === sessionId) return false;
+						}
+						return true;
+					};
+					if (!mayClose()) continue;
+					if (!this.#sessionPort.close) {
+						this.#database.transaction(() => this.#database.core.metaDelete(key));
+						outcome = "unsupported";
+						continue;
+					}
+					let held: string | undefined;
+					// Independent observations in turn, queue, jobs order do not reserve an idle host.
+					for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
+						if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
+						try {
+							const result = await this.#sessionPort[probe]?.({ sessionId, repo: this.#repo });
+							const busy =
+								probe === "turnRunning"
+									? result === true
+									: probe === "queueEmpty"
+										? result === false
+										: Array.isArray(result) && result.length > 0;
+							const idle =
+								probe === "turnRunning"
+									? result === false
+									: probe === "queueEmpty"
+										? result === true
+										: Array.isArray(result) && result.length === 0;
+							if (!idle) held ??= `${probe}_${busy ? "busy" : "unknown"}`;
+						} catch {
+							held ??= `${probe}_unavailable`;
+						}
+					}
+					if (held) {
+						outcome = `held:${held}`;
+						continue;
+					}
+					// No await between final local authorization, durable intent, and issuing close.
+					const authorized = this.#database.transaction(() => {
+						if (!mayClose()) return false;
+						// Diagnostic only: prior close attempts never authorize another close.
+						record = { ...record, phase: "closing", closeStartedAt: this.#now() };
+						raw = JSON.stringify(record);
+						this.#database.core.metaSet(key, raw);
+						return true;
+					});
+					if (!authorized) continue;
+					try {
+						await this.#sessionPort.close({ sessionId, repo: this.#repo });
+						outcome = "closed";
+					} catch (error) {
+						const brokerCode =
+							error instanceof GjcCliError && error.exitCode === 0 ? envelopeErrorCode(error.details) : undefined;
+						const code =
+							typeof brokerCode === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(brokerCode) ? brokerCode : undefined;
+						outcome = `error:${code ?? "unknown"}`;
+						continue;
+					}
+					this.#database.transaction(() => {
+						if (this.#database.core.metaGet(key) === raw) this.#database.core.metaDelete(key);
+					});
+				} catch {
+					outcome = "error:unknown";
+				} finally {
+					console.info(
+						`monitor retired session close for ${sessionOriginKey}: session=${sessionId} outcome=${outcome}`,
+					);
+				}
+			}
+		} catch {
+			// Retirement availability must never prevent the fresh authoring dispatch.
+			console.error(`monitor retired session sweep for ${sessionOriginKey}: outcome=error`);
+		}
+	}
 	/**
 	 * THE ONE monitor-session roll choke point (issue #68). It consumes an armed
 	 * failure-recovery or owner-opted-in context-size roll, never a turn count.
@@ -2280,8 +2416,13 @@ export class MonitorPropagator {
 		state.stalledSessionId = undefined;
 		this.#database.transaction((tx) => {
 			if (reason === "context_budget") {
-				const retiredSessionId = this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId;
-				if (retiredSessionId) {
+				const retired = this.#database.bindings.getSessionRecord(sessionOriginKey);
+				if (retired?.sessionId) {
+					const retiredSessionId = retired.sessionId;
+					this.#database.core.metaSet(
+						`monitor_retired_session:${sessionOriginKey}:${retiredSessionId}`,
+						JSON.stringify({ sessionId: retiredSessionId, epoch: retired.epoch, retiredAt: this.#now() }),
+					);
 					for (const key of this.#database.core.metaKeysInRange("monitor_authoring_turn:", "monitor_authoring_turn;")) {
 						const raw = this.#database.core.metaGet(key);
 						const turn = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
@@ -2655,6 +2796,47 @@ function monitorRollHandoffKey(sessionOriginKey: string): string {
 
 function monitorContextBudgetArmKey(sessionOriginKey: string): string {
 	return `monitor_context_budget_arm:${sessionOriginKey}`;
+}
+
+interface RetiredSession {
+	sessionId: string;
+	epoch: number;
+	retiredAt: number;
+	lastAttemptAt?: number;
+	phase?: "closing";
+	closeStartedAt?: number;
+}
+
+function parseRetiredSession(raw: string): RetiredSession | undefined {
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object") return undefined;
+		const { sessionId, epoch, retiredAt, lastAttemptAt, phase, closeStartedAt } = value as Record<string, unknown>;
+		if (typeof sessionId !== "string" || !sessionId) return undefined;
+		if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return undefined;
+		if (typeof retiredAt !== "number" || !Number.isFinite(retiredAt) || retiredAt < 0) return undefined;
+		if (
+			lastAttemptAt !== undefined &&
+			(typeof lastAttemptAt !== "number" || !Number.isSafeInteger(lastAttemptAt) || lastAttemptAt < 0)
+		)
+			return undefined;
+		if (phase !== undefined && phase !== "closing") return undefined;
+		if (
+			phase === "closing" &&
+			(typeof closeStartedAt !== "number" || !Number.isFinite(closeStartedAt) || closeStartedAt < 0)
+		)
+			return undefined;
+		return {
+			sessionId,
+			epoch,
+			retiredAt,
+			lastAttemptAt,
+			phase,
+			...(phase === "closing" ? { closeStartedAt: closeStartedAt as number } : {}),
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 function parseContextBudgetArm(raw: string): { epoch: number; tokens: number } | undefined {
