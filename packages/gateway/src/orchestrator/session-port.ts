@@ -348,9 +348,13 @@ export type WorkerOutputResult =
 	| {
 			readonly status: "unavailable";
 			readonly code: "output_unavailable" | "invalid_evidence" | "identity_mismatch" | "incomplete_body" | "cancelled";
+			/** Only an identity-validated terminal receipt explicitly declaring absence. */
+			readonly definitiveLoss?: true;
 	  };
 
 export interface SessionRequestInput extends SessionSendInput {
+	/** Best-effort post-turn context sampling. Off unless explicitly requested. */
+	readonly sampleContext?: boolean;
 	/** Stable caller identity carried into tail observability. */
 	readonly originKey?: string;
 	/**
@@ -2092,10 +2096,12 @@ export class BrokerSessionPort implements SessionPort {
 				},
 			);
 			let contextUsage: SessionContextUsage | undefined;
-			try {
-				contextUsage = await this.contextUsage({ sessionId: input.sessionId, repo: input.repo, relay });
-			} catch (error) {
-				if (error instanceof BrokerAuthorityError) throw markSessionRequestStep(error, "authority");
+			if (input.sampleContext) {
+				try {
+					contextUsage = await this.contextUsage({ sessionId: input.sessionId, repo: input.repo, relay });
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw markSessionRequestStep(error, "authority");
+				}
 			}
 			result = {
 				receipt,
@@ -2346,7 +2352,7 @@ export function parseWorkerOutputResponse(
 		// is retryable within the bounded read budget. A terminal op whose receipt
 		// is `absent` contradicts the SDK contract and is not.
 		return result.receiptState === "absent"
-			? { status: "unavailable", code: "output_unavailable" }
+			? { status: "unavailable", code: "output_unavailable", definitiveLoss: true }
 			: { status: "absent", code: "output_pending" };
 	}
 	if (content.truncated === true) return { status: "unavailable", code: "incomplete_body" };

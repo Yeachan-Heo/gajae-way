@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Features
-- **monitors**: Opt in to digest-seeded session rolls with per-monitor observed-usage threshold `contextRollTokens` to reduce carried-context cost; sampled after the turn, this is not a hard limit and a stale reading can still roll after native compaction
+- **monitors**: Opt in to digest-seeded session rolls with per-monitor observed-usage threshold `contextRollTokens` to reduce carried-context cost; sampled after the turn only when configured, this is not a hard limit and a stale reading can still roll after native compaction. Persisted arms and handoffs survive restart, failure rolls take precedence, and internal diagnostics emit armed, disarmed, deferred, and rolled lifecycle logs. Size-retired saved results are harvested or held on their original session, and removing a monitor clears its size-roll state.
 
 ## [0.4.2] - 2026-10-29
 

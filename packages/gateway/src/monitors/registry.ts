@@ -6,6 +6,7 @@ import {
 	type MonitorSpec,
 	type MonitorUpdateParams,
 	OriginRefError,
+	parseOriginKey,
 	type TriggerSpec,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
@@ -177,6 +178,16 @@ export class MonitorRegistry {
 			const deleted = this.#database.monitors.delete(tx, monitorId);
 			this.#database.core.metaDelete(monitorCronMetaKey(monitorId));
 			this.#database.core.metaDelete(monitorReportToMetaKey(monitorId));
+			for (const prefix of ["monitor_context_budget_arm:", "monitor_roll_handoff:"]) {
+				for (const key of this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+					try {
+						const origin = parseOriginKey(key.slice(prefix.length));
+						if (origin.platform === "monitor" && origin.parentId === monitorId) this.#database.core.metaDelete(key);
+					} catch {
+						// Malformed keys cannot identify a monitor origin.
+					}
+				}
+			}
 			if (!deleted) return false;
 			for (const event of this.#database.monitors.eventsAwaitingDispatch(monitorId)) {
 				this.#database.monitors.eventTerminalFail(

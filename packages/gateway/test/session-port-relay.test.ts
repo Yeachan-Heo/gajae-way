@@ -487,6 +487,7 @@ test("session request still reconciles native client-ref conflict without anothe
 		repo: f.repo,
 		text: "prompt",
 		opRef: "gw-native-conflict",
+		sampleContext: true,
 	});
 	expect(result.assistant.text).toBe("recovered original result");
 	expect(result.status.operationRef).toBe("gw-native-conflict");
@@ -547,7 +548,13 @@ for (const scenario of [
 			},
 		});
 		closeContextRelay = () => f.relay.streams[1]!.close();
-		const result = await f.port.request({ sessionId: "sdk-1", repo: f.repo, text: "author", opRef: "gw-context" });
+		const result = await f.port.request({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			text: "author",
+			opRef: "gw-context",
+			sampleContext: true,
+		});
 		expect(result.assistant.text).toBe("answered");
 		expect(result.contextUsage).toEqual(scenario.expected);
 		if (scenario.expected === undefined) expect(result).not.toHaveProperty("contextUsage");
@@ -591,7 +598,13 @@ for (const authorityFailure of [false, true]) {
 		f.port.contextUsage = async () => {
 			throw error;
 		};
-		const request = f.port.request({ sessionId: "sdk-1", repo: f.repo, text: "author", opRef: "gw-context-error" });
+		const request = f.port.request({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			text: "author",
+			opRef: "gw-context-error",
+			sampleContext: true,
+		});
 		if (authorityFailure) {
 			const observed = await request.catch((failure: unknown) => failure);
 			expect(observed).toBe(error);
@@ -605,6 +618,41 @@ for (const authorityFailure of [false, true]) {
 		await f.handle.close();
 	});
 }
+
+test("session request opts out of context sampling by default without waiting for context.get", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "context.get") return { ok: false, error: { code: "unexpected_context_get" } };
+			if (request.operation === "turn.result")
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: request.input.clientRef,
+						status: "terminal_ok",
+						receiptState: "present",
+						outcome: { reason: "end_turn", provenance: "agent" },
+					},
+				};
+			return { ok: true, page: { items: ["answered"], complete: true } };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const start = performance.now();
+	const result = await f.port.request({ sessionId: "sdk-1", repo: f.repo, text: "author", opRef: "gw-no-context" });
+	expect(result.assistant.text).toBe("answered");
+	expect(result).not.toHaveProperty("contextUsage");
+	expect(f.relay.requests.map((request) => request.operation)).toEqual([
+		"turn.prompt",
+		"turn.result",
+		"session.last_assistant",
+	]);
+	expect(performance.now() - start).toBeLessThan(1000);
+	await f.handle.close();
+});
 
 test("session request wraps primitive send rejections with a safe message and original cause", async () => {
 	const f = await fixture({
