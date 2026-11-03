@@ -1447,7 +1447,10 @@ export class MonitorPropagator {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
 						// Forget the prior pointer when same-session busy-refused OR in eventIdsToForget.
-						if (eventIdsToForget.includes(row.event_id) || (prior && prior.sessionId === sessionId && prior.opRef !== opRef)) {
+						if (
+							eventIdsToForget.includes(row.event_id) ||
+							(prior && prior.sessionId === sessionId && prior.opRef !== opRef)
+						) {
 							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
 						}
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
