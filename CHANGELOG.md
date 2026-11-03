@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.3] - 2026-11-03
+
+### Fixes
+- **cli**: `gajaeway update` with `SHELL` unset no longer assumes `/bin/zsh`; it tries the passwd shell, `/bin/bash`, then `/bin/sh`, and falls back to the default PATH instead of exiting 1 after the release is installed (#734)
+- **adapter-discord**: A reply with a refused `MEDIA:` attachment still sends its text plus a `(file not sent: …)` note, without exposing host paths (#730)
+- **gateway**: An uncorrelated `agent_end` is no longer treated as owned terminal evidence (#733)
+
+### CI
+- Move darwin-arm64 runners off the retiring macos-14 image (#732)
+
 ## [0.4.2] - 2026-10-29
 
 ### Features

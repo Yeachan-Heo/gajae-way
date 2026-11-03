@@ -3854,7 +3854,26 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch) }),
 		respond: async () => {
 			// The first worker commits; that HEAD move is the progress signal the row must show.
-			if (!committed) git("commit", "--allow-empty", "--quiet", "-m", "lane: land the fix");
+			// Spawn asynchronously: a synchronous commit stalls the event loop that must deliver
+			// the work.run response, which timed out on loaded linux-arm64 runners (issue #67).
+			if (!committed) {
+				const exitCode = await Bun.spawn(
+					["git", "-C", repo, "commit", "--allow-empty", "--quiet", "-m", "lane: land the fix"],
+					{
+						stdout: "ignore",
+						stderr: "ignore",
+						env: {
+							...process.env,
+							GIT_AUTHOR_NAME: "lane",
+							GIT_AUTHOR_EMAIL: "lane@example.invalid",
+							GIT_COMMITTER_NAME: "lane",
+							GIT_COMMITTER_EMAIL: "lane@example.invalid",
+							GIT_COMMITTER_DATE: "2026-09-01T00:00:00Z",
+						},
+					},
+				).exited;
+				expect(exitCode).toBe(0);
+			}
 			committed = true;
 			return "worker result";
 		},
