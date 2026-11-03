@@ -17,6 +17,7 @@ import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
+import { isBrokerUnavailable } from "../orchestrator/broker";
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
@@ -273,6 +274,8 @@ export interface MonitorSessionSafetyState {
 	stalledSessionId: string | undefined;
 	/** Consecutive exact `sdk_prompt_terminal_failed` prior-run-busy failures in this epoch. */
 	priorRunBusyFailures: number;
+	/** Consecutive first-attempt bind failures in this epoch; tracks #748 degradation. */
+	firstAttemptBindFailures: number;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
@@ -1409,8 +1412,11 @@ export class MonitorPropagator {
 					);
 					const safety = this.#safetyState(sessionOriginKey);
 					safety.turns = turns;
-					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch)
+					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch) {
 						safety.priorRunBusyFailures = 0;
+						// Clear first-attempt bind failure counter on successful bind + answer
+						safety.firstAttemptBindFailures = 0;
+					}
 				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
@@ -1667,7 +1673,27 @@ export class MonitorPropagator {
 						}
 					}
 				});
-				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
+				// Track consecutive first-attempt bind failures per monitor origin (#748)
+				if (
+					transitionedFailure &&
+					code === "session_bind_failed" &&
+					claimed.some((row) => row.dispatch_attempts === 0)
+				) {
+					const state = this.#safetyState(sessionOriginKey);
+					state.firstAttemptBindFailures += 1;
+					if (state.firstAttemptBindFailures >= 3) {
+						readinessFailure = {
+							code: "monitor_bind_degraded",
+							detail: `monitor first-attempt bind failed ${state.firstAttemptBindFailures} times consecutively; binding may be slow or queue-saturated (#748)`,
+						};
+					}
+				} else if (transitionedFailure && code !== "session_bind_failed") {
+					// Reset counter on non-bind failures
+					const state = this.#safetyState(sessionOriginKey);
+					state.firstAttemptBindFailures = 0;
+				}
+				if (transitionedFailure && !readinessFailure)
+					readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
 				flushReadinessFailure();
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 				await this.#recordAuthoringFailure({
@@ -1807,6 +1833,7 @@ export class MonitorPropagator {
 			turns: 0,
 			contextFailures: 0,
 			staleContextFailures: 0,
+			firstAttemptBindFailures: 0,
 			orphanedExecutorFailures: 0,
 			lastExecutorReason: undefined,
 			executorFailures: 0,
@@ -2263,6 +2290,11 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	// hid every configure/request refusal (live: 169 rows in one day, all
 	// GjcCliError exitCode 0 at #dispatchBatch, none actionable).
 	if (error instanceof GjcCliError) {
+		if (phase === "bind" || phase === "configure") return "session_bind_failed";
+		if (phase === "request") return "authoring_turn_failed";
+	}
+	// GjcCliUnavailableError from broker timeout/queue saturation (#748)
+	if (isBrokerUnavailable(error)) {
 		if (phase === "bind" || phase === "configure") return "session_bind_failed";
 		if (phase === "request") return "authoring_turn_failed";
 	}

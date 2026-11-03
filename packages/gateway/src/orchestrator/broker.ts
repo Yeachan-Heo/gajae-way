@@ -404,8 +404,16 @@ const MAX_CLI_POOL = 16;
 
 /** The local CLI pool stayed full for the whole call budget; the broker was never asked. */
 export class GjcCommandQueueTimeoutError extends Error {
-	constructor(readonly timeoutMs: number) {
-		super(`gjc command queue timed out after ${timeoutMs}ms (local CLI pool saturated)`);
+	constructor(
+		readonly timeoutMs: number,
+		readonly queueLength?: number,
+		readonly poolOccupancy?: number,
+	) {
+		const detail =
+			queueLength !== undefined && poolOccupancy !== undefined
+				? ` (queue=${queueLength} occupancy=${poolOccupancy}/${timeoutMs})`
+				: "";
+		super(`gjc command queue timed out after ${timeoutMs}ms (local CLI pool saturated)${detail}`);
 		this.name = "GjcCommandQueueTimeoutError";
 	}
 }
@@ -763,10 +771,11 @@ export class GlobalGjcClient {
 		args: readonly string[],
 		timeout: number,
 		priority: "interactive" | "background",
+		context?: { queueLength?: number; poolOccupancy?: number },
 	): Promise<CliResult> {
 		const remaining = Math.max(1, timeout);
 		if (this.#options.command)
-			return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining);
+			return await bounded(this.#options.command(args, { timeoutMs: remaining, priority }), remaining, context);
 		const child = this.#spawn({
 			cmd: [this.executable, ...args],
 			cwd: this.#cwd,
@@ -784,6 +793,7 @@ export class GlobalGjcClient {
 					child.exited,
 				]),
 				remaining,
+				context,
 			);
 			return { stdout, stderr, exitCode };
 		} catch (error) {
@@ -900,7 +910,7 @@ export class GlobalGjcClient {
 			// Local pool congestion is a per-call failure, never broker evidence:
 			// reporting it as an outage failed every other caller while the broker
 			// itself was healthy (#675).
-			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(timeout);
+			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(timeout, this.#queue.length, this.#inflight);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
@@ -908,7 +918,10 @@ export class GlobalGjcClient {
 		if (priority === "background") this.#backgroundInFlight++;
 		try {
 			const remaining = Math.max(1, deadline - Date.now());
-			const result = await this.#executeCommand(args, remaining, priority);
+			const result = await this.#executeCommand(args, remaining, priority, {
+				queueLength: this.#queue.length,
+				poolOccupancy: this.#inflight,
+			});
 			return this.#checkUnavailable(result);
 		} finally {
 			this.#inflight--;
@@ -1192,13 +1205,24 @@ function integer(value: number | undefined, fallback: number, minimum: number): 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
-async function bounded<T>(promise: Promise<T>, timeout: number): Promise<T> {
+async function bounded<T>(
+	promise: Promise<T>,
+	timeout: number,
+	context?: { queueLength?: number; poolOccupancy?: number },
+): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		return await Promise.race([
 			promise,
 			new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new GjcCliUnavailableError(`request timed out after ${timeout}ms`)), timeout);
+				const detail =
+					context?.queueLength !== undefined && context?.poolOccupancy !== undefined
+						? ` queue=${context.queueLength} occupancy=${context.poolOccupancy}`
+						: "";
+				timer = setTimeout(
+					() => reject(new GjcCliUnavailableError(`request timed out after ${timeout}ms${detail}`)),
+					timeout,
+				);
 			}),
 		]);
 	} finally {
