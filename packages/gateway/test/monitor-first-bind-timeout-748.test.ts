@@ -354,3 +354,156 @@ test("queue timeout error includes pool occupancy in error message (#748)", asyn
 	expect(unavailable.message).toContain("operation=session.create");
 	expect(unavailable.operation).toBe("session.create");
 });
+
+test("monitor_bind readiness clears only when ALL degraded origins succeed on first attempt (#748)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-multi-origin-bind-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const readiness = new FunctionalReadiness();
+
+		// Create monitors for two different origin types
+		const monitorA = registry.add({
+			name: "multi-origin-test-a",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.multi_a"],
+			burstPolicy: "serialize",
+		});
+
+		const monitorB = registry.add({
+			name: "multi-origin-test-b",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.multi_b"],
+			burstPolicy: "serialize",
+		});
+
+		let originAWillFail = true;
+		let originBWillFail = false;
+
+		const multiOriginPort: Partial<SessionPort> = {
+			bind: async (input: SessionBindInput) => {
+				const isOriginA = input.originKey.includes("multi_a");
+
+				if ((isOriginA && originAWillFail) || (!isOriginA && originBWillFail)) {
+					throw new GjcCliUnavailableError("request timed out after 30000ms queue=12 occupancy=8");
+				}
+
+				return {
+					sessionId: `session-${input.epoch}`,
+					epoch: input.epoch,
+					originKey: input.originKey,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			request: async (input) =>
+				({
+					assistant: {
+						text: JSON.stringify(eventIdsFromPrompt(input.text).map((eventId) => ({ eventId, note: "[SILENT]" }))),
+					},
+				}) as never,
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const readinessFailures: Array<{ code: string; detail: string; originKey: string }> = [];
+		const readinessSuccesses: Array<{ originKey: string }> = [];
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: multiOriginPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			onReadinessFailure: (failure) => {
+				readiness.recordFailure({
+					category: failure.code === "monitor_bind_degraded" ? "monitor_bind" : "monitor_delivery",
+					code: failure.code,
+					detail: failure.detail,
+					origin: failure.originKey,
+					at: failure.at,
+				});
+				readinessFailures.push(failure);
+			},
+			onReadinessSuccess: () => readiness.recordSuccess("monitor_delivery"),
+			onFirstAttemptBindSuccess: (input) => {
+				readinessSuccesses.push(input);
+				readiness.recordSuccess("monitor_bind");
+			},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const originKeyA = `monitor/eventtype/test.multi_a/parent=${monitorA.monitorId}`;
+		const originKeyB = `monitor/eventtype/test.multi_b/parent=${monitorB.monitorId}`;
+
+		// Step 1: Submit 3 events to monitorA that will all fail on first attempt
+		const failingEventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eid = await pipeline.submitAwaitable(monitorA.monitorId, "test.multi_a", {});
+			failingEventIds.push(eid);
+			// Wait for failure to be recorded
+			for (let j = 0; j < 200; j++) {
+				const row = database.monitors.eventGet(eid);
+				if (row?.stage === "failed") break;
+				await Bun.sleep(5);
+			}
+		}
+
+		// Wait for monitor_bind_degraded to be recorded (happens on 3rd failure)
+		for (let i = 0; i < 200; i++) {
+			if (readinessFailures.find((f) => f.code === "monitor_bind_degraded")) break;
+			await Bun.sleep(10);
+		}
+
+		// Verify monitorA is degraded
+		const degradedFailure = readinessFailures.find((f) => f.code === "monitor_bind_degraded");
+		expect(degradedFailure).toBeDefined();
+		const stateA = pipeline.sessionSafetyState(originKeyA);
+		expect(stateA.firstAttemptBindFailures).toBe(3);
+		// Verify the degradation is tracked in the pipeline's internal set
+		// (We can't directly check the set, but we can verify through behavior)
+
+		// Step 2: Submit event to monitorB with first-attempt success
+		originBWillFail = false;
+		const successBEventId = await pipeline.submitAwaitable(monitorB.monitorId, "test.multi_b", {});
+
+		// Wait for B to succeed
+		for (let i = 0; i < 200; i++) {
+			const row = database.monitors.eventGet(successBEventId);
+			if (row?.stage === "authored_no_delivery") break;
+			await Bun.sleep(10);
+		}
+
+		// Verify: B succeeded
+		expect(database.monitors.eventGet(successBEventId)?.stage).toBe("authored_no_delivery");
+		const stateB = pipeline.sessionSafetyState(originKeyB);
+		expect(stateB.firstAttemptBindFailures).toBe(0);
+		// B's success should NOT have triggered readinessSuccesses because A is still degraded
+		const successesAfterB = readinessSuccesses.length;
+		expect(successesAfterB).toBe(0); // No first-attempt bind success yet because A is still degraded
+
+		// Step 3: Now allow A to succeed and submit an event
+		originAWillFail = false;
+		const successAEventId = await pipeline.submitAwaitable(monitorA.monitorId, "test.multi_a", {});
+
+		// Wait for A to succeed
+		for (let i = 0; i < 200; i++) {
+			const row = database.monitors.eventGet(successAEventId);
+			if (row?.stage === "authored_no_delivery") break;
+			await Bun.sleep(10);
+		}
+
+		// Verify: A succeeded and now the readiness observer was called
+		expect(database.monitors.eventGet(successAEventId)?.stage).toBe("authored_no_delivery");
+		const stateAFinal = pipeline.sessionSafetyState(originKeyA);
+		expect(stateAFinal.firstAttemptBindFailures).toBe(0);
+		// Now the readiness success should have been recorded
+		expect(readinessSuccesses.length).toBe(1);
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});

@@ -332,6 +332,8 @@ export class MonitorPropagator {
 	 * bind anyway, so persisting it would only carry a stale verdict forward.
 	 */
 	readonly #safety = new Map<string, MonitorSessionSafetyState>();
+	/** Track origins with monitor_bind_degradation so we only clear when ALL are resolved (#748). */
+	readonly #degradedBindOrigins = new Set<string>();
 	/** THE ONE seam that asks for native compaction. */
 	readonly #compaction: CompactionPort;
 	/** Consecutive context-class authoring failures required before a roll. */
@@ -1414,7 +1416,12 @@ export class MonitorPropagator {
 						safety.priorRunBusyFailures = 0;
 						if (firstAttemptBindSucceeded) {
 							safety.firstAttemptBindFailures = 0;
-							this.#recordFirstAttemptBindSuccess(sessionOriginKey);
+							if (this.#degradedBindOrigins.has(sessionOriginKey)) {
+								this.#degradedBindOrigins.delete(sessionOriginKey);
+							}
+							if (this.#degradedBindOrigins.size === 0) {
+								this.#recordFirstAttemptBindSuccess(sessionOriginKey);
+							}
 						}
 					}
 				}
@@ -1711,6 +1718,7 @@ export class MonitorPropagator {
 					const state = this.#safetyState(sessionOriginKey);
 					state.firstAttemptBindFailures += 1;
 					if (state.firstAttemptBindFailures >= 3) {
+						this.#degradedBindOrigins.add(sessionOriginKey);
 						readinessFailure = {
 							code: "monitor_bind_degraded",
 							detail: `monitor first-attempt bind failed ${state.firstAttemptBindFailures} times consecutively; binding may be slow or queue-saturated (#748)`,
@@ -2124,6 +2132,7 @@ export class MonitorPropagator {
 		state.priorRunBusyFailures = 0;
 		state.firstAttemptBindFailures = 0;
 		state.turns = 0;
+		this.#degradedBindOrigins.delete(sessionOriginKey);
 		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
 		);
