@@ -1389,14 +1389,6 @@ export class MonitorPropagator {
 								pendingTurn,
 							);
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
-				// The turn settled: a later retry must author afresh, never re-read it.
-				this.#database.transaction((tx) => {
-					this.#forgetAuthoringTurn(
-						tx,
-						claimed.map((row) => row.event_id),
-						pendingTurn,
-					);
-				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
@@ -1434,6 +1426,18 @@ export class MonitorPropagator {
 					),
 				);
 				if (!fenced.length) return;
+				// The fenced events have successfully transitioned to dispatched: they are now
+				// past the lease-check barrier. Now forget the authoring-turn pointers so a later
+				// retry must author afresh, never re-read the same turn. Issue #743: this must
+				// happen AFTER lease fencing succeeds, never before, so that if the lease is stolen
+				// the pointer is preserved for the next boot to harvest.
+				this.#database.transaction((tx) => {
+					this.#forgetAuthoringTurn(
+						tx,
+						fenced.map((row) => row.event_id),
+						pendingTurn,
+					);
+				});
 				protocolValidationActive = true;
 				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
