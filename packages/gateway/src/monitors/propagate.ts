@@ -16,7 +16,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
-import { isBrokerUnavailable } from "../orchestrator/broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "../orchestrator/broker";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -303,6 +303,9 @@ export class MonitorPropagator {
 		  }) => void)
 		| undefined;
 	readonly #onReadinessSuccess: ((input: { readonly originKey: string; readonly at: number }) => void) | undefined;
+	readonly #onFirstAttemptBindSuccess:
+		| ((input: { readonly originKey: string; readonly at: number }) => void)
+		| undefined;
 	readonly #now: () => number;
 	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
@@ -357,6 +360,8 @@ export class MonitorPropagator {
 		}) => void;
 		/** Reports successful monitor dispatches that require no adapter delivery. */
 		onReadinessSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
+		/** Reports a successful bind on the dispatch's first attempt. */
+		onFirstAttemptBindSuccess?: (input: { readonly originKey: string; readonly at: number }) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
 		/** Memory corpus scanned for `memory.debloat` events, and the byte size a file must exceed. */
@@ -403,6 +408,7 @@ export class MonitorPropagator {
 		this.#notifyInbound = options.notifyInbound;
 		this.#onReadinessFailure = options.onReadinessFailure;
 		this.#onReadinessSuccess = options.onReadinessSuccess;
+		this.#onFirstAttemptBindSuccess = options.onFirstAttemptBindSuccess;
 		this.#now = options.now ?? (() => Date.now());
 		this.#acquireLease =
 			options.acquireLease ??
@@ -1237,6 +1243,7 @@ export class MonitorPropagator {
 		let dispatchPhase = "bind";
 		let dispatchOperation: string | undefined;
 		let dispatchOperationArgs: Record<string, unknown> | undefined;
+		let firstAttemptBindSucceeded = false;
 		// Registered before the per-origin queue: an event still waiting for its
 		// turn is just as interrupted by a shutdown as one mid-request.
 		for (const row of claimed)
@@ -1300,6 +1307,7 @@ export class MonitorPropagator {
 						repo: this.#repo,
 						...(effectiveModel ? { model: effectiveModel } : {}),
 					});
+					firstAttemptBindSucceeded = !replayedBatch;
 					sessionId = binding.sessionId;
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
@@ -1406,9 +1414,9 @@ export class MonitorPropagator {
 					safety.turns = turns;
 					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch) {
 						safety.priorRunBusyFailures = 0;
-						// Clear first-attempt bind failure counter only on successful first-attempt bind (#748)
-						if (claimed.some((row) => row.dispatch_attempts === 0)) {
+						if (firstAttemptBindSucceeded) {
 							safety.firstAttemptBindFailures = 0;
+							this.#recordFirstAttemptBindSuccess(sessionOriginKey);
 						}
 					}
 				}
@@ -1664,6 +1672,7 @@ export class MonitorPropagator {
 							}
 						: undefined;
 				const code: DispatchFailureCode = failureCode(error, failureClass, dispatchPhase);
+				const cliDiagnostic = cliFailureDiagnostic(error);
 				let transitionedFailure = false;
 				this.#database.transaction((tx) => {
 					for (const row of leased) {
@@ -1673,7 +1682,16 @@ export class MonitorPropagator {
 							leaseId,
 							batchId,
 							code,
-							`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
+							`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({
+								phase: dispatchPhase,
+								...cliDiagnostic,
+								operation: cliDiagnostic.operation ?? dispatchOperation,
+								dispatch_operation: dispatchOperation,
+								operation_args: dispatchOperationArgs,
+								sessionId: boundSessionId ?? null,
+								origin: sessionOriginKey,
+								attempt: row.dispatch_attempts + 1,
+							})}`,
 							now(),
 							false,
 							protocolFailure,
@@ -1698,10 +1716,6 @@ export class MonitorPropagator {
 							detail: `monitor first-attempt bind failed ${state.firstAttemptBindFailures} times consecutively; binding may be slow or queue-saturated (#748)`,
 						};
 					}
-				} else if (transitionedFailure && code !== "session_bind_failed") {
-					// Reset counter on non-bind failures
-					const state = this.#safetyState(sessionOriginKey);
-					state.firstAttemptBindFailures = 0;
 				}
 				if (transitionedFailure && !readinessFailure)
 					readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
@@ -2108,6 +2122,7 @@ export class MonitorPropagator {
 		state.protocolFailures = 0;
 		state.busyFailures = 0;
 		state.priorRunBusyFailures = 0;
+		state.firstAttemptBindFailures = 0;
 		state.turns = 0;
 		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
@@ -2187,6 +2202,13 @@ export class MonitorPropagator {
 	#recordReadinessSuccess(originKey: string): void {
 		try {
 			this.#onReadinessSuccess?.({ originKey, at: this.#now() });
+		} catch {
+			console.error("monitor readiness observer failed");
+		}
+	}
+	#recordFirstAttemptBindSuccess(originKey: string): void {
+		try {
+			this.#onFirstAttemptBindSuccess?.({ originKey, at: this.#now() });
 		} catch {
 			console.error("monitor readiness observer failed");
 		}
@@ -2483,6 +2505,45 @@ function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): Origi
 
 function monitorReadinessOriginKey(monitorId: string): string {
 	return originKey(monitorSessionOrigin(monitorId, CATCH_ALL_EVENT_ORIGIN.conversationId));
+}
+
+function cliFailureDiagnostic(error: unknown): {
+	operation?: string;
+	cliSubcommand?: string;
+	queueWaitMs?: number;
+	queueLength?: number;
+	poolOccupancy?: number;
+	poolSize?: number;
+} {
+	const fields = error !== null && typeof error === "object" ? (error as Record<string, unknown>) : {};
+	const message = error instanceof Error ? error.message : "";
+	const numberValue = (value: unknown): number | undefined => {
+		const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+		return Number.isSafeInteger(number) && number >= 0 ? number : undefined;
+	};
+	const numberFromMessage = (pattern: RegExp): number | undefined => numberValue(message.match(pattern)?.[1]);
+	const operation =
+		typeof fields.operation === "string"
+			? fields.operation
+			: message.match(/\boperation=([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)\b/)?.[1];
+	const cliSubcommand = message.match(/\bcliSubcommand="([a-z][a-z0-9_]*(?: [a-z][a-z0-9_]*)?)"/)?.[1];
+	const occupancy = message.match(/\boccupancy=(\d+)(?:\/(\d+))?/);
+	const queueWaitMs =
+		numberValue(fields.queueWaitMs) ??
+		(error instanceof GjcCommandQueueTimeoutError
+			? numberValue(error.timeoutMs)
+			: numberFromMessage(/\bqueueWaitMs=(\d+)\b/));
+	const queueLength = numberValue(fields.queueLength) ?? numberFromMessage(/\bqueue=(\d+)\b/);
+	const poolOccupancy = numberValue(fields.poolOccupancy) ?? numberValue(occupancy?.[1]);
+	const poolSize = numberValue(fields.poolSize) ?? numberValue(occupancy?.[2]);
+	return {
+		...(operation && /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/.test(operation) ? { operation } : {}),
+		...(cliSubcommand ? { cliSubcommand } : {}),
+		...(queueWaitMs !== undefined ? { queueWaitMs } : {}),
+		...(queueLength !== undefined ? { queueLength } : {}),
+		...(poolOccupancy !== undefined ? { poolOccupancy } : {}),
+		...(poolSize !== undefined ? { poolSize } : {}),
+	};
 }
 
 /** Extract a bounded, sanitized lower-level diagnosis without persisting raw error payloads. */

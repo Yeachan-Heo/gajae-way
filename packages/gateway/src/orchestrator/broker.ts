@@ -144,8 +144,10 @@ export class RelayStreamUnwrittenError extends Error {
 }
 export class GjcCliUnavailableError extends Error {
 	readonly code = "broker_unavailable";
-	constructor(message: string) {
-		super(`gjc sdk request failed: broker_unavailable (${message})`);
+	readonly operation: string | undefined;
+	constructor(message: string, operation?: string) {
+		super(`gjc sdk request failed: broker_unavailable (${message}${operation ? ` operation=${operation}` : ""})`);
+		this.operation = operation;
 	}
 }
 
@@ -404,18 +406,24 @@ const MAX_CLI_POOL = 16;
 
 /** The local CLI pool stayed full for the whole call budget; the broker was never asked. */
 export class GjcCommandQueueTimeoutError extends Error {
+	readonly operation: string | undefined;
 	constructor(
 		readonly timeoutMs: number,
 		readonly queueLength?: number,
 		readonly poolOccupancy?: number,
 		readonly poolSize?: number,
+		operation?: string,
 	) {
-		const detail =
-			queueLength !== undefined && poolOccupancy !== undefined && poolSize !== undefined
-				? ` (queue=${queueLength} occupancy=${poolOccupancy}/${poolSize})`
-				: "";
+		const details = [
+			...(operation ? [`operation=${operation}`] : []),
+			...(queueLength !== undefined && poolOccupancy !== undefined && poolSize !== undefined
+				? [`queue=${queueLength} occupancy=${poolOccupancy}/${poolSize}`]
+				: []),
+		];
+		const detail = details.length ? ` (${details.join(" ")})` : "";
 		super(`gjc command queue timed out after ${timeoutMs}ms (local CLI pool saturated)${detail}`);
 		this.name = "GjcCommandQueueTimeoutError";
+		this.operation = operation;
 	}
 }
 
@@ -772,7 +780,7 @@ export class GlobalGjcClient {
 		args: readonly string[],
 		timeout: number,
 		priority: "interactive" | "background",
-		context?: { queueLength?: number; poolOccupancy?: number; cliSubcommand?: string; queueWaitMs?: number },
+		context?: { queueLength?: number; poolOccupancy?: number; cliSubcommand?: string; queueWaitMs?: number; operation?: string },
 	): Promise<CliResult> {
 		const remaining = Math.max(1, timeout);
 		if (this.#options.command)
@@ -885,6 +893,7 @@ export class GlobalGjcClient {
 	): Promise<CliResult> {
 		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestTimeout, COMMAND_TIMEOUT_MS, 1);
+		const operation = cliOperation(args);
 		const deadline = Date.now() + timeout;
 		// Interactive callers may use the whole pool; background commands at most half of it.
 		const maxBackground = Math.ceil(this.#maxPoolSize / 2);
@@ -915,7 +924,7 @@ export class GlobalGjcClient {
 			// reporting it as an outage failed every other caller while the broker
 			// itself was healthy (#675).
 			if (Date.now() >= deadline)
-				throw new GjcCommandQueueTimeoutError(timeout, this.#queue.length, this.#inflight, this.#maxPoolSize);
+				throw new GjcCommandQueueTimeoutError(timeout, this.#queue.length, this.#inflight, this.#maxPoolSize, operation);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
@@ -928,6 +937,7 @@ export class GlobalGjcClient {
 				poolOccupancy: this.#inflight,
 				cliSubcommand: args.slice(0, 2).join(" "),
 				queueWaitMs,
+				...(operation ? { operation } : {}),
 			});
 			return this.#checkUnavailable(result);
 		} finally {
@@ -1129,6 +1139,15 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 	bound.push("--agent-dir", agentDir);
 	return bound;
 }
+
+function cliOperation(args: readonly string[]): string | undefined {
+	const optionIndex = Math.max(args.indexOf("--op"), args.indexOf("--query"));
+	const optionOperation = optionIndex >= 0 ? args[optionIndex + 1] : undefined;
+	if (optionOperation && /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/.test(optionOperation)) return optionOperation;
+	if (args[0] === "sdk" && args[1] === "session" && /^[a-z][a-z0-9_]*$/.test(args[2] ?? ""))
+		return `session.${args[2]}`;
+	return undefined;
+}
 /** Fail closed on project dotenv path declarations; do not promote Bun-loaded project values to user authority. */
 function trustedEnvironment(cwd: string): Record<string, string> {
 	const env = Object.fromEntries(
@@ -1215,7 +1234,7 @@ function delay(ms: number): Promise<void> {
 async function bounded<T>(
 	promise: Promise<T>,
 	timeout: number,
-	context?: { queueLength?: number; poolOccupancy?: number; cliSubcommand?: string; queueWaitMs?: number },
+	context?: { queueLength?: number; poolOccupancy?: number; cliSubcommand?: string; queueWaitMs?: number; operation?: string },
 ): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -1233,7 +1252,7 @@ async function bounded<T>(
 					detail += ` queueWaitMs=${context.queueWaitMs}`;
 				}
 				timer = setTimeout(
-					() => reject(new GjcCliUnavailableError(`request timed out after ${timeout}ms${detail}`)),
+					() => reject(new GjcCliUnavailableError(`request timed out after ${timeout}ms${detail}`, context?.operation)),
 					timeout,
 				);
 			}),
