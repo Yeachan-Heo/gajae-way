@@ -2770,19 +2770,22 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		expectOldPointerStatus(result);
 	});
 
-	test("moved binding with durable busy refusal for the old op forgets it and sends exactly one fresh prompt", async () => {
-		const result = await dispatchWithPriorPointer({
-			priorStatus: "unknown",
-			priorSessionId: "s1",
-			currentSessionId: "s2",
-			durableBusyRefusal: true,
+	for (const priorStatus of ["unknown", "throws"] as const) {
+		test(`moved binding with durable busy refusal for the old op forgets it without reading old status (${priorStatus})`, async () => {
+			const result = await dispatchWithPriorPointer({
+				priorStatus,
+				priorSessionId: "s1",
+				currentSessionId: "s2",
+				durableBusyRefusal: true,
+			});
+			expect(result.prompts()).toBe(1);
+			expect(result.sessionPort.sendAttempts).toHaveLength(1);
+			const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
+			expect(replacement).toMatchObject({ sessionId: "s2", eventIds: [result.eventId] });
+			expect(replacement.opRef).not.toBe(result.priorOpRef);
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+			// The durable refusal settles it; an unreachable retired session is never asked.
+			expect(result.statusCalls).not.toContainEqual({ sessionId: result.priorSessionId, opRef: result.priorOpRef });
 		});
-		expect(result.prompts()).toBe(1);
-		expect(result.sessionPort.sendAttempts).toHaveLength(1);
-		const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
-		expect(replacement).toMatchObject({ sessionId: "s2", eventIds: [result.eventId] });
-		expect(replacement.opRef).not.toBe(result.priorOpRef);
-		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
-		expectOldPointerStatus(result);
-	});
+	}
 });

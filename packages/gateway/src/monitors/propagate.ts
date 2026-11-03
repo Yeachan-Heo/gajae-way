@@ -1398,7 +1398,23 @@ export class MonitorPropagator {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
 						if (prior && prior.sessionId !== sessionId) {
-							// Binding moved after this pointer was created: check the old session's disposition.
+							// Binding moved after this pointer was created. A durable busy refusal for
+							// the exact old op proves it was never admitted, so it needs no status read
+							// from the old session, which may be unreachable after a roll.
+							if (
+								authority !== null &&
+								isBrokerPromptBusyRefusal(
+									this.#database.bindings.brokerOperation(
+										authority,
+										"turn.prompt",
+										JSON.stringify([prior.sessionId, prior.opRef]),
+									),
+								)
+							) {
+								eventIdsToForget.push(row.event_id);
+								continue;
+							}
+							// Otherwise resolve the old op against its own session.
 							try {
 								const report = await this.#sessionPort.status({
 									sessionId: prior.sessionId,
@@ -1415,17 +1431,8 @@ export class MonitorPropagator {
 									// For safety, hold instead of attempting cross-session harvest.
 									throw new AuthoringResultUnavailableError("output_pending");
 								}
-								const hasDurableBusyRefusal =
-									authority !== null &&
-									isBrokerPromptBusyRefusal(
-										this.#database.bindings.brokerOperation(
-											authority,
-											"turn.prompt",
-											JSON.stringify([prior.sessionId, prior.opRef]),
-										),
-									);
-								if (state === "failed" || hasDurableBusyRefusal) {
-									// A failed turn or durable never-admitted refusal permits a fresh prompt.
+								if (state === "failed") {
+									// A terminally failed turn permits a fresh prompt.
 									eventIdsToForget.push(row.event_id);
 								} else {
 									// Unknown or otherwise inconclusive status is not evidence that the old
