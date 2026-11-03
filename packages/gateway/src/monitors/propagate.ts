@@ -1447,6 +1447,12 @@ export class MonitorPropagator {
 						safety.lastContextTokens = contextUsage.tokens;
 						const contextRollTokens = this.#registry.get(monitor.monitorId)?.contextRollTokens;
 						if (contextRollTokens !== undefined && !safety.pendingRoll && contextUsage.tokens >= contextRollTokens) {
+							this.#database.transaction(() =>
+								this.#database.core.metaSet(
+									monitorContextBudgetArmKey(sessionOriginKey),
+									JSON.stringify({ epoch: boundSessionEpoch, tokens: contextUsage.tokens }),
+								),
+							);
 							safety.pendingRoll = "context_budget";
 							console.error(
 								`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${contextUsage.tokens}/${contextRollTokens} turns=${safety.turns}`,
@@ -2057,6 +2063,20 @@ export class MonitorPropagator {
 	 */
 	#rollSessionIfArmed(sessionOriginKey: string, originRefJson: string, monitor: MonitorRecord): string | undefined {
 		const state = this.#safetyState(sessionOriginKey);
+		const armKey = monitorContextBudgetArmKey(sessionOriginKey);
+		if (!state.pendingRoll) {
+			const rawArm = this.#database.core.metaGet(armKey);
+			if (rawArm !== undefined) {
+				const arm = parseContextBudgetArm(rawArm);
+				const liveEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+				if (arm && arm.epoch === liveEpoch) {
+					state.pendingRoll = "context_budget";
+					state.lastContextTokens = arm.tokens;
+				} else {
+					this.#database.transaction(() => this.#database.core.metaDelete(armKey));
+				}
+			}
+		}
 		const reason = state.pendingRoll;
 		const handoffKey = monitorRollHandoffKey(sessionOriginKey);
 		if (!reason) {
@@ -2083,6 +2103,7 @@ export class MonitorPropagator {
 				state.lastContextTokens === undefined ||
 				state.lastContextTokens < contextRollTokens
 			) {
+				this.#database.transaction(() => this.#database.core.metaDelete(armKey));
 				state.pendingRoll = undefined;
 				console.info(
 					`monitor session size roll disarmed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${state.lastContextTokens ?? "unknown"}/${contextRollTokens ?? "unset"}`,
@@ -2110,6 +2131,7 @@ export class MonitorPropagator {
 		this.#database.transaction((tx) => {
 			const epoch = this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson);
 			this.#database.core.metaSet(handoffKey, JSON.stringify({ epoch, reason }));
+			this.#database.core.metaDelete(armKey);
 		});
 		// A stalled session is still holding its wedged turn; nothing will prompt
 		// it again now that the origin is bound to a new epoch, so end its host
@@ -2468,6 +2490,23 @@ function authoringTurnKey(eventId: string): string {
 
 function monitorRollHandoffKey(sessionOriginKey: string): string {
 	return `monitor_roll_handoff:${sessionOriginKey}`;
+}
+
+function monitorContextBudgetArmKey(sessionOriginKey: string): string {
+	return `monitor_context_budget_arm:${sessionOriginKey}`;
+}
+
+function parseContextBudgetArm(raw: string): { epoch: number; tokens: number } | undefined {
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object") return undefined;
+		const { epoch, tokens } = value as Record<string, unknown>;
+		if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return undefined;
+		if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return undefined;
+		return { epoch, tokens };
+	} catch {
+		return undefined;
+	}
 }
 
 function parseRollHandoffEpoch(raw: string | undefined): number | undefined {

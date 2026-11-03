@@ -370,6 +370,10 @@ for (const tokens of [10_000, 12_000]) {
 				lastContextTokens: tokens,
 				turns: 1,
 			});
+			expect(JSON.parse(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)!)).toEqual({
+				epoch: 0,
+				tokens,
+			});
 			expect(log.mock.calls.filter(([line]) => String(line).includes("reason=context_budget"))).toEqual([
 				[
 					`monitor session safety net armed for ${sessionKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${tokens}/10000 turns=1`,
@@ -387,11 +391,110 @@ for (const tokens of [10_000, 12_000]) {
 				lastContextTokens: undefined,
 				turns: 1,
 			});
+			expect(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)).toBeUndefined();
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			expect(turns[2]?.sessionId).toBe("event-session-e1");
 			database.close();
 		} finally {
 			log.mockRestore();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const scenario of ["unchanged", "raised", "cleared", "operator epoch bump"] as const) {
+	test(`a persisted context budget arm survives restart with ${scenario}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-arm-restart-"));
+		try {
+			let observeUsage = true;
+			const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+				contextUsage: () => (observeUsage ? { percent: 60, tokens: 12_000 } : undefined),
+			});
+			const monitor = registry.add({
+				name: "persisted-budget-arm",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				instruction: "Check the deploy queue.",
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			const armKey = `monitor_context_budget_arm:${sessionKey}`;
+			const first = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+			expect(JSON.parse(database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: 12_000 });
+			observeUsage = false;
+			pipeline.dispose();
+			if (scenario === "raised") registry.update({ monitorId: monitor.monitorId, contextRollTokens: 20_000 });
+			if (scenario === "cleared") registry.update({ monitorId: monitor.monitorId, contextRollTokens: null });
+			if (scenario === "operator epoch bump")
+				database.transaction((tx) => database.bindings.rotateEpoch(tx, sessionKey));
+			const restarted = new MonitorPropagator({
+				database,
+				registry,
+				sessionPort,
+				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+				delivery: new DeliveryService(database),
+				emit: () => {},
+			});
+			expect(restarted.sessionSafetyState(sessionKey).pendingRoll).toBeUndefined();
+			const second = await restarted.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(database.monitors.authoredOutput(second)).toBe(`note for ${second}`);
+			expect(database.core.metaGet(armKey)).toBeUndefined();
+			const expectedEpoch = scenario === "unchanged" || scenario === "operator epoch bump" ? 1 : 0;
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(expectedEpoch);
+			expect(turns[1]?.sessionId).toBe(`event-session-e${expectedEpoch}`);
+			if (scenario === "unchanged") {
+				expect(turns[1]?.prompt).toContain("Context compaction");
+				expect(turns[1]?.prompt).toContain(`note for ${first}`);
+				expect(restarted.sessionSafetyState(sessionKey).lastRoll).toBe("context_budget");
+			} else {
+				expect(turns[1]?.prompt).not.toContain("Context compaction");
+				expect(restarted.sessionSafetyState(sessionKey).lastRoll).toBeUndefined();
+			}
+			expect(restarted.sessionSafetyState(sessionKey).pendingRoll).toBeUndefined();
+			await restarted.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(turns[2]?.sessionId).toBe(`event-session-e${expectedEpoch}`);
+			expect(turns[2]?.prompt).not.toContain("Context compaction");
+			restarted.dispose();
+			database.close();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const rawArm of [
+	"{invalid",
+	"null",
+	'{"epoch":0}',
+	'{"epoch":0,"tokens":"12000"}',
+	'{"epoch":-1,"tokens":12000}',
+]) {
+	test(`a malformed persisted context budget arm ${rawArm} is deleted without rolling`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-malformed-arm-"));
+		try {
+			const { database, registry, pipeline, turns } = await harness(directory);
+			const monitor = registry.add({
+				name: "malformed-budget-arm",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			const armKey = `monitor_context_budget_arm:${sessionKey}`;
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			database.core.metaSet(armKey, rawArm);
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+			expect(database.core.metaGet(armKey)).toBeUndefined();
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			expect(turns[1]?.sessionId).toBe("event-session-e0");
+			expect(turns[1]?.prompt).not.toContain("Context compaction");
+			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBeUndefined();
+			database.close();
+		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
@@ -426,6 +529,7 @@ for (const contextRollTokens of [undefined, null, 20_000]) {
 				lastRoll: undefined,
 				lastContextTokens: 12_000,
 			});
+			expect(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)).toBeUndefined();
 			expect(log.mock.calls.filter(([line]) => String(line).includes("monitor session size roll disarmed"))).toEqual([
 				[
 					`monitor session size roll disarmed for ${sessionKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=12000/${contextRollTokens ?? "unset"}`,
@@ -493,6 +597,7 @@ for (const reason of ["context_budget", "context_failures_native_compaction_unav
 				);
 				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 				expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason });
+				expect(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)).toBeUndefined();
 				registry.update({ monitorId: monitor.monitorId, instruction: "Check the updated deploy queue." });
 				let active = pipeline;
 				if (failure === "bind failure and restart") {
