@@ -2424,6 +2424,72 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 	});
 });
 
+test("#743: late completion after shutdown drain preserves pointer for harvest on next boot", async () => {
+	let sideEffectCount = 0;
+	let release: (() => void) | undefined;
+	const parked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const {
+		propagator,
+		monitor,
+		database: db,
+		registry,
+		sessionPort,
+	} = await harness(async (_id, text) => {
+		sideEffectCount++;
+		if (sideEffectCount === 1) await parked;
+		return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "answer" })));
+	});
+	const eventId = seedEvent(db, monitor.monitorId, "admitted");
+	const reconcile = propagator.reconcile();
+	// Wait for the authoring turn to start
+	for (let attempt = 0; attempt < 100 && sideEffectCount === 0; attempt++) await Bun.sleep(5);
+	expect(sideEffectCount).toBe(1);
+	// The turn never settles inside the shutdown window: drain must return on
+	// its own instead of waiting for the service manager's SIGKILL.
+	await propagator.drain(100);
+	expect(stage(db, eventId)).toBe("failed");
+	expect(db.monitors.failure(eventId)?.code).toBe("gateway_shutdown");
+	expect(db.monitors.eventLiveLeaseOwner(eventId)).toBeUndefined();
+	// The orphaned turn finishes after the stop and completes successfully.
+	// Issue #743: the authoring-turn pointer should not be deleted before lease
+	// fencing, so if the fenced update fails (lease is gone), the pointer is still
+	// available for the next boot to harvest the result instead of resending.
+	release?.();
+	await reconcile;
+	// Wait for the late-completing turn to actually finish
+	for (let attempt = 0; attempt < 100 && sideEffectCount === 1; attempt++) await Bun.sleep(10);
+	// The late completion cannot transition the event from failed because the lease
+	// is gone, but the pointer should still be in the database.
+	const pointerKey = `monitor_authoring_turn:${eventId}`;
+	const pointer = db.core.metaGet(pointerKey);
+	expect(pointer).toBeDefined(); // Pointer is preserved
+	expect(sideEffectCount).toBe(1); // Still only one authoring turn started
+	// The next boot should harvest the result using the preserved pointer, not resend.
+	// Reuse the same sessionPort so the operation from the first boot is still available.
+	sessionPort.responds = async (_id, text) => {
+		sideEffectCount++;
+		return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "resent" })));
+	};
+	const next = new MonitorPropagator({
+		database: db,
+		registry,
+		sessionPort,
+		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+		delivery: new DeliveryService(db),
+		emit: () => {},
+		now: () => Date.now() + 10 * 60_000 + 1,
+	});
+	propagators.push(next);
+	await next.reconcile();
+	// The pointer should be gone now (harvested)
+	expect(db.core.metaGet(pointerKey)).toBeUndefined();
+	// The original result should be harvested, not resent
+	expect(db.monitors.authoredOutput(eventId)).toBe("answer");
+	expect(sideEffectCount).toBe(1); // No additional side effect
+});
+
 test("#702: failureDetail names an unlisted Error subclass and keeps only a token-shaped code", () => {
 	class RuntimePolicyError extends Error {
 		readonly code: string;
