@@ -2443,3 +2443,94 @@ test("#702: failureDetail names an unlisted Error subclass and keeps only a toke
 	});
 	expect(JSON.parse(failureDetail(new Error("plain")))).toEqual({ class: "Error" });
 });
+
+describe("#742: authoring turn pointer on unknown status or throwing status", () => {
+	test("pointer is held (not forgotten) on same-session retry with unknown status", async () => {
+		let skew = 0;
+		const { propagator, monitor, database: db, sessionPort } = await harness(
+			async () => new Promise<string>(() => {}),
+			{ now: () => Date.now() + skew },
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		// First dispatch: the prompt is sent but times out while running
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			await sessionPort.send(input);
+			throw new SessionRequestTimeoutError(
+				input.sessionId,
+				input.opRef,
+				await sessionPort.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef }),
+			);
+		};
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(sessionPort.sends).toHaveLength(1);
+		const firstOpRef = sessionPort.sends[0]?.opRef;
+		expect(firstOpRef).toBeDefined();
+		const savedPointer = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(savedPointer).toBeDefined();
+		
+		// For the retry: make the operation return unknown (missing reconciliation)
+		skew += (MONITOR_EVENT_RETRY_BACKOFF_MS[1] ?? 0) + 60_000;
+		if (firstOpRef) sessionPort.forgetOperation(firstOpRef);
+		sessionPort.request = request;
+		
+		// Retry reconcile: should check status, get unknown, and NOT dispatch (holding the pointer)
+		await propagator.reconcile();
+		
+		// Still only one prompt sent (no new dispatch due to unverifiable pointer)
+		expect(sessionPort.sends).toHaveLength(1);
+		// The pointer should still exist unchanged (held, not forgotten)
+		const afterRetryPointer = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(afterRetryPointer).toBe(savedPointer);
+	});
+	
+	test("pointer is held (not forgotten) on same-session retry with throwing status", async () => {
+		let skew = 0;
+		let statusThrows = false;
+		const { propagator, monitor, database: db, sessionPort } = await harness(
+			async () => new Promise<string>(() => {}),
+			{ now: () => Date.now() + skew },
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		
+		// Override status to throw after first attempt
+		const originalStatus = sessionPort.status.bind(sessionPort);
+		sessionPort.status = async (input) => {
+			if (statusThrows) throw new Error("broker_unavailable");
+			return originalStatus(input);
+		};
+		
+		// First dispatch: the prompt is sent but times out while running
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			await sessionPort.send(input);
+			throw new SessionRequestTimeoutError(
+				input.sessionId,
+				input.opRef,
+				await sessionPort.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef }),
+			);
+		};
+		await propagator.reconcile();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(sessionPort.sends).toHaveLength(1);
+		const firstOpRef = sessionPort.sends[0]?.opRef;
+		expect(firstOpRef).toBeDefined();
+		const savedPointer = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(savedPointer).toBeDefined();
+		
+		// For the retry: make status check throw (broker unavailable)
+		skew += (MONITOR_EVENT_RETRY_BACKOFF_MS[1] ?? 0) + 60_000;
+		statusThrows = true;
+		sessionPort.request = request;
+		
+		// Retry reconcile: should catch the status error and NOT dispatch (holding the pointer)
+		await propagator.reconcile();
+		
+		// Still only one prompt sent (no new dispatch due to unverifiable pointer)
+		expect(sessionPort.sends).toHaveLength(1);
+		// Pointer should still exist unchanged (held, not forgotten)
+		const afterRetryPointer = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(afterRetryPointer).toBe(savedPointer);
+	});
+});

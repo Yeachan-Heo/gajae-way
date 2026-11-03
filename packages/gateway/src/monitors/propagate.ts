@@ -1361,7 +1361,25 @@ export class MonitorPropagator {
 				// #187: a request-phase failure does not mean the prompt was refused —
 				// the turn it started may still be running. Reuse its op-ref on retry.
 				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
+				const firstEventRaw = authoringEventIds[0] ? this.#database.core.metaGet(authoringTurnKey(authoringEventIds[0])) : undefined;
 				const reusedOpRef = resumeTurn?.opRef ?? (await this.#reusableAuthoringTurn(authoringEventIds, sessionId));
+				// #742: If we had a saved pointer but #reusableAuthoringTurn couldn't verify it
+				// (unknown or throwing status), hold this dispatch and let reconcile retry later.
+				// Only apply to retry scenarios (dispatch_attempts > 0) to avoid false positives.
+				const isRetryScenario = claimed.some((row) => row.dispatch_attempts > 0);
+				if (
+					isRetryScenario &&
+					resumeTurn === undefined &&
+					reusedOpRef === undefined &&
+					firstEventRaw !== undefined &&
+					(await this.#hasUnverifiablePointer(firstEventRaw, sessionId))
+				) {
+					// Pointer exists on this session but status is unknown or check threw.
+					// Don't dispatch; release lease and let next reconcile try after status changes.
+					for (const row of leased)
+						this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
+					return;
+				}
 				const opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
 				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
 				this.#database.transaction((tx) => {
@@ -1735,6 +1753,21 @@ export class MonitorPropagator {
 		throw new AuthoringResultUnavailableError(output.code);
 	}
 	/**
+	 * Check if a saved pointer's status is unknown or throws (#742).
+	 * Used to decide whether to hold a dispatch when reusing fails.
+	 */
+	async #hasUnverifiablePointer(pointerRaw: string, sessionId: string): Promise<boolean> {
+		const pointer = parseAuthoringTurnPointer(pointerRaw);
+		if (!pointer || pointer.sessionId !== sessionId) return false;
+		try {
+			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: pointer.opRef });
+			return report.status.status === "unknown";
+		} catch {
+			return true;
+		}
+	}
+
+	/**
 	 * The op-ref of a previous attempt's authoring turn for exactly these events
 	 * on this session, when that turn is still running or finished successfully.
 	 * A failed, unknown or unreadable prior turn is forgotten so the retry sends
@@ -1760,8 +1793,13 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+			// Unknown status is not evidence that the operation was never admitted (#742):
+			// missing reconciliation evidence must not authorize recreation. Hold the pointer.
+			if (state === "unknown") return undefined;
 		} catch {
-			// Unreadable status is not evidence of a live turn.
+			// Status read failed: not evidence the operation was never admitted (#742).
+			// Hold the pointer; on same-session retry a subsequent read may succeed.
+			return undefined;
 		}
 		forget();
 		return undefined;
