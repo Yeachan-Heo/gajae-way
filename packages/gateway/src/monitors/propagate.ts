@@ -1365,6 +1365,31 @@ export class MonitorPropagator {
 				const reusedOpRef = resumeTurn?.opRef ?? (await this.#reusableAuthoringTurn(authoringEventIds, sessionId));
 				const opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
 				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
+				// #742: Check if we should hold the pointer instead of overwriting it with a fresh opRef
+				let shouldThrowOutputPending = false;
+				const authority = this.#database.bindings.brokerAuthority();
+				if (reusedOpRef === undefined && !resumeTurn && authority) {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && prior.sessionId === sessionId && prior.opRef !== opRef) {
+							// Check if we have positive evidence the prior opRef was never admitted
+							const brokerOp = this.#database.bindings.brokerOperation(
+								authority,
+								"turn.prompt",
+								JSON.stringify([sessionId, prior.opRef]),
+							);
+							if (!isBrokerPromptBusyRefusal(brokerOp)) {
+								// No positive never-admitted evidence: hold the pointer instead
+								shouldThrowOutputPending = true;
+								break;
+							}
+						}
+					}
+				}
+				if (shouldThrowOutputPending) {
+					throw new AuthoringResultUnavailableError("output_pending");
+				}
 				this.#database.transaction((tx) => {
 					for (const row of claimed) {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));

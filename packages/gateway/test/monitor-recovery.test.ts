@@ -32,7 +32,7 @@ import {
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 } from "../src/store/groups/monitors";
 import type { SessionPortResponder } from "./session-port.fake";
-import { sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -2445,10 +2445,14 @@ test("#702: failureDetail names an unlisted Error subclass and keeps only a toke
 });
 
 describe("#742: accepted authoring turns held when status is unknown or throws", () => {
-	test("holds pointer when status is unknown during exhausted turn evaluation", async () => {
-		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-unknown-"));
+	test("dispatch does not author fresh when existing pointer status is unknown", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-unknown-dispatch-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// Set up broker authority so the fix can check for busy refusal
+		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+
 		const monitor = new MonitorRegistry(db).add({
 			name: "test-monitor",
 			trigger: { kind: "cron", schedule: "* * * * *" },
@@ -2456,9 +2460,9 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		});
 
 		const eventId = crypto.randomUUID();
-		const opRef = crypto.randomUUID();
+		const priorOpRef = crypto.randomUUID();
 
-		// Create event with failed stage and exhausted attempts, save a pointer
+		// Create an event in admitted state with a prior pointer, simulating a retry scenario
 		db.transaction((tx) => {
 			db.monitors.eventCreate(tx, {
 				eventId,
@@ -2467,23 +2471,23 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 				payloadJson: JSON.stringify({}),
 				firedAt: new Date().toISOString(),
 			});
-			// Mark as failed with max attempts
-			for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
-				db.monitors.eventUpdate(tx, eventId, "failed");
-				db.monitors.eventIncrementAttempts(tx, eventId);
-			}
-			// Save pointer
-			const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+			// Set to admitted state so it gets picked up for dispatch
+			db.monitors.eventUpdate(tx, eventId, "admitted");
+			// Add a prior pointer from that dispatch (as if a prior dispatch created it but then failed during request)
+			const pointer = JSON.stringify({ sessionId: "s1", opRef: priorOpRef, eventIds: [eventId] });
 			db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
 		});
 
-		const sessionPort = fakeSessionPort(async () => "[]");
-		// Make status return unknown
-		sessionPort.status = async () => ({
-			operationRef: opRef,
-			status: { status: "unknown" as const },
-			summaryCompleted: false,
-		});
+		let statusCallCount = 0;
+		// Make status return unknown to prevent reuse
+		sessionPort.status = async () => {
+			statusCallCount++;
+			return {
+				operationRef: priorOpRef,
+				status: { status: "unknown" as const },
+				summaryCompleted: false,
+			};
+		};
 
 		const propagator = new MonitorPropagator({
 			database: db,
@@ -2497,19 +2501,31 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 
 		await propagator.reconcile();
 
-		// Pointer should be held (not forgotten)
+		// Should have called status during dispatch
+		expect(statusCallCount).toBeGreaterThan(0);
+		// Pointer should still exist and point to the prior opRef (not overwritten with fresh opRef)
 		const pointerStored = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
 		expect(pointerStored).toBeDefined();
 		if (pointerStored) {
 			const parsed = JSON.parse(pointerStored);
-			expect(parsed.opRef).toBe(opRef);
+			// The opRef should NOT have changed to a fresh one
+			expect(parsed.opRef).toBe(priorOpRef);
+		}
+		// Event should move to failed state due to output_pending error
+		const eventRow = db.monitors.eventGet(eventId);
+		if (eventRow) {
+			expect(eventRow.stage).toBe("failed");
 		}
 	});
 
-	test("holds pointer when status throws during exhausted turn evaluation", async () => {
-		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-throw-"));
+	test("dispatch does not author fresh when existing pointer status throws", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-throw-dispatch-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// Set up broker authority so the fix can check for busy refusal
+		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+
 		const monitor = new MonitorRegistry(db).add({
 			name: "test-monitor",
 			trigger: { kind: "cron", schedule: "* * * * *" },
@@ -2517,7 +2533,7 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		});
 
 		const eventId = crypto.randomUUID();
-		const opRef = crypto.randomUUID();
+		const priorOpRef = crypto.randomUUID();
 
 		db.transaction((tx) => {
 			db.monitors.eventCreate(tx, {
@@ -2527,17 +2543,15 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 				payloadJson: JSON.stringify({}),
 				firedAt: new Date().toISOString(),
 			});
-			for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
-				db.monitors.eventUpdate(tx, eventId, "failed");
-				db.monitors.eventIncrementAttempts(tx, eventId);
-			}
-			const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+			db.monitors.eventUpdate(tx, eventId, "admitted");
+			const pointer = JSON.stringify({ sessionId: "s1", opRef: priorOpRef, eventIds: [eventId] });
 			db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
 		});
 
-		const sessionPort = fakeSessionPort(async () => "[]");
-		// Make status throw
+		let statusCallCount = 0;
+		// Make status throw to prevent reuse
 		sessionPort.status = async () => {
+			statusCallCount++;
 			throw new Error("broker_unavailable");
 		};
 
@@ -2553,12 +2567,20 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 
 		await propagator.reconcile();
 
-		// Pointer should be held (not forgotten)
+		// Should have called status during dispatch
+		expect(statusCallCount).toBeGreaterThan(0);
+		// Pointer should still exist and not be overwritten
 		const pointerStored = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
 		expect(pointerStored).toBeDefined();
 		if (pointerStored) {
 			const parsed = JSON.parse(pointerStored);
-			expect(parsed.opRef).toBe(opRef);
+			// The opRef should NOT have changed to a fresh one
+			expect(parsed.opRef).toBe(priorOpRef);
+		}
+		// Event should move to failed state
+		const eventRow = db.monitors.eventGet(eventId);
+		if (eventRow) {
+			expect(eventRow.stage).toBe("failed");
 		}
 	});
 });
