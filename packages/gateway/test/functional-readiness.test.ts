@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
+import type { FunctionalReadinessCategory } from "@gajae-gateway/protocol";
 import {
 	FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
 	FUNCTIONAL_READINESS_WINDOW_MS,
 	FunctionalReadiness,
 } from "../src/functional-readiness";
-import type { FunctionalReadinessCategory } from "@gajae-gateway/protocol";
 
 const START = Date.UTC(2026, 0, 1);
 
