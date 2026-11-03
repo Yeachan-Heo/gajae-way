@@ -412,6 +412,7 @@ export interface SessionRequestResult {
 	readonly receipt: SendReceipt;
 	readonly status: StatusReport;
 	readonly assistant: LastAssistantResult;
+	readonly contextUsage?: SessionContextUsage;
 }
 
 export class SessionRequestTimeoutError extends Error {
@@ -2085,14 +2086,22 @@ export class BrokerSessionPort implements SessionPort {
 			// projection before consuming an assistant response as this answer.
 			if (projectOpState(status.status) !== "completed")
 				throw markSessionRequestStep(new SessionTerminalError(status), "status");
+			const assistant = await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
+				(error: unknown) => {
+					throw markSessionRequestStep(error, "last_assistant");
+				},
+			);
+			let contextUsage: SessionContextUsage | undefined;
+			try {
+				contextUsage = await this.contextUsage({ sessionId: input.sessionId, repo: input.repo, relay });
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw markSessionRequestStep(error, "authority");
+			}
 			result = {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
-					(error: unknown) => {
-						throw markSessionRequestStep(error, "last_assistant");
-					},
-				),
+				assistant,
+				...(contextUsage === undefined ? {} : { contextUsage }),
 			};
 		} catch (error) {
 			requestFailed = true;

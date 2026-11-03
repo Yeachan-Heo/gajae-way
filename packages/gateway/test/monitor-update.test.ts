@@ -112,6 +112,7 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 		const update = await request("update", "monitor.update", {
 			monitorId: monitor.monitorId,
 			schedule: "0 */2 * * *",
+			contextRollTokens: 100_000,
 			reportTo: { platform: "discord", kind: "channel", conversationId: "report-room" },
 		});
 		expect(update).toMatchObject({ type: "response", result: { monitorId: monitor.monitorId } });
@@ -122,13 +123,63 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 				monitor: {
 					monitorId: monitor.monitorId,
 					trigger: { kind: "cron", schedule: "0 */2 * * *" },
+					contextRollTokens: 100_000,
 					reportTo: { platform: "discord", kind: "channel", conversationId: "report-room" },
 				},
 			},
 		});
+		const listed = await request("list", "monitor.list", {});
+		expect(listed).toMatchObject({
+			result: { monitors: [{ monitorId: monitor.monitorId, contextRollTokens: 100_000 }] },
+		});
 	} finally {
 		socket?.end();
 		await server?.stop();
+		database?.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("contextRollTokens validates bounds and round-trips set, omitted and cleared updates", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-context-roll-registry-"));
+	const path = join(home, "gateway.db");
+	let database: Store | undefined;
+	try {
+		database = await Store.open(path);
+		let registry = new MonitorRegistry(database);
+		const spec = {
+			name: "context-roll",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["context.tick"],
+		} as const;
+		for (const contextRollTokens of [0, 9999, 1.5, 2_000_001, "10000", null])
+			expect(() => registry.add({ ...spec, contextRollTokens: contextRollTokens as number })).toThrow(
+				"monitor contextRollTokens is invalid",
+			);
+		const monitor = registry.add({ ...spec, contextRollTokens: 10_000 });
+		expect(registry.get(monitor.monitorId)?.contextRollTokens).toBe(10_000);
+		expect(database.monitors.rows()[0]?.context_roll_tokens).toBe(10_000);
+		for (const contextRollTokens of [0, 9999, 1.5, 2_000_001, "10000", null])
+			expect(() =>
+				registry.update({ monitorId: monitor.monitorId, contextRollTokens: contextRollTokens as number }),
+			).toThrow("monitor contextRollTokens is invalid");
+		expect(registry.get(monitor.monitorId)?.contextRollTokens).toBe(10_000);
+		expect(registry.update({ monitorId: monitor.monitorId, contextRollTokens: 2_000_000 })?.contextRollTokens).toBe(
+			2_000_000,
+		);
+		expect(registry.update({ monitorId: monitor.monitorId, name: "renamed" })?.contextRollTokens).toBe(2_000_000);
+		database.close();
+		database = await Store.open(path);
+		registry = new MonitorRegistry(database);
+		expect(registry.get(monitor.monitorId)?.contextRollTokens).toBe(2_000_000);
+		expect(
+			registry.update({ monitorId: monitor.monitorId, contextRollTokens: undefined })?.contextRollTokens,
+		).toBeUndefined();
+		expect(database.monitors.rows()[0]?.context_roll_tokens).toBeNull();
+		database.close();
+		database = await Store.open(path);
+		expect(new MonitorRegistry(database).get(monitor.monitorId)?.contextRollTokens).toBeUndefined();
+	} finally {
 		database?.close();
 		await rm(home, { recursive: true, force: true });
 	}

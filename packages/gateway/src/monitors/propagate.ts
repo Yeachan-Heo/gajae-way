@@ -275,6 +275,8 @@ export interface MonitorSessionSafetyState {
 	priorRunBusyFailures: number;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
+	/** Last observed context token count in the current session epoch. */
+	lastContextTokens: number | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
 	pendingRoll: SessionRollReason | undefined;
 	/** Reason of the last roll actually performed. */
@@ -1379,9 +1381,10 @@ export class MonitorPropagator {
 					opRef,
 				};
 				const requestInput = { sessionId, repo: this.#repo, originKey: sessionOriginKey, text: prompt, opRef };
+				const requestResult = reusedOpRef === undefined ? await this.#sessionPort.request(requestInput) : undefined;
 				const response =
-					reusedOpRef === undefined
-						? (await this.#sessionPort.request(requestInput)).assistant.text
+					requestResult !== undefined
+						? requestResult.assistant.text
 						: await this.#harvestAuthoringTurn(
 								requestInput,
 								{ sessionId, opRef, eventIds: authoringEventIds },
@@ -1401,8 +1404,8 @@ export class MonitorPropagator {
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
-				// rolls a session on its own — native gjc compaction owns keeping the
-				// context bounded while the session is answering.
+				// rolls a session on its own. Native compaction owns context bounds;
+				// an owner may separately opt in to a context-size roll.
 				if (boundSessionEpoch !== undefined) {
 					const turns = this.#database.transaction((tx) =>
 						this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
@@ -1414,13 +1417,27 @@ export class MonitorPropagator {
 				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
-				// answer: it must not arm the safety net.
+				// answer: it is not evidence of context exhaustion.
 				if (!response.trim()) throw new Error("authoring response is empty");
 				if (boundSessionEpoch !== undefined) {
 					const safety = this.#safetyState(sessionOriginKey);
 					safety.contextFailures = 0;
 					// The runtime accepted and finished a turn, so it is not stalled.
 					safety.busyFailures = 0;
+					const contextUsage = requestResult?.contextUsage;
+					if (
+						contextUsage !== undefined &&
+						this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch
+					) {
+						safety.lastContextTokens = contextUsage.tokens;
+						const contextRollTokens = this.#registry.get(monitor.monitorId)?.contextRollTokens;
+						if (contextRollTokens !== undefined && !safety.pendingRoll && contextUsage.tokens >= contextRollTokens) {
+							safety.pendingRoll = "context_budget";
+							console.error(
+								`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${contextUsage.tokens}/${contextRollTokens} turns=${safety.turns}`,
+							);
+						}
+					}
 				}
 				// Lease fencing: after an await, this attempt may no longer own the
 				// claim (expired + stolen). Every write below is conditional on the
@@ -1816,6 +1833,7 @@ export class MonitorPropagator {
 			stalledSessionId: undefined,
 			priorRunBusyFailures: 0,
 			nativeCompaction: undefined,
+			lastContextTokens: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
 		};
@@ -2015,8 +2033,8 @@ export class MonitorPropagator {
 		}
 	}
 	/**
-	 * THE ONE monitor-session roll choke point (issue #68). LAST RESORT: it fires
-	 * only for a roll armed by `#recordAuthoringFailure`, never on turn count.
+	 * THE ONE monitor-session roll choke point (issue #68). It consumes an armed
+	 * failure-recovery or owner-opted-in context-size roll, never a turn count.
 	 *
 	 * Returns the digest to inject into this turn's prompt, or undefined when no
 	 * roll was armed. The digest is pure text assembly — a roll costs no model
@@ -2026,6 +2044,20 @@ export class MonitorPropagator {
 		const state = this.#safetyState(sessionOriginKey);
 		const reason = state.pendingRoll;
 		if (!reason) return undefined;
+		if (reason === "context_budget") {
+			const contextRollTokens = this.#registry.get(monitor.monitorId)?.contextRollTokens;
+			if (
+				contextRollTokens === undefined ||
+				state.lastContextTokens === undefined ||
+				state.lastContextTokens < contextRollTokens
+			) {
+				state.pendingRoll = undefined;
+				console.info(
+					`monitor session size roll disarmed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${state.lastContextTokens ?? "unknown"}/${contextRollTokens ?? "unset"}`,
+				);
+				return undefined;
+			}
+		}
 		// Build the digest BEFORE the roll: it reads durable authored notes, which
 		// the roll does not touch, but reading first keeps the ordering obvious.
 		const digest = buildMonitorCompactionDigest({
@@ -2071,6 +2103,7 @@ export class MonitorPropagator {
 		state.busyFailures = 0;
 		state.priorRunBusyFailures = 0;
 		state.turns = 0;
+		state.lastContextTokens = undefined;
 		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
 		);

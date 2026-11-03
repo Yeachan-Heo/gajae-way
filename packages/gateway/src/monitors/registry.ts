@@ -28,6 +28,7 @@ const MONITOR_UPDATE_FIELDS = new Set([
 	"instruction",
 	"model",
 	"serviceTier",
+	"contextRollTokens",
 	"reportTo",
 	"enabled",
 	"procedureFiles",
@@ -74,6 +75,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: record.model ? JSON.stringify(record.model) : null,
 				serviceTier: record.serviceTier ?? null,
+				contextRollTokens: record.contextRollTokens ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
 			if (record.reportTo)
@@ -148,6 +150,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: updated.model ? JSON.stringify(updated.model) : null,
 				serviceTier: updated.serviceTier ?? null,
+				contextRollTokens: updated.contextRollTokens ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
 			if (!persisted) return undefined;
@@ -231,6 +234,7 @@ function rowToRecord(row: ReturnType<Store["monitors"]["rows"]>[number], reportT
 		instruction: row.instruction ?? undefined,
 		model: row.model_json ? JSON.parse(row.model_json) : undefined,
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
+		contextRollTokens: row.context_roll_tokens ?? undefined,
 		procedureFiles: row.procedure_files_json ? JSON.parse(row.procedure_files_json) : undefined,
 		reportTo: reportToJson ? JSON.parse(reportToJson) : undefined,
 		createdAt: row.created_at,
@@ -288,6 +292,11 @@ export function validateSpec(spec: MonitorSpec): void {
 	}
 	if (spec.serviceTier !== undefined && !SERVICE_TIERS.has(spec.serviceTier))
 		throw new Error("monitor serviceTier is invalid");
+	if (
+		spec.contextRollTokens !== undefined &&
+		(!Number.isInteger(spec.contextRollTokens) || spec.contextRollTokens < 10_000 || spec.contextRollTokens > 2_000_000)
+	)
+		throw new Error("monitor contextRollTokens is invalid");
 	if (spec.instruction !== undefined) {
 		if (typeof spec.instruction !== "string") throw new Error("monitor instruction must be a string");
 		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)

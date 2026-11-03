@@ -566,6 +566,12 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/**
+	 * After an answered authoring turn at or above this session context size in
+	 * tokens, arm a roll. The next fresh dispatch starts a new session epoch
+	 * seeded with the monitor digest. Unset means never roll on context size.
+	 */
+	readonly contextRollTokens?: number;
 	/** Inject each reportable authored result as an internal report into this conversation session. */
 	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;

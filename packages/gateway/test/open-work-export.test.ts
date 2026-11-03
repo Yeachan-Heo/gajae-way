@@ -4,7 +4,7 @@ import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeOpenWorkExport } from "../src/ops/open-work-export";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
 const roots: string[] = [];
 
@@ -109,7 +109,7 @@ test("open-work export publishes v1 atomically with 0600 mode, backup hash and c
 			kind: "gajaeway.open-work-export",
 			version: 1,
 			reason: "cutover",
-			schemaVersion: 39,
+			schemaVersion: LATEST_SCHEMA_VERSION,
 			backup: { path: backupPath, sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
 			cutoverIds: ["cutover-inbound", "cutover-invalid"],
 			counts: receipt.counts,

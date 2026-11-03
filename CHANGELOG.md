@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+- **monitors**: Opt in to digest-seeded session rolls with per-monitor observed-usage threshold `contextRollTokens` to reduce carried-context cost; sampled after the turn, this is not a hard limit and a stale reading can still roll after native compaction
+
 ## [0.4.2] - 2026-10-29
 
 ### Features

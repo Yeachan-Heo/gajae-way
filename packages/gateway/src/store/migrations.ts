@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 39;
+export const LATEST_SCHEMA_VERSION = 40;
 
 export interface MigrationHost {
 	readonly database: {
@@ -884,6 +884,21 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(39, new Date().toISOString());
+		});
+	}
+	if (current < 40) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(monitors)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("context_roll_tokens"))
+				host.database.execute("ALTER TABLE monitors ADD COLUMN context_roll_tokens INTEGER");
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(40, new Date().toISOString());
 		});
 	}
 }

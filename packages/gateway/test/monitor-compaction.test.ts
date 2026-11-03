@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +23,11 @@ import {
 } from "../src/monitors/compaction";
 import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { SessionTerminalError } from "../src/orchestrator/session-port";
+import {
+	type SessionContextUsage,
+	SessionRequestTimeoutError,
+	SessionTerminalError,
+} from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
@@ -101,6 +105,7 @@ async function harness(
 		compaction?: CompactionPort;
 		/** Per-turn response. Defaults to a valid note per claimed event. */
 		respond?: (prompt: string, index: number) => string;
+		contextUsage?: (sessionId: string) => SessionContextUsage | undefined;
 		/**
 		 * When true for a session, the runtime refuses the prompt with the exact
 		 * `busy` envelope the real port surfaces after its bounded busy wait: the
@@ -136,7 +141,9 @@ async function harness(
 		if (options.busy?.(input.sessionId))
 			throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", { code: "busy" });
 		if (options.wedgedSubmission?.(input.sessionId)) throw new SessionTerminalError(wedgedSubmissionReport());
-		return request(input);
+		const result = await request(input);
+		const contextUsage = options.contextUsage?.(input.sessionId);
+		return { ...result, ...(contextUsage === undefined ? {} : { contextUsage }) };
 	};
 	const pipeline = new MonitorPropagator({
 		database,
@@ -329,6 +336,350 @@ test("a healthy 10-minute monitor is never rolled, however far past any turn thr
 		expect(state.lastRoll).toBeUndefined();
 		// And every turn authored its event.
 		for (const eventId of eventIds) expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const tokens of [10_000, 12_000]) {
+	test(`context budget ${tokens} arms after an answer and rolls with a digest at the next fresh dispatch`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-context-budget-"));
+		const log = spyOn(console, "error");
+		try {
+			const { database, registry, pipeline, turns } = await harness(directory, {
+				contextUsage: (sessionId) => (sessionId === "event-session-e0" ? { percent: 50, tokens } : undefined),
+			});
+			const instruction = "Check the deploy queue and report the oldest item.";
+			const monitor = registry.add({
+				name: "context-budget",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				instruction,
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			const first = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(database.monitors.authoredOutput(first)).toBe(`note for ${first}`);
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+				pendingRoll: "context_budget",
+				lastContextTokens: tokens,
+				turns: 1,
+			});
+			expect(log.mock.calls.filter(([line]) => String(line).includes("reason=context_budget"))).toEqual([
+				[
+					`monitor session safety net armed for ${sessionKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${tokens}/10000 turns=1`,
+				],
+			]);
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(turns[1]?.sessionId).toBe("event-session-e1");
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+			expect(turns[1]?.prompt).toContain("Context compaction");
+			expect(turns[1]?.prompt).toContain(`Standing instruction: ${instruction}`);
+			expect(turns[1]?.prompt).toContain(`note for ${first}`);
+			expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+				pendingRoll: undefined,
+				lastRoll: "context_budget",
+				lastContextTokens: undefined,
+				turns: 1,
+			});
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(turns[2]?.sessionId).toBe("event-session-e1");
+			database.close();
+		} finally {
+			log.mockRestore();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const contextRollTokens of [undefined, 20_000]) {
+	test(`an armed context budget is disarmed when its threshold is ${contextRollTokens === undefined ? "cleared" : "raised"} before dispatch`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-budget-disarm-"));
+		const log = spyOn(console, "info");
+		try {
+			const { database, registry, pipeline, turns } = await harness(directory, {
+				contextUsage: () => ({ percent: 60, tokens: 12_000 }),
+			});
+			const monitor = registry.add({
+				name: "disarm-budget",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+			registry.update({ monitorId: monitor.monitorId, contextRollTokens });
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+			expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e0", "event-session-e0"]);
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			expect(turns[1]?.prompt).not.toContain("Context compaction");
+			expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+				pendingRoll: undefined,
+				lastRoll: undefined,
+				lastContextTokens: 12_000,
+			});
+			expect(log.mock.calls.filter(([line]) => String(line).includes("monitor session size roll disarmed"))).toEqual([
+				[
+					`monitor session size roll disarmed for ${sessionKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=12000/${contextRollTokens ?? "unset"}`,
+				],
+			]);
+			database.close();
+		} finally {
+			log.mockRestore();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("a queued dispatch rechecks an armed context budget after waiting in runExclusive", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-queued-budget-"));
+	let release = () => {};
+	let blocker: Promise<void> | undefined;
+	let dispatch: Promise<string> | undefined;
+	try {
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			contextUsage: () => ({ percent: 60, tokens: 12_000 }),
+		});
+		const monitor = registry.add({
+			name: "queued-budget",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let entered = () => {};
+		const locked = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		blocker = sessionPort.runExclusive(sessionKey, async () => {
+			entered();
+			await gate;
+		});
+		await locked;
+		let enqueue = () => {};
+		const queued = new Promise<void>((resolve) => {
+			enqueue = resolve;
+		});
+		const runExclusive = sessionPort.runExclusive.bind(sessionPort);
+		sessionPort.runExclusive = (key, work) => {
+			const result = runExclusive(key, work);
+			enqueue();
+			return result;
+		};
+		dispatch = pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		await queued;
+		// The dispatch already read its MonitorRecord and is waiting on the real port's chain.
+		expect(turns).toHaveLength(1);
+		registry.update({ monitorId: monitor.monitorId, contextRollTokens: 20_000 });
+		release();
+		await blocker;
+		const eventId = await dispatch;
+		expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e0", "event-session-e0"]);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(turns[1]?.prompt).not.toContain("Context compaction");
+		expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({ pendingRoll: undefined, lastRoll: undefined });
+		database.close();
+	} finally {
+		release();
+		await blocker;
+		await dispatch;
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("context budget arming uses a threshold raised during the awaited authoring turn", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-live-budget-"));
+	let release = () => {};
+	let dispatch: Promise<string> | undefined;
+	try {
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			contextUsage: () => ({ percent: 60, tokens: 12_000 }),
+		});
+		const monitor = registry.add({
+			name: "live-budget",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let answer = () => {};
+		const answered = new Promise<void>((resolve) => {
+			answer = resolve;
+		});
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			const result = await request(input);
+			answer();
+			await gate;
+			return result;
+		};
+		dispatch = pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		await answered;
+		registry.update({ monitorId: monitor.monitorId, contextRollTokens: 20_000 });
+		release();
+		const eventId = await dispatch;
+		expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+			pendingRoll: undefined,
+			lastContextTokens: 12_000,
+		});
+		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e0", "event-session-e0"]);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(turns[1]?.prompt).not.toContain("Context compaction");
+		database.close();
+	} finally {
+		release();
+		await dispatch;
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const scenario of [
+	{ name: "below threshold", threshold: 10_000, tokens: 9_999 },
+	{ name: "field unset even with huge usage", threshold: undefined, tokens: 3_000_000 },
+	{ name: "usage unavailable", threshold: 10_000, tokens: undefined },
+]) {
+	test(`context budget does not roll when ${scenario.name}, and authoring succeeds`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-no-budget-roll-"));
+		try {
+			const { database, registry, pipeline, turns } = await harness(directory, {
+				contextUsage: () => (scenario.tokens === undefined ? undefined : { percent: 50, tokens: scenario.tokens }),
+			});
+			const monitor = registry.add({
+				name: "no-budget-roll",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				...(scenario.threshold === undefined ? {} : { contextRollTokens: scenario.threshold }),
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			for (let tick = 0; tick < 2; tick++) {
+				const eventId = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { tick });
+				expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+			}
+			expect(turns.map((turn) => turn.sessionId)).toEqual(["event-session-e0", "event-session-e0"]);
+			expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
+			expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+				pendingRoll: undefined,
+				lastRoll: undefined,
+				lastContextTokens: scenario.tokens,
+			});
+			database.close();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("harvesting an accepted authoring turn succeeds without observing usage or arming a context budget roll", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-harvest-budget-"));
+	try {
+		let clock = Date.now();
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			contextUsage: () => ({ percent: 90, tokens: 90_000 }),
+			now: () => clock,
+		});
+		const monitor = registry.add({
+			name: "harvest-budget",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			const result = await request(input);
+			throw new SessionRequestTimeoutError(input.sessionId, input.opRef, result.status);
+		};
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(database.monitors.failure(eventId)?.code).toBe("authoring_turn_failed");
+		clock += 6 * 60 * 60_000;
+		await pipeline.reconcile();
+		expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		expect(turns).toHaveLength(1);
+		expect(sessionPort.sendAttempts).toHaveLength(1);
+		expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+			pendingRoll: undefined,
+			lastContextTokens: undefined,
+		});
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("an empty authoring answer cannot arm a context budget roll even when usage exceeds the threshold", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-empty-budget-"));
+	try {
+		const { database, registry, pipeline } = await harness(directory, {
+			contextUsage: () => ({ percent: 90, tokens: 90_000 }),
+			respond: () => "",
+		});
+		const monitor = registry.add({
+			name: "empty-budget",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(database.monitors.failure(eventId)?.code).toBe("authoring_context_exhausted");
+		expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a superseded authoring epoch cannot arm a context budget roll for its successor", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-budget-"));
+	try {
+		let supersede = () => {};
+		const { database, registry, pipeline } = await harness(directory, {
+			contextUsage: () => ({ percent: 90, tokens: 90_000 }),
+			respond: (prompt) => {
+				supersede();
+				return echoNotes(prompt);
+			},
+		});
+		const monitor = registry.add({
+			name: "superseded-budget",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["budget.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+		supersede = () => {
+			database.transaction((tx) => database.bindings.rotateEpoch(tx, sessionKey));
+		};
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
+		expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+			pendingRoll: undefined,
+			lastContextTokens: undefined,
+		});
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

@@ -13,7 +13,7 @@ import {
 	parseLaneJobRecord,
 	planContinuation,
 } from "@gajae-gateway/subsession";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
 const NOW = new Date("2026-08-27T13:00:00.000Z").toISOString();
 const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
@@ -50,7 +50,7 @@ describe("lane_jobs store (migration v10)", () => {
 	test("fresh database opens at the current schema with the lane_jobs table", async () => {
 		const database = await openDatabase();
 		try {
-			expect(database.schemaVersion).toBe(39);
+			expect(database.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 			expect(database.work.laneJobRows()).toEqual([]);
 			expect(database.work.laneJobJson("lanejob-none")).toBeUndefined();
 		} finally {

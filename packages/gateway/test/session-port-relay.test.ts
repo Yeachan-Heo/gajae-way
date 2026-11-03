@@ -16,7 +16,7 @@ import {
 	sessionRequestStep,
 } from "../src/orchestrator/session-port";
 import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
-import { Store } from "../src/store";
+import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
@@ -494,6 +494,7 @@ test("session request still reconciles native client-ref conflict without anothe
 		"turn.prompt",
 		"turn.result",
 		"session.last_assistant",
+		"context.get",
 	]);
 	expect(f.relay.requests[1]?.input).toEqual({ kind: "prompt", clientRef: "gw-native-conflict" });
 	expect(f.relay.streams).toHaveLength(2);
@@ -501,6 +502,109 @@ test("session request still reconciles native client-ref conflict without anothe
 	expect(f.relay.streams[1]!.closed).toBe(true);
 	await f.handle.close();
 });
+
+for (const scenario of [
+	{
+		name: "a good page",
+		reply: { ok: true, page: { items: [{ usage: { percent: 17.74935, contextWindow: 1_000_000 } }] } },
+		expected: { percent: 17.74935, tokens: 177_494 },
+	},
+	{ name: "a refused context.get", reply: { ok: false, error: { code: "unsupported_query" } }, expected: undefined },
+	{ name: "a torn context relay", reply: { ok: true }, expected: undefined, tear: true },
+	{ name: "a malformed context page", reply: { ok: true, page: { items: [null] } }, expected: undefined },
+	{
+		name: "malformed context usage",
+		reply: { ok: true, page: { items: [{ usage: { percent: "17", contextWindow: 1_000_000 } }] } },
+		expected: undefined,
+	},
+] satisfies ReadonlyArray<{ name: string; reply: ScriptedRelayReply; expected: unknown; tear?: boolean }>) {
+	test(`session request reads context usage best-effort on its own relay with ${scenario.name}`, async () => {
+		let closeContextRelay = () => {};
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "context.get") {
+					if ("tear" in scenario && scenario.tear) closeContextRelay();
+					return scenario.reply;
+				}
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: ["answered"], complete: true } };
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
+				return { ok: true, result: {} };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		closeContextRelay = () => f.relay.streams[1]!.close();
+		const result = await f.port.request({ sessionId: "sdk-1", repo: f.repo, text: "author", opRef: "gw-context" });
+		expect(result.assistant.text).toBe("answered");
+		expect(result.contextUsage).toEqual(scenario.expected);
+		if (scenario.expected === undefined) expect(result).not.toHaveProperty("contextUsage");
+		expect(f.relay.requests.map((request) => request.operation)).toEqual([
+			"turn.prompt",
+			"turn.result",
+			"session.last_assistant",
+			"context.get",
+		]);
+		// The fixture's first relay is idle; all four operations used request()'s relay.
+		expect(f.relay.streams[0]?.written.filter((frame) => frame.type === "query_request")).toEqual([]);
+		expect(f.relay.streams[1]?.closed).toBe(true);
+		expect(f.cli).toEqual([]);
+		await f.handle.close();
+	});
+}
+
+for (const authorityFailure of [false, true]) {
+	test(`session request ${authorityFailure ? "propagates authority errors" : "ignores thrown errors"} from context usage`, async () => {
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
+				return { ok: true, page: { items: ["answered"], complete: true } };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		const error = authorityFailure ? new BrokerAuthorityError("quarantined") : new Error("context read failed");
+		f.port.contextUsage = async () => {
+			throw error;
+		};
+		const request = f.port.request({ sessionId: "sdk-1", repo: f.repo, text: "author", opRef: "gw-context-error" });
+		if (authorityFailure) {
+			const observed = await request.catch((failure: unknown) => failure);
+			expect(observed).toBe(error);
+			expect(sessionRequestStep(observed)).toBe("authority");
+		} else {
+			const result = await request;
+			expect(result.assistant.text).toBe("answered");
+			expect(result).not.toHaveProperty("contextUsage");
+		}
+		expect(f.relay.streams[1]?.closed).toBe(true);
+		await f.handle.close();
+	});
+}
 
 test("session request wraps primitive send rejections with a safe message and original cause", async () => {
 	const f = await fixture({
