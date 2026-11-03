@@ -654,6 +654,47 @@ test("session request opts out of context sampling by default without waiting fo
 	await f.handle.close();
 });
 
+for (const empty of ["", "  \n"]) {
+	test(`session request skips context sampling for an empty answer ${JSON.stringify(empty)}`, async () => {
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "context.get") return { ok: false, error: { code: "unexpected_context_get" } };
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
+				return { ok: true, page: { items: [empty], complete: true } };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		const result = await f.port.request({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			text: "author",
+			opRef: "gw-empty-context",
+			sampleContext: true,
+		});
+		expect(result.assistant.text.trim()).toBe("");
+		expect(result).not.toHaveProperty("contextUsage");
+		expect(f.relay.requests.map((request) => request.operation)).toEqual([
+			"turn.prompt",
+			"turn.result",
+			"session.last_assistant",
+		]);
+		await f.handle.close();
+	});
+}
+
 test("session request wraps primitive send rejections with a safe message and original cause", async () => {
 	const f = await fixture({
 		mode: "answer",

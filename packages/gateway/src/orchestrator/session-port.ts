@@ -2096,7 +2096,8 @@ export class BrokerSessionPort implements SessionPort {
 				},
 			);
 			let contextUsage: SessionContextUsage | undefined;
-			if (input.sampleContext) {
+			// An empty answer cannot arm a size roll, so it never pays for a context read.
+			if (input.sampleContext && assistant.text.trim()) {
 				try {
 					contextUsage = await this.contextUsage({ sessionId: input.sessionId, repo: input.repo, relay });
 				} catch (error) {

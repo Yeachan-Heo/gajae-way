@@ -1444,14 +1444,6 @@ export class MonitorPropagator {
 						? requestResult.assistant.text
 						: await this.#harvestAuthoringTurn(requestInput, turn, claimed, pendingTurn);
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
-				// The turn settled: a later retry must author afresh, never re-read it.
-				this.#database.transaction((tx) => {
-					this.#forgetAuthoringTurn(
-						tx,
-						claimed.map((row) => row.event_id),
-						pendingTurn,
-					);
-				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
@@ -1484,9 +1476,10 @@ export class MonitorPropagator {
 				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
-				// answer: it is not evidence of context exhaustion.
-				if (!response.trim()) throw new Error("authoring response is empty");
-				if (boundSessionEpoch !== undefined) {
+				// answer: it is not evidence of context exhaustion. An empty answer
+				// does not clear the context-failure streak here and never samples
+				// context or arms a size roll; it fails after the lease fence below.
+				if (boundSessionEpoch !== undefined && response.trim()) {
 					const safety = this.#safetyState(sessionOriginKey);
 					safety.contextFailures = 0;
 					// The runtime accepted and finished a turn, so it is not stalled.
@@ -1532,6 +1525,22 @@ export class MonitorPropagator {
 					),
 				);
 				if (!fenced.length) return;
+				// Retire the authoring-turn pointer only after confirming we own the lease through
+				// the fenced update. Do not delete it before the fenced check: if the lease expires
+				// between deletion and the fenced write, the pointer is lost and the event will be
+				// re-authored on restart instead of recovering its saved result (#743).
+				// On empty response, retire the pointer before throwing so the same answer
+				// is not re-harvested on the next attempt (fix for monitor issue).
+				this.#database.transaction((tx) => {
+					this.#forgetAuthoringTurn(
+						tx,
+						fenced.map((row) => row.event_id),
+						pendingTurn,
+					);
+				});
+				// Check for empty response after retiring pointer for rows we still own.
+				// If we don't own the lease, we never reach this code (#743).
+				if (!response.trim()) throw new Error("authoring response is empty");
 				protocolValidationActive = true;
 				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
