@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
@@ -928,9 +928,17 @@ export async function settleDiscordDelivery(
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
 		const parsed = parseDiscordMedia(message.text);
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
-		const text = notice ? `${notice}\n${body}` : body;
+		const mediaResult = await loadDiscordMedia(parsed.paths, mediaDirectories);
+		const fileNotes = mediaResult.failures.map((f) => `(file not sent: ${basename(f.path)} - ${f.reason})`).join("\n");
+		const fullBody = fileNotes ? (body ? `${body}\n${fileNotes}` : fileNotes) : body;
+		const text = notice ? `${notice}\n${fullBody}` : fullBody;
+		if (mediaResult.failures.length > 0) {
+			console.log(
+				`discord media refused origin=${message.origin.conversationId}: ${mediaResult.failures.map((f) => `${f.path}: ${f.reason}`).join(", ")}`,
+			);
+		}
 		const chunks = text === "" ? [] : chunkDiscordMessage(text);
-		const files = await loadDiscordMedia(parsed.paths, mediaDirectories);
+		const files = mediaResult.attachments;
 		try {
 			if (files.length > 0 && chunks.length === 0) {
 				const reply =
@@ -980,6 +988,8 @@ export async function settleDiscordDelivery(
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
+		const failReason = error instanceof Error ? error.message : String(error);
+		console.error(`discord delivery failed origin=${message.origin.conversationId}: ${failReason}`);
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: error instanceof Error ? error.message : String(error),

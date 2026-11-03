@@ -1,5 +1,5 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
@@ -172,12 +172,37 @@ export async function defaultLoginPathRunner(command: readonly string[]): Promis
 	return stdout;
 }
 
+function defaultPasswdShell(): string | undefined {
+	try {
+		return userInfo().shell ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Discover the login PATH by running a login shell with `-lc` (#39). Candidates are
+ * SHELL, the account's passwd shell, /bin/bash, then /bin/sh. When none can run,
+ * return "" so mergePathEntries falls back to FALLBACK_PATH_DIRS instead of failing
+ * an update whose binaries are already installed (#734).
+ */
 export async function discoverLoginPath(
 	env: NodeJS.ProcessEnv = process.env,
 	runner: LoginPathRunner = defaultLoginPathRunner,
+	passwdShell: () => string | undefined = defaultPasswdShell,
 ): Promise<string> {
-	const shell = env.SHELL || "/bin/zsh";
-	return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+	const candidates = new Set<string>();
+	if (env.SHELL) candidates.add(env.SHELL);
+	const accountShell = passwdShell();
+	if (accountShell) candidates.add(accountShell);
+	candidates.add("/bin/bash");
+	candidates.add("/bin/sh");
+	for (const shell of candidates) {
+		try {
+			return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+		} catch {}
+	}
+	return "";
 }
 
 export async function resolvePath(options: ResolvePathOptions): Promise<string> {

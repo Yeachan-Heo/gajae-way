@@ -431,18 +431,59 @@ test("keeps files and reply metadata with the first chunk of a long caption", as
 	}
 });
 
-// Purpose: ensure missing requested files fail visibly instead of confirming a caption-only send.
-// Expected: no Discord message is sent and the delivery ledger receives a failure; that is the completion condition.
-test("fails delivery before posting when a MEDIA file is missing", async () => {
+// Purpose: a refused MEDIA file must never drop the reply text (#730).
+// Expected: the text is posted with a name-only note, no host path leaks, and the delivery confirms.
+test("posts the reply with a note when MEDIA uploads are disabled (#730)", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const sent: unknown[] = [];
 	const discord: DiscordClientLike = {
 		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
 	};
 	await settleDiscordDelivery(mockGateway(requests), discord, delivery("Caption\nMEDIA:/not/a/real/gajaeway-file.bin"));
-	expect(sent).toEqual([]);
-	expect(requests).toHaveLength(1);
-	expect(requests[0]?.verb).toBe("delivery.fail");
+	expect(sent).toEqual(["Caption\n(file not sent: gajaeway-file.bin - uploads disabled: set mediaDirectories)"]);
+	expect(JSON.stringify(sent)).not.toContain("/not/a/real");
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a reply that is only a refused MEDIA line still posts its note (#730)", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("MEDIA:/not/a/real/only.bin"));
+	expect(sent).toEqual(["(file not sent: only.bin - uploads disabled: set mediaDirectories)"]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a missing MEDIA file is noted while a valid one is still uploaded (#730)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-media-mixed-"));
+	try {
+		await writeFile(join(home, "ok.txt"), "ok");
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: unknown[] = [];
+		const discord: DiscordClientLike = {
+			channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+		};
+		await settleDiscordDelivery(
+			mockGateway(requests),
+			discord,
+			delivery(`Here\nMEDIA:${join(home, "ok.txt")}\nMEDIA:${join(home, "gone.txt")}`),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[home],
+		);
+		expect(sent).toHaveLength(1);
+		const payload = sent[0] as { content: string; files: Array<{ name: string }> };
+		expect(payload.files.map((file) => file.name)).toEqual(["ok.txt"]);
+		expect(payload.content).toBe("Here\n(file not sent: gone.txt - file not found)");
+		expect(payload.content).not.toContain(home);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });
 
 test("settles a delivery after sending all chunks", async () => {

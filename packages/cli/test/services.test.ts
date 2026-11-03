@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	BROKER_UNIT,
+	discoverLoginPath,
 	GATEWAY_UNIT,
 	installServices,
 	restartStackCommands,
@@ -188,4 +189,94 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 	}
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
+});
+
+test("discoverLoginPath uses SHELL when set and executable", async () => {
+	const env = { SHELL: "/bin/sh" };
+	let ranCommand: string[] | undefined;
+	const runner = async (command: readonly string[]) => {
+		ranCommand = [...command];
+		if (command[0] === "/bin/sh") return "exported PATH value";
+		throw new Error("not reached");
+	};
+
+	const result = await discoverLoginPath(env, runner);
+
+	expect(result).toBe("exported PATH value");
+	expect(ranCommand).toEqual(["/bin/sh", "-lc", 'printf %s "$PATH"']);
+});
+
+function recordingRunner(succeedOn?: string) {
+	const ran: string[] = [];
+	const runner = async (command: readonly string[]) => {
+		ran.push(command[0] ?? "");
+		expect(command.slice(1)).toEqual(["-lc", 'printf %s "$PATH"']);
+		if (command[0] === succeedOn) return `PATH from ${succeedOn}`;
+		throw new Error(`ENOENT: posix_spawn '${command[0]}'`);
+	};
+	return { ran, runner };
+}
+
+test("discoverLoginPath with SHELL unset uses the passwd shell, never /bin/zsh", async () => {
+	const { ran, runner } = recordingRunner("/usr/bin/fish");
+	const result = await discoverLoginPath({}, runner, () => "/usr/bin/fish");
+	expect(result).toBe("PATH from /usr/bin/fish");
+	expect(ran).toEqual(["/usr/bin/fish"]);
+});
+
+test("discoverLoginPath falls back SHELL -> passwd shell -> /bin/bash -> /bin/sh", async () => {
+	const { ran, runner } = recordingRunner("/bin/sh");
+	const result = await discoverLoginPath({ SHELL: "/opt/missing/zsh" }, runner, () => "/usr/bin/fish");
+	expect(result).toBe("PATH from /bin/sh");
+	expect(ran).toEqual(["/opt/missing/zsh", "/usr/bin/fish", "/bin/bash", "/bin/sh"]);
+});
+
+test("discoverLoginPath tries each shell once when SHELL equals the passwd shell", async () => {
+	const { ran, runner } = recordingRunner();
+	await discoverLoginPath({ SHELL: "/bin/bash" }, runner, () => "/bin/bash");
+	expect(ran).toEqual(["/bin/bash", "/bin/sh"]);
+});
+
+test("discoverLoginPath returns an empty login PATH instead of throwing when no shell runs", async () => {
+	const { ran, runner } = recordingRunner();
+	expect(await discoverLoginPath({}, runner, () => undefined)).toBe("");
+	expect(ran).toEqual(["/bin/bash", "/bin/sh"]);
+	expect(ran).not.toContain("/bin/zsh");
+});
+
+test("installServices succeeds even when shell discovery returns empty", async () => {
+	const { home, cleanup } = await configuredHome();
+	const binDir = join(home, "bin");
+	const written = new Map<string, string>();
+	try {
+		await mkdir(binDir);
+		for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+
+		const failingRunner = async () => {
+			throw new Error("shell discovery failed");
+		};
+
+		const paths = await installServices({
+			binDir,
+			platform: "linux",
+			unitDir: join(home, "units"),
+			env: { HOME: home, GAJAEWAY_HOME: home },
+			loginPathRunner: failingRunner,
+			writeFile: (path, contents) => {
+				written.set(path, contents);
+			},
+		});
+
+		// Should still write all units using FALLBACK_PATH_DIRS.
+		expect(paths).toHaveLength(serviceSpecs().length);
+		expect(written.size).toBe(serviceSpecs().length);
+
+		// Verify at least one unit was written and contains fallback paths.
+		const firstUnit = [...written.values()][0] ?? "";
+		expect(firstUnit).toContain("/usr/local/bin");
+		expect(firstUnit).toContain("/usr/bin");
+		expect(firstUnit).toContain("/bin");
+	} finally {
+		await cleanup();
+	}
 });
