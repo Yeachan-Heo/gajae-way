@@ -585,8 +585,10 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
-export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
+export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger" | "contextRollTokens">> {
 	readonly monitorId: string;
+	/** Null clears the observed-usage roll threshold on update. */
+	readonly contextRollTokens?: number | null;
 	/** Replace the trigger spec; use schedule to change only a cron schedule. */
 	readonly trigger?: TriggerSpec;
 	/** Change the schedule while retaining the monitor's existing cron trigger. */

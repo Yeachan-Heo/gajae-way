@@ -32,6 +32,8 @@ Every event authored with declared procedure files records the versions it was g
 
 `contextRollTokens` (optional integer, 10000 to 2000000) is a per-monitor observed-usage roll threshold, not a hard context limit. Usage is sampled after an answered authoring turn; a count at or above the threshold arms a roll for the next fresh dispatch. Unset by default, it never rolls on size. See the session-context trade-off below.
 
+On update only, `contextRollTokens: null` clears the threshold; creating a monitor with `null` is invalid. Omitting the field from an update preserves its current value.
+
 `overlap` decides what a new fire does while an earlier event of the same monitor still owes an authoring turn (stage `admitted`, `batched`, `dispatched`, or `failed` awaiting retry):
 
 - `queue` (default) admits it behind the predecessor. A monitor slower than its cadence then stacks up and its later reports describe old state.
@@ -119,6 +121,8 @@ On a counted context-class failure the gateway asks for native compaction throug
 
 A roll bumps the session epoch (fresh gjc session and idempotency key) and injects a compact digest into that session's first authoring prompt: the monitor's standing instruction plus its most recent authored notes, each clipped and the whole digest capped. Notes that ended `contract_unmet`, silent notes, and notes that only restate the instruction or event type are left out, so a fresh session never starts from an echo it would copy. The digest is pure text assembly — no model call — so a roll never costs a turn. Continuity is carried by the digest, not by the discarded transcript.
 
+The digest handoff survives bind failure, gateway restart, and later epoch changes until the first answered turn on the live epoch.
+
 The roll happens after the per-origin turn chain is taken and before the session is bound, so a batch can neither be stranded nor authored twice across the boundary; leases and fencing are untouched. All of it lives in one place (`packages/gateway/src/monitors/compaction.ts` plus the single `#rollSessionIfArmed` call site).
 
 Persona sessions likewise do not rotate on a turn count. Native SDK compaction is observed, while `/new` remains the explicit epoch boundary.
@@ -149,6 +153,7 @@ gajaeway monitors update <monitor-id> --enabled false
 gajaeway monitors update <monitor-id> --schedule '0 9 * * 1-5' --enabled true
 gajaeway monitors update <monitor-id> --json '{"instruction":"Review the open queue."}'
 gajaeway monitors update <monitor-id> --json '{"contextRollTokens":100000}'
+gajaeway monitors update <id> --json '{"contextRollTokens":null}'
 gajaeway monitors list
 gajaeway monitors list --json
 gajaeway monitors list --fields id,name,schedule --limit 20 --offset 20

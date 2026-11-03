@@ -132,6 +132,17 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 		expect(listed).toMatchObject({
 			result: { monitors: [{ monitorId: monitor.monitorId, contextRollTokens: 100_000 }] },
 		});
+		const cleared = await request("clear-budget", "monitor.update", {
+			monitorId: monitor.monitorId,
+			contextRollTokens: null,
+		});
+		expect(cleared).toMatchObject({ type: "response", result: { monitorId: monitor.monitorId } });
+		const inspectedCleared = await request("inspect-cleared", "monitor.inspect", { monitorId: monitor.monitorId });
+		expect(inspectedCleared).toMatchObject({ type: "response", result: { monitor: { monitorId: monitor.monitorId } } });
+		expect((inspectedCleared.result as { monitor: Record<string, unknown> }).monitor).not.toHaveProperty(
+			"contextRollTokens",
+		);
+		expect(database.monitors.rows()[0]?.context_roll_tokens).toBeNull();
 	} finally {
 		socket?.end();
 		await server?.stop();
@@ -159,7 +170,7 @@ test("contextRollTokens validates bounds and round-trips set, omitted and cleare
 		const monitor = registry.add({ ...spec, contextRollTokens: 10_000 });
 		expect(registry.get(monitor.monitorId)?.contextRollTokens).toBe(10_000);
 		expect(database.monitors.rows()[0]?.context_roll_tokens).toBe(10_000);
-		for (const contextRollTokens of [0, 9999, 1.5, 2_000_001, "10000", null])
+		for (const contextRollTokens of [0, 9999, 1.5, 2_000_001, "10000"])
 			expect(() =>
 				registry.update({ monitorId: monitor.monitorId, contextRollTokens: contextRollTokens as number }),
 			).toThrow("monitor contextRollTokens is invalid");
@@ -174,6 +185,15 @@ test("contextRollTokens validates bounds and round-trips set, omitted and cleare
 		expect(registry.get(monitor.monitorId)?.contextRollTokens).toBe(2_000_000);
 		expect(
 			registry.update({ monitorId: monitor.monitorId, contextRollTokens: undefined })?.contextRollTokens,
+		).toBeUndefined();
+		expect(database.monitors.rows()[0]?.context_roll_tokens).toBeNull();
+		database.close();
+		database = await Store.open(path);
+		expect(new MonitorRegistry(database).get(monitor.monitorId)?.contextRollTokens).toBeUndefined();
+		registry = new MonitorRegistry(database);
+		registry.update({ monitorId: monitor.monitorId, contextRollTokens: 10_000 });
+		expect(
+			registry.update({ monitorId: monitor.monitorId, contextRollTokens: null })?.contextRollTokens,
 		).toBeUndefined();
 		expect(database.monitors.rows()[0]?.context_roll_tokens).toBeNull();
 		database.close();

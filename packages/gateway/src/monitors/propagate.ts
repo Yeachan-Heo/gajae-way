@@ -1407,9 +1407,24 @@ export class MonitorPropagator {
 				// rolls a session on its own. Native compaction owns context bounds;
 				// an owner may separately opt in to a context-size roll.
 				if (boundSessionEpoch !== undefined) {
-					const turns = this.#database.transaction((tx) =>
-						this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
-					);
+					const answeredEpoch = boundSessionEpoch;
+					const turns = this.#database.transaction((tx) => {
+						const turns = this.#database.bindings.incrementTurnCount(
+							tx,
+							sessionOriginKey,
+							JSON.stringify(sessionOrigin),
+						);
+						const handoffKey = monitorRollHandoffKey(sessionOriginKey);
+						const handoffEpoch = parseRollHandoffEpoch(this.#database.core.metaGet(handoffKey));
+						if (
+							response.trim() &&
+							this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === answeredEpoch &&
+							handoffEpoch !== undefined &&
+							handoffEpoch <= answeredEpoch
+						)
+							this.#database.core.metaDelete(handoffKey);
+						return turns;
+					});
 					const safety = this.#safetyState(sessionOriginKey);
 					safety.turns = turns;
 					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch)
@@ -2036,14 +2051,31 @@ export class MonitorPropagator {
 	 * THE ONE monitor-session roll choke point (issue #68). It consumes an armed
 	 * failure-recovery or owner-opted-in context-size roll, never a turn count.
 	 *
-	 * Returns the digest to inject into this turn's prompt, or undefined when no
-	 * roll was armed. The digest is pure text assembly — a roll costs no model
-	 * turn.
+	 * Returns the digest for a new roll or an unanswered durable handoff on the
+	 * live epoch. The handoff survives failures until a non-empty answer. Digest
+	 * assembly costs no model turn.
 	 */
 	#rollSessionIfArmed(sessionOriginKey: string, originRefJson: string, monitor: MonitorRecord): string | undefined {
 		const state = this.#safetyState(sessionOriginKey);
 		const reason = state.pendingRoll;
-		if (!reason) return undefined;
+		const handoffKey = monitorRollHandoffKey(sessionOriginKey);
+		if (!reason) {
+			const handoff = this.#database.core.metaGet(handoffKey);
+			if (handoff === undefined) return undefined;
+			const epoch = parseRollHandoffEpoch(handoff);
+			const liveEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+			if (epoch === undefined || epoch > liveEpoch) {
+				this.#database.transaction(() => this.#database.core.metaDelete(handoffKey));
+				return undefined;
+			}
+			const current = this.#registry.get(monitor.monitorId);
+			if (!current) return undefined;
+			return buildMonitorCompactionDigest({
+				monitorName: current.name,
+				instruction: current.instruction,
+				notes: this.#recentAuthoredNotes(current),
+			});
+		}
 		if (reason === "context_budget") {
 			const contextRollTokens = this.#registry.get(monitor.monitorId)?.contextRollTokens;
 			if (
@@ -2075,7 +2107,10 @@ export class MonitorPropagator {
 				? state.stalledSessionId
 				: undefined;
 		state.stalledSessionId = undefined;
-		this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson));
+		this.#database.transaction((tx) => {
+			const epoch = this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson);
+			this.#database.core.metaSet(handoffKey, JSON.stringify({ epoch, reason }));
+		});
 		// A stalled session is still holding its wedged turn; nothing will prompt
 		// it again now that the origin is bound to a new epoch, so end its host
 		// rather than leave it occupying the runtime forever. Best-effort: the
@@ -2429,6 +2464,22 @@ const AUTHORING_TURN_UNRESOLVED = "authoring_turn_unresolved";
 /** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
 function authoringTurnKey(eventId: string): string {
 	return `monitor_authoring_turn:${eventId}`;
+}
+
+function monitorRollHandoffKey(sessionOriginKey: string): string {
+	return `monitor_roll_handoff:${sessionOriginKey}`;
+}
+
+function parseRollHandoffEpoch(raw: string | undefined): number | undefined {
+	if (raw === undefined) return undefined;
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object") return undefined;
+		const epoch = (value as Record<string, unknown>).epoch;
+		return typeof epoch === "number" && Number.isInteger(epoch) && epoch >= 0 ? epoch : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function parseAuthoringTurnPointer(raw: string): AuthoringTurnPointer | undefined {

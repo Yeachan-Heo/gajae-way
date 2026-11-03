@@ -136,7 +136,10 @@ export class MonitorRegistry {
 					? patch.procedureFiles.map((file) => file.trim())
 					: undefined
 				: current.procedureFiles;
-			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
+			const contextRollTokens = Object.hasOwn(patch, "contextRollTokens")
+				? (patch.contextRollTokens ?? undefined)
+				: current.contextRollTokens;
+			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles, contextRollTokens };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
 			const persisted = this.#database.monitors.update(tx, {

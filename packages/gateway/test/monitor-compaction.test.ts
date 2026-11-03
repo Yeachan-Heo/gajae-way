@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
-import { GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
+import { type CliRunner, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import {
 	buildMonitorCompactionDigest,
@@ -24,12 +24,14 @@ import {
 import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import {
+	BrokerSessionPort,
 	type SessionContextUsage,
 	SessionRequestTimeoutError,
 	SessionTerminalError,
 } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
-import { sessionPortFromScript } from "./session-port.fake";
+import { initializeTestBrokerAuthority, scriptedRelay, sessionPortFromScript } from "./session-port.fake";
 
 /**
  * Issue #68, final design: native gjc auto-compaction is the primary defence
@@ -395,8 +397,8 @@ for (const tokens of [10_000, 12_000]) {
 	});
 }
 
-for (const contextRollTokens of [undefined, 20_000]) {
-	test(`an armed context budget is disarmed when its threshold is ${contextRollTokens === undefined ? "cleared" : "raised"} before dispatch`, async () => {
+for (const contextRollTokens of [undefined, null, 20_000]) {
+	test(`an armed context budget is disarmed when its threshold is ${contextRollTokens === undefined ? "cleared" : contextRollTokens === null ? "cleared with null" : "raised"} before dispatch`, async () => {
 		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-budget-disarm-"));
 		const log = spyOn(console, "info");
 		try {
@@ -436,6 +438,314 @@ for (const contextRollTokens of [undefined, 20_000]) {
 		}
 	});
 }
+
+for (const reason of ["context_budget", "context_failures_native_compaction_unavailable"] as const) {
+	for (const failure of ["bind failure", "bind failure and restart", "request failure"] as const) {
+		test(`${reason} digest handoff survives ${failure} until the first answered new-epoch turn`, async () => {
+			const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-roll-handoff-"));
+			try {
+				let clock = Date.now();
+				let arm = false;
+				const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+					now: () => clock,
+					contextFailureRollThreshold: 1,
+					contextUsage: () => (arm && reason === "context_budget" ? { percent: 60, tokens: 12_000 } : undefined),
+					respond: (prompt) => (arm && reason !== "context_budget" ? "" : echoNotes(prompt)),
+				});
+				const monitor = registry.add({
+					name: "handoff",
+					trigger: { kind: "cron", schedule: "0 */6 * * *" },
+					eventTypes: ["handoff.tick"],
+					burstPolicy: "serialize",
+					instruction: "Check the deploy queue.",
+					contextRollTokens: 10_000,
+				});
+				const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "handoff.tick"));
+				const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+				const healthy = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+				arm = true;
+				const armed = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+				expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe(reason);
+				if (reason !== "context_budget") expect(pipeline.settle(armed).done).toBe(true);
+				arm = false;
+				const bind = sessionPort.bind.bind(sessionPort);
+				const request = sessionPort.request.bind(sessionPort);
+				let fail = true;
+				sessionPort.bind = async (input) => {
+					if (fail && failure !== "request failure") {
+						fail = false;
+						throw new Error("session bind failed once");
+					}
+					return bind(input);
+				};
+				sessionPort.request = async (input) => {
+					if (fail && failure === "request failure") {
+						fail = false;
+						expect(input.sessionId).toBe("event-session-e1");
+						expect(input.text).toContain("Context compaction");
+						throw new Error("session send failed once before acceptance");
+					}
+					return request(input);
+				};
+				const failed = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+				expect(database.monitors.failure(failed)?.code).toBe(
+					failure === "request failure" ? "authoring_turn_failed" : "session_bind_failed",
+				);
+				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
+				expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason });
+				registry.update({ monitorId: monitor.monitorId, instruction: "Check the updated deploy queue." });
+				let active = pipeline;
+				if (failure === "bind failure and restart") {
+					pipeline.dispose();
+					active = new MonitorPropagator({
+						database,
+						registry,
+						sessionPort,
+						memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+						delivery: new DeliveryService(database),
+						emit: () => {},
+						now: () => clock,
+					});
+				}
+				clock += 6 * 60 * 60_000;
+				await active.reconcile();
+				expect(database.monitors.authoredOutput(failed)).toBe(`note for ${failed}`);
+				const recovered = turns.find((turn) => turn.sessionId === "event-session-e1");
+				expect(recovered?.prompt).toContain("Context compaction");
+				expect(recovered?.prompt).toContain("Standing instruction: Check the updated deploy queue.");
+				expect(recovered?.prompt).toContain(`note for ${healthy}`);
+				expect(database.core.metaGet(handoffKey)).toBeUndefined();
+				await active.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+				expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
+				expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+				active.dispose();
+				database.close();
+			} finally {
+				await rm(directory, { recursive: true, force: true });
+			}
+		});
+	}
+}
+
+test("an unanswered roll handoff survives an operator epoch bump until a live-epoch answer", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-handoff-"));
+	try {
+		let arm = true;
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			contextUsage: () => (arm ? { percent: 60, tokens: 12_000 } : undefined),
+		});
+		const monitor = registry.add({
+			name: "stale-handoff",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["handoff.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "handoff.tick"));
+		const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		arm = false;
+		const bind = sessionPort.bind.bind(sessionPort);
+		sessionPort.bind = async () => {
+			throw new Error("session bind failed once");
+		};
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason: "context_budget" });
+		database.transaction((tx) => database.bindings.rotateEpoch(tx, sessionKey));
+		sessionPort.bind = bind;
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(2);
+		expect(turns.at(-1)?.sessionId).toBe("event-session-e2");
+		expect(turns.at(-1)?.prompt).toContain("Context compaction");
+		expect(database.core.metaGet(handoffKey)).toBeUndefined();
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const marker of ["{invalid", JSON.stringify({ epoch: 2, reason: "context_budget" })]) {
+	test(`a ${marker === "{invalid" ? "malformed" : "future-epoch"} roll handoff is deleted without digest injection`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-handoff-"));
+		try {
+			const { database, registry, pipeline, turns } = await harness(directory);
+			const monitor = registry.add({
+				name: "invalid-handoff",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["handoff.tick"],
+				burstPolicy: "serialize",
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "handoff.tick"));
+			const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+			await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+			database.core.metaSet(handoffKey, marker);
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+			expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+			expect(database.core.metaGet(handoffKey)).toBeUndefined();
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			database.close();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("a stale authoring answer cannot consume an unanswered handoff after an operator epoch bump", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-answer-handoff-"));
+	try {
+		let arm = true;
+		const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+			contextUsage: () => (arm ? { percent: 60, tokens: 12_000 } : undefined),
+		});
+		const monitor = registry.add({
+			name: "stale-answer-handoff",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["handoff.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "handoff.tick"));
+		const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		arm = false;
+		const request = sessionPort.request.bind(sessionPort);
+		sessionPort.request = async (input) => {
+			const result = await request(input);
+			database.transaction((tx) => database.bindings.rotateEpoch(tx, sessionKey));
+			return result;
+		};
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		sessionPort.request = request;
+		expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason: "context_budget" });
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(turns.at(-1)?.sessionId).toBe("event-session-e2");
+		expect(turns.at(-1)?.prompt).toContain("Context compaction");
+		expect(database.core.metaGet(handoffKey)).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a roll digest survives real BrokerSessionPort poisoned-create epoch recovery and is consumed once", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-broker-handoff-"));
+	const database = await Store.open(join(directory, "gateway.db"));
+	let pipeline: MonitorPropagator | undefined;
+	try {
+		const authority = initializeTestBrokerAuthority(database, join(directory, "agent"));
+		const repo = join(directory, "workspace");
+		let poison = false;
+		let clock = Date.now();
+		let creates = 0;
+		const cli: CliRunner = async (args) => {
+			if (args.includes("session.create")) {
+				creates++;
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify(
+						poison
+							? { ok: false, error: { code: "resource_gone", message: "saved session no longer exists" } }
+							: { ok: true, result: { sessionId: `broker-session-${creates}` } },
+					),
+					stderr: "",
+				};
+			}
+			if (args.includes("inspect"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: { session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: repo } } },
+					}),
+					stderr: "",
+				};
+			throw new Error(`unexpected command ${args.join(" ")}`);
+		};
+		const prompts: string[] = [];
+		let response = "";
+		const relay = scriptedRelay((request) => {
+			if (request.operation === "turn.prompt") {
+				const text = String(request.input.text);
+				prompts.push(text);
+				response = echoNotes(text);
+				return { ok: true, result: { accepted: true, clientRef: request.input.clientRef } };
+			}
+			if (request.operation === "turn.result")
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: request.input.clientRef,
+						status: "terminal_ok",
+						receiptState: "present",
+						outcome: { reason: "end_turn", provenance: "agent" },
+					},
+				};
+			if (request.operation === "session.last_assistant")
+				return { ok: true, page: { items: [response], complete: true } };
+			if (request.operation === "context.get")
+				return {
+					ok: true,
+					page: { items: [{ usage: { percent: prompts.length === 1 ? 60 : 1, contextWindow: 20_000 } }] },
+				};
+			throw new Error(`unexpected relay request ${request.operation}`);
+		});
+		const sessionPort = new BrokerSessionPort({
+			database,
+			authority,
+			cli,
+			tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+			sleep: async () => {},
+		});
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "broker-handoff",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["handoff.tick"],
+			burstPolicy: "serialize",
+			contextRollTokens: 10_000,
+		});
+		pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			repo,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			now: () => clock,
+		});
+		const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "handoff.tick"));
+		const handoffKey = `monitor_roll_handoff:${sessionKey}`;
+		const first = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
+		poison = true;
+		const failed = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(database.monitors.failure(failed)?.code).toBe("session_bind_failed");
+		expect(creates).toBe(3);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(2);
+		expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason: "context_budget" });
+		poison = false;
+		clock += 6 * 60 * 60_000;
+		await pipeline.reconcile();
+		expect(database.monitors.authoredOutput(failed)).toBe(`note for ${failed}`);
+		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(2);
+		expect(prompts[1]).toContain("Context compaction");
+		expect(prompts[1]).toContain(`note for ${first}`);
+		expect(database.core.metaGet(handoffKey)).toBeUndefined();
+		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
+		expect(prompts).toHaveLength(3);
+		expect(prompts[2]).not.toContain("Context compaction");
+	} finally {
+		pipeline?.dispose();
+		database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
 
 test("a queued dispatch rechecks an armed context budget after waiting in runExclusive", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-queued-budget-"));
