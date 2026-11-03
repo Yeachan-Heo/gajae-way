@@ -16,8 +16,8 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
-import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import { isBrokerUnavailable } from "../orchestrator/broker";
+import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
@@ -1414,8 +1414,10 @@ export class MonitorPropagator {
 					safety.turns = turns;
 					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch) {
 						safety.priorRunBusyFailures = 0;
-						// Clear first-attempt bind failure counter on successful bind + answer
-						safety.firstAttemptBindFailures = 0;
+						// Clear first-attempt bind failure counter only on successful first-attempt bind (#748)
+						if (claimed.some((row) => row.dispatch_attempts === 0)) {
+							safety.firstAttemptBindFailures = 0;
+						}
 					}
 				}
 				// A non-empty answer is proof the session still has usable context, so
