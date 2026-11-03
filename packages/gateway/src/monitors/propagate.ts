@@ -1492,6 +1492,13 @@ export class MonitorPropagator {
 							console.error(
 								`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${contextUsage.tokens}/${contextRollTokens} turns=${safety.turns}`,
 							);
+						} else if (safety.pendingRoll === "context_budget") {
+							this.#database.transaction(() =>
+								this.#database.core.metaSet(
+									monitorContextBudgetArmKey(sessionOriginKey),
+									JSON.stringify({ epoch: boundSessionEpoch, tokens: contextUsage.tokens }),
+								),
+							);
 						}
 					}
 				}

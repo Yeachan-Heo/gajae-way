@@ -844,6 +844,90 @@ for (const scenario of ["retry", "fresh dispatch before retry", "restart"] as co
 	});
 }
 
+for (const scenario of [
+	{ tokens: 9_000, threshold: 10_000, restart: true, rolls: false },
+	{ tokens: 9_000, threshold: 10_000, restart: false, rolls: false },
+	{ tokens: 15_000, threshold: 14_000, restart: true, rolls: true },
+	{ tokens: 15_000, threshold: 16_000, restart: true, rolls: false },
+]) {
+	test(`a deferred size roll persists its latest ${scenario.tokens} token sample with threshold ${scenario.threshold}${scenario.restart ? " across restart" : " in the same process"}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-arm-latest-sample-"));
+		try {
+			let clock = Date.now();
+			let tokens: number | undefined;
+			const { database, registry, pipeline, sessionPort, turns } = await harness(directory, {
+				now: () => clock,
+				contextUsage: () => (tokens === undefined ? undefined : { percent: 60, tokens }),
+			});
+			attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+			const monitor = registry.add({
+				name: "latest-sample-budget",
+				trigger: { kind: "cron", schedule: "0 */6 * * *" },
+				eventTypes: ["budget.tick"],
+				burstPolicy: "serialize",
+				contextRollTokens: 10_000,
+			});
+			const sessionKey = originKey(monitorSessionOrigin(monitor.monitorId, "budget.tick"));
+			const armKey = `monitor_context_budget_arm:${sessionKey}`;
+			const fetchLastAssistant = sessionPort.fetchLastAssistant.bind(sessionPort);
+			sessionPort.fetchLastAssistant = async () => {
+				throw new LastAssistantUnreadableError("last_assistant_no_page");
+			};
+			const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "A" });
+			sessionPort.fetchLastAssistant = fetchLastAssistant;
+			const pointerKey = `monitor_authoring_turn:${eventA}`;
+			const pointer = database.core.metaGet(pointerKey);
+			expect(pointer).toBeDefined();
+			tokens = 12_000;
+			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "B" });
+			expect(JSON.parse(database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: 12_000 });
+			tokens = scenario.tokens;
+			const eventC = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "C" });
+			expect(database.monitors.authoredOutput(eventC)).toBe(`note for ${eventC}`);
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+			expect(database.core.metaGet(pointerKey)).toBe(pointer);
+			expect(pipeline.sessionSafetyState(sessionKey)).toMatchObject({
+				pendingRoll: "context_budget",
+				lastContextTokens: scenario.tokens,
+			});
+			expect(JSON.parse(database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: scenario.tokens });
+			tokens = undefined;
+			registry.update({ monitorId: monitor.monitorId, contextRollTokens: scenario.threshold });
+			let active = pipeline;
+			if (scenario.restart) {
+				pipeline.dispose();
+				active = new MonitorPropagator({
+					database,
+					registry,
+					sessionPort,
+					memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+					delivery: new DeliveryService(database),
+					emit: () => {},
+					now: () => clock,
+				});
+			}
+			const sends = sessionPort.sendAttempts.length;
+			clock += 10 * 60_000 + 1;
+			await active.reconcile();
+			expect(sessionPort.sendAttempts).toHaveLength(sends);
+			expect(database.monitors.authoredOutput(eventA)).toBe(`note for ${eventA}`);
+			expect(database.core.metaGet(pointerKey)).toBeUndefined();
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
+			await active.submitAwaitable(monitor.monitorId, "budget.tick", { event: "after-harvest" });
+			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(scenario.rolls ? 1 : 0);
+			expect(turns.at(-1)?.sessionId).toBe(scenario.rolls ? "event-session-e1" : "event-session-e0");
+			expect(turns.at(-1)?.prompt.includes("Context compaction")).toBe(scenario.rolls);
+			expect(database.core.metaGet(armKey)).toBeUndefined();
+			expect(active.sessionSafetyState(sessionKey).pendingRoll).toBeUndefined();
+			active.dispose();
+			database.close();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
 for (const scenario of ["unchanged", "raised", "cleared", "operator epoch bump"] as const) {
 	test(`a persisted context budget arm survives restart with ${scenario}`, async () => {
 		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-arm-restart-"));
