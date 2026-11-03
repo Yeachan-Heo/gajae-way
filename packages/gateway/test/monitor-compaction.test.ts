@@ -25,7 +25,7 @@ import { MONITOR_AUTHORING_HEADER, MONITOR_AUTHORING_REPORT_RULE, MonitorPropaga
 import { MonitorRegistry } from "../src/monitors/registry";
 import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
-import { sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 /**
  * Issue #68, final design: native gjc auto-compaction is the primary defence
@@ -54,7 +54,7 @@ function stubPort(status: NativeCompactionStatus): CompactionPort & { calls: str
  * with: the runtime took the prompt, no run ever started, and the cause is the
  * agent runtime itself (measured live: `Timed out waiting for prior agent run
  * to finish before prompting.` — memory.canonicalize, every slot from
- * 2026-10-13T21:30Z).
+ * 2026-10-13T21:30Z). It is only raised from a terminal `failed` op status.
  */
 function wedgedSubmissionReport(): StatusReport {
 	return {
@@ -109,9 +109,8 @@ async function harness(
 		busy?: (sessionId: string) => boolean;
 		/**
 		 * When true for a session, the runtime takes the prompt but never starts an
-		 * agent run: the exact terminal submission failure a wedged session answers
-		 * with (`Timed out waiting for prior agent run to finish before prompting.`).
-		 * Nothing was sent, so it is not recorded in `turns` either.
+		 * agent run: the op settles terminal `failed` and the request throws the
+		 * wedged submission failure. It is not recorded in `turns`.
 		 */
 		wedgedSubmission?: (sessionId: string) => boolean;
 		/** Propagator clock; reconcile reclaims a `failed` slot only after its retry backoff (#179). */
@@ -131,11 +130,35 @@ async function harness(
 			return options.respond ? options.respond(text, index) : echoNotes(text);
 		},
 	});
+	if (options.busy) attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	const request = sessionPort.request.bind(sessionPort);
 	sessionPort.request = async (input) => {
-		if (options.busy?.(input.sessionId))
+		if (options.busy?.(input.sessionId)) {
+			const authority = database.bindings.brokerAuthority();
+			if (!authority) throw new Error("busy refusal fixture has no broker authority");
+			const scope = JSON.stringify([input.sessionId, input.opRef]);
+			database.transaction((tx) => {
+				database.bindings.beginBrokerOperation(tx, authority, {
+					operation: "turn.prompt",
+					scope,
+					operationRef: input.opRef,
+					requestJson: JSON.stringify({ repo: input.repo, text: input.text }),
+				});
+				database.bindings.completeBrokerOperation(
+					tx,
+					authority,
+					"turn.prompt",
+					scope,
+					input.opRef,
+					JSON.stringify({ ok: false, error: { code: "busy" } }),
+				);
+			});
 			throw new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", { code: "busy" });
-		if (options.wedgedSubmission?.(input.sessionId)) throw new SessionTerminalError(wedgedSubmissionReport());
+		}
+		if (options.wedgedSubmission?.(input.sessionId)) {
+			sessionPort.seedOperation(input.opRef, input.sessionId, "failed");
+			throw new SessionTerminalError(wedgedSubmissionReport());
+		}
 		return request(input);
 	};
 	const pipeline = new MonitorPropagator({
@@ -978,12 +1001,11 @@ test("a session that stays busy across dispatches is rolled so the next slot lan
 	}
 });
 
-test("a wedged prompt submission rolls the session so the next slot lands on a live session", async () => {
+test("a wedged prompt submission rolls the session and replays from failed old-session status", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-wedged-"));
 	try {
-		// The live shape: the epoch-0 session takes every prompt and answers with a
-		// terminal submission failure (a prior run or its pre-prompt compaction
-		// still holds the agent); a fresh session answers normally.
+		// The epoch-0 session reports terminal failed for this prompt; a fresh
+		// session answers both the next slot and the safely replayed event.
 		const { database, registry, pipeline, turns, sessionPort } = await harness(directory, {
 			wedgedSubmission: (sessionId) => sessionId === "event-session-e0",
 		});
@@ -1017,19 +1039,22 @@ test("a wedged prompt submission rolls the session so the next slot lands on a l
 		// The wedged session's host is ended so it stops occupying the runtime.
 		await Bun.sleep(0);
 		expect(sessionPort.closes.map((entry) => entry.sessionId)).toEqual(["event-session-e0"]);
-		// The stranded slot replays into the live session: nothing was sent, so the
-		// #179 retry backoff must not apply to this code.
+		// The saved old op is terminal failed, so the event may be authored once on
+		// the new session instead of being held or duplicated.
 		await pipeline.reconcile();
 		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === first)?.stage).toBe(
 			"authored_no_delivery",
 		);
+		expect(database.monitors.authoredOutput(first)).toBe(`note for ${first}`);
+		expect(database.core.metaGet(`monitor_authoring_turn:${first}`)).toBeUndefined();
+		expect(turns.map(({ sessionId }) => sessionId)).toEqual(["event-session-e1", "event-session-e1"]);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
 
-test("repeated prior-run-busy terminal failures roll within a bounded streak and replay events once", async () => {
+test("repeated prior-run-busy terminal failures roll within a bounded streak and replay once", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-prior-run-busy-"));
 	try {
 		const { database, registry, pipeline, turns, sessionPort } = await harness(directory);
@@ -1050,6 +1075,7 @@ test("repeated prior-run-busy terminal failures roll within a bounded streak and
 			const eventIds = (JSON.parse(payload) as Array<{ eventId: string }>).map(({ eventId }) => eventId);
 			attempts.push({ sessionId: input.sessionId, eventIds });
 			if (input.sessionId === "event-session-e0") {
+				sessionPort.seedOperation(input.opRef, input.sessionId, "failed");
 				const cause = Object.assign(new Error("sdk_prompt_terminal_failed"), {
 					code: "sdk_prompt_terminal_failed",
 					reason: priorRunReason,
@@ -1085,15 +1111,19 @@ test("repeated prior-run-busy terminal failures roll within a bounded streak and
 		await Bun.sleep(0);
 		expect(sessionPort.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
 
-		// The known terminal failure proves nothing was sent, so its rows replay
-		// immediately on the fresh session. Every durable event is authored once.
+		// The prior-run-busy terminal result leaves its original op failed. Once the
+		// old status is verified, the events replay once on the fresh session.
 		await pipeline.reconcile();
-		for (const eventId of [...failed, recovered]) {
+		for (const eventId of failed) {
 			expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
 			expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === eventId)?.stage).toBe(
 				"authored",
 			);
 		}
+		expect(database.monitors.authoredOutput(recovered)).toBe(`note for ${recovered}`);
+		expect(database.monitors.eventRows(monitor.monitorId).find((row) => row.event_id === recovered)?.stage).toBe(
+			"authored",
+		);
 		for (const eventId of failed)
 			expect(attempts.filter((attempt) => attempt.eventIds.includes(eventId))).toHaveLength(2);
 		expect(attempts.filter((attempt) => attempt.eventIds.includes(recovered))).toHaveLength(1);
@@ -1110,8 +1140,9 @@ test("repeated prior-run-busy terminal failures roll within a bounded streak and
 			"event-session-e1",
 		]);
 		const deliveries = database.outbox.rows().map((row) => JSON.parse(row.payload_json) as { text: string });
-		for (const eventId of [...failed, recovered])
+		for (const eventId of failed)
 			expect(deliveries.filter(({ text }) => text.includes(`note for ${eventId}`))).toHaveLength(1);
+		expect(deliveries.filter(({ text }) => text.includes(`note for ${recovered}`))).toHaveLength(1);
 		expect(database.monitors.eventRows(monitor.monitorId)).toHaveLength(failed.length + 1);
 		database.close();
 	} finally {

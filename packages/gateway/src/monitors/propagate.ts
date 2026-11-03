@@ -1415,24 +1415,23 @@ export class MonitorPropagator {
 									// For safety, hold instead of attempting cross-session harvest.
 									throw new AuthoringResultUnavailableError("output_pending");
 								}
-								if (state === "failed") {
-									// Old turn failed: OK to forget and author fresh.
-									eventIdsToForget.push(row.event_id);
-								}
-								if (
-									authority &&
+								const hasDurableBusyRefusal =
+									authority !== null &&
 									isBrokerPromptBusyRefusal(
 										this.#database.bindings.brokerOperation(
 											authority,
 											"turn.prompt",
 											JSON.stringify([prior.sessionId, prior.opRef]),
 										),
-									)
-								) {
-									// Durable busy refusal in old session: OK to forget and author fresh.
+									);
+								if (state === "failed" || hasDurableBusyRefusal) {
+									// A failed turn or durable never-admitted refusal permits a fresh prompt.
 									eventIdsToForget.push(row.event_id);
+								} else {
+									// Unknown or otherwise inconclusive status is not evidence that the old
+									// authoring turn was never admitted.
+									throw new AuthoringResultUnavailableError("output_pending");
 								}
-								// For unknown/throw: hold (don't add to eventIdsToForget).
 							} catch (error) {
 								// Unreadable status in old session: hold (don't forget), keep the pointer.
 								if (!(error instanceof AuthoringResultUnavailableError)) {
@@ -1817,8 +1816,8 @@ export class MonitorPropagator {
 	/**
 	 * The op-ref of a previous attempt's authoring turn for exactly these events
 	 * on this session, when that turn is still running or finished successfully.
-	 * A failed, unknown or unreadable prior turn is forgotten so the retry sends
-	 * a fresh prompt.
+	 * A failed prior turn is forgotten so the retry sends fresh. Unknown or
+	 * unreadable status is not evidence that the prior prompt was never admitted.
 	 */
 	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(eventIds[0] ?? ""));
@@ -1828,11 +1827,12 @@ export class MonitorPropagator {
 		const forget = () => {
 			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, eventIds, raw));
 		};
-		if (
-			prior.sessionId !== sessionId ||
-			prior.eventIds.length !== eventIds.length ||
-			!eventIds.every((id) => prior.eventIds.includes(id))
-		) {
+		if (prior.sessionId !== sessionId) {
+			// A rebinding does not prove that the turn in the old session was never
+			// admitted. Leave it for the dispatch path to resolve against that session.
+			return undefined;
+		}
+		if (prior.eventIds.length !== eventIds.length || !eventIds.every((id) => prior.eventIds.includes(id))) {
 			forget();
 			return undefined;
 		}
