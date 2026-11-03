@@ -1445,8 +1445,9 @@ export class MonitorPropagator {
 				this.#database.transaction((tx) => {
 					for (const row of claimed) {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
-						if (eventIdsToForget.includes(row.event_id)) {
-							// Forget after deciding it is safe during pre-transaction checks.
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						// Forget the prior pointer when same-session busy-refused OR in eventIdsToForget.
+						if (eventIdsToForget.includes(row.event_id) || (prior && prior.sessionId === sessionId && prior.opRef !== opRef)) {
 							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
 						}
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
