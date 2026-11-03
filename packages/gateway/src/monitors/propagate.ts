@@ -1390,29 +1390,65 @@ export class MonitorPropagator {
 				if (shouldThrowOutputPending) {
 					throw new AuthoringResultUnavailableError("output_pending");
 				}
-				this.#database.transaction((tx) => {
+				// #742: Check pointers with different sessionId before transaction.
+				// Resolve them against their own sessionId to decide whether to hold, forget, or harvest.
+				const eventIdsToForget: string[] = [];
+				if (reusedOpRef === undefined && !resumeTurn) {
 					for (const row of claimed) {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
 						if (prior && prior.sessionId !== sessionId) {
-							// Session changed: prior pointer is stale, forget it.
-							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
-						} else if (prior && prior.opRef !== opRef) {
-							// Only forget the prior opRef if we have positive evidence it was never admitted.
-							// Otherwise hold it for operator judgement (#742).
-							const authority = this.#database.bindings.brokerAuthority();
-							if (authority) {
-								const brokerOp = this.#database.bindings.brokerOperation(
-									authority,
-									"turn.prompt",
-									JSON.stringify([sessionId, prior.opRef]),
-								);
-								if (isBrokerPromptBusyRefusal(brokerOp)) {
-									// Positive evidence: prior op was never admitted. Forget it.
-									this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+							// Binding moved after this pointer was created: check the old session's disposition.
+							try {
+								const report = await this.#sessionPort.status({
+									sessionId: prior.sessionId,
+									repo: this.#repo,
+									opRef: prior.opRef,
+								});
+								const state = report.status?.status;
+								if (state === "accepted" || state === "in_flight") {
+									// Old turn still running: hold this dispatch, keep the pointer.
+									throw new AuthoringResultUnavailableError("output_pending");
 								}
+								if (state === "terminal_ok") {
+									// Old turn finished: would harvest, but session context differs.
+									// For safety, hold instead of attempting cross-session harvest.
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+								if (state === "failed") {
+									// Old turn failed: OK to forget and author fresh.
+									eventIdsToForget.push(row.event_id);
+								}
+								if (
+									authority &&
+									isBrokerPromptBusyRefusal(
+										this.#database.bindings.brokerOperation(
+											authority,
+											"turn.prompt",
+											JSON.stringify([prior.sessionId, prior.opRef]),
+										),
+									)
+								) {
+									// Durable busy refusal in old session: OK to forget and author fresh.
+									eventIdsToForget.push(row.event_id);
+								}
+								// For unknown/throw: hold (don't add to eventIdsToForget).
+							} catch (error) {
+								// Unreadable status in old session: hold (don't forget), keep the pointer.
+								if (!(error instanceof AuthoringResultUnavailableError)) {
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+								throw error;
 							}
-							// Otherwise: hold the prior pointer for recovery.
+						}
+					}
+				}
+				this.#database.transaction((tx) => {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						if (eventIdsToForget.includes(row.event_id)) {
+							// Forget after deciding it is safe during pre-transaction checks.
+							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
 						}
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 					}
@@ -1804,6 +1840,11 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+			// Failed status: forget and let dispatch author fresh (#742).
+			if (state === "failed") {
+				forget();
+				return undefined;
+			}
 			// Unknown status: hold for operator judgement, do not forget or reuse (#742).
 			return undefined;
 		} catch {
