@@ -10,6 +10,7 @@ import {
 	type OriginRef,
 	originKey,
 	type ProtocolFailureReason,
+	parseOriginKey,
 } from "@gajae-gateway/protocol";
 import { envelopeErrorCode, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
@@ -312,6 +313,9 @@ export class MonitorPropagator {
 	#inFlight = new Set<string>();
 	/** Re-entrancy guard: only one reconcile sweep may run at a time in this process. */
 	#reconciling = false;
+	#retiredSweep: Promise<void> | undefined;
+	/** Shared by inline and background retirement attempts in this process. */
+	#retiringKeys = new Set<string>();
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
 	/** Lease/batch identity per event this process is authoring right now. */
@@ -454,13 +458,14 @@ export class MonitorPropagator {
 	async drain(timeoutMs = MONITOR_SHUTDOWN_DRAIN_MS): Promise<void> {
 		this.dispose();
 		const deadline = this.#now() + Math.max(0, timeoutMs);
-		while (this.#reconciling || this.#inFlightPromises.size > 0) {
+		while (this.#reconciling || this.#inFlightPromises.size > 0 || this.#retiredSweep) {
 			const remaining = deadline - this.#now();
 			if (remaining <= 0) {
 				this.#interruptClaims();
 				return;
 			}
 			const active = [...new Set(this.#inFlightPromises.values())];
+			if (this.#retiredSweep) active.push(this.#retiredSweep);
 			await Promise.race([Promise.all(active), Bun.sleep(Math.min(remaining, 50))]);
 		}
 	}
@@ -646,6 +651,7 @@ export class MonitorPropagator {
 	 */
 	async reconcile(): Promise<void> {
 		this.reapStale();
+		this.#startRetiredSessionSweep();
 		if (this.#reconciling) {
 			// Yield once so a caller racing the first sweep observes its claimed work
 			// rather than an artificial pre-bind microtask gap in the shared port.
@@ -1310,7 +1316,7 @@ export class MonitorPropagator {
 				}
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
-				if (!resumeTurn) await this.#retireRolledSessions(monitor, sessionOriginKey);
+				if (!resumeTurn) await this.#retireRolledSessions(sessionOriginKey);
 				const digest = resumeTurn
 					? undefined
 					: this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
@@ -2176,11 +2182,26 @@ export class MonitorPropagator {
 			return "failed";
 		}
 	}
-	/** Bound close attempts; every attempt requires fresh positive idle evidence. */
-	async #retireRolledSessions(monitor: MonitorRecord, sessionOriginKey: string): Promise<void> {
+	/** Resolves when the current background retired-session sweep finishes (for tests and diagnostics). */
+	retiredSessionSweepSettled(): Promise<void> {
+		return this.#retiredSweep ?? Promise.resolve();
+	}
+	#startRetiredSessionSweep(): void {
+		if (this.#closing || this.#retiredSweep) return;
+		this.#retiredSweep = this.#sweepRetiredSessions()
+			.catch(() => console.error("monitor retired session sweep failed"))
+			.finally(() => {
+				this.#retiredSweep = undefined;
+			});
+	}
+	/** Removed monitors have no future dispatch, but their retired hosts still need cleanup. */
+	async #sweepRetiredSessions(): Promise<void> {
+		await this.#retireRolledSessions();
+	}
+	/** Bound both sweep paths to two attempts, with shared fair ordering and counter repair. */
+	async #retireRolledSessions(sessionOriginKey?: string): Promise<void> {
 		try {
-			if (!this.#registry.get(monitor.monitorId)) return;
-			const prefix = `monitor_retired_session:${sessionOriginKey}:`;
+			const prefix = sessionOriginKey ? `monitor_retired_session:${sessionOriginKey}:` : "monitor_retired_session:";
 			const records = this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`).flatMap((key) => {
 				const raw = this.#database.core.metaGet(key);
 				let record = raw === undefined ? undefined : parseRetiredSession(raw);
@@ -2194,7 +2215,17 @@ export class MonitorPropagator {
 						}
 					} catch {}
 				}
-				return record && key === `${prefix}${record.sessionId}` ? [{ key, raw: raw!, record }] : [];
+				if (!record) return [];
+				const suffix = `:${record.sessionId}`;
+				if (!key.endsWith(suffix)) return [];
+				const recordOriginKey = key.slice("monitor_retired_session:".length, -suffix.length);
+				if (!recordOriginKey || (sessionOriginKey && recordOriginKey !== sessionOriginKey)) return [];
+				try {
+					if (parseOriginKey(recordOriginKey).platform !== "monitor") return [];
+				} catch {
+					return [];
+				}
+				return [{ key, raw: raw!, record, sessionOriginKey: recordOriginKey }];
 			});
 			records.sort(
 				(a, b) =>
@@ -2214,101 +2245,107 @@ export class MonitorPropagator {
 				});
 				lastAttemptAt = records.length;
 			}
-			for (const pending of records.slice(0, 2)) {
-				const { key } = pending;
-				let { record, raw } = pending;
-				const { sessionId } = record;
-				let outcome = "held:authorization";
-				try {
-					if (this.#database.core.metaGet(key) !== raw || !this.#registry.get(monitor.monitorId)) continue;
-					lastAttemptAt = Math.min(Number.MAX_SAFE_INTEGER, Math.max(this.#now(), lastAttemptAt + 1));
-					record = { ...record, lastAttemptAt };
-					raw = JSON.stringify(record);
-					this.#database.transaction(() => this.#database.core.metaSet(key, raw));
-					const mayClose = () => {
-						if (
-							this.#database.core.metaGet(key) !== raw ||
-							!this.#registry.get(monitor.monitorId) ||
-							this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId === sessionId
-						)
-							return false;
-						for (const pointerKey of this.#database.core.metaKeysInRange(
-							"monitor_authoring_turn:",
-							"monitor_authoring_turn;",
-						)) {
-							const pointer = this.#database.core.metaGet(pointerKey);
-							if (pointer !== undefined && parseAuthoringTurnPointer(pointer)?.sessionId === sessionId) return false;
-						}
-						return true;
-					};
-					if (!mayClose()) continue;
-					if (!this.#sessionPort.close) {
-						this.#database.transaction(() => this.#database.core.metaDelete(key));
-						outcome = "unsupported";
-						continue;
-					}
-					let held: string | undefined;
-					// Independent observations in turn, queue, jobs order do not reserve an idle host.
-					for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
-						if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
-						try {
-							const result = await this.#sessionPort[probe]?.({ sessionId, repo: this.#repo });
-							const busy =
-								probe === "turnRunning"
-									? result === true
-									: probe === "queueEmpty"
-										? result === false
-										: Array.isArray(result) && result.length > 0;
-							const idle =
-								probe === "turnRunning"
-									? result === false
-									: probe === "queueEmpty"
-										? result === true
-										: Array.isArray(result) && result.length === 0;
-							if (!idle) held ??= `${probe}_${busy ? "busy" : "unknown"}`;
-						} catch {
-							held ??= `${probe}_unavailable`;
-						}
-					}
-					if (held) {
-						outcome = `held:${held}`;
-						continue;
-					}
-					// No await between final local authorization, durable intent, and issuing close.
-					const authorized = this.#database.transaction(() => {
-						if (!mayClose()) return false;
-						// Diagnostic only: prior close attempts never authorize another close.
-						record = { ...record, phase: "closing", closeStartedAt: this.#now() };
-						raw = JSON.stringify(record);
-						this.#database.core.metaSet(key, raw);
-						return true;
-					});
-					if (!authorized) continue;
-					try {
-						await this.#sessionPort.close({ sessionId, repo: this.#repo });
-						outcome = "closed";
-					} catch (error) {
-						const brokerCode =
-							error instanceof GjcCliError && error.exitCode === 0 ? envelopeErrorCode(error.details) : undefined;
-						const code =
-							typeof brokerCode === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(brokerCode) ? brokerCode : undefined;
-						outcome = `error:${code ?? "unknown"}`;
-						continue;
-					}
-					this.#database.transaction(() => {
-						if (this.#database.core.metaGet(key) === raw) this.#database.core.metaDelete(key);
-					});
-				} catch {
-					outcome = "error:unknown";
-				} finally {
-					console.info(
-						`monitor retired session close for ${sessionOriginKey}: session=${sessionId} outcome=${outcome}`,
-					);
-				}
+			for (const pending of records.filter(({ key }) => !this.#retiringKeys.has(key)).slice(0, 2)) {
+				if (this.#closing) break;
+				lastAttemptAt = Math.min(Number.MAX_SAFE_INTEGER, Math.max(this.#now(), lastAttemptAt + 1));
+				await this.#attemptRetiredSession(pending, lastAttemptAt);
 			}
 		} catch {
-			// Retirement availability must never prevent the fresh authoring dispatch.
-			console.error(`monitor retired session sweep for ${sessionOriginKey}: outcome=error`);
+			// Retirement availability must never prevent authoring or monitor recovery.
+			console.error(`monitor retired session sweep for ${sessionOriginKey ?? "all origins"}: outcome=error`);
+		}
+	}
+	/** Final synchronous authorization protects close without taking a dispatch lock. */
+	async #attemptRetiredSession(pending: PendingRetiredSession, lastAttemptAt: number): Promise<void> {
+		const { key, sessionOriginKey } = pending;
+		if (this.#retiringKeys.has(key)) return;
+		this.#retiringKeys.add(key);
+		let { record, raw } = pending;
+		const { sessionId } = record;
+		let outcome = "held:authorization";
+		try {
+			if (this.#closing || this.#database.core.metaGet(key) !== raw) return;
+			record = { ...record, lastAttemptAt };
+			raw = JSON.stringify(record);
+			this.#database.transaction(() => this.#database.core.metaSet(key, raw));
+			const mayClose = () => {
+				if (
+					this.#closing ||
+					this.#database.core.metaGet(key) !== raw ||
+					this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId === sessionId
+				)
+					return false;
+				for (const pointerKey of this.#database.core.metaKeysInRange(
+					"monitor_authoring_turn:",
+					"monitor_authoring_turn;",
+				)) {
+					const pointer = this.#database.core.metaGet(pointerKey);
+					if (pointer !== undefined && parseAuthoringTurnPointer(pointer)?.sessionId === sessionId) return false;
+				}
+				return true;
+			};
+			if (!mayClose()) return;
+			if (!this.#sessionPort.close) {
+				this.#database.transaction(() => this.#database.core.metaDelete(key));
+				outcome = "unsupported";
+				return;
+			}
+			let held: string | undefined;
+			// Independent observations in turn, queue, jobs order do not reserve an idle host.
+			for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
+				if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
+				try {
+					const result = await this.#sessionPort[probe]?.({ sessionId, repo: this.#repo });
+					const busy =
+						probe === "turnRunning"
+							? result === true
+							: probe === "queueEmpty"
+								? result === false
+								: Array.isArray(result) && result.length > 0;
+					const idle =
+						probe === "turnRunning"
+							? result === false
+							: probe === "queueEmpty"
+								? result === true
+								: Array.isArray(result) && result.length === 0;
+					if (!idle) held ??= `${probe}_${busy ? "busy" : "unknown"}`;
+				} catch {
+					held ??= `${probe}_unavailable`;
+				}
+			}
+			if (held) {
+				outcome = `held:${held}`;
+				return;
+			}
+			// No await between final local authorization, durable intent, and issuing close.
+			const authorized = this.#database.transaction(() => {
+				if (!mayClose()) return false;
+				// Diagnostic only: prior close attempts never authorize another close.
+				record = { ...record, phase: "closing", closeStartedAt: this.#now() };
+				raw = JSON.stringify(record);
+				this.#database.core.metaSet(key, raw);
+				return true;
+			});
+			if (!authorized) return;
+			try {
+				await this.#sessionPort.close({ sessionId, repo: this.#repo });
+				outcome = "closed";
+			} catch (error) {
+				const brokerCode =
+					error instanceof GjcCliError && error.exitCode === 0 ? envelopeErrorCode(error.details) : undefined;
+				const code =
+					typeof brokerCode === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(brokerCode) ? brokerCode : undefined;
+				outcome = `error:${code ?? "unknown"}`;
+				return;
+			}
+			this.#database.transaction(() => {
+				if (this.#database.core.metaGet(key) === raw) this.#database.core.metaDelete(key);
+			});
+		} catch {
+			outcome = "error:unknown";
+		} finally {
+			this.#retiringKeys.delete(key);
+			console.info(`monitor retired session close for ${sessionOriginKey}: session=${sessionId} outcome=${outcome}`);
 		}
 	}
 	/**
@@ -2814,6 +2851,13 @@ interface RetiredSession {
 	lastAttemptAt?: number;
 	phase?: "closing";
 	closeStartedAt?: number;
+}
+
+interface PendingRetiredSession {
+	key: string;
+	raw: string;
+	record: RetiredSession;
+	sessionOriginKey: string;
 }
 
 function parseRetiredSession(raw: string): RetiredSession | undefined {

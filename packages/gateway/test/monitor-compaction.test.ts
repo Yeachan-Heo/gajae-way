@@ -252,7 +252,7 @@ async function harness(
 		protocolFailureRollThreshold?: number;
 		compaction?: CompactionPort;
 		/** Per-turn response. Defaults to a valid note per claimed event. */
-		respond?: (prompt: string, index: number) => string;
+		respond?: (prompt: string, index: number) => string | Promise<string>;
 		contextUsage?: (sessionId: string) => SessionContextUsage | undefined;
 		sessionIdForBind?: (originKey: string, epoch: number) => string;
 		/**
@@ -315,9 +315,15 @@ async function harness(
 	return { database, registry, pipeline, turns, sessionPort };
 }
 
-async function retirementHarness(directory: string) {
+async function retirementHarness(
+	directory: string,
+	now?: () => number,
+	respond?: (prompt: string, index: number) => string | Promise<string>,
+) {
 	const origins = new Map<string, number>();
 	const f = await harness(directory, {
+		...(now ? { now } : {}),
+		...(respond ? { respond } : {}),
 		contextUsage: (sessionId) => (sessionId.endsWith("-e0") ? { percent: 60, tokens: 12_000 } : undefined),
 		sessionIdForBind: (key, epoch) => {
 			if (!origins.has(key)) origins.set(key, origins.size);
@@ -340,6 +346,26 @@ async function retirementHarness(directory: string) {
 	const close = spyOn(f.sessionPort, "close");
 	const dispatch = () => f.pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 	return { ...f, monitor, sessionKey, retiredKey, jobs, terminate, close, dispatch };
+}
+
+async function failOtherMonitor(f: Awaited<ReturnType<typeof retirementHarness>>): Promise<string> {
+	const other = f.registry.add({
+		name: "other-recovery",
+		trigger: { kind: "cron", schedule: "0 * * * *" },
+		eventTypes: ["other.tick"],
+		burstPolicy: "serialize",
+	});
+	const request = spyOn(f.sessionPort, "request").mockRejectedValueOnce(
+		new GjcCliError("gjc sdk turn.prompt reported failure", 0, "", { code: "busy" }),
+	);
+	try {
+		const event = await f.pipeline.submitAwaitable(other.monitorId, "other.tick", {});
+		expect(f.database.monitors.failure(event)?.code).toBe("session_busy");
+		expect(f.database.monitors.authoredOutput(event)).toBeUndefined();
+		return event;
+	} finally {
+		request.mockRestore();
+	}
 }
 
 for (const restart of [false, true]) {
@@ -416,9 +442,10 @@ test("a size-rolled host waits for its tagged pointer to be harvested before ret
 		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
 		expect(f.pipeline.retry(savedEvent).done).toBe(true);
 		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
 		expect(f.database.monitors.authoredOutput(savedEvent)).toBe(`note for ${savedEvent}`);
 		expect(f.database.core.metaGet(pointerKey)).toBeUndefined();
-		// Harvesting is not a fresh dispatch and must not sweep even after settling.
+		// Reconcile's sweep saw the saved pointer before recovery harvested it.
 		expect(f.terminate).not.toHaveBeenCalled();
 		expect(f.close).not.toHaveBeenCalled();
 		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
@@ -603,7 +630,7 @@ test("retired-session sweeping ignores invalid authoring pointers but holds with
 	}
 });
 
-test("monitor removal deletes retired-session records for declared and catch-all origins but keeps another monitor's records", async () => {
+test("monitor removal preserves retired-session records for declared, catch-all and other monitor origins", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-remove-"));
 	const f = await retirementHarness(directory);
 	try {
@@ -615,11 +642,564 @@ test("monitor removal deletes retired-session records for declared and catch-all
 		await f.pipeline.submitAwaitable(other.monitorId, "other:tick", {});
 		await f.pipeline.submitAwaitable(other.monitorId, "other:tick", {});
 		const prefix = "monitor_retired_session:";
-		expect(f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`)).toHaveLength(3);
+		const records = f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`);
+		expect(records).toHaveLength(3);
 		const otherKey = `${prefix}${originKey(monitorSessionOrigin(other.monitorId, "other:tick"))}:event-session-2-e0`;
+		expect(records).toContain(otherKey);
 		expect(f.registry.remove(f.monitor.monitorId)).toBe(true);
-		expect(f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`)).toEqual([otherKey]);
+		expect(f.database.core.metaKeysInRange(prefix, `${prefix}\uffff`)).toEqual(records);
 		expect(f.terminate).not.toHaveBeenCalled();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const restart of [false, true]) {
+	test(`reconcile closes a size-rolled host after monitor removal without another dispatch${restart ? " after database restart" : ""}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-remove-"));
+		const f = await retirementHarness(directory);
+		let database = f.database;
+		let active = f.pipeline;
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			expect(f.registry.remove(f.monitor.monitorId)).toBe(true);
+			expect(database.core.metaGet(f.retiredKey)).toBeDefined();
+			expect(database.bindings.getSessionRecord(f.sessionKey)?.sessionId).toBe("event-session-e1");
+			if (restart) {
+				active.dispose();
+				database.close();
+				database = await Store.open(join(directory, "gateway.db"));
+				active = new MonitorPropagator({
+					database,
+					registry: new MonitorRegistry(database),
+					sessionPort: f.sessionPort,
+					memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+					delivery: new DeliveryService(database),
+					emit: () => {},
+				});
+			}
+			await active.reconcile();
+			await active.retiredSessionSweepSettled();
+			expect(f.sessionPort.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
+			expect(f.jobs).toHaveBeenCalledTimes(1);
+			expect(f.turns).toHaveLength(2);
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(database.core.metaGet(f.retiredKey)).toBeUndefined();
+			expect(database.bindings.getSessionRecord(f.sessionKey)?.sessionId).toBe("event-session-e1");
+		} finally {
+			active.dispose();
+			database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("reconcile holds a removed monitor's retired host while its saved authoring pointer survives", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-pointer-"));
+	const f = await retirementHarness(directory);
+	try {
+		const fetchLastAssistant = f.sessionPort.fetchLastAssistant.bind(f.sessionPort);
+		f.sessionPort.fetchLastAssistant = async () => {
+			throw new LastAssistantUnreadableError("last_assistant_no_page");
+		};
+		const savedEvent = await f.dispatch();
+		f.sessionPort.fetchLastAssistant = fetchLastAssistant;
+		expect(f.pipeline.settle(savedEvent).done).toBe(true);
+		await f.dispatch();
+		await f.dispatch();
+		const pointerKey = `monitor_authoring_turn:${savedEvent}`;
+		const pointer = f.database.core.metaGet(pointerKey);
+		expect(JSON.parse(pointer!)).toMatchObject({ sessionId: "event-session-e0", sizeRolled: true });
+		const binding = f.database.bindings.getSessionRecord(f.sessionKey);
+		expect(f.registry.remove(f.monitor.monitorId)).toBe(true);
+		expect(f.database.core.metaGet(pointerKey)).toBe(pointer);
+		expect(f.database.bindings.getSessionRecord(f.sessionKey)).toEqual(binding);
+		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).not.toHaveBeenCalled();
+		expect(f.jobs).not.toHaveBeenCalled();
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		expect(f.database.core.metaGet(pointerKey)).toBe(pointer);
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
+	for (const evidence of ["busy", "unknown", "throws", "missing"] as const) {
+		if (probe === "queueEmpty" && evidence === "missing") continue;
+		test(`reconcile holds a removed monitor's retired host when ${probe} is ${evidence}`, async () => {
+			const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-probe-"));
+			const f = await retirementHarness(directory);
+			try {
+				await f.dispatch();
+				await f.dispatch();
+				f.registry.remove(f.monitor.monitorId);
+				const original = f.sessionPort[probe];
+				Object.defineProperty(f.sessionPort, probe, {
+					configurable: true,
+					value:
+						evidence === "missing"
+							? undefined
+							: async () => {
+									if (evidence === "throws") throw new Error("host unavailable");
+									if (evidence === "unknown") return undefined;
+									return probe === "turnRunning" ? true : probe === "queueEmpty" ? false : [{ id: "busy" }];
+								},
+				});
+				await f.pipeline.reconcile();
+				await f.pipeline.retiredSessionSweepSettled();
+				expect(f.close).not.toHaveBeenCalled();
+				expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+				Object.defineProperty(f.sessionPort, probe, { value: original });
+				await f.pipeline.reconcile();
+				await f.pipeline.retiredSessionSweepSettled();
+				expect(f.close).toHaveBeenCalledTimes(1);
+				expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+			} finally {
+				f.pipeline.dispose();
+				f.database.close();
+				await rm(directory, { recursive: true, force: true });
+			}
+		});
+	}
+}
+
+test("reconcile attempts at most two retired hosts globally and fairly across removed monitor origins", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-fair-"));
+	let now = Date.now();
+	const f = await retirementHarness(directory, () => now);
+	try {
+		const eventTypes = ["budget.tick", "second.tick", "third.tick"];
+		f.registry.update({ monitorId: f.monitor.monitorId, eventTypes });
+		for (const eventType of eventTypes) {
+			await f.pipeline.submitAwaitable(f.monitor.monitorId, eventType, {});
+			await f.pipeline.submitAwaitable(f.monitor.monitorId, eventType, {});
+			now++;
+		}
+		const sessions = ["event-session-e0", "event-session-1-e0", "event-session-2-e0"];
+		for (const sessionId of sessions) f.sessionPort.hostJobs.set(sessionId, new Error("host unavailable"));
+		f.registry.remove(f.monitor.monitorId);
+		const exclusive = spyOn(f.sessionPort, "runExclusive");
+		for (const expected of [
+			[sessions[0], sessions[1]],
+			[sessions[2], sessions[0]],
+			[sessions[1], sessions[2]],
+		]) {
+			f.jobs.mockClear();
+			exclusive.mockClear();
+			await f.pipeline.reconcile();
+			await f.pipeline.retiredSessionSweepSettled();
+			expect(f.jobs.mock.calls.map(([input]) => input.sessionId)).toEqual(expected);
+			expect(exclusive).not.toHaveBeenCalled();
+		}
+		expect(f.close).not.toHaveBeenCalled();
+		for (const sessionId of sessions) f.sessionPort.hostJobs.set(sessionId, []);
+		for (const count of [2, 1]) {
+			f.close.mockClear();
+			await f.pipeline.reconcile();
+			await f.pipeline.retiredSessionSweepSettled();
+			expect(f.close).toHaveBeenCalledTimes(count);
+		}
+		expect(f.database.core.metaKeysInRange("monitor_retired_session:", "monitor_retired_session;")).toEqual([]);
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a gated retirement probe permits its own saved-event recovery and later other-origin recovery", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-overlap-"));
+	let now = Date.now();
+	const f = await retirementHarness(directory, () => now);
+	let release = () => {};
+	let sweep: Promise<void> | undefined;
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		// Keep e0 until A has a real failed dispatch with a saved turn on e1.
+		f.sessionPort.hostJobs.set("event-session-e0", [{ type: "bash", id: "busy", label: "busy" }]);
+		const unreadable = spyOn(f.sessionPort, "fetchLastAssistant").mockRejectedValueOnce(
+			new LastAssistantUnreadableError("last_assistant_no_page"),
+		);
+		const failedA = await f.dispatch();
+		unreadable.mockRestore();
+		expect(f.database.monitors.eventGet(failedA)?.stage).toBe("failed");
+		expect(JSON.parse(f.database.core.metaGet(`monitor_authoring_turn:${failedA}`)!)).toMatchObject({
+			sessionId: "event-session-e1",
+		});
+		now++;
+		const failedB = await failOtherMonitor(f);
+		expect(f.database.monitors.eventsOpen().map((row) => row.event_id)).toEqual([failedA, failedB]);
+		now += 13 * 60 * 60_000;
+		f.sessionPort.hostJobs.set("event-session-e0", []);
+		f.jobs.mockClear();
+		let entered = () => {};
+		const inProbe = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const turnRunning = f.sessionPort.turnRunning.bind(f.sessionPort);
+		const probe = spyOn(f.sessionPort, "turnRunning").mockImplementation(async (input) => {
+			entered();
+			await gate;
+			return turnRunning(input);
+		});
+		const exclusive = spyOn(f.sessionPort, "runExclusive");
+		sweep = f.pipeline.reconcile();
+		await inProbe;
+		const currentSweep = f.pipeline.retiredSessionSweepSettled();
+		const recovered = await Promise.race([sweep.then(() => true), Bun.sleep(1_000).then(() => false)]);
+		expect(recovered).toBe(true);
+		expect(f.database.monitors.authoredOutput(failedA)).toBe(`note for ${failedA}`);
+		expect(f.database.monitors.authoredOutput(failedB)).toBe(`note for ${failedB}`);
+		await f.pipeline.reconcile();
+		expect(f.pipeline.retiredSessionSweepSettled()).toBe(currentSweep);
+		expect(probe).toHaveBeenCalledTimes(1);
+		expect(exclusive.mock.calls.filter(([key]) => key === f.sessionKey)).toHaveLength(1);
+		expect(f.jobs).not.toHaveBeenCalled();
+		expect(f.close).not.toHaveBeenCalled();
+		release();
+		await sweep;
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		release();
+		await sweep;
+		await f.pipeline.retiredSessionSweepSettled();
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a rolled origin's gated authoring request cannot delay another monitor's failed-event recovery", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-busy-origin-"));
+	let release = () => {};
+	let entered = () => {};
+	const inRequest = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const f = await retirementHarness(directory, undefined, async (prompt, index) => {
+		if (index === 1) {
+			entered();
+			await gate;
+		}
+		return echoNotes(prompt);
+	});
+	let dispatch: Promise<string> | undefined;
+	let recovery: Promise<void> | undefined;
+	try {
+		await f.dispatch();
+		dispatch = f.dispatch();
+		await inRequest;
+		expect(f.database.bindings.getSessionRecord(f.sessionKey)?.epoch).toBe(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		const failed = await failOtherMonitor(f);
+		const exclusive = spyOn(f.sessionPort, "runExclusive");
+		recovery = f.pipeline.reconcile();
+		const recovered = await Promise.race([recovery.then(() => true), Bun.sleep(1_000).then(() => false)]);
+		expect(recovered).toBe(true);
+		expect(f.database.monitors.authoredOutput(failed)).toBe(`note for ${failed}`);
+		expect(exclusive.mock.calls.filter(([key]) => key === f.sessionKey)).toHaveLength(0);
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.jobs).toHaveBeenCalledTimes(1);
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+		release();
+		await dispatch;
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		release();
+		await dispatch;
+		await recovery;
+		await f.pipeline.retiredSessionSweepSettled();
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const expire of [false, true]) {
+	test(`drain ${expire ? "bounds its wait for" : "waits for"} a background retirement sweep and dispose prevents later closes`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-drain-"));
+		const f = await retirementHarness(directory);
+		let release = () => {};
+		let draining: Promise<void> | undefined;
+		try {
+			for (const eventType of ["budget.tick", "second.tick"]) {
+				await f.pipeline.submitAwaitable(f.monitor.monitorId, eventType, {});
+				await f.pipeline.submitAwaitable(f.monitor.monitorId, eventType, {});
+			}
+			let entered = () => {};
+			const inProbe = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const turnRunning = f.sessionPort.turnRunning.bind(f.sessionPort);
+			const probe = spyOn(f.sessionPort, "turnRunning").mockImplementation(async (input) => {
+				entered();
+				await gate;
+				return turnRunning(input);
+			});
+			await f.pipeline.reconcile();
+			await inProbe;
+			const sweep = f.pipeline.retiredSessionSweepSettled();
+			let settled = false;
+			void sweep.then(() => {
+				settled = true;
+			});
+			const started = performance.now();
+			let drained = false;
+			draining = f.pipeline.drain(expire ? 20 : 1_000).then(() => {
+				drained = true;
+			});
+			await Bun.sleep(0);
+			expect(drained).toBe(false);
+			await f.pipeline.reconcile();
+			expect(f.pipeline.retiredSessionSweepSettled()).toBe(sweep);
+			expect(probe).toHaveBeenCalledTimes(1);
+			if (expire) {
+				await draining;
+				expect(performance.now() - started).toBeLessThan(1_000);
+				expect(settled).toBe(false);
+			}
+			release();
+			await draining;
+			await sweep;
+			expect(settled).toBe(true);
+			expect(probe).toHaveBeenCalledTimes(1);
+			expect(f.close).not.toHaveBeenCalled();
+			expect(f.database.core.metaKeysInRange("monitor_retired_session:", "monitor_retired_session;")).toHaveLength(2);
+			await f.pipeline.reconcile();
+			await f.pipeline.retiredSessionSweepSettled();
+			expect(probe).toHaveBeenCalledTimes(1);
+			expect(f.close).not.toHaveBeenCalled();
+		} finally {
+			release();
+			await draining;
+			await f.pipeline.retiredSessionSweepSettled();
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("a gated retirement sweep resolves after drain times out and the real Store closes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-closed-store-"));
+	const f = await retirementHarness(directory);
+	let release = () => {};
+	let sweep: Promise<void> | undefined;
+	let closed = false;
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		let entered = () => {};
+		const inProbe = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const turnRunning = f.sessionPort.turnRunning.bind(f.sessionPort);
+		f.sessionPort.turnRunning = async (input) => {
+			entered();
+			await gate;
+			return turnRunning(input);
+		};
+		await f.pipeline.reconcile();
+		await inProbe;
+		sweep = f.pipeline.retiredSessionSweepSettled();
+		let settled = false;
+		void sweep.then(() => {
+			settled = true;
+		});
+		await f.pipeline.drain(20);
+		expect(settled).toBe(false);
+		f.database.close();
+		closed = true;
+		release();
+		await sweep;
+		await Bun.sleep(0);
+		expect(settled).toBe(true);
+		expect(unhandled).toEqual([]);
+		expect(f.close).not.toHaveBeenCalled();
+	} finally {
+		release();
+		await sweep;
+		await f.pipeline.retiredSessionSweepSettled();
+		process.off("unhandledRejection", onUnhandled);
+		f.pipeline.dispose();
+		if (!closed) f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+for (const backgroundFirst of [true, false]) {
+	test(`inline and background retirement share one probe sequence and close when ${backgroundFirst ? "background" : "inline"} starts first`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-attempt-guard-"));
+		const f = await retirementHarness(directory);
+		let release = () => {};
+		let recovery: Promise<void> | undefined;
+		let dispatch: Promise<string> | undefined;
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			let entered = () => {};
+			const inProbe = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const order: string[] = [];
+			const turnRunning = f.sessionPort.turnRunning.bind(f.sessionPort);
+			const queueEmpty = f.sessionPort.queueEmpty.bind(f.sessionPort);
+			const runningJobs = f.sessionPort.runningJobs.bind(f.sessionPort);
+			f.sessionPort.turnRunning = async (input) => {
+				order.push("turn");
+				entered();
+				await gate;
+				return turnRunning(input);
+			};
+			f.sessionPort.queueEmpty = async (input) => {
+				order.push("queue");
+				return queueEmpty(input);
+			};
+			f.sessionPort.runningJobs = async (input) => {
+				order.push("jobs");
+				return runningJobs(input);
+			};
+			const exclusive = spyOn(f.sessionPort, "runExclusive");
+			if (backgroundFirst) recovery = f.pipeline.reconcile();
+			else dispatch = f.dispatch();
+			await inProbe;
+			if (backgroundFirst) {
+				dispatch = f.dispatch();
+				const authored = await Promise.race([dispatch.then(() => true), Bun.sleep(1_000).then(() => false)]);
+				expect(authored).toBe(true);
+			} else recovery = f.pipeline.reconcile();
+			await recovery;
+			expect(exclusive.mock.calls.map(([key]) => key)).toEqual([f.sessionKey]);
+			expect(order).toEqual(["turn"]);
+			expect(f.close).not.toHaveBeenCalled();
+			release();
+			const event = await dispatch;
+			await f.pipeline.retiredSessionSweepSettled();
+			expect(f.database.monitors.authoredOutput(event!)).toBe(`note for ${event}`);
+			expect(f.turns).toHaveLength(3);
+			expect(order).toEqual(["turn", "queue", "jobs"]);
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+		} finally {
+			release();
+			await recovery;
+			await dispatch;
+			await f.pipeline.retiredSessionSweepSettled();
+			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+test("reconcile contains retirement enumeration errors and retries on its next pass", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-error-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.registry.remove(f.monitor.monitorId);
+		const metaKeysInRange = f.database.core.metaKeysInRange.bind(f.database.core);
+		const keys = spyOn(f.database.core, "metaKeysInRange").mockImplementation((start, end) => {
+			if (start === "monitor_retired_session:") throw new Error("retirement scan failed");
+			return metaKeysInRange(start, end);
+		});
+		try {
+			await f.pipeline.reconcile();
+			await f.pipeline.retiredSessionSweepSettled();
+			expect(f.close).not.toHaveBeenCalled();
+			expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		} finally {
+			keys.mockRestore();
+		}
+		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("reconcile keeps failed closes after removal and retries only with fresh idle evidence", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-close-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.registry.remove(f.monitor.monitorId);
+		f.sessionPort.closeOutcomes.set("event-session-e0", [new GjcCliError("transport lost", 1, "")]);
+		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
+		f.sessionPort.hostTurnRunning.set("event-session-e0", undefined);
+		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeDefined();
+		f.sessionPort.hostTurnRunning.set("event-session-e0", false);
+		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(2);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("reconcile ignores malformed retirement keys without blocking valid removed-monitor cleanup", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-key-"));
+	const f = await retirementHarness(directory);
+	try {
+		await f.dispatch();
+		await f.dispatch();
+		f.registry.remove(f.monitor.monitorId);
+		const raw = f.database.core.metaGet(f.retiredKey)!;
+		const invalidKeys = ["monitor_retired_session:invalid:event-session-e0", `${f.retiredKey}:wrong-session`];
+		for (const key of invalidKeys) f.database.core.metaSet(key, raw);
+		await f.pipeline.reconcile();
+		await f.pipeline.retiredSessionSweepSettled();
+		expect(f.close).toHaveBeenCalledTimes(1);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+		for (const key of invalidKeys) expect(f.database.core.metaGet(key)).toBe(raw);
 	} finally {
 		f.pipeline.dispose();
 		f.database.close();
@@ -651,7 +1231,7 @@ test("a size roll without a persisted session ID does not create an empty retire
 	}
 });
 
-test("monitor removal during the last retired-session probe relinquishes close", async () => {
+test("monitor removal during the last retired-session probe still permits close", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-remove-probe-"));
 	const f = await retirementHarness(directory);
 	try {
@@ -662,7 +1242,7 @@ test("monitor removal during the last retired-session probe relinquishes close",
 		};
 		await f.dispatch();
 		expect(f.terminate).not.toHaveBeenCalled();
-		expect(f.close).not.toHaveBeenCalled();
+		expect(f.close).toHaveBeenCalledTimes(1);
 		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
 	} finally {
 		f.pipeline.dispose();
@@ -751,7 +1331,7 @@ for (const evidence of [false, "throws", "missing"] as const) {
 }
 
 for (const change of ["remove", "replace_record", "saved_pointer", "live_binding"] as const) {
-	test(`size-rolled close authorization refuses ${change} during the last job probe`, async () => {
+	test(`size-rolled close authorization ${change === "remove" ? "permits" : "refuses"} ${change} during the last job probe`, async () => {
 		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-guard-"));
 		const f = await retirementHarness(directory);
 		try {
@@ -776,11 +1356,15 @@ for (const change of ["remove", "replace_record", "saved_pointer", "live_binding
 					spyOn(f.database.bindings, "getSessionRecord").mockReturnValue({ sessionId: "event-session-e0", epoch: 0 });
 			};
 			await f.dispatch();
-			expect(f.close).not.toHaveBeenCalled();
 			expect(f.terminate).not.toHaveBeenCalled();
-			expect(f.sessionPort.closes).toEqual([]);
-			if (change === "remove") expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
-			else expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
+			if (change === "remove") {
+				expect(f.close).toHaveBeenCalledTimes(1);
+				expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+			} else {
+				expect(f.close).not.toHaveBeenCalled();
+				expect(f.sessionPort.closes).toEqual([]);
+				expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
+			}
 		} finally {
 			f.pipeline.dispose();
 			f.database.close();
