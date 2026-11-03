@@ -780,7 +780,13 @@ export class GlobalGjcClient {
 		args: readonly string[],
 		timeout: number,
 		priority: "interactive" | "background",
-		context?: { queueLength?: number; poolOccupancy?: number; cliSubcommand?: string; queueWaitMs?: number; operation?: string },
+		context?: {
+			queueLength?: number;
+			poolOccupancy?: number;
+			cliSubcommand?: string;
+			queueWaitMs?: number;
+			operation?: string;
+		},
 	): Promise<CliResult> {
 		const remaining = Math.max(1, timeout);
 		if (this.#options.command)
@@ -924,7 +930,13 @@ export class GlobalGjcClient {
 			// reporting it as an outage failed every other caller while the broker
 			// itself was healthy (#675).
 			if (Date.now() >= deadline)
-				throw new GjcCommandQueueTimeoutError(timeout, this.#queue.length, this.#inflight, this.#maxPoolSize, operation);
+				throw new GjcCommandQueueTimeoutError(
+					timeout,
+					this.#queue.length,
+					this.#inflight,
+					this.#maxPoolSize,
+					operation,
+				);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
@@ -1118,7 +1130,8 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 		// Skip option payloads so a literal --json value is not an output flag.
 		let jsonFlags = 0;
 		for (let i = 2; i < bound.length; i++) {
-			const arg = bound[i]!;
+			const arg = bound[i];
+			if (arg === undefined) continue;
 			if (arg === "--") throw new Error("Global GJC client rejects session option delimiters");
 			if (SESSION_VALUE_OPTIONS.has(arg)) {
 				if (bound[i + 1] === undefined) throw new Error(`Global GJC client requires a value after ${arg}`);
@@ -1182,7 +1195,9 @@ function trustedEnvironment(cwd: string): Record<string, string> {
 				throw error;
 			}
 			for (const match of text.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/gm)) {
-				const key = process.platform === "win32" ? match[1]!.toUpperCase() : match[1]!;
+				const name = match[1];
+				if (name === undefined) continue;
+				const key = process.platform === "win32" ? name.toUpperCase() : name;
 				if (sensitive.has(key) && env[key])
 					throw new Error(`Cannot trust project-declared ${key}; launch from a clean service directory`);
 			}
@@ -1234,7 +1249,13 @@ function delay(ms: number): Promise<void> {
 async function bounded<T>(
 	promise: Promise<T>,
 	timeout: number,
-	context?: { queueLength?: number; poolOccupancy?: number; cliSubcommand?: string; queueWaitMs?: number; operation?: string },
+	context?: {
+		queueLength?: number;
+		poolOccupancy?: number;
+		cliSubcommand?: string;
+		queueWaitMs?: number;
+		operation?: string;
+	},
 ): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {

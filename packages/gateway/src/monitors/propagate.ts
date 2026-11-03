@@ -16,7 +16,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
-import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "../orchestrator/broker";
+import { GjcCommandQueueTimeoutError, isBrokerUnavailable } from "../orchestrator/broker";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -1312,20 +1312,18 @@ export class MonitorPropagator {
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
 					dispatchPhase = "configure";
-					const modelKey = effectiveModel
-						? typeof effectiveModel === "string"
-							? effectiveModel
-							: `preset:${effectiveModel.preset}`
-						: undefined;
-					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
-						dispatchOperation = "setModel";
-						dispatchOperationArgs = {
-							model: modelKey,
-						};
-						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
-						this.#appliedModels.set(sessionId, modelKey!);
-					} else if (effectiveModel && binding.startupModelApplied) {
-						this.#appliedModels.set(sessionId, modelKey!);
+					if (effectiveModel) {
+						const modelKey = typeof effectiveModel === "string" ? effectiveModel : `preset:${effectiveModel.preset}`;
+						if (!binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+							dispatchOperation = "setModel";
+							dispatchOperationArgs = {
+								model: modelKey,
+							};
+							await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
+							this.#appliedModels.set(sessionId, modelKey);
+						} else if (binding.startupModelApplied) {
+							this.#appliedModels.set(sessionId, modelKey);
+						}
 					}
 					if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
 						dispatchOperation = "setServiceTier";
@@ -1686,8 +1684,10 @@ export class MonitorPropagator {
 								phase: dispatchPhase,
 								...cliDiagnostic,
 								operation: cliDiagnostic.operation ?? dispatchOperation,
-								dispatch_operation: dispatchOperation,
-								operation_args: dispatchOperationArgs,
+								...(cliDiagnostic.operation && cliDiagnostic.operation !== dispatchOperation
+									? { dispatch_operation: dispatchOperation }
+									: {}),
+								...(Object.keys(cliDiagnostic).length === 0 ? { operation_args: dispatchOperationArgs } : {}),
 								sessionId: boundSessionId ?? null,
 								origin: sessionOriginKey,
 								attempt: row.dispatch_attempts + 1,

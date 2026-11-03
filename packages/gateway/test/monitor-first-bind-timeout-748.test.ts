@@ -129,7 +129,7 @@ test("first-bind degradation survives successful retries until a first-attempt s
 				if (failNextBind) {
 					failNextBind = false;
 					throw new Error(
-						"gjc sdk request failed: broker_unavailable (request timed out after 30000ms queue=12 occupancy=8 cliSubcommand=\"sdk session\" queueWaitMs=12000 operation=session.resume)",
+						'gjc sdk request failed: broker_unavailable (request timed out after 30000ms queue=12 occupancy=8 cliSubcommand="sdk session" queueWaitMs=12000 operation=session.resume)',
 					);
 				}
 				return {
@@ -176,7 +176,7 @@ test("first-bind degradation survives successful retries until a first-attempt s
 			serviceTier: undefined,
 		});
 
-		const sessionOrigin = "monitor/eventtype/test.bind_retry/parent=" + monitor.monitorId;
+		const sessionOrigin = `monitor/eventtype/test.bind_retry/parent=${monitor.monitorId}`;
 		for (let i = 0; i < 5; i++) {
 			failNextBind = true;
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.bind_retry", { tick: i });
@@ -210,17 +210,16 @@ test("first-bind degradation survives successful retries until a first-attempt s
 			ready: false,
 			failure: { category: "monitor_bind", code: "monitor_bind_degraded" },
 		});
+		const firstAttemptSuccessId = await pipeline.submitAwaitable(monitor.monitorId, "test.bind_retry", { tick: 5 });
+		expect(database.monitors.eventGet(firstAttemptSuccessId)?.stage).toBe("authored");
+		expect(pipeline.sessionSafetyState(sessionOrigin).firstAttemptBindFailures).toBe(0);
+		expect(readiness.snapshot()).toMatchObject({ ready: true, failure: null });
 		expect(firstBindFailureDetail).toContain('"operation":"session.resume"');
 		expect(firstBindFailureDetail).toContain('"dispatch_operation":"bind"');
 		expect(firstBindFailureDetail).toContain('"cliSubcommand":"sdk session"');
 		expect(firstBindFailureDetail).toContain('"queueWaitMs":12000');
 		expect(firstBindFailureDetail).toContain('"queueLength":12');
 		expect(firstBindFailureDetail).toContain('"poolOccupancy":8');
-
-		const firstAttemptSuccessId = await pipeline.submitAwaitable(monitor.monitorId, "test.bind_retry", { tick: 5 });
-		expect(database.monitors.eventGet(firstAttemptSuccessId)?.stage).toBe("authored");
-		expect(pipeline.sessionSafetyState(sessionOrigin).firstAttemptBindFailures).toBe(0);
-		expect(readiness.snapshot()).toMatchObject({ ready: true, failure: null });
 
 		database.close();
 	} finally {
@@ -262,11 +261,12 @@ test("first-attempt bind failure counter resets on successful bind (#748)", asyn
 					startupModelApplied: false,
 				};
 			},
-			request: async (input) => ({
-				assistant: {
-					text: JSON.stringify(eventIdsFromPrompt(input.text).map((eventId) => ({ eventId, note: "[SILENT]" }))),
-				},
-			}) as never,
+			request: async (input) =>
+				({
+					assistant: {
+						text: JSON.stringify(eventIdsFromPrompt(input.text).map((eventId) => ({ eventId, note: "[SILENT]" }))),
+					},
+				}) as never,
 			runExclusive: async (_, fn) => fn(),
 		};
 
