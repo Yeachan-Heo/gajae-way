@@ -58,9 +58,11 @@ import {
 	type ServicePlatform,
 	servicePinCandidates,
 	serviceUsage,
+	homeForEnvironment,
 } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
+import { acquireLease, LeaseHeldError } from "@gajae-gateway/home";
 
 async function connectGatewaySocket(
 	path: string,
@@ -1214,22 +1216,37 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
-				const gjcVersion = await installPinnedGjcForServices({
-					home: gatewayHome(),
-					candidates: servicePinCandidates(service.binDir),
-					...(options.services?.gjcInstallRunner === undefined ? {} : { runner: options.services.gjcInstallRunner }),
-				});
-				console.log(`installed pinned gjc ${gjcVersion}`);
-				const written = await installServices({
-					binDir: service.binDir,
-					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),
-					...(service.unitDir === undefined ? {} : { unitDir: service.unitDir }),
-					...(service.platform === undefined ? {} : { platform: service.platform }),
-					env: process.env,
-					...options.services,
-				});
-				console.log(`services ${service.action}: wrote ${written.length} service definitions`);
-				for (const definition of written) console.log(definition);
+				const home = homeForEnvironment(process.env);
+				let lease: Awaited<ReturnType<typeof acquireLease>> | undefined;
+				try {
+					try {
+						lease = await acquireLease(home, "update");
+					} catch (error) {
+						if (error instanceof LeaseHeldError) {
+							console.error(error.message);
+							throw new Error(`another gajaeway update is running (${error.message})`, { cause: error });
+						}
+						throw error;
+					}
+					const gjcVersion = await installPinnedGjcForServices({
+						home,
+						candidates: servicePinCandidates(service.binDir, process.env),
+						...(options.services?.gjcInstallRunner === undefined ? {} : { runner: options.services.gjcInstallRunner }),
+					});
+					console.log(`installed pinned gjc ${gjcVersion}`);
+					const written = await installServices({
+						binDir: service.binDir,
+						...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),
+						...(service.unitDir === undefined ? {} : { unitDir: service.unitDir }),
+						...(service.platform === undefined ? {} : { platform: service.platform }),
+						env: process.env,
+						...options.services,
+					});
+					console.log(`services ${service.action}: wrote ${written.length} service definitions`);
+					for (const definition of written) console.log(definition);
+				} finally {
+					if (lease) await lease.release();
+				}
 				break;
 			}
 			case "migrate":

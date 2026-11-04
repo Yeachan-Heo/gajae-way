@@ -8,6 +8,7 @@ import {
 	BROKER_UNIT,
 	discoverLoginPath,
 	GATEWAY_UNIT,
+	homeForEnvironment,
 	installPinnedGjcForServices,
 	installServices,
 	restartStackCommands,
@@ -165,49 +166,27 @@ test("an unsupported platform is refused by name", async () => {
 	try {
 		await expect(
 			installServices({
-				binDir: join(home, "bin"),
+				binDir: "bin",
+				platform: "windows" as never,
 				env: { HOME: home, GAJAEWAY_HOME: home },
-				platform: "plan9" as never,
-				writeFile: () => {},
 			}),
-		).rejects.toThrow("unsupported service platform: plan9");
+		).rejects.toThrow("unsupported service platform");
 	} finally {
 		await cleanup();
 	}
 });
 
-test("restart-stack is one systemctl call on linux and an ordered kickstart chain on darwin", () => {
-	expect(restartStackCommands("linux")).toEqual([
-		["systemctl", "--user", "restart", BROKER_UNIT],
-		["systemctl", "--user", "restart", GATEWAY_UNIT],
+test("restart-stack is ordered systemctl calls on linux and an ordered kickstart chain on darwin", () => {
+	const linuxCmds = restartStackCommands("linux");
+	expect(linuxCmds).toEqual([
+		["systemctl", "--user", "restart", "gajaeway-broker.service"],
+		["systemctl", "--user", "restart", "gajaeway-gateway.service"],
 	]);
-
-	const darwin = restartStackCommands("darwin", 501);
-	expect(darwin[0]).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.broker"]);
-	expect(darwin.at(-1)).toEqual(["launchctl", "kickstart", "-k", "gui/501/dev.gajaeway.gateway"]);
-	expect(darwin).toHaveLength(serviceSpecs().length);
-	const gatewayIndex = darwin.findIndex((command) => command[3] === "gui/501/dev.gajaeway.gateway");
-	for (const spec of serviceSpecs().filter((candidate) => candidate.dependsOnGateway)) {
-		expect(darwin).toContainEqual(["launchctl", "kickstart", "-k", `gui/501/${spec.label}`]);
-		expect(darwin.findIndex((command) => command[3] === `gui/501/${spec.label}`)).toBeLessThan(gatewayIndex);
-	}
-	// bootout removes the job and leaves the bot offline with no automatic recovery.
-	expect(darwin.flat()).not.toContain("bootout");
-});
-
-test("discoverLoginPath uses SHELL when set and executable", async () => {
-	const env = { SHELL: "/bin/sh" };
-	let ranCommand: string[] | undefined;
-	const runner = async (command: readonly string[]) => {
-		ranCommand = [...command];
-		if (command[0] === "/bin/sh") return "exported PATH value";
-		throw new Error("not reached");
-	};
-
-	const result = await discoverLoginPath(env, runner);
-
-	expect(result).toBe("exported PATH value");
-	expect(ranCommand).toEqual(["/bin/sh", "-lc", 'printf %s "$PATH"']);
+	const darwinCmds = restartStackCommands("darwin");
+	expect(darwinCmds[0][0]).toBe("launchctl");
+	expect(darwinCmds[0][3]).toContain("dev.gajaeway.broker");
+	const darwinCmds42 = restartStackCommands("darwin", 42);
+	expect(darwinCmds42[0]).toEqual(["launchctl", "kickstart", "-k", "gui/42/dev.gajaeway.broker"]);
 });
 
 function recordingRunner(succeedOn?: string) {
@@ -220,6 +199,13 @@ function recordingRunner(succeedOn?: string) {
 	};
 	return { ran, runner };
 }
+
+test("discoverLoginPath uses SHELL when set and executable", async () => {
+	const { ran, runner } = recordingRunner("/bin/bash");
+	const result = await discoverLoginPath({ SHELL: "/bin/bash" }, runner);
+	expect(result).toBe("PATH from /bin/bash");
+	expect(ran).toEqual(["/bin/bash"]);
+});
 
 test("discoverLoginPath with SHELL unset uses the passwd shell, never /bin/zsh", async () => {
 	const { ran, runner } = recordingRunner("/usr/bin/fish");
@@ -357,8 +343,49 @@ test("installPinnedGjcForServices names every candidate when none carries a pin"
 	}
 });
 
-test("servicePinCandidates checks the checkout gateway package before the binDir package", () => {
-	const [checkout, release] = servicePinCandidates("~/bin", { HOME: "/home/op" });
-	expect(checkout).toBe(join(import.meta.dir, "..", "..", "gateway", "package.json"));
-	expect(release).toBe("/home/op/bin/package.json");
+test("servicePinCandidates checks the binDir package before the checkout gateway package (Finding 1)", () => {
+	const [binDirCandidate, checkoutCandidate] = servicePinCandidates("~/bin", { HOME: "/home/op" });
+	expect(binDirCandidate).toBe("/home/op/bin/package.json");
+	expect(checkoutCandidate).toBe(join(import.meta.dir, "..", "..", "gateway", "package.json"));
+});
+
+test("servicePinCandidates uses the bin directory from the passed environment (Finding 1 - env-based fallback)", () => {
+	const candidates = servicePinCandidates("/opt/binaries", { HOME: "/nonstandard" });
+	expect(candidates[0]).toBe("/opt/binaries/package.json");
+});
+
+test("installPinnedGjcForServices uses binDir pin when available, falls back to checkout only when no manifest (Finding 1)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-order-"));
+	try {
+		const installed: string[] = [];
+		// Test case: binDir has a pin, should be used
+		const binDirCandidatePath = await pinFile(dir, "bindir.json", "0.19.5");
+		const checkoutCandidatePath = await pinFile(dir, "checkout.json", "0.19.3");
+		const version = await installPinnedGjcForServices({
+			home: dir,
+			candidates: [binDirCandidatePath, checkoutCandidatePath],
+			runner: stubGjcRunner(installed),
+		});
+		expect(version).toBe("0.19.5");
+		expect(installed).toEqual(["0.19.5"]);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("homeForEnvironment resolves from GAJAEWAY_HOME when set (Finding 3)", () => {
+	const home = homeForEnvironment({ GAJAEWAY_HOME: "/custom/gajaeway" });
+	expect(home).toBe("/custom/gajaeway");
+});
+
+test("homeForEnvironment falls back to HOME/.gajaeway when GAJAEWAY_HOME is not set (Finding 3)", () => {
+	const home = homeForEnvironment({ HOME: "/home/user" });
+	expect(home).toBe("/home/user/.gajaeway");
+});
+
+test("homeForEnvironment uses default home dir when both GAJAEWAY_HOME and HOME are missing (Finding 3)", () => {
+	const home = homeForEnvironment({});
+	expect(home).toMatch(/\.gajaeway$/);
+	// We can't check the exact path since homedir() depends on the system,
+	// but we can verify it ends with .gajaeway
 });

@@ -125,7 +125,7 @@ export function adapterConfigPath(home: string, specId: string): string | undefi
 	return join(home, `adapter-${specId.slice("adapter-".length)}.json`);
 }
 
-function homeForEnvironment(env: NodeJS.ProcessEnv): string {
+export function homeForEnvironment(env: NodeJS.ProcessEnv): string {
 	return env.GAJAEWAY_HOME || join(env.HOME || homedir(), ".gajaeway");
 }
 
@@ -448,15 +448,15 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 }
 
 /**
- * Where `services install|repair` finds the GJC pin, mirroring the runtime guard's candidates
- * (`pinnedGjcCandidatePaths` in packages/gateway/src/orchestrator/broker.ts): the checkout's gateway
- * package.json resolved from this module, then the package.json the release updater places beside the binaries.
+ * Where `services install|repair` finds the GJC pin. If DIR/package.json carries a gjc.version,
+ * that pin wins. Falls back to the checkout packages/gateway/package.json only when DIR has no manifest,
+ * which is the source-build case.
  */
 export function servicePinCandidates(binDir: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
-	const repoRoot = dirname(dirname(dirname(dirname(__filename))));
+	const repoRoot = dirname(dirname(dirname(import.meta.dir)));
 	return [
-		join(repoRoot, "packages", "gateway", "package.json"),
 		join(expandHome(binDir, env.HOME || homedir()), "package.json"),
+		join(repoRoot, "packages", "gateway", "package.json"),
 	];
 }
 
