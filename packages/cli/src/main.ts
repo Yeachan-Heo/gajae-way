@@ -1219,10 +1219,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					try {
 						lease = await acquireLease(home, "update");
 					} catch (error) {
-						if (error instanceof LeaseHeldError) {
-							console.error(error.message);
-							throw new Error(`another gajaeway update is running (${error.message})`, { cause: error });
-						}
+						if (error instanceof LeaseHeldError)
+							throw new Error(`services ${service.action} refused while an update holds the lease: ${error.message}`, {
+								cause: error,
+							});
 						throw error;
 					}
 					const gjcVersion = await installPinnedGjcForServices({
