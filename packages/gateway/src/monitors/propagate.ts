@@ -1730,8 +1730,7 @@ export class MonitorPropagator {
 			report = await readStatus();
 		}
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
-		if (projectOpState(report.status) !== "completed")
-			throw new SessionTerminalError(report);
+		if (projectOpState(report.status) !== "completed") throw new SessionTerminalError(report);
 		const output = await this.#readAuthoringResult(turn, rows, report);
 		if (output.status === "proven") return output.text;
 		if (output.status === "unavailable")
