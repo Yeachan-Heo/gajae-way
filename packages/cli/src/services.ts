@@ -1,8 +1,10 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
+import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
+import { readPinnedGjcVersion } from "./update";
 
 const CONFIG_SCHEMA_VERSION = 1;
 
@@ -443,6 +445,46 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 		const message = error instanceof RuntimeConfigError ? error.message : String(error);
 		throw new Error(`invalid runtime configuration ${configPath}: ${message}`);
 	}
+}
+
+/**
+ * Where `services install|repair` finds the GJC pin, mirroring the runtime guard's candidates
+ * (`pinnedGjcCandidatePaths` in packages/gateway/src/orchestrator/broker.ts): the checkout's gateway
+ * package.json resolved from this module, then the package.json the release updater places beside the binaries.
+ */
+export function servicePinCandidates(binDir: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
+	const repoRoot = dirname(dirname(dirname(dirname(__filename))));
+	return [
+		join(repoRoot, "packages", "gateway", "package.json"),
+		join(expandHome(binDir, env.HOME || homedir()), "package.json"),
+	];
+}
+
+/**
+ * Install the first pin found among `candidates` into the private prefix and return its version.
+ * Unreadable or pin-less candidates are skipped; an install failure propagates instead of falling
+ * through to a later candidate whose pin the runtime guard would not enforce.
+ */
+export async function installPinnedGjcForServices(options: {
+	readonly home: string;
+	readonly candidates: readonly string[];
+	readonly runner?: GjcInstallRunner;
+}): Promise<string> {
+	for (const path of options.candidates) {
+		let version: string;
+		try {
+			version = await readPinnedGjcVersion(path);
+		} catch {
+			continue;
+		}
+		await installPinnedGjc({
+			home: options.home,
+			version,
+			...(options.runner === undefined ? {} : { runner: options.runner }),
+		});
+		return version;
+	}
+	throw new Error(`could not find a pinned gjc version in any of: ${options.candidates.join(", ")}`);
 }
 
 export async function installServices(options: InstallServicesOptions): Promise<readonly string[]> {
