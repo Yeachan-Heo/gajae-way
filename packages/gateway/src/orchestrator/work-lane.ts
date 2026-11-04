@@ -247,7 +247,6 @@ interface StartContext {
 	readonly parent: WorkParent | null;
 	readonly runCall?: RunCall;
 	readonly opRef?: string;
-	readonly callerSessionId?: string;
 	readonly wakeReportId?: string;
 	/** Only the check-polling path may add an attempt while the lane is parked. */
 	readonly checksRetry?: boolean;
@@ -876,7 +875,7 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall, callerSessionId: input.callerSessionId });
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
 		const admitting = this.#admissions.get(input.name);
 		// A same-name retry (for example after a caller timeout) must not queue a
 		// second clone, bind or send behind the admission still in progress.
@@ -1119,7 +1118,7 @@ export class WorkLaneManager {
 				sessionId: runtime.sessionId,
 				repo: runtime.cwd,
 				opRef,
-				text: this.#withDirectives(input.text, context.parent, context.callerSessionId),
+				text: this.#withDirectives(input.text, context.parent),
 				...(observer.tail ? { relay: observer.tail } : {}),
 				...(notice ? { systemPreamble: notice.text } : {}),
 				codingRegister: true,
@@ -1280,8 +1279,18 @@ export class WorkLaneManager {
 					reasonCode: "directive_limit",
 				},
 			);
-		const directive: WorkDirective = {
-			id: `wd-${randomUUID().slice(0, 8)}`,
+		let directive: WorkDirective;
+		let directiveId: string;
+		// Use substantially larger ID (128 bits vs 32 bits) to prevent collision overwriting
+		// Retry if collision detected (low probability but possible across scopes)
+		for (let attempts = 0; attempts < 10; attempts++) {
+			directiveId = `wd-${randomUUID().replace(/-/g, "").slice(0, 32)}`;
+			const existing = this.#db.core.metaGet(`${DIRECTIVE_KEY_PREFIX}${directiveId}`);
+			if (!existing) break;
+			if (attempts === 9) throw new ProtocolError("verb_failed", "cannot generate unique directive ID");
+		}
+		directive = {
+			id: directiveId,
 			scope,
 			text: text.trim(),
 			createdAt: this.#at(),
@@ -1333,16 +1342,35 @@ export class WorkLaneManager {
 		}
 		return directives.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 	}
-	#withDirectives(text: string, parent: WorkParent | null, callerSessionId?: string): string {
-		// For work.run with callerSessionId, use caller's scope instead of parent's scope
-		// This ensures conversation directives reach the worker even when parent=null
-		let scope = laneDirectiveScope(parent);
-		if (parent === null && callerSessionId !== undefined) {
-			const callerScope = this.#directiveScope(callerSessionId);
-			if (callerScope !== OWNER_DIRECTIVE_SCOPE) scope = callerScope;
-		}
+	#withDirectives(text: string, parent: WorkParent | null): string {
+		const scope = laneDirectiveScope(parent);
 		const active = this.#directives().filter((directive) => directiveApplies(directive, scope));
 		return active.length === 0 ? text : `${directiveText(active, "standing")}\n\n${text}`;
+	}
+	/**
+	 * Reconcile directive delivery for an open attempt during recovery.
+	 * If the gateway crashed after writing a directive but before steering it to an open attempt,
+	 * this ensures the directive is delivered during recovery.
+	 * Returns the number of directives steered, or 0 if none applied or all failed.
+	 */
+	async #reconcileDirectivesForAttempt(runtime: WorkRuntime): Promise<number> {
+		const scope = laneDirectiveScope(runtime.parent);
+		const active = this.#directives().filter((directive) => directiveApplies(directive, scope));
+		if (!active.length) return 0;
+		const name = runtime.sessionKey.slice(WORK_SESSION_PREFIX.length);
+		let steered = 0;
+		try {
+			const result = await this.steer({ name, text: directiveText(active, "recovery_reconciliation") });
+			if (result.steered) {
+				steered = active.length;
+				console.error(
+					`work_directive_recovery_reconciled opRef=${runtime.opRef} lane=${name} directives=${steered}`,
+				);
+			}
+		} catch {
+			/* Recovery reports its own failures; steer result is uncertain but attempt stays live. */
+		}
+		return steered;
 	}
 	async steer(params: unknown): Promise<WorkSteerResult> {
 		const name = parseName(params);
@@ -2829,6 +2857,9 @@ export class WorkLaneManager {
 				// continuous-death grace as a live observer, never one inspect verdict.
 				if (terminalStillRunning && this.#binding(runtime) && this.#writeCurrent(observer)) {
 					this.#attach(observer);
+					// Reconcile any directives that may have been added after the attempt started
+					// but before recovery, in case the gateway crashed during directive delivery
+					await this.#reconcileDirectivesForAttempt(runtime);
 					this.#schedule(observer, 0);
 					continue;
 				}
@@ -2841,6 +2872,9 @@ export class WorkLaneManager {
 				if (!this.#current(observer)) continue;
 				if (live.live === true && !live.disowned && this.#binding(runtime)) {
 					this.#attach(observer);
+					// Reconcile any directives that may have been added after the attempt started
+					// but before recovery, in case the gateway crashed during directive delivery
+					await this.#reconcileDirectivesForAttempt(runtime);
 					this.#schedule(observer, 0);
 					continue;
 				}
@@ -3044,7 +3078,7 @@ function makeRuntime(
 const WORK_SESSION_PREFIX = "work/task/";
 const OWNER_DIRECTIVE_SCOPE = "owner";
 const DIRECTIVE_KEY_PREFIX = "work_directive:";
-const DIRECTIVE_ID = /^wd-[0-9a-f]{8}$/;
+const DIRECTIVE_ID = /^wd-[0-9a-f]{32}$/;
 const MAX_DIRECTIVE_CHARS = 2_000;
 const MAX_DIRECTIVES_PER_SCOPE = 50;
 
@@ -3059,11 +3093,13 @@ function directiveApplies(directive: WorkDirective, laneScope: string): boolean 
 	return directive.scope === OWNER_DIRECTIVE_SCOPE || directive.scope === laneScope;
 }
 
-function directiveText(directives: readonly WorkDirective[], kind: "standing" | "new"): string {
+function directiveText(directives: readonly WorkDirective[], kind: "standing" | "new" | "recovery_reconciliation"): string {
 	const lead =
 		kind === "new"
 			? "[New standing directive from your operator. It overrides your task from now on: follow it before your next tool call, and stop any step that violates it.]"
-			: "[Standing directives from your operator. They override anything in the task below; follow them for the whole lane.]";
+			: kind === "recovery_reconciliation"
+				? "[Standing directives from your operator (re-delivered after gateway restart). They override anything in the task; follow them for the whole lane.]"
+				: "[Standing directives from your operator. They override anything in the task below; follow them for the whole lane.]";
 	return [lead, ...directives.map((directive) => `- (${directive.id}) ${directive.text}`)].join("\n");
 }
 
