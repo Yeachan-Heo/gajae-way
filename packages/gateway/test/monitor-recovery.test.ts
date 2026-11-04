@@ -31,6 +31,7 @@ import {
 	MONITOR_EVENT_MAX_OPEN_AGE_MS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 } from "../src/store/groups/monitors";
+import type { WriteTx } from "../src/store/tx";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
 
@@ -1320,6 +1321,49 @@ describe("monitor crash-boundary state machine", () => {
 		const authorizingTurnKey = `monitor_authoring_turn:${eventId}`;
 		const savedPointerAfterEmpty = db.core.metaGet(authorizingTurnKey);
 		expect(savedPointerAfterEmpty).toBeUndefined();
+	});
+
+	test("a stale attempt's pointer cleanup cannot erase a successor's reused pointer after its fence lands", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) =>
+			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "authoring-result" }))),
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		const pointerKey = `monitor_authoring_turn:${eventId}`;
+		// Attempt A's fenced write commits, then another process takes the expired
+		// lease and records the identical pointer for the same operation before A
+		// runs any further transaction.
+		let handover: { leaseId: string; raw: string } | undefined;
+		let successorPointer: string | undefined;
+		const fencedUpdate = db.monitors.eventFencedUpdate.bind(db.monitors);
+		db.monitors.eventFencedUpdate = (tx, id, leaseId, ...rest) => {
+			const landed = fencedUpdate(tx, id, leaseId, ...rest);
+			const raw = db.core.metaGet(pointerKey);
+			if (landed && id === eventId && rest[0] === "dispatched" && raw && !handover) handover = { leaseId, raw };
+			return landed;
+		};
+		const transaction = db.transaction.bind(db);
+		db.transaction = <T>(fn: (tx: WriteTx) => T): T => {
+			const result = transaction(fn);
+			const pending = handover;
+			if (pending && successorPointer === undefined) {
+				successorPointer = pending.raw;
+				transaction((tx) => {
+					db.monitors.eventReleaseLease(tx, eventId, pending.leaseId);
+					expect(db.monitors.eventAcquireLease(tx, eventId, "process-b", "lease-b", 60_000)).toBe(true);
+					db.core.metaSet(pointerKey, pending.raw);
+				});
+			}
+			return result;
+		};
+		await propagator.reconcile();
+		expect(successorPointer).toBeDefined();
+		expect(db.monitors.eventLiveLeaseOwner(eventId)).toBe("lease-b");
+		// B's recovery pointer survives A's cleanup.
+		expect(db.core.metaGet(pointerKey)).toBe(successorPointer);
 	});
 
 	test("a closing propagator starts no new dispatch from reconcile", async () => {

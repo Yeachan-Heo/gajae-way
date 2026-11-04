@@ -1421,25 +1421,22 @@ export class MonitorPropagator {
 				// Atomic fencing: each stage write carries its live-lease check in the
 				// same UPDATE, so a lease stolen between check and write cannot be
 				// exploited (TOCTOU-free). `fenced` = rows whose write landed.
+				// The pointer is retired in the SAME transaction as the fenced write. Split
+				// transactions let a stale attempt whose fence landed pause past its lease
+				// while a successor takes the claim and re-records the identical pointer;
+				// the stale cleanup would then erase the successor's recovery pointer.
+				// Retiring before the fence instead loses the pointer when the lease is
+				// stolen in between (#743). Inside one transaction, the pointer goes only
+				// for rows whose live-lease write landed. It is retired before the empty
+				// check so the same answer is not re-harvested on the next attempt.
 				const fenced = claimed.filter((row) =>
-					this.#database.transaction((tx) =>
-						this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "dispatched", batchId),
-					),
+					this.#database.transaction((tx) => {
+						const landed = this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "dispatched", batchId);
+						if (landed) this.#forgetAuthoringTurn(tx, [row.event_id], pendingTurn);
+						return landed;
+					}),
 				);
 				if (!fenced.length) return;
-				// Retire the authoring-turn pointer only after confirming we own the lease through
-				// the fenced update. Do not delete it before the fenced check: if the lease expires
-				// between deletion and the fenced write, the pointer is lost and the event will be
-				// re-authored on restart instead of recovering its saved result (#743).
-				// On empty response, retire the pointer before throwing so the same answer
-				// is not re-harvested on the next attempt (fix for monitor issue).
-				this.#database.transaction((tx) => {
-					this.#forgetAuthoringTurn(
-						tx,
-						fenced.map((row) => row.event_id),
-						pendingTurn,
-					);
-				});
 				// Check for empty response after retiring pointer for rows we still own.
 				// If we don't own the lease, we never reach this code (#743).
 				if (!response.trim()) throw new Error("authoring response is empty");
