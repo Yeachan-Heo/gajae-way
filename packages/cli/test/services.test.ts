@@ -389,3 +389,23 @@ test("homeForEnvironment uses default home dir when both GAJAEWAY_HOME and HOME 
 	// We can't check the exact path since homedir() depends on the system,
 	// but we can verify it ends with .gajaeway
 });
+
+test("homeForEnvironment expands empty GAJAEWAY_HOME to HOME/.gajaeway (Finding 2 - consistent with update)", () => {
+	// When GAJAEWAY_HOME is explicitly set to empty string, it should fall back to HOME/.gajaeway
+	// This ensures services and update use the same lease home
+	const home = homeForEnvironment({ GAJAEWAY_HOME: "", HOME: "/home/operator" });
+	expect(home).toBe("/home/operator/.gajaeway");
+});
+
+test("servicePinCandidates prefers sidecar manifest before checkout (Finding 1)", () => {
+	// Both services installer and broker runtime should prefer the sidecar manifest (in binDir)
+	// over the checkout manifest to ensure consistent pin enforcement
+	const candidates = servicePinCandidates("/app/bin", { HOME: "/home/op" });
+	
+	// First candidate should be the sidecar (in binDir)
+	expect(candidates[0]).toContain("/app/bin");
+	expect(candidates[0]).toEndWith("package.json");
+	
+	// Second candidate should be the checkout gateway package
+	expect(candidates[1]).toContain("gateway/package.json");
+});

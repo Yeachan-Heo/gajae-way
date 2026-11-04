@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { acquireLease, LeaseHeldError } from "@gajae-gateway/home";
 import type {
 	MonitorEventOperatorResult,
@@ -50,7 +51,6 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import {
-	homeForEnvironment,
 	type InstallServicesOptions,
 	installPinnedGjcForServices,
 	installServices,
@@ -116,7 +116,7 @@ export function parseArgs(args: string[]): { command?: string; rest: string[]; s
 }
 
 function gatewayHome(): string {
-	return process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`;
+	return process.env.GAJAEWAY_HOME || join(process.env.HOME || homedir(), ".gajaeway");
 }
 
 export interface MainOptions {
@@ -1213,7 +1213,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
-				const home = homeForEnvironment(process.env);
+				const home = gatewayHome();
 				let lease: Awaited<ReturnType<typeof acquireLease>> | undefined;
 				try {
 					try {
