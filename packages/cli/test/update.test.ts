@@ -757,4 +757,40 @@ describe("update dispatch through main", () => {
 			await rm(home, { recursive: true, force: true });
 		}
 	});
+
+	test("an empty GAJAEWAY_HOME resolves to the same update lease that services repair takes", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gajaeway-empty-home-"));
+		const dir = await mkdtemp(join(tmpdir(), "gajaeway-empty-home-bin-"));
+		const saved = { HOME: process.env.HOME, GAJAEWAY_HOME: process.env.GAJAEWAY_HOME };
+		const previousCwd = process.cwd();
+		const previousExitCode = process.exitCode;
+		const originalError = console.error;
+		const errors: string[] = [];
+		const holder = await acquireLease(join(root, ".gajaeway"), "update");
+		try {
+			process.chdir(root);
+			process.env.HOME = root;
+			process.env.GAJAEWAY_HOME = "";
+			console.error = (message: unknown) => errors.push(String(message));
+			await main(["update", "--bin-dir", dir], {
+				update: {
+					fetchLatestRelease: async () => release("v99.0.0", [DARWIN_ASSET]),
+					platform: "darwin",
+					arch: "arm64",
+				},
+			});
+			expect(process.exitCode).toBe(1);
+			expect(errors.join("\n")).toContain("another gajaeway update is running (lease_held name=update");
+		} finally {
+			process.chdir(previousCwd);
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+			for (const [key, value] of Object.entries(saved))
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			await holder.release();
+			await rm(dir, { recursive: true, force: true });
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });

@@ -106,4 +106,11 @@ describe("GJC version pinning", () => {
 	it("offers the running binary's own directory as a pin location", () => {
 		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway")).toContain("/opt/gajaeway/bin/package.json");
 	});
+
+	it("prefers the manifest beside the binary over the checkout, matching services install", () => {
+		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway")).toEqual([
+			"/opt/gajaeway/bin/package.json",
+			join(import.meta.dir, "..", "package.json"),
+		]);
+	});
 });

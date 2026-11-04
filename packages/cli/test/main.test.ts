@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promi
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { acquireLease } from "@gajae-gateway/home";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -771,6 +772,83 @@ describe("service installation", () => {
 				},
 			});
 			expect(process.exitCode).toBe(1);
+			expect(writes).toHaveLength(0);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+			for (const [key, value] of Object.entries(saved))
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("services repair installs the --bin-dir manifest's pin and refuses while an update holds the lease", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-target-pin-"));
+		const saved = { HOME: process.env.HOME, GAJAEWAY_HOME: process.env.GAJAEWAY_HOME };
+		const originalLog = console.log;
+		const originalError = console.error;
+		const previousExitCode = process.exitCode;
+		try {
+			process.env.HOME = home;
+			process.env.GAJAEWAY_HOME = home;
+			console.log = () => {};
+			console.error = () => {};
+			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
+			const binDir = join(home, "release-bin");
+			await mkdir(binDir);
+			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+			await writeFile(join(binDir, "package.json"), JSON.stringify({ gjc: { version: "0.0.42" } }));
+			const args = [
+				"services",
+				"repair",
+				"--bin-dir",
+				binDir,
+				"--platform",
+				"darwin",
+				"--launch-agents-dir",
+				join(home, "LaunchAgents"),
+			];
+			const writes: string[] = [];
+			const installs: string[] = [];
+			const services = {
+				loginPathRunner: async () => "/usr/bin",
+				writeFile: async (path: string): Promise<void> => {
+					writes.push(path);
+				},
+				gjcInstallRunner: async (command: readonly string[], cwd: string) => {
+					if (command[0] === "bun") {
+						const version = (
+							JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+								dependencies: { "gajae-code": string };
+							}
+						).dependencies["gajae-code"];
+						installs.push(version);
+						await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+						await writeFile(join(cwd, "node_modules", ".bin", "gjc"), version);
+						return { exitCode: 0, stdout: "", stderr: "" };
+					}
+					return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+				},
+			};
+
+			await main(args, { services });
+			expect(installs).toEqual(["0.0.42"]);
+			expect(await readlink(join(home, "gjc", "current"))).toBe("0.0.42");
+			expect(writes).toHaveLength(serviceSpecs().length);
+
+			installs.length = 0;
+			writes.length = 0;
+			process.exitCode = 0;
+			const lease = await acquireLease(home, "update");
+			try {
+				await main(args, { services });
+			} finally {
+				await lease.release();
+			}
+			expect(process.exitCode).toBe(1);
+			expect(installs).toHaveLength(0);
 			expect(writes).toHaveLength(0);
 		} finally {
 			console.log = originalLog;
