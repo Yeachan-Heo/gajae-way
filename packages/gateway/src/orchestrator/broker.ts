@@ -161,6 +161,15 @@ export function isBrokerUnavailable(error: unknown): boolean {
 	return error instanceof Error && /^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(error.message);
 }
 
+/**
+ * Local CLI pool queue timeout: the pool stayed full for the whole call budget.
+ * This error class is preserved through sanitization so it can be properly
+ * classified as session_bind_failed during bind/configure phases (#748).
+ */
+export function isCliQueueTimeout(error: unknown): boolean {
+	return error instanceof GjcCommandQueueTimeoutError;
+}
+
 export interface BrokerWaitOptions {
 	readonly initialMs?: number;
 	readonly maxMs?: number;

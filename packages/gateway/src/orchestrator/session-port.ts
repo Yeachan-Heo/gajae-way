@@ -35,7 +35,7 @@ import {
 	type BrokerOperationRecord,
 	isBrokerPromptBusyRefusal,
 } from "../store/groups/bindings";
-import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -2661,6 +2661,9 @@ function sanitizeSdkFailure(error: unknown): Error {
 			stableErrorCode(error.code) ?? "sdk_error",
 			sanitizedDetails(error.details),
 		);
+	// Preserve GjcCommandQueueTimeoutError through sanitization so it can be
+	// properly classified as session_bind_failed during bind/configure phases (#748).
+	if (error instanceof GjcCommandQueueTimeoutError) return error;
 	if (error instanceof GjcCliError) {
 		const code = sdkErrorCode(error) ?? "sdk_error";
 		return new GjcCliError(

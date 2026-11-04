@@ -16,7 +16,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
-import { GjcCommandQueueTimeoutError, isBrokerUnavailable } from "../orchestrator/broker";
+import { GjcCommandQueueTimeoutError, isBrokerUnavailable, isCliQueueTimeout } from "../orchestrator/broker";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -2332,6 +2332,12 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	// hid every configure/request refusal (live: 169 rows in one day, all
 	// GjcCliError exitCode 0 at #dispatchBatch, none actionable).
 	if (error instanceof GjcCliError) {
+		if (phase === "bind" || phase === "configure") return "session_bind_failed";
+		if (phase === "request") return "authoring_turn_failed";
+	}
+	// Local CLI pool queue timeout: classify as session_bind_failed during bind/configure,
+	// not as a broker outage or executor timeout (#748).
+	if (isCliQueueTimeout(error)) {
 		if (phase === "bind" || phase === "configure") return "session_bind_failed";
 		if (phase === "request") return "authoring_turn_failed";
 	}

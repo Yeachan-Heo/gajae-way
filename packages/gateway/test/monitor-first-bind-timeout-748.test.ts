@@ -104,6 +104,86 @@ test("first-attempt bind timeout is recorded with queue context and degraded sig
 	}
 });
 
+test("GjcCommandQueueTimeoutError passes through sanitizer and classifies as session_bind_failed (#748)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-queue-timeout-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "queue-timeout-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.queue_timeout"],
+			burstPolicy: "serialize",
+			model: { preset: "claude-opus" },
+		});
+
+		let bindAttempts = 0;
+		const readinessFailures: Array<{ code: string; detail: string; originKey: string; at: number }> = [];
+
+		const failingPort: Partial<SessionPort> = {
+			bind: async (_input: SessionBindInput) => {
+				bindAttempts++;
+				// Local CLI pool queue timeout (preserved through sanitizer)
+				const error = new GjcCommandQueueTimeoutError(30000, 4, 16, 16, "session.create");
+				throw error;
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: failingPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			onReadinessFailure: (failure) => readinessFailures.push(failure),
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		// Dispatch multiple events to accumulate consecutive first-attempt failures
+		const eventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "test.queue_timeout", {}));
+		}
+
+		// Let all 3 dispatch attempts fail
+		for (let i = 0; i < 200; i++) {
+			const allFailed = eventIds.every((eid) => {
+				const row = database.monitors.eventRows().find((r) => r.event_id === eid);
+				return row?.stage === "failed";
+			});
+			if (allFailed) break;
+			await Bun.sleep(10);
+		}
+
+		expect(bindAttempts).toBe(3);
+
+		// Verify all events failed with session_bind_failed (the key test for sanitizer preservation)
+		for (const eventId of eventIds) {
+			const failure = database.monitors.failure(eventId);
+			expect(failure?.code).toBe("session_bind_failed");
+		}
+
+		// Verify degraded readiness signal was recorded after 3rd failure
+		expect(readinessFailures.length).toBeGreaterThan(0);
+		const degradedSignal = readinessFailures.find((f) => f.code === "monitor_bind_degraded");
+		expect(degradedSignal).toBeDefined();
+		expect(degradedSignal?.detail).toContain("first-attempt bind failed");
+		expect(degradedSignal?.detail).toContain("#748");
+
+		// Verify safety state reflects the consecutive failures
+		const safetyState = pipeline.sessionSafetyState(`monitor/eventtype/test.queue_timeout/parent=${monitor.monitorId}`);
+		expect(safetyState.firstAttemptBindFailures).toBe(3);
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("first-bind degradation survives successful retries until a first-attempt success (#748)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-bind-retry-"));
 	try {
