@@ -1982,6 +1982,65 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 		}
 	});
 
+	test("a crash between batch rows' fenced writes leaves the shared authoring pointer whole", async () => {
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-batch-fence-"));
+		try {
+			const db = await Store.open(join(raceHome, "gateway.db"));
+			const registry = new MonitorRegistry(db);
+			const monitor = registry.add({
+				name: "batch-fence",
+				trigger: { kind: "cron", schedule: "30 6 * * *" },
+				eventTypes: ["memory.canonicalize"],
+				burstPolicy: "coalesce",
+				enabled: true,
+			});
+			const closure = new MemoryClosureQueue(db, raceHome);
+			await initializeMemory(raceHome);
+			const propagator = new MonitorPropagator({
+				database: db,
+				registry,
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) =>
+						JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "n" }))),
+				}),
+				memory: closure,
+				delivery: new DeliveryService(db),
+				emit: () => {},
+			});
+			// The process dies after the first row's fenced write: the second write throws.
+			let dispatchedWrites = 0;
+			let pointersAtCrash: Array<string | undefined> | undefined;
+			const ids: string[] = [];
+			const fencedUpdate = db.monitors.eventFencedUpdate.bind(db.monitors);
+			db.monitors.eventFencedUpdate = (tx, id, leaseId, stage, ...rest) => {
+				if (stage === "dispatched" && ++dispatchedWrites === 2) throw new Error("process killed mid-batch");
+				return fencedUpdate(tx, id, leaseId, stage, ...rest);
+			};
+			const transaction = db.transaction.bind(db);
+			db.transaction = <T>(fn: (tx: WriteTx) => T): T => {
+				try {
+					return transaction(fn);
+				} catch (error) {
+					if ((error as Error).message === "process killed mid-batch" && !pointersAtCrash)
+						pointersAtCrash = ids.map((id) => db.core.metaGet(`monitor_authoring_turn:${id}`));
+					throw error;
+				}
+			};
+			ids.push(propagator.submit(monitor.monitorId, "memory.canonicalize", { at: 1 }));
+			ids.push(propagator.submit(monitor.monitorId, "memory.canonicalize", { at: 2 }));
+			for (let attempt = 0; attempt < 100 && !pointersAtCrash; attempt++) await Bun.sleep(10);
+			await closure.drain();
+			expect(pointersAtCrash).toBeDefined();
+			// Both rows still carry the same shared pointer, so recovery can harvest the batch.
+			expect(pointersAtCrash?.[0]).toBeDefined();
+			expect(pointersAtCrash?.[0]).toBe(pointersAtCrash?.[1]);
+			db.close();
+		} finally {
+			await rm(raceHome, { recursive: true, force: true });
+		}
+	});
+
 	test("partial authoring response: omitted dispatched events never become delivered", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-partial-"));
 		try {

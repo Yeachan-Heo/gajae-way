@@ -1421,21 +1421,29 @@ export class MonitorPropagator {
 				// Atomic fencing: each stage write carries its live-lease check in the
 				// same UPDATE, so a lease stolen between check and write cannot be
 				// exploited (TOCTOU-free). `fenced` = rows whose write landed.
-				// The pointer is retired in the SAME transaction as the fenced write. Split
-				// transactions let a stale attempt whose fence landed pause past its lease
-				// while a successor takes the claim and re-records the identical pointer;
-				// the stale cleanup would then erase the successor's recovery pointer.
-				// Retiring before the fence instead loses the pointer when the lease is
-				// stolen in between (#743). Inside one transaction, the pointer goes only
-				// for rows whose live-lease write landed. It is retired before the empty
-				// check so the same answer is not re-harvested on the next attempt.
-				const fenced = claimed.filter((row) =>
-					this.#database.transaction((tx) => {
-						const landed = this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "dispatched", batchId);
-						if (landed) this.#forgetAuthoringTurn(tx, [row.event_id], pendingTurn);
-						return landed;
-					}),
-				);
+				// The pointer is retired in the SAME transaction as the fenced writes.
+				// Split transactions let a stale attempt whose fence landed pause past
+				// its lease while a successor takes the claim and re-records the
+				// identical pointer; the stale cleanup would then erase the successor's
+				// recovery pointer. Retiring before the fence instead loses the pointer
+				// when the lease is stolen in between (#743). One transaction for the
+				// whole batch also keeps a shared pointer all-or-nothing: a crash cannot
+				// retire it for some rows only, which would stop #savedBatch from
+				// harvesting the completed operation. The pointer goes only for rows
+				// whose live-lease write landed, before the empty check, so the same
+				// answer is not re-harvested on the next attempt.
+				const fenced = this.#database.transaction((tx) => {
+					const landed = claimed.filter((row) =>
+						this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "dispatched", batchId),
+					);
+					if (landed.length)
+						this.#forgetAuthoringTurn(
+							tx,
+							landed.map((row) => row.event_id),
+							pendingTurn,
+						);
+					return landed;
+				});
 				if (!fenced.length) return;
 				// Check for empty response after retiring pointer for rows we still own.
 				// If we don't own the lease, we never reach this code (#743).
