@@ -5,7 +5,7 @@
 ### Fixes
 - **gateway**: Pin GJC 0.19.3, which exits a broker wedged on a stalled discovery write and keeps publication liveness SIGKILL off a full stderr
 - **gateway**: A lane started from a monitor turn reports to the monitor's channel target (#739)
-- **gateway**: Keep the authoring-turn pointer through a lease-fenced update and retire it before throwing on an empty response (#743, #744)
+- **gateway**: Keep the authoring-turn pointer through a lease-fenced update, retire it in the same transaction as the `dispatched` transition so a stale attempt cannot erase a successor's pointer, and retire it before throwing on an empty response (#743, #744)
 
 ## [0.4.3] - 2026-11-03
 
