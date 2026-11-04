@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.4] - 2026-11-04
+
+### Fixes
+- **gateway**: Pin GJC 0.19.3, which exits a broker wedged on a stalled discovery write and keeps publication liveness SIGKILL off a full stderr
+- **gateway**: A lane started from a monitor turn reports to the monitor's channel target (#739)
+- **gateway**: Keep the authoring-turn pointer through a lease-fenced update, retire it in the same transaction as the `dispatched` transition so a stale attempt cannot erase a successor's pointer, and retire it before throwing on an empty response (#743, #744)
+
+## [0.4.3] - 2026-11-03
+
+### Fixes
+- **cli**: `gajaeway update` with `SHELL` unset no longer assumes `/bin/zsh`; it tries the passwd shell, `/bin/bash`, then `/bin/sh`, and falls back to the default PATH instead of exiting 1 after the release is installed (#734)
+- **adapter-discord**: A reply with a refused `MEDIA:` attachment still sends its text plus a `(file not sent: …)` note, without exposing host paths (#730)
+- **gateway**: An uncorrelated `agent_end` is no longer treated as owned terminal evidence (#733)
+
+### CI
+- Move darwin-arm64 runners off the retiring macos-14 image (#732)
+
 ## [0.4.2] - 2026-10-29
 
 ### Features
