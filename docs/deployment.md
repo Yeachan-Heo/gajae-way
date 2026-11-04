@@ -112,7 +112,7 @@ Check `schemaVersion` in the census report before cutover. This procedure requir
 GJC 0.19.0 appends every session-index rejection to `$GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl` without a bound and reads the whole file each time a broker or session host starts. A large file makes those hosts unresponsive at startup, so no turns start (#752). GJC 0.19.3 bounds and rotates the log, but move an oversized file aside before the first 0.19.3 start. The log only seeds rejection de-duplication, so moving it does not affect the session index.
 
 ```sh
-f="$GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl"
+f="${GAJAEWAY_HOME:-$HOME/.gajaeway}/broker/agent/sdk/sessions/index-audit.jsonl"
 ls -lh "$f"
 # Stop the gateway service first, then:
 mv "$f" "$f.pre-0.19.3"
