@@ -53,9 +53,10 @@ import {
 } from "./restart-stack";
 import {
 	type InstallServicesOptions,
-	installPinnedGjcFromSourceBuild,
+	installPinnedGjcForServices,
 	installServices,
 	type ServicePlatform,
+	servicePinCandidates,
 	serviceUsage,
 } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
@@ -1213,17 +1214,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
-				// Install pinned GJC from source build or release
-				try {
-					const gjcVersion = await installPinnedGjcFromSourceBuild(
-						gatewayHome(),
-						service.binDir,
-						options.services?.gjcInstallRunner,
-					);
-					console.log(`installed pinned gjc ${gjcVersion}`);
-				} catch (error) {
-					throw new Error(`could not install pinned gjc: ${error instanceof Error ? error.message : String(error)}`);
-				}
+				const gjcVersion = await installPinnedGjcForServices({
+					home: gatewayHome(),
+					candidates: servicePinCandidates(service.binDir),
+					...(options.services?.gjcInstallRunner === undefined ? {} : { runner: options.services.gjcInstallRunner }),
+				});
+				console.log(`installed pinned gjc ${gjcVersion}`);
 				const written = await installServices({
 					binDir: service.binDir,
 					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),

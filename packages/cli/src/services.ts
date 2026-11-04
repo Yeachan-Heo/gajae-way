@@ -448,50 +448,43 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 }
 
 /**
- * Candidate locations for the pinned GJC version, in priority order.
- * For a source checkout: packages/gateway/package.json from the CLI module location.
- * For a release install: package.json beside the binaries.
- * Returns undefined if no candidate has a pin; otherwise installs the version and returns it.
- * Installation failures propagate as errors.
+ * Where `services install|repair` finds the GJC pin, mirroring the runtime guard's candidates
+ * (`pinnedGjcCandidatePaths` in packages/gateway/src/orchestrator/broker.ts): the checkout's gateway
+ * package.json resolved from this module, then the package.json the release updater places beside the binaries.
  */
-function pinnedGjcCandidatePaths(binDir?: string): readonly string[] {
-	const candidates: string[] = [
-		// Source checkout: from CLI module location, go up to the repo root, then to packages/gateway/package.json
-		// __filename is packages/cli/src/services.ts, so we go up 4 levels to reach the repo root
-		join(dirname(dirname(dirname(dirname(__filename)))), "packages", "gateway", "package.json"),
+export function servicePinCandidates(binDir: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
+	const repoRoot = dirname(dirname(dirname(dirname(__filename))));
+	return [
+		join(repoRoot, "packages", "gateway", "package.json"),
+		join(expandHome(binDir, env.HOME || homedir()), "package.json"),
 	];
-	if (binDir) {
-		// Release install: package.json beside the binaries
-		candidates.push(join(binDir, "package.json"));
-	}
-	return candidates;
 }
 
 /**
- * Installs the pinned GJC version from a source-checkout or release gateway package.json if it exists.
- * Returns the installed version. Errors when no candidate has a pin or installation fails.
- * Called as part of source-checkout service installation/repair to ensure the GJC pin is current.
- * For release installs, pass the binDir where the binaries are located.
+ * Install the first pin found among `candidates` into the private prefix and return its version.
+ * Unreadable or pin-less candidates are skipped; an install failure propagates instead of falling
+ * through to a later candidate whose pin the runtime guard would not enforce.
  */
-export async function installPinnedGjcFromSourceBuild(
-	home: string,
-	binDir?: string,
-	runner?: GjcInstallRunner,
-): Promise<string> {
-	const candidates = pinnedGjcCandidatePaths(binDir);
-
-	for (const path of candidates) {
+export async function installPinnedGjcForServices(options: {
+	readonly home: string;
+	readonly candidates: readonly string[];
+	readonly runner?: GjcInstallRunner;
+}): Promise<string> {
+	for (const path of options.candidates) {
+		let version: string;
 		try {
-			const version = await readPinnedGjcVersion(path);
-			await installPinnedGjc({ home, version, runner });
-			return version;
-		} catch (_error) {
-			// A missing or malformed candidate is not fatal: a later one may carry the pin.
+			version = await readPinnedGjcVersion(path);
+		} catch {
+			continue;
 		}
+		await installPinnedGjc({
+			home: options.home,
+			version,
+			...(options.runner === undefined ? {} : { runner: options.runner }),
+		});
+		return version;
 	}
-
-	// No candidate had a pin
-	throw new Error(`could not find pinned gjc version in any of: ${candidates.join(", ")}`);
+	throw new Error(`could not find a pinned gjc version in any of: ${options.candidates.join(", ")}`);
 }
 
 export async function installServices(options: InstallServicesOptions): Promise<readonly string[]> {

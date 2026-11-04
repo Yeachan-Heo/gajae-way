@@ -87,7 +87,7 @@ The updater stages the platform release, backs up replaced binaries, reads the s
 
 With `--no-restart`, stale service definitions for missing binaries are left alone so a healthy running process is not stopped during the staged update. The later `gajaeway ops restart-stack` stops and removes those stale services before restarting the installed stack.
 
-A source checkout upgrades through `git pull`, `bun run build`, and `gajaeway services repair` (or `gajaeway services install`). The `gajaeway services repair|install` command installs the pinned GJC version from either the source checkout's `packages/gateway/package.json` or from `package.json` beside the binaries (for release installs), ensuring the broker-host version guard is satisfied. When running under Bun outside a source checkout, pass `--bin-dir DIR` to point to the release binaries. The release update via `gajaeway update` requires Bun to install the pinned GJC package.
+A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`. `services install|repair` installs and verifies the GJC pin from the checkout's `packages/gateway/package.json` (or, for a release install, the `package.json` beside the binaries) before writing service definitions, and fails if that install fails; it needs Bun for the package install. When running `gajaeway update` under Bun, pass `--bin-dir DIR`. The release update requires Bun to install the pinned GJC package.
 
 ### macOS upgrade from 0.1.x to 0.2.0
 

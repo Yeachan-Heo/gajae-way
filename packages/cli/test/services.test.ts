@@ -1,15 +1,17 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homeLayout } from "@gajae-gateway/home";
 import type { GjcInstallRunner } from "../src/gjc-install";
 import {
 	BROKER_UNIT,
 	discoverLoginPath,
 	GATEWAY_UNIT,
-	installPinnedGjcFromSourceBuild,
+	installPinnedGjcForServices,
 	installServices,
 	restartStackCommands,
+	servicePinCandidates,
 	serviceSpecs,
 	systemdUnitName,
 } from "../src/services";
@@ -283,182 +285,80 @@ test("installServices succeeds even when shell discovery returns empty", async (
 	}
 });
 
-test("installPinnedGjcFromSourceBuild installs the pinned gjc from gateway package.json", async () => {
-	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
-	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
+function stubGjcRunner(installed: string[]): GjcInstallRunner {
+	return async (command, cwd) => {
+		if (command[0] === "bun") {
+			const dependency = (
+				JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+					dependencies: { "gajae-code": string };
+				}
+			).dependencies["gajae-code"];
+			installed.push(dependency);
+			await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+			await writeFile(join(cwd, "node_modules", ".bin", "gjc"), dependency);
+			return { exitCode: 0, stdout: "", stderr: "" };
+		}
+		return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+	};
+}
 
+async function pinFile(dir: string, name: string, version?: string): Promise<string> {
+	const path = join(dir, name);
+	await writeFile(path, JSON.stringify(version === undefined ? { name } : { name, gjc: { version } }));
+	return path;
+}
+
+test("installPinnedGjcForServices installs the first candidate that carries a pin", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
 	try {
-		// Mock the gateway package.json with gjc version
-		const packagePath = join(gatewayDir, "package.json");
-		await writeFile(
-			packagePath,
-			JSON.stringify({
-				name: "@gajae-gateway/gateway",
-				gjc: { version: "0.19.3" },
-			}),
-			"utf8",
-		);
-
-		// Proper mock runner that creates the directory structure
-		const runner: GjcInstallRunner = async (command, cwd) => {
-			if (command[0] === "bun" && command[1] === "install") {
-				const binDir = join(cwd, "node_modules", ".bin");
-				await mkdir(binDir, { recursive: true });
-				await writeFile(join(binDir, "gjc"), "gjc shim");
-				return { exitCode: 0, stdout: "", stderr: "" };
-			}
-			const packageData = JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
-				dependencies: { "gajae-code": string };
-			};
-			return { exitCode: 0, stdout: `gjc/${packageData.dependencies["gajae-code"]}`, stderr: "" };
-		};
-
-		const version = await installPinnedGjcFromSourceBuild(testHome, gatewayDir, runner);
+		const installed: string[] = [];
+		const candidates = [
+			join(dir, "missing.json"),
+			await pinFile(dir, "nopin.json"),
+			await pinFile(dir, "checkout.json", "0.19.3"),
+			await pinFile(dir, "release.json", "0.19.0"),
+		];
+		const version = await installPinnedGjcForServices({ home: dir, candidates, runner: stubGjcRunner(installed) });
 		expect(version).toBe("0.19.3");
+		expect(installed).toEqual(["0.19.3"]);
+		expect(await readlink(homeLayout(dir).gjcCurrent)).toBe("0.19.3");
 	} finally {
-		await rm(testHome, { recursive: true, force: true });
-		await rm(gatewayDir, { recursive: true, force: true });
+		await rm(dir, { recursive: true, force: true });
 	}
 });
 
-test("installPinnedGjcFromSourceBuild throws when no candidate has a pin", async () => {
-	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
-	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
-
+test("installPinnedGjcForServices does not fall through to a later pin when the install fails", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
 	try {
-		const runner: GjcInstallRunner = async () => ({
-			exitCode: 0,
-			stdout: "1.0.0",
-			stderr: "",
-		});
-
-		try {
-			await installPinnedGjcFromSourceBuild(testHome, gatewayDir, runner);
-			expect.unreachable("should have thrown");
-		} catch (error) {
-			expect(error).toBeInstanceOf(Error);
-			if (error instanceof Error) {
-				expect(error.message).toMatch(/could not find pinned gjc version/);
-			}
-		}
-	} finally {
-		await rm(testHome, { recursive: true, force: true });
-		await rm(gatewayDir, { recursive: true, force: true });
-	}
-});
-
-test("installPinnedGjcFromSourceBuild throws when gjc.version is missing", async () => {
-	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
-	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
-
-	try {
-		// Write a gateway package.json without gjc version
-		const packagePath = join(gatewayDir, "package.json");
-		await writeFile(packagePath, JSON.stringify({ name: "@gajae-gateway/gateway" }), "utf8");
-
-		const runner: GjcInstallRunner = async () => ({
-			exitCode: 0,
-			stdout: "1.0.0",
-			stderr: "",
-		});
-
-		try {
-			await installPinnedGjcFromSourceBuild(testHome, gatewayDir, runner);
-			expect.unreachable("should have thrown");
-		} catch (error) {
-			expect(error).toBeInstanceOf(Error);
-			if (error instanceof Error) {
-				expect(error.message).toMatch(/could not find pinned gjc version/);
-			}
-		}
-	} finally {
-		await rm(testHome, { recursive: true, force: true });
-		await rm(gatewayDir, { recursive: true, force: true });
-	}
-});
-
-test("installPinnedGjcFromSourceBuild throws when install fails", async () => {
-	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
-	const binDir = await mkdtemp(join(tmpdir(), "bindir-"));
-
-	try {
-		// Write a package.json with a gjc pin to binDir (simulating release install)
-		const packagePath = join(binDir, "package.json");
-		await writeFile(
-			packagePath,
-			JSON.stringify({
-				name: "gajaeway",
-				gjc: { version: "0.19.4" },
-			}),
-			"utf8",
-		);
-
-		// Mock runner that fails on all bun commands
-		const failingRunner: GjcInstallRunner = async (_command) => ({
-			exitCode: 1,
-			stdout: "",
-			stderr: "command failed",
-		});
-
-		try {
-			await installPinnedGjcFromSourceBuild(testHome, binDir, failingRunner);
-			expect.unreachable("should have thrown when install fails");
-		} catch (error) {
-			expect(error).toBeInstanceOf(Error);
-			if (error instanceof Error) {
-				// Should contain either the install error or a "could not find" error
-				expect(
-					error.message.includes("could not install pinned gjc") ||
-						error.message.includes("could not find pinned gjc version"),
-				).toBe(true);
-			}
-		}
-	} finally {
-		await rm(testHome, { recursive: true, force: true });
-		await rm(binDir, { recursive: true, force: true });
-	}
-});
-
-test("installPinnedGjcFromSourceBuild uses first available candidate in priority order", async () => {
-	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
-	const binDir = await mkdtemp(join(tmpdir(), "bindir-"));
-
-	try {
-		// Write a package.json with a gjc pin to binDir (simulating release install)
-		const packagePath = join(binDir, "package.json");
-		await writeFile(
-			packagePath,
-			JSON.stringify({
-				name: "gajaeway",
-				gjc: { version: "0.19.5" },
-			}),
-			"utf8",
-		);
-
-		// Mock runner that creates the expected structure
-		let installedVersion = "0.0.0";
-		const runner: GjcInstallRunner = async (command, cwd) => {
-			if (command[0] === "bun" && command[1] === "install") {
-				const binDirPath = join(cwd, "node_modules", ".bin");
-				await mkdir(binDirPath, { recursive: true });
-				await writeFile(join(binDirPath, "gjc"), "gjc shim");
-				return { exitCode: 0, stdout: "", stderr: "" };
-			}
-			const packageData = JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
-				dependencies: { "gajae-code": string };
-			};
-			installedVersion = packageData.dependencies["gajae-code"];
-			return { exitCode: 0, stdout: `gjc/${packageData.dependencies["gajae-code"]}`, stderr: "" };
+		const commands: string[][] = [];
+		const failing: GjcInstallRunner = async (command) => {
+			commands.push([...command]);
+			return { exitCode: 1, stdout: "", stderr: "registry unavailable" };
 		};
-
-		const version = await installPinnedGjcFromSourceBuild(testHome, binDir, runner);
-		// The function will use the first candidate that has a pin (packages/gateway/package.json)
-		// If that doesn't have a pin, it will use binDir/package.json
-		// In this repo, packages/gateway/package.json has gjc.version = "0.19.3"
-		expect(version).toBe("0.19.3");
-		expect(installedVersion).toBe("0.19.3");
+		const candidates = [await pinFile(dir, "checkout.json", "0.19.3"), await pinFile(dir, "release.json", "0.19.0")];
+		await expect(installPinnedGjcForServices({ home: dir, candidates, runner: failing })).rejects.toThrow(
+			"registry unavailable",
+		);
+		expect(commands).toHaveLength(1);
 	} finally {
-		await rm(testHome, { recursive: true, force: true });
-		await rm(binDir, { recursive: true, force: true });
+		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+test("installPinnedGjcForServices names every candidate when none carries a pin", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		const candidates = [join(dir, "missing.json"), await pinFile(dir, "nopin.json")];
+		await expect(installPinnedGjcForServices({ home: dir, candidates, runner: stubGjcRunner([]) })).rejects.toThrow(
+			`could not find a pinned gjc version in any of: ${candidates.join(", ")}`,
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("servicePinCandidates checks the checkout gateway package before the binDir package", () => {
+	const [checkout, release] = servicePinCandidates("~/bin", { HOME: "/home/op" });
+	expect(checkout).toBe(join(import.meta.dir, "..", "..", "gateway", "package.json"));
+	expect(release).toBe("/home/op/bin/package.json");
 });
