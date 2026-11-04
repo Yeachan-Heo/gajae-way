@@ -247,6 +247,7 @@ interface StartContext {
 	readonly parent: WorkParent | null;
 	readonly runCall?: RunCall;
 	readonly opRef?: string;
+	readonly callerSessionId?: string;
 	readonly wakeReportId?: string;
 	/** Only the check-polling path may add an attempt while the lane is parked. */
 	readonly checksRetry?: boolean;
@@ -875,7 +876,7 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall, callerSessionId: input.callerSessionId });
 		const admitting = this.#admissions.get(input.name);
 		// A same-name retry (for example after a caller timeout) must not queue a
 		// second clone, bind or send behind the admission still in progress.
@@ -1118,7 +1119,7 @@ export class WorkLaneManager {
 				sessionId: runtime.sessionId,
 				repo: runtime.cwd,
 				opRef,
-				text: this.#withDirectives(input.text, context.parent),
+				text: this.#withDirectives(input.text, context.parent, context.callerSessionId),
 				...(observer.tail ? { relay: observer.tail } : {}),
 				...(notice ? { systemPreamble: notice.text } : {}),
 				codingRegister: true,
@@ -1332,8 +1333,14 @@ export class WorkLaneManager {
 		}
 		return directives.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 	}
-	#withDirectives(text: string, parent: WorkParent | null): string {
-		const scope = laneDirectiveScope(parent);
+	#withDirectives(text: string, parent: WorkParent | null, callerSessionId?: string): string {
+		// For work.run with callerSessionId, use caller's scope instead of parent's scope
+		// This ensures conversation directives reach the worker even when parent=null
+		let scope = laneDirectiveScope(parent);
+		if (parent === null && callerSessionId !== undefined) {
+			const callerScope = this.#directiveScope(callerSessionId);
+			if (callerScope !== OWNER_DIRECTIVE_SCOPE) scope = callerScope;
+		}
 		const active = this.#directives().filter((directive) => directiveApplies(directive, scope));
 		return active.length === 0 ? text : `${directiveText(active, "standing")}\n\n${text}`;
 	}
