@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
-import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { acquireLease, LeaseHeldError } from "@gajae-gateway/home";
 import type {
 	MonitorEventOperatorResult,
@@ -51,6 +50,7 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import {
+	homeForEnvironment,
 	type InstallServicesOptions,
 	installPinnedGjcForServices,
 	installServices,
@@ -113,10 +113,6 @@ export function parseArgs(args: string[]): { command?: string; rest: string[]; s
 		else rest.push(args[i]);
 	}
 	return { command: rest[0], rest: rest.slice(1), socket };
-}
-
-function gatewayHome(): string {
-	return process.env.GAJAEWAY_HOME || join(process.env.HOME || homedir(), ".gajaeway");
 }
 
 export interface MainOptions {
@@ -791,7 +787,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					// It also runs detached: restarting the gateway kills a persona turn that
 					// invoked it, which must not end the sequence half-applied (issue #54).
 					const usage = "usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
-					const home = gatewayHome();
+					const home = homeForEnvironment(process.env);
 					const flag = parsed.rest[1];
 					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
 						const receipt = await runRestartStack({
@@ -1213,7 +1209,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
-				const home = gatewayHome();
+				const home = homeForEnvironment(process.env);
 				let lease: Awaited<ReturnType<typeof acquireLease>> | undefined;
 				try {
 					try {
@@ -1253,7 +1249,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const update = parseUpdateArgs(parsed.rest);
 				const result = await runUpdate({
 					args: update,
-					home: gatewayHome(),
+					home: homeForEnvironment(process.env),
 					gatewaySocketPath: parsed.socket,
 					...(options.update === undefined ? {} : { deps: options.update }),
 				});
@@ -1262,7 +1258,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "setup": {
 				// Socket-free: setup runs before any gateway exists.
-				await runSetup(parsed.rest, { home: gatewayHome(), ...options.setup });
+				await runSetup(parsed.rest, { home: homeForEnvironment(process.env), ...options.setup });
 				break;
 			}
 			default:

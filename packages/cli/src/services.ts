@@ -453,7 +453,7 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
  * which is the source-build case.
  */
 export function servicePinCandidates(binDir: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
-	const repoRoot = dirname(dirname(dirname(import.meta.dir)));
+	const repoRoot = dirname(dirname(dirname(dirname(__filename))));
 	return [
 		join(expandHome(binDir, env.HOME || homedir()), "package.json"),
 		join(repoRoot, "packages", "gateway", "package.json"),

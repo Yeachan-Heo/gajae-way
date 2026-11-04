@@ -25,18 +25,14 @@ export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 /**
  * Candidate locations for the pinned GJC version, in priority order.
  *
- * An installed binary carries the pin beside itself; this sidecar pin is authoritative
- * for the binaries being wired, so it takes priority. A compiled binary keeps the
- * *build-time* source path in `__filename`, so the checkout candidate only resolves
- * on the machine that built it. Without the fallback a binary shipped to another host
- * exits at boot naming a path from the build machine, which no operator can act on
- * (found deploying dev to jip-gajae).
+ * The manifest beside the running binary wins: both the release updater and
+ * `bun run build` place it there, and `services install|repair` installs that same
+ * pin (`servicePinCandidates`). The checkout manifest is the fallback; a compiled
+ * binary keeps the *build-time* source path in `__filename` (not `import.meta.dir`,
+ * which is `/$bunfs/root` there), so it only resolves on the machine that built it.
  */
 export function pinnedGjcCandidatePaths(execPath: string = process.execPath): readonly string[] {
-	return [
-		join(dirname(execPath), "package.json"),
-		join(dirname(dirname(dirname(dirname(import.meta.dir)))), "packages", "gateway", "package.json"),
-	];
+	return [join(dirname(execPath), "package.json"), join(dirname(dirname(dirname(__filename))), "package.json")];
 }
 
 /** Read the pinned GJC version this build runs against, or throw naming every candidate tried. */

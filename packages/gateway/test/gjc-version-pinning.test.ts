@@ -107,12 +107,10 @@ describe("GJC version pinning", () => {
 		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway")).toContain("/opt/gajaeway/bin/package.json");
 	});
 
-	it("prefers the sidecar manifest (next to binary) before the checkout (Finding 1 - consistent with installer)", () => {
-		const candidates = pinnedGjcCandidatePaths("/app/bin/gjc");
-		// The sidecar manifest (in binDir) should be preferred first
-		expect(candidates[0]).toContain("/app/bin");
-		expect(candidates[0]).toEndWith("package.json");
-		// The checkout manifest should be the fallback
-		expect(candidates[1]).toContain("gateway/package.json");
+	it("prefers the manifest beside the binary over the checkout, matching services install", () => {
+		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway")).toEqual([
+			"/opt/gajaeway/bin/package.json",
+			join(import.meta.dir, "..", "package.json"),
+		]);
 	});
 });
