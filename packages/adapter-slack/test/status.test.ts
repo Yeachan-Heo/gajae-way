@@ -313,25 +313,40 @@ for (const reaction of [false, true]) {
 	}
 }
 
-test("Slack status line is never set for a root channel or DM message, so no empty thread opens", async () => {
+test("Slack status line is never set for a root channel message, so no empty thread opens", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	// Presence still shows as reactions on the message itself.
+	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
+	const refresh = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
+	await refresh?.fn();
+	await f.status.reassert(origin.conversationId);
+	await f.status.clear(origin.conversationId);
+	await flush();
+	expect(f.statuses).toEqual([]);
+	expect(f.removes.length).toBeGreaterThan(0);
+});
+
+test("a DM turn keeps the native status line on the triggering message", async () => {
 	const dm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1" };
-	for (const root of [origin, dm]) {
-		const f = fixture();
-		const channel = root.conversationId;
-		f.status.arm(root, `${channel}:1.000`);
-		await flush();
-		// Presence still shows as reactions on the message itself.
-		expect(f.adds).toEqual([`${channel}:1.000:hourglass_flowing_sand`]);
-		f.tick(PRESENCE_MIN_SWAP_MS);
-		await f.status.update(progress({ origin: root, elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
-		const refresh = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
-		await refresh?.fn();
-		await f.status.reassert(channel);
-		await f.status.clear(channel);
-		await flush();
-		expect(f.statuses).toEqual([]);
-		expect(f.removes.length).toBeGreaterThan(0);
-	}
+	const f = fixture();
+	f.status.arm(dm, "D1:1.000");
+	await flush();
+	expect(f.statuses).toEqual([`D1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`]);
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ origin: dm, elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
+	expect(f.statuses.at(-1)).toBe(`D1:1.000:${presenceStatusText({ phase: "tool", clock: 1, effort: 2 })}`);
+	// A mid-turn delivery clears the line; the DM entry re-asserts it.
+	await f.status.reassert(dm.conversationId);
+	await flush();
+	expect(f.statuses.at(-1)).toBe(`D1:1.000:${presenceStatusText({ phase: "tool", clock: 1, effort: 2 })}`);
+	await f.status.clear(dm.conversationId);
+	await flush();
+	expect(f.statuses.at(-1)).toBe("D1:1.000:");
+	expect(f.removes.length).toBeGreaterThan(0);
 });
 
 test("Slack interim delivery keeps presence and re-sets the status line; the final reply clears it", async () => {
@@ -534,7 +549,7 @@ test("Slack presence: a change arriving during the last pass is still applied", 
 
 test("Slack presence: periodic refresh keeps status alive across multiple turns", async () => {
 	const f = fixture();
-	// The status line only exists for threaded turns.
+	// A threaded turn anchors the status line to the thread root.
 	const origin: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
 	f.status.arm(origin, "C1:1.002");
 	await flush();
