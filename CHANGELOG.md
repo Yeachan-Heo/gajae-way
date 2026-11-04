@@ -3,7 +3,9 @@
 ## [0.4.4] - 2026-11-04
 
 ### Fixes
-- **gateway**: Pin GJC 0.19.3, which exits a broker wedged on a stalled discovery write and keeps publication liveness SIGKILL off a full stderr
+- **gateway**: Pin GJC 0.19.3, which bounds and rotates the session-index rejection audit log, exits a broker wedged on a stalled discovery write, and keeps publication liveness SIGKILL off a full stderr (#752)
+- **docs**: Move an oversized pre-0.19.3 `index-audit.jsonl` aside before the first 0.19.3 start, since 0.19.0 re-read the whole log at host startup (#752)
+- **cli**: `services install|repair` installs and verifies the pinned GJC from the checkout (or the manifest beside release binaries) before writing service definitions, and fails instead of falling through to another pin (#753)
 - **gateway**: A lane started from a monitor turn reports to the monitor's channel target (#739)
 - **gateway**: Keep the authoring-turn pointer through a lease-fenced update, retire it in the same transaction as the `dispatched` transition so a stale attempt cannot erase a successor's pointer, and retire it before throwing on an empty response (#743, #744)
 
