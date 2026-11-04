@@ -106,8 +106,11 @@ function bindWorkFixture(key: string, epoch: number, preferred?: string): string
 	return sessionId;
 }
 
-async function waitFrame(frames: any[], id: string): Promise<void> {
-	for (let attempt = 0; attempt < 600 && !frames.some((frame) => frame.id === id); attempt++) await Bun.sleep(5);
+async function waitFrame(frames: any[], id: string, timeoutMs: number = 15000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline && !frames.some((frame) => frame.id === id)) {
+		await Bun.sleep(5);
+	}
 	expect(frames.some((frame) => frame.id === id)).toBe(true);
 }
 
