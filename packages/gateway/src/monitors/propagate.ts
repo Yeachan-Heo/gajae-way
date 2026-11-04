@@ -893,6 +893,12 @@ export class MonitorPropagator {
 		if (state === "failed") return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
 		if (state !== "terminal_ok") return { kind: "hold", reason: "unresolved" };
+		// Check for incomplete terminal outcomes: definitive terminal-incomplete operations
+		// (cancelled, max_tokens, refusal) must not be resumed.
+		if (projectOpState(report.status) !== "completed") {
+			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
+			return { kind: "terminal", raw };
+		}
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
 		if (!monitor) return { kind: "monitor_invalid", raw };
 		const related: MonitorEventDbRow[] = [];
@@ -1730,7 +1736,19 @@ export class MonitorPropagator {
 			report = await readStatus();
 		}
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
-		if (projectOpState(report.status) !== "completed") throw new SessionTerminalError(report);
+		if (projectOpState(report.status) !== "completed") {
+			// Retire incomplete terminal authoring turns before retrying. A definitive
+			// terminal-incomplete outcome (cancelled, max_tokens, refusal) must not be
+			// retried: clear the pointer to break the retry loop.
+			this.#database.transaction((tx) =>
+				this.#forgetAuthoringTurn(
+					tx,
+					rows.map((row) => row.event_id),
+					pendingTurn,
+				),
+			);
+			throw new SessionTerminalError(report);
+		}
 		const output = await this.#readAuthoringResult(turn, rows, report);
 		if (output.status === "proven") return output.text;
 		if (output.status === "unavailable")
@@ -1768,7 +1786,15 @@ export class MonitorPropagator {
 		try {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
-			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+			if (state === "accepted" || state === "in_flight") return prior.opRef;
+			// For terminal_ok, only reuse if the operation completed successfully.
+			// Incomplete terminal outcomes (cancelled, max_tokens, refusal) must not be retried.
+			if (state === "terminal_ok" && projectOpState(report.status) === "completed") return prior.opRef;
+			if (state === "terminal_ok") {
+				// Terminal incomplete: clear the pointer to prevent retry loop.
+				forget();
+				return undefined;
+			}
 		} catch {
 			// Unreadable status is not evidence of a live turn.
 		}
