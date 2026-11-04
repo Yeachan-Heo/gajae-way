@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type {
 	MonitorEventOperatorResult,
@@ -50,7 +50,13 @@ import {
 	renderRestartReceipt,
 	runRestartStack,
 } from "./restart-stack";
-import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import {
+	type InstallServicesOptions,
+	installPinnedGjcFromSourceBuild,
+	installServices,
+	type ServicePlatform,
+	serviceUsage,
+} from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 
@@ -1204,6 +1210,14 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
+				// Install pinned GJC from source build if present
+				const gjcVersion = await installPinnedGjcFromSourceBuild(
+					join(process.cwd(), "packages", "gateway"),
+					gatewayHome(),
+				).catch(() => undefined); // Silently skip if not a source build
+				if (gjcVersion) {
+					console.log(`installed pinned gjc ${gjcVersion}`);
+				}
 				const written = await installServices({
 					binDir: service.binDir,
 					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),

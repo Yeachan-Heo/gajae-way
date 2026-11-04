@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { GjcInstallRunner } from "../src/gjc-install";
 import {
 	BROKER_UNIT,
 	discoverLoginPath,
 	GATEWAY_UNIT,
+	installPinnedGjcFromSourceBuild,
 	installServices,
 	restartStackCommands,
 	serviceSpecs,
@@ -278,5 +280,85 @@ test("installServices succeeds even when shell discovery returns empty", async (
 		expect(firstUnit).toContain("/bin");
 	} finally {
 		await cleanup();
+	}
+});
+
+test("installPinnedGjcFromSourceBuild installs the pinned gjc from gateway package.json", async () => {
+	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
+	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
+
+	try {
+		// Write a mock gateway package.json with gjc version
+		const packagePath = join(gatewayDir, "package.json");
+		await writeFile(
+			packagePath,
+			JSON.stringify({
+				name: "@gajae-gateway/gateway",
+				gjc: { version: "0.19.3" },
+			}),
+			"utf8",
+		);
+
+		// Proper mock runner that creates the directory structure
+		const runner: GjcInstallRunner = async (command, cwd) => {
+			if (command[0] === "bun" && command[1] === "install") {
+				const binDir = join(cwd, "node_modules", ".bin");
+				await mkdir(binDir, { recursive: true });
+				await writeFile(join(binDir, "gjc"), "gjc shim");
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}
+			const packageData = JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+				dependencies: { "gajae-code": string };
+			};
+			return { exitCode: 0, stdout: `gjc/${packageData.dependencies["gajae-code"]}`, stderr: "" };
+		};
+
+		const version = await installPinnedGjcFromSourceBuild(gatewayDir, testHome, runner);
+		expect(version).toBe("0.19.3");
+	} finally {
+		await rm(testHome, { recursive: true, force: true });
+		await rm(gatewayDir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcFromSourceBuild returns undefined when gateway package.json is missing", async () => {
+	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
+	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
+
+	try {
+		const runner: GjcInstallRunner = async () => ({
+			exitCode: 0,
+			stdout: "1.0.0",
+			stderr: "",
+		});
+
+		const version = await installPinnedGjcFromSourceBuild(gatewayDir, testHome, runner);
+		expect(version).toBeUndefined();
+	} finally {
+		await rm(testHome, { recursive: true, force: true });
+		await rm(gatewayDir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcFromSourceBuild returns undefined when gjc.version is missing", async () => {
+	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
+	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
+
+	try {
+		// Write a gateway package.json without gjc version
+		const packagePath = join(gatewayDir, "package.json");
+		await writeFile(packagePath, JSON.stringify({ name: "@gajae-gateway/gateway" }), "utf8");
+
+		const runner: GjcInstallRunner = async () => ({
+			exitCode: 0,
+			stdout: "1.0.0",
+			stderr: "",
+		});
+
+		const version = await installPinnedGjcFromSourceBuild(gatewayDir, testHome, runner);
+		expect(version).toBeUndefined();
+	} finally {
+		await rm(testHome, { recursive: true, force: true });
+		await rm(gatewayDir, { recursive: true, force: true });
 	}
 });
