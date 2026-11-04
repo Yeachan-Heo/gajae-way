@@ -27,7 +27,7 @@
 ## [0.4.0] - 2026-10-26
 
 ### Features
-- **gateway**: Support the GJC 0.19.0 runtime contracts and lifecycle fences; the pinned GJC is now 0.19.0 (#663)
+- **gateway**: Support the GJC 0.19.3 runtime contracts and lifecycle fences; the pinned GJC is now 0.19.3 (#663)
 - **gateway**: Announce stack restarts to active conversations ("restarting", then "back online" or "restart cancelled"), configurable via `restartNotice` (#662)
 - **gateway**: Default daily memory de-bloat cron for Markdown memory files over 100KB (#651)
 - **gateway**: Suggest gjc-listed models in `/model set` autocomplete (#647)
