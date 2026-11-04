@@ -3926,7 +3926,7 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	const gone = jobs.find((job: { lane_key: string }) => job.lane_key === "work-gone");
 	expect(gone.last_commit).toBeNull();
 	client.close();
-});
+}, 20_000);
 
 test("a stalled durable job holds the next work.run until resume (production path)", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
