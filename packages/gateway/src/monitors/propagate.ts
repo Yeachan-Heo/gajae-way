@@ -893,9 +893,11 @@ export class MonitorPropagator {
 		if (state === "failed") return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
 		if (state !== "terminal_ok") return { kind: "hold", reason: "unresolved" };
-		// Check for incomplete terminal outcomes: definitive terminal-incomplete operations
-		// (cancelled, max_tokens, refusal) must not be resumed.
-		if (projectOpState(report.status) !== "completed") {
+		// A definitively incomplete turn (cancelled, max_tokens, refusal) is never
+		// resumed; an uncertain or missing receipt keeps the pointer and holds.
+		const completion = terminalCompletion(report);
+		if (completion === "uncertain") return { kind: "hold", reason: "unresolved" };
+		if (completion === "incomplete") {
 			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 			return { kind: "terminal", raw };
 		}
@@ -997,7 +999,9 @@ export class MonitorPropagator {
 				continue;
 			}
 			if (state !== "terminal_ok") continue;
-			if (projectOpState(report.status) !== "completed") {
+			const completion = terminalCompletion(report);
+			if (completion === "uncertain") continue;
+			if (completion === "incomplete") {
 				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 				continue;
 			}
@@ -1736,10 +1740,13 @@ export class MonitorPropagator {
 			report = await readStatus();
 		}
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
-		if (projectOpState(report.status) !== "completed") {
-			// Retire incomplete terminal authoring turns before retrying. A definitive
-			// terminal-incomplete outcome (cancelled, max_tokens, refusal) must not be
-			// retried: clear the pointer to break the retry loop.
+		const completion = terminalCompletion(report);
+		// An uncertain or missing receipt is not proof the turn stopped short: keep the
+		// pointer so a later status read can still recover the result.
+		if (completion === "uncertain") throw new SessionTerminalError(report);
+		if (completion === "incomplete") {
+			// A definitive terminal-incomplete outcome (cancelled, max_tokens, refusal)
+			// must not be retried: clear the pointer to break the retry loop.
 			this.#database.transaction((tx) =>
 				this.#forgetAuthoringTurn(
 					tx,
@@ -1787,11 +1794,10 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight") return prior.opRef;
-			// For terminal_ok, only reuse if the operation completed successfully.
-			// Incomplete terminal outcomes (cancelled, max_tokens, refusal) must not be retried.
-			if (state === "terminal_ok" && projectOpState(report.status) === "completed") return prior.opRef;
+			// A terminal_ok turn is reused unless it definitively stopped short
+			// (cancelled, max_tokens, refusal); an uncertain receipt keeps the pointer.
 			if (state === "terminal_ok") {
-				// Terminal incomplete: clear the pointer to prevent retry loop.
+				if (terminalCompletion(report) !== "incomplete") return prior.opRef;
 				forget();
 				return undefined;
 			}
@@ -2429,6 +2435,18 @@ export function parseAuthoredArray(response: string): unknown {
 const AUTHORING_TURN_UNRESOLVED = "authoring_turn_unresolved";
 
 /** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
+/**
+ * How a terminal_ok turn ended: completed, definitively incomplete (cancelled,
+ * max_tokens, refusal), or uncertain because its receipt is missing or unknown.
+ * Only a definitive outcome may retire the authoring-turn pointer.
+ */
+function terminalCompletion(report: StatusReport): "completed" | "incomplete" | "uncertain" {
+	const state = projectOpState(report.status);
+	if (state === "completed") return "completed";
+	if (state === "terminal_uncertain" || state === "terminal_missing_receipt") return "uncertain";
+	return "incomplete";
+}
+
 function authoringTurnKey(eventId: string): string {
 	return `monitor_authoring_turn:${eventId}`;
 }
