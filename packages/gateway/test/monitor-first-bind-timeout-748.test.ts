@@ -198,6 +198,7 @@ test("first-bind degradation survives successful retries until a first-attempt s
 		});
 
 		let failNextBind = false;
+		let failNextRequest = false;
 		let bindAttempts = 0;
 		let requestAttempts = 0;
 		let firstBindFailureDetail: string | undefined;
@@ -222,6 +223,10 @@ test("first-bind degradation survives successful retries until a first-attempt s
 			},
 			request: async (input) => {
 				requestAttempts++;
+				if (failNextRequest) {
+					failNextRequest = false;
+					throw new Error("session send failed after bind");
+				}
 				return {
 					assistant: {
 						text: JSON.stringify(
@@ -290,7 +295,15 @@ test("first-bind degradation survives successful retries until a first-attempt s
 			ready: false,
 			failure: { category: "monitor_bind", code: "monitor_bind_degraded" },
 		});
-		const firstAttemptSuccessId = await pipeline.submitAwaitable(monitor.monitorId, "test.bind_retry", { tick: 5 });
+		// A first-attempt bind that succeeds proves binding recovered even when the
+		// authoring turn itself then fails.
+		failNextRequest = true;
+		const requestFailureId = await pipeline.submitAwaitable(monitor.monitorId, "test.bind_retry", { tick: 5 });
+		expect(database.monitors.eventGet(requestFailureId)?.stage).toBe("failed");
+		expect(database.monitors.failure(requestFailureId)?.code).not.toBe("session_bind_failed");
+		expect(pipeline.sessionSafetyState(sessionOrigin).firstAttemptBindFailures).toBe(0);
+		expect(readiness.snapshot().failure?.category).not.toBe("monitor_bind");
+		const firstAttemptSuccessId = await pipeline.submitAwaitable(monitor.monitorId, "test.bind_retry", { tick: 6 });
 		expect(database.monitors.eventGet(firstAttemptSuccessId)?.stage).toBe("authored");
 		expect(pipeline.sessionSafetyState(sessionOrigin).firstAttemptBindFailures).toBe(0);
 		expect(readiness.snapshot()).toMatchObject({ ready: true, failure: null });

@@ -1384,6 +1384,13 @@ export class MonitorPropagator {
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 					}
 				});
+				// Bind and configure succeeded on the first attempt: binding has recovered,
+				// whatever the authoring turn does next (#748).
+				if (firstAttemptBindSucceeded) {
+					this.#safetyState(sessionOriginKey).firstAttemptBindFailures = 0;
+					this.#degradedBindOrigins.delete(sessionOriginKey);
+					if (this.#degradedBindOrigins.size === 0) this.#recordFirstAttemptBindSuccess(sessionOriginKey);
+				}
 				dispatchPhase = "request";
 				dispatchOperation = "request";
 				dispatchOperationArgs = {
@@ -1414,15 +1421,6 @@ export class MonitorPropagator {
 					safety.turns = turns;
 					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch) {
 						safety.priorRunBusyFailures = 0;
-						if (firstAttemptBindSucceeded) {
-							safety.firstAttemptBindFailures = 0;
-							if (this.#degradedBindOrigins.has(sessionOriginKey)) {
-								this.#degradedBindOrigins.delete(sessionOriginKey);
-							}
-							if (this.#degradedBindOrigins.size === 0) {
-								this.#recordFirstAttemptBindSuccess(sessionOriginKey);
-							}
-						}
 					}
 				}
 				// A non-empty answer is proof the session still has usable context, so
