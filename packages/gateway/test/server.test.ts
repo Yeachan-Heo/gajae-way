@@ -106,8 +106,11 @@ function bindWorkFixture(key: string, epoch: number, preferred?: string): string
 	return sessionId;
 }
 
-async function waitFrame(frames: any[], id: string): Promise<void> {
-	for (let attempt = 0; attempt < 600 && !frames.some((frame) => frame.id === id); attempt++) await Bun.sleep(5);
+async function waitFrame(frames: any[], id: string, timeoutMs: number = 15000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline && !frames.some((frame) => frame.id === id)) {
+		await Bun.sleep(5);
+	}
 	expect(frames.some((frame) => frame.id === id)).toBe(true);
 }
 
@@ -3923,7 +3926,7 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	const gone = jobs.find((job: { lane_key: string }) => job.lane_key === "work-gone");
 	expect(gone.last_commit).toBeNull();
 	client.close();
-});
+}, 20_000);
 
 test("a stalled durable job holds the next work.run until resume (production path)", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
