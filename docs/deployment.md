@@ -107,19 +107,18 @@ Before census, stop the gateway service and disable managed startup for the enti
 
 Check `schemaVersion` in the census report before cutover. This procedure requires the current schema 37; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
 
-### Upgrading from GJC 0.19.0 to 0.19.3
+### Upgrading from GJC 0.19.0
 
-GJC 0.19.3 includes bound session index-audit rejection auditing in the broker's index-audit.jsonl log. When upgrading from 0.19.0, check and rotate the index-audit log before restarting:
+GJC 0.19.0 appends every session-index rejection to `$GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl` without a bound and reads the whole file each time a broker or session host starts. A large file makes those hosts unresponsive at startup, so no turns start (#752). GJC 0.19.3 bounds and rotates the log, but move an oversized file aside before the first 0.19.3 start. The log only seeds rejection de-duplication, so moving it does not affect the session index.
 
 ```sh
-ls -la $GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl
-# If the file exists and is growing, rotate it:
-tar -czf $GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit-$(date +%s).tar.gz \
-  $GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl
-rm $GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl
+f="$GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl"
+ls -lh "$f"
+# Stop the gateway service first, then:
+mv "$f" "$f.pre-0.19.3"
 ```
 
-Then run `gajaeway update` or restart the gateway service. The new version will create a fresh index-audit.jsonl with enhanced rejection tracking.
+Then run `gajaeway update` and start the gateway service. Delete the moved file once the gateway is healthy.
 
 ## Home and configuration
 
