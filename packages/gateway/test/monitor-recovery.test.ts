@@ -2514,56 +2514,36 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 		expect(db.monitors.eventGet(eventId)).toBeUndefined();
 		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeUndefined();
 	});
-});
 
-test("#703/#704 review: recovered operation with terminal_ok but non-completed state (cancelled) is forgotten", async () => {
-	const { propagator, database: db, monitor } = await harness(
-		async (input) => {
-			if (input.method === "status") {
-				// Return terminal_ok with cancelled (not completed) outcome
-				return {
-					stdout: JSON.stringify({
-						status: "terminal_ok",
-						receiptState: undefined,
-						supervisorState: "cancelled", // CANCELLED, not completed
-					}),
-				};
+	for (const reason of ["cancelled", "max_tokens", "refusal"]) {
+		test(`a given-up batch whose late op ended terminal_ok but ${reason} is never authored from its body (#704 review)`, async () => {
+			const { db, eventIds, opRef, sessionPort, propagator, prompts, advance } = await heldSkipMonitor("unknown", 2);
+			advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+			await propagator.reconcile();
+			for (const id of eventIds) expect(stage(db, id)).toBe("failed_no_retry");
+			// The body is a valid event array, but the turn did not complete.
+			sessionPort.seedOperation(
+				opRef,
+				"s1",
+				"terminal_ok",
+				JSON.stringify(eventIds.map((eventId) => ({ eventId, note: `incomplete ${eventId}` }))),
+			);
+			const status = sessionPort.status.bind(sessionPort);
+			sessionPort.status = async (input) => {
+				const report = await status(input);
+				if (input.opRef !== opRef) return report;
+				return { ...report, status: { ...report.status, outcome: { reason } } } as typeof report;
+			};
+			await propagator.reconcile();
+			for (const id of eventIds) {
+				expect(stage(db, id)).toBe("failed_no_retry");
+				expect(db.monitors.authoredOutput(id)).toBeUndefined();
+				expect(db.core.metaGet(`monitor_authoring_turn:${id}`)).toBeUndefined();
 			}
-			return { stdout: "{}" };
-		},
-		{ now: () => Date.now() },
-	);
-
-	const eventId = crypto.randomUUID();
-	createEvent(db, {
-		eventId,
-		monitorId: monitor.monitorId,
-		eventType: "memory.canonicalize",
-		payloadJson: "{}",
-		firedAt: new Date().toISOString(),
-	});
-
-	// Setup event as given up
-	db.transaction((tx) => db.monitors.eventUpdate(tx, eventId, "failed_no_retry"));
-	recordFailure(db, eventId, "authoring_turn_unresolved", "authoring turn unresolved");
-
-	// Save authoring pointer and mark with sufficient dispatch attempts
-	const pointer = JSON.stringify({ sessionId: "s1", opRef: "op:test", eventIds: [eventId] });
-	db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
-	db.transaction((tx) => {
-		for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
-			db.monitors.eventUpdate(tx, eventId, "failed");
-		}
-	});
-
-	// Verify pointer exists before recovery
-	expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeDefined();
-
-	// Recovery with non-completed status should forget the pointer
-	await propagator.reconcile();
-
-	// Pointer should be forgotten
-	expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeUndefined();
+			expect(sessionPort.sendAttempts).toHaveLength(0);
+			expect(prompts()).toBe(0);
+		});
+	}
 });
 
 test("#702: failureDetail names an unlisted Error subclass and keeps only a token-shaped code", () => {
