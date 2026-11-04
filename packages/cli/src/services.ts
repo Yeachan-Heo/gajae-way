@@ -1,9 +1,10 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
 import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
+import { readPinnedGjcVersion } from "./update";
 
 const CONFIG_SCHEMA_VERSION = 1;
 
@@ -447,45 +448,50 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 }
 
 /**
- * Installs the pinned GJC version from a source-checkout gateway package.json if it exists.
- * Returns the installed version or undefined if not a source build or already installed.
+ * Candidate locations for the pinned GJC version, in priority order.
+ * For a source checkout: packages/gateway/package.json from the CLI module location.
+ * For a release install: package.json beside the binaries.
+ * Returns undefined if no candidate has a pin; otherwise installs the version and returns it.
+ * Installation failures propagate as errors.
+ */
+function pinnedGjcCandidatePaths(binDir?: string): readonly string[] {
+	const candidates: string[] = [
+		// Source checkout: from CLI module location, go up to the repo root, then to packages/gateway/package.json
+		// __filename is packages/cli/src/services.ts, so we go up 4 levels to reach the repo root
+		join(dirname(dirname(dirname(dirname(__filename)))), "packages", "gateway", "package.json"),
+	];
+	if (binDir) {
+		// Release install: package.json beside the binaries
+		candidates.push(join(binDir, "package.json"));
+	}
+	return candidates;
+}
+
+/**
+ * Installs the pinned GJC version from a source-checkout or release gateway package.json if it exists.
+ * Returns the installed version. Errors when no candidate has a pin or installation fails.
  * Called as part of source-checkout service installation/repair to ensure the GJC pin is current.
+ * For release installs, pass the binDir where the binaries are located.
  */
 export async function installPinnedGjcFromSourceBuild(
-	gatewayPackageDir: string,
 	home: string,
+	binDir?: string,
 	runner?: GjcInstallRunner,
-): Promise<string | undefined> {
-	const packagePath = join(gatewayPackageDir, "package.json");
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(await readFile(packagePath, "utf8"));
-	} catch (_error) {
-		// Not a source build or package.json missing
-		return undefined;
-	}
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		return undefined;
-	}
-	const gjc = (parsed as { gjc?: unknown }).gjc;
-	if (typeof gjc !== "object" || gjc === null || Array.isArray(gjc)) {
-		return undefined;
-	}
-	const version = (gjc as { version?: unknown }).version;
-	if (typeof version !== "string" || version.trim() === "") {
-		return undefined;
+): Promise<string> {
+	const candidates = pinnedGjcCandidatePaths(binDir);
+
+	for (const path of candidates) {
+		try {
+			const version = await readPinnedGjcVersion(path);
+			await installPinnedGjc({ home, version, runner });
+			return version;
+		} catch (_error) {
+			// A missing or malformed candidate is not fatal: a later one may carry the pin.
+		}
 	}
 
-	try {
-		await installPinnedGjc({ home, version, runner });
-		return version;
-	} catch (error) {
-		throw new Error(
-			`could not install pinned gjc ${version} from source build: ${
-				error instanceof Error ? error.message : String(error)
-			}`,
-		);
-	}
+	// No candidate had a pin
+	throw new Error(`could not find pinned gjc version in any of: ${candidates.join(", ")}`);
 }
 
 export async function installServices(options: InstallServicesOptions): Promise<readonly string[]> {

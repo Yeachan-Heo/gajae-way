@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import type {
 	MonitorEventOperatorResult,
@@ -29,6 +29,7 @@ import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
+import type { GjcInstallRunner } from "./gjc-install";
 import {
 	columnNames,
 	type ListOptions,
@@ -119,7 +120,9 @@ function gatewayHome(): string {
 }
 
 export interface MainOptions {
-	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile"> & {
+		gjcInstallRunner?: GjcInstallRunner;
+	};
 	/** Test seams for `setup`: the platform fetch and the prompter. */
 	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env" | "binDir" | "runBrokerAgent">;
 	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
@@ -1210,13 +1213,16 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
-				// Install pinned GJC from source build if present
-				const gjcVersion = await installPinnedGjcFromSourceBuild(
-					join(process.cwd(), "packages", "gateway"),
-					gatewayHome(),
-				).catch(() => undefined); // Silently skip if not a source build
-				if (gjcVersion) {
+				// Install pinned GJC from source build or release
+				try {
+					const gjcVersion = await installPinnedGjcFromSourceBuild(
+						gatewayHome(),
+						service.binDir,
+						options.services?.gjcInstallRunner,
+					);
 					console.log(`installed pinned gjc ${gjcVersion}`);
+				} catch (error) {
+					throw new Error(`could not install pinned gjc: ${error instanceof Error ? error.message : String(error)}`);
 				}
 				const written = await installServices({
 					binDir: service.binDir,

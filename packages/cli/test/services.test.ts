@@ -288,7 +288,7 @@ test("installPinnedGjcFromSourceBuild installs the pinned gjc from gateway packa
 	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
 
 	try {
-		// Write a mock gateway package.json with gjc version
+		// Mock the gateway package.json with gjc version
 		const packagePath = join(gatewayDir, "package.json");
 		await writeFile(
 			packagePath,
@@ -313,7 +313,7 @@ test("installPinnedGjcFromSourceBuild installs the pinned gjc from gateway packa
 			return { exitCode: 0, stdout: `gjc/${packageData.dependencies["gajae-code"]}`, stderr: "" };
 		};
 
-		const version = await installPinnedGjcFromSourceBuild(gatewayDir, testHome, runner);
+		const version = await installPinnedGjcFromSourceBuild(testHome, gatewayDir, runner);
 		expect(version).toBe("0.19.3");
 	} finally {
 		await rm(testHome, { recursive: true, force: true });
@@ -321,7 +321,7 @@ test("installPinnedGjcFromSourceBuild installs the pinned gjc from gateway packa
 	}
 });
 
-test("installPinnedGjcFromSourceBuild returns undefined when gateway package.json is missing", async () => {
+test("installPinnedGjcFromSourceBuild throws when no candidate has a pin", async () => {
 	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
 	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
 
@@ -332,15 +332,22 @@ test("installPinnedGjcFromSourceBuild returns undefined when gateway package.jso
 			stderr: "",
 		});
 
-		const version = await installPinnedGjcFromSourceBuild(gatewayDir, testHome, runner);
-		expect(version).toBeUndefined();
+		try {
+			await installPinnedGjcFromSourceBuild(testHome, gatewayDir, runner);
+			expect.unreachable("should have thrown");
+		} catch (error) {
+			expect(error).toBeInstanceOf(Error);
+			if (error instanceof Error) {
+				expect(error.message).toMatch(/could not find pinned gjc version/);
+			}
+		}
 	} finally {
 		await rm(testHome, { recursive: true, force: true });
 		await rm(gatewayDir, { recursive: true, force: true });
 	}
 });
 
-test("installPinnedGjcFromSourceBuild returns undefined when gjc.version is missing", async () => {
+test("installPinnedGjcFromSourceBuild throws when gjc.version is missing", async () => {
 	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
 	const gatewayDir = await mkdtemp(join(tmpdir(), "gateway-"));
 
@@ -355,10 +362,103 @@ test("installPinnedGjcFromSourceBuild returns undefined when gjc.version is miss
 			stderr: "",
 		});
 
-		const version = await installPinnedGjcFromSourceBuild(gatewayDir, testHome, runner);
-		expect(version).toBeUndefined();
+		try {
+			await installPinnedGjcFromSourceBuild(testHome, gatewayDir, runner);
+			expect.unreachable("should have thrown");
+		} catch (error) {
+			expect(error).toBeInstanceOf(Error);
+			if (error instanceof Error) {
+				expect(error.message).toMatch(/could not find pinned gjc version/);
+			}
+		}
 	} finally {
 		await rm(testHome, { recursive: true, force: true });
 		await rm(gatewayDir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcFromSourceBuild throws when install fails", async () => {
+	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
+	const binDir = await mkdtemp(join(tmpdir(), "bindir-"));
+
+	try {
+		// Write a package.json with a gjc pin to binDir (simulating release install)
+		const packagePath = join(binDir, "package.json");
+		await writeFile(
+			packagePath,
+			JSON.stringify({
+				name: "gajaeway",
+				gjc: { version: "0.19.4" },
+			}),
+			"utf8",
+		);
+
+		// Mock runner that fails on all bun commands
+		const failingRunner: GjcInstallRunner = async (_command) => ({
+			exitCode: 1,
+			stdout: "",
+			stderr: "command failed",
+		});
+
+		try {
+			await installPinnedGjcFromSourceBuild(testHome, binDir, failingRunner);
+			expect.unreachable("should have thrown when install fails");
+		} catch (error) {
+			expect(error).toBeInstanceOf(Error);
+			if (error instanceof Error) {
+				// Should contain either the install error or a "could not find" error
+				expect(
+					error.message.includes("could not install pinned gjc") ||
+						error.message.includes("could not find pinned gjc version"),
+				).toBe(true);
+			}
+		}
+	} finally {
+		await rm(testHome, { recursive: true, force: true });
+		await rm(binDir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcFromSourceBuild uses first available candidate in priority order", async () => {
+	const testHome = await mkdtemp(join(tmpdir(), "gjc-source-install-"));
+	const binDir = await mkdtemp(join(tmpdir(), "bindir-"));
+
+	try {
+		// Write a package.json with a gjc pin to binDir (simulating release install)
+		const packagePath = join(binDir, "package.json");
+		await writeFile(
+			packagePath,
+			JSON.stringify({
+				name: "gajaeway",
+				gjc: { version: "0.19.5" },
+			}),
+			"utf8",
+		);
+
+		// Mock runner that creates the expected structure
+		let installedVersion = "0.0.0";
+		const runner: GjcInstallRunner = async (command, cwd) => {
+			if (command[0] === "bun" && command[1] === "install") {
+				const binDirPath = join(cwd, "node_modules", ".bin");
+				await mkdir(binDirPath, { recursive: true });
+				await writeFile(join(binDirPath, "gjc"), "gjc shim");
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}
+			const packageData = JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+				dependencies: { "gajae-code": string };
+			};
+			installedVersion = packageData.dependencies["gajae-code"];
+			return { exitCode: 0, stdout: `gjc/${packageData.dependencies["gajae-code"]}`, stderr: "" };
+		};
+
+		const version = await installPinnedGjcFromSourceBuild(testHome, binDir, runner);
+		// The function will use the first candidate that has a pin (packages/gateway/package.json)
+		// If that doesn't have a pin, it will use binDir/package.json
+		// In this repo, packages/gateway/package.json has gjc.version = "0.19.3"
+		expect(version).toBe("0.19.3");
+		expect(installedVersion).toBe("0.19.3");
+	} finally {
+		await rm(testHome, { recursive: true, force: true });
+		await rm(binDir, { recursive: true, force: true });
 	}
 });
