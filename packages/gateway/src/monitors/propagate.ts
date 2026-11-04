@@ -11,7 +11,7 @@ import {
 	originKey,
 	type ProtocolFailureReason,
 } from "@gajae-gateway/protocol";
-import { envelopeErrorCode, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
+import { envelopeErrorCode, GjcCliError, projectOpState, type StatusReport } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
@@ -991,6 +991,10 @@ export class MonitorPropagator {
 				continue;
 			}
 			if (state !== "terminal_ok") continue;
+			if (projectOpState(report.status) !== "completed") {
+				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
+				continue;
+			}
 			const output = await this.#readAuthoringResult(turn, members, report);
 			if (output.status === "unavailable") {
 				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
@@ -1726,6 +1730,8 @@ export class MonitorPropagator {
 			report = await readStatus();
 		}
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
+		if (projectOpState(report.status) !== "completed")
+			throw new SessionTerminalError(report);
 		const output = await this.#readAuthoringResult(turn, rows, report);
 		if (output.status === "proven") return output.text;
 		if (output.status === "unavailable")
