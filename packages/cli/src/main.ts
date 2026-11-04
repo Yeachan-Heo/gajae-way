@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { isAbsolute, resolve } from "node:path";
-
+import { acquireLease, LeaseHeldError } from "@gajae-gateway/home";
 import type {
 	MonitorEventOperatorResult,
 	MonitorEventRecord,
@@ -25,10 +25,8 @@ import type {
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
-
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
-
 import type { GjcInstallRunner } from "./gjc-install";
 import {
 	columnNames,
@@ -52,17 +50,16 @@ import {
 	runRestartStack,
 } from "./restart-stack";
 import {
+	homeForEnvironment,
 	type InstallServicesOptions,
 	installPinnedGjcForServices,
 	installServices,
 	type ServicePlatform,
 	servicePinCandidates,
 	serviceUsage,
-	homeForEnvironment,
 } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
-import { acquireLease, LeaseHeldError } from "@gajae-gateway/home";
 
 async function connectGatewaySocket(
 	path: string,
