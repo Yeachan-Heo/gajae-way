@@ -895,10 +895,11 @@ export class MonitorPropagator {
 		if (state !== "terminal_ok") return { kind: "hold", reason: "unresolved" };
 		// A definitively incomplete turn (cancelled, max_tokens, refusal) is never
 		// resumed; an uncertain or missing receipt keeps the pointer and holds.
+		// Retire the pointer inside the same transaction that settles the terminal event
+		// (compare-and-delete), not before, so the settle transaction can find the pointer.
 		const completion = terminalCompletion(report);
 		if (completion === "uncertain") return { kind: "hold", reason: "unresolved" };
 		if (completion === "incomplete") {
-			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 			return { kind: "terminal", raw };
 		}
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.

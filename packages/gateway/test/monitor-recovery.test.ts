@@ -2299,6 +2299,76 @@ describe("monitor overlap policy (issue #83)", () => {
 	});
 });
 
+test("#704: exhausted event with incomplete terminal turn settles atomically with pointer retirement (#760)", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-704-incomplete-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const db = database;
+	const monitor = new MonitorRegistry(db).add({
+		name: "test",
+		trigger: { kind: "cron", schedule: "* * * * *" },
+		eventTypes: ["test.event"],
+	});
+
+	const eventId = crypto.randomUUID();
+	const opRef = crypto.randomUUID();
+	createEvent(db, {
+		eventId,
+		monitorId: monitor.monitorId,
+		eventType: "test.event",
+		payloadJson: "{}",
+		firedAt: new Date().toISOString(),
+	});
+
+	// Exhaust dispatch attempts
+	for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
+		updateEvent(db, eventId, "failed");
+		db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+	}
+
+	const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+	db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+
+	let prompts = 0;
+	const sessionPort = fakeSessionPort(async () => {
+		prompts++;
+		return "[]";
+	});
+
+	// Seed operation as terminal_ok with incomplete reason (max_tokens)
+	sessionPort.seedOperation(opRef, "s1", "terminal_ok", JSON.stringify([{ eventId, note: "incomplete" }]));
+	const status = sessionPort.status.bind(sessionPort);
+	sessionPort.status = async (input) => {
+		const report = await status(input);
+		if (input.opRef !== opRef) return report;
+		return { ...report, status: { ...report.status, outcome: { reason: "max_tokens" } } } as typeof report;
+	};
+
+	const clock = Date.now();
+	const propagator = new MonitorPropagator({
+		database: db,
+		registry: new MonitorRegistry(db),
+		sessionPort,
+		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+		delivery: new DeliveryService(db),
+		emit: () => {},
+		now: () => clock,
+	});
+	propagators.push(propagator);
+
+	// Run reconcile - the event should be marked as failed_no_retry and the pointer should be deleted
+	await propagator.reconcile();
+
+	// Verify the event is settled
+	expect(stage(db, eventId)).toBe("failed_no_retry");
+	expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
+
+	// Verify the pointer is deleted
+	expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeUndefined();
+
+	// Verify no new prompt was sent (operation was not resent)
+	expect(prompts).toBe(0);
+});
+
 describe("#702: an exhausted event held on an unresolvable authoring turn", () => {
 	async function heldSkipMonitor(status: "unknown" | "throws" | "accepted" | "in_flight", batchSize = 1) {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-702-"));
