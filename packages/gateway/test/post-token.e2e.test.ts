@@ -77,6 +77,15 @@ async function startGateway(port: ScriptedSessionPort) {
 	return client;
 }
 
+// Convert test ID to a realistic Discord snowflake (17-20 digits)
+function testIdToSnowflake(id: string): string {
+	// Generate a deterministic snowflake from the test ID
+	// Use timestamp-based snowflake format: 18 digits is typical
+	const base = 154470000000000000n; // Base snowflake value
+	const idNum = id.charCodeAt(0) * 100 + Number.parseInt(id.slice(1), 10);
+	return (base + BigInt(idNum)).toString();
+}
+
 function sendChannelMessage(client: { send(value: unknown): void }, id: string, text: string): void {
 	client.send({
 		v: "0.1",
@@ -86,7 +95,7 @@ function sendChannelMessage(client: { send(value: unknown): void }, id: string, 
 		params: {
 			origin: { platform: "discord", kind: "channel", conversationId: "chan-1" },
 			text,
-			messageId: `m-${id}`,
+			messageId: testIdToSnowflake(id),
 			engagement: { mentioned: true, group: true, authorId: "human-1" },
 		},
 	});
@@ -179,7 +188,8 @@ test("[REPLY:<channel>] posts there; [REPLY:<message id>] in the same reply thre
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	const client = await startGateway(port);
 	const send = await startTurn(port, client, "c1");
-	port.complete(send.opRef, "[REPLY:discord:report-room] 보고 올립니다\n[BREAK]\n[REPLY:m-c1] 여기 답");
+	const replyTarget = testIdToSnowflake("c1");
+	port.complete(send.opRef, `[REPLY:discord:report-room] 보고 올립니다\n[BREAK]\n[REPLY:${replyTarget}] 여기 답`);
 	await eventually(() => messages(client).length === 2, "both parts were not delivered");
 	const delivered = messages(client).map((frame) => [
 		frame.payload.origin.conversationId,
@@ -187,7 +197,7 @@ test("[REPLY:<channel>] posts there; [REPLY:<message id>] in the same reply thre
 		frame.payload.replyToMessageId,
 	]);
 	expect(delivered).toContainEqual(["report-room", "보고 올립니다", undefined]);
-	expect(delivered).toContainEqual(["chan-1", "여기 답", "m-c1"]);
+	expect(delivered).toContainEqual(["chan-1", "여기 답", replyTarget]);
 });
 
 test("a [POST:] part goes to the configured target once, recorded there as the persona's own words", async () => {
@@ -203,7 +213,7 @@ test("a [POST:] part goes to the configured target once, recorded there as the p
 		origin: { platform: "discord", kind: "channel", conversationId: "report-room" },
 		final: false,
 	});
-	const postId = deterministicPostDeliveryId(HERE, REPORT, "m-a1", 1);
+	const postId = deterministicPostDeliveryId(HERE, REPORT, testIdToSnowflake("a1"), 1);
 	expect(report.payload.deliveryId).toBe(postId);
 	expect(rows(REPORT).map((row) => row.delivery_id)).toEqual([postId]);
 	// The target's next turn reads the post as unread context from "you".
@@ -303,7 +313,7 @@ test("a second terminal pass or a regenerated answer for the same trigger posts 
 	const send = await startTurn(port, client, "d1");
 	port.complete(send.opRef, `[POST:${REPORT}] 한 번만`);
 	await eventually(() => rows(REPORT).length === 1, "post was not sent");
-	const postId = deterministicPostDeliveryId(HERE, REPORT, "m-d1", 0);
+	const postId = deterministicPostDeliveryId(HERE, REPORT, testIdToSnowflake("d1"), 0);
 	expect(rows(REPORT)[0]?.delivery_id).toBe(postId);
 	// The slot is owned: a regenerated answer's claim returns the existing post.
 	expect(
@@ -312,7 +322,7 @@ test("a second terminal pass or a regenerated answer for the same trigger posts 
 				tx,
 				send.opRef,
 				0,
-				deterministicPostDeliveryId(HERE, "discord/channel/x", "m-d1", 0),
+				deterministicPostDeliveryId(HERE, "discord/channel/x", testIdToSnowflake("d1"), 0),
 			),
 		),
 	).toBe(postId);
@@ -338,7 +348,7 @@ test("the post survives a gateway restart exactly once: held before the crash, p
 	await startGateway(port);
 	await eventually(() => database!.inbox.nonterminalTurns(HERE).length === 0, "recovered turn never completed", 2_000);
 	expect(rows(REPORT).map((row) => [row.delivery_id, JSON.parse(row.payload_json).text])).toEqual([
-		[deterministicPostDeliveryId(HERE, REPORT, "m-s1", 1), "재시작 보고"],
+		[deterministicPostDeliveryId(HERE, REPORT, testIdToSnowflake("s1"), 1), "재시작 보고"],
 	]);
 	// The local part kept its pre-restart row.
 	expect(rows(HERE)).toHaveLength(1);
