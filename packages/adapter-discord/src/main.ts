@@ -907,6 +907,34 @@ function endDiscordWorkingState(
 		);
 }
 
+/**
+ * Sends a delivery's first part, threaded to `reference` when given. failIfNotExists keeps a
+ * deleted target from failing the delivery; a malformed reference (Discord 50035 Invalid Form
+ * Body, e.g. a non-snowflake id) fails before anything posts, so the part is resent once without
+ * the reference instead of losing the text (#763).
+ */
+async function sendFirstDiscordPart(
+	channel: DiscordTextChannelLike,
+	part: { content: string; files?: readonly unknown[] },
+	reference: string | undefined,
+): Promise<void> {
+	const plain = part.files ? { files: part.files, content: part.content } : part.content;
+	if (!reference) {
+		await channel.send(plain);
+		return;
+	}
+	try {
+		await channel.send({ ...part, reply: { messageReference: reference, failIfNotExists: false } });
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+		if (code !== "50035") throw error;
+		console.log(
+			`discord reply_reference_rejected reference=${JSON.stringify(reference.slice(0, 80))}; resending without it`,
+		);
+		await channel.send(plain);
+	}
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -939,36 +967,21 @@ export async function settleDiscordDelivery(
 		}
 		const chunks = text === "" ? [] : chunkDiscordMessage(text);
 		const files = mediaResult.attachments;
+		// Reply-threading applies to the first send only. A reply reference points into the thread, so
+		// it is dropped on parent fallback (notice).
+		const reference = message.replyToMessageId && !notice ? message.replyToMessageId : undefined;
 		try {
 			if (files.length > 0 && chunks.length === 0) {
-				const reply =
-					message.replyToMessageId && !notice
-						? { messageReference: message.replyToMessageId, failIfNotExists: false }
-						: undefined;
-				await channel.send({
-					files,
-					content: chunks[0] ?? "",
-					...(reply ? { reply } : {}),
-				});
+				await sendFirstDiscordPart(channel, { files, content: "" }, reference);
 			} else {
 				for (let index = 0; index < chunks.length; index++) {
-					// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-					// deleted target from failing the whole delivery.
 					const chunk = chunks[index] as string;
-					// A reply reference points into the thread, so it is dropped on parent fallback.
-					if (index === 0 && files.length > 0)
-						await channel.send({
-							content: chunk,
-							files,
-							...(message.replyToMessageId && !notice
-								? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
-								: {}),
-						});
-					else if (index === 0 && message.replyToMessageId && !notice)
-						await channel.send({
-							content: chunk,
-							reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-						});
+					if (index === 0)
+						await sendFirstDiscordPart(
+							channel,
+							files.length > 0 ? { content: chunk, files } : { content: chunk },
+							reference,
+						);
 					else await channel.send(chunk);
 				}
 			}
