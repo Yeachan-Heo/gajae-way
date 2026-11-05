@@ -550,3 +550,62 @@ test("pending pointer rewrite preserves busy proof for the same session and oper
 	expect(marker()).toBeDefined();
 	expect(state.store.core.metaGet(`monitor_authoring_turn:${second}`)).toBe(prior);
 });
+
+test("incomplete terminal-ok outcomes clear pointer during given-up recovery (reconcile path)", async () => {
+	const state = await fixture();
+	// The saved operation reports terminal_ok with an incomplete outcome.
+	// The reconciliation cleanup (given-up path) should clear the pointer when incomplete.
+	state.sessionPort.status = async (input) => ({
+		operationRef: input.opRef,
+		status: {
+			status: "terminal_ok",
+			startedAt: Date.now(),
+			commandId: "cmd-test",
+			turnId: "turn-test",
+			clientRef: input.opRef,
+			terminalAt: Date.now(),
+			receiptState: "present",
+			// Incomplete outcome: cancelled (must not be retried)
+			outcome: { reason: "cancelled" },
+		},
+		summaryCompleted: true,
+	});
+
+	// Run reconciliation: pointer should be cleared when incomplete is detected
+	await state.pipeline.reconcile();
+
+	// Verify the pointer is cleared (atomically retired on detection of incomplete)
+	expect(state.store.core.metaGet(state.pointerKey)).toBeUndefined();
+});
+
+test("reusable authoring turn rejects incomplete terminal-ok outcomes", async () => {
+	const state = await fixture();
+	// Simulate a retry scenario: status returns terminal_ok with incomplete outcome
+	let statusCalls = 0;
+	state.sessionPort.status = async (input) => {
+		statusCalls++;
+		return {
+			operationRef: input.opRef,
+			status: {
+				status: "terminal_ok",
+				startedAt: Date.now(),
+				commandId: "cmd-test",
+				turnId: "turn-test",
+				clientRef: input.opRef,
+				terminalAt: Date.now(),
+				receiptState: "present",
+				// Incomplete terminal: refusal
+				outcome: { reason: "refusal" },
+			},
+			summaryCompleted: true,
+		};
+	};
+
+	// Reconcile to trigger the reusable-turn check
+	await state.pipeline.reconcile();
+
+	// Verify status was called at least once
+	expect(statusCalls).toBeGreaterThan(0);
+	// Verify the pointer is cleared (not reused for incomplete outcomes)
+	expect(state.store.core.metaGet(state.pointerKey)).toBeUndefined();
+});
