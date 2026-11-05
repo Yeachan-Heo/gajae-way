@@ -36,6 +36,75 @@ function dateFields(date: Date, timezone?: string): [number, number, number, num
 		throw new Error(`could not read cron time in timezone ${timezone}`);
 	return [minute, hour, day, month, weekday];
 }
+const CRON_FIELD_NAMES = ["minute", "hour", "day-of-month", "month", "day-of-week"] as const;
+const CRON_PART = /^(\*|\d+|\d+-\d+)(?:\/(\d+))?$/;
+
+/**
+ * Write-time check for a cron schedule, stricter than the matcher: exactly five fields, every
+ * comma part `*`, `N` or `N-M` with an optional `/step` inside the field's range, and at least one
+ * future fire. A schedule that passes can never stop the gateway from starting; the error says
+ * what is wrong so the caller (often an agent) can retry with a corrected value.
+ */
+export function validateCronSchedule(schedule: string, timezone?: string): void {
+	const fields = schedule.trim().split(/\s+/).filter(Boolean);
+	if (fields.length !== 5)
+		throw new Error(
+			`cron schedule must have five fields (minute hour day-of-month month day-of-week), got ${fields.length}: ${JSON.stringify(schedule)}. A year is not a cron field; for a one-time reminder use the month and day, e.g. "0 12 30 10 *", and remove the monitor after it fires`,
+		);
+	fields.forEach((field, index) => {
+		const [min, max] = CRON_FIELD_RANGES[index] as readonly [number, number];
+		const name = CRON_FIELD_NAMES[index];
+		for (const part of field.split(",")) {
+			const match = part.match(CRON_PART);
+			const invalid = (why: string) =>
+				new Error(
+					`cron ${name} field ${JSON.stringify(field)} is invalid: ${why} (allowed ${min}-${max}, *, N-M, */step)`,
+				);
+			if (!match) throw invalid(`${JSON.stringify(part)} is not *, N, N-M or one of them with /step`);
+			const [base, stepText] = [match[1] as string, match[2]];
+			if (stepText !== undefined && Number(stepText) < 1) throw invalid("step must be at least 1");
+			if (base === "*") continue;
+			if (stepText !== undefined && !base.includes("-"))
+				throw invalid(`${JSON.stringify(part)}: a step needs * or a range`);
+			const [start, end = start] = base.split("-").map(Number) as [number, number?];
+			if (start < min || (end as number) > max || (end as number) < start)
+				throw invalid(`${JSON.stringify(part)} is out of range`);
+		}
+	});
+	if (nextCronFire(schedule, new Date(), timezone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone) === null)
+		throw new Error(
+			`cron schedule ${JSON.stringify(schedule)} never fires (no date matches day-of-month, month and day-of-week together)`,
+		);
+}
+
+/**
+ * Boot-time check for a stored cron schedule, looser than validateCronSchedule: a schedule the matcher
+ * compiles, whose numeric values and ranges are inside each field's range, and that fires again can
+ * run, even when it fails the stricter write policy (a legacy `5/1`, for example). Returns why the
+ * schedule cannot run, or null when it can.
+ */
+export function cronScheduleStartProblem(schedule: string, timezone?: string): string | null {
+	try {
+		compileCron(schedule, timezone);
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	const fields = schedule.trim().split(/\s+/);
+	for (const [index, field] of fields.entries()) {
+		const [min, max] = CRON_FIELD_RANGES[index] as readonly [number, number];
+		for (const part of field.split(",")) {
+			const base = part.match(CRON_PART)?.[1];
+			if (base === undefined || base === "*") continue;
+			const [start, end = start] = base.split("-").map(Number) as [number, number?];
+			if (start < min || (end as number) > max || (end as number) < start)
+				return `cron ${CRON_FIELD_NAMES[index]} field ${JSON.stringify(field)} is invalid: ${JSON.stringify(part)} is out of range (allowed ${min}-${max})`;
+		}
+	}
+	if (nextCronFire(schedule, new Date(), timezone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone) === null)
+		return `cron schedule ${JSON.stringify(schedule)} never fires (no date matches day-of-month, month and day-of-week together)`;
+	return null;
+}
+
 export function cronMatches(schedule: string, date: Date, timezone?: string): boolean {
 	const fields = schedule.trim().split(/\s+/);
 	if (fields.length !== 5) throw new Error("cron schedule must have five fields");

@@ -2,6 +2,7 @@ import {
 	eventTypeOrigin,
 	isChatPlatform,
 	type MonitorChannelTarget,
+	type MonitorInvalidRecord,
 	type MonitorRecord,
 	type MonitorSpec,
 	type MonitorUpdateParams,
@@ -12,6 +13,7 @@ import {
 import type { Store } from "../store";
 import type { MonitorCronState } from "../store/groups/monitors";
 import { validateProcedureFiles } from "./procedure";
+import { cronScheduleStartProblem, validateCronSchedule } from "./triggers/cron";
 
 const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
 const monitorReportToMetaKey = (monitorId: string) => `monitor_report_to:${monitorId}`;
@@ -42,6 +44,7 @@ export class MonitorRegistry {
 	}
 	add(spec: MonitorSpec): MonitorRecord {
 		validateSpec(spec);
+		if (spec.trigger.kind === "cron") validateCronSchedule(spec.trigger.schedule, spec.trigger.timezone);
 		const trigger: TriggerSpec =
 			spec.trigger.kind === "webhook"
 				? { ...spec.trigger, route: crypto.randomUUID() }
@@ -82,18 +85,69 @@ export class MonitorRegistry {
 		return record;
 	}
 	list(): MonitorRecord[] {
+		return this.#scan().records;
+	}
+	/**
+	 * Stored monitors that need repair: rows that no longer load (they are left out of `list()`,
+	 * never run, and can only be removed) and loadable cron monitors whose schedule fails write-time
+	 * validation (still in `list()`, repairable with `update --schedule`; they keep running unless
+	 * `notStartable()` also reports them).
+	 */
+	invalid(): MonitorInvalidRecord[] {
+		return this.#scan({ cron: "write" }).invalid;
+	}
+	/**
+	 * Monitors that cannot be started: rows that no longer load and cron monitors whose
+	 * schedule cannot be compiled or never fires (matcher cannot execute). Unlike invalid(),
+	 * this excludes cron schedules that fail write-time policy but can still run
+	 * (e.g., a monitor saved with '5/1' before strict validation was added).
+	 * Used at runtime to distinguish genuinely not-startable from stricter-policy-rejected.
+	 */
+	notStartable(): MonitorInvalidRecord[] {
+		return this.#scan({ cron: "start" }).invalid;
+	}
+	/** `cron` picks the check that reports cron rows: the write policy, or whether the stored schedule can run. */
+	#scan(options: { cron?: "write" | "start" } = {}): {
+		records: MonitorRecord[];
+		invalid: MonitorInvalidRecord[];
+	} {
 		const records: MonitorRecord[] = [];
+		const invalid: MonitorInvalidRecord[] = [];
 		for (const row of this.#database.monitors.rows()) {
+			let record: MonitorRecord;
 			try {
-				records.push(rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id))));
-			} catch {
-				console.warn(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
+				record = rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id)));
+			} catch (error) {
+				invalid.push({ monitorId: row.monitor_id, name: row.name, reason: errorReason(error), loadable: false });
+				continue;
+			}
+			records.push(record);
+			if (options.cron && record.trigger.kind === "cron") {
+				let reason: string | null = null;
+				if (options.cron === "start") {
+					reason = cronScheduleStartProblem(record.trigger.schedule, record.trigger.timezone);
+				} else {
+					try {
+						validateCronSchedule(record.trigger.schedule, record.trigger.timezone);
+					} catch (error) {
+						reason = errorReason(error);
+					}
+				}
+				if (reason !== null) {
+					invalid.push({ monitorId: record.monitorId, name: record.name, reason, loadable: true });
+				}
 			}
 		}
-		return records;
+		return { records, invalid };
 	}
 	get(monitorId: string): MonitorRecord | undefined {
-		return this.list().find((monitor) => monitor.monitorId === monitorId);
+		const row = this.#database.monitors.row(monitorId);
+		if (!row) return undefined;
+		try {
+			return rowToRecord(row, this.#database.core.metaGet(monitorReportToMetaKey(row.monitor_id)));
+		} catch {
+			return undefined;
+		}
 	}
 	update(params: MonitorUpdateParams): MonitorRecord | undefined {
 		if (!params || typeof params !== "object" || typeof params.monitorId !== "string" || !params.monitorId)
@@ -137,6 +191,10 @@ export class MonitorRegistry {
 			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
+			// A changed schedule is checked like a new one; an unchanged stored one is left as it is
+			// (so an operator can still disable or rename a monitor saved before this check).
+			if (updated.trigger.kind === "cron" && (schedule !== undefined || patch.trigger !== undefined))
+				validateCronSchedule(updated.trigger.schedule, updated.trigger.timezone);
 			const persisted = this.#database.monitors.update(tx, {
 				id: current.monitorId,
 				name: updated.name,
@@ -340,4 +398,8 @@ function localTimezone(): string {
 	const timezone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
 	if (!timezone) throw new Error("gateway local IANA timezone is unavailable");
 	return timezone;
+}
+
+function errorReason(error: unknown): string {
+	return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
 }

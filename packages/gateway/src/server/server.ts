@@ -2166,7 +2166,7 @@ async function handleRequest(
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitors, schedules },
+				result: { monitors, schedules, invalid: runtime.registry.invalid() },
 			});
 			return;
 		}
