@@ -64,11 +64,11 @@ On macOS, `bun run build` finishes with `scripts/sign-dist.sh`, which re-signs e
 
 Each adapter binary runs in the foreground. Discord and Slack `--help` and `--version` return without connecting. Every adapter acquires its own non-blocking home lease (`adapter-discord`, `adapter-slack`, or `adapter-telegram`) and refuses a second owner for the same `$GAJAEWAY_HOME`; no PID file decides ownership.
 
-The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.19.0`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
+The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.19.3`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
 
-The gateway's error contract is verified through GJC 0.19.x. Client preflight admits the package pin or newer, but this is not production runtime selection: the broker host requires exact equality with the package pin before spawning. A newer unverified minor raises `gjc_unverified_version`. Updating a host-global `gjc` does not upgrade the private runtime or an already-running broker. GJC 0.19.0 keeps a supervised foreground broker alive when idle; only detached autostart brokers reap themselves when abandoned. The gateway continues to use the public foreground command and owns shutdown through its service manager.
+The gateway's error contract is verified through GJC 0.19.x. Client preflight admits the package pin or newer, but this is not production runtime selection: the broker host requires exact equality with the package pin before spawning. A newer unverified minor raises `gjc_unverified_version`. Updating a host-global `gjc` does not upgrade the private runtime or an already-running broker. GJC 0.19.3 keeps a supervised foreground broker alive when idle; only detached autostart brokers reap themselves when abandoned. The gateway continues to use the public foreground command and owns shutdown through its service manager.
 
-GJC lifecycle hosts can detach into their own process groups (also in 0.18.12). Terminating the broker's group is not proof that every session host exited; Linux systemd adds a cgroup fence, while other supervisors need independent host-liveness evidence. Preserve the lifecycle ledger. In 0.19.0, `lifecycle_legacy_history_ambiguous` is an explicit admission fence: retain the original operation, key, target and pending intent for operator reconciliation; never rotate the key or infer no effect from a stopped host or empty transcript.
+GJC lifecycle hosts can detach into their own process groups (also in 0.18.12). Terminating the broker's group is not proof that every session host exited; Linux systemd adds a cgroup fence, while other supervisors need independent host-liveness evidence. Preserve the lifecycle ledger. In 0.19.3, `lifecycle_legacy_history_ambiguous` is an explicit admission fence: retain the original operation, key, target and pending intent for operator reconciliation; never rotate the key or infer no effect from a stopped host or empty transcript.
 
 The gateway and broker host pass `GJC_SDK_BROKER_AUTOSTART=0` to GJC child processes. GJC 0.18.9 and later honor this attach-only contract: a client that finds no live broker fails with `broker_unavailable` instead of spawning, retiring, or restarting one, and `gjc doctor` refuses broker restarts. The gateway refuses any GJC older than 0.18.9. The broker service runs the public foreground command `gjc sdk broker run --agent-dir <gjc.agentDir>` as its child; the broker never detaches, a live incumbent makes it exit 1 without being touched, and its exit code propagates to the service manager.
 
@@ -87,7 +87,7 @@ The updater stages the platform release, backs up replaced binaries, reads the s
 
 With `--no-restart`, stale service definitions for missing binaries are left alone so a healthy running process is not stopped during the staged update. The later `gajaeway ops restart-stack` stops and removes those stale services before restarting the installed stack.
 
-A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`; when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
+A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`. `services install|repair` installs and verifies the GJC pin from the checkout's `packages/gateway/package.json` (or, for a release install, the `package.json` beside the binaries) before writing service definitions, and fails if that install fails; it needs Bun for the package install. When running `gajaeway update` under Bun, pass `--bin-dir DIR`. The release update requires Bun to install the pinned GJC package.
 
 ### macOS upgrade from 0.1.x to 0.2.0
 
@@ -106,6 +106,19 @@ gajaeway ops restart-stack --status
 Before census, stop the gateway service and disable managed startup for the entire cutover window; follow [Explicit broker-authority cutover](runbooks/gajaeway-v1.md#explicit-broker-authority-cutover) and retain its census and cutover evidence. The final restart loads a missing macOS LaunchAgent from its plist, including `dev.gajaeway.broker` once its provision manifest exists.
 
 Check `schemaVersion` in the census report before cutover. This procedure requires the current schema 37; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
+
+### Upgrading from GJC 0.19.0
+
+GJC 0.19.0 appends every session-index rejection to `$GAJAEWAY_HOME/broker/agent/sdk/sessions/index-audit.jsonl` without a bound and reads the whole file each time a broker or session host starts. A large file makes those hosts unresponsive at startup, so no turns start (#752). GJC 0.19.3 bounds and rotates the log, but move an oversized file aside before the first 0.19.3 start. The log only seeds rejection de-duplication, so moving it does not affect the session index.
+
+```sh
+f="${GAJAEWAY_HOME:-$HOME/.gajaeway}/broker/agent/sdk/sessions/index-audit.jsonl"
+ls -lh "$f"
+# Stop the gateway service first, then:
+mv "$f" "$f.pre-0.19.3"
+```
+
+Then run `gajaeway update` and start the gateway service. Delete the moved file once the gateway is healthy.
 
 ## Home and configuration
 

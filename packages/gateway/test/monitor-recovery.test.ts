@@ -31,6 +31,7 @@ import {
 	MONITOR_EVENT_MAX_OPEN_AGE_MS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 } from "../src/store/groups/monitors";
+import type { WriteTx } from "../src/store/tx";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
 
@@ -1322,6 +1323,49 @@ describe("monitor crash-boundary state machine", () => {
 		expect(savedPointerAfterEmpty).toBeUndefined();
 	});
 
+	test("a stale attempt's pointer cleanup cannot erase a successor's reused pointer after its fence lands", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) =>
+			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "authoring-result" }))),
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		const pointerKey = `monitor_authoring_turn:${eventId}`;
+		// Attempt A's fenced write commits, then another process takes the expired
+		// lease and records the identical pointer for the same operation before A
+		// runs any further transaction.
+		let handover: { leaseId: string; raw: string } | undefined;
+		let successorPointer: string | undefined;
+		const fencedUpdate = db.monitors.eventFencedUpdate.bind(db.monitors);
+		db.monitors.eventFencedUpdate = (tx, id, leaseId, ...rest) => {
+			const landed = fencedUpdate(tx, id, leaseId, ...rest);
+			const raw = db.core.metaGet(pointerKey);
+			if (landed && id === eventId && rest[0] === "dispatched" && raw && !handover) handover = { leaseId, raw };
+			return landed;
+		};
+		const transaction = db.transaction.bind(db);
+		db.transaction = <T>(fn: (tx: WriteTx) => T): T => {
+			const result = transaction(fn);
+			const pending = handover;
+			if (pending && successorPointer === undefined) {
+				successorPointer = pending.raw;
+				transaction((tx) => {
+					db.monitors.eventReleaseLease(tx, eventId, pending.leaseId);
+					expect(db.monitors.eventAcquireLease(tx, eventId, "process-b", "lease-b", 60_000)).toBe(true);
+					db.core.metaSet(pointerKey, pending.raw);
+				});
+			}
+			return result;
+		};
+		await propagator.reconcile();
+		expect(successorPointer).toBeDefined();
+		expect(db.monitors.eventLiveLeaseOwner(eventId)).toBe("lease-b");
+		// B's recovery pointer survives A's cleanup.
+		expect(db.core.metaGet(pointerKey)).toBe(successorPointer);
+	});
+
 	test("a closing propagator starts no new dispatch from reconcile", async () => {
 		let turns = 0;
 		const {
@@ -1932,6 +1976,65 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			expect(db.monitors.eventRows().find((candidate) => candidate.event_id === seeded)?.stage).toBe(
 				"authored_no_delivery",
 			);
+			db.close();
+		} finally {
+			await rm(raceHome, { recursive: true, force: true });
+		}
+	});
+
+	test("a crash between batch rows' fenced writes leaves the shared authoring pointer whole", async () => {
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-batch-fence-"));
+		try {
+			const db = await Store.open(join(raceHome, "gateway.db"));
+			const registry = new MonitorRegistry(db);
+			const monitor = registry.add({
+				name: "batch-fence",
+				trigger: { kind: "cron", schedule: "30 6 * * *" },
+				eventTypes: ["memory.canonicalize"],
+				burstPolicy: "coalesce",
+				enabled: true,
+			});
+			const closure = new MemoryClosureQueue(db, raceHome);
+			await initializeMemory(raceHome);
+			const propagator = new MonitorPropagator({
+				database: db,
+				registry,
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) =>
+						JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "n" }))),
+				}),
+				memory: closure,
+				delivery: new DeliveryService(db),
+				emit: () => {},
+			});
+			// The process dies after the first row's fenced write: the second write throws.
+			let dispatchedWrites = 0;
+			let pointersAtCrash: Array<string | undefined> | undefined;
+			const ids: string[] = [];
+			const fencedUpdate = db.monitors.eventFencedUpdate.bind(db.monitors);
+			db.monitors.eventFencedUpdate = (tx, id, leaseId, stage, ...rest) => {
+				if (stage === "dispatched" && ++dispatchedWrites === 2) throw new Error("process killed mid-batch");
+				return fencedUpdate(tx, id, leaseId, stage, ...rest);
+			};
+			const transaction = db.transaction.bind(db);
+			db.transaction = <T>(fn: (tx: WriteTx) => T): T => {
+				try {
+					return transaction(fn);
+				} catch (error) {
+					if ((error as Error).message === "process killed mid-batch" && !pointersAtCrash)
+						pointersAtCrash = ids.map((id) => db.core.metaGet(`monitor_authoring_turn:${id}`));
+					throw error;
+				}
+			};
+			ids.push(propagator.submit(monitor.monitorId, "memory.canonicalize", { at: 1 }));
+			ids.push(propagator.submit(monitor.monitorId, "memory.canonicalize", { at: 2 }));
+			for (let attempt = 0; attempt < 100 && !pointersAtCrash; attempt++) await Bun.sleep(10);
+			await closure.drain();
+			expect(pointersAtCrash).toBeDefined();
+			// Both rows still carry the same shared pointer, so recovery can harvest the batch.
+			expect(pointersAtCrash?.[0]).toBeDefined();
+			expect(pointersAtCrash?.[0]).toBe(pointersAtCrash?.[1]);
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
