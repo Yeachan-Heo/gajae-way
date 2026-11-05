@@ -3,6 +3,8 @@ import type {
 	ChatReactResult,
 	ChatSendResult,
 	GatewayStatusResult,
+	OpsCancelInboundParams,
+	OpsCancelInboundResult,
 	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
@@ -337,6 +339,9 @@ export class GajaewayClient {
 	}
 	opsDeliveries(params: OpsDeliveriesParams = {}): Promise<OpsDeliveriesResult> {
 		return this.request("ops.deliveries", params);
+	}
+	opsCancelInbound(params: OpsCancelInboundParams): Promise<OpsCancelInboundResult> {
+		return this.request("ops.cancelInbound", params);
 	}
 
 	async close(): Promise<void> {
