@@ -3565,7 +3565,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
+		respond: async () => "[REPLY:1544704223634260038] threaded answer\n[BREAK]\nplain follow-up",
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -3590,13 +3590,13 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	}
 	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(2);
-	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "msg-42" });
+	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "1544704223634260038" });
 	expect(messages[1].payload.text).toBe("plain follow-up");
 	expect(messages[1].payload.replyToMessageId).toBeUndefined();
 	client.close();
 });
 
-test("[REPLY:invalid-id] strips invalid platform message IDs and delivers the text without replyTo (#763)", async () => {
+test("a non-snowflake Discord [REPLY:] target is dropped and the text still delivers (#763)", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -3611,7 +3611,6 @@ test("[REPLY:invalid-id] strips invalid platform message IDs and delivers the te
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		// Invalid Discord reply ID (not a valid snowflake)
 		respond: async () => "[REPLY:silent-none] hello",
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));

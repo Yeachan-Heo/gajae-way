@@ -3800,11 +3800,10 @@ async function createInboundTurnLifecycle(
 				planned.push({ body, post });
 				continue;
 			}
-			// Validate the reply target against the platform message ID shape.
-			// Strip invalid tokens to avoid platform delivery errors like Discord 50035.
-			if (replyTarget && !isValidPlatformMessageId(replyTarget, origin.platform)) {
+			// A malformed Discord reply target would fail the whole delivery; drop just the reference.
+			if (replyTarget && origin.platform === "discord" && !isDiscordSnowflake(replyTarget)) {
 				console.log(
-					`gateway reply_target_invalid origin=${originKey(origin)} invalid_id=${JSON.stringify(sanitizeDiagnostic(replyTarget).slice(0, 80))} platform=${origin.platform}; stripping the token`,
+					`gateway reply_target_invalid origin=${originKey(origin)} target=${JSON.stringify(sanitizeDiagnostic(replyTarget).slice(0, 80))}; delivering without the reference`,
 				);
 				replyTarget = undefined;
 			}
@@ -4765,27 +4764,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 	].join("\n");
 }
 /**
- * Validates a message ID against the platform-specific format.
- * Discord snowflakes: 17-20 digits
- * Slack ts: digits.digits (channel:timestamp)
- * Telegram: numeric ID
- * Other: defer to general isPlatformMessageId
+ * A Discord reply target must be a snowflake: Discord rejects anything else as 50035 Invalid Form
+ * Body before posting, which would lose the whole reply (#763).
  */
-function isValidPlatformMessageId(messageId: string, platform: string): boolean {
-	if (platform === "discord") {
-		// Discord snowflakes are 17-20 digit decimal numbers
-		return /^\d{17,20}$/.test(messageId);
-	}
-	if (platform === "slack") {
-		// Slack ts format: channel:timestamp or just timestamp
-		return /^(?:[A-Z][A-Z0-9]+:)?\d+\.\d+$/.test(messageId);
-	}
-	if (platform === "telegram") {
-		// Telegram message IDs are numeric
-		return /^\d+$/.test(messageId);
-	}
-	// For unknown platforms, use the general message ID validation
-	return isPlatformMessageId(messageId);
+function isDiscordSnowflake(value: string): boolean {
+	return /^\d{17,20}$/.test(value);
 }
 
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
