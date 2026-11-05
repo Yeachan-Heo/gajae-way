@@ -3800,6 +3800,14 @@ async function createInboundTurnLifecycle(
 				planned.push({ body, post });
 				continue;
 			}
+			// Validate the reply target against the platform message ID shape.
+			// Strip invalid tokens to avoid platform delivery errors like Discord 50035.
+			if (replyTarget && !isValidPlatformMessageId(replyTarget, origin.platform)) {
+				console.log(
+					`gateway reply_target_invalid origin=${originKey(origin)} invalid_id=${JSON.stringify(sanitizeDiagnostic(replyTarget).slice(0, 80))} platform=${origin.platform}; stripping the token`,
+				);
+				replyTarget = undefined;
+			}
 			const replyTo = replyTarget || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
@@ -4756,6 +4764,30 @@ export function currentConversationNotice(origin: OriginRef): string {
 		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
 }
+/**
+ * Validates a message ID against the platform-specific format.
+ * Discord snowflakes: 17-20 digits
+ * Slack ts: digits.digits (channel:timestamp)
+ * Telegram: numeric ID
+ * Other: defer to general isPlatformMessageId
+ */
+function isValidPlatformMessageId(messageId: string, platform: string): boolean {
+	if (platform === "discord") {
+		// Discord snowflakes are 17-20 digit decimal numbers
+		return /^\d{17,20}$/.test(messageId);
+	}
+	if (platform === "slack") {
+		// Slack ts format: channel:timestamp or just timestamp
+		return /^(?:[A-Z][A-Z0-9]+:)?\d+\.\d+$/.test(messageId);
+	}
+	if (platform === "telegram") {
+		// Telegram message IDs are numeric
+		return /^\d+$/.test(messageId);
+	}
+	// For unknown platforms, use the general message ID validation
+	return isPlatformMessageId(messageId);
+}
+
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
 function isSlackMessageId(value: string): boolean {
 	return /^[A-Z][A-Z0-9]+:\d+\.\d+$/.test(value);

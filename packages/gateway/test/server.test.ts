@@ -3596,6 +3596,54 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	client.close();
 });
 
+test("[REPLY:invalid-id] strips invalid platform message IDs and delivers the text without replyTo (#763)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		// Invalid Discord reply ID (not a valid snowflake)
+		respond: async () => "[REPLY:silent-none] hello",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "dm",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			messageId: "m-1",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 1) break;
+		await Bun.sleep(5);
+	}
+	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	// The message is delivered, but without the invalid reply reference
+	expect(messages).toHaveLength(1);
+	expect(messages[0].payload.text).toBe("hello");
+	// Crucially, replyToMessageId must NOT be set to the invalid ID
+	expect(messages[0].payload.replyToMessageId).toBeUndefined();
+	client.close();
+});
+
 test("work.run runs a named worker session in the requested cwd and returns the text", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

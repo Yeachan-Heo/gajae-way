@@ -907,6 +907,51 @@ function endDiscordWorkingState(
 		);
 }
 
+/**
+ * Sends a Discord message with reply reference support. The actual sending logic
+ * extracted to support retry without reply reference on 50035 errors.
+ */
+async function sendDiscordMessageWithRetry(
+	channel: DiscordTextChannelLike,
+	chunks: readonly string[],
+	files: readonly FileRef[],
+	message: ChatMessagePayload,
+	notice: string | undefined,
+): Promise<void> {
+	if (files.length > 0 && chunks.length === 0) {
+		const reply =
+			message.replyToMessageId && !notice
+				? { messageReference: message.replyToMessageId, failIfNotExists: false }
+				: undefined;
+		await channel.send({
+			files,
+			content: chunks[0] ?? "",
+			...(reply ? { reply } : {}),
+		});
+	} else {
+		for (let index = 0; index < chunks.length; index++) {
+			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+			// deleted target from failing the whole delivery.
+			const chunk = chunks[index] as string;
+			// A reply reference points into the thread, so it is dropped on parent fallback.
+			if (index === 0 && files.length > 0)
+				await channel.send({
+					content: chunk,
+					files,
+					...(message.replyToMessageId && !notice
+						? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
+						: {}),
+				});
+			else if (index === 0 && message.replyToMessageId && !notice)
+				await channel.send({
+					content: chunk,
+					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+				});
+			else await channel.send(chunk);
+		}
+	}
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -940,37 +985,22 @@ export async function settleDiscordDelivery(
 		const chunks = text === "" ? [] : chunkDiscordMessage(text);
 		const files = mediaResult.attachments;
 		try {
-			if (files.length > 0 && chunks.length === 0) {
-				const reply =
-					message.replyToMessageId && !notice
-						? { messageReference: message.replyToMessageId, failIfNotExists: false }
-						: undefined;
-				await channel.send({
-					files,
-					content: chunks[0] ?? "",
-					...(reply ? { reply } : {}),
-				});
+			await sendDiscordMessageWithRetry(channel, chunks, files, message, notice);
+		} catch (sendError) {
+			// If we get a 50035 Invalid Form Body error related to message_reference,
+			// retry once without the reply reference as defensive recovery (issue #763).
+			if (
+				message.replyToMessageId &&
+				sendError instanceof Error &&
+				sendError.message.includes("50035")
+			) {
+				console.log(
+					`discord delivery 50035 error with replyToMessageId=${message.replyToMessageId}, retrying without reply reference`,
+				);
+				message.replyToMessageId = undefined;
+				await sendDiscordMessageWithRetry(channel, chunks, files, message, notice);
 			} else {
-				for (let index = 0; index < chunks.length; index++) {
-					// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-					// deleted target from failing the whole delivery.
-					const chunk = chunks[index] as string;
-					// A reply reference points into the thread, so it is dropped on parent fallback.
-					if (index === 0 && files.length > 0)
-						await channel.send({
-							content: chunk,
-							files,
-							...(message.replyToMessageId && !notice
-								? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
-								: {}),
-						});
-					else if (index === 0 && message.replyToMessageId && !notice)
-						await channel.send({
-							content: chunk,
-							reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-						});
-					else await channel.send(chunk);
-				}
+				throw sendError;
 			}
 		} finally {
 			if (!message.final) typing?.refresh(message.origin.conversationId);

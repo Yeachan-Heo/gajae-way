@@ -788,6 +788,42 @@ test("a reply-threaded delivery threads its first chunk and only its first chunk
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
+test("Discord 50035 Invalid Form Body error with message_reference retries without the reply (#763)", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const payloads: unknown[] = [];
+	let attemptCount = 0;
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: unknown) => {
+					attemptCount++;
+					// First attempt with reply reference fails with 50035
+					if (attemptCount === 1 && payload && typeof payload === "object" && "reply" in payload) {
+						const error = new Error(
+							"Invalid Form Body\n  message_reference: Value \"invalid-id\" is not snowflake.",
+						);
+						(error as any).code = 50035;
+						throw error;
+					}
+					// Subsequent attempts succeed
+					payloads.push(payload);
+				},
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, {
+		...delivery("hello world"),
+		replyToMessageId: "invalid-id",
+	});
+	// Verify retry succeeded: one payload sent (the retry without reply)
+	expect(payloads).toHaveLength(1);
+	expect(payloads[0]).toEqual({
+		content: "hello world",
+		// Reply reference should be absent in the successful retry
+	});
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
 test("delivery subscription filters non-Discord and missing delivery ids", async () => {
 	let handler: ((message: ChatMessagePayload) => void) | undefined;
 	const requests: Array<{ verb: string; params: unknown }> = [];
