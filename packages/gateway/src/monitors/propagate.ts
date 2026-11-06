@@ -1434,10 +1434,10 @@ export class MonitorPropagator {
 										opRef: prior.opRef,
 									});
 									const state = report.status?.status;
-									if (state === "failed" || state === "unknown" || typeof state === "undefined") {
-										// Explicit failure or unknown status permits fresh authoring (#742)
+									if (state === "failed") {
+										// Explicit failure permits fresh authoring
 									} else {
-										// Other states (running, accepted, terminal_ok, etc): hold the pointer
+										// Unknown status, throwing, or other states: hold the pointer (#742)
 										shouldThrowOutputPending = true;
 										break;
 									}
@@ -1498,9 +1498,21 @@ export class MonitorPropagator {
 									// A terminally failed turn permits a fresh prompt.
 									eventIdsToForget.push(row.event_id);
 								} else if (state === "unknown" || typeof state === "undefined") {
-									// Unknown status after session roll: old session context no longer applies.
-									// Forget the old pointer and allow fresh authoring (#742).
-									eventIdsToForget.push(row.event_id);
+									// Unknown status: hold pointer for operator judgement (#742).
+									// Exception: explicit failure rolls invalidate old session context and allow fresh authoring.
+									const lastRoll = this.#safetyState(sessionOriginKey).lastRoll;
+									if (
+										lastRoll === "session_submission_wedged" ||
+										lastRoll === "session_busy_stalled" ||
+										lastRoll === "session_prior_run_busy_stalled" ||
+										lastRoll === "session_host_unavailable"
+									) {
+										// Explicit failure roll: old context is invalid, forget the pointer
+										eventIdsToForget.push(row.event_id);
+									} else {
+										// Size roll or other reasons: hold pointer
+										throw new AuthoringResultUnavailableError("output_pending");
+									}
 								} else {
 									// Other inconclusive status: hold pointer
 									throw new AuthoringResultUnavailableError("output_pending");
