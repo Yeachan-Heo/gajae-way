@@ -1434,12 +1434,13 @@ export class MonitorPropagator {
 										opRef: prior.opRef,
 									});
 									const state = report.status?.status;
-									if (state !== "failed") {
-										// Not explicitly failed: hold the pointer
+									if (state === "failed" || state === "unknown" || typeof state === "undefined") {
+										// Explicit failure or unknown status permits fresh authoring (#742)
+									} else {
+										// Other states (running, accepted, terminal_ok, etc): hold the pointer
 										shouldThrowOutputPending = true;
 										break;
 									}
-									// Explicit failure: allow fresh authoring (don't set shouldThrowOutputPending)
 								} catch {
 									// Unable to check status: hold the pointer instead
 									shouldThrowOutputPending = true;
@@ -1505,11 +1506,25 @@ export class MonitorPropagator {
 									throw new AuthoringResultUnavailableError("output_pending");
 								}
 							} catch (error) {
-								// Unreadable status in old session: hold (don't forget), keep the pointer.
-								if (!(error instanceof AuthoringResultUnavailableError)) {
-									throw new AuthoringResultUnavailableError("output_pending");
+								// Unreadable status in old session after explicit failure roll: forget the pointer (#742/#738).
+								// Failure codes (session_*_stalled, session_submission_wedged, session_host_unavailable)
+								// are definitive reasons to roll. The old session context is invalid.
+								const lastRoll = this.#safetyState(sessionOriginKey).lastRoll;
+								if (
+									lastRoll === "session_submission_wedged" ||
+									lastRoll === "session_busy_stalled" ||
+									lastRoll === "session_prior_run_busy_stalled" ||
+									lastRoll === "session_host_unavailable"
+								) {
+									// Explicit failure roll: forget the old pointer
+									eventIdsToForget.push(row.event_id);
+								} else {
+									// Other errors (size roll, unknown reason): hold the pointer
+									if (!(error instanceof AuthoringResultUnavailableError)) {
+										throw new AuthoringResultUnavailableError("output_pending");
+									}
+									throw error;
 								}
-								throw error;
 							}
 						}
 					}
