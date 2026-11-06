@@ -1425,9 +1425,26 @@ export class MonitorPropagator {
 								JSON.stringify([sessionId, prior.opRef]),
 							);
 							if (!isBrokerPromptBusyRefusal(brokerOp)) {
-								// No positive never-admitted evidence: hold the pointer instead
-								shouldThrowOutputPending = true;
-								break;
+								// No positive never-admitted evidence: check actual status.
+								// Explicit failure permits fresh authoring; unknown status holds the pointer.
+								try {
+									const report = await this.#sessionPort.status({
+										sessionId,
+										repo: this.#repo,
+										opRef: prior.opRef,
+									});
+									const state = report.status?.status;
+									if (state !== "failed") {
+										// Not explicitly failed: hold the pointer
+										shouldThrowOutputPending = true;
+										break;
+									}
+									// Explicit failure: allow fresh authoring (don't set shouldThrowOutputPending)
+								} catch {
+									// Unable to check status: hold the pointer instead
+									shouldThrowOutputPending = true;
+									break;
+								}
 							}
 						}
 					}
@@ -1479,9 +1496,12 @@ export class MonitorPropagator {
 								if (state === "failed") {
 									// A terminally failed turn permits a fresh prompt.
 									eventIdsToForget.push(row.event_id);
+								} else if (state === "unknown" || typeof state === "undefined") {
+									// Unknown status after session roll: old session context no longer applies.
+									// Forget the old pointer and allow fresh authoring (#742).
+									eventIdsToForget.push(row.event_id);
 								} else {
-									// Unknown or otherwise inconclusive status is not evidence that the old
-									// authoring turn was never admitted.
+									// Other inconclusive status: hold pointer
 									throw new AuthoringResultUnavailableError("output_pending");
 								}
 							} catch (error) {
