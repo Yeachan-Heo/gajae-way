@@ -10,8 +10,9 @@ import {
 	personaTurnOpRef,
 	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
+import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { ScriptedSessionPort, type ScriptedTailHandle } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -538,6 +539,124 @@ test("an escalated hold whose status is only transiently unreadable keeps holdin
 		expect(reads).toBeGreaterThanOrEqual(60);
 		expect(reads).toBeLessThanOrEqual(64);
 		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("relay unavailable escalation measures time from the first failure, not the latest, even with frequent retries (#766)", async () => {
+	const clock = new VirtualClock();
+	const heldMs = 10 * MINUTE; // Hold will escalate after 10 minutes
+	const f = await heldOrigin("relay-unavailable-timestamp", { heldForMs: heldMs, live: true, clock });
+	// Seed accepted operation before recovery so status checks can exercise relay path (#766)
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	try {
+		await f.manager.recover();
+
+		let escalationNotices = f.notices.length;
+		const status = f.port.status.bind(f.port);
+		const relayUnavailableMs = 30_000; // Probe every 30 seconds to make test ~5s on darwin
+		// With 11 minute duration and 30s intervals: ~22 reconciles, proving relay unavailable
+		// evidence is tracked from first failure, not latest.
+
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			const isRelay = input.relay !== undefined;
+			if (isRelay) {
+				// Simulate relay transport failure with the real error type production code recognizes
+				throw new RelayClosedError(f.binding.sessionId, "relay unavailable", false);
+			}
+			return await status(input);
+		};
+
+		// Advance by 11 minutes with relay failures to meet the escalation threshold.
+		// The relay status is probed every ~250ms at the start of reconciliation, so many retries occur.
+		// Since relay failures start immediately, after 10+ minutes the relay unavailable evidence
+		// will span >= 10 minutes and trigger escalation on a live host.
+		for (let i = 0; i < 11; i++) {
+			for (let j = 0; j < MINUTE / relayUnavailableMs; j++) {
+				await clock.advance(relayUnavailableMs);
+				await f.manager.reconcile(f.originKey);
+			}
+		}
+
+		// Escalation must occur with exactly one notice with the right reason
+		expect(f.notices.length).toBe(escalationNotices + 1);
+		expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
+
+		// Advance further to verify escalation does not fire again
+		const noticesAfterEscalation = f.notices.length;
+		for (let i = 0; i < 5; i++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+
+		expect(f.notices.length).toBe(noticesAfterEscalation);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a dead relay (onRelayDead) followed only by CLI-only status probes still escalates after unresolvedHoldMs (#766)", async () => {
+	const clock = new VirtualClock();
+	const heldMs = 10 * MINUTE; // Hold will escalate after 10 minutes
+	const f = await heldOrigin("relay-dead-escalation", { heldForMs: heldMs, live: true, clock });
+	// Seed accepted operation before recovery so status checks can exercise relay path (#766)
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	try {
+		await f.manager.recover();
+
+		// Exercise the relay-death callback to set bound.detached = true (#766).
+		// After onRelayDead, statusOf must record relay unavailable evidence via CLI-only probes.
+		const relayHandles = f.port.getTailHandles(f.binding.sessionId);
+		const handle = [...relayHandles][0] as ScriptedTailHandle | undefined;
+		expect(handle).toBeDefined();
+		let escalationNotices = f.notices.length;
+
+		// Trigger the relay death callback; this sets bound.detached and records relay unavailable evidence.
+		handle!.die();
+		await clock.advance(0); // Let async work settle
+
+		// After relay death, only CLI-only status probes can check the operation.
+		const status = f.port.status.bind(f.port);
+		const relayUnavailableMs = 30_000; // Probe every 30 seconds
+		let cliProbeCount = 0;
+
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			const isRelay = input.relay !== undefined;
+			if (isRelay) {
+				// After onRelayDead, the bound should be detached and no relay probe should happen.
+				throw new Error("relay probe should not happen after onRelayDead");
+			}
+			cliProbeCount++;
+			return await status(input);
+		};
+
+		// Advance by 11 minutes with CLI-only status probes.
+		// Escalation should trigger based on relay unavailable evidence recorded at death.
+		for (let i = 0; i < 11; i++) {
+			for (let j = 0; j < MINUTE / relayUnavailableMs; j++) {
+				await clock.advance(relayUnavailableMs);
+				await f.manager.reconcile(f.originKey);
+			}
+		}
+
+		// Verify CLI-only probes were used (no relay probes after death)
+		expect(cliProbeCount).toBeGreaterThan(0);
+
+		// Escalation must occur exactly once with the right reason.
+		// It escalates because relay unavailable evidence is >= unresolvedHoldMs old.
+		expect(f.notices.length).toBe(escalationNotices + 1);
+		expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
+
+		// Verify no second escalation
+		const noticesAfterEscalation = f.notices.length;
+		for (let i = 0; i < 5; i++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.notices.length).toBe(noticesAfterEscalation);
 	} finally {
 		await f.manager.stop();
 	}

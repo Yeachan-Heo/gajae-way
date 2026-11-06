@@ -1059,8 +1059,12 @@ export interface SilentOriginView {
 	/** Oldest unanswered platform message on the origin. */
 	readonly oldestMessageId: string;
 	readonly oldestPendingAgeMs: number;
-	/** Unanswered messages older than the threshold. */
+	/** Unanswered platform messages older than the threshold. */
 	readonly unanswered: number;
+	/** Pending lane report backlog (internal diagnostic messages, not user messages). */
+	readonly pendingLaneReports?: number;
+	/** Oldest pending lane report when the backlog exceeds the threshold (#766). */
+	readonly oldestLaneReportAgeMs?: number;
 	/** The nonterminal trigger that owns the origin's current epoch; null when none is bound. */
 	readonly blockingOpRef: string | null;
 	readonly holdReason: OriginHoldReason;

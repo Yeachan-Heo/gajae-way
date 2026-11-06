@@ -136,6 +136,11 @@ function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
 }
 
+/** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
+function relayUnavailableTrackerKey(opRef: string): string {
+	return `relay_unavailable:${opRef}`;
+}
+
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
 
 /**
@@ -267,6 +272,8 @@ function completeInboundTurn(
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
+	// Clean up relay unavailability tracker when turn completes (#766)
+	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	return changed;
 }
 
@@ -1746,10 +1753,15 @@ class OriginActor {
 		if (heldMs < this.#manager.unresolvedHoldMs) return false;
 		const sessionId = bound?.sessionId ?? turn.sessionId;
 		if (!sessionId) return false;
-		// Only a dead host is evidence the op will not settle by itself; an
-		// unanswerable probe is not.
+		// Check for relay unavailable evidence even if the host is live (#766).
+		// A live host whose relay is unresponsive should escalate if the evidence spans long enough.
+		const relayTrackerTs = database.core.metaGet(relayUnavailableTrackerKey(turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
 		const host = await this.#bindingState(sessionId);
-		if (host.live !== false && host.disowned !== true) return false;
+		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
 		// A turn recovery never adopted carries no status verdict yet.
 		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
 		const trigger = database.inbox.turnRow(turn.opRef);
@@ -3784,6 +3796,12 @@ class OriginActor {
 			// for commands. Keeping a closed handle here made status throw forever.
 			bound.tail = undefined;
 			bound.detached = true;
+			// Record first-outage time on relay death to detect unresponsive relays (#766).
+			// This ensures statusOf records evidence even on the CLI-only path after detach.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 		}
 		if (!bound.tailEvidenceUnavailable) {
 			bound.tailEvidenceUnavailable = true;
@@ -4009,13 +4027,23 @@ class OriginActor {
 		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
 		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
 		try {
-			return await this.#manager.port.status({ ...base, relay: bound.tail });
+			const report = await this.#manager.port.status({ ...base, relay: bound.tail });
+			// Clear relay unavailable tracker on successful relay/status answer (#766)
+			this.#manager.database.core.metaDelete(relayUnavailableTrackerKey(bound.turn.opRef));
+			return report;
 		} catch (error) {
 			if (!isRelayTransportFailure(error)) throw error;
 			this.#manager.log(
 				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 				"error",
 			);
+			// Track relay unavailable evidence to detect unresponsive relays on live hosts (#766).
+			// Record only the first unavailable timestamp for the current unavailability streak;
+			// it is cleared on successful relay/status answer and scoped per op so it cannot leak.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 			return await this.#manager.port.status(base);
 		}
 	}
@@ -4058,7 +4086,12 @@ class OriginActor {
 			this.#scheduleStatusRecheck(bound);
 			return;
 		}
-		if (report.status.status === "unknown") {
+		// Check for relay unavailable evidence even with "in_flight" status (#766).
+		const relayTrackerTs = this.#manager.database.core.metaGet(relayUnavailableTrackerKey(bound.turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		if (report.status.status === "unknown" || (report.status.status === "in_flight" && hasRelayUnavailableEvidence)) {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
@@ -4072,7 +4105,9 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown", `sweeps=${count}`);
+			const reason =
+				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
+			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}

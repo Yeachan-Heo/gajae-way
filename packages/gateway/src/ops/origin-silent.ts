@@ -34,7 +34,16 @@ export function findSilentOrigins(
 	thresholdMs: number = ORIGIN_SILENT_MS,
 ): SilentOriginView[] {
 	const cutoff = new Date(nowMs - thresholdMs).toISOString();
-	const byOrigin = new Map<string, { oldestMessageId: string; oldestReceivedAt: string; unanswered: number }>();
+	const byOrigin = new Map<
+		string,
+		{
+			oldestMessageId: string;
+			oldestReceivedAt: string;
+			unanswered: number;
+			oldestLaneReportReceivedAt?: string;
+			pendingLaneReports: number;
+		}
+	>();
 	for (const row of database.inbox.unansweredMessages(cutoff)) {
 		if (inMutedThread(database, row)) continue;
 		const entry = byOrigin.get(row.origin_key);
@@ -44,11 +53,32 @@ export function findSilentOrigins(
 				oldestMessageId: row.message_id,
 				oldestReceivedAt: row.received_at,
 				unanswered: 1,
+				pendingLaneReports: 0,
 			});
+	}
+	// Lane reports stuck past the threshold also contribute to origin_silent (#766)
+	// Track separately from user messages per P2-2 requirement
+	for (const row of database.inbox.unansweredLaneReports(cutoff)) {
+		const entry = byOrigin.get(row.origin_key);
+		if (entry) {
+			entry.pendingLaneReports += 1;
+			// Update oldest lane report only if not already set or if this is older
+			if (!entry.oldestLaneReportReceivedAt || row.received_at < entry.oldestLaneReportReceivedAt) {
+				entry.oldestLaneReportReceivedAt = row.received_at;
+			}
+		} else {
+			byOrigin.set(row.origin_key, {
+				oldestMessageId: row.message_id,
+				oldestReceivedAt: row.received_at,
+				unanswered: 0,
+				oldestLaneReportReceivedAt: row.received_at,
+				pendingLaneReports: 1,
+			});
+		}
 	}
 	return [...byOrigin].map(([originKey, entry]) => {
 		const block = blockingTurn(database, originKey);
-		return {
+		const baseResult = {
 			originKey,
 			oldestMessageId: entry.oldestMessageId,
 			oldestPendingAgeMs: Math.max(0, nowMs - Date.parse(entry.oldestReceivedAt)),
@@ -56,6 +86,14 @@ export function findSilentOrigins(
 			blockingOpRef: block.opRef,
 			holdReason: block.reason,
 		};
+		if (entry.pendingLaneReports > 0 && entry.oldestLaneReportReceivedAt) {
+			return {
+				...baseResult,
+				pendingLaneReports: entry.pendingLaneReports,
+				oldestLaneReportAgeMs: Math.max(0, nowMs - Date.parse(entry.oldestLaneReportReceivedAt)),
+			};
+		}
+		return baseResult;
 	});
 }
 
@@ -189,9 +227,19 @@ export class OriginSilentAlerter {
 }
 
 function silentNotice(origin: SilentOriginView): string {
-	const minutes = Math.floor(origin.oldestPendingAgeMs / 60_000);
 	const op = origin.blockingOpRef ? ` op=${origin.blockingOpRef}` : "";
-	return `[origin silent] ${displayKey(origin.originKey)} 사용자 메시지 ${origin.unanswered}건이 ${minutes}분째 응답이 없습니다. reason=${origin.holdReason}${op}. 확인: gajaeway ops cycle`;
+	// Render user messages when present
+	if (origin.unanswered > 0) {
+		const minutes = Math.floor(origin.oldestPendingAgeMs / 60_000);
+		return `[origin silent] ${displayKey(origin.originKey)} 사용자 메시지 ${origin.unanswered}건이 ${minutes}분째 응답이 없습니다. reason=${origin.holdReason}${op}. 확인: gajaeway ops cycle`;
+	}
+	// Render lane report backlog when user messages are not present
+	if (origin.pendingLaneReports && origin.pendingLaneReports > 0 && origin.oldestLaneReportAgeMs !== undefined) {
+		const minutes = Math.floor(origin.oldestLaneReportAgeMs / 60_000);
+		return `[origin silent] ${displayKey(origin.originKey)} 내부 lane report ${origin.pendingLaneReports}건이 ${minutes}분째 응답이 없습니다. reason=${origin.holdReason}${op}. 확인: gajaeway ops cycle`;
+	}
+	// Fallback: should not happen, but be explicit
+	return `[origin silent] ${displayKey(origin.originKey)} no pending messages. reason=${origin.holdReason}${op}`;
 }
 
 function displayKey(originKey: string): string {
