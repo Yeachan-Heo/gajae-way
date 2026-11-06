@@ -555,10 +555,9 @@ test("relay unavailable escalation measures time from the first failure, not the
 
 		let escalationNotices = f.notices.length;
 		const status = f.port.status.bind(f.port);
-		const relayUnavailableMs = 1_000; // Probe every 1 second (reduced from 500ms to fix darwin-arm64 timeout #766)
-		// This halves the iterations from ~1320 to ~660, making the test 50% faster.
-		// Still probes more frequently than unresolvedHoldMs (10 minutes), so it still proves
-		// that relay unavailable evidence is tracked from first failure, not latest.
+		const relayUnavailableMs = 30_000; // Probe every 30 seconds to make test ~5s on darwin
+		// With 11 minute duration and 30s intervals: ~22 reconciles, proving relay unavailable
+		// evidence is tracked from first failure, not latest.
 
 		f.port.status = async (input) => {
 			if (input.opRef !== f.heldOpRef) return await status(input);
@@ -581,15 +580,9 @@ test("relay unavailable escalation measures time from the first failure, not the
 			}
 		}
 
-		// The test verifies that with the correct RelayClosedError type, relay unavailable evidence
-		// is properly recorded for later escalation checks. The virtual clock makes timing deterministic.
-		// When escalation occurs (which may happen on any reconciliation depending on turn lifecycle),
-		// it must be exactly one escalation with the correct reason.
-		if (f.notices.length > escalationNotices) {
-			// Escalation occurred: verify it's exactly one notice with the right reason
-			expect(f.notices.length).toBe(escalationNotices + 1);
-			expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
-		}
+		// Escalation must occur with exactly one notice with the right reason
+		expect(f.notices.length).toBe(escalationNotices + 1);
+		expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
 
 		// Advance further to verify escalation does not fire again
 		const noticesAfterEscalation = f.notices.length;
@@ -615,7 +608,7 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 
 		let escalationNotices = f.notices.length;
 		const status = f.port.status.bind(f.port);
-		const relayUnavailableMs = 1_000; // Probe every 1 second
+		const relayUnavailableMs = 30_000; // Probe every 30 seconds
 		let relayProbeCount = 0;
 
 		f.port.status = async (input) => {
@@ -639,13 +632,11 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 		}
 
 		// Verify the relay was probed multiple times during the test
-		expect(relayProbeCount).toBeGreaterThan(50);
+		expect(relayProbeCount).toBeGreaterThan(10);
 
-		// When escalation occurs, verify it's exactly one notice with the right reason
-		if (f.notices.length > escalationNotices) {
-			expect(f.notices.length).toBe(escalationNotices + 1);
-			expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
-		}
+		// Escalation must occur with exactly one notice with the right reason
+		expect(f.notices.length).toBe(escalationNotices + 1);
+		expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
 
 		// Verify no second escalation
 		const noticesAfterEscalation = f.notices.length;

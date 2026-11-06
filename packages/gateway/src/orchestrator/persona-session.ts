@@ -4086,7 +4086,12 @@ class OriginActor {
 			this.#scheduleStatusRecheck(bound);
 			return;
 		}
-		if (report.status.status === "unknown") {
+		// Check for relay unavailable evidence even with "in_flight" status (#766).
+		const relayTrackerTs = this.#manager.database.core.metaGet(relayUnavailableTrackerKey(bound.turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		if (report.status.status === "unknown" || (report.status.status === "in_flight" && hasRelayUnavailableEvidence)) {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
@@ -4100,7 +4105,8 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown", `sweeps=${count}`);
+			const reason = report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
+			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
