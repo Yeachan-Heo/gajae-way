@@ -2034,13 +2034,13 @@ async function handleRequest(
 			} catch {
 				// Invalid origin format: fail closed with empty choices
 			}
-			
+
 			// If no origin was provided or validated, return empty choices (context-free requests get no catalog).
 			if (!origin) {
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices: [] } });
 				return;
 			}
-			
+
 			const threadFollowUp =
 				origin.kind === "thread" && threadFollowUpEngaged(origin, originKey(origin), options.database.inbox);
 			if (!commandAuthorised(origin, runtime.config, params?.engagement, threadFollowUp)) {

@@ -24,6 +24,7 @@ import {
 	type OriginRef,
 	PROFILE_VERSION,
 	ProtocolError,
+	SUPPORTED_PROFILE_VERSIONS,
 } from "@gajae-gateway/protocol";
 
 type EventHandler = (payload: unknown, frame: Frame) => void;
@@ -379,7 +380,7 @@ export class GajaewayClient {
 					v: PROFILE_VERSION,
 					type: "hello",
 					payload: {
-						supportedVersions: [PROFILE_VERSION],
+						supportedVersions: [...SUPPORTED_PROFILE_VERSIONS].reverse(),
 						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
 					},
 				})

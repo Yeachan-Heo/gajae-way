@@ -390,3 +390,52 @@ test("an abort during negotiation rejects promptly and releases the connection",
 		},
 	);
 });
+
+test("client negotiates 1.0 profile with a server that only supports 0.1 and 1.0", async () => {
+	let negotiatedProfile: string | undefined;
+	await withSocket(
+		(socket, frame) => {
+			if (frame.type === "hello") {
+				const hello = frame as { payload?: { supportedVersions?: unknown[] } };
+				const clientVersions = (hello.payload?.supportedVersions as string[]) ?? [];
+				// Verify client advertises multiple versions
+				expect(clientVersions.length).toBeGreaterThan(1);
+				// Server only supports 0.1 and 1.0, should pick 1.0 (highest mutual)
+				const mutual = clientVersions.filter((v) => ["0.1", "1.0"].includes(v));
+				negotiatedProfile = [...mutual]
+					.sort((a, b) => {
+						const pa = a.split(".").map(Number);
+						const pb = b.split(".").map(Number);
+						for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+							const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+							if (d !== 0) return d;
+						}
+						return 0;
+					})
+					.at(-1);
+				socket.write(`${JSON.stringify({
+					v: negotiatedProfile,
+					type: "negotiated",
+					payload: { profileVersion: negotiatedProfile, capabilities: [] },
+				})}
+`);
+			}
+			if (frame.type === "request") {
+				socket.write(`${JSON.stringify({
+					v: negotiatedProfile,
+					type: "response",
+					id: frame.id,
+					result: "test-response",
+				})}
+`);
+			}
+		},
+		async (path) => {
+			const client = await GajaewayClient.connectSocket(path);
+			const result = await client.request<string>("test.verb");
+			expect(result).toBe("test-response");
+			expect(negotiatedProfile).toBe("1.0");
+			await client.close();
+		},
+	);
+});
