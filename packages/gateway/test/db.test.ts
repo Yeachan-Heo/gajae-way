@@ -5,13 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { type DatabaseStartupError, Store } from "../src/store";
+import { type DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
 test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await Store.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(39);
+		expect(database.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 		database.transaction((tx) =>
 			database.memory.createIntent(tx, { id: "memory-schema", kind: "daily_capture", payloadJson: "{}" }),
@@ -166,7 +166,7 @@ test("adds quarantine diagnostics to existing memory intents", async () => {
 		legacy.close();
 
 		const migrated = await Store.open(path);
-		expect(migrated.schemaVersion).toBe(39);
+		expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		expect(migrated.memory.rows()[0]).toMatchObject({
 			id: "legacy-intent",
 			state: "queued",

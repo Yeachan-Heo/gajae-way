@@ -7,7 +7,7 @@ import type {
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
-	MonitorSpec,
+	MonitorUpdateParams,
 	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
@@ -179,7 +179,7 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 	const [monitorId, ...options] = args;
 	if (!monitorId || monitorId.startsWith("--") || options.length === 0) throw new Error(MONITOR_UPDATE_USAGE);
 
-	let jsonPatch: Partial<MonitorSpec> | undefined;
+	let jsonPatch: Omit<MonitorUpdateParams, "monitorId"> | undefined;
 	let schedule: string | undefined;
 	let enabled: boolean | undefined;
 	for (let i = 0; i < options.length; i++) {
@@ -195,7 +195,7 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 				throw new Error(MONITOR_UPDATE_USAGE);
 			}
 			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(MONITOR_UPDATE_USAGE);
-			jsonPatch = parsed as Partial<MonitorSpec>;
+			jsonPatch = parsed as Omit<MonitorUpdateParams, "monitorId">;
 		} else if (option === "--schedule") {
 			const value = options[++i];
 			if (schedule !== undefined || !value || value.startsWith("--")) throw new Error(MONITOR_UPDATE_USAGE);

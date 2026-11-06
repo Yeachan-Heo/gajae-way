@@ -348,9 +348,13 @@ export type WorkerOutputResult =
 	| {
 			readonly status: "unavailable";
 			readonly code: "output_unavailable" | "invalid_evidence" | "identity_mismatch" | "incomplete_body" | "cancelled";
+			/** Only an identity-validated terminal receipt explicitly declaring absence. */
+			readonly definitiveLoss?: true;
 	  };
 
 export interface SessionRequestInput extends SessionSendInput {
+	/** Best-effort post-turn context sampling. Off unless explicitly requested. */
+	readonly sampleContext?: boolean;
 	/** Stable caller identity carried into tail observability. */
 	readonly originKey?: string;
 	/**
@@ -412,6 +416,7 @@ export interface SessionRequestResult {
 	readonly receipt: SendReceipt;
 	readonly status: StatusReport;
 	readonly assistant: LastAssistantResult;
+	readonly contextUsage?: SessionContextUsage;
 }
 
 export class SessionRequestTimeoutError extends Error {
@@ -2085,14 +2090,25 @@ export class BrokerSessionPort implements SessionPort {
 			// projection before consuming an assistant response as this answer.
 			if (projectOpState(status.status) !== "completed")
 				throw markSessionRequestStep(new SessionTerminalError(status), "status");
+			const assistant = await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
+				(error: unknown) => {
+					throw markSessionRequestStep(error, "last_assistant");
+				},
+			);
+			let contextUsage: SessionContextUsage | undefined;
+			// An empty answer cannot arm a size roll, so it never pays for a context read.
+			if (input.sampleContext && assistant.text.trim()) {
+				try {
+					contextUsage = await this.contextUsage({ sessionId: input.sessionId, repo: input.repo, relay });
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw markSessionRequestStep(error, "authority");
+				}
+			}
 			result = {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
-					(error: unknown) => {
-						throw markSessionRequestStep(error, "last_assistant");
-					},
-				),
+				assistant,
+				...(contextUsage === undefined ? {} : { contextUsage }),
 			};
 		} catch (error) {
 			requestFailed = true;
@@ -2337,7 +2353,7 @@ export function parseWorkerOutputResponse(
 		// is retryable within the bounded read budget. A terminal op whose receipt
 		// is `absent` contradicts the SDK contract and is not.
 		return result.receiptState === "absent"
-			? { status: "unavailable", code: "output_unavailable" }
+			? { status: "unavailable", code: "output_unavailable", definitiveLoss: true }
 			: { status: "absent", code: "output_pending" };
 	}
 	if (content.truncated === true) return { status: "unavailable", code: "incomplete_body" };

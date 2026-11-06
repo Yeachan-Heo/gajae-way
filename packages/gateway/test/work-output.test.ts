@@ -248,6 +248,7 @@ test("absence is retryable, affirmative missing authority is unavailable, and tr
 	expect(parse(terminal("", { content: undefined, receiptState: "absent" }))).toEqual({
 		status: "unavailable",
 		code: "output_unavailable",
+		definitiveLoss: true,
 	});
 	for (const code of ["session_unavailable", "operation_not_session_owned", "resource_gone", "unsupported_query"]) {
 		expect(
