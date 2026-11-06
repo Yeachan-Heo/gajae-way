@@ -7,6 +7,7 @@ import { draftScore, speechGateApplies } from "../src/engagement/speech-gate";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const OWNER = "owner-1";
 const NARRATION = "기술 질문이라 채널에는 안 올리고, 오늘 기록만 남깁니다.";
@@ -135,7 +136,7 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 			},
 		},
 	});
-	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
 	for (let attempt = 0; attempt < 60 && frames.length < 1; attempt++) await Bun.sleep(5);
 	let sequence = 0;
 	return {
@@ -143,7 +144,7 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 			const id = `c${++sequence}`;
 			socket.write(
 				`${JSON.stringify({
-					v: "0.1",
+					v: PROFILE_VERSION,
 					type: "request",
 					id,
 					verb: "chat.send",

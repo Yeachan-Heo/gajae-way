@@ -9,6 +9,7 @@ import { TailRunner } from "../src/orchestrator/tail-runner";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "tail-liveness" } as const;
 const ORIGIN_KEY = "loopback/loopback/tail-liveness";
@@ -253,11 +254,11 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
 		await eventually(() => frames.length >= 1, "gateway negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "turn",
 				verb: "chat.send",

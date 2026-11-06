@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -781,7 +782,7 @@ async function serverFixture(port: TornReplayPort): Promise<ServerFixture> {
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(() => client.frames.length > 0, "server negotiation did not complete");
 	return {
 		home,
@@ -799,7 +800,7 @@ async function serverFixture(port: TornReplayPort): Promise<ServerFixture> {
 
 function chatSend(client: SocketClient, id: string, messageId: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",
@@ -809,7 +810,7 @@ function chatSend(client: SocketClient, id: string, messageId: string, text: str
 
 function chatEdit(client: SocketClient, id: string, messageId: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.edit",

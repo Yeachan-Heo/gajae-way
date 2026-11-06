@@ -6,6 +6,7 @@ import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, U
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { sessionPortFromResponder } from "./session-port.fake";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 /**
  * Live config reload.
@@ -90,7 +91,7 @@ async function daemon(initial: Record<string, unknown>): Promise<{ client: Clien
 	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	return { client, home: directory, socketPath: config.socketPath };
 }
@@ -195,7 +196,7 @@ test("over the socket, a vanished config cannot widen a mention-gated room", asy
 	const { client, home } = await daemon({ mentionAllowlist: ["owner"], channels: {} });
 	const groupSend = (id: string, authorId: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -210,7 +211,7 @@ test("over the socket, a vanished config cannot widen a mention-gated room", asy
 	await waitFor(client.frames, 2);
 	expect(resultOf(client.frames, 1).engaged).toBe(false);
 	await rm(join(home, "config.json"));
-	client.send({ v: "0.1", type: "request", id: "reload", verb: "gateway.reloadConfig" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "reload", verb: "gateway.reloadConfig" });
 	await waitFor(client.frames, 3);
 	expect(resultOf(client.frames, 2).ok).toBe(false);
 	// Still gated: the stranger must not have been let in by an unreadable file.
@@ -272,7 +273,7 @@ test("the reload verb applies a mention allowlist change without a restart", asy
 	const { client, home } = await daemon({ mentionAllowlist: ["owner"], channels: {} });
 	const groupSend = (id: string, authorId: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -287,7 +288,7 @@ test("the reload verb applies a mention allowlist change without a restart", asy
 	await waitFor(client.frames, 2);
 	expect(resultOf(client.frames, 1).engaged).toBe(false);
 	await writeConfig(home, { schemaVersion: 1, mentionAllowlist: ["owner", "newcomer"], channels: {} });
-	client.send({ v: "0.1", type: "request", id: "reload", verb: "gateway.reloadConfig" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "reload", verb: "gateway.reloadConfig" });
 	await waitFor(client.frames, 3);
 	expect(resultOf(client.frames, 2)).toMatchObject({ ok: true, changed: ["mentionAllowlist"], restartRequired: [] });
 	// The very next turn honours the new allowlist: no restart in between.
@@ -305,7 +306,7 @@ test("the reload verb reports a restart-only field instead of pretending to appl
 		dbPath: join(home, "moved.db"),
 		model: "opus",
 	});
-	client.send({ v: "0.1", type: "request", id: "reload", verb: "gateway.reloadConfig" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "reload", verb: "gateway.reloadConfig" });
 	await waitFor(client.frames, 2);
 	expect(resultOf(client.frames, 1).ok).toBe(true);
 	expect(resultOf(client.frames, 1).changed).toEqual([]);
@@ -316,12 +317,12 @@ test("the reload verb reports a restart-only field instead of pretending to appl
 test("the reload verb reports failure and keeps serving on an invalid config", async () => {
 	const { client, home } = await daemon({ mentionAllowlist: ["owner"] });
 	await Bun.write(join(home, "config.json"), "{ not json");
-	client.send({ v: "0.1", type: "request", id: "reload", verb: "gateway.reloadConfig" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "reload", verb: "gateway.reloadConfig" });
 	await waitFor(client.frames, 2);
 	expect(resultOf(client.frames, 1).ok).toBe(false);
 	expect(resultOf(client.frames, 1).diagnostics?.[0]?.code).toBe("config_invalid");
 	// The daemon is still alive and still holding the previous config.
-	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
 	expect(resultOf(client.frames, 2).pid).toBe(process.pid);
 	client.close();
@@ -331,7 +332,7 @@ test("SIGHUP triggers the same reload as the verb", async () => {
 	const { client, home } = await daemon({ mentionAllowlist: ["owner"], channels: {} });
 	const groupSend = (id: string, authorId: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",

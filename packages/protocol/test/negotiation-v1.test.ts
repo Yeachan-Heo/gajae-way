@@ -25,6 +25,15 @@ describe("profile v1.1 negotiation", () => {
 		}
 	});
 
+	test("client offering only 1.0 also gets incompatible_profile_version", () => {
+		const result = negotiate({ supportedVersions: ["1.0"] });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.code).toBe("incompatible_profile_version");
+			expect(result.supportedVersions).toEqual(SUPPORTED_PROFILE_VERSIONS);
+		}
+	});
+
 	test("future-only client rejects typed with the supported range", () => {
 		const result = negotiate({ supportedVersions: ["2.0"] });
 		expect(result.ok).toBe(false);

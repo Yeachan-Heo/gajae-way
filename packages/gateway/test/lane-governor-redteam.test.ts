@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -105,12 +106,12 @@ async function harness(
 		expect(frame).toBeDefined();
 		return frame;
 	}
-	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
 	await wait((frame) => frame.type === "negotiated");
 	let sequence = 0;
 	function request(verb: string, params?: unknown) {
 		const id = `request-${sequence++}`;
-		socket.write(`${JSON.stringify({ v: "0.1", type: "request", id, verb, params })}\n`);
+		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id, verb, params })}\n`);
 		return wait((frame) => frame.id === id);
 	}
 	return {

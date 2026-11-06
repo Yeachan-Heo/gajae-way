@@ -7,6 +7,7 @@ import { checkOutboundFile, deterministicFileDeliveryId } from "../src/server/ou
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const SLACK_ORIGIN = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const DISCORD_ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
@@ -114,14 +115,14 @@ async function gateway(
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return { client, database };
 }
 
 function sendMessage(client: Client, origin: unknown, messageId: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "c1",
 		verb: "chat.send",

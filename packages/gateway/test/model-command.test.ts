@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { ChannelEngagementPolicy, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import type { ChannelPolicy, GatewayConfig } from "../src/config";
 import { GlobalGjcClient, parseListModelsOutput } from "../src/orchestrator/broker";
@@ -447,13 +448,13 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 		client = await connect(config.socketPath);
-		client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await Bun.sleep(5);
 		// Autocomplete source over the socket: no broker agent dir here, so only the
 		// configured selector is offered.
 		const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "model" };
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "choices",
 			verb: "session.modelChoices",
@@ -470,7 +471,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		});
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "first",
 			verb: "chat.send",
@@ -488,7 +489,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		);
 
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "model",
 			verb: "chat.send",
@@ -515,7 +516,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		).toBe(true);
 
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "second",
 			verb: "chat.send",
@@ -529,7 +530,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		expect(port.serviceTiers).toHaveLength(1);
 		port.complete(second.opRef, "second transcript");
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "clear",
 			verb: "chat.send",
@@ -540,7 +541,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			return typeof selection !== "string" && selection?.preset === "base";
 		}, "clearing the override did not restore the configured model on the same session");
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "third",
 			verb: "chat.send",
@@ -588,11 +589,11 @@ async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly
 			listProviderModels,
 		});
 		client = await connect(config.socketPath);
-		client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await Bun.sleep(5);
 		const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "model" };
 		client.send({
-			v: "1.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "choices",
 			verb: "session.modelChoices",
@@ -670,10 +671,10 @@ async function modelChoicesWithPolicy(
 				onStop: () => database.close(),
 			});
 			client = await connect(config.socketPath);
-			client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 			await Bun.sleep(5);
 			client.send({
-				v: "1.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "choices",
 				verb: "session.modelChoices",
@@ -770,10 +771,10 @@ test("session.modelChoices allows allowlisted user in closed channel", async () 
 				onStop: () => database.close(),
 			});
 			client = await connect(config.socketPath);
-			client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 			await Bun.sleep(5);
 			client.send({
-				v: "1.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "choices",
 				verb: "session.modelChoices",

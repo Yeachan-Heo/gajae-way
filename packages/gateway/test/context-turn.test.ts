@@ -8,6 +8,7 @@ import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "context-turn" } as const;
 const ORIGIN_KEY = "discord/channel/context-turn";
@@ -59,7 +60,7 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 
 function send(client: { send(value: unknown): void }, id: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",
@@ -94,7 +95,7 @@ async function start(
 		},
 	});
 	const client = await connect(gatewayConfig.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitUntil(() => client.frames.length >= 1);
 	return { client };
 }

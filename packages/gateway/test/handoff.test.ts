@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, type GatewayConfig, parseConfigFile } from "../src/config";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import {
 	buildHandoffDigest,
 	extendHandoffChain,
@@ -95,14 +96,14 @@ async function gateway(replies: Replies) {
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return { client, database, turns };
 }
 
 function say(client: Client, origin: typeof A | typeof B | typeof C, messageId: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: `req-${messageId}`,
 		verb: "chat.send",
@@ -209,7 +210,7 @@ test("a replayed handoff for the same source message does not run the target tur
 	await settle();
 	// The edit re-runs A's turn for the SAME source message; A hands off again.
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "edit-1",
 		verb: "chat.edit",

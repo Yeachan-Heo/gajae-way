@@ -8,6 +8,7 @@ import type { GatewayServer } from "../src/server/server";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -159,7 +160,7 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	});
 
 	// Send hello
-	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}
+	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}
 `);
 	await Bun.sleep(100);
 
@@ -167,7 +168,7 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	const requestId = "req-1";
 	socket.write(
 		`${JSON.stringify({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: requestId,
 			verb: "chat.send",
@@ -262,7 +263,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	});
 
 	// Send hello
-	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}
+	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}
 `);
 	await Bun.sleep(100);
 
@@ -270,7 +271,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	const requestId = "req-2";
 	socket.write(
 		`${JSON.stringify({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: requestId,
 			verb: "chat.send",
@@ -369,7 +370,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	});
 
 	// Send hello
-	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}
+	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}
 `);
 	await Bun.sleep(100);
 
@@ -377,7 +378,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	const requestId = "req-3";
 	socket.write(
 		`${JSON.stringify({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: requestId,
 			verb: "chat.send",

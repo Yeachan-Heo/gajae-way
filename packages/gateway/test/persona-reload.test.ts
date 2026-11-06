@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
+import { originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { PersonaLoader, SELF_OPS_PREAMBLE_POINTER } from "../src/persona/persona";
 import { startUnixServer } from "../src/server/server";
@@ -75,12 +75,12 @@ async function connectLoopbackClient(config: GatewayConfig) {
 		}
 		throw new Error(message);
 	};
-	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor((frame) => frame.type === "negotiated", "gateway did not negotiate the loopback test client");
 	return {
 		sendTurn: async (id: string, text: string) => {
 			send({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id,
 				verb: "chat.send",
@@ -152,10 +152,10 @@ test("persona USER.md edits are included on the next turn", async () => {
 		const wait = async (count: number) => {
 			for (let i = 0; i < 100 && frames.length < count; i++) await Bun.sleep(5);
 		};
-		send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await wait(1);
 		send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "one",
 			verb: "chat.send",
@@ -164,7 +164,7 @@ test("persona USER.md edits are included on the next turn", async () => {
 		await wait(3);
 		await Bun.write(join(home, "workspace/USER.md"), "second");
 		send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "two",
 			verb: "chat.send",

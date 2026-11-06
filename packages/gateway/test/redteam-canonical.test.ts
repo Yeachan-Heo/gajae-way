@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { StatusReport } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import {
@@ -725,7 +726,7 @@ async function serverFixture(
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(
 		() => client.frames.some((frame) => frame.type === "negotiated"),
 		"gateway negotiation did not complete",
@@ -745,7 +746,7 @@ async function serverFixture(
 }
 
 function request(id: string, verb: "chat.send" | "chat.edit", params: Record<string, unknown>) {
-	return { v: "0.1", type: "request", id, verb, params };
+	return { v: PROFILE_VERSION, type: "request", id, verb, params };
 }
 
 const DM_ORIGIN = { platform: "discord", kind: "dm", conversationId: "canonical-dm", peerId: "owner" } as const;

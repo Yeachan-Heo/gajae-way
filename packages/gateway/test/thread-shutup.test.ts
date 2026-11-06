@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
+import { originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -107,7 +107,7 @@ async function start(
 		},
 	});
 	const client = await connect(gatewayConfig.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitUntil(() => client.frames.length > 0);
 	return client;
 }
@@ -168,7 +168,7 @@ async function send(
 	},
 ): Promise<any> {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",
@@ -376,7 +376,7 @@ test("an unmute commits atomically with the addressed message that carries it", 
 		const error = spyOn(console, "error").mockImplementation(() => {});
 		try {
 			f.client.send({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "atomic-unmute-crash",
 				verb: "chat.send",
