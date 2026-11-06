@@ -227,9 +227,19 @@ export class OriginSilentAlerter {
 }
 
 function silentNotice(origin: SilentOriginView): string {
-	const minutes = Math.floor(origin.oldestPendingAgeMs / 60_000);
 	const op = origin.blockingOpRef ? ` op=${origin.blockingOpRef}` : "";
-	return `[origin silent] ${displayKey(origin.originKey)} 사용자 메시지 ${origin.unanswered}건이 ${minutes}분째 응답이 없습니다. reason=${origin.holdReason}${op}. 확인: gajaeway ops cycle`;
+	// Render user messages when present
+	if (origin.unanswered > 0) {
+		const minutes = Math.floor(origin.oldestPendingAgeMs / 60_000);
+		return `[origin silent] ${displayKey(origin.originKey)} 사용자 메시지 ${origin.unanswered}건이 ${minutes}분째 응답이 없습니다. reason=${origin.holdReason}${op}. 확인: gajaeway ops cycle`;
+	}
+	// Render lane report backlog when user messages are not present
+	if (origin.pendingLaneReports && origin.pendingLaneReports > 0 && origin.oldestLaneReportAgeMs !== undefined) {
+		const minutes = Math.floor(origin.oldestLaneReportAgeMs / 60_000);
+		return `[origin silent] ${displayKey(origin.originKey)} 내부 lane report ${origin.pendingLaneReports}건이 ${minutes}분째 응답이 없습니다. reason=${origin.holdReason}${op}. 확인: gajaeway ops cycle`;
+	}
+	// Fallback: should not happen, but be explicit
+	return `[origin silent] ${displayKey(origin.originKey)} no pending messages. reason=${origin.holdReason}${op}`;
 }
 
 function displayKey(originKey: string): string {

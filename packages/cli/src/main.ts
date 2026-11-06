@@ -395,10 +395,13 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	if ((cycle as Partial<OpsCycleResult>).silentOrigins === undefined)
 		lines.push("origin silence: not reported by the running gateway");
 	else if (cycle.silentOrigins.length === 0) lines.push("origin silence: none");
-	for (const silent of cycle.silentOrigins ?? [])
-		lines.push(
-			`origin silent: ${silent.originKey} unanswered=${silent.unanswered} oldest=${Math.floor(silent.oldestPendingAgeMs / 60_000)}m reason=${silent.holdReason}${silent.blockingOpRef ? ` op=${silent.blockingOpRef}` : ""}`,
-		);
+	for (const silent of cycle.silentOrigins ?? []) {
+		let silentLine = `origin silent: ${silent.originKey} unanswered=${silent.unanswered} oldest=${Math.floor(silent.oldestPendingAgeMs / 60_000)}m reason=${silent.holdReason}${silent.blockingOpRef ? ` op=${silent.blockingOpRef}` : ""}`;
+		if (silent.pendingLaneReports && silent.pendingLaneReports > 0 && silent.oldestLaneReportAgeMs !== undefined) {
+			silentLine += ` laneReports=${silent.pendingLaneReports} oldestLaneReport=${Math.floor(silent.oldestLaneReportAgeMs / 60_000)}m`;
+		}
+		lines.push(silentLine);
+	}
 	if (cycle.monitorAuthoringLost.length > 0)
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,
