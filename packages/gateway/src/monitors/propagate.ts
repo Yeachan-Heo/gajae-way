@@ -903,8 +903,15 @@ export class MonitorPropagator {
 		const state = report.status?.status;
 		if (state === "failed" && !turn.sizeRolled) return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
-		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled))
+		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) {
+			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
+			// are explicit evidence the operation was never sent. Forget the pointer and recover.
+			const failure = this.#database.monitors.failure(row.event_id);
+			if (failure && (failure.code === "session_busy" || failure.code === "session_submission_wedged" || failure.code === "session_host_unavailable")) {
+				return { kind: "terminal", raw };
+			}
 			return { kind: "hold", reason: "unresolved" };
+		}
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
 		if (!monitor) return { kind: "monitor_invalid", raw };
 		const related: MonitorEventDbRow[] = [];
@@ -1437,9 +1444,16 @@ export class MonitorPropagator {
 									if (state === "failed") {
 										// Explicit failure permits fresh authoring
 									} else {
-										// Unknown status, throwing, or other states: hold the pointer (#742)
-										shouldThrowOutputPending = true;
-										break;
+										// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
+										// are explicit evidence the operation was never sent. Permit fresh authoring.
+										const failure = this.#database.monitors.failure(row.event_id);
+										if (failure && (failure.code === "session_busy" || failure.code === "session_submission_wedged" || failure.code === "session_host_unavailable")) {
+											// Durable failure: permit fresh authoring
+										} else {
+											// Unknown status, throwing, or other states: hold the pointer (#742)
+											shouldThrowOutputPending = true;
+											break;
+										}
 									}
 								} catch {
 									// Unable to check status: hold the pointer instead
