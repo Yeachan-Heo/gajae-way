@@ -903,7 +903,8 @@ export class MonitorPropagator {
 		const state = report.status?.status;
 		if (state === "failed" && !turn.sizeRolled) return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
-		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) return { kind: "hold", reason: "unresolved" };
+		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled))
+			return { kind: "hold", reason: "unresolved" };
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
 		if (!monitor) return { kind: "monitor_invalid", raw };
 		const related: MonitorEventDbRow[] = [];
