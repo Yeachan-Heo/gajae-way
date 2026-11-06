@@ -121,7 +121,7 @@ describe("monitors list rendering", () => {
 		const lines = renderList(MONITOR_COLUMNS, rows, parseListOptions([], MONITOR_COLUMNS), monitorEnvelope(rows));
 		expect(lines).toHaveLength(3);
 		expect(lines[0]).toBe(
-			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               REPORT_TO            ENABLED",
+			"ID        NAME           SCHEDULE     TIMEZONE    NEXT_FIRE                                EVENTS      TARGET               REPORT_TO            CONTEXT_ROLL_TOKENS  ENABLED",
 		);
 		expect(lines[1]).toContain("mon-1234");
 		expect(lines[1]).toContain("0 3 * * *");
@@ -168,7 +168,7 @@ describe("monitors list rendering", () => {
 
 	test("empty list renders a header plus an explicit (none) marker", () => {
 		expect(renderList(MONITOR_COLUMNS, [], parseListOptions([], MONITOR_COLUMNS), monitorEnvelope([]))).toEqual([
-			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  REPORT_TO  ENABLED",
+			"ID  NAME  SCHEDULE  TIMEZONE  NEXT_FIRE  EVENTS  TARGET  REPORT_TO  CONTEXT_ROLL_TOKENS  ENABLED",
 			"(none)",
 		]);
 	});
@@ -195,6 +195,24 @@ describe("monitors list rendering", () => {
 				envelope,
 			),
 		).toEqual([JSON.stringify({ ...envelope.result, monitors: [{ name: "nightly-audit", enabled: true }] })]);
+	});
+
+	test("contextRollTokens renders configured budgets and unset values in table and JSON projections", () => {
+		const rows = [monitorRow(monitor({ contextRollTokens: 100_000 })), monitorRow()];
+		const envelope = monitorEnvelope(rows);
+		expect(
+			renderList(MONITOR_COLUMNS, rows, parseListOptions(["--fields", "contextRollTokens"], MONITOR_COLUMNS), envelope),
+		).toEqual(["CONTEXT_ROLL_TOKENS", "100000", "-"]);
+		expect(
+			renderList(
+				MONITOR_COLUMNS,
+				rows,
+				parseListOptions(["--json", "--fields", "contextRollTokens"], MONITOR_COLUMNS),
+				envelope,
+			),
+		).toEqual([
+			JSON.stringify({ ...envelope.result, monitors: [{ contextRollTokens: 100_000 }, { contextRollTokens: null }] }),
+		]);
 	});
 
 	test("--limit/--offset page the rows in both output modes", () => {

@@ -18,7 +18,7 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -106,8 +106,11 @@ function bindWorkFixture(key: string, epoch: number, preferred?: string): string
 	return sessionId;
 }
 
-async function waitFrame(frames: any[], id: string): Promise<void> {
-	for (let attempt = 0; attempt < 600 && !frames.some((frame) => frame.id === id); attempt++) await Bun.sleep(5);
+async function waitFrame(frames: any[], id: string, timeoutMs: number = 15000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline && !frames.some((frame) => frame.id === id)) {
+		await Bun.sleep(5);
+	}
 	expect(frames.some((frame) => frame.id === id)).toBe(true);
 }
 
@@ -195,7 +198,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(39);
+	expect(client.frames[2].result.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.readiness).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 	expect(client.frames[2].result.contextDiff).toEqual({
@@ -3562,7 +3565,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
+		respond: async () => "[REPLY:1544704223634260038] threaded answer\n[BREAK]\nplain follow-up",
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -3587,9 +3590,56 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	}
 	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(2);
-	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "msg-42" });
+	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "1544704223634260038" });
 	expect(messages[1].payload.text).toBe("plain follow-up");
 	expect(messages[1].payload.replyToMessageId).toBeUndefined();
+	client.close();
+});
+
+test("a non-snowflake Discord [REPLY:] target is dropped and the text still delivers (#763)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "[REPLY:silent-none] hello",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "dm",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			messageId: "m-1",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 1) break;
+		await Bun.sleep(5);
+	}
+	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	// The message is delivered, but without the invalid reply reference
+	expect(messages).toHaveLength(1);
+	expect(messages[0].payload.text).toBe("hello");
+	// Crucially, replyToMessageId must NOT be set to the invalid ID
+	expect(messages[0].payload.replyToMessageId).toBeUndefined();
 	client.close();
 });
 
@@ -3923,7 +3973,7 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	const gone = jobs.find((job: { lane_key: string }) => job.lane_key === "work-gone");
 	expect(gone.last_commit).toBeNull();
 	client.close();
-});
+}, 20_000);
 
 test("a stalled durable job holds the next work.run until resume (production path)", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));

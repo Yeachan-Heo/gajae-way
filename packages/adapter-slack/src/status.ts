@@ -20,9 +20,11 @@ type Entry = {
 	readonly channel: string;
 	readonly ts: string;
 	/**
-	 * Thread the native status line hangs under. Only set when the turn lives in a
-	 * thread; a root channel/DM message has no thread for the reply to land in, and
-	 * setting a status on it would open an empty thread under the user's message.
+	 * Thread the native status line hangs under. Threaded turns use the thread
+	 * root; a DM uses the triggering message because the DM itself is the only
+	 * thread Slack renders the line in. A root channel message has no thread for
+	 * the reply to land in, and setting a status on it would open an empty thread
+	 * under the user's message.
 	 */
 	readonly threadTs: string | undefined;
 	/** Coalescing state: what the gradient should show, decided by presenceTransition. */
@@ -81,14 +83,16 @@ export function presenceStatusText(snapshot: PresenceSnapshot): string {
  * call leaves the marker un-shown so it is retried rather than believed.
  *
  * The same snapshot also drives Slack's native "<app> <status>" line
- * (assistant.threads.setStatus) under the thread the reply will land in - the
- * affordance users know from Slack's AI apps. Only threaded turns get it: a
- * root channel/DM message is answered at the root, and a status keyed to its
- * ts would open an empty thread under it. It works on channel and DM threads
- * with an ordinary bot token (verified live 2026-09-17), needs no Agent
- * registration, and is reconciled exactly like a marker: desired text vs
- * confirmed text. Slack clears it when the reply posts and expires it after
- * two minutes; retiring the entry clears it explicitly for silent turns.
+ * (assistant.threads.setStatus) on the thread the reply will land in - the
+ * affordance users know from Slack's AI apps. Threaded turns anchor it to the
+ * thread root; a DM anchors it to the triggering message, since Slack renders
+ * assistant status on that message. A root channel message gets none: its
+ * reply posts at the root, and a status keyed to its ts would open an empty
+ * thread under it. It works with an ordinary bot token (verified live
+ * 2026-09-17), needs no Agent registration, and is reconciled exactly like a
+ * marker: desired text vs confirmed text. Slack clears it when the reply posts
+ * and expires it after two minutes; retiring the entry clears it explicitly
+ * for silent turns.
  */
 export class WorkingStatus {
 	readonly #entries = new Map<string, Entry>();
@@ -128,10 +132,17 @@ export class WorkingStatus {
 		// A different message in the same conversation takes over; the old
 		// gradient is retired through its own reconcile (desired = nothing).
 		if (prior) this.#retire(key, prior);
-		// Inside a thread the status hangs under that thread. A root channel/DM
-		// message gets no status line: its reply posts at the root, so a status
-		// keyed to the message's ts would open a thread nothing ever lands in.
-		const threadTs = origin.kind === "thread" ? parseSlackMessageId(origin.conversationId)?.ts : undefined;
+		// A thread turn hangs its status under that thread's root. A DM has no
+		// thread of its own, and its reply lands at the DM root, so the triggering
+		// message is the only anchor Slack can show the line on. A root channel
+		// message gets none: its reply posts at the root, and a status keyed to the
+		// message's ts would open a thread nothing ever lands in.
+		const threadTs =
+			origin.kind === "thread"
+				? parseSlackMessageId(origin.conversationId)?.ts
+				: origin.kind === "dm"
+					? target.ts
+					: undefined;
 		const entry: Entry = {
 			channel: target.channel,
 			ts: target.ts,
