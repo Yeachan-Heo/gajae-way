@@ -447,13 +447,13 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 		client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
 		await Bun.sleep(5);
 		// Autocomplete source over the socket: no broker agent dir here, so only the
 		// configured selector is offered.
 		const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "model" };
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "choices",
 			verb: "session.modelChoices",
@@ -470,7 +470,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		});
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "first",
 			verb: "chat.send",
@@ -488,7 +488,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		);
 
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "model",
 			verb: "chat.send",
@@ -515,7 +515,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		).toBe(true);
 
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "second",
 			verb: "chat.send",
@@ -529,7 +529,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		expect(port.serviceTiers).toHaveLength(1);
 		port.complete(second.opRef, "second transcript");
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "clear",
 			verb: "chat.send",
@@ -540,7 +540,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			return typeof selection !== "string" && selection?.preset === "base";
 		}, "clearing the override did not restore the configured model on the same session");
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "third",
 			verb: "chat.send",
@@ -588,11 +588,11 @@ async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly
 			listProviderModels,
 		});
 		client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
 		await Bun.sleep(5);
 		const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "model" };
 		client.send({
-			v: "0.1",
+			v: "1.1",
 			type: "request",
 			id: "choices",
 			verb: "session.modelChoices",
@@ -670,10 +670,10 @@ async function modelChoicesWithPolicy(
 				onStop: () => database.close(),
 			});
 			client = await connect(config.socketPath);
-			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
 			await Bun.sleep(5);
 			client.send({
-				v: "0.1",
+				v: "1.1",
 				type: "request",
 				id: "choices",
 				verb: "session.modelChoices",
@@ -770,10 +770,10 @@ test("session.modelChoices allows allowlisted user in closed channel", async () 
 				onStop: () => database.close(),
 			});
 			client = await connect(config.socketPath);
-			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
 			await Bun.sleep(5);
 			client.send({
-				v: "0.1",
+				v: "1.1",
 				type: "request",
 				id: "choices",
 				verb: "session.modelChoices",
@@ -812,7 +812,7 @@ test("session.modelChoices allows loopback origin (no engagement needed)", async
 	});
 });
 
-test("session.modelChoices denies missing origin", async () => {
+test("regression: old 0.1 client gets incompatible_profile_version at handshake (model authorization required)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gjc-"));
 	try {
 		const config: GatewayConfig = {
@@ -838,25 +838,77 @@ test("session.modelChoices denies missing origin", async () => {
 				onStop: () => database.close(),
 			});
 			client = await connect(config.socketPath);
+			// Old 0.1 client sends hello
 			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 			await Bun.sleep(5);
-			// Send request without origin parameter
+			// Should get negotiation error instead of being able to negotiate
+			const negotiationError = client.frames.find((frame) => frame.type === "error");
+			expect(negotiationError).toBeDefined();
+			expect((negotiationError as any)?.error?.code).toBe("incompatible_profile_version");
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("session.modelChoices works with 1.1 client providing origin", async () => {
+	const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// 1.1 client sends hello
+			client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
+			await Bun.sleep(5);
+			// Should negotiate successfully
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe("1.1");
+			// Send session.modelChoices with origin
 			client.send({
-				v: "0.1",
+				v: "1.1",
 				type: "request",
 				id: "choices",
 				verb: "session.modelChoices",
-				params: {},
+				params: { origin: loopbackOrigin },
 			});
-			const connected = client;
 			await waitFor(
-				() => connected.frames.some((frame) => frame.id === "choices"),
+				() => client!.frames.some((frame) => frame.id === "choices"),
 				"session.modelChoices did not answer",
 			);
-			const result = connected.frames.find((frame) => frame.id === "choices");
-			expect(result?.type).toBe("error");
-			expect((result as any)?.error?.code).toBe("invalid_params");
-			expect((result as any)?.error?.message).toContain("origin");
+			const result = client.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			expect((result as any)?.result?.choices).toEqual(["base"]);
 		} finally {
 			client?.close();
 			try {
