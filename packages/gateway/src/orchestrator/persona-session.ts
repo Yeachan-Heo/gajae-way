@@ -4018,15 +4018,23 @@ class OriginActor {
 		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
 		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
 		try {
-			return await this.#manager.port.status({ ...base, relay: bound.tail });
+			const report = await this.#manager.port.status({ ...base, relay: bound.tail });
+			// Clear relay unavailable tracker on successful relay/status answer (#766)
+			this.#manager.database.core.metaDelete(relayUnavailableTrackerKey(bound.turn.opRef));
+			return report;
 		} catch (error) {
 			if (!isRelayTransportFailure(error)) throw error;
 			this.#manager.log(
 				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 				"error",
 			);
-			// Track relay unavailable evidence to detect unresponsive relays on live hosts (#766)
-			this.#manager.database.core.metaSet(relayUnavailableTrackerKey(bound.turn.opRef), this.#manager.now().toString());
+			// Track relay unavailable evidence to detect unresponsive relays on live hosts (#766).
+			// Record only the first unavailable timestamp for the current unavailability streak;
+			// it is cleared on successful relay/status answer and scoped per op so it cannot leak.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 			return await this.#manager.port.status(base);
 		}
 	}

@@ -544,3 +544,75 @@ test("an escalated hold whose status is only transiently unreadable keeps holdin
 		await f.manager.stop();
 	}
 });
+
+test("relay unavailable escalation measures time from the first failure, not the latest, even with frequent retries (#766)", async () => {
+	const clock = new VirtualClock();
+	const heldMs = 10 * MINUTE; // Hold will escalate after 10 minutes
+	const f = await heldOrigin("relay-unavailable-timestamp", { heldForMs: heldMs, live: true, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+
+		let statusReads = 0;
+		let escalationNotices = f.notices.length;
+		const status = f.port.status.bind(f.port);
+		const relayUnavailableMs = 500; // Probes retry every 500ms
+		let makeRelayFail = false;
+
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			if (makeRelayFail) {
+				// Simulate relay transport failure
+				const error = Object.assign(new Error("relay unavailable"), { code: "relay_closed" });
+				throw error;
+			}
+			return await status(input);
+		};
+
+		// Advance by 5 minutes (half the bound) with relay available
+		for (let i = 0; i < 5; i++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+
+		const readsBefore = statusReads;
+
+		// Start making relay fail
+		makeRelayFail = true;
+
+		// Advance by another 4 minutes (total 9 minutes) with relay failures and frequent retries
+		// The relay status is probed every ~250ms at the start of reconciliation, so many retries occur
+		for (let i = 0; i < 4; i++) {
+			for (let j = 0; j < MINUTE / relayUnavailableMs; j++) {
+				await clock.advance(relayUnavailableMs);
+				await f.manager.reconcile(f.originKey);
+			}
+		}
+
+		// Verify escalation has not fired yet (9 minutes < 10 minute bound)
+		expect(f.notices.length).toBe(escalationNotices);
+
+		// Advance by 1 more minute to exceed the 10 minute bound
+		for (let j = 0; j < MINUTE / relayUnavailableMs; j++) {
+			await clock.advance(relayUnavailableMs);
+			await f.manager.reconcile(f.originKey);
+		}
+
+		// Now escalation should have fired exactly once
+		await until(() => f.notices.length === escalationNotices + 1);
+		expect(f.notices.length).toBe(escalationNotices + 1);
+		expect(f.notices[f.notices.length - 1]).toContain("held");
+
+		// Advance further to verify escalation does not fire again
+		const noticesAfterEscalation = f.notices.length;
+		for (let i = 0; i < 5; i++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+
+		expect(f.notices.length).toBe(noticesAfterEscalation);
+	} finally {
+		await f.manager.stop();
+	}
+});

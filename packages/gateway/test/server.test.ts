@@ -1553,7 +1553,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	const auditResponse = client.frames.find((frame) => frame.type === "response" && frame.id === "audit");
 	expect(auditResponse).toBeDefined();
 	expect(auditResponse?.result?.opRef).toBeDefined();
-	const opRef = (auditResponse?.result as { opRef: string }).opRef;
+	const opRef = (auditResponse!.result as { opRef: string }).opRef;
 
 	// Poll for the audit result via memory.status
 	let auditStatus: any;
