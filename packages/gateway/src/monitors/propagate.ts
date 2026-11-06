@@ -1985,11 +1985,12 @@ export class MonitorPropagator {
 			if (prior.sessionId !== sessionId) throw new AuthoringResultUnavailableError("output_pending");
 			return prior.opRef;
 		}
-		if (
-			prior.sessionId !== sessionId ||
-			prior.eventIds.length !== eventIds.length ||
-			!eventIds.every((id) => prior.eventIds.includes(id))
-		) {
+		if (prior.sessionId !== sessionId) {
+			// A rebinding does not prove that the turn in the old session was never
+			// admitted. Leave it for the dispatch path to resolve against that session.
+			return undefined;
+		}
+		if (prior.eventIds.length !== eventIds.length || !eventIds.every((id) => prior.eventIds.includes(id))) {
 			forget();
 			return undefined;
 		}
