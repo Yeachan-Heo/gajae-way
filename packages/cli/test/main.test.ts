@@ -804,6 +804,16 @@ describe("monitor update", () => {
 		expect(result.connections).toBe(4);
 	});
 
+	test("sends a null contextRollTokens update over JSON to clear the threshold", async () => {
+		const result = await run([["monitor-42", "--json", '{"contextRollTokens":null}']]);
+		expect(result.requests).toEqual([
+			{ verb: "monitor.update", params: { monitorId: "monitor-42", contextRollTokens: null } },
+		]);
+		expect(result.lines).toEqual(['{"monitorId":"monitor-42"}']);
+		expect(result.errors).toEqual([]);
+		expect(result.connections).toBe(1);
+	});
+
 	const invalidCases: Array<[string, string[]]> = [
 		["missing id", ["--enabled", "true"]],
 		["missing patch", ["monitor-42"]],

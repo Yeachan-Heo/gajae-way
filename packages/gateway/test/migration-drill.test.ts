@@ -3,7 +3,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/store";
+import { MonitorRegistry } from "../src/monitors/registry";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
 /** Remove broker-authority and v22-v24 schema objects before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
@@ -36,7 +37,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await Store.open(path);
-		expect(database.schemaVersion).toBe(39);
+		expect(database.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -65,6 +66,62 @@ test("migrates a migration-001 database to the latest schema", async () => {
 	}
 });
 
+test("migration 40 preserves existing monitors with unset context roll tokens and persists new budgets", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-context-roll-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const initial = await Store.open(path);
+		const monitor = new MonitorRegistry(initial).add({
+			name: "existing-monitor",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["existing.tick"],
+		});
+		initial.close();
+		const legacy = new Database(path);
+		legacy.exec(
+			"ALTER TABLE monitors DROP COLUMN context_roll_tokens; DELETE FROM schema_migrations WHERE version = 40",
+		);
+		legacy.close();
+
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		const registry = new MonitorRegistry(upgraded);
+		expect(registry.get(monitor.monitorId)).toMatchObject({ name: "existing-monitor", contextRollTokens: undefined });
+		expect(upgraded.monitors.rows()[0]?.context_roll_tokens).toBeNull();
+		registry.update({ monitorId: monitor.monitorId, contextRollTokens: 10_000 });
+		upgraded.close();
+		const reopened = await Store.open(path);
+		expect(new MonitorRegistry(reopened).get(monitor.monitorId)?.contextRollTokens).toBe(10_000);
+		reopened.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("migration 40 is idempotent when context roll tokens already exist", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-context-roll-partial-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const initial = await Store.open(path);
+		const monitor = new MonitorRegistry(initial).add({
+			name: "partial-monitor",
+			trigger: { kind: "cron", schedule: "0 */6 * * *" },
+			eventTypes: ["partial.tick"],
+			contextRollTokens: 20_000,
+		});
+		initial.close();
+		const partial = new Database(path);
+		partial.exec("DELETE FROM schema_migrations WHERE version = 40");
+		partial.close();
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		expect(new MonitorRegistry(upgraded).get(monitor.monitorId)?.contextRollTokens).toBe(20_000);
+		upgraded.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("migration 38 is idempotent when a partially upgraded database already has thread mutes", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v38-idempotent-"));
 	const path = join(directory, "gateway.db");
@@ -79,7 +136,7 @@ test("migration 38 is idempotent when a partially upgraded database already has 
 		partial.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		expect(upgraded.inbox.isThreadMuted(threadKey)).toBe(true);
 		const verified = new Database(path, { readonly: true });
 		expect(
@@ -89,7 +146,7 @@ test("migration 38 is idempotent when a partially upgraded database already has 
 		upgraded.close();
 
 		const reopened = await Store.open(path);
-		expect(reopened.schemaVersion).toBe(39);
+		expect(reopened.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		expect(reopened.inbox.isThreadMuted(threadKey)).toBe(true);
 		reopened.close();
 	} finally {
@@ -133,7 +190,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 		expect(upgraded.work.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
@@ -183,7 +240,7 @@ DELETE FROM schema_migrations WHERE version > 12;
 		v12.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 		expect(upgraded.work.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.core.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
@@ -230,7 +287,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 		const rows = upgraded.monitors.rows();
 		expect(rows).toHaveLength(1);
@@ -286,7 +343,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await Store.open(path);
-	expect(upgraded.schemaVersion).toBe(39);
+	expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 	upgraded.transaction((tx) => upgraded.bindings.modelSet(tx, "discord:c1", { preset: "gpt-heavy" }, "owner"));
 	expect(upgraded.bindings.modelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
@@ -298,7 +355,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await Store.open(path);
-		expect(latest.schemaVersion).toBe(39);
+		expect(latest.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
 		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
@@ -337,7 +394,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 		const after = new Database(path, { readonly: true });
 		const columns = after
@@ -459,7 +516,7 @@ DELETE FROM schema_migrations WHERE version > 23;
 `);
 		raw.close();
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 
 		expect(upgraded.monitors.rows()[0]).toMatchObject({ monitor_id: "m1", overlap: "queue" });
 		expect(upgraded.monitors.eventRows("m1")[0]).toMatchObject({
@@ -502,7 +559,7 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		raw.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		upgraded.close();
 
 		const after = new Database(path, { readonly: true });

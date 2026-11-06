@@ -788,6 +788,52 @@ test("a reply-threaded delivery threads its first chunk and only its first chunk
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
+test("a reply reference Discord rejects as Invalid Form Body resends the text once without it (#763)", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const attempts: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: unknown) => {
+					attempts.push(payload);
+					if (typeof payload === "object" && payload !== null && "reply" in payload)
+						throw Object.assign(new Error("Invalid Form Body"), { code: 50035 });
+				},
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, {
+		...delivery(`${"x".repeat(2_000)}y`),
+		replyToMessageId: "silent-none",
+	});
+	expect(attempts).toEqual([
+		{ content: "x".repeat(2_000), reply: { messageReference: "silent-none", failIfNotExists: false } },
+		"x".repeat(2_000),
+		"y",
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a reply-threaded send failing for any other reason is not resent", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const attempts: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: unknown) => {
+					attempts.push(payload);
+					throw Object.assign(new Error("Missing Permissions"), { code: 50013 });
+				},
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("hello"), replyToMessageId: "msg-42" });
+	expect(attempts).toHaveLength(1);
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Missing Permissions", ambiguous: false } },
+	]);
+});
+
 test("delivery subscription filters non-Discord and missing delivery ids", async () => {
 	let handler: ((message: ChatMessagePayload) => void) | undefined;
 	const requests: Array<{ verb: string; params: unknown }> = [];
