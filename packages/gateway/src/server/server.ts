@@ -2016,6 +2016,27 @@ async function handleRequest(
 			return;
 		}
 		case "session.modelChoices": {
+			// Authorization checks identical to `/model` command: model choices catalog
+			// is sensitive runtime configuration that should not be disclosed to
+			// unauthorized users. Autocomplete calls must provide origin + engagement.
+			const params = request.params as
+				| {
+						origin?: unknown;
+						engagement?: unknown;
+				  }
+				| undefined;
+			let origin: OriginRef;
+			try {
+				if (!params?.origin) throw new Error("origin is required");
+				origin = validateOriginRef(params.origin as never);
+			} catch {
+				throw new ProtocolError("invalid_params", "session.modelChoices requires a valid origin");
+			}
+			const threadFollowUp =
+				origin.kind === "thread" && threadFollowUpEngaged(origin, originKey(origin), options.database.inbox);
+			if (!commandAuthorised(origin, runtime.config, params?.engagement, threadFollowUp)) {
+				throw new ProtocolError("unauthorized", "not authorized for model choices");
+			}
 			const choices = await listModelChoices(
 				options.broker?.agentDir,
 				runtime.config.model,

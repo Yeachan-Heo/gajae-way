@@ -1415,13 +1415,30 @@ export interface AutocompleteInteractionLike {
 	isAutocomplete?(): boolean;
 	readonly commandName?: string;
 	readonly options: { getFocused(): string };
+	readonly user?: {
+		readonly id: string;
+		readonly username?: string;
+		readonly globalName?: string | null;
+		readonly primaryGuild?: {
+			readonly tag?: string | null;
+		} | null;
+	};
+	/** Guild member for the invoking user, when the autocomplete ran in a guild. */
+	readonly member?: {
+		readonly nick?: string | null;
+		readonly displayName?: string | null;
+		readonly nickname?: string | null;
+	} | null;
+	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	respond(choices: Array<{ name: string; value: string }>): Promise<unknown>;
 }
 
 /**
  * Answers `/model set` autocomplete from the gateway's catalog. Fails soft: an
- * unreachable gateway or unreadable catalog yields an empty list, which Discord
- * shows as "no options" while still accepting a typed choice.
+ * unreachable gateway, authorization failure, or unreadable catalog yields an
+ * empty list, which Discord shows as "no options" while still accepting a typed
+ * choice. Authorization checks follow the `/model` command policy: DM policy,
+ * group allowlist, and owner identity determine catalog access.
  */
 export async function handleModelAutocomplete(
 	interaction: AutocompleteInteractionLike,
@@ -1431,8 +1448,33 @@ export async function handleModelAutocomplete(
 	if (!interaction.isAutocomplete?.() || interaction.commandName !== "model") return;
 	let choices: readonly string[] = [];
 	try {
-		choices = await gateway.modelChoices();
+		if (!interaction.channel || !interaction.user) {
+			// Missing channel or user: respond with empty list (fail soft)
+			log.error("Discord /model autocomplete missing channel or user");
+			try {
+				await interaction.respond([]);
+			} catch (error) {
+				log.error(
+					`Discord /model autocomplete reply failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			return;
+		}
+		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
+		const interactionServerTag = resolveServerTag(interaction.user);
+		const engagement: EngagementContext = {
+			mentioned: true,
+			group: origin.kind !== "dm",
+			authorId: interaction.user.id,
+			...(resolveInteractionDisplayName(interaction)
+				? { authorName: resolveInteractionDisplayName(interaction) as string }
+				: {}),
+			...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
+			...(interactionServerTag ? { authorServerTag: interactionServerTag } : {}),
+		};
+		choices = await gateway.modelChoices(origin, engagement);
 	} catch (error) {
+		// Authorization failure, gateway down, or catalog error: respond with empty list (fail soft)
 		log.error(`Discord /model autocomplete failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	const needle = interaction.options.getFocused().trim().toLowerCase();
@@ -2130,11 +2172,14 @@ export class ReconnectingGateway {
 		});
 	}
 
-	/** `/model set` autocomplete source; throws when the gateway link is down. */
-	async modelChoices(): Promise<readonly string[]> {
+	/** `/model set` autocomplete source; throws when the gateway link is down or authorization fails. */
+	async modelChoices(origin: OriginRef, engagement: EngagementContext): Promise<readonly string[]> {
 		const client = this.#client;
 		if (!client) throw new Error("gateway link not connected");
-		const result = await client.request<SessionModelChoicesResult>("session.modelChoices");
+		const result = await client.request<SessionModelChoicesResult>("session.modelChoices", {
+			origin,
+			engagement,
+		});
 		return result.choices;
 	}
 

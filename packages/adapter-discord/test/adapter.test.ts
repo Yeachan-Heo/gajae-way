@@ -1306,6 +1306,8 @@ test("/model autocomplete filters gateway choices and fails soft to an empty lis
 	const interaction = (focused: string) => ({
 		isAutocomplete: () => true,
 		commandName: "model",
+		channel: { id: "123" },
+		user: { id: "user-1", username: "testuser" },
 		options: { getFocused: () => focused },
 		respond: async (choices: Array<{ name: string; value: string }>) => {
 			responded.push(choices);
@@ -1334,6 +1336,8 @@ test("/model autocomplete narrows provider models by typed text and drops choice
 	const interaction = (focused: string) => ({
 		isAutocomplete: () => true,
 		commandName: "model",
+		channel: { id: "123" },
+		user: { id: "user-1", username: "testuser" },
 		options: { getFocused: () => focused },
 		respond: async (choices: Array<{ name: string; value: string }>) => {
 			responded.push(choices);
@@ -1352,6 +1356,107 @@ test("/model autocomplete narrows provider models by typed text and drops choice
 		"xai/grok-4.7",
 	]);
 	expect(responded[1]?.some((choice) => choice.value === tooLong)).toBe(false);
+});
+
+test("/model autocomplete returns empty list when missing channel or user", async () => {
+	const responded: Array<Array<{ name: string; value: string }>> = [];
+	const gateway = { modelChoices: async () => ["should-not-be-called"] };
+
+	// Missing channel
+	await handleModelAutocomplete(
+		{
+			isAutocomplete: () => true,
+			commandName: "model",
+			options: { getFocused: () => "" },
+			user: { id: "user-1" },
+			channel: undefined,
+			respond: async (choices: Array<{ name: string; value: string }>) => responded.push(choices),
+		} as never,
+		gateway as never,
+	);
+
+	// Missing user
+	await handleModelAutocomplete(
+		{
+			isAutocomplete: () => true,
+			commandName: "model",
+			options: { getFocused: () => "" },
+			user: undefined,
+			channel: { id: "123", type: 0 },
+			respond: async (choices: Array<{ name: string; value: string }>) => responded.push(choices),
+		} as never,
+		gateway as never,
+	);
+
+	expect(responded).toEqual([[], []]);
+});
+
+test("/model autocomplete returns empty list on authorization failure", async () => {
+	const responded: Array<Array<{ name: string; value: string }>> = [];
+	const gateway = {
+		modelChoices: async () => {
+			const error = new Error("unauthorized");
+			(error as any).code = "unauthorized";
+			throw error;
+		},
+	};
+
+	await handleModelAutocomplete(
+		{
+			isAutocomplete: () => true,
+			commandName: "model",
+			options: { getFocused: () => "" },
+			user: { id: "user-1", username: "testuser" },
+			channel: { id: "123", type: 0 },
+			respond: async (choices: Array<{ name: string; value: string }>) => responded.push(choices),
+		} as never,
+		gateway as never,
+	);
+
+	expect(responded).toEqual([[]]);
+});
+
+test("/model autocomplete propagates origin and engagement to gateway", async () => {
+	const callsToModelChoices: Array<{ origin: any; engagement: any }> = [];
+	const gateway = {
+		modelChoices: async (origin: any, engagement: any) => {
+			callsToModelChoices.push({ origin, engagement });
+			return ["base"];
+		},
+	};
+
+	await handleModelAutocomplete(
+		{
+			isAutocomplete: () => true,
+			commandName: "model",
+			options: { getFocused: () => "" },
+			user: { id: "user-123", username: "alice", primaryGuild: { tag: "guild-1" } },
+			member: { displayName: "Alice", nick: null },
+			channel: { id: "channel-456", type: 0 },
+			respond: async () => {},
+		} as never,
+		gateway as never,
+	);
+
+	expect(callsToModelChoices).toHaveLength(1);
+	const call = callsToModelChoices[0]!;
+
+	// Verify origin
+	expect(call.origin).toMatchObject({
+		platform: "discord",
+		kind: "channel",
+		conversationId: "channel-456",
+	});
+
+	// Verify engagement context includes author identity
+	expect(call.engagement).toMatchObject({
+		mentioned: true,
+		group: true,
+		authorId: "user-123",
+		authorName: "Alice",
+		authorHandle: "alice",
+		authorServerTag: "guild-1",
+	});
 });
 
 test("a declined slash command answers not-authorized instead of claiming a reset", async () => {
