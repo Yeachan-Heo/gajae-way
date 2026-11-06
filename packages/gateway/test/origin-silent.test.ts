@@ -289,5 +289,7 @@ test("lane_report messages with no platform messages should trigger origin_silen
 	const silentOrigins = findSilentOrigins(db, NOW);
 	expect(silentOrigins.some((origin) => origin.originKey === originKey)).toBe(true);
 	const silentOrigin = silentOrigins.find((origin) => origin.originKey === originKey);
-	expect(silentOrigin?.unanswered).toBe(5);
+	// Lane reports are tracked separately from user messages per P2-2
+	expect(silentOrigin?.unanswered).toBe(0);
+	expect(silentOrigin?.pendingLaneReports).toBe(5);
 });

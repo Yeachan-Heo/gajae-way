@@ -272,6 +272,8 @@ function completeInboundTurn(
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
+	// Clean up relay unavailability tracker when turn completes (#766)
+	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	return changed;
 }
 
@@ -1755,7 +1757,8 @@ class OriginActor {
 		// A live host whose relay is unresponsive should escalate if the evidence spans long enough.
 		const relayTrackerTs = database.core.metaGet(relayUnavailableTrackerKey(turn.opRef));
 		const hasRelayUnavailableEvidence =
-			relayTrackerTs !== undefined && this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
 		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
 		const host = await this.#bindingState(sessionId);
 		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
@@ -3793,6 +3796,12 @@ class OriginActor {
 			// for commands. Keeping a closed handle here made status throw forever.
 			bound.tail = undefined;
 			bound.detached = true;
+			// Record first-outage time on relay death to detect unresponsive relays (#766).
+			// This ensures statusOf records evidence even on the CLI-only path after detach.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 		}
 		if (!bound.tailEvidenceUnavailable) {
 			bound.tailEvidenceUnavailable = true;
