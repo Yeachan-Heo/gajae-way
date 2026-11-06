@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 /**
  * A `gateway.shutdown` request over stdio must let `stop()` resolve: the request
@@ -21,9 +22,11 @@ test("a stdio gateway.shutdown request completes ordered shutdown and exits the 
 	});
 	try {
 		const output = new Response(child.stdout as ReadableStream).text();
-		child.stdin.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
 		child.stdin.write(
-			`${JSON.stringify({ v: "0.1", type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`,
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
+		child.stdin.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`,
 		);
 		child.stdin.flush();
 		const exit = await Promise.race([child.exited, Bun.sleep(15_000).then(() => "timeout" as const)]);

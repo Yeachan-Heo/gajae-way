@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type BotAudienceLimits, BotAudienceTurnGuard } from "../src/engagement/policy";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
@@ -209,10 +210,10 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 	);
 	server = await startUnixServer({ config, database, sessionPort: port });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 400 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "admit",
 		verb: "chat.send",
@@ -225,7 +226,7 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 	});
 	expect(resultOf(await waitForFrame(client.frames, "admit")).engaged).toBe(true);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "addressed-decline",
 		verb: "chat.send",
@@ -238,7 +239,7 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 	});
 	expect(resultOf(await waitForFrame(client.frames, "addressed-decline")).engaged).toBe(false);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "unaddressed-decline",
 		verb: "chat.send",
@@ -250,7 +251,7 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 		},
 	});
 	expect(resultOf(await waitForFrame(client.frames, "unaddressed-decline")).engaged).toBe(false);
-	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	expect(resultOf(await waitForFrame(client.frames, "status")).engagement).toEqual({
 		botAudienceDeclines: 1,
 		botAudienceRateLimited: 0,
@@ -288,11 +289,11 @@ test("an open bot audience runs consecutive bot turns by default and stops only 
 	);
 	server = await startUnixServer({ config, database, sessionPort: port });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 400 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	const botSend = (id: string, messageId: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -310,7 +311,7 @@ test("an open bot audience runs consecutive bot turns by default and stops only 
 	expect(resultOf(await waitForFrame(client.frames, "bot-2")).engaged).toBe(true);
 	botSend("bot-3", "bot-loop-3");
 	expect(resultOf(await waitForFrame(client.frames, "bot-3")).engaged).toBe(false);
-	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	expect(resultOf(await waitForFrame(client.frames, "status")).engagement).toEqual({
 		botAudienceDeclines: 1,
 		botAudienceRateLimited: 1,

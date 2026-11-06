@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -52,11 +53,13 @@ test("chat.progress emits periodically from turn start even before tail frames, 
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "turn",
 				verb: "chat.send",
@@ -155,11 +158,13 @@ test("chat.progress without tail frames for >90s still yields periodic progress 
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "turn",
 				verb: "chat.send",
@@ -276,11 +281,13 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "turn",
 				verb: "chat.send",
@@ -344,11 +351,13 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "turn",
 				verb: "chat.send",
@@ -409,11 +418,13 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "retired" };
 		socket.write(
-			`${JSON.stringify({ v: "0.1", type: "request", id: "turn", verb: "chat.send", params: { origin, text: "long job" } })}\n`,
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "turn", verb: "chat.send", params: { origin, text: "long job" } })}\n`,
 		);
 		await eventually(() => port.sends.length === 1, "turn was not sent");
 		const send = port.sends[0]!;
@@ -427,7 +438,7 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 		const turnId = frames.find((frame) => frame.event === "chat.progress").payload.turnId as string;
 
 		socket.write(
-			`${JSON.stringify({ v: "0.1", type: "request", id: "new", verb: "chat.send", params: { origin, text: "/new" } })}\n`,
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "new", verb: "chat.send", params: { origin, text: "/new" } })}\n`,
 		);
 		await eventually(
 			() => progressOf(turnId).some((frame) => frame.payload.final === true),

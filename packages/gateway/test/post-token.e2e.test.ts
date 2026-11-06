@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OriginRef } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { deterministicPostDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, replyTargetConversation, resolvePostTarget, startUnixServer } from "../src/server/server";
@@ -72,14 +73,14 @@ async function startGateway(port: ScriptedSessionPort) {
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return client;
 }
 
 function sendChannelMessage(client: { send(value: unknown): void }, id: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",

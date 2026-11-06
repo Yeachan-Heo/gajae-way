@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
@@ -87,11 +88,11 @@ async function start(
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(() => client.frames.length >= 1, "negotiation did not complete");
 	const send = (id: string, messageId: string, text: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -99,7 +100,7 @@ async function start(
 		});
 	const edit = (id: string, messageId: string, text: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.edit",
@@ -238,7 +239,7 @@ test("a steered edit of a context-only message consumes the ORIGINAL message's c
 	const channel = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
 	const post = (id: string, messageId: string, text: string, authorId: string, mentioned: boolean) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -251,7 +252,7 @@ test("a steered edit of a context-only message consumes the ORIGINAL message's c
 		});
 	const editIn = (id: string, messageId: string, text: string, authorId: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.edit",
@@ -319,14 +320,14 @@ async function startWith(port: ScriptedSessionPort, dir?: string) {
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(() => client.frames.length >= 1, "negotiation did not complete");
 	return client;
 }
 
 const dm = (client: Awaited<ReturnType<typeof connect>>, id: string, messageId: string, text: string) =>
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",

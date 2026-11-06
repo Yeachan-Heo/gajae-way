@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -56,12 +57,12 @@ async function waitFor(frames: any[], count: number): Promise<void> {
 }
 
 function chatSend(id: string, messageId: string, text: string): unknown {
-	return { v: "0.1", type: "request", id, verb: "chat.send", params: { origin: ORIGIN, text, messageId } };
+	return { v: PROFILE_VERSION, type: "request", id, verb: "chat.send", params: { origin: ORIGIN, text, messageId } };
 }
 
 async function negotiated(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
 	const client = await connect(socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	return client;
 }
@@ -151,7 +152,7 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 
 	client.send(chatSend("first", "msg-1", "hello"));
@@ -175,7 +176,7 @@ test("a message arriving while a persistent turn is in flight is steered into th
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 
 	client.send(chatSend("one", "msg-1", "first"));

@@ -71,6 +71,7 @@ export {
 	type ReplyContext,
 	type SessionBootstrapProjection,
 	type SessionListResult,
+	type SessionModelChoicesParams,
 	type SessionModelChoicesResult,
 	type SessionRecallParams,
 	type SessionRecallResult,

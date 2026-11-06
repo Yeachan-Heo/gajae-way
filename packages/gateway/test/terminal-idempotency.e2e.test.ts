@@ -3,6 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager, STALLED_TURN_TERMINAL_TIMEOUT_MS } from "../src/orchestrator/persona-session";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
@@ -70,14 +71,14 @@ async function startGateway(port: ScriptedSessionPort, personaNow?: () => number
 	});
 	server = runtime;
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return { client, runtime };
 }
 
 function sendChannelMessage(client: { send(value: unknown): void }, id: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",
@@ -324,7 +325,7 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 		onStop: () => database?.close(),
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	sendChannelMessage(client, "i1", "중간 보고 두 개");
 	await eventually(() => port.sends.length === 1, "turn was not sent");

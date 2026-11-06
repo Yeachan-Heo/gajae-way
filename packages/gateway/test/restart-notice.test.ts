@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, OriginRef } from "@gajae-gateway/protocol";
-import { originKey } from "@gajae-gateway/protocol";
+import { originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { ConfigError, type GatewayConfig, parseConfigFile, type RestartNoticePhase } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
@@ -361,10 +361,10 @@ async function restartAcrossServers(
 	const first = database;
 	server = await startUnixServer({ config, database: first, sessionPort, onStop: () => first.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await until(() => client.frames.length >= 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "talk",
 		verb: "chat.send",
@@ -373,7 +373,7 @@ async function restartAcrossServers(
 	await until(() => noticeTexts(client.frames).includes("hello back"));
 	for (const id of ["prepare-1", "prepare-2"]) {
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "gateway.restart.prepare",
@@ -397,13 +397,13 @@ async function restartAcrossServers(
 	server = await startUnixServer({ config, database: second, sessionPort, onStop: () => second.close() });
 	database = undefined;
 	const supervisor = await connect(config.socketPath);
-	supervisor.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	supervisor.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await until(() => supervisor.frames.length >= 1);
 	for (const [id, verb] of [
 		["reattach", "gateway.restart.prepare"],
 		["release", "gateway.restart.cancel"],
 	] as const) {
-		supervisor.send({ v: "0.1", type: "request", id, verb, params: { restartId: "stack-9", waitMs: 0 } });
+		supervisor.send({ v: PROFILE_VERSION, type: "request", id, verb, params: { restartId: "stack-9", waitMs: 0 } });
 		await until(() => supervisor.frames.some((frame) => frame.id === id));
 	}
 	await Bun.sleep(20);

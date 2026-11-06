@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -102,10 +103,12 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 			}
 			throw new Error(`no ${label} response`);
 		};
-		connectedSocket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		connectedSocket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await waitFor((frame) => frame.type === "negotiated", "negotiation");
 		const request = async (id: string, verb: string, params: Record<string, unknown>) => {
-			connectedSocket.write(`${JSON.stringify({ v: "0.1", type: "request", id, verb, params })}\n`);
+			connectedSocket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id, verb, params })}\n`);
 			return await waitFor((frame) => frame.id === id, verb);
 		};
 

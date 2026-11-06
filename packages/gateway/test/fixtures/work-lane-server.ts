@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, rmSync, writeFile
 import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { StatusReport } from "@gajae-gateway/subsession";
 import type {
 	SessionBindInput,
@@ -362,7 +363,7 @@ export async function wire(socketPath: string) {
 		},
 	});
 	const send = (value: unknown) => socket.write(`${JSON.stringify(value)}\n`);
-	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(
 		() => frames,
 		(items) => items.some((frame) => frame.type === "negotiated"),
@@ -374,7 +375,7 @@ export async function wire(socketPath: string) {
 		close: () => socket.end(),
 		async request(verb: string, params?: unknown) {
 			const id = crypto.randomUUID();
-			send({ v: "0.1", type: "request", id, verb, params });
+			send({ v: PROFILE_VERSION, type: "request", id, verb, params });
 			return eventually(() => frames.find((frame) => frame.id === id), Boolean, verb);
 		},
 	};

@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
+import { originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
@@ -82,13 +82,13 @@ async function fixture(jobs = 0, noticeReply = "비교표", maxTailProcesses = 1
 		send = (value) => {
 			socket.write(`${JSON.stringify(value)}\n`);
 		};
-		send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await Bun.sleep(10);
 	};
 	await start();
 	const chat = (id: string, conversationId: string = ORIGIN.conversationId) =>
 		send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",

@@ -11,6 +11,7 @@ import {
 	type OpsCycleResult,
 	type OriginRef,
 	originKey,
+	PROFILE_VERSION,
 } from "@gajae-gateway/protocol";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
@@ -542,9 +543,9 @@ test("ops.cycle serves a fresh fail-closed snapshot and broker provisioning stat
 		const conn = await socket;
 		try {
 			const send = (frame: unknown) => conn.write(`${JSON.stringify(frame)}\n`);
-			send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-			send({ v: "0.1", type: "request", id: "cycle", verb: "ops.cycle" });
-			send({ v: "0.1", type: "request", id: "slo", verb: "ops.slo", params: { days: 1 } });
+			send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			send({ v: PROFILE_VERSION, type: "request", id: "cycle", verb: "ops.cycle" });
+			send({ v: PROFILE_VERSION, type: "request", id: "slo", verb: "ops.slo", params: { days: 1 } });
 			for (let i = 0; i < 100 && frames.length < 3; i++) await Bun.sleep(5);
 		} finally {
 			conn.end();
@@ -737,8 +738,10 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 			},
 		});
 		try {
-			conn.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
-			conn.write(`${JSON.stringify({ v: "0.1", type: "request", id: "cycle", verb: "ops.cycle" })}\n`);
+			conn.write(
+				`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+			);
+			conn.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "cycle", verb: "ops.cycle" })}\n`);
 			for (let i = 0; i < 100 && !frames.some((frame) => (frame as { id?: string }).id === "cycle"); i++)
 				await Bun.sleep(5);
 		} finally {
@@ -856,23 +859,23 @@ test("ops.cycle pages 1200 session rows under the frame cap without hiding whole
 		});
 		try {
 			const send = (frame: unknown) => conn.write(`${JSON.stringify(frame)}\n`);
-			send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-			send({ v: "0.1", type: "request", id: "default", verb: "ops.cycle", params: {} });
-			send({ v: "0.1", type: "request", id: "legacy", verb: "ops.cycle" });
+			send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			send({ v: PROFILE_VERSION, type: "request", id: "default", verb: "ops.cycle", params: {} });
+			send({ v: PROFILE_VERSION, type: "request", id: "legacy", verb: "ops.cycle" });
 			for (const [id, offset] of [
 				["page-0", 0],
 				["page-500", 500],
 				["page-1000", 1_000],
 			] as const)
 				send({
-					v: "0.1",
+					v: PROFILE_VERSION,
 					type: "request",
 					id,
 					verb: "ops.cycle",
 					params: { limit: OPS_CYCLE_MAX_LIMIT, offset },
 				});
 			send({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "invalid-limit",
 				verb: "ops.cycle",
@@ -922,7 +925,7 @@ test("ops.cycle pages 1200 session rows under the frame cap without hiding whole
 		if (!firstPage) throw new Error("first session page missing");
 		expect(() =>
 			encodeFrame({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "response",
 				id: "legacy-unpaged",
 				result: { ...firstPage, sessions: allSessions },

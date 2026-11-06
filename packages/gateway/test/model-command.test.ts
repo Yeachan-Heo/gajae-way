@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GatewayConfig } from "../src/config";
+import type { EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
+import type { ChannelPolicy, GatewayConfig } from "../src/config";
 import { GlobalGjcClient, parseListModelsOutput } from "../src/orchestrator/broker";
 import {
 	applyModelCommand,
@@ -446,11 +448,18 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 		client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await Bun.sleep(5);
 		// Autocomplete source over the socket: no broker agent dir here, so only the
 		// configured selector is offered.
-		client.send({ v: "0.1", type: "request", id: "choices", verb: "session.modelChoices" });
+		const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "model" };
+		client.send({
+			v: PROFILE_VERSION,
+			type: "request",
+			id: "choices",
+			verb: "session.modelChoices",
+			params: { origin: loopbackOrigin },
+		});
 		const choicesClient = client;
 		await waitFor(
 			() => choicesClient.frames.some((frame) => frame.id === "choices"),
@@ -462,7 +471,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		});
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "first",
 			verb: "chat.send",
@@ -480,7 +489,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		);
 
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "model",
 			verb: "chat.send",
@@ -507,7 +516,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		).toBe(true);
 
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "second",
 			verb: "chat.send",
@@ -521,7 +530,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		expect(port.serviceTiers).toHaveLength(1);
 		port.complete(second.opRef, "second transcript");
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "clear",
 			verb: "chat.send",
@@ -532,7 +541,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			return typeof selection !== "string" && selection?.preset === "base";
 		}, "clearing the override did not restore the configured model on the same session");
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "third",
 			verb: "chat.send",
@@ -580,9 +589,16 @@ async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly
 			listProviderModels,
 		});
 		client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await Bun.sleep(5);
-		client.send({ v: "0.1", type: "request", id: "choices", verb: "session.modelChoices" });
+		const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "model" };
+		client.send({
+			v: PROFILE_VERSION,
+			type: "request",
+			id: "choices",
+			verb: "session.modelChoices",
+			params: { origin: loopbackOrigin },
+		});
 		const connected = client;
 		await waitFor(
 			() => connected.frames.some((frame) => frame.id === "choices"),
@@ -621,4 +637,430 @@ test("session.modelChoices keeps the named choices when the provider listing fai
 		console.error = previousError;
 	}
 	expect(errors).toContain("model_choices_provider_list_failed reason=gjc --list-models exited 1");
+});
+
+/** Helper for testing authorization on session.modelChoices with different channel policies. */
+async function modelChoicesWithPolicy(
+	policy: ChannelPolicy,
+	requestOrigin: OriginRef,
+	engagement: EngagementContext | undefined,
+): Promise<unknown> {
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+			channels: { "123": policy },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			await Bun.sleep(5);
+			client.send({
+				v: PROFILE_VERSION,
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: { origin: requestOrigin, engagement },
+			});
+			const connected = client;
+			await waitFor(
+				() => connected.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			return connected.frames.find((frame) => frame.id === "choices");
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+test("session.modelChoices authorizes like /model: closed channel, non-owner denied", async () => {
+	const discordOrigin = {
+		platform: "discord" as const,
+		kind: "channel" as const,
+		conversationId: "123",
+		parentId: undefined,
+	};
+	const nonOwnerEngagement: EngagementContext = {
+		mentioned: true,
+		group: true,
+		authorId: "user-123",
+	};
+	// Closed channel (only owner can access)
+	const closedPolicy: ChannelPolicy = {
+		engagement: "closed",
+		audience: "all",
+	};
+	// Non-owner should get authorization error
+	const result = await modelChoicesWithPolicy(closedPolicy, discordOrigin, nonOwnerEngagement);
+	expect(result).toMatchObject({
+		type: "error",
+		error: { code: "unauthorized" },
+	});
+});
+
+test("session.modelChoices allows allowlisted user in closed channel", async () => {
+	const discordOrigin = {
+		platform: "discord" as const,
+		kind: "channel" as const,
+		conversationId: "123",
+		parentId: undefined,
+	};
+	const allowlistedUser: EngagementContext = {
+		mentioned: true,
+		group: true,
+		authorId: "allowlisted-user",
+	};
+	// Closed channel with allowlist
+	const closedPolicy: ChannelPolicy = {
+		engagement: "closed",
+		audience: "all",
+	};
+	// Create a home and config with the allowlisted user in the mention allowlist
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+			channels: { "123": closedPolicy },
+			mentionAllowlist: ["allowlisted-user"],
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			await Bun.sleep(5);
+			client.send({
+				v: PROFILE_VERSION,
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: { origin: discordOrigin, engagement: allowlistedUser },
+			});
+			const connected = client;
+			await waitFor(
+				() => connected.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			const result = connected.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			expect((result as any)?.result?.choices).toBeDefined();
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("session.modelChoices allows loopback origin (no engagement needed)", async () => {
+	const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
+	// Loopback doesn't need engagement context
+	const result = await modelChoicesWithPolicy({ engagement: "open", audience: "all" }, loopbackOrigin, undefined);
+	expect(result).toMatchObject({
+		type: "response",
+		result: { choices: ["base"] },
+	});
+});
+
+test("frozen-client contract: 0.1 client negotiates 0.1 and can make RPCs", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// Old 0.1 client sends hello
+			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			await Bun.sleep(5);
+			// Should negotiate successfully
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe("0.1");
+			// Verify gateway.status RPC succeeds on 0.1 client
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "status",
+				verb: "gateway.status",
+				params: undefined,
+			});
+			await waitFor(() => client!.frames.some((frame) => frame.id === "status"), "gateway.status did not answer");
+			const statusResult = client.frames.find((frame) => frame.id === "status");
+			expect(statusResult?.type).toBe("response");
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("session.modelChoices works with 1.1 client providing origin", async () => {
+	const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// 1.1 client sends hello
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			await Bun.sleep(5);
+			// Should negotiate successfully
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe(PROFILE_VERSION);
+			// Send session.modelChoices with origin
+			client.send({
+				v: PROFILE_VERSION,
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: { origin: loopbackOrigin },
+			});
+			await waitFor(
+				() => client!.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			const result = client.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			expect((result as any)?.result?.choices).toEqual(["base"]);
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("frozen-client contract: 1.0 context-free modelChoices gets empty choices (fail closed)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// 1.0 client sends hello
+			client.send({ v: "1.0", type: "hello", payload: { supportedVersions: ["1.0"] } });
+			await Bun.sleep(5);
+			// Should negotiate 1.0
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe("1.0");
+			// Send modelChoices WITHOUT origin (context-free)
+			client.send({
+				v: "1.0",
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: {}, // No origin provided
+			});
+			await waitFor(
+				() => client!.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			const result = client.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			// Should get empty choices (fail closed), not an error
+			expect((result as any)?.result?.choices).toEqual([]);
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("profile 1.1 with context still authorized/denied per channel policy", async () => {
+	const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// 1.1 client sends hello
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			await Bun.sleep(5);
+			// Should negotiate 1.1
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe(PROFILE_VERSION);
+			// Send modelChoices WITH origin and context (1.1 with authorization)
+			client.send({
+				v: PROFILE_VERSION,
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: { origin: loopbackOrigin, engagement: { mentioned: true, group: false } },
+			});
+			await waitFor(
+				() => client!.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			const result = client.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			// Should get choices (authorized on loopback)
+			expect((result as any)?.result?.choices).toEqual(["base"]);
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
 });

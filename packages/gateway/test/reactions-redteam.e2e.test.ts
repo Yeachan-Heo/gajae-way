@@ -21,6 +21,7 @@ import { join } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilenceToken,
+	PROFILE_VERSION,
 	parseReactionReply,
 	REACTION_ALLOWLIST,
 	REACTIONS_PER_MESSAGE_CAP,
@@ -183,13 +184,13 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return { client, database, config, turns, calls };
 }
 
 async function request(client: Client, id: string, verb: string, params: unknown): Promise<void> {
-	await client.send({ v: "0.1", type: "request", id, verb, params });
+	await client.send({ v: PROFILE_VERSION, type: "request", id, verb, params });
 }
 
 async function humanMessage(client: Client, id: string, messageId: string, text = "형님 이거 봐주세요"): Promise<void> {
@@ -255,7 +256,7 @@ test("RT-INBOUND-01 an add/remove storm on an open, allowlisted channel never be
 	// One chunk, so the daemon handles all 20 back to back inside one tick.
 	await client.sendBatch(
 		Array.from({ length: 20 }, (_, index) => ({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: `r${index}`,
 			verb: "engagement.reaction",
@@ -628,7 +629,7 @@ test("RT-LEDGER-02 an ambiguous reaction failure survives and is re-emitted on r
 	// connection must be told about it again, reaction intact.
 	await Bun.sleep(2_050);
 	const reconnected = await connect(config.socketPath);
-	await reconnected.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await reconnected.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await settle();
 	const redelivered = chatMessages(reconnected.frames);
 	expect(redelivered).toHaveLength(1);
@@ -655,7 +656,7 @@ test("RT-LEDGER-03 a definitive reaction failure is retried five times, then exp
 	// pretends the reaction happened.
 	expect(database.outbox.rows()[0]?.state).toBe("expired");
 	const reconnected = await connect(config.socketPath);
-	await reconnected.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await reconnected.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await settle();
 	expect(chatMessages(reconnected.frames)).toHaveLength(0);
 	reconnected.close();
@@ -1548,7 +1549,7 @@ async function preambleGateway(): Promise<{ client: Client; preambles: string[] 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return { client, preambles };
 }

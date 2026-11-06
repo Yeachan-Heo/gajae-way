@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { Store } from "../src/store";
 
@@ -61,7 +62,7 @@ async function client(socketPath: string) {
 		},
 	});
 	const send = (value: unknown) => socket.write(`${JSON.stringify(value)}\n`);
-	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	return { frames, send, close: () => socket.end() };
 }
 async function waitFor(frames: any[], predicate: (frame: any) => boolean) {
@@ -78,7 +79,7 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-crash-")));
 	const first = await client(await start());
 	first.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "send",
 		verb: "chat.send",
@@ -117,9 +118,9 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	const second = await client(await start());
 	const redelivery = await waitFor(second.frames, (frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(redelivery.payload).toMatchObject({ deliveryId, redelivered: true, duplicateWarning: true });
-	second.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
+	second.send({ v: PROFILE_VERSION, type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
 	await waitFor(second.frames, (frame) => frame.id === "confirm");
-	second.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	second.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	const status = await waitFor(second.frames, (frame) => frame.id === "status");
 	expect(status.result.delivery.pending).toBe(0);
 	second.close();

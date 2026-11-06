@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type OriginRef, originKey } from "@gajae-gateway/protocol";
+import { type OriginRef, originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
 import { FunctionalReadiness } from "../src/functional-readiness";
@@ -384,10 +384,12 @@ test("the runtime routes a monitor report into the target conversation's persona
 			}
 			throw new Error(`no ${label} frame`);
 		};
-		connectedSocket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		connectedSocket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await waitForFrame((frame) => frame.type === "negotiated", "negotiation");
 		connectedSocket.write(
-			`${JSON.stringify({ v: "0.1", type: "request", id: "monitor-test", verb: "monitor.test", params: { monitorId: monitor.monitorId } })}\n`,
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "monitor-test", verb: "monitor.test", params: { monitorId: monitor.monitorId } })}\n`,
 		);
 		const response = await waitForFrame((frame) => frame.id === "monitor-test", "monitor.test");
 		expect(response).toMatchObject({ type: "response", result: { eventId: expect.any(String) } });

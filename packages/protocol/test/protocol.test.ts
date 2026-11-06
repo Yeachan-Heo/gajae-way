@@ -35,7 +35,7 @@ describe("negotiation", () => {
 
 	test("rejects missing required capability", () => {
 		const result = negotiate({
-			supportedVersions: ["0.1"],
+			supportedVersions: [PROFILE_VERSION],
 			requiredCapabilities: ["timetravel"],
 		});
 		expect(result.ok).toBe(false);
@@ -44,7 +44,7 @@ describe("negotiation", () => {
 
 	test("unknown optional fields are ignored", () => {
 		const hello = {
-			supportedVersions: ["0.1"],
+			supportedVersions: [PROFILE_VERSION],
 			futureOptionalField: { anything: true },
 		} as never;
 		expect(negotiate(hello).ok).toBe(true);

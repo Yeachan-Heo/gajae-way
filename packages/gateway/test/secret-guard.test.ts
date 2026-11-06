@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ChatProgressPayload, Frame } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { SecretGuard, type SecretSources, secretSourcesFromEnv } from "../src/guard/secret-guard";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -263,7 +264,7 @@ describe("frames", () => {
 	const origin = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 	const message = (text: string, extra: Record<string, unknown> = {}): Frame =>
 		({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "event",
 			event: "chat.message",
 			payload: { turnId: "t", origin, role: "assistant", text, final: true, ...extra },
@@ -290,7 +291,7 @@ describe("frames", () => {
 	test("chat.progress activity is redacted; clean frames, reactions and other events are returned as-is", () => {
 		const g = guard();
 		const progress = {
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "event",
 			event: "chat.progress",
 			payload: {
@@ -311,7 +312,7 @@ describe("frames", () => {
 		const reaction = message("👀", { reaction: { emoji: "👀", targetMessageId: "m1" } });
 		expect(g.guardFrame(reaction)).toBe(reaction);
 		const response = {
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "response",
 			id: "r",
 			ok: true,
@@ -432,10 +433,10 @@ test("integration: a persona reply leaves the gateway socket redacted", async ()
 		},
 	});
 	const send = (value: unknown) => socket.write(`${JSON.stringify(value)}\n`);
-	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && frames.length < 1; attempt++) await Bun.sleep(5);
 	send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "c1",
 		verb: "chat.send",
