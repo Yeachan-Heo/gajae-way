@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
@@ -53,7 +53,9 @@ test("chat.progress emits periodically from turn start even before tail frames, 
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
@@ -156,7 +158,9 @@ test("chat.progress without tail frames for >90s still yields periodic progress 
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
@@ -277,7 +281,9 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
@@ -345,7 +351,9 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		socket.write(
 			`${JSON.stringify({
@@ -410,7 +418,9 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "negotiation did not complete");
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "retired" };
 		socket.write(

@@ -22,7 +22,9 @@ test("a stdio gateway.shutdown request completes ordered shutdown and exits the 
 	});
 	try {
 		const output = new Response(child.stdout as ReadableStream).text();
-		child.stdin.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		child.stdin.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		child.stdin.write(
 			`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`,
 		);

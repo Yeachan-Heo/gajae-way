@@ -3,13 +3,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager, STALLED_TURN_TERMINAL_TIMEOUT_MS } from "../src/orchestrator/persona-session";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 /**
  * The live double-reply (2026-09-02 DM 1468535438498336923): a turn's tail was

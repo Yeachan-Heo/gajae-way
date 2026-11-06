@@ -21,13 +21,13 @@ import { join } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilenceToken,
+	PROFILE_VERSION,
 	parseReactionReply,
 	REACTION_ALLOWLIST,
 	REACTIONS_PER_MESSAGE_CAP,
 	REACTIONS_PER_TURN_CAP,
 	resolveReactionEmoji,
 	VERBS_V01,
-	PROFILE_VERSION,
 } from "@gajae-gateway/protocol";
 import type { DiscordClientLike, GatewayClientLike } from "../../adapter-discord/src/main";
 import {

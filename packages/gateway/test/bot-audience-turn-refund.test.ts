@@ -2,13 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type BotAudienceLimits, BotAudienceTurnGuard } from "../src/engagement/policy";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const ORIGIN = "discord/channel/bot-budget";
 const ORIGIN_REF = { platform: "discord", kind: "channel", conversationId: "bot-budget" };

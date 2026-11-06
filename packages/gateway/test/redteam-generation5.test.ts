@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import {

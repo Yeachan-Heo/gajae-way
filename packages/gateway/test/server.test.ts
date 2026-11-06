@@ -1,5 +1,4 @@
 import { Database } from "bun:sqlite";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,9 +7,9 @@ import {
 	type GatewayReadinessResult,
 	type MemoryOperationStatusResult,
 	originKey,
+	PROFILE_VERSION,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
-	PROFILE_VERSION,
 } from "@gajae-gateway/protocol";
 import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
@@ -1103,7 +1102,13 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	});
 	await waitFrame(client.frames, "unknown-redelivery");
 	expect(client.frames.find((frame) => frame.id === "unknown-redelivery").error.code).toBe("invalid_params");
-	client.send({ v: PROFILE_VERSION, type: "request", id: "bad-since", verb: "ops.redeliver", params: { since: "not-a-time" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "bad-since",
+		verb: "ops.redeliver",
+		params: { since: "not-a-time" },
+	});
 	await waitFrame(client.frames, "bad-since");
 	expect(client.frames.find((frame) => frame.id === "bad-since").error.code).toBe("invalid_params");
 	client.close();
@@ -1560,7 +1565,13 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	// Poll for the audit result via memory.status
 	let auditStatus: any;
 	for (let attempt = 0; attempt < 200; attempt++) {
-		client.send({ v: PROFILE_VERSION, type: "request", id: `status-${attempt}`, verb: "memory.status", params: { opRef } });
+		client.send({
+			v: PROFILE_VERSION,
+			type: "request",
+			id: `status-${attempt}`,
+			verb: "memory.status",
+			params: { opRef },
+		});
 		await waitFor(client.frames, client.frames.length + 1);
 		const statusFrame = client.frames[client.frames.length - 1];
 		if (statusFrame?.result?.status === "completed") {
@@ -3786,7 +3797,13 @@ test("work.jobs pages newest-first so a home with many jobs stays under the fram
 	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const request = async (id: string, params?: unknown) => {
-		client.send({ v: PROFILE_VERSION, type: "request", id, verb: "work.jobs", ...(params === undefined ? {} : { params }) });
+		client.send({
+			v: PROFILE_VERSION,
+			type: "request",
+			id,
+			verb: "work.jobs",
+			...(params === undefined ? {} : { params }),
+		});
 		await waitFor(client.frames, client.frames.length + 1);
 		return client.frames.find((frame) => frame.id === id);
 	};
@@ -4726,7 +4743,13 @@ for (const verb of ["work.start", "work.run"] as const) {
 	test(`session.list preserves fresh ${verb} worker identity before and after settlement`, async () => {
 		const f = await workSocketFixture();
 		const name = "identity-worker";
-		f.client.send({ v: PROFILE_VERSION, type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
+		f.client.send({
+			v: PROFILE_VERSION,
+			type: "request",
+			id: "worker",
+			verb,
+			params: { name, text: "work", cwd: directory },
+		});
 		for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 		expect(f.port.sends).toHaveLength(1);
 		const opRef = f.port.sends[0]!.opRef;

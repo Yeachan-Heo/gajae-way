@@ -738,7 +738,9 @@ test("session_rebound dispatch failure cause reaches ops.cycle diagnostics (#600
 			},
 		});
 		try {
-			conn.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+			conn.write(
+				`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+			);
 			conn.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "cycle", verb: "ops.cycle" })}\n`);
 			for (let i = 0; i < 100 && !frames.some((frame) => (frame as { id?: string }).id === "cycle"); i++)
 				await Bun.sleep(5);

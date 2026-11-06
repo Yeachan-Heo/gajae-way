@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, type GatewayConfig, parseConfigFile } from "../src/config";
 import { PROFILE_VERSION } from "@gajae-gateway/protocol";
+import { ConfigError, type GatewayConfig, parseConfigFile } from "../src/config";
 import {
 	buildHandoffDigest,
 	extendHandoffChain,

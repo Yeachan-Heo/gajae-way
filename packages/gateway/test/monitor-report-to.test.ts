@@ -384,7 +384,9 @@ test("the runtime routes a monitor report into the target conversation's persona
 			}
 			throw new Error(`no ${label} frame`);
 		};
-		connectedSocket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		connectedSocket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await waitForFrame((frame) => frame.type === "negotiated", "negotiation");
 		connectedSocket.write(
 			`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "monitor-test", verb: "monitor.test", params: { monitorId: monitor.monitorId } })}\n`,

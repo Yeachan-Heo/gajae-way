@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROTOCOL_FAILURE_REASONS, PROFILE_VERSION } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION, PROTOCOL_FAILURE_REASONS } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
@@ -270,7 +270,9 @@ test("monitor.inspect exposes quarantined accepted and failed history without re
 			}
 			throw new Error(`no ${verb} response for ${id}`);
 		};
-		connected.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		connected.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		const listResponse = await request("list", "monitor.list");
 		const list = listResponse.monitors as Array<Record<string, unknown>>;
 		const schedules = listResponse.schedules as Record<string, Record<string, unknown>>;

@@ -4,12 +4,12 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ChatProgressPayload, Frame } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { SecretGuard, type SecretSources, secretSourcesFromEnv } from "../src/guard/secret-guard";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 // Fake credentials only, assembled at runtime so no literal in this file has a
 // live credential's shape (push protection, scanners).

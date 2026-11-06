@@ -2,13 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { InterimSpeechGate, isNearDuplicate, isProceduralNarration } from "../src/server/interim-speech";
 import type { GatewayServer } from "../src/server/server";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 let directory = "";
 let server: GatewayServer | undefined;

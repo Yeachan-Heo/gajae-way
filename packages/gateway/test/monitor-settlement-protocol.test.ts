@@ -2,11 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { sessionPortFromResponder } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -164,7 +164,13 @@ test("late delivery.fail cannot regress a delivered monitor event (server protoc
 test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", async () => {
 	const ctx = await startWithMonitor();
 	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
-	ctx.send({ v: PROFILE_VERSION, type: "request", id: "c1", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "c1",
+		verb: "delivery.confirm",
+		params: { deliveryId: ctx.deliveryId },
+	});
 	await response(ctx.frames, "c1");
 	expect(
 		ctx.db.monitors
@@ -173,7 +179,13 @@ test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", asyn
 			.map((row) => row.stage),
 	).toEqual(["delivered", "delivered"]);
 	// Duplicate confirm (idempotent ack):
-	ctx.send({ v: PROFILE_VERSION, type: "request", id: "c2", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "c2",
+		verb: "delivery.confirm",
+		params: { deliveryId: ctx.deliveryId },
+	});
 	const dup = await response(ctx.frames, "c2");
 	expect(dup.result).toEqual({ settled: true });
 	expect(
@@ -264,7 +276,13 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	expect(stagesAfter.map((row) => row.stage)).toEqual(["failed_no_retry", "failed_no_retry"]);
 	for (const eventId of ctx.eventIds) expect(ctx.db.monitors.failure(eventId)?.code).toBe("delivery_expired");
 	// An UNKNOWN delivery id is still invalid_params (an error frame):
-	ctx.send({ v: PROFILE_VERSION, type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
+	ctx.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "unknown-id",
+		verb: "delivery.confirm",
+		params: { deliveryId: "nope" },
+	});
 	for (let attempt = 0; attempt < 400; attempt++) {
 		const frame = ctx.frames.find((f) => f.id === "unknown-id");
 		if (frame) {

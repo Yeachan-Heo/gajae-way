@@ -2,12 +2,12 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { checkOutboundFile, deterministicFileDeliveryId } from "../src/server/outbound-files";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const SLACK_ORIGIN = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const DISCORD_ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;

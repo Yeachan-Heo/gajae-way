@@ -3,8 +3,8 @@ import { appendFileSync, existsSync, readFileSync, renameSync, rmSync, writeFile
 import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { StatusReport } from "@gajae-gateway/subsession";
 import { PROFILE_VERSION } from "@gajae-gateway/protocol";
+import type { StatusReport } from "@gajae-gateway/subsession";
 import type {
 	SessionBindInput,
 	SessionSendInput,

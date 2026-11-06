@@ -2,11 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, UNCONSUMED_FIELDS } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { sessionPortFromResponder } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 /**
  * Live config reload.

@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, newOpRef } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -106,7 +106,9 @@ async function harness(
 		expect(frame).toBeDefined();
 		return frame;
 	}
-	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+	socket.write(
+		`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+	);
 	await wait((frame) => frame.type === "negotiated");
 	let sequence = 0;
 	function request(verb: string, params?: unknown) {

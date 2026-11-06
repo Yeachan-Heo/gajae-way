@@ -3,12 +3,12 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "context-turn" } as const;
 const ORIGIN_KEY = "discord/channel/context-turn";

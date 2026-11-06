@@ -3,12 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OriginRef } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { deterministicPostDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, replyTargetConversation, resolvePostTarget, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 /**
  * [POST:<origin key>] (owner request 2026-10-01): a part of a persona answer

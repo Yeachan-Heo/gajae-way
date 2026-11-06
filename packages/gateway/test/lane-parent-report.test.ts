@@ -3,7 +3,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
+import {
+	eventTypeOrigin,
+	monitorSessionOrigin,
+	type OriginRef,
+	originKey,
+	PROFILE_VERSION,
+} from "@gajae-gateway/protocol";
 import { maybeCreateThreadOnMention, settleDiscordDelivery, UnnamedThreads } from "../../adapter-discord/src/main";
 import { discordMessageOrigin } from "../../adapter-discord/src/origin";
 import type { GatewayConfig } from "../src/config";

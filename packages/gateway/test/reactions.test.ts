@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OriginRef } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
 const ORIGIN_KEY = "discord/channel/chan-1";
@@ -322,7 +322,8 @@ test("engagement.reaction rejects a missing target, a bad action and a loopback 
 		],
 		["e4", { origin: ORIGIN, targetMessageId: "m1", emoji: "👍", action: "add" }],
 	];
-	for (const [id, params] of cases) client.send({ v: PROFILE_VERSION, type: "request", id, verb: "engagement.reaction", params });
+	for (const [id, params] of cases)
+		client.send({ v: PROFILE_VERSION, type: "request", id, verb: "engagement.reaction", params });
 	await settle();
 	for (const [id] of cases) {
 		const error = client.frames.find((frame) => frame.type === "error" && frame.id === id);

@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { ChannelEngagementPolicy, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { ChannelPolicy, GatewayConfig } from "../src/config";
 import { GlobalGjcClient, parseListModelsOutput } from "../src/orchestrator/broker";
 import {
@@ -889,12 +889,12 @@ test("session.modelChoices works with 1.1 client providing origin", async () => 
 			});
 			client = await connect(config.socketPath);
 			// 1.1 client sends hello
-			client.send({ v: "1.1", type: "hello", payload: { supportedVersions: ["1.1"] } });
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 			await Bun.sleep(5);
 			// Should negotiate successfully
 			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
 			expect(negotiated).toBeDefined();
-			expect((negotiated as any)?.payload?.profileVersion).toBe("1.1");
+			expect((negotiated as any)?.payload?.profileVersion).toBe(PROFILE_VERSION);
 			// Send session.modelChoices with origin
 			client.send({
 				v: "1.1",
