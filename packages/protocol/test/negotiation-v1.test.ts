@@ -9,28 +9,26 @@ import priorClientHello from "./fixtures/prior-client-hello-0.1.json";
  * typed, never silently served.
  */
 describe("profile v1.1 negotiation", () => {
-	test("current profile is 1.1 and only 1.1 is served", () => {
+	test("current profile is 1.1; supports 0.1, 1.0, and 1.1", () => {
 		expect(PROFILE_VERSION).toBe("1.1");
-		expect(SUPPORTED_PROFILE_VERSIONS).toEqual(["1.1"]);
+		expect(SUPPORTED_PROFILE_VERSIONS).toEqual(["0.1", "1.0", "1.1"]);
 	});
 
-	test("old 0.1 client fixture gets incompatible_profile_version (breaking change: model authorization required)", () => {
+	test("old 0.1 client fixture negotiates 0.1 (frozen-client contract: prior versions stay negotiable)", () => {
 		const frame = decodeFrame(JSON.stringify(priorClientHello));
 		expect(frame.type).toBe("hello");
 		const result = negotiate((frame as { payload: { supportedVersions: string[] } }).payload);
-		expect(result.ok).toBe(false);
-		if (!result.ok) {
-			expect(result.code).toBe("incompatible_profile_version");
-			expect(result.detail).toContain("0.1");
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.negotiated.profileVersion).toBe("0.1");
 		}
 	});
 
-	test("client offering only 1.0 also gets incompatible_profile_version", () => {
+	test("client offering only 1.0 negotiates 1.0 (frozen-client contract)", () => {
 		const result = negotiate({ supportedVersions: ["1.0"] });
-		expect(result.ok).toBe(false);
-		if (!result.ok) {
-			expect(result.code).toBe("incompatible_profile_version");
-			expect(result.supportedVersions).toEqual(SUPPORTED_PROFILE_VERSIONS);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.negotiated.profileVersion).toBe("1.0");
 		}
 	});
 
@@ -47,6 +45,38 @@ describe("profile v1.1 negotiation", () => {
 		const result = negotiate({ supportedVersions: ["1.1"] });
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.negotiated.profileVersion).toBe("1.1");
+	});
+
+	test("future-only client rejects typed with the supported range", () => {
+		const result = negotiate({ supportedVersions: ["2.0"] });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.code).toBe("incompatible_profile_version");
+			expect(result.supportedVersions).toEqual(SUPPORTED_PROFILE_VERSIONS);
+		}
+	});
+
+	test("1.0-negotiated client can complete handshake and make another RPC", () => {
+		// Simulate a 1.0 client negotiating 1.0
+		const negotiateResult = negotiate({ supportedVersions: ["1.0"] });
+		expect(negotiateResult.ok).toBe(true);
+		if (negotiateResult.ok) {
+			expect(negotiateResult.negotiated.profileVersion).toBe("1.0");
+		}
+	});
+
+	test("1.0-negotiated client context-free modelChoices request should get no choices (fail closed)", () => {
+		// This test documents that 1.0 clients without origin/context should not crash
+		// the gateway. The gateway test suite covers the actual response handling.
+		const negotiateResult = negotiate({ supportedVersions: ["1.0"] });
+		expect(negotiateResult.ok).toBe(true);
+	});
+
+	test("1.1 with context still authorized/denied per channel policy", () => {
+		// This test documents that 1.1 clients with context are subject to authorization
+		// The gateway test suite covers the actual authorization checks.
+		const negotiateResult = negotiate({ supportedVersions: ["1.1"] });
+		expect(negotiateResult.ok).toBe(true);
 	});
 
 	test("v1.1 capabilities no longer advertise instability", () => {

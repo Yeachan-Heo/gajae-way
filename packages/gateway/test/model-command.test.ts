@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChannelEngagementPolicy, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import type { EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { ChannelPolicy, GatewayConfig } from "../src/config";
 import { GlobalGjcClient, parseListModelsOutput } from "../src/orchestrator/broker";
@@ -813,7 +813,7 @@ test("session.modelChoices allows loopback origin (no engagement needed)", async
 	});
 });
 
-test("regression: old 0.1 client gets incompatible_profile_version at handshake (model authorization required)", async () => {
+test("frozen-client contract: 0.1 client negotiates 0.1 and can make RPCs", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gjc-"));
 	try {
 		const config: GatewayConfig = {
@@ -842,10 +842,21 @@ test("regression: old 0.1 client gets incompatible_profile_version at handshake 
 			// Old 0.1 client sends hello
 			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 			await Bun.sleep(5);
-			// Should get negotiation error instead of being able to negotiate
-			const negotiationError = client.frames.find((frame) => frame.type === "error");
-			expect(negotiationError).toBeDefined();
-			expect((negotiationError as any)?.error?.code).toBe("incompatible_profile_version");
+			// Should negotiate successfully
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe("0.1");
+			// Verify gateway.status RPC succeeds on 0.1 client
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "status",
+				verb: "gateway.status",
+				params: undefined,
+			});
+			await waitFor(() => client!.frames.some((frame) => frame.id === "status"), "gateway.status did not answer");
+			const statusResult = client.frames.find((frame) => frame.id === "status");
+			expect(statusResult?.type).toBe("response");
 		} finally {
 			client?.close();
 			try {
@@ -909,6 +920,135 @@ test("session.modelChoices works with 1.1 client providing origin", async () => 
 			);
 			const result = client.frames.find((frame) => frame.id === "choices");
 			expect(result?.type).toBe("response");
+			expect((result as any)?.result?.choices).toEqual(["base"]);
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("frozen-client contract: 1.0 context-free modelChoices gets empty choices (fail closed)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// 1.0 client sends hello
+			client.send({ v: "1.0", type: "hello", payload: { supportedVersions: ["1.0"] } });
+			await Bun.sleep(5);
+			// Should negotiate 1.0
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe("1.0");
+			// Send modelChoices WITHOUT origin (context-free)
+			client.send({
+				v: "1.0",
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: {}, // No origin provided
+			});
+			await waitFor(
+				() => client!.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			const result = client.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			// Should get empty choices (fail closed), not an error
+			expect((result as any)?.result?.choices).toEqual([]);
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	} catch (error) {
+		await rm(home, { recursive: true, force: true });
+		throw error;
+	}
+});
+
+test("profile 1.1 with context still authorized/denied per channel policy", async () => {
+	const loopbackOrigin = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
+	const home = await mkdtemp(join(tmpdir(), "gjc-"));
+	try {
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+		};
+		const database = await Store.open(config.dbPath);
+		const port = new ScriptedSessionPort();
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({
+				config,
+				database,
+				sessionPort: port,
+				onStop: () => database.close(),
+			});
+			client = await connect(config.socketPath);
+			// 1.1 client sends hello
+			client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+			await Bun.sleep(5);
+			// Should negotiate 1.1
+			const negotiated = client.frames.find((frame) => frame.type === "negotiated");
+			expect(negotiated).toBeDefined();
+			expect((negotiated as any)?.payload?.profileVersion).toBe(PROFILE_VERSION);
+			// Send modelChoices WITH origin and context (1.1 with authorization)
+			client.send({
+				v: PROFILE_VERSION,
+				type: "request",
+				id: "choices",
+				verb: "session.modelChoices",
+				params: { origin: loopbackOrigin, engagement: { mentioned: true, group: false } },
+			});
+			await waitFor(
+				() => client!.frames.some((frame) => frame.id === "choices"),
+				"session.modelChoices did not answer",
+			);
+			const result = client.frames.find((frame) => frame.id === "choices");
+			expect(result?.type).toBe("response");
+			// Should get choices (authorized on loopback)
 			expect((result as any)?.result?.choices).toEqual(["base"]);
 		} finally {
 			client?.close();

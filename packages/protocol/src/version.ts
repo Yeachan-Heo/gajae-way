@@ -10,7 +10,7 @@
 export const PROFILE_VERSION = "1.1" as const;
 
 /** Inclusive range of profile versions this build can serve. */
-export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = ["1.1"];
+export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = ["0.1", "1.0", "1.1"];
 
 /** Capability identifiers advertised at negotiation. Grows additively per phase. */
 export const CAPABILITIES = [
