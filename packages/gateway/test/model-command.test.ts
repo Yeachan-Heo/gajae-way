@@ -897,7 +897,7 @@ test("session.modelChoices works with 1.1 client providing origin", async () => 
 			expect((negotiated as any)?.payload?.profileVersion).toBe(PROFILE_VERSION);
 			// Send session.modelChoices with origin
 			client.send({
-				v: "1.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id: "choices",
 				verb: "session.modelChoices",
