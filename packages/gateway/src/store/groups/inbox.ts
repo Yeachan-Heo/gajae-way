@@ -814,16 +814,38 @@ export class InboxGroup {
 						WHERE d.origin_key = inbound_messages.origin_key AND d.state = 'confirmed'
 							AND d.created_at >= inbound_messages.received_at
 							AND d.delivery_id NOT LIKE 'gw-h-%' AND d.delivery_id NOT LIKE 'gw-s-%'
-					)
+				)
 				ORDER BY origin_key, received_at, rowid`,
-			)
-			.all(cutoff) as Array<{
-			origin_key: string;
-			origin_ref_json: string;
-			message_id: string;
-			received_at: string;
-			engagement_json: string | null;
-		}>;
+		)
+		.all(cutoff) as Array<{
+		origin_key: string;
+		origin_ref_json: string;
+		message_id: string;
+		received_at: string;
+		engagement_json: string | null;
+	}>;
+	}
+
+	/** Lane reports pending past the cutoff that may contribute to origin_silent (#766). */
+	unansweredLaneReports(cutoff: string): Array<{
+		readonly origin_key: string;
+		readonly origin_ref_json: string;
+		readonly message_id: string;
+		readonly received_at: string;
+	}> {
+		return this.#db
+			.prepare(
+				`SELECT origin_key, origin_ref_json, message_id, received_at
+				FROM inbound_messages
+				WHERE source = 'lane_report' AND state = 'pending' AND received_at <= ? AND ${REPLAYABLE_INBOUND}
+				ORDER BY origin_key, received_at, rowid`,
+		)
+		.all(cutoff) as Array<{
+		origin_key: string;
+		origin_ref_json: string;
+		message_id: string;
+		received_at: string;
+	}>;
 	}
 
 	nonterminalOrigins(): readonly string[] {

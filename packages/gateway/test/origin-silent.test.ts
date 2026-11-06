@@ -266,3 +266,28 @@ test("without an owner target the incident is recorded for ops cycle and no DM i
 	expect(transition).toMatchObject({ kind: "silent", payload: undefined });
 	expect(db.outbox.get(transition!.deliveryId)).toBeUndefined();
 });
+
+test("lane_report messages with no platform messages should trigger origin_silent (issue #766)", async () => {
+	const db = await open();
+	// Enqueue only lane_report messages, no platform messages
+	const originKey = "discord/channel/lane-reports-only";
+	const [platform, kind, conversationId] = originKey.split("/");
+	for (let i = 0; i < 5; i++) {
+		expect(
+			db.transaction((tx) =>
+				db.inbox.enqueue(tx, {
+					messageId: `lane-${i}`,
+					originKey,
+					originRefJson: JSON.stringify({ platform, kind, conversationId }),
+					body: `lane report ${i}`,
+					source: "lane_report",
+					receivedAt: new Date(NOW - (21 - i) * MINUTE).toISOString(),
+				}),
+			),
+		).toBe(true);
+	}
+	const silentOrigins = findSilentOrigins(db, NOW);
+	expect(silentOrigins.some((origin) => origin.originKey === originKey)).toBe(true);
+	const silentOrigin = silentOrigins.find((origin) => origin.originKey === originKey);
+	expect(silentOrigin?.unanswered).toBe(5);
+});

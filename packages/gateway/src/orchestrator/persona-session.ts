@@ -136,6 +136,11 @@ function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
 }
 
+/** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
+function relayUnavailableTrackerKey(opRef: string): string {
+	return `relay_unavailable:${opRef}`;
+}
+
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
 
 /**
@@ -1746,10 +1751,14 @@ class OriginActor {
 		if (heldMs < this.#manager.unresolvedHoldMs) return false;
 		const sessionId = bound?.sessionId ?? turn.sessionId;
 		if (!sessionId) return false;
-		// Only a dead host is evidence the op will not settle by itself; an
-		// unanswerable probe is not.
+		// Check for relay unavailable evidence even if the host is live (#766).
+		// A live host whose relay is unresponsive should escalate if the evidence spans long enough.
+		const relayTrackerTs = database.core.metaGet(relayUnavailableTrackerKey(turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined && this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
 		const host = await this.#bindingState(sessionId);
-		if (host.live !== false && host.disowned !== true) return false;
+		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
 		// A turn recovery never adopted carries no status verdict yet.
 		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
 		const trigger = database.inbox.turnRow(turn.opRef);
@@ -4016,6 +4025,8 @@ class OriginActor {
 				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 				"error",
 			);
+			// Track relay unavailable evidence to detect unresponsive relays on live hosts (#766)
+			this.#manager.database.core.metaSet(relayUnavailableTrackerKey(bound.turn.opRef), this.#manager.now().toString());
 			return await this.#manager.port.status(base);
 		}
 	}

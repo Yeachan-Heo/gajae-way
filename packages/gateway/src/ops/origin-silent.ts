@@ -46,6 +46,17 @@ export function findSilentOrigins(
 				unanswered: 1,
 			});
 	}
+	// Lane reports stuck past the threshold also contribute to origin_silent (#766)
+	for (const row of database.inbox.unansweredLaneReports(cutoff)) {
+		const entry = byOrigin.get(row.origin_key);
+		if (entry) entry.unanswered += 1;
+		else
+			byOrigin.set(row.origin_key, {
+				oldestMessageId: row.message_id,
+				oldestReceivedAt: row.received_at,
+				unanswered: 1,
+			});
+	}
 	return [...byOrigin].map(([originKey, entry]) => {
 		const block = blockingTurn(database, originKey);
 		return {
