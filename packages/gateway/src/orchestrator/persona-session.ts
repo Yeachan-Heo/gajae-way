@@ -4105,7 +4105,8 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			const reason = report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
+			const reason =
+				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
 			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;

@@ -12,7 +12,7 @@ import {
 } from "../src/orchestrator/persona-session";
 import { RelayClosedError } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { ScriptedSessionPort, type ScriptedTailHandle } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -606,24 +606,35 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 	try {
 		await f.manager.recover();
 
+		// Exercise the relay-death callback to set bound.detached = true (#766).
+		// After onRelayDead, statusOf must record relay unavailable evidence via CLI-only probes.
+		const relayHandles = f.port.getTailHandles(f.binding.sessionId);
+		const handle = [...relayHandles][0] as ScriptedTailHandle | undefined;
+		expect(handle).toBeDefined();
 		let escalationNotices = f.notices.length;
+
+		// Trigger the relay death callback; this sets bound.detached and records relay unavailable evidence.
+		handle!.die();
+		await clock.advance(0); // Let async work settle
+
+		// After relay death, only CLI-only status probes can check the operation.
 		const status = f.port.status.bind(f.port);
 		const relayUnavailableMs = 30_000; // Probe every 30 seconds
-		let relayProbeCount = 0;
+		let cliProbeCount = 0;
 
 		f.port.status = async (input) => {
 			if (input.opRef !== f.heldOpRef) return await status(input);
 			const isRelay = input.relay !== undefined;
 			if (isRelay) {
-				relayProbeCount++;
-				// Simulate relay dead with the real error type production code recognizes
-				throw new RelayClosedError(f.binding.sessionId, "relay dead", false);
+				// After onRelayDead, the bound should be detached and no relay probe should happen.
+				throw new Error("relay probe should not happen after onRelayDead");
 			}
+			cliProbeCount++;
 			return await status(input);
 		};
 
-		// Advance by 11 minutes with relay failures. The relay is dead from the start,
-		// so escalation should still trigger based on relay unavailable evidence.
+		// Advance by 11 minutes with CLI-only status probes.
+		// Escalation should trigger based on relay unavailable evidence recorded at death.
 		for (let i = 0; i < 11; i++) {
 			for (let j = 0; j < MINUTE / relayUnavailableMs; j++) {
 				await clock.advance(relayUnavailableMs);
@@ -631,10 +642,11 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 			}
 		}
 
-		// Verify the relay was probed multiple times during the test
-		expect(relayProbeCount).toBeGreaterThan(10);
+		// Verify CLI-only probes were used (no relay probes after death)
+		expect(cliProbeCount).toBeGreaterThan(0);
 
-		// Escalation must occur with exactly one notice with the right reason
+		// Escalation must occur exactly once with the right reason.
+		// It escalates because relay unavailable evidence is >= unresolvedHoldMs old.
 		expect(f.notices.length).toBe(escalationNotices + 1);
 		expect(f.notices[f.notices.length - 1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
 

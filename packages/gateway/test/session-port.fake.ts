@@ -555,6 +555,11 @@ export class ScriptedSessionPort implements SessionPort {
 		return handle;
 	}
 
+	/** Test-only accessor to get tail handles for a session. */
+	getTailHandles(sessionId: string): ReadonlySet<ScriptedTailHandle> {
+		return this.#tails.get(sessionId) ?? new Set();
+	}
+
 	async runCompaction(_input: {
 		sessionId: string;
 		repo: string;
