@@ -1323,6 +1323,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	staleOutput?: { count: number; firstAt: number; lastAt: number };
 	/** Last assistant message the owned relay delivered for THIS turn (correlation-fenced by the handle). */
 	lastAssistantText?: string;
+	/** stopReason from the last message_end frame for THIS turn's final assistant message. */
+	lastAssistantStopReason?: string;
 	/** A tool ran during this turn; replaying its trigger could repeat external side effects. */
 	hadToolActivity: boolean;
 	/** A permission request may already have displayed an approval panel for this turn. */
@@ -3869,7 +3871,13 @@ class OriginActor {
 				(!frame.idle || frame.rawKind === "agent_end" || frame.rawKind === "agent_failed")
 			)
 				this.#clearStallReconciliation(bound);
-			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
+			if (frame.assistantText && !frame.steerEcho) {
+				bound.lastAssistantText = frame.assistantText;
+				// Capture stopReason from message_end frames for THIS turn
+				if (frame.rawKind === "message_end" && typeof frame.payload.stopReason === "string") {
+					bound.lastAssistantStopReason = frame.payload.stopReason;
+				}
+			}
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
 				bound.hadToolActivity = true;
 			if (frame.rawKind === "tool_execution_start")
@@ -4586,6 +4594,9 @@ class OriginActor {
 		this.#flushStaleOutput(bound, "session_gone");
 		await bound.tail?.close();
 		const discarded = bound.retired && !bound.answerWanted;
+		// Check if THIS turn's last assistant message ended with stopReason='stop'.
+		// Use the stopReason captured from tail frames (no query to dead host).
+		const assistantStoppedNormally = bound.lastAssistantStopReason === "stop";
 		// The notice is persisted BEFORE the trigger closes. If persisting it
 		// throws, the trigger stays open and the next sweep retries the same
 		// deterministic notice: a closed turn never silently loses it.
@@ -4596,7 +4607,7 @@ class OriginActor {
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
-					forceFailureNotice: true,
+					forceFailureNotice: !assistantStoppedNormally,
 				});
 			} catch (error) {
 				this.#scheduleStatusRecheck(bound);
@@ -4617,7 +4628,9 @@ class OriginActor {
 					this.#current === bound &&
 					session?.epoch === bound.epoch &&
 					session.sessionId === bound.sessionId;
-				const changed = completeInboundTurn(database, tx, bound.turn.opRef, discarded ? "retired" : "turn_failed");
+				// When the turn delivered a stop answer, close as answered. Otherwise turn_failed.
+				const unlinkedReason: TerminalUnlinkedReason = assistantStoppedNormally ? "no_delivery" : "turn_failed";
+				const changed = completeInboundTurn(database, tx, bound.turn.opRef, discarded ? "retired" : unlinkedReason);
 				if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);
 				return changed;
 			});
@@ -4628,7 +4641,7 @@ class OriginActor {
 		for (const held of database.inbox.steersHeld(bound.turn.opRef))
 			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
 		this.#manager.log(
-			`${discarded ? "retired_turn_closed" : "accepted_turn_closed"} origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=stalled_no_terminal_event`,
+			`${discarded ? "retired_turn_closed" : "accepted_turn_closed"} origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=${assistantStoppedNormally ? "stalled_after_stop" : "stalled_no_terminal_event"}`,
 		);
 		if (completed === 0) {
 			await this.#forgetClosed(bound);
