@@ -1179,6 +1179,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		laneRoot: options.config.home,
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
+		brokerGeneration: () => options.broker?.generation ?? 0,
 	});
 	const work = new WorkLaneManager({
 		database: options.database,
