@@ -313,3 +313,93 @@ test("allows SQLite's intrinsic memory journal mode for an in-memory store", asy
 		store.close();
 	}
 });
+
+test("fresh database ends with auto_vacuum = 2 (INCREMENTAL)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-auto-vacuum-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const database = await Store.open(path);
+		database.close();
+		const raw = new Database(path);
+		const autoVacuum = raw.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum ?? 0;
+		raw.close();
+		expect(autoVacuum).toBe(2);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("legacy database with auto_vacuum=0 is converted on open and gives its free pages back", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-legacy-vacuum-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const seeded = await Store.open(path);
+		seeded.close();
+		const legacy = new Database(path);
+		// Model a pre-#678 file: no auto_vacuum, and a large table compacted away.
+		legacy.exec("PRAGMA auto_vacuum = NONE; VACUUM;");
+		legacy.exec("CREATE TABLE bloat (blob BLOB)");
+		const insert = legacy.prepare("INSERT INTO bloat VALUES (randomblob(4096))");
+		for (let index = 0; index < 2_000; index++) insert.run();
+		legacy.exec("DROP TABLE bloat");
+		const pragma = (name: string) => (legacy.query(`PRAGMA ${name}`).get() as Record<string, number>)[name]!;
+		expect(pragma("auto_vacuum")).toBe(0);
+		const pagesBefore = pragma("page_count");
+		expect(pragma("freelist_count")).toBeGreaterThan(1_900);
+		legacy.close();
+
+		const store = await Store.open(path);
+		expect(store.core.getFreelistCount()).toBe(0);
+		expect(store.core.getPageCount()).toBeLessThan(pagesBefore - 1_900);
+		store.close();
+		const raw = new Database(path);
+		expect((raw.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number }).auto_vacuum).toBe(2);
+		raw.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/** Leaves `freePages` pages on the freelist of an INCREMENTAL store, with `livePages` of data kept. */
+function fragment(store: Store, livePages: number, freePages: number): void {
+	store.core.metaSet("vacuum-test-live", "x".repeat(livePages * 4_000));
+	store.core.metaSet("vacuum-test-free", "x".repeat(freePages * 4_000));
+	store.core.metaDelete("vacuum-test-free");
+}
+
+test("maintain() reclaims at most 4096 free pages per call while the freelist is above 25%", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-maintain-"));
+	try {
+		const store = await Store.open(join(directory, "gateway.db"));
+		fragment(store, 0, 6_000);
+		const before = store.core.getFreelistCount();
+		expect(before).toBeGreaterThan(5_000);
+		expect(before / store.core.getPageCount()).toBeGreaterThan(0.25);
+		store.core.maintain();
+		// `optimize` in the same pass may move a page or two; the vacuum step itself is bounded.
+		const reclaimed = before - store.core.getFreelistCount();
+		expect(reclaimed).toBeGreaterThanOrEqual(4_090);
+		expect(reclaimed).toBeLessThanOrEqual(4_100);
+		store.core.maintain();
+		expect(store.core.getFreelistCount()).toBe(0);
+		store.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("maintain() leaves a freelist at or below 25% alone", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-maintain-no-op-"));
+	try {
+		const store = await Store.open(join(directory, "gateway.db"));
+		fragment(store, 4_000, 500);
+		const before = store.core.getFreelistCount();
+		expect(before).toBeGreaterThan(400);
+		expect(before / store.core.getPageCount()).toBeLessThanOrEqual(0.25);
+		store.core.maintain();
+		expect(Math.abs(store.core.getFreelistCount() - before)).toBeLessThanOrEqual(2);
+		store.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
