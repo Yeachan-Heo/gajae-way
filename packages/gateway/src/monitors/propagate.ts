@@ -1287,6 +1287,7 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			let opRef: string | undefined;
 			const flushReadinessFailure = () => {
 				if (!readinessFailure) return;
 				this.#recordReadinessFailure({
@@ -1417,7 +1418,7 @@ export class MonitorPropagator {
 				// the turn it started may still be running. Reuse its op-ref on retry.
 				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
 				const reusedOpRef = resumeTurn?.opRef ?? (await this.#reusableAuthoringTurn(authoringEventIds, sessionId));
-				const opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
+				opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
 				// #742: Check if we should hold the pointer instead of overwriting it with a fresh opRef
 				let shouldThrowOutputPending = false;
 				const authority = this.#database.bindings.brokerAuthority();
@@ -1449,7 +1450,7 @@ export class MonitorPropagator {
 										// are explicit evidence the operation was never sent. Permit fresh authoring.
 										// HOWEVER: verify the failure belongs to this pointer's operation (#742).
 										const failure = this.#database.monitors.failure(row.event_id);
-										if (isDurableNoSendFailureForOperation(failure, sessionId, opRef)) {
+										if (isDurableNoSendFailureForOperation(failure, prior.sessionId, prior.opRef)) {
 											// Durable failure: permit fresh authoring
 										} else {
 											// Unknown status, throwing, or other states: hold the pointer (#742)
@@ -1926,7 +1927,11 @@ export class MonitorPropagator {
 							`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 							now(),
 							false,
-							protocolFailure,
+							{
+								...(protocolFailure ?? {}),
+								sessionId: boundSessionId,
+								opRef,
+							},
 						);
 						if (failed) {
 							transitionedFailure = true;
@@ -2824,33 +2829,11 @@ export class MonitorPropagator {
 }
 
 /**
- * Extract operation reference (sessionId + opRef) from a failure detail if encoded.
- * The detail field may contain JSON with operation info at the end.
- */
-function extractOperationReference(detail: string): { sessionId?: string; opRef?: string } | undefined {
-	try {
-		// Try to find JSON at the end of the detail string
-		const lastBraceIdx = detail.lastIndexOf("{");
-		if (lastBraceIdx === -1) return undefined;
-		const json = JSON.parse(detail.slice(lastBraceIdx));
-		if (typeof json === "object" && json !== null) {
-			const { sessionId, opRef } = json as Record<string, unknown>;
-			if (typeof sessionId === "string" && typeof opRef === "string") {
-				return { sessionId, opRef };
-			}
-		}
-	} catch {
-		// Not valid JSON or not in expected format
-	}
-	return undefined;
-}
-
-/**
  * Verify that a failure is a durable no-send failure belonging to the specified operation (#742).
  * Checks both the code AND that the operation reference matches (sessionId + opRef).
  */
 function isDurableNoSendFailureForOperation(
-	failure: { readonly code: string; readonly detail: string } | undefined,
+	failure: { readonly code: string; readonly session_id?: string | null; readonly op_ref?: string | null } | undefined,
 	sessionId: string,
 	opRef: string,
 ): boolean {
@@ -2861,9 +2844,7 @@ function isDurableNoSendFailureForOperation(
 		failure.code !== "session_host_unavailable"
 	)
 		return false;
-	const opRef_ = extractOperationReference(failure.detail);
-	if (!opRef_) return false;
-	return opRef_.sessionId === sessionId && opRef_.opRef === opRef;
+	return failure.session_id === sessionId && failure.op_ref === opRef;
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
