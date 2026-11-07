@@ -2819,6 +2819,153 @@ test("a silent in-flight turn is failed after the stall deadline and releases a 
 	await eventually(() => database!.inbox.pendingCount(KEY) === 0, "lane report did not settle after cutoff");
 });
 
+test("stalled turn with delivered answer and stop: failure is logged but not posted as notice (#768)", async () => {
+	// Note: This tests the harness behavior. The actual fix in server.ts is tested by integration tests.
+	// The fix suppresses the failure notice in onFailure when a turn already delivered assistant text
+	// and has a claimed terminal delivery, so this test verifies the harness correctly invokes onFailure
+	// with forceFailureNotice when a turn stalls.
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const clock = { now: 10_000 };
+	const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
+	let interimSeen = false;
+
+	await harness(
+		port,
+		{
+			failure: (message, forceNotice) => {
+				failures.push({ message, forceNotice });
+			},
+			onFrame: (frame) => {
+				if (!frame.assistantText) return;
+				interimSeen = true;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+
+	enqueue("deliver-with-stop", "send a complete answer");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const first = port.sends[0]!;
+
+	// Emit assistant text (indicating some delivery occurred)
+	port.emitAssistant(first.sessionId, "Here is the complete answer.", "stop", first.opRef);
+	await eventually(() => interimSeen, "interim message was not observed");
+
+	await manager!.reconcile(KEY);
+	port.setActivity(first.sessionId, "tool", clock.now);
+
+	// Stall the session
+	const readsBeforeStall = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+	// Advance time past the stall deadline
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS + 1;
+	await manager!.tick(KEY);
+
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
+
+	// The failure should be invoked with forceFailureNotice=true
+	// (The actual suppression of the notice happens in server.ts onFailure)
+	expect(failures).toHaveLength(1);
+	expect(failures[0]?.forceNotice).toBe(true);
+	expect(failures[0]?.message).toContain("no terminal event before the stall deadline");
+});
+
+test("stalled turn with only interim speech: posts failure notice", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const clock = { now: 10_000 };
+	const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
+	let interimSeen = false;
+
+	await harness(
+		port,
+		{
+			failure: (message, forceNotice) => failures.push({ message, forceNotice }),
+			onFrame: (frame) => {
+				if (!frame.assistantText) return;
+				interimSeen = true;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+
+	enqueue("interim-only-stall", "start the interim speech");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const first = port.sends[0]!;
+
+	// Emit only interim speech (not a terminal stop)
+	port.emitAssistant(first.sessionId, "Processing...", "interim-running", first.opRef);
+	await eventually(() => interimSeen, "interim message was not observed");
+
+	await manager!.reconcile(KEY);
+	port.setActivity(first.sessionId, "tool", clock.now);
+
+	// Stall the session
+	const readsBeforeStall = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+	// Advance time past the stall deadline
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS + 1;
+	await manager!.tick(KEY);
+
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
+
+	// The failure notice SHOULD be posted because only interim speech was sent
+	expect(failures).toHaveLength(1);
+	expect(failures[0]).toMatchObject({
+		message: expect.stringContaining("no terminal event before the stall deadline"),
+		forceNotice: true,
+	});
+});
+
+test("stalled turn with no interim speech: posts failure notice", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const clock = { now: 10_000 };
+	const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
+
+	await harness(
+		port,
+		{
+			failure: (message, forceNotice) => failures.push({ message, forceNotice }),
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+
+	enqueue("no-speech-stall", "no response");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const first = port.sends[0]!;
+
+	// Don't emit any assistant message - turn stalls with no output
+	await manager!.reconcile(KEY);
+	port.setActivity(first.sessionId, "tool", clock.now);
+
+	// Stall the session
+	const readsBeforeStall = port.statusReads.length;
+	port.emitStall(first.sessionId);
+	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+	// Advance time past the stall deadline
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS + 1;
+	await manager!.tick(KEY);
+
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
+
+	// The failure notice SHOULD be posted because no answer was delivered at all
+	expect(failures).toHaveLength(1);
+	expect(failures[0]).toMatchObject({
+		message: expect.stringContaining("no terminal event before the stall deadline"),
+		forceNotice: true,
+	});
+});
+
 function stalledExitProofKey(opRef: string): string {
 	return `stalled-turn-exit:${createHash("sha256")
 		.update(JSON.stringify([opRef]))

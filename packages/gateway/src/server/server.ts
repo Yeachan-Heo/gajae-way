@@ -4211,7 +4211,21 @@ async function createInboundTurnLifecycle(
 				options.database.transaction((tx) =>
 					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision),
 				);
-			if (nonLoopback && (!assistantDeliveryStarted || forceFailureNotice)) {
+			// Do not post the notice if the turn already delivered a complete answer with stop,
+			// even if forceFailureNotice is set due to a stall (#768).
+			const shouldSuppressNotice = forceFailureNotice && assistantDeliveryStarted && (() => {
+				// Check if the turn has a successful terminal delivery claimed
+				const row = options.database.inbox.turnRow(input.turn.opRef);
+				if (!row || !row.terminal_delivery_id) return false;
+				try {
+					const claims = JSON.parse(row.terminal_delivery_id) as Record<string, unknown>;
+					// If all keys are "none", it was marked unlinked (failure)
+					return Object.keys(claims).some((key) => key !== "none");
+				} catch {
+					return false;
+				}
+			})();
+			if (nonLoopback && (!assistantDeliveryStarted || (forceFailureNotice && !shouldSuppressNotice))) {
 				// Recovery can observe the same failed terminal after the notice was
 				// persisted but before the trigger was settled. Reuse the trigger's
 				// terminal delivery identity instead of emitting another failure. A
