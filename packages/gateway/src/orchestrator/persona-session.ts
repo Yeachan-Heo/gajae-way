@@ -3874,11 +3874,11 @@ class OriginActor {
 			if (frame.assistantText && !frame.steerEcho) {
 				bound.lastAssistantText = frame.assistantText;
 			}
-			// Capture stopReason from EVERY message_end frame for THIS turn, even ones with no text,
-			// so a later text-free toolUse message_end overwrites an earlier stop.
-			if (frame.rawKind === "message_end" && typeof frame.payload.stopReason === "string") {
-				bound.lastAssistantStopReason = frame.payload.stopReason;
-			}
+			// Every assistant message_end of THIS turn replaces the stop evidence, text or not,
+			// so a later text-free toolUse message (or one without a reason) clears an earlier stop.
+			if (frame.rawKind === "message_end" && frame.payload.role === "assistant")
+				bound.lastAssistantStopReason =
+					typeof frame.payload.stopReason === "string" ? frame.payload.stopReason : undefined;
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
 				bound.hadToolActivity = true;
 			if (frame.rawKind === "tool_execution_start")

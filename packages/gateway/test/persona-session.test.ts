@@ -3732,21 +3732,21 @@ test("stall after stop with delivered text: forceFailureNotice=false, closes as 
 	port.emitAssistant(first.sessionId, "Here is the answer", "stop-answer", first.opRef, "stop");
 	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "accepted", "turn not accepted");
 	await manager!.reconcile(KEY);
-	
+
 	// Now trigger stall
 	const readsBeforeStall = port.statusReads.length;
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
 	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-	
+
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS - 1;
 	await manager!.tick(KEY);
 	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-	
+
 	clock.now += 1;
 	await manager!.tick(KEY);
 	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
-	
+
 	// Verify turn closed as no_delivery (not turn_failed)
 	expect(database!.inbox.turnRow(first.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "no_delivery" }));
 	// Verify notice was NOT forced
@@ -3780,21 +3780,21 @@ test("stall with no assistant output: notice posted", async () => {
 	// No assistant output at all
 	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "accepted", "turn not accepted");
 	await manager!.reconcile(KEY);
-	
+
 	// Trigger stall
 	const readsBeforeStall = port.statusReads.length;
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
 	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-	
+
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS - 1;
 	await manager!.tick(KEY);
 	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-	
+
 	clock.now += 1;
 	await manager!.tick(KEY);
 	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
-	
+
 	// Verify turn closed as turn_failed
 	expect(database!.inbox.turnRow(first.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
 	// Verify notice was posted
@@ -3802,6 +3802,44 @@ test("stall with no assistant output: notice posted", async () => {
 	expect(failures[0]?.forceNotice).toBe(true);
 	expect(logs.some((line) => line.includes("stalled_no_terminal_event") && line.includes(first.opRef))).toBe(true);
 });
+
+for (const scenario of ["interim toolUse text only", "stop then a later text-free toolUse"] as const)
+	test(`stall after ${scenario}: notice posted and closes as turn_failed (#768)`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		const clock = { now: Date.now() };
+		const logs: string[] = [];
+		const failures: Array<{ message: string; forceNotice: boolean | undefined }> = [];
+		await harness(
+			port,
+			{ failure: (message, forceNotice) => failures.push({ message, forceNotice }) },
+			(line) => logs.push(line),
+			{ now: () => clock.now },
+		);
+		enqueue("not-finished", "keep working");
+		await manager!.notifyInbound(KEY);
+		await eventually(() => port.sends.length === 1, "persona turn did not start");
+		const first = port.sends[0]!;
+		if (scenario === "interim toolUse text only") {
+			port.emitAssistant(first.sessionId, "Checking the logs", "interim", first.opRef, "toolUse");
+		} else {
+			port.emitAssistant(first.sessionId, "Here is the answer", "stop-answer", first.opRef, "stop");
+			port.emitToolUseEnd(first.sessionId, "later-tool", first.opRef, "toolUse");
+		}
+		await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "accepted", "turn not accepted");
+		await manager!.reconcile(KEY);
+
+		const readsBeforeStall = port.statusReads.length;
+		port.emitStall(first.sessionId);
+		await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+		await manager!.tick(KEY);
+		await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
+
+		expect(database!.inbox.turnRow(first.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.forceNotice).toBe(true);
+		expect(logs.some((line) => line.includes("stalled_no_terminal_event") && line.includes(first.opRef))).toBe(true);
+	});
 /** A torn initial send used to exercise recovery of persisted unaccepted turns. */
 for (const restart of [false, true])
 	for (const evidence of ["empty_live_queue", "dead_session", "transcript_only", "tail_disowned"] as const)
