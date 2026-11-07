@@ -906,13 +906,9 @@ export class MonitorPropagator {
 		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) {
 			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 			// are explicit evidence the operation was never sent. Forget the pointer and recover.
+			// HOWEVER: verify the failure belongs to this pointer's operation (#742).
 			const failure = this.#database.monitors.failure(row.event_id);
-			if (
-				failure &&
-				(failure.code === "session_busy" ||
-					failure.code === "session_submission_wedged" ||
-					failure.code === "session_host_unavailable")
-			) {
+			if (isDurableNoSendFailureForOperation(failure, turn.sessionId, turn.opRef)) {
 				return { kind: "terminal", raw };
 			}
 			return { kind: "hold", reason: "unresolved" };
@@ -1451,13 +1447,9 @@ export class MonitorPropagator {
 									} else {
 										// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 										// are explicit evidence the operation was never sent. Permit fresh authoring.
+										// HOWEVER: verify the failure belongs to this pointer's operation (#742).
 										const failure = this.#database.monitors.failure(row.event_id);
-										if (
-											failure &&
-											(failure.code === "session_busy" ||
-												failure.code === "session_submission_wedged" ||
-												failure.code === "session_host_unavailable")
-										) {
+										if (isDurableNoSendFailureForOperation(failure, sessionId, opRef)) {
 											// Durable failure: permit fresh authoring
 										} else {
 											// Unknown status, throwing, or other states: hold the pointer (#742)
@@ -2829,6 +2821,49 @@ export class MonitorPropagator {
 			stage,
 		});
 	}
+}
+
+/**
+ * Extract operation reference (sessionId + opRef) from a failure detail if encoded.
+ * The detail field may contain JSON with operation info at the end.
+ */
+function extractOperationReference(detail: string): { sessionId?: string; opRef?: string } | undefined {
+	try {
+		// Try to find JSON at the end of the detail string
+		const lastBraceIdx = detail.lastIndexOf("{");
+		if (lastBraceIdx === -1) return undefined;
+		const json = JSON.parse(detail.slice(lastBraceIdx));
+		if (typeof json === "object" && json !== null) {
+			const { sessionId, opRef } = json as Record<string, unknown>;
+			if (typeof sessionId === "string" && typeof opRef === "string") {
+				return { sessionId, opRef };
+			}
+		}
+	} catch {
+		// Not valid JSON or not in expected format
+	}
+	return undefined;
+}
+
+/**
+ * Verify that a failure is a durable no-send failure belonging to the specified operation (#742).
+ * Checks both the code AND that the operation reference matches (sessionId + opRef).
+ */
+function isDurableNoSendFailureForOperation(
+	failure: { readonly code: string; readonly detail: string } | undefined,
+	sessionId: string,
+	opRef: string,
+): boolean {
+	if (!failure) return false;
+	if (
+		failure.code !== "session_busy" &&
+		failure.code !== "session_submission_wedged" &&
+		failure.code !== "session_host_unavailable"
+	)
+		return false;
+	const opRef_ = extractOperationReference(failure.detail);
+	if (!opRef_) return false;
+	return opRef_.sessionId === sessionId && opRef_.opRef === opRef;
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
