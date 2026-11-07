@@ -797,13 +797,13 @@ test("a stalled turn that delivered a reply with stopReason stop does not post a
 		// Trigger stall cutoff
 		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 		await eventually(() => db.inbox.turnRow(send.opRef)?.turn_state === "done", "stalled turn did not close");
-		
+
 		// Verify that no failure notice was posted (only the original answer remains)
 		const replies = messages(client).map((frame) => frame.payload.text as string);
 		expect(replies).toHaveLength(1);
 		expect(replies[0]).toBe("Here is my answer");
 		expect(replies.filter((text) => text.startsWith("[turn failed]"))).toHaveLength(0);
-		
+
 		// Verify session was closed
 		expect(port.closes.map((close) => close.sessionId)).toEqual([send.sessionId]);
 	} finally {
