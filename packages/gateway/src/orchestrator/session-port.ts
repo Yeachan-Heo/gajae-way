@@ -1870,7 +1870,7 @@ export class BrokerSessionPort implements SessionPort {
 		sdk: SdkTransport,
 	): Promise<LastAssistantResult | undefined> {
 		let cursor: string | undefined;
-		type Row = { role?: string; ts?: string; textSummary?: string; body?: string };
+		type Row = { role?: string; ts?: string; textSummary?: string; body?: string; stopReason?: string };
 		const rowText = (row: Row): string =>
 			(typeof row.body === "string" && row.body) || (typeof row.textSummary === "string" ? row.textSummary : "");
 		let latest: Row | undefined;
@@ -1884,7 +1884,7 @@ export class BrokerSessionPort implements SessionPort {
 			const page = (
 				envelope as {
 					page?: {
-						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }>;
+						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string; stopReason?: string }>;
 						complete?: unknown;
 						continuationCursor?: unknown;
 					};
@@ -1902,7 +1902,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (page.complete === true) {
 				const chosen = (input.preferSpoken ? latestSpoken : undefined) ?? latest;
 				if (!chosen) return undefined;
-				return { text: rowText(chosen), pages, complete: true };
+				return { text: rowText(chosen), pages, complete: true, stopReason: chosen.stopReason };
 			}
 			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
 			if (!next || seenCursors.has(next))

@@ -513,12 +513,12 @@ export class ScriptedSessionPort implements SessionPort {
 		);
 	}
 
-	readonly #assistantRows = new Map<string, Array<{ text: string; at: number }>>();
+	readonly #assistantRows = new Map<string, Array<{ text: string; at: number; stopReason?: string }>>();
 
 	/** Scripts a transcript assistant row; a session with scripted rows answers fetchAssistantSince from them only. */
-	appendAssistant(sessionId: string, text: string, at: number = Date.now()): void {
+	appendAssistant(sessionId: string, text: string, at: number = Date.now(), stopReason?: string): void {
 		const rows = this.#assistantRows.get(sessionId) ?? [];
-		rows.push({ text, at });
+		rows.push({ text, at, stopReason });
 		this.#assistantRows.set(sessionId, rows);
 	}
 
@@ -529,7 +529,7 @@ export class ScriptedSessionPort implements SessionPort {
 			const eligible = rows.filter((row) => row.at + 2_000 >= input.notBeforeMs);
 			const chosen =
 				(input.preferSpoken ? eligible.filter((row) => !isSilentReply(row.text)).at(-1) : undefined) ?? eligible.at(-1);
-			return chosen ? { text: chosen.text, pages: 1, complete: true } : undefined;
+			return chosen ? { text: chosen.text, pages: 1, complete: true, stopReason: chosen.stopReason } : undefined;
 		}
 		const operation = [...this.#operations.values()]
 			.reverse()
