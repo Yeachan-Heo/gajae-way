@@ -3527,6 +3527,119 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 });
 
+test("a stalled turn with a reply ending in stopReason stop does not post a failure notice (#768)", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-stop-reply", "answer with a proper conclusion");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Set up the transcript with a reply that ended with stopReason "stop"
+	port.appendAssistant(send.sessionId, "Here is my answer", clock.now, "stop");
+	port.emitAssistant(send.sessionId, "Here is my answer", "answer-frame", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	let statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify no failure notice was posted
+	expect(failureNoticePosted).toBe(false);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
+test("a stalled turn with interim speech still posts a failure notice", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-interim-speech", "start working with interim updates");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Emit interim speech without final answer (no stopReason)
+	port.emitAssistant(send.sessionId, "Still thinking...", "interim-1", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	let statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify failure notice was posted (interim speech did not answer the question)
+	expect(failureNoticePosted).toBe(true);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
+test("a stalled turn with a reply ending in stopReason error still posts a failure notice", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-error-reply", "fail with an error");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Set up the transcript with a reply that ended with stopReason "error"
+	port.appendAssistant(send.sessionId, "An error occurred", clock.now, "error");
+	port.emitAssistant(send.sessionId, "An error occurred", "error-frame", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	let statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify failure notice was posted (error stopReason is not "stop")
+	expect(failureNoticePosted).toBe(true);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
 test("an uncorrelated idle broadcast does not retire a turn with stalled-status polling", async () => {
 	class UnknownStatusPort extends ScriptedSessionPort {
 		unknown = false;

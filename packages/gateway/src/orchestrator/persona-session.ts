@@ -3598,6 +3598,33 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * Check if the turn's last assistant message has stopReason "stop",
+	 * indicating the agent properly concluded and did not have an error.
+	 * Returns true if the last message is confirmed to end with stopReason "stop",
+	 * false if it has a different stopReason, and undefined if unreadable.
+	 */
+	async #lastAssistantIsAnswering(bound: BoundTurn): Promise<boolean | undefined> {
+		const port = this.#manager.port;
+		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return undefined;
+		try {
+			const found = await port.fetchAssistantSince({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				notBeforeMs: bound.dispatchedAtMs,
+				...this.#liveRelay(bound),
+			});
+			// Correlate with the text from the tail to ensure we're looking at the same message
+			if (!found || found.text !== bound.lastAssistantText) return undefined;
+			return found.stopReason === "stop";
+		} catch (error) {
+			this.#manager.log(
+				`stall_last_assistant_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return undefined;
+		}
+	}
+
 	/** True while `bound` is still this actor's current or retired turn and the actor runs. */
 	#stillTracked(bound: BoundTurn): boolean {
 		return (
@@ -4593,10 +4620,25 @@ class OriginActor {
 			const message =
 				"the session running this turn produced no terminal event before the stall deadline; the request was not resent";
 			try {
+				// Check if the turn delivered a reply that properly concluded (stopReason "stop").
+				// If it did, don't post the failure notice, as the user has their answer.
+				let forceFailureNotice = true;
+				if (bound.lastAssistantText !== undefined) {
+					const isAnswering = await this.#lastAssistantIsAnswering(bound);
+					// isAnswering === true: last message has stopReason "stop" → no notice needed
+					// isAnswering === false: last message has different stopReason → keep notice
+					// isAnswering === undefined: read failed → keep notice (fail safe)
+					if (isAnswering === true) {
+						forceFailureNotice = false;
+						this.#manager.log(
+							`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
+						);
+					}
+				}
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
-					forceFailureNotice: true,
+					forceFailureNotice,
 				});
 			} catch (error) {
 				this.#scheduleStatusRecheck(bound);

@@ -26,6 +26,7 @@ export type LastAssistantResult = {
 	readonly text: string;
 	readonly pages: number;
 	readonly complete: boolean;
+	readonly stopReason?: string;
 };
 
 export class TranscriptIncompleteError extends Error {
