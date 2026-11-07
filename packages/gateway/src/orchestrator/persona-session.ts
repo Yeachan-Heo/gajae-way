@@ -3873,10 +3873,11 @@ class OriginActor {
 				this.#clearStallReconciliation(bound);
 			if (frame.assistantText && !frame.steerEcho) {
 				bound.lastAssistantText = frame.assistantText;
-				// Capture stopReason from message_end frames for THIS turn
-				if (frame.rawKind === "message_end" && typeof frame.payload.stopReason === "string") {
-					bound.lastAssistantStopReason = frame.payload.stopReason;
-				}
+			}
+			// Capture stopReason from EVERY message_end frame for THIS turn, even ones with no text,
+			// so a later text-free toolUse message_end overwrites an earlier stop.
+			if (frame.rawKind === "message_end" && typeof frame.payload.stopReason === "string") {
+				bound.lastAssistantStopReason = frame.payload.stopReason;
 			}
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
 				bound.hadToolActivity = true;

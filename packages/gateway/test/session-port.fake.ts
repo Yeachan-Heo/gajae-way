@@ -653,17 +653,40 @@ export class ScriptedSessionPort implements SessionPort {
 		text: string,
 		eventId: string | null = `event-${crypto.randomUUID()}`,
 		opRef?: string,
+		stopReason?: string,
 	): void {
 		const transcript = this.#transcripts.get(sessionId) ?? [];
 		transcript.push(text);
 		this.#transcripts.set(sessionId, transcript);
 		const ref = opRef ?? this.#inFlightOpRef(sessionId);
+		const payload: Record<string, unknown> = { role: "assistant", content: [{ text }] };
+		if (stopReason) payload.stopReason = stopReason;
 		this.#emit(sessionId, ref, {
 			kind: "message_end",
 			rawKind: "message_end",
 			...(eventId === null ? {} : { eventId }),
-			payload: { role: "assistant", content: [{ text }] },
+			payload,
 			assistantText: text,
+			steerEcho: false,
+			idle: false,
+		});
+	}
+
+	/** Emit a text-free message_end frame with stopReason (e.g., toolUse). */
+	emitToolUseEnd(
+		sessionId: string,
+		eventId: string | null = `event-${crypto.randomUUID()}`,
+		opRef?: string,
+		stopReason = "toolUse",
+	): void {
+		const ref = opRef ?? this.#inFlightOpRef(sessionId);
+		const payload: Record<string, unknown> = { role: "assistant", content: [] };
+		if (stopReason) payload.stopReason = stopReason;
+		this.#emit(sessionId, ref, {
+			kind: "message_end",
+			rawKind: "message_end",
+			...(eventId === null ? {} : { eventId }),
+			payload,
 			steerEcho: false,
 			idle: false,
 		});
