@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { FunctionalReadinessCategory } from "@gajae-gateway/protocol";
 import {
 	FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
 	FUNCTIONAL_READINESS_WINDOW_MS,
@@ -9,7 +10,7 @@ const START = Date.UTC(2026, 0, 1);
 
 function fail(
 	readiness: FunctionalReadiness,
-	category: "session_create" | "turn" | "delivery" | "monitor_delivery",
+	category: FunctionalReadinessCategory,
 	at: number,
 	code = "persona_bind_failed",
 ): void {
@@ -43,6 +44,21 @@ test("a success resets only its own failure streak", () => {
 	expect(readiness.snapshot(START + 3).ready).toBe(false);
 
 	readiness.recordSuccess("monitor_delivery");
+	expect(readiness.snapshot(START + 3)).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
+});
+
+test("monitor bind degradation survives delivery success until a first-attempt bind succeeds", () => {
+	const readiness = new FunctionalReadiness();
+	for (let i = 0; i < 3; i++) fail(readiness, "monitor_bind", START + i, "monitor_bind_degraded");
+
+	readiness.recordSuccess("delivery");
+	readiness.recordSuccess("monitor_delivery");
+	expect(readiness.snapshot(START + 3)).toMatchObject({
+		ready: false,
+		failure: { category: "monitor_bind", code: "monitor_bind_degraded" },
+	});
+
+	readiness.recordSuccess("monitor_bind");
 	expect(readiness.snapshot(START + 3)).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 });
 

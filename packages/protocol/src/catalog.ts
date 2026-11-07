@@ -24,7 +24,7 @@ export type DeliveryErrorCode =
 	| "invalid_request"
 	| "other";
 
-export type FunctionalReadinessCategory = "session_create" | "turn" | "delivery" | "monitor_delivery";
+export type FunctionalReadinessCategory = "session_create" | "turn" | "delivery" | "monitor_delivery" | "monitor_bind";
 
 export interface FunctionalReadinessFailure {
 	readonly category: FunctionalReadinessCategory;
