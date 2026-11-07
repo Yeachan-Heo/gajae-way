@@ -907,7 +907,12 @@ export class MonitorPropagator {
 			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 			// are explicit evidence the operation was never sent. Forget the pointer and recover.
 			const failure = this.#database.monitors.failure(row.event_id);
-			if (failure && (failure.code === "session_busy" || failure.code === "session_submission_wedged" || failure.code === "session_host_unavailable")) {
+			if (
+				failure &&
+				(failure.code === "session_busy" ||
+					failure.code === "session_submission_wedged" ||
+					failure.code === "session_host_unavailable")
+			) {
 				return { kind: "terminal", raw };
 			}
 			return { kind: "hold", reason: "unresolved" };
@@ -1447,7 +1452,12 @@ export class MonitorPropagator {
 										// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 										// are explicit evidence the operation was never sent. Permit fresh authoring.
 										const failure = this.#database.monitors.failure(row.event_id);
-										if (failure && (failure.code === "session_busy" || failure.code === "session_submission_wedged" || failure.code === "session_host_unavailable")) {
+										if (
+											failure &&
+											(failure.code === "session_busy" ||
+												failure.code === "session_submission_wedged" ||
+												failure.code === "session_host_unavailable")
+										) {
 											// Durable failure: permit fresh authoring
 										} else {
 											// Unknown status, throwing, or other states: hold the pointer (#742)
